@@ -55,8 +55,11 @@ The protocol is designed for a world where:
         │               │              │              │
         ╳               ╳              ╳              ╳
    No protocol-level communication between agents across contexts.
-   Contexts are fully isolated. Agents are separate instances.
+   Agent isolation is absolute — agents are separate instances per context.
+   Information may cross context boundaries only through opt-in tool interfaces (§2.3).
 ```
+
+The **protocol boundary** encompasses everything that touches the network — contexts, identity state (both public and private), encrypted envelopes, relay interactions, and attestations. Identity private state (§3.7) is protocol-governed even though it exists outside any context — it is encrypted data stored on relays, subject to protocol rules. Above the boundary, local agent orchestration and client behavior are unconstrained. Below it, all data and interactions are protocol-governed and cryptographically enforced.
 
 ### 2.2 Context Interior
 
@@ -136,11 +139,19 @@ The protocol is designed for a world where:
           │     (unconstrained)        │
           └────────────────────────────┘
 
-  Context-to-context tool interfaces:
-  - Both contexts must explicitly opt in
-  - Calls are stateless and structured
-  - Data flows through defined interfaces, not agent memory
-  - Every call is auditable
+  Cross-context tool interfaces are the ONLY protocol-level
+  channel for information to cross context boundaries:
+
+  - Both contexts must explicitly opt in (mutual consent)
+  - Calls are stateless — no session, no persistent channel
+  - Data flows through declared tool schemas, not agent memory
+  - Every call is logged in the verifiable event log
+  - Results carry provenance (originating context, tool, operator)
+
+  This is a controlled crossing, not a breach of isolation.
+  Agent isolation remains absolute: no agent instance spans contexts,
+  no agent in Context B can see Context A's keys, members, or state.
+  The tool interface exposes only what the tool's schema declares.
 ```
 
 ### 2.4 Trust and Capability Model
@@ -269,6 +280,8 @@ No seed phrases. Recovery uses social and device mechanisms:
 - **Social recovery:** Trusted contacts confirm your identity.
 - **Platform-backed recovery:** If custody is delegated to Apple/Google, their recovery mechanisms apply.
 
+For new users with a single device and no SCP contacts, platform-backed recovery is the practical safety net. Social and device recovery grow in value over time as users add devices and build connections. Apps should prompt for trusted recovery contacts during onboarding — the same pattern Google and Apple use today.
+
 ### 3.4 Linking Existing Identities
 
 Existing platform identities (Google, Apple, social accounts) can be linked to a protocol identity but are never the root. They serve as convenience and interop, not as source of truth.
@@ -310,11 +323,15 @@ A user's view of their own social graph is **assembled from capability-gated que
 
 This extends to relationship metadata — not just whether a connection exists, but the nature of it. Alice might see that you and Bob are both in the cooking quest. She cannot see that you and Bob also share a private finance context, unless you've granted that visibility.
 
-**Access is through tool calls and agent-to-agent queries.** An agent or human requesting social graph data hits a capability-gated interface — the same pattern as any other protocol data access. The entity holding the data checks permissions before responding. No special mechanisms, no local caches treated as source of truth.
+**Access is through capability-gated protocol interfaces.** Social graph data is accessed through the same permission model as any other protocol data. Queries hit capability-gated interfaces; the protocol checks permissions before responding. No special mechanisms, no local caches treated as source of truth. The protocol provides query APIs for assembling and sharing graph views — these are not static data stores but permission-scoped computations over context membership.
 
 **No new primitives required.** Social graph visibility falls out of the existing trust equation: `trust = f(identity, capability, context, metadata)`. Capability tokens authorize reading specific slices of your graph. The social graph isn't a separate system with its own privacy model — it's just another resource governed by the same model as everything else.
 
-**Block/mute** is stored in identity private state (§3.7) — persistent, portable, encrypted, invisible to other participants. Your agent enforces blocks by refusing to join contexts containing blocked DIDs. The blocked party doesn't know they're blocked at the protocol level.
+**Block/mute** is stored in identity private state (§3.7) — persistent, portable, encrypted.
+
+**Block** is DID-to-DID and bidirectional. When Alice blocks Dave, neither can see the other — across all shared contexts. Blocking is cryptographically enforced through the group encryption protocol (§10.5). When a block is issued, the blocker's encryption keys are rotated and redistributed to all context members except the blocked party. The blocked party physically cannot decrypt the blocker's future messages. This is the same key management mechanism used for member removal — blocking and removal share cryptographic infrastructure. Blocks can optionally be scoped to a specific context, but the default and most common case is DID-to-DID across all shared contexts.
+
+**Mute** is unidirectional. Alice mutes Dave; Alice no longer sees Dave's content. Dave is unaffected and can still see Alice. Muting is a protocol rule enforced in the SDK — apps built on the SDK inherit this behavior. Because the muter is not adversarial against themselves (they chose the mute), SDK-level enforcement is sufficient; cryptographic exclusion is not required.
 
 ### 3.7 Identity Private State
 
@@ -371,7 +388,7 @@ Humans and their bound agents are the only actors in the system. Every action on
 Every agent is bound to one or more humans via cryptographic proof. The binding is verifiable by any participant.
 
 - **Personal agents:** Bound to a single human. The common case.
-- **Institutional agents:** Bound to multiple humans through shared governance (multi-sig, elected operators, organizational hierarchy). Structurally identical to personal agents; the difference is in who holds the keys and how revocation/control works.
+- **Institutional agents:** Bound to multiple humans through shared governance (multi-sig, elected operators, organizational hierarchy). Structurally identical to personal agents; the difference is in who holds the keys and how revocation/control works. Institutions get one agent per context, the same as individuals — one seat per institution per table.
 
 ### 4.3 One Agent Per Person Per Context
 
@@ -404,7 +421,17 @@ What this means for the ecosystem:
 - **Agent capability is a spectrum.** A passthrough agent that forwards human keystrokes is valid. A fully autonomous agent that acts on its own judgment is valid. The protocol treats both identically — the difference is in the human's local configuration, not in the protocol's evaluation.
 - **The minimum viable agent is trivial.** A user doesn't need to "set up an agent" any more than they need to "set up TCP." The simplest agent can be generated, embedded in an app, or provided as a default. The protocol requires the pairing to exist, not that it be sophisticated.
 
-### 4.6 Context-Bound at Protocol Level
+### 4.6 Agents Are Consumers, Not Enforcers
+
+Human-bound agents are **protocol consumers** — a different class of user than humans, but users nonetheless. They use apps. They use context tools. They interact with contexts through the protocol. They have zero responsibility for enforcing protocol rules.
+
+The protocol enforces itself — through cryptography (encryption-as-access-control, key tree exclusion for blocks, capability token validation) and through the SDK that builders use to construct conformant apps. Agents do not enforce blocking, role permissions, capability ceilings, or any other protocol rule. The protocol and its cryptographic guarantees handle enforcement. Apps built on the SDK inherit those guarantees. Agents and humans consume those apps.
+
+This distinction matters because SCP is designed for a world of generated, ephemeral clients. Any enforcement that depends on agent or client behavior is not enforcement — it's a suggestion that non-conformant software can ignore. Protocol guarantees must be cryptographic or structural, never behavioral.
+
+A separate class of agents exists outside this context: **builder agents** — the LLMs and AI systems that generate apps and services on top of SCP using the SDK. These are developers, not protocol participants. They are responsible for constructing software; human-bound agents are responsible for nothing beyond using it.
+
+### 4.7 Context-Bound at Protocol Level
 
 An agent in Context A has no protocol-level awareness of or connection to the same human's agent in Context B. At the protocol level, they are separate instances. They share no state through the network.
 
@@ -412,7 +439,7 @@ The human coordinates locally. On the user's machine, agents share state freely,
 
 This eliminates: cross-context infection via agent memory, runaway agent coordination at the protocol level, the need for bridging rate limits, metastatic growth patterns through agent connections.
 
-### 4.7 Agent Fleet
+### 4.8 Agent Fleet
 
 A human can be in many contexts, each with one agent configured for that context. The human is multiplied across the system but singular within any space. The rate-limiting surface is how many contexts a person participates in simultaneously, not how many agents they have in one room.
 
@@ -487,7 +514,7 @@ Contexts are cryptographic entities. You opt into a key, not a name. Naming and 
 
 Contexts support multiple governance models for who can change roles, settings, membership, and other context configuration. Models include but are not limited to: single admin, multi-sig (N-of-M approval), elected moderators, full member consensus, weighted voting.
 
-The governance model is declared at creation and visible to all. Specific protocol-level primitives for governance are TBD.
+The governance model is declared at creation and visible to all. Governance implementations are **pluggable** — the protocol defines the interface (propose, approve, reject) but specific multi-sig, consensus, and voting implementations are not protocol-mandated. Context creators bring or select their own governance logic. Specific protocol-level primitives for the governance interface are TBD.
 
 ---
 
@@ -616,7 +643,7 @@ Behavioral records replace endorsements as the primary input to evaluation for e
 
 #### 7.3.3 Tool Verification
 
-SCP tools are stateless functions: same input produces the same output. This makes tool integrity **testable**.
+SCP tools are stateless functions with broadly deterministic behavior — consistent behavior and output format for a given input, though not necessarily token-for-token identical output. An LLM-backed tool that answers cooking questions in a consistent schema is "stateless" in the protocol's sense. This makes tool integrity **testable** at the behavioral level.
 
 When a tool is registered with a context, the registration includes:
 
@@ -631,7 +658,7 @@ Any agent can verify a tool's integrity at any time by:
 2. Comparing outputs against expected values
 3. Verifying the implementation hash hasn't changed since registration
 
-If outputs match expected values: the tool behaves as claimed. Verified. If outputs diverge: the tool has been modified or compromised. Detectable, attributable to the operator.
+Test vectors verify behavioral conformance and schema compliance, not exact string matching. A tool that returns a correct answer in a valid schema passes, even if the phrasing differs between invocations. If outputs diverge from expected behavior: the tool has been modified or compromised. Detectable, attributable to the operator.
 
 Multiple agents verifying independently creates threshold confidence. If 10 agents all get expected outputs, the tool is almost certainly behaving correctly. This is continuous validation, not a one-time trust decision.
 
@@ -785,9 +812,13 @@ The common envelope format (§7.4.1) unifies these under a single verifiable str
 
 ## 8. Products and Apps in the Graph
 
-### 8.1 Apps as Entities
+### 8.1 Apps in the Protocol
 
-Products and apps are not transparent pipes. They are entities in the social graph with their own gravity, culture, and relationships. A community built around a specific generated app has identity. The app itself is a node.
+An app is not a protocol entity. It has no DID, is not an agent, and is not a context. The protocol has no `App` type.
+
+What people experience as "an app" is a composite: a context (or set of contexts) + its members + its data + the backend, hosting, and relays that support it. The client is just the visible surface. The app's identity is the whole gestalt — the community, the infrastructure, the accumulated state. This is a philosophical identity, not a codified one. The protocol doesn't need to model it because the constituent parts (contexts, members, tools, data, capability declarations) are already first-class. The app emerges from their composition.
+
+What the protocol *does* ensure is that this emergent identity never becomes lock-in: protocol state is portable (§8.3), clients are switchable, and no app owns the social graph.
 
 ### 8.2 App Interface
 
@@ -927,13 +958,15 @@ The protocol's security model assumes one identity per human. Sybil attacks — 
 
 Provably guaranteeing one-identity-per-human in a decentralized system without invasive verification (KYC, biometric databases) is an unsolved problem. The protocol's approach is to make sybil attacks **expensive enough to be manageable** through three layered mechanisms:
 
-**Device attestation.** Modern devices provide hardware-backed attestation (Apple App Attest, Google Play Integrity) that can prove: "this is a real, un-jailbroken device and it has not previously created another DID through this protocol." One physical device = one DID creation. This doesn't prove one human (a person with two phones gets two identities), but it makes identity creation cost the price of a physical device. The SDK integrates device attestation as part of DID creation.
+**Device attestation.** Modern devices provide hardware-backed attestation (Apple App Attest, Google Play Integrity) that can prove: "this is a real, un-jailbroken device and it has not previously created another DID through this protocol." One physical device = one DID creation. This doesn't prove one human (a person with two phones gets two identities), but it makes identity creation cost the price of a physical device. The SDK integrates device attestation as part of DID creation. Device attestation constrains DID **creation** only — a DID created on one device can authenticate on multiple devices freely. Multi-device usage (§10.2) is unaffected; the restriction is on how many identities can be minted, not how many devices can use one.
 
 **Earned capacity.** New identities start with limited capabilities — restricted context creation, limited context participation slots, constrained tool invocation rates. Capacity grows through participation history, behavioral records, and time. Sybil accounts are cheap to create (one device per identity) but expensive to make useful — each needs real participation history. This is the Reddit model: new accounts can browse, established accounts can post in restricted communities.
 
 **Context-level social verification.** Contexts set their own admission thresholds — how much behavioral history, how many endorsements, what attestations are required for participation at each role level. A casual group chat might require nothing beyond a valid DID. A high-trust financial context might require 6 months of behavioral history, 3 independent endorsements, and challenge-verified agent capabilities. The protocol provides the verification data (behavioral records, attestations, challenge results); contexts define their own thresholds.
 
-These three layers compose: device attestation makes identity creation expensive → earned capacity makes new identities limited → context-level thresholds make meaningful participation require real history. A sybil attacker needs many devices AND time AND social verification to gain influence. Not impossible, but expensive enough that the attack scales poorly.
+These three layers compose: device attestation makes identity creation expensive → earned capacity makes new identities limited → context-level thresholds make meaningful participation require real history. A sybil attacker needs many devices AND time AND social verification to gain influence. Not impossible, but expensive enough that the attack scales poorly. Crucially, consequences for coordinated attacks render sybil accounts single-use — once detected and penalized, the investment in aging and building history is lost. This makes sustained sybil campaigns economically irrational even when individual identity creation is feasible.
+
+Sybil resistance is a **deterrent**, not an enforcement guarantee. The protocol concedes that a sufficiently determined attacker with many devices can create multiple identities. The defense is structural: making the attack expensive to mount, expensive to sustain, and costly when detected.
 
 ### 9.4 Systemic Defense Philosophy
 
@@ -977,6 +1010,15 @@ Deployment spectrum:
   Laptop running SCP daemon      ← more capable. Can be always-on.
        │                            Can serve as personal relay.
        │
+  Agent workstation              ← dedicated always-on hardware running
+       │                            builder agents. Mac Mini, Mac Studio,
+       │                            or equivalent. Non-technical users.
+       │                            Already always-on for agent tasks.
+       │                            Natural SCP node: relay, hosting,
+       │                            bridge connectors as marginal load.
+       │                            Likely the most common always-on
+       │                            self-hosted node type.
+       │
   Personal server / NAS          ← power user. Persistent relay.
        │                            Hosts bridge connectors.
        │                            Not "self-hosting" in the Matrix
@@ -988,6 +1030,10 @@ Deployment spectrum:
        │
   All of the above simultaneously ← the expected state for many users.
 ```
+
+The **agent workstation** tier is a critical addition to the deployment model. As builder agents (LLMs that generate and manage software) become mainstream, non-technical users are acquiring dedicated always-on hardware to run them. These machines are already always-on, capable, and user-controlled. SCP infrastructure — relays, context hosting, bridge connectors — is marginal additional load on hardware that's already running 24/7. The builder agent that generates an SCP app can also provision the infrastructure: spin up a relay, configure contexts, register tools — developer and ops in one.
+
+This changes relay economics fundamentally. The question is not "who pays for relay infrastructure" but "you already have the hardware, the relay is just another process." Self-hosting stops being an aspirational option for technical users and becomes the natural default for anyone with a builder agent workstation. The gravitational pull toward centralized relays weakens when most users have their own always-on node.
 
 The protocol must function correctly at every point on this spectrum. A phone-only user and a user with dedicated infrastructure are both first-class participants. The protocol cannot assume persistent connectivity, stable IP addresses, or server-grade resources.
 
@@ -1018,7 +1064,7 @@ Devices that aren't always online need relays for message delivery. Relays hold 
 - **Metadata exposure.** Relays see who talks to whom, when, and how much, even with encrypted payloads. Traffic analysis is powerful. Mitigating this (mixnets, onion routing, cover traffic) is an unsolved-at-scale problem. The protocol should acknowledge this gap rather than claim relays are fully untrusted.
 - **Relay discovery.** If Alice wants to reach Bob, she needs to know Bob's relay. If Bob switches relays, Alice needs to discover the new one. This requires either a centralized directory (defeats the purpose), a distributed discovery mechanism (adds complexity and latency), or multi-relay registration (Bob publishes to several relays, Alice checks all of them). Nostr's experience: users publish a relay list, clients check multiple relays. Workable but not seamless.
 - **Operational complexity.** A production relay needs reliable delivery, ordering, deduplication, rate limiting, and abuse prevention. "Simple message queue" undersells this. A reference implementation should exist, but running it reliably is a server operations task — not "install an app" level.
-- **Gravitational pull.** In theory relays are commodity. In practice, network effects apply to infrastructure. Nostr shows this: a few popular relays handle most traffic. The protocol can't prevent this concentration, but DID-based identity ensures it doesn't create lock-in — popular relay dies, users switch, identity survives.
+- **Gravitational pull.** In theory relays are commodity. In practice, network effects apply to infrastructure. Nostr shows this: a few popular relays handle most traffic. The protocol can't prevent this concentration, but DID-based identity ensures it doesn't create lock-in — popular relay dies, users switch, identity survives. The agent workstation trend (§10.2) may significantly weaken centralization pressure — if most users run their own always-on node, personal relays become the default rather than the exception.
 
 **Self-hosting:** Running a personal relay is feasible for technical users. It requires a stable address, TLS, and uptime commitment. This is meaningfully simpler than running a Matrix homeserver (no state resolution, no federation protocol, no room DAG) but it is still a server. The protocol should ship a reference relay that minimizes operational burden, but should not claim self-hosting is effortless.
 
@@ -1044,6 +1090,8 @@ Below the abstraction, **transport bindings** adapt SCP's requirements to specif
 - Relay operations (that's either self-hosting or managed infrastructure)
 
 **Encryption-as-access-control.** Context access control is enforced through encryption, not through relay logic. When a context is created, a context encryption key is generated and distributed only to members. All context events are encrypted with this key before reaching the transport layer. Relays store and forward opaque blobs — they cannot read content, verify membership, or enforce roles. Key distribution is membership. Member removal triggers key rotation. This keeps the relay layer genuinely protocol-unaware and makes any encrypted-blob-capable relay — including existing Nostr relays — usable as SCP transport without modification.
+
+**Blocking shares this cryptographic infrastructure.** DID-to-DID blocking (§3.6) is enforced through the same group encryption mechanism as member removal. When Alice blocks Dave, Alice's encryption keys are rotated and redistributed to all context members except Dave — across every shared context. Dave physically cannot decrypt Alice's future messages. This is not a separate system from member key management; it is the same key rotation machinery applied to a different trigger. The choice of group encryption protocol (MLS vs Sender Keys — see §16) determines the scaling characteristics of both member removal and blocking simultaneously.
 
 ### 10.6 Content and Data Sovereignty
 
@@ -1110,13 +1158,15 @@ The SDK provides the transport abstraction and envelope delivery. Whether that d
 
 Managed infrastructure and media/content hosting are the probable revenue surfaces. Heavy content (video, large files, real-time streams) has real storage and bandwidth costs. The protocol works either way — self-hosters shoulder their own costs, managed infrastructure shoulders it for a fee. The point is the choice exists and the protocol doesn't prefer either.
 
-Relay economics are the responsibility of app builders and relay operators. The protocol defines what relays do, not who runs them or how they're funded. Community-operated relays, paid relay services, app-bundled relay infrastructure, and self-hosted relays are all valid. The protocol ensures none of them create lock-in (DID identity, substitutable relays).
+Relay economics are the responsibility of app builders and relay operators. The protocol defines what relays do, not who runs them or how they're funded. Community-operated relays, paid relay services, app-bundled relay infrastructure, and self-hosted relays are all valid. The protocol ensures none of them create lock-in (DID identity, substitutable relays). In practice, app developers who build on SCP are expected to provision relay infrastructure for their users — the same way app developers today provision API servers, databases, and CDNs. There is no assumption of free community relay infrastructure at the protocol level; a protocol foundation may eventually provide shared infrastructure, but this is not a dependency.
+
+**The agent workstation effect.** As builder agents become mainstream and users acquire dedicated always-on hardware to run them (§10.2), the relay economics shift structurally. Relay infrastructure is marginal load on hardware that's already running 24/7. Builder agents can provision SCP infrastructure — relays, context hosting, bridge connectors — as part of generating apps. The "who pays for relays?" question dissolves for users with agent workstations: you already have the hardware, the relay is just another process. Managed infrastructure remains valuable for users without always-on hardware (phone-only users) and for heavy content workloads, but the default self-hosting path becomes significantly more accessible.
 
 ### 10.11 Build on Existing Infrastructure
 
 The transport, data sovereignty, and self-hosting layers are the least novel parts of the system. Existing technologies provide strong foundations. The novel work — and the value — is the Social Context Layer that sits on top.
 
-**Nostr** is the closest existing analog to SCP's transport and identity layer. Keypair-based identity, substitutable relays, signed events, client-side intelligence — SCP's lower stack is architecturally near-identical. The strategic question is whether SCP should build directly on Nostr (encoding SCP events as Nostr event kinds, using Nostr relays as delivery infrastructure) or define its own transport with a Nostr binding as one option. The former gets a live relay ecosystem and existing client libraries. The latter preserves transport agnosticism and avoids coupling to Nostr's governance and ecosystem dynamics. Key tension: Nostr relays are mostly open and public; SCP contexts require access control, which means either SCP-aware relays or an encryption-based access model where relays store blobs they can't read.
+**Nostr** is the closest existing analog to SCP's transport and identity layer. Keypair-based identity, substitutable relays, signed events, client-side intelligence — SCP's lower stack is architecturally near-identical. SCP defines its own transport abstraction with Nostr as one possible binding rather than building directly on Nostr's event model. This preserves transport agnosticism and avoids coupling to Nostr's governance and ecosystem dynamics. SCP's encryption-as-access-control model and MLS-based group encryption requirements (§10.5) go beyond what unmodified Nostr relays provide — the transport binding approach allows SCP to use Nostr relays where they fit while maintaining its own protocol requirements.
 
 **Matrix** provides federated messaging with strong encryption (Megolm/Olm) and a mature room model. SCP contexts could map to Matrix rooms with SCP-specific state events. Matrix's federation model is heavier than Nostr's relay model but provides stronger delivery guarantees.
 
@@ -1239,15 +1289,34 @@ All content entering an SCP context through a bridge carries a **provenance chai
 
 This provenance is structural, not content-level. It flows through the content provenance system (§9.2) and is available to any agent evaluating trust.
 
-Trust evaluation for bridged content is necessarily weaker than for native content:
+Trust evaluation for bridged content is necessarily weaker than for native content. The hierarchy reflects two independent axes — **identity confidence** (who is the author?) and **transport confidence** (how did the content arrive?):
 
 ```
 Trust hierarchy:
 
-  Native SCP identity + native action          ← strongest
-  Native SCP identity + bridged action         ← strong (user bridged their own content)
-  Claimed shadow + historical bridged action   ← moderate (retroactive attribution)
-  Shadow identity + bridged action             ← weakest (depends on bridge operator trust)
+  IDENTITY                TRANSPORT              COMBINED
+
+  Native SCP identity     Native action          ← strongest
+  (DID verified)          (end-to-end SCP)         Both axes at full confidence.
+
+  Native SCP identity     Bridged action          ← strong
+  (DID verified)          (via bridge infra)        Identity is verified — an attestation
+                                                    links the external handle to the DID.
+                                                    But content traveled through bridge
+                                                    infrastructure: timestamps are platform-
+                                                    reported, content integrity depends on
+                                                    bridge operator fidelity.
+
+  Claimed shadow          Historical bridged      ← moderate
+  (retroactive DID link)  (pre-claim content)       User joined SCP and claimed an existing
+                                                    shadow. Old content gets retroactive
+                                                    attribution, but was created before any
+                                                    SCP identity existed to verify against.
+
+  Shadow identity         Bridged action          ← weakest
+  (no DID claim)          (via bridge infra)        No SCP identity has claimed this shadow.
+                                                    Trust depends entirely on the bridge
+                                                    operator's DID and reputation.
 ```
 
 Agents can calibrate their behavior based on provenance. A conservative agent might ignore all shadow-attributed content. A permissive agent might treat claimed shadows equivalently to native identities. The protocol makes the distinction legible; the evaluation is up to the participant.
@@ -1346,6 +1415,7 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 - Content moderation is a context governance responsibility, not a protocol responsibility. Contexts define their own rules, enforce them through roles and consequence mechanisms, and are governed by accountable identities.
 - The protocol provides the tools for moderation (role-based permissions, consequence mechanisms, governance models, member ejection) but does not mandate specific content policies. Different contexts have different standards — this is by design.
 - Managed infrastructure providers (relay operators, hosting services) may have additional obligations under local law. The protocol's encryption model means relay operators have limited ability to moderate content they can't read — this is a feature for privacy and a tension for compliance that operators must navigate based on their jurisdiction.
+- **Relay vs. context as regulatory surface.** Relays handle opaque encrypted blobs and are not positioned to be classified as content intermediaries — they are more analogous to encrypted storage or transport providers. Content moderation obligations, if they materialize, are expected to apply at the **context** level, where content is legible and governance structures exist to enforce policies. This legal argument has not been tested in any jurisdiction; the protocol's design assumes it but does not depend on it.
 
 **The boundary:** The protocol is responsible for providing privacy-preserving, sovereignty-respecting infrastructure with the tools needed for compliance. The protocol is not responsible for the compliance decisions of entities that build on it. This is the same boundary that TCP/IP, HTTP, and email operate under — the protocol enables, the users of the protocol are responsible.
 
@@ -1355,14 +1425,14 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 
 ### Design Decisions Pending
 
-- **Context capability ceiling mutability.** Immutable (stronger security, requires migration to expand) vs. mutable under governance (more flexible, enables creep). Depends on solving artifact portability.
-- **Context governance primitives.** What does the protocol provide for single-admin, multi-sig, consensus models? Specifics TBD.
+- **Context capability ceiling mutability.** Leaning toward immutable (stronger security, requires migration to expand — analogous to onchain programs). Mutable under governance is the alternative (more flexible, enables creep). Undecided; depends on solving artifact portability and context migration tooling.
+- **Context governance primitives.** Governance implementations are pluggable — the protocol defines the interface (propose, approve, reject), not the implementations. Remaining question: what is the minimum viable governance interface that all models must conform to?
 - **Context-to-context tool interface mechanics.** How do contexts discover, negotiate, and establish interop interfaces? Specifics TBD.
 - **Earned capacity mechanisms.** How do new identities earn more agent slots / context participation capacity? What signals are used? Not gamifiable.
 - **Agent capability metadata standard.** What's surfaced, how it's structured, how it's verified.
 - **Content provenance system.** Hash chains, origin tracking, interface chain tracing. Identified as needed, not designed.
 - **Rate limiting defaults.** Context creation limits, context participation limits per human. Surfaces identified, defaults not set.
-- **Identity attestation discovery.** How do users discover that an external platform handle maps to a known DID? Options include distributed registry, DHT, attestations in DID documents, or a gossip protocol. Must be decentralized and not depend on a single directory.
+- **Identity attestation discovery.** Likely direction: attestations are discoverable through the contexts and platforms where they're relevant. If Alice wants to find Bob's SCP identity from his X handle, she queries through X's context or bridge — platforms store attestation data alongside their own data. This may eliminate the need for separate discovery infrastructure (DHT, registry), but the mechanics need specification.
 - **Identity attestation verification methods.** Platform-specific verification flows (OAuth, signed posts, DNS records, etc.) need standardization per platform.
 - **Shadow identity role defaults.** What capabilities should shadow identities receive by default? Observer-equivalent is conservative; some contexts may want more permissive defaults.
 - **Bridge connector interface specification.** The cooperative mode interface — what a platform implements to participate — needs to be minimal and well-specified. This is the "pitch" to platforms.
@@ -1373,9 +1443,9 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 - **Minimum viable agent specification.** What does the simplest possible agent look like? The "transparent pipe" agent that just forwards human input needs a reference implementation that's trivially embeddable.
 - **Relay protocol specification.** What does the relay interface look like? Must be simple enough to self-host on consumer hardware. Encrypted payload in, encrypted payload out. (Partially resolved by §10.5 — may be delegated to existing transport if binding-first approach is taken.)
 - **Cooperative mode trust tiers.** How much does cooperative mode actually improve trust provenance for bridged content? Need to define the specific trust differential that incentivizes platforms.
-- **Primary transport binding.** Which transport does SCP ship its reference binding for? Nostr is architecturally closest. Matrix has stronger delivery guarantees. This choice determines which ecosystem SCP builds alongside.
+- **Primary transport binding.** SCP defines its own transport abstraction with bindings to existing transports. The choice of first reference binding determines which ecosystem SCP builds alongside. Nostr is architecturally closest but SCP's encryption and key management requirements go beyond unmodified Nostr relays. Decision is driven by expediency and scalability, not ecosystem allegiance.
 - **Transport abstraction interface.** Exact contract between SCP protocol logic and transport bindings. Must be thin enough that bindings are simple to write, rich enough that protocol logic doesn't leak transport assumptions.
-- **Context key management.** Encryption-as-access-control requires group key distribution, key rotation on member removal, and forward secrecy. These are solved problems (MLS, Signal's Sender Keys) but the specific approach needs selection.
+- **Context key management.** Encryption-as-access-control requires group key distribution, key rotation on member removal, and forward secrecy. These are solved problems (MLS, Signal's Sender Keys) but the specific approach needs selection. This is the first implementation domino — the choice also determines the mechanics of DID-to-DID blocking (§3.6, §10.5), which uses the same key rotation infrastructure. MLS (tree-based, O(log N) member exclusion) scales better for large contexts; Sender Keys (per-sender, O(N) distribution) are simpler for small ones.
 - **Metadata privacy.** Relays see context_ids, sender identifiers, timing, and volume. How much metadata leakage is acceptable? Do we need mixnet-style protections, or is encrypted content + substitutable relays sufficient for v1?
 - **Verifiable event log format.** §7.3.1 specifies Merkle trees per context for event ordering and tamper detection. The concrete format — tree structure, hash algorithm, leaf schema, proof format — is not yet specified. Must be efficient enough for device-as-node participation. Candidates: sparse Merkle trees, append-only log trees (Certificate Transparency style), or Prolly trees.
 - **Behavioral record schema.** §7.3.2 defines what facts are derivable from event logs, but the record format is unspecified. How are behavioral records serialized, exchanged between agents, and verified against source logs? Must be compact enough for inline presentation and rich enough for meaningful evaluation.
