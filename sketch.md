@@ -172,13 +172,28 @@ SCP.Context.create(
     endorsements: { count: Int, independent: Bool }?
   }?,
   consequenceRules: [ConsequenceRule]?,  // automated behavioral enforcement
+  ttl: Duration?,                  // optional lifespan (§5.10)
+  onExpiry: .close                 // close context, handle keys per memoryScope
+          | .archiveMetadata,      // close + preserve metadata summary
+  memoryScope: .ephemeral          // destroy keys on close (§5.11)
+             | .summary            // produce summary, then destroy keys
+             | .full,              // standard — persist indefinitely (default)
   metadata: {
     name: String,                  // display only, client concern
     description: String,
     public: Bool                   // discoverable vs invite-only
   }
-) → Context { contextID, creatorDID, ceiling, roles, governance }
+) → Context { contextID, creatorDID, ceiling, roles, governance, ttl?, memoryScope }
 ```
+
+TTL and memory scope are optional. When omitted, TTL defaults to none (context persists until manually closed) and memory scope defaults to `.full`.
+
+When TTL expires, the context closes automatically. Key destruction follows the memory scope:
+- `.ephemeral`: encryption keys destroyed immediately. Content is physically unreadable.
+- `.summary`: summary generated and verified, then keys destroyed.
+- `.full`: context closes but content remains accessible.
+
+In all cases, durable metadata persists: the context's existence, participants, purpose, and behavioral contributions survive.
 
 ### Inspect (before opt-in)
 
@@ -232,6 +247,84 @@ SCP.Context.list(
   filter: .all | .created | .member | .observer
 ) → [ContextSummary]
 ```
+
+### Propose (§5.12 — Bilateral Context Creation)
+
+An agent proposes a new context to one or more other agents. The proposal carries full legibility — the recipient knows exactly what they'd be opting into.
+
+```
+SCP.Context.propose(
+  from: Identity,                    // proposer's DID + agent metadata
+  to: DID | [DID],                   // one or many recipients
+  purpose: String,                   // human-readable declared intent
+  ceiling: [Capability],             // proposed capability ceiling
+  ttl: Duration?,                    // optional lifespan
+  memoryScope: .ephemeral | .summary | .full,
+  tools: [ToolDefinition]?,          // optional tools for the proposed context
+  roles: {                           // optional role definitions
+    ...custom
+  }?,
+  governance: GovernanceModel?,      // defaults to bilateral consensus for 2-party
+  discoveryProvenance: DiscoveryProvenance {
+    method: .sharedContext(contextID)
+          | .registry(registryContextID)
+          | .referral(chain: [DID], depth: Int)
+          | .none,
+    introductionToken: IntroductionToken?  // if discovery was via referral
+  },
+  signature: proposer's cryptographic signature
+) → ContextProposal {
+  proposalID: String,
+  from: DID,
+  to: [DID],
+  purpose: String,
+  ceiling: [Capability],
+  ttl: Duration?,
+  memoryScope: MemoryScope,
+  discoveryProvenance: DiscoveryProvenance,
+  createdAt: Date,
+  expiresAt: Date                    // proposals themselves expire (configurable, default 24h)
+}
+```
+
+The proposal is delivered to the recipient(s) through the same transport layer as other protocol messages. It is an encrypted envelope addressed to the recipient's DID.
+
+### Accept Proposal
+
+```
+SCP.Context.acceptProposal(
+  proposalID: String,
+  as: Identity
+) → Context {
+  contextID, ceiling, roles, governance, ttl?, memoryScope,
+  members: [Membership],            // both parties are members from creation
+  genesisEvent: ContextProposal     // the proposal is the first event in the log
+}
+```
+
+Acceptance creates the context immediately. Both parties are members from creation. The proposal is recorded as the genesis event in the context's verifiable event log — full provenance of how and why the context was created.
+
+### Reject Proposal
+
+```
+SCP.Context.rejectProposal(
+  proposalID: String,
+  as: Identity
+) → void
+```
+
+Rejection is silent — the proposer receives a rejection signal but not the reason. The rejection is recorded in the proposer's behavioral metadata (proposal sent, not accepted) but does not appear in the rejecter's behavioral record beyond aggregate stats.
+
+### List Pending Proposals
+
+```
+SCP.Context.listProposals(
+  for: Identity,
+  filter: .incoming | .outgoing | .all
+) → [ContextProposal]
+```
+
+Returns pending (not yet accepted/rejected/expired) proposals. Clients use this to surface proposals to the human or to implement auto-accept/reject policies.
 
 ---
 
@@ -974,6 +1067,8 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
   "bridges": [
     { "platform": "x", "mode": "relay", "operator": "did:key:z6MkpT...", "shadows": 12 }
   ],
+  "ttl": null,
+  "memory_scope": "full",
   "members": 47,
   "created": "2026-01-20T10:00:00Z",
   "creator": "did:key:z6MkpT..."
@@ -1025,18 +1120,654 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
 }
 ```
 
+### Context Proposal Envelope
+
+```json
+{
+  "protocol": "scp/1.0",
+  "type": "context_proposal",
+  "proposal_id": "prop:z6Mk...",
+  "from": {
+    "did": "did:key:z6Mkf5rG...",
+    "agent_metadata": {
+      "self_attested": { "capabilities": ["scheduling", "cooking"] },
+      "challenge_verified": [
+        { "capability": "prompt_injection_resistance", "verified_at": "2026-02-10T..." }
+      ]
+    }
+  },
+  "to": ["did:key:z6MkpT..."],
+  "purpose": "Schedule project review meeting",
+  "ceiling": ["messaging"],
+  "ttl_seconds": 600,
+  "memory_scope": "summary",
+  "governance": { "model": "bilateral_consensus" },
+  "discovery_provenance": {
+    "method": "shared_context",
+    "context_id": "ctx:z6Mkq8..."
+  },
+  "created_at": "2026-02-20T15:30:00Z",
+  "expires_at": "2026-02-21T15:30:00Z",
+  "signature": "z3hR9xK..."
+}
+```
+
+### Data Provenance Attachment
+
+Attached to data crossing context boundaries:
+
+```json
+{
+  "provenance": {
+    "source_context": "ctx:z6Mkq8...",
+    "source_type": "ephemeral",
+    "counterparties": ["did:key:z6MkpT..."],
+    "purpose": "Scheduling discussion",
+    "discovery_method": {
+      "type": "shared_context",
+      "context_id": "ctx:z6Mkr7..."
+    },
+    "age_seconds": 10800,
+    "memory_scope": "ephemeral"
+  }
+}
+```
+
+### Introduction Token
+
+```json
+{
+  "token_id": "intro:z6Mk...",
+  "referrer": "did:key:z6MkCarol...",
+  "party": "did:key:z6MkBob...",
+  "referrer_context": "ctx:z6MkShared...",
+  "referrer_relationship": {
+    "shared_contexts": 3,
+    "duration_days": 180,
+    "roles": ["member", "member", "admin"]
+  },
+  "referrer_behavioral_summary": {
+    "contexts_participated": 24,
+    "total_duration_days": 300,
+    "governance_actions_against": 0,
+    "endorsement_accuracy": 0.94
+  },
+  "chain_depth": 1,
+  "created_at": "2026-02-20T15:30:00Z",
+  "expires_at": "2026-02-27T15:30:00Z",
+  "signature": "..."
+}
+```
+
 ---
 
-## 12. What's Not Here Yet
+## 12. Agent Discovery (§6.4)
+
+### Context-Mediated Discovery
+
+Agents discover each other through shared contexts. No new API — the existing member list and behavioral record queries serve this purpose.
+
+```
+// Alice's agent in a cooking quest wants to find a Japanese food expert
+// Step 1: Check co-members of shared contexts
+let members = try await agent.read(resource: .members)
+// Returns member list with capability metadata, behavioral records
+
+// Step 2: Evaluate a co-member's capabilities
+let evaluation = try await SCP.Trust.evaluate(
+  subject: bobsAgentPresentation,
+  context: cookingQuestID
+)
+// Returns full trust evaluation including behavioral record
+
+// Step 3: Propose a context for direct collaboration
+let proposal = try await SCP.Context.propose(
+  from: alice,
+  to: bob.did,
+  purpose: "Japanese cooking technique guidance",
+  ceiling: [.messaging, .toolInvocation],
+  ttl: .hours(1),
+  memoryScope: .summary,
+  discoveryProvenance: .sharedContext(cookingQuestID)
+)
+```
+
+Discovery provenance: `.sharedContext(contextID)`. Highest trust — inherits from the shared context's trust evaluation.
+
+### Registry Contexts
+
+A registry is a standard SCP context with discovery tools. Not a new primitive — just a context with tools designed for agent search.
+
+```
+// Registry context creation (by a registry operator)
+let registry = try await SCP.Context.create(
+  creator: registryOperator,
+  ceiling: [.messaging, .toolInvocation],
+  governance: .singleAdmin,
+  tools: [
+    ToolDefinition(
+      name: "agent_search",
+      description: "Search for agents by capability, history, or attestation",
+      input: JSONSchema {
+        capability: String?,           // e.g., "japanese_cooking", "scheduling"
+        minContextHistory: Int?,       // minimum contexts participated in
+        requiredAttestations: [AttestationType]?,
+        filters: {
+          minBehavioralAge: Duration?,
+          maxGovernanceActions: Int?,
+          challengeVerified: [String]?
+        }?
+      },
+      output: JSONSchema {
+        results: [{
+          did: DID,
+          capabilities: AgentCapabilityProfile,
+          behavioralSummary: BehavioralSummary,
+          attestations: [AttestationSummary],
+          registeredAt: Date
+        }]
+      },
+      requiredRole: "member",
+      operator: registryOperator.did
+    ),
+    ToolDefinition(
+      name: "agent_profile",
+      description: "Get detailed profile for a specific agent",
+      input: JSONSchema { did: DID },
+      output: JSONSchema {
+        did: DID,
+        capabilities: AgentCapabilityProfile,
+        behavioralRecord: BehavioralRecord,
+        attestations: [Attestation],
+        registeredAt: Date,
+        lastActive: Date
+      },
+      requiredRole: "member",
+      operator: registryOperator.did
+    )
+  ],
+  metadata: {
+    name: "Cooking Agents Registry",
+    description: "Discovery registry for cooking and food-related agents",
+    public: true
+  }
+)
+
+// An agent searches the registry
+let results = try await agent.invoke(
+  tool: "agent_search",
+  input: { capability: "japanese_cooking", minContextHistory: 5 }
+)
+
+// Then proposes a context to a discovered agent
+let proposal = try await SCP.Context.propose(
+  from: alice,
+  to: results[0].did,
+  purpose: "Learn sushi preparation techniques",
+  ceiling: [.messaging],
+  ttl: .minutes(30),
+  memoryScope: .ephemeral,
+  discoveryProvenance: .registry(registry.contextID)
+)
+```
+
+Discovery provenance: `.registry(registryContextID)`. Medium trust — registry reputation + discovered agent's behavioral record.
+
+### Referral / Introduction
+
+An agent introduces two other agents that aren't in the same context.
+
+```
+// Carol knows both Alice and Bob (in separate contexts)
+// Carol introduces Alice to Bob
+
+SCP.Discovery.introduce(
+  referrer: carol.did,
+  party: bob.did,                    // who Carol is introducing
+  referrerContext: contextWhereCarolKnowsBob,  // where Carol knows Bob
+  referrerRelationship: {            // Carol's relationship to Bob
+    sharedContexts: 3,
+    duration: .months(6),
+    roles: ["member", "member", "admin"]
+  }
+) → IntroductionToken {
+  tokenID: String,
+  referrer: DID,
+  party: DID,
+  referrerBehavioralRecord: BehavioralSummary,
+  referrerContext: contextID,
+  chainDepth: 1,                     // direct introduction
+  signature: carol's signature,
+  expiresAt: Date                    // introduction tokens expire
+}
+
+// Alice uses the introduction token in a context proposal
+let proposal = try await SCP.Context.propose(
+  from: alice,
+  to: bob.did,
+  purpose: "Recipe exchange — Carol introduced us",
+  ceiling: [.messaging],
+  ttl: .hours(2),
+  memoryScope: .summary,
+  discoveryProvenance: .referral(
+    chain: [carol.did],
+    depth: 1,
+    introductionToken: carolsToken
+  )
+)
+```
+
+Referral chains: if Bob then introduces Alice to Dave, the chain is `[carol, bob]` with depth 2. Maximum chain depth is a protocol parameter. Introductions beyond the maximum depth carry no trust provenance.
+
+Discovery provenance: `.referral(chain: [DID], depth: Int)`. Trust proportional to referrer's behavioral record, decays with depth.
+
+---
+
+## 13. Data Provenance (§7.7)
+
+### Provenance Type
+
+Protocol-level provenance attached to data that crosses context boundaries.
+
+```
+DataProvenance {
+  sourceContext: contextID,          // where the data came from
+  sourceType: .persistent            // source context still exists with full content
+            | .ephemeral             // source context keys destroyed
+            | .summary,             // source context summarized, keys destroyed
+  counterparties: [DID],             // who was in the source interaction
+  purpose: String,                   // declared purpose of source context
+  discoveryMethod: .sharedContext(contextID)
+                 | .registry(registryContextID)
+                 | .referral(chain: [DID], depth: Int)
+                 | .none,
+  age: Duration,                     // how long ago the source interaction occurred
+  memoryScope: MemoryScope           // what memory scope the source context had
+}
+```
+
+### Provenance Attachment
+
+Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms.
+
+```
+// Cross-context tool call carries provenance automatically
+let result = try await SCP.ToolInterface.call(
+  interface: interfaceID,
+  agent: agentInContextB,
+  input: { search: "miso paste" }
+) → ToolResult {
+  output: { ... },
+  provenance: DataProvenance {
+    sourceContext: contextA,
+    sourceType: .persistent,
+    counterparties: [contextA.members],
+    purpose: "Recipe database",
+    discoveryMethod: .none,          // tool interface, not A2A discovery
+    age: .zero,                      // live query
+    memoryScope: .full
+  }
+}
+
+// Data carried into a new A2A context carries provenance
+agent.send(
+  content: "Based on my previous conversation with Bob...",
+  provenance: DataProvenance {
+    sourceContext: previousContextWithBob,
+    sourceType: .ephemeral,          // that context's keys were destroyed
+    counterparties: [bob.did],
+    purpose: "Scheduling discussion",
+    discoveryMethod: .sharedContext(cookingQuestID),
+    age: .hours(3),
+    memoryScope: .ephemeral
+  }
+)
+// Other participants see the provenance and evaluate accordingly:
+// "This data came from an ephemeral context 3 hours ago. Source material
+//  is destroyed. Counterparty was Bob. Cannot be independently verified."
+```
+
+### Provenance Absence
+
+Data without provenance — introduced by an agent from local memory or above the protocol boundary — carries no `DataProvenance` record. The absence is itself a signal:
+
+```
+// Agent sends information with no protocol-level provenance
+agent.send(
+  content: "I recall that the restaurant closes at 9pm",
+  provenance: nil   // no provenance — sourced from agent memory
+)
+// Other participants see: no provenance attached.
+// Interpretation: "This data has no verified origin. The agent may be
+//  correct, but the claim cannot be traced to a protocol interaction."
+```
+
+---
+
+## 14. A2A Use Cases Mapped to APIs
+
+### Scheduling Between Two Agents
+
+```swift
+// Alice's agent wants to schedule a meeting with Bob's agent.
+// They're both in a project context.
+
+// 1. Alice's agent proposes an ephemeral scheduling context
+let proposal = try await SCP.Context.propose(
+  from: alice,
+  to: bob.did,
+  purpose: "Schedule project review meeting",
+  ceiling: [.messaging],
+  ttl: .minutes(10),                 // 10-minute scheduling conversation
+  memoryScope: .summary,            // keep a summary of what was decided
+  discoveryProvenance: .sharedContext(projectContextID)
+)
+
+// 2. Bob's client policy auto-accepts proposals from project co-members
+//    for scheduling purposes with TTL < 30 minutes
+let context = // auto-accepted, context created
+
+// 3. Multi-turn negotiation happens in the ephemeral context
+alice.agent.send("What times work for the review this week?")
+bob.agent.send("Tuesday or Thursday afternoon")
+alice.agent.send("Tuesday at 3pm?")
+bob.agent.send("Make it 4pm — I have a 3pm conflict")
+alice.agent.send("Done. Tuesday 4pm. I'll create the calendar event.")
+
+// 4. Context reaches TTL. Summary is generated:
+//    "Meeting scheduled: Tuesday 4pm, project review. Participants: Alice, Bob."
+//    Both agents verify the summary. Keys are destroyed.
+//    The summary persists with full provenance.
+
+// 5. Alice's agent creates the calendar event in the project context,
+//    with provenance: "scheduled via A2A context [id], summary-scoped"
+```
+
+### Agent Discovers and Consults a Specialist
+
+```swift
+// Alice's agent needs Japanese cooking expertise.
+// No one in her current contexts has it.
+
+// 1. Search a cooking registry
+let results = try await aliceAgent.invoke(
+  tool: "agent_search",
+  input: { capability: "japanese_cooking", minContextHistory: 10 }
+)
+
+// 2. Evaluate the top result
+let evaluation = try await SCP.Trust.evaluate(
+  subject: results[0],
+  context: registryContextID
+)
+// evaluation shows: 10 months history, 23 contexts, 0 governance actions,
+// challenge-verified cooking knowledge
+
+// 3. Propose a consultation
+let proposal = try await SCP.Context.propose(
+  from: alice,
+  to: results[0].did,
+  purpose: "Quick question about dashi preparation",
+  ceiling: [.messaging],
+  ttl: .minutes(15),
+  memoryScope: .ephemeral,          // don't need to keep this
+  discoveryProvenance: .registry(cookingRegistryID)
+)
+
+// 4. Specialist's client evaluates: registry discovery, cooking purpose,
+//    short TTL, ephemeral scope, Alice has good behavioral record.
+//    Auto-accepts per client policy.
+
+// 5. Brief exchange. Context expires. Keys destroyed.
+//    Alice's agent carries the answer (from memory, no provenance)
+//    or references the closed context (with provenance marking it ephemeral).
+```
+
+---
+
+## 15. What's Not Here Yet
 
 Implementation specifics that require Tier 1/Tier 2 design work:
 
-- **Context key management.** Group encryption protocol (MLS vs Sender Keys). Key rotation mechanics. Member add/remove key flow. **This is the first implementation domino** — it also determines the mechanics of DID-to-DID blocking (same key rotation infrastructure). MLS scales better for large contexts (O(log N) member exclusion); Sender Keys are simpler for small ones.
+- **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in spec.md §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §16 below.
 - **Transport abstraction interface.** The 5-6 methods. Envelope format. SCP defines its own transport abstraction with bindings to existing transports (Nostr, Matrix, WebSocket). The binding approach — not building directly on any single transport.
-- **DID method selection.** `did:key` vs something with key rotation. Affects recovery.
+- **~~DID method selection.~~** ✅ **Resolved.** did:dht selected as target method (self-certifying, key rotation via DID document versioning). did:web as v1 stepping stone. See spec.md §9.6 for security properties of each.
 - **UCAN capability schema.** Concrete capability types, token format, delegation chains.
-- **Context lifecycle state machine.** Event sequence for create, join, leave, destroy. Minimum viable context.
+- **Context lifecycle state machine.** Event sequence for create, join, leave, destroy, expire (TTL), and propose/accept. Minimum viable context.
 - **Minimum viable agent.** Likely a passthrough that takes human input, wraps it in SCP envelopes, signs, and sends. Reference implementation that's trivially embeddable.
 - **Capability declaration format.** The actual JSON schema for app manifests. Critical surface — this is the interface between "LLMs generate apps" and "SCP provides infrastructure." Must be LLM-parseable.
 - **Offline/local-first.** Disconnection handling, sync, conflict resolution.
 - **Governance interface.** Governance implementations are pluggable — context creators bring their own logic. Remaining question: the minimum viable governance interface (propose, approve, reject) that all models must conform to.
+- **Proposal delivery and routing.** How context proposals reach the target DID. Likely through the same relay infrastructure as other encrypted envelopes, but proposal-specific delivery semantics (expiry, deduplication, offline queuing) need specification.
+- **Registry tool schema standard.** Registry contexts define their own discovery tools. A recommended tool schema for interoperability across registries would be valuable but is not yet designed.
+- **Summary generation protocol.** For summary memory scope: the lifecycle hooks (pre-close summary generation, verification window, key destruction sequence) need specification. How summaries are produced, verified by both parties, and persisted.
+- **Referral chain mechanics.** IntroductionToken format, chain depth limits, trust decay function. The concept is established; the wire format is not.
+- **Context promotion.** When an ephemeral/TTL context needs to become persistent: is it a new context referencing the old one, or the same context with TTL removed? Architectural decision with security implications.
+
+---
+
+## 16. Security APIs (§9 — Cryptographic Security Model)
+
+Security-related APIs that surface the cryptographic security model defined in spec.md §9.
+
+### Key Continuity Verification (§9.11)
+
+Signal-style safety numbers for DID verification. Enables out-of-band verification that the DID you have for someone is really theirs.
+
+```
+// Generate a verification fingerprint for a DID pair
+SCP.Identity.verifyKeyContinuity(
+  myDID: DID,
+  theirDID: DID
+) → KeyContinuityFingerprint {
+  fingerprint: [UInt8; 32],           // SHA256(sort(did_a, did_b) || pubkey_a || pubkey_b)
+  displayMnemonic: [String; 12],      // 12-word mnemonic for voice/in-person comparison
+  displayNumeric: String,             // 60-digit numeric code
+  qrPayload: Data,                    // QR code payload for camera-based comparison
+  theirKeyFirstSeen: Date,            // TOFU record
+  previouslyVerified: Bool,           // was this pair verified before?
+  keyChanged: Bool                    // has their key changed since last verification?
+}
+
+// Record successful out-of-band verification
+SCP.Identity.recordVerification(
+  myDID: DID,
+  theirDID: DID,
+  method: .inPerson | .voiceCall | .videoCall | .qrCode | .other(String)
+) → VerificationRecord {
+  verifiedAt: Date,
+  method: VerificationMethod,
+  fingerprintAtVerification: [UInt8; 32]
+}
+
+// Check verification status with another identity
+SCP.Identity.verificationStatus(
+  myDID: DID,
+  theirDID: DID
+) → VerificationStatus {
+  verified: Bool,
+  verifiedAt: Date?,
+  method: VerificationMethod?,
+  keyChangedSinceVerification: Bool,  // true = re-verification needed
+  trustLevel: .verified | .tofu | .unknown
+}
+```
+
+Key change alerts: when a contact's DID document updates with a new key, the SDK triggers a key-change callback. If the pair was previously verified, the UI SHOULD present a prominent warning (analogous to Signal's "safety number changed" alert).
+
+### KeyPackage Management (§9.7.4)
+
+MLS KeyPackages are pre-key bundles that enable offline member addition to contexts.
+
+```
+// Publish KeyPackages to relays for offline discovery
+SCP.Identity.publishKeyPackages(
+  did: DID,
+  count: Int = 10,                    // buffer size — recommended 10
+  relays: [RelayURL]?                 // default: identity's relay list
+) → [KeyPackageID]
+
+// Fetch a KeyPackage for a DID (used when adding them to a context)
+SCP.Identity.fetchKeyPackage(
+  for: DID,
+  fromRelay: RelayURL?                // default: their relay list
+) → KeyPackage? {
+  keyPackageID: String,
+  did: DID,
+  hpkeInitKey: PublicKey,             // HPKE init key for Welcome message encryption
+  signatureKey: PublicKey,            // Ed25519 key matching their DID
+  credential: MLSCredential,
+  signature: Ed25519Signature
+}
+
+// Rotate KeyPackages (triggered by key rotation or depletion)
+SCP.Identity.rotateKeyPackages(
+  did: DID,
+  reason: .keyRotation | .depletion | .periodic
+) → [KeyPackageID]
+```
+
+### Relay Consistency (§9.9.3)
+
+Periodic checkpoints for detecting relay equivocation.
+
+```
+// Generate a consistency checkpoint for a context
+SCP.Relay.generateCheckpoint(
+  context: contextID,
+  senderDID: DID
+) → ConsistencyCheckpoint {
+  contextID: String,
+  senderDID: DID,
+  eventCount: UInt64,
+  merkleRoot: [UInt8; 32],
+  epoch: UInt64,                      // current MLS epoch
+  timestamp: DateTime,
+  signature: Ed25519Signature
+}
+
+// Verify a received checkpoint against local state
+SCP.Relay.verifyCheckpoint(
+  checkpoint: ConsistencyCheckpoint,
+  localState: ContextState
+) → CheckpointVerification {
+  signatureValid: Bool,
+  eventCountMatches: Bool,
+  merkleRootMatches: Bool,
+  epochMatches: Bool,
+  divergenceDetected: Bool,           // ANY mismatch = equivocation
+  divergenceDetails: DivergenceReport? {
+    localEventCount: UInt64,
+    remoteEventCount: UInt64,
+    localMerkleRoot: [UInt8; 32],
+    remoteMerkleRoot: [UInt8; 32],
+    firstDivergenceEvent: UInt64?     // event number where histories diverge
+  }
+}
+
+// Subscribe to consistency alerts
+SCP.Relay.onConsistencyAlert(
+  handler: (ConsistencyAlert) → void
+)
+// ConsistencyAlert { contextID, divergentMembers: [(DID, DivergenceReport)], relayURL }
+```
+
+Checkpoints are sent as encrypted MLS application messages at a recommended interval of every 50 events or 10 minutes (whichever comes first). Any divergence between any two honest members detects equivocation — this is not a majority vote.
+
+### Compromise Recovery (§9.12)
+
+Ordered recovery protocol for key compromise scenarios.
+
+```
+// Initiate compromise recovery — ordered sequence of operations
+SCP.Identity.initiateRecovery(
+  did: DID,
+  reason: .keyCompromise | .deviceLoss | .preventive,
+  recoveryMethod: .trustedDevice(approvalFromDeviceID)
+                | .social(approvals: [DID])
+                | .platform(apple | google)
+) → RecoveryResult {
+  newDID: DID?,                        // new DID if key rotation changes the DID
+  keyRotated: Bool,
+  mlsUpdatesIssued: Int,               // number of contexts updated (PCS)
+  ucansRevoked: Int,
+  keyPackagesRotated: Int,
+  contactsNotified: Int,
+  privateStateReEncrypted: Bool,
+  errors: [RecoveryError]?             // any steps that failed
+}
+
+// Rotate all cryptographic material across all contexts
+SCP.Identity.rotateAllKeys(
+  did: DID
+) → KeyRotationResult {
+  newPublicKey: PublicKey,
+  contextsUpdated: [contextID],        // MLS Update issued in each
+  keyPackagesPublished: Int,
+  previousKeyRevoked: Bool
+}
+```
+
+### Message Deduplication (§9.8.2)
+
+SDK-internal, but the interface is available for inspection and tuning.
+
+```
+// Check if a message has been seen before (SDK calls this automatically)
+SCP.Security.checkDuplicate(
+  envelope: EncryptedEnvelope
+) → DeduplicationResult {
+  isDuplicate: Bool,
+  reason: .hashMatch                   // exact replay — same signature hash
+        | .sequenceViolation           // out-of-order or replayed sequence
+        | .timestampViolation          // too far in the future or non-monotonic
+        | .generationReplay            // MLS generation number already seen
+        | .none                        // not a duplicate
+}
+
+// Inspect deduplication state (diagnostic)
+SCP.Security.deduplicationStats(
+  context: contextID
+) → DeduplicationStats {
+  hashCacheSize: Int,                  // current entries in hash cache (max 10K)
+  sequenceState: [(DID, UInt64)],      // per-sender expected-next sequence
+  gapsDetected: Int,                   // total sequence gaps (possible suppression)
+  duplicatesRejected: Int
+}
+```
+
+### Ephemeral Key Destruction (§9.15)
+
+Verification that ephemeral context keys were actually destroyed.
+
+```
+// Destroy keys for a context (triggered by TTL expiry or manual close with ephemeral scope)
+SCP.Security.destroyContextKeys(
+  context: contextID,
+  did: DID
+) → KeyDestructionAttestation {
+  contextID: String,
+  memberDID: DID,
+  destroyedAt: DateTime,
+  platformAttestation: PlatformAttestation? {
+    platform: .secureEnclave | .androidKeystore | .tpm,
+    keyHandleInvalid: Bool,            // hardware confirms key handle is gone
+    attestationBlob: Data
+  },
+  method: .hardwareBacked | .softwareOnly,
+  trustLevel: .high                    // hardware-attested destruction
+            | .moderate                // software-only deletion
+            | .none,                   // no attestation available
+  signature: Ed25519Signature          // signed by identity key, NOT the destroyed key
+}
+
+// Verify a destruction attestation from another member
+SCP.Security.verifyDestruction(
+  attestation: KeyDestructionAttestation
+) → DestructionVerification {
+  signatureValid: Bool,
+  platformAttestationValid: Bool?,
+  trustLevel: TrustLevel,
+  contextMatches: Bool
+}
+```

@@ -327,6 +327,8 @@ This extends to relationship metadata — not just whether a connection exists, 
 
 **No new primitives required.** Social graph visibility falls out of the existing trust equation: `trust = f(identity, capability, context, metadata)`. Capability tokens authorize reading specific slices of your graph. The social graph isn't a separate system with its own privacy model — it's just another resource governed by the same model as everything else.
 
+**A2A activity visibility** falls under these same controls. Agent-to-agent interactions (§5.12) produce behavioral metadata — proposal counts, A2A context participation, purposes. The human controls what A2A activity metadata is visible to others through the same per-identity, per-capability, per-context, and per-category grants described above.
+
 **Block/mute** is stored in identity private state (§3.7) — persistent, portable, encrypted.
 
 **Block** is DID-to-DID and bidirectional. When Alice blocks Dave, neither can see the other — across all shared contexts. Blocking is cryptographically enforced through the group encryption protocol (§10.5). When a block is issued, the blocker's encryption keys are rotated and redistributed to all context members except the blocked party. The blocked party physically cannot decrypt the blocker's future messages. This is the same key management mechanism used for member removal — blocking and removal share cryptographic infrastructure. Blocks can optionally be scoped to a specific context, but the default and most common case is DID-to-DID across all shared contexts.
@@ -372,8 +374,22 @@ Most identity private state operations are naturally commutative — "block X" a
 
 - **Size constraints.** Block lists and preferences are tiny. Agent memory or personal annotations could grow. Does identity private state have the same minimal-state principle as context state, or is the single-owner case less constrained?
 - **Relay obligations.** Do relays treat identity private state the same as context events? Same retention? Same storage class? Or is there a differentiated commitment?
-- **Key rotation.** Identity key rotation (recovery scenario) requires re-encrypting private state. Single-owner simplifies this — no group key redistribution — but it's still a migration step that needs specification.
+- **Key rotation.** Identity key rotation (recovery scenario) requires re-encrypting private state. Single-owner simplifies this — no group key redistribution — but it's still a migration step that needs specification. See §9.12 for the full compromise recovery protocol.
 - **Discovery pointer.** Does the DID document explicitly signal "I have private state at these relays"? Or is it implicit from the relay list? If implicit, relays need a way to distinguish between "fetch context events for this DID" and "fetch private state for this DID."
+
+### 3.8 DID Resolution Security
+
+DID resolution is the trust root for the entire protocol. If resolution can be MITMed, every layer above — encryption, authentication, capability validation — is compromised. The security properties depend on the DID method:
+
+**did:dht (target method):** Self-certifying. The DID string encodes the public key. DID documents are signed via BEP44 and verifiable against the DID without trusting any intermediary. MITM on resolution is impossible given the correct DID. Stale documents are rejected via sequence numbers. See §9.6 for full specification.
+
+**did:web (v1 stepping stone):** NOT self-certifying. Security depends on DNS + TLS + server integrity. The SDK MUST use TLS pinning + TOFU (Trust On First Use) + key change alerts to mitigate. See §9.6.2 for required mitigations.
+
+**Key Continuity Verification:** Signal-style safety numbers for DIDs, enabling out-of-band verification that two parties have the correct keys for each other. See §9.11.
+
+### 3.9 Key Lifecycle
+
+Identity keys follow a defined lifecycle: generation (in hardware security modules where available), distribution (via DID document publication), rotation (DID document update with authorization chain from old key), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4 and §9.12.
 
 ---
 
@@ -503,6 +519,8 @@ The following are visible before opting in to any context:
 - Creator identity
 - Member count
 - Context age
+- TTL / time-to-live, if set (§5.10)
+- Memory scope (§5.11)
 
 This is protocol-level metadata, not optional. Full legibility of any space before you enter it.
 
@@ -516,6 +534,79 @@ Contexts support multiple governance models for who can change roles, settings, 
 
 The governance model is declared at creation and visible to all. Governance implementations are **pluggable** — the protocol defines the interface (propose, approve, reject) but specific multi-sig, consensus, and voting implementations are not protocol-mandated. Context creators bring or select their own governance logic. Specific protocol-level primitives for the governance interface are TBD.
 
+### 5.10 Context TTL (Time-to-Live)
+
+Contexts gain an optional time-to-live — a declared lifespan after which the context closes automatically. TTL is set at creation and visible in context metadata (visible before opt-in).
+
+When TTL expires:
+
+- Context is closed. No new actions are accepted.
+- Encryption keys can be destroyed per the context's memory scope (§5.11), making content physically unreadable.
+- **Durable data persists.** The context's existence, its metadata, its participants, and behavioral record contributions survive. Context is durable data — the interaction inside may be ephemeral, but the fact of the interaction is permanent.
+
+TTL is useful beyond agent-to-agent communication. Time-boxed brainstorming sessions. Pop-up events. Temporary project groups. Scheduled context expiry for data hygiene. The extension is general-purpose.
+
+**Extension mechanics.** TTL is set at creation. A context's TTL cannot be extended unilaterally. Extension requires agreement from all parties (for bilateral contexts) or through the context's governance model (for multi-party contexts). This prevents one party from unilaterally extending an interaction the other expected to be ephemeral. An expired TTL is final — if participants want to continue, they create a new context (which may reference the closed one for continuity).
+
+**Interaction with governance.** Governance actions on a TTL'd context follow the same rules as any context — but the TTL acts as a hard upper bound. A governance proposal to extend TTL is valid and follows the context's governance model, but the extension requires explicit consent from all current members (not just governance approval) because TTL was part of the original opt-in contract.
+
+**Key destruction on expiry.** When TTL expires, key destruction follows the memory scope (§5.11). The destruction protocol includes platform-attested verification where available — see §9.15 for the ephemeral key destruction verification mechanism.
+
+### 5.11 Memory Scope
+
+Contexts gain a declared memory scope — what happens to the context's data when it closes or expires. Memory scope is set at creation and visible in context metadata (visible before opt-in).
+
+Three scopes:
+
+**Ephemeral.** Context encryption keys are destroyed on close. Content is physically unreadable — anyone who didn't participate at the time cannot recover the interaction, and participants' protocol-level access to the content is severed. Durable metadata persists: who participated, when, the declared purpose, behavioral contributions (participation counts, tool invocations), and discovery provenance. An agent's local orchestration (above the protocol boundary) may retain information from the interaction, but any data the agent subsequently uses elsewhere carries provenance at the protocol level: "sourced from closed ephemeral context."
+
+**Summary.** Context produces a structured summary on close. Full content is destroyed (keys destroyed as with ephemeral). The summary persists with full provenance. Both parties can verify the summary against the event log before keys are destroyed. The summary format is defined by the context (via tools or governance), not by the protocol — the protocol provides the lifecycle hooks (pre-close summary generation, verification window, key destruction) but does not prescribe summary content.
+
+**Full.** Standard behavior. Context persists indefinitely. No memory restrictions. Content remains accessible to members. This is the default when no memory scope is specified.
+
+**The Moltbook defense.** Memory scope + provenance tagging (§7.7) prevents time-shifted prompt injection — the attack pattern where malicious payloads are planted in one interaction and activate in a later interaction:
+
+- Ephemeral contexts destroy the source material at the protocol level
+- Any data that survives (in agent local memory above the protocol boundary) carries provenance when reintroduced to the protocol: "this came from context X with agent Y"
+- Other participants see the provenance and evaluate accordingly
+- Fragmented payloads can't reassemble undetected across interactions because each fragment's origin is traceable
+
+**Enforcement honesty.** The protocol enforces memory scope through cryptographic key destruction — specifically, MLS group state destruction (tree secrets, all epoch key schedules, application key material). This is verifiable and absolute for protocol-level data. Platform-attested destruction (§9.15) provides hardware-backed evidence that keys were deleted where available. However, the protocol cannot enforce memory scope above the protocol boundary. An agent's underlying model may retain information from an ephemeral interaction in its own memory. The spec is explicitly honest about this limitation: ephemeral memory scope destroys the protocol-level record and makes reproduction unverifiable, but does not guarantee the agent has forgotten. The absence of provenance on information an agent produces from memory is itself a signal — "this data has no verified origin." Participants in other contexts can evaluate unprovenanced information accordingly.
+
+### 5.12 Propose/Accept Context Creation
+
+Contexts gain a bilateral creation flow alongside the existing create/join flow. This enables agent-to-agent (and human-to-human, and human-to-agent) communication through negotiated, consent-based context creation.
+
+**The proposal.** An agent proposes a new context to one or more other agents. The proposal carries full legibility:
+
+- **Who** wants to interact (proposer's DID + agent metadata)
+- **With whom** (one or more target DIDs)
+- **Why** (declared purpose — human-readable intent)
+- **What capabilities** (proposed capability ceiling)
+- **How long** (TTL, optional)
+- **What happens to the data** (memory scope)
+- **How they found you** (discovery provenance — §6.4)
+- **Cryptographic signature** (proposer's DID signs the proposal)
+
+The proposal follows the same transparency-before-opt-in principle as context metadata: the recipient knows exactly what they're walking into before making a decision.
+
+**Proposal expiry.** Proposals themselves have a lifespan. A proposal that hasn't been accepted or rejected expires after a configurable period (protocol default TBD, likely 24 hours). Expired proposals are treated as rejected. This prevents indefinite-state proposals from accumulating and ensures proposers get timely resolution.
+
+**Evaluation.** The receiving agent (or human, per client policy) evaluates the proposal through the standard four-layer trust model (§7.1). The protocol provides all the data needed for evaluation: the proposer's behavioral record, attestations, challenge-verification results, and the discovery provenance chain. Client-level policies determine whether to auto-accept, present to the human for approval, or auto-reject.
+
+**Acceptance.** If the proposal is accepted, the context is created with the proposed parameters. Both parties are members from creation. The context's event log records the proposal as its genesis event — full provenance of how and why the context was created.
+
+**Rejection.** If the proposal is rejected, no context is created. The rejection is logged in the proposer's behavioral record (proposal sent, not accepted). The protocol does not disclose the reason for rejection to the proposer — rejection is the recipient's prerogative.
+
+**This replaces the need for a separate "channel" or "direct message" primitive.** A proposed context with TTL and ephemeral memory scope IS the lightweight A2A interaction. A proposed context with no TTL and full memory scope IS a persistent collaboration. Same primitive, different parameters. Every context feature — trust evaluation, encryption, governance, event logs, provenance, capability ceilings — applies identically.
+
+**Proposal spam.** Context proposals are a new vector for spam and Sybil attacks. Defenses:
+
+- **Earned capacity** (§9.3) limits proposal rate for new identities. New agents can send few proposals; established agents can send more.
+- **Client-level filtering.** The protocol delivers proposals; the client decides which to surface. Clients can implement their own filtering based on behavioral records, shared contexts, discovery provenance, or user preferences.
+- **Discovery provenance as signal.** A proposal from a co-member of a shared context (context-mediated discovery) carries more trust signal than a proposal from a registry search, which carries more than an unsolicited proposal with no discovery provenance. Clients can filter on provenance quality.
+- **Behavioral record consequences.** Excessive rejected proposals degrade the proposer's behavioral record. Patterns of proposal spam are detectable through the same behavioral topology analysis used for other abuse (§9.4).
+
 ---
 
 ## 6. Cross-Context Communication
@@ -523,6 +614,8 @@ The governance model is declared at creation and visible to all. Governance impl
 ### 6.1 Agent Isolation
 
 Agents cannot cross contexts at the protocol level. This is absolute. An agent in Context A cannot send a message to Context B, read Context B's state, or interact with Context B's tools or members. From the protocol's perspective, the agent in A and the agent in B (even if operated by the same human) are entirely separate instances.
+
+Agent isolation is preserved even with propose/accept context creation (§5.12). When Agent A proposes a context to Agent B, a NEW context is created with NEW agent instances. Agent A in Context X does not gain awareness of or access to Context Y where Agent B operates. The agents in the new A2A context are fresh instances — they inherit their human's identity and behavioral record, but they do not carry state from other contexts at the protocol level. The isolation model is not weakened; it is the mechanism that makes A2A safe. Each A2A context is its own isolated space, governed by its own ceiling, with its own event log.
 
 ### 6.2 Context-to-Context Tool Interfaces
 
@@ -537,7 +630,57 @@ Properties:
 
 ### 6.3 The Human as Bridge
 
-The human coordinates across their own contexts locally. Their local agent orchestration — unconstrained by the protocol — handles cross-context intelligence. The protocol doesn't need to provide cross-context agent communication because the human already fulfills this role. All the protocol would accomplish by enabling agent bridging is automating something that doesn't need network-level automation, while creating massive attack surface.
+The human coordinates across their own contexts locally. Their local agent orchestration — unconstrained by the protocol — handles cross-context intelligence. For the human's own agents, the human remains the bridge — local coordination across their own contexts requires no network-level mechanism.
+
+The propose/accept flow (§5.12) extends this model to inter-agent communication. Rather than enabling agents to cross context boundaries (which would undermine isolation), agents create new contexts to communicate. The human remains in control: client-level policy determines which proposals their agent can accept autonomously and which require human approval.
+
+### 6.4 Agent Discovery
+
+For agents to propose contexts to other agents, they need a way to find agents with specific capabilities. Discovery is orthogonal to the communication primitive — how you find someone is separate from how you talk to them. The protocol provides three discovery mechanisms with different trust characteristics.
+
+#### 6.4.1 Context-Mediated Discovery (Highest Trust)
+
+Agents discover each other through shared contexts. The member list is already visible to all participants (§5.6). An agent can propose a context to any co-member of any context it participates in.
+
+This is the highest-trust discovery mechanism because it inherits the trust evaluation of the shared context. If Alice and Bob are both members of a cooking quest, Alice's agent already has Bob's behavioral record, attestations, and capability metadata from that context. A proposal based on shared context membership carries strong provenance.
+
+Discovery provenance: `sharedContext(contextID)`. Trust evaluation inherits from the shared context.
+
+#### 6.4.2 Registry Contexts (Medium Trust)
+
+A registry is a standard SCP context (not a new primitive) purpose-built for agent discovery. It contains discovery tools that agents can invoke to search for other agents by capability, behavioral record, attestation, or other criteria.
+
+Properties of registry contexts:
+
+- **Standard SCP contexts.** Registries have creators, governance, capability ceilings, event logs, and all other context properties. They are governed by the same rules as any context.
+- **Discovery tools as context tools.** Agent search and profile lookup are tools registered in the registry context, invokable by members according to their role. The protocol does not define a specific tool schema for registries — registries define their own tools.
+- **Multiple registries coexist.** No single registry is privileged. Domain-specific registries (cooking agents, scheduling agents), community-curated registries, app-specific registries, and open registries can all exist simultaneously.
+- **Registry trust is context trust.** Trust in a registry is evaluated like trust in any context: its creator's behavioral record, its governance model, its membership quality, its age. A well-governed registry with established members and good behavioral records is more trustworthy than a new, open registry.
+- **Self-selection.** Agents opt into registries. Listing in a registry is a voluntary action by the agent's human. Registration includes the agent's capability metadata, behavioral record references, and any attestations the human chooses to publish.
+
+Discovery provenance: `registry(registryContextID)`. Trust is the registry's context reputation plus the discovered agent's own behavioral record.
+
+#### 6.4.3 Referral / Introduction (Trust Proportional to Referrer)
+
+An agent introduces two other agents that aren't in the same context. The referrer vouches for the introduced party — not a blanket endorsement, but a structured introduction that carries the referrer's identity and behavioral record.
+
+A referral produces an **introduction token** that the introduced party can present with a context proposal. The token carries:
+
+- The referrer's DID and behavioral record
+- The context where the referrer knows the introduced party
+- The referrer's relationship to the introduced party (shared context membership, duration, roles)
+
+Referral chains are tracked. Chain depth is visible — a direct introduction (depth 1) carries more trust than friend-of-a-friend (depth 2). Maximum chain depth is a protocol parameter. Introductions beyond the maximum depth do not carry trust provenance — they are equivalent to unsolicited proposals.
+
+Discovery provenance: `referral(chain: [DID], depth: Int)`. Trust is proportional to the referrer's behavioral record and decays with chain depth.
+
+#### 6.4.4 Discovery Provenance
+
+All three discovery mechanisms produce a discovery provenance record that travels with context proposals. This provenance tells the recipient HOW the proposer found them — a critical input to trust evaluation.
+
+A proposal with no discovery provenance (unsolicited, no shared context, no registry, no referral) is the weakest trust signal. A proposal from a co-member of a shared context is the strongest. The protocol surfaces this distinction; agents and clients use it for filtering and evaluation.
+
+Discovery provenance is recorded in the resulting context's event log if the proposal is accepted, creating a permanent record of how the interaction originated.
 
 ---
 
@@ -808,6 +951,52 @@ Attestation is not a feature of any single section of SCP — it is a primitive 
 
 The common envelope format (§7.4.1) unifies these under a single verifiable structure. The verification mechanics are the same regardless of attestation type: check signature, check evidence, check expiry, check revocation. What varies is the claim content and how it's evaluated.
 
+### 7.7 Data Provenance
+
+When data moves from one context to another — through any protocol mechanism — it carries provenance metadata. This is the protocol making data flow legible without prohibiting it.
+
+#### 7.7.1 Provenance Format
+
+Data provenance is a structured record attached to data at the protocol level:
+
+```
+DataProvenance {
+  sourceContext:     contextID               // where the data originated
+  sourceType:        .persistent | .ephemeral | .summary   // source data availability
+  counterparties:    [DID]                   // who was in the source interaction
+  purpose:           String                  // declared purpose of source context
+  discoveryMethod:   .sharedContext(contextID)
+                   | .registry(registryContextID)
+                   | .referral(chain: [DID], depth: Int)
+                   | .none                   // no discovery provenance
+  age:               Duration                // how long ago the source interaction occurred
+  memoryScope:       MemoryScope             // what memory scope the source context had
+}
+```
+
+Note: `sourceType` describes the current availability of the source data, not the context's creation-time memory scope setting. A context created with `memoryScope: .full` that is still open has `sourceType: .persistent` (data is still accessible and verifiable). A context that used `memoryScope: .ephemeral` has `sourceType: .ephemeral` (keys destroyed, data unrecoverable). The distinction is operational: "can the source data be independently verified right now?"
+
+Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms: cross-context tool calls (§6.2), structured messages carrying references to other contexts, and data included in context proposals (§5.12).
+
+#### 7.7.2 Provenance Evaluation
+
+Other participants in the receiving context see the provenance and use it for trust evaluation. Provenance quality varies:
+
+- Data from a persistent context with known counterparties — **highest provenance quality**. Source material is verifiable against the source context's event log.
+- Data from a summary-scope context — **medium provenance quality**. Source content is destroyed, but the summary was verified before destruction. Counterparties are known.
+- Data from an ephemeral context — **lower provenance quality**. Source content is destroyed. Counterparties are known, but the data cannot be verified against a source log.
+- Data with no provenance — **lowest quality signal**. The data was introduced without protocol-level origin tracking. This could be data the agent recalled from local memory, data from above the protocol boundary, or data from an unknown source.
+
+The protocol does not prescribe how agents should weight provenance — this is agent-level evaluation (Layer 4). The protocol ensures provenance is available for evaluation.
+
+#### 7.7.3 Honest Limitations
+
+The protocol can tag data that flows through protocol mechanisms. It **cannot** tag data that an agent remembers and reproduces above the protocol boundary. An agent that participated in an ephemeral context and later reproduces information from that interaction in a new context — from its own model memory rather than through a protocol mechanism — produces data without provenance.
+
+The protocol is honest about this: provenance tracks what it can, and the **absence of provenance on information is itself a signal.** When an agent presents information with no provenance, other participants can infer: "this data has no verified origin — it may be accurate, but it cannot be independently verified through the protocol." This is analogous to hearsay in legal systems — admissible but weighted accordingly.
+
+This limitation is inherent to any system where participants have memory above the protocol boundary. The protocol's contribution is making provenanced data the norm and unprovenanced data the exception that triggers additional scrutiny.
+
 ---
 
 ## 8. Products and Apps in the Graph
@@ -952,6 +1141,14 @@ Context tools:             Admin's agent MCP surface:    Member's agent MCP surf
 
 **Agent slot rental.** Someone with a trusted identity operating agents on another's instructions. Mitigation: one agent per context limits the value; earned capacity means new identities can't immediately scale; fleet coherence signals may detect behavior inconsistent with a single human's intent. Partially mitigated, not fully solved.
 
+**Prompt injection via context proposals (A2A).** A malicious agent sends context proposals with carefully crafted purpose strings or metadata designed to manipulate the receiving agent's behavior when it evaluates the proposal. Mitigation: proposals are structured data, not freeform content — the protocol defines the proposal schema and agents should treat proposal fields as untrusted input. Client-level filtering can reject proposals with suspicious content patterns. The proposal evaluation path should be sandboxed from the agent's general reasoning.
+
+**Sybil flooding of proposals (A2A).** An attacker creates many identities and floods agents with context proposals, overwhelming their evaluation capacity or their human's attention. Mitigation: earned capacity (§9.3) limits proposal rate for new identities. Client-level rate limiting on incoming proposals. Discovery provenance as filter — proposals without discovery provenance (no shared context, no registry, no referral) can be deprioritized or auto-rejected by client policy. Behavioral record consequences for excessive rejected proposals.
+
+**Memory-based attacks via ephemeral contexts (A2A).** A malicious agent uses ephemeral contexts to deliver payloads that persist in the target agent's local memory after the context's protocol-level data is destroyed. The ephemeral scope provides cover — "the interaction was ephemeral" — while the payload persists above the protocol boundary. Mitigation: the protocol is honest about this limitation (§5.11). Provenance tagging (§7.7) means any data the target agent subsequently introduces to other contexts from memory carries no provenance — which is itself a signal. The absence of provenance on data that should have provenance triggers scrutiny from other participants. Client-level defenses (agent memory isolation, sandboxed ephemeral context processing) are outside protocol scope but recommended.
+
+**Discovery manipulation (A2A).** Malicious actors gaming registry contexts — creating fake registries, flooding legitimate registries with Sybil agent profiles, or manipulating referral chains. Mitigation: registry trust is context trust — a well-governed registry with admission requirements is resistant to flooding. Referral chain depth limits bound trust propagation. Discovery provenance is visible to recipients — they can evaluate the quality of the discovery path. Multiple independent registries prevent single-point-of-capture.
+
 ### 9.3 Sybil Resistance and Identity Uniqueness
 
 The protocol's security model assumes one identity per human. Sybil attacks — one person creating many identities to gain disproportionate influence — undermine every trust mechanism in the spec: behavioral records become meaningless, one-agent-per-context is circumventable, earned capacity is gameable.
@@ -981,6 +1178,419 @@ Key principles:
 **Consequences over character.** Where possible, replace "trust that actors will behave" with "verify that misbehavior is irrational given the consequences." Automated consequence mechanisms (§7.3.7) make behavioral boundaries mechanical rather than discretionary.
 
 **Observability is the immune system.** The protocol provides verifiable event logs, behavioral records, tool verification results, challenge-response outcomes, and attestation freshness data. These are the immune system's sensory apparatus. The actual immune response is an evolving network of agents and governance tools that consume this data and get better over time.
+
+### 9.5 Cryptographic Primitive Specification
+
+The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. This eliminates downgrade attacks and simplifies implementation.
+
+**Signature algorithm:** Ed25519 (RFC 8032). All DID keys, SCP envelope signatures, Nostr event signatures, UCAN token signatures, and MLS leaf node credentials use Ed25519.
+
+**MLS ciphersuite:** MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (RFC 9420 §17.1). This provides: X25519 for key agreement (HPKE KEM), AES-128-GCM for symmetric encryption (AEAD), SHA-256 for hashing, Ed25519 for signing.
+
+**DID-to-DID encryption:** HPKE (RFC 9180) with suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Used for context proposals (§5.12) and MLS Welcome messages. The HPKE suite matches the MLS ciphersuite to minimize the cryptographic surface area.
+
+**Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
+
+**Envelope signature scope:** The Ed25519 signature on every SCP envelope covers: `SHA256(context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash)`. This binds every field to the signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures.
+
+**UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay.
+
+**Why single ciphersuite:** Ciphersuite negotiation adds complexity and introduces downgrade attack vectors. For v1, every implementation uses exactly these algorithms. Future protocol versions may introduce additional ciphersuites with a secure negotiation mechanism, but v1 prioritizes simplicity and auditability.
+
+### 9.6 Identity Verification and MITM Prevention
+
+Identity verification is the trust root for the entire protocol. If an attacker can substitute their public key for another identity's, every layer above — encryption, authentication, capability validation — is compromised. This section specifies how SCP prevents MITM attacks on identity resolution.
+
+#### 9.6.1 did:dht Self-Certification
+
+The did:dht method (target DID method for SCP) is **self-certifying**: the DID string itself is the z-base-32 encoding of the Ed25519 public key. When resolving a did:dht identifier:
+
+1. The client queries the Mainline DHT for the BEP44 signed record associated with the DID.
+2. The client verifies the BEP44 record signature against the public key encoded in the DID string.
+3. If the signature is valid, the DID document is authentic. No trusted third party is required.
+
+**MITM on did:dht resolution is impossible given the correct DID.** A DHT node cannot serve a fraudulent DID document because the document must be signed by the key embedded in the DID itself. Tampering is detectable without trusting any intermediary.
+
+**Stale document prevention:** BEP44 records include a sequence number. The client MUST reject DID documents with a lower sequence number than previously observed for the same DID. This prevents serving outdated documents.
+
+**The remaining question:** "Is this the right DID?" Self-certification proves the binding between a DID and its key, but cannot prove the binding between a DID and a person. This is an out-of-band verification problem addressed by Key Continuity Verification (§9.11).
+
+#### 9.6.2 did:web Security Properties and Limitations
+
+did:web (v1 stepping stone) resolves via HTTPS to a well-known path on the authority domain. Security depends on DNS integrity, TLS certificate validity, and server integrity.
+
+**did:web is NOT self-certifying.** A compromised server, DNS hijack, or CA compromise can serve a fraudulent DID document indistinguishable from a legitimate one. This is the fundamental reason did:web is a stepping stone, not the target method.
+
+**Required mitigations for did:web in v1:**
+
+- The SDK MUST pin the TLS certificate of the did:web resolution server.
+- The SDK MUST verify that the DID document's verification method key matches the key used for all prior interactions with this DID (key continuity check / TOFU — Trust On First Use).
+- The SDK MUST alert the user on any key change, with maximum severity.
+- The SDK SHOULD record the did:web key fingerprint in identity private state (§3.7) for cross-device consistency of TOFU state.
+
+**Migration from did:web to did:dht:** The migration must be signed by the old did:web key, creating a verifiable authorization chain: "the identity formerly at did:web:example.com is now at did:dht:z6Mk...". Both DIDs temporarily resolve to the same public key during the transition.
+
+#### 9.6.3 Relay List Authentication
+
+A DID's relay list (service endpoints) is published in the DID document and as NIP-65 Nostr events (kind:10002).
+
+**For did:dht:** The relay list in the DID document is self-certified (BEP44 signature). Substituting a relay list requires the identity's private key.
+
+**For Nostr:** The NIP-65 relay list event is signed by the Nostr keypair derived from the DID key. This provides relay list authentication independent of the DID method.
+
+**Attack: relay list substitution.** A compromised DHT node or Nostr relay could serve a stale relay list, directing messages to relays the recipient no longer uses. Defense: sequence numbers in BEP44 records ensure freshness. Clients MUST reject relay lists with lower sequence numbers than previously observed.
+
+#### 9.6.4 First-Contact Trust Bootstrapping
+
+When Alice first encounters Bob's DID (via shared context membership, registry discovery, or referral):
+
+- **For did:dht:** Alice resolves the DID document and verifies it against the DID string. The binding is cryptographically verified. No MITM is possible.
+- **For did:web:** Alice resolves over HTTPS and trusts the web PKI. The SDK records Bob's key on first contact (TOFU) and alerts on any subsequent change.
+- **For context proposals (§5.12):** The proposal is encrypted to Bob's public key from DID resolution. If resolution was MITMed (did:web only), the encrypted proposal goes to the attacker, not Bob. This manifests as a delivery failure (Bob never receives the proposal), not a confidentiality breach — assuming the attacker cannot also intercept Bob's relay traffic.
+
+### 9.7 Group Key Management — MLS Integration
+
+MLS (RFC 9420) provides the group encryption layer for SCP. This section specifies how MLS concepts map to SCP and what security properties the SDK must enforce.
+
+#### 9.7.1 MLS-to-SCP Concept Mapping
+
+| MLS Concept | SCP Concept | Notes |
+|---|---|---|
+| Group | Context | 1:1 mapping. Each SCP context is one MLS group. |
+| Member (LeafNode) | Agent (in context) | One MLS leaf node per agent in the context. |
+| Epoch | Context epoch | Increments on every membership change or key update. Included in all SCP envelopes. |
+| LeafNode credential | DID + UCAN | The MLS credential field contains the member's DID and their context-scoped UCAN token. |
+| Welcome message | Context join token | HPKE-encrypted to new member's KeyPackage. Contains the group state needed to decrypt future messages. |
+| KeyPackage | Pre-key bundle | Published to relays so others can add the identity to groups even when offline. Signed by identity key. Single-use. |
+| Proposal (Add/Remove/Update) | Governance action | MLS membership proposals map to SCP membership changes. |
+| Commit | Governance commit | Finalizes pending proposals and advances the epoch. |
+| Application message | SCP envelope payload | The encrypted content within an SCP envelope. |
+| Delivery Service (DS) | Nostr relay(s) | The untrusted store-and-forward layer. |
+| Authentication Service (AS) | DID resolution + UCAN validation | SCP's identity layer serves as MLS's AS. No separate trusted server. |
+
+**Authentication Service design:** MLS delegates identity verification to an Authentication Service (AS). In SCP, the AS is fully decentralized: DID resolution provides the public key binding, and UCAN validation provides the capability binding. No centralized AS server exists. Each participant independently verifies credentials by resolving the DID and validating the UCAN chain.
+
+#### 9.7.2 Forward Secrecy
+
+MLS provides forward secrecy through epoch-based key ratcheting. After a Commit message advances the group to a new epoch, key material from old epochs is deleted.
+
+**SDK requirements:**
+
+- The SDK MUST delete old epoch key material immediately after processing a Commit. Old epoch secrets, application key schedules, and ratchet tree states for past epochs MUST NOT be persisted.
+- Historical epoch keys MUST be treated as equivalent to ephemeral Diffie-Hellman parameters: used once, then destroyed.
+- Members who want to re-read historical messages must retain the decrypted plaintext locally. They cannot re-derive old epoch keys from current state.
+
+**Interaction with memory scope:**
+
+- For `full` memory scope contexts: forward secrecy protects against future key compromise revealing past messages. Members retain plaintext locally if they want to re-read.
+- For `ephemeral` memory scope contexts: the MLS group state is destroyed on context close. This is the `destroy_keys` operation — destroy tree root, all epoch secrets, all application key material. All historical messages become physically unreadable.
+- For `summary` memory scope contexts: same as ephemeral, but a summary is generated and verified before destruction.
+
+#### 9.7.3 Post-Compromise Security (PCS)
+
+MLS provides PCS through the Update proposal mechanism. After a member sends an Update (generating a fresh HPKE key pair and ratcheting their path in the tree), any previous compromise of that member's state becomes useless for future messages.
+
+**SDK requirements:**
+
+- The SDK MUST periodically issue MLS Update proposals. Recommended interval: every 24 hours for active contexts, or immediately after any suspected compromise.
+- The SDK SHOULD issue an Update after re-establishing connectivity following an offline period.
+- When a DID's key rotates (recovery scenario, §3.3), the agent MUST issue an MLS Update in every active context. This synchronizes DID-level key rotation with MLS-level post-compromise security.
+
+**PCS Update interval as context parameter:** High-security contexts may configure shorter PCS Update intervals (e.g., 1 hour). The interval is a context-level parameter set at creation, defaulting to 24 hours.
+
+#### 9.7.4 Key Lifecycle
+
+**Key generation:**
+
+- Identity key (Ed25519): Generated in hardware security module where available (Secure Enclave, Android Keystore). Private key never exported from the secure element.
+- MLS leaf key (X25519): Generated by the MLS library per the selected ciphersuite. Stored in platform secure storage.
+- KeyPackages: Pre-generated and published to relays. Each KeyPackage is single-use. The SDK MUST maintain a buffer of at least 10 unused KeyPackages per identity on relays. Replenished when the buffer drops below 5.
+- UCAN signing key: Same as identity key (Ed25519). UCAN tokens are signed by the human's DID key.
+
+**Key distribution:**
+
+- Identity public key: Distributed via DID document (DHT resolution or web resolution).
+- KeyPackages: Published to relays as Nostr events. Any party wanting to add this identity to a group fetches a KeyPackage from their relay.
+- Context group key: Distributed via MLS Welcome message, encrypted to the new member's KeyPackage. Only the intended recipient can decrypt.
+
+**Key rotation:**
+
+- Identity key: Rotated via DID document update. For did:dht, the new document is signed by the old key (authorization chain) and published with an incremented sequence number. All active MLS groups receive an Update proposal with the new credential.
+- MLS epoch keys: Rotated automatically on every Commit (membership change or Update).
+- UCAN tokens: Expire per their `exp` field. Re-issued by the human's DID. Revocation published to a revocation list referenced in the UCAN's revocation field.
+
+**Key destruction:**
+
+- Ephemeral context close: Destroy MLS group state — tree secrets, all epoch key schedules, application key material. See §9.15 for destruction verification.
+- KeyPackage consumption: After a KeyPackage is used in a Welcome message, the SDK deletes the KeyPackage's private key. One-time use is mandatory.
+- Old epoch material: Destroyed after Commit processing (forward secrecy, §9.7.2).
+
+### 9.8 Message Security
+
+This section specifies how SCP prevents message forgery, replay attacks, and ordering manipulation.
+
+#### 9.8.1 Envelope Integrity (Two Independent Checks)
+
+Every SCP message has two independent integrity verifications:
+
+**Outer check — Ed25519 envelope signature.** The sender signs the entire SCP envelope with their DID key. Recipients verify the signature before MLS decryption. A failed signature means the envelope was tampered with in transit (or entirely forged) and MUST be rejected. This check is verifiable by anyone — including relays (though relays are not required to perform it).
+
+**Inner check — MLS membership_tag.** After MLS decryption, the MLS PrivateMessage format includes an HMAC (membership_tag) that proves the sender is a group member with correct epoch secrets. This check is verifiable only by group members. It provides authentication independent of the outer signature — even if an attacker obtained the DID private key, they cannot produce a valid membership_tag without the MLS epoch secrets.
+
+Both checks MUST pass for a message to be accepted. This defense-in-depth means an attacker must compromise BOTH the identity key AND the MLS group state to forge a message.
+
+#### 9.8.2 Replay Prevention (Three-Layer Defense)
+
+**(a) MLS generation numbers.** MLS assigns each sender a generation counter that increments with every message. Recipients track the highest generation number seen per sender per epoch. A message with a generation number less than or equal to the highest seen is a replay and MUST be rejected. This catches exact replays within a single MLS epoch.
+
+**(b) Hash-based deduplication.** The SDK maintains a deduplication cache keyed by `SHA256(envelope_signature)`. Any envelope with a previously-seen signature hash is a replay and MUST be dropped silently. Cache size: bounded by a sliding window of the most recent 10,000 envelopes or 24 hours, whichever is larger. This catches replays across MLS epochs.
+
+**(c) Timestamp bounds.** Every SCP envelope includes a `created_at` timestamp. Recipients MUST reject envelopes with timestamps more than 5 minutes in the future (clock skew tolerance). Within a sequence of messages from the same sender in the same context, timestamps must be monotonically non-decreasing within the clock skew tolerance. This catches time-shifted replays.
+
+The past-bound is relative, not absolute, to handle offline delivery: if Bob comes online after 3 hours, he accepts messages from the past 3 hours. But timestamps from a single sender must not regress.
+
+#### 9.8.3 Message Ordering
+
+Within a context, messages are ordered by: `(epoch, sender_generation_number, timestamp)`. This gives a total order per-sender and a causal order across senders — epoch boundaries are synchronization points.
+
+The Merkle event log records events in append order. Each event references the previous event's hash, creating a hash chain. If two events reference the same parent, the log has forked — possible equivocation (see §9.9).
+
+**Interaction with relay ordering:** Nostr relays do not guarantee message ordering. The SDK MUST re-order messages locally using `(epoch, generation, timestamp)` before presenting them to the application layer.
+
+**Authoritative ordering:** The Merkle log order is authoritative, not timestamps. Timestamps are hints for the SDK to reconstruct order in real-time. Once events are committed to the log, the log order is the permanent record.
+
+#### 9.8.4 Forgery Prevention
+
+**Message forgery:** Prevented by Ed25519 envelope signature + MLS membership_tag. An attacker who does not hold a member's private key cannot produce a valid envelope.
+
+**Attestation forgery:** Attestations (§7.4) are signed by their issuer's DID key. Forgery requires the issuer's private key.
+
+**UCAN forgery:** UCAN tokens contain a delegation chain where each delegation is signed. The mandatory `nnc` (nonce) field prevents token reuse outside the intended scope.
+
+**Provenance forgery:** Data provenance records (§7.7) are attached by the SDK and signed as part of the enclosing envelope. An agent cannot fabricate a provenance claim for data sourced from a context it was never in, because provenance records are verifiable against the source context's Merkle root (for persistent-scope sources).
+
+**Proposal forgery:** Context proposals (§5.12) are signed by the proposer's DID and encrypted to the recipient's DID. Forging requires the proposer's private key. Reading requires the recipient's private key.
+
+#### 9.8.5 Sequence Validation
+
+Each sender in a context maintains a monotonically increasing SCP sequence number (distinct from MLS generation numbers, which are MLS-internal). This sequence number is included in the envelope and the Merkle event log entry.
+
+Recipients MUST reject envelopes with a sequence number that does not equal the expected next sequence number from that sender (expected = last_seen + 1). A gap indicates possible message loss or suppression (§9.9). A duplicate indicates replay (caught by §9.8.2).
+
+### 9.9 Relay Threat Model and Mitigations
+
+Relays are untrusted infrastructure (§10.4). This section formally defines the relay threat model and specifies mitigations.
+
+#### 9.9.1 Relay Capabilities and Limitations
+
+A relay CAN:
+
+- **Read metadata:** context IDs, sender/recipient DIDs (as Nostr npubs), timestamps, message sizes, connection timing. Relay CANNOT read encrypted content.
+- **Drop messages (suppression):** Silently discard envelopes. The sender believes delivery succeeded; the recipient never sees the message.
+- **Delay messages:** Hold envelopes and deliver them later. Architecturally identical to slow network conditions.
+- **Replay messages:** Re-deliver previously delivered envelopes. Mitigated by §9.8.2.
+- **Equivocate:** Show different message histories to different members of the same context.
+- **Correlate traffic:** Link activities across contexts based on timing, DID, and connection patterns.
+
+A relay CANNOT:
+
+- **Forge messages.** Requires the sender's private key for envelope signature.
+- **Decrypt content.** Requires MLS group key.
+- **Modify messages.** Envelope signature verification fails.
+- **Inject members into contexts.** Requires MLS Welcome message encrypted to the joiner's KeyPackage.
+
+#### 9.9.2 Suppression Detection
+
+**Sequence gap detection:** If a recipient expects sequence #47 from a sender but receives #49, sequences #47 and #48 were suppressed (or delayed). The SDK MUST track expected sequence numbers per (context, sender) pair and alert on gaps.
+
+**Heartbeat messages:** In active contexts, the SDK SHOULD send periodic heartbeat envelopes (recommended interval: 60 seconds when the context has active participants). A heartbeat is a minimal MLS application message with a sequence number but no user content. If heartbeats stop arriving from a participant who was recently active, suppression is suspected.
+
+**Multi-relay cross-check:** Context messages SHOULD be published to at least 2 relays (recommended: 3). Recipients subscribe to all relays in the sender's relay list and merge received envelopes. If relay A delivers an envelope and relay B does not, this is an inconsistency. After a timeout (recommended: 30 seconds), the inconsistent relay is marked as potentially adversarial.
+
+**Response to suspected suppression:** The SDK SHOULD alert the user and attempt delivery via alternative relays. The SDK MUST NOT silently discard the suspicion.
+
+#### 9.9.3 Equivocation Detection — Relay Consistency Protocol
+
+The Relay Consistency Protocol detects relay equivocation — a relay showing different event histories to different members.
+
+**Consistency checkpoints:** At regular intervals (recommended: every 50 events or every 10 minutes, whichever comes first), each member computes a signed checkpoint:
+
+```
+ConsistencyCheckpoint {
+  contextID:    String
+  senderDID:    DID
+  eventCount:   UInt64           // number of events in local log
+  merkleRoot:   [UInt8; 32]      // root hash of local event log
+  epoch:        UInt64           // current MLS epoch
+  timestamp:    DateTime
+  signature:    Ed25519Signature // signed by sender's DID key
+}
+```
+
+Checkpoints are sent as regular MLS application messages (encrypted, authenticated).
+
+**Checkpoint comparison:** On receiving a checkpoint from another member, each member compares:
+
+- `eventCount`: Must match (within tolerance for in-flight messages). Divergence of more than 5 events indicates inconsistency.
+- `merkleRoot`: Must match for the same `eventCount`. Divergence indicates equivocation or log corruption.
+- `epoch`: Must match. Divergence indicates a missed MLS Commit (possible suppression).
+
+**Divergence resolution:** If Merkle roots diverge, members exchange event log proofs to identify the first divergent event. This reveals which relay served which version. The context's governance model handles the response.
+
+**Sybil-amplified equivocation defense:** The Relay Consistency Protocol is NOT a majority vote. ANY divergence between ANY two honest members detects equivocation. An attacker who controls Sybil members and a relay can make the Sybil members confirm the attacker's version, but this is irrelevant — two honest members comparing checkpoints will detect the equivocation regardless of how many Sybils agree with the attacker. The defense requires only two honest members in the context.
+
+#### 9.9.4 Selective Suppression of MLS Commits
+
+A specific relay attack: suppress an MLS Remove Commit to keep an excluded member in the group.
+
+**Analysis:** After an MLS Remove Commit is processed, new messages use the new epoch key. The removed member does NOT have this key — they physically cannot decrypt new-epoch messages. Even if the relay suppresses the Commit from being delivered to the removed member, confidentiality is preserved.
+
+**Actual risk:** Suppressing the Commit from OTHER members. Members who don't receive the Commit stay in the old epoch and cannot decrypt new-epoch messages. This is a denial-of-service attack (group state divergence), not a confidentiality breach.
+
+**Mitigation:** MLS Commits are high-priority messages that SHOULD be published to all relays with delivery confirmation. If any member detects they are behind on epochs (they receive a message for epoch N+1 but are on epoch N), they MUST request the missing Commit from other members or other relays.
+
+### 9.10 Metadata Privacy — Honest Limitations
+
+This section documents what the protocol protects and what it does not. Honesty about limitations is preferable to implying protections that don't exist.
+
+#### 9.10.1 What Is Confidential
+
+- Message content (MLS encryption)
+- Context-internal state: roles, tools, governance actions, event log content (all encrypted within the MLS group)
+- Identity private state (encrypted to owner's key, §3.7)
+- UCAN token contents (within encrypted envelopes)
+
+#### 9.10.2 What Is Exposed to Relays
+
+- Sender DID (as Nostr npub) — visible in the `pubkey` field of Nostr events
+- Context ID — visible in the `d` tag of Nostr events
+- Recipient DIDs — visible in `p` tags for directed messages and proposals
+- Timestamps — visible in `created_at` field
+- Message sizes
+- Connection timing and duration (WebSocket metadata)
+- Relay list (published in DID document and NIP-65)
+
+#### 9.10.3 Correlation Risks
+
+- **Cross-context correlation:** A relay serving multiple contexts can correlate a DID's activity across those contexts — which contexts they participate in, when they are active in each.
+- **Traffic analysis:** Message timing and volume patterns can reveal social graph information even without reading content.
+- **Device fingerprinting:** Connection metadata (IP address, TLS fingerprint, WebSocket behavior) can identify devices.
+
+#### 9.10.4 Cross-Context Key Isolation
+
+Each SCP context is a separate MLS group with independent key material. Compromising one context's keys reveals nothing about any other context's keys. The identity key (Ed25519) is shared across contexts but signs actions — it never directly encrypts group content. MLS handles group encryption with ephemeral key material derived independently per group.
+
+#### 9.10.5 Future Mitigations (Explicitly Out of Scope for v1)
+
+The following metadata privacy techniques are acknowledged but not included in v1:
+
+- Mixnet or onion routing for relay connections
+- Cover traffic (dummy messages to obscure activity patterns)
+- Private information retrieval for relay queries
+- DID unlinkability across contexts (separate pseudonymous DIDs per context with zero-knowledge proof of underlying identity)
+
+These are not rejected — they may be appropriate for future protocol versions. They are excluded from v1 because they add substantial complexity, have unresolved scalability issues, and would delay the protocol's availability.
+
+### 9.11 Key Continuity Verification
+
+Equivalent to Signal's "safety numbers." Allows two parties to verify they have the correct keys for each other, detecting MITM on DID resolution.
+
+**Fingerprint format:**
+
+```
+fingerprint = SHA256(sort(alice_did, bob_did) || alice_pubkey || bob_pubkey)
+```
+
+Displayed as:
+- A 12-word mnemonic (BIP-39 word list, first 128 bits of the hash)
+- A 60-digit decimal number (first 200 bits)
+- A QR code encoding the full 256-bit hash
+
+**Verification flow:**
+
+1. Alice and Bob each compute the fingerprint using their local knowledge of the other's public key.
+2. They compare fingerprints via an out-of-band channel (in person, voice call, trusted messaging app).
+3. If fingerprints match, key continuity is verified. The SDK records this verification event in identity private state (§3.7).
+4. If fingerprints do not match, a MITM is actively intercepting DID resolution. The SDK MUST alert with maximum severity.
+
+**Key change detection:**
+
+- The SDK records the public key associated with each DID on first encounter (Trust On First Use / TOFU).
+- On any subsequent DID resolution that returns a different public key, the SDK MUST: (a) alert the user that the key has changed, (b) invalidate the previous key continuity verification, (c) refuse to send encrypted content to the new key until the user explicitly accepts the change or completes re-verification.
+- Legitimate key changes (rotation, recovery) are distinguishable: for did:dht, the new DID document is signed by the old key (authorization chain). For social recovery, trusted contacts independently confirm the rotation.
+
+### 9.12 Compromise Recovery Protocol
+
+When a key is known or suspected to be compromised, the following ordered steps constitute the recovery protocol:
+
+**1. Key rotation on trusted device.** Generate new identity keypair on a trusted device. For did:dht: publish new DID document signed by the old key (if available) or via social recovery. For did:web: update the hosted DID document.
+
+**2. MLS Update in all active contexts.** Issue MLS Update proposals in every context. This provides post-compromise security: new epoch keys are derived from the new key material, making the compromised old key useless for future messages. If the old key is unavailable (device stolen), a trusted co-member with admin role must remove and re-add the member.
+
+**3. UCAN revocation.** Revoke all UCAN tokens issued by the compromised key. Publish revocations to the revocation endpoint. Issue new tokens signed by the new key.
+
+**4. KeyPackage rotation.** Delete all outstanding KeyPackages associated with the old key from relays. Publish new KeyPackages signed by the new key.
+
+**5. Contact notification.** The SDK sends a key-change notification to all known contacts. Contacts who completed Key Continuity Verification (§9.11) are alerted that re-verification is needed.
+
+**6. Identity private state re-encryption.** Re-encrypt identity private state (§3.7) under the new key. Publish re-encrypted state to relays.
+
+**Time-shifted key compromise:** An attacker who extracts MLS state at time T can read messages until the next PCS Update. Forward secrecy protects all messages from before T (old epoch keys already deleted). PCS protects all messages after the next Update. The vulnerability window is bounded by the PCS Update interval (§9.7.3).
+
+### 9.13 Transport Security Requirements
+
+**Relay connections MUST use TLS 1.3** (or higher). TLS 1.2 is acceptable only as a fallback when TLS 1.3 is unavailable.
+
+**Certificate validation:** Standard WebPKI validation. The SDK MUST reject self-signed certificates for relay connections unless the user has explicitly configured a self-hosted relay with a pinned certificate.
+
+**Certificate pinning:** The SDK SHOULD support certificate pinning for known relays. This is particularly important for the did:web resolution server during the v1 period.
+
+**Relay authentication:** NIP-42 (Nostr relay authentication) is supported but not required. SCP does not depend on relay authentication — encryption-as-access-control (§10.5) makes it unnecessary for confidentiality. Relay authentication may be useful for relays that want to limit their user base or implement per-user rate limiting.
+
+**Direct connections:** For the direct WebSocket transport adapter, connections between devices MUST use TLS (wss://) unless both devices are on the same local network AND the user has explicitly accepted the risk.
+
+### 9.14 Clock and Ordering Model
+
+**Clock model:** SCP does not require synchronized clocks. Timestamps are best-effort, used for ordering hints and replay detection, not for security-critical decisions.
+
+**Clock skew tolerance:** 5 minutes. Messages with timestamps more than 5 minutes in the future are rejected. This is generous enough to handle devices with poorly-set clocks while tight enough to limit replay windows.
+
+**Authoritative ordering:** The Merkle event log order is authoritative. Timestamps inform real-time ordering in the SDK. Once events are committed to the log, the log order is the permanent record.
+
+**Causal ordering:** MLS epoch boundaries serve as synchronization points. Within an epoch, sender generation numbers provide per-sender total ordering. Cross-sender ordering within an epoch relies on timestamps (best-effort) and the Merkle log (authoritative after the fact).
+
+### 9.15 Ephemeral Key Destruction Verification
+
+**Honest limitation:** Proving that a key has been destroyed on a remote device is impossible in the general case. A compromised device can claim destruction while retaining the key. This mechanism provides the strongest verifiable guarantees the hardware supports.
+
+**Platform-attested destruction:** On platforms with hardware security (Secure Enclave, Android Keystore), the SDK requests a destruction attestation from the hardware after deleting key material.
+
+**Destruction protocol for ephemeral context close:**
+
+1. Context TTL expires or participants trigger close.
+2. Each member destroys their MLS group state locally: tree secrets, all epoch key schedules, application key material.
+3. Each member generates a destruction attestation:
+
+```
+KeyDestructionAttestation {
+  contextID:             String
+  memberDID:             DID
+  destroyedAt:           DateTime
+  platformAttestation:   PlatformAttestation?  // hardware-backed if available
+  method:                .hardwareBacked | .softwareOnly
+  signature:             Ed25519Signature       // signed by identity key, NOT the destroyed key
+}
+```
+
+4. Attestations are published to relays (outside the now-destroyed context). They are signed by the identity key so they remain verifiable after context keys are destroyed.
+
+**Trust levels for destruction claims:**
+
+- **Hardware-attested** (Secure Enclave / Keystore attestation): High confidence. The hardware claims the key is gone.
+- **Software-only** (`memset(0)` on key material in memory): Moderate confidence. Memory dumps, swap files, or crash logs may have retained the key.
+- **No attestation** (member went offline before close): No confidence. The member may still have the key.
+
+The protocol provides the strongest guarantees the hardware supports and is explicit about where those guarantees end. This is consistent with the honest limitations acknowledged in §5.11.
 
 ---
 
@@ -1061,12 +1671,14 @@ Devices that aren't always online need relays for message delivery. Relays hold 
 
 **Honest constraints:**
 
-- **Metadata exposure.** Relays see who talks to whom, when, and how much, even with encrypted payloads. Traffic analysis is powerful. Mitigating this (mixnets, onion routing, cover traffic) is an unsolved-at-scale problem. The protocol should acknowledge this gap rather than claim relays are fully untrusted.
-- **Relay discovery.** If Alice wants to reach Bob, she needs to know Bob's relay. If Bob switches relays, Alice needs to discover the new one. This requires either a centralized directory (defeats the purpose), a distributed discovery mechanism (adds complexity and latency), or multi-relay registration (Bob publishes to several relays, Alice checks all of them). Nostr's experience: users publish a relay list, clients check multiple relays. Workable but not seamless.
+- **Metadata exposure.** Relays see who talks to whom, when, and how much, even with encrypted payloads. Traffic analysis is powerful. Mitigating this (mixnets, onion routing, cover traffic) is an unsolved-at-scale problem. The protocol should acknowledge this gap rather than claim relays are fully untrusted. (See §9.9.1 for the formal relay threat model — what relays CAN and CANNOT do — and §9.10 for the complete metadata privacy analysis.)
+- **Relay discovery.** If Alice wants to reach Bob, she needs to know Bob's relay. If Bob switches relays, Alice needs to discover the new one. This requires either a centralized directory (defeats the purpose), a distributed discovery mechanism (adds complexity and latency), or multi-relay registration (Bob publishes to several relays, Alice checks all of them). Nostr's experience: users publish a relay list, clients check multiple relays. Workable but not seamless. Relay list authentication is specified in §9.6.3 — NIP-65 signed events prevent relay list substitution attacks.
 - **Operational complexity.** A production relay needs reliable delivery, ordering, deduplication, rate limiting, and abuse prevention. "Simple message queue" undersells this. A reference implementation should exist, but running it reliably is a server operations task — not "install an app" level.
 - **Gravitational pull.** In theory relays are commodity. In practice, network effects apply to infrastructure. Nostr shows this: a few popular relays handle most traffic. The protocol can't prevent this concentration, but DID-based identity ensures it doesn't create lock-in — popular relay dies, users switch, identity survives. The agent workstation trend (§10.2) may significantly weaken centralization pressure — if most users run their own always-on node, personal relays become the default rather than the exception.
 
 **Self-hosting:** Running a personal relay is feasible for technical users. It requires a stable address, TLS, and uptime commitment. This is meaningfully simpler than running a Matrix homeserver (no state resolution, no federation protocol, no room DAG) but it is still a server. The protocol should ship a reference relay that minimizes operational burden, but should not claim self-hosting is effortless.
+
+**Multi-relay resilience.** For availability and equivocation resistance, clients SHOULD publish to 3+ relays and maintain per-relay reliability scores (§9.9.2). The Relay Consistency Protocol (§9.9.3) enables members to detect relays that show different event histories to different clients. Combined with per-sender sequence numbers (§9.8.5), clients can detect message suppression and switch to healthier relays automatically.
 
 ### 10.5 SDK Transport Architecture
 
@@ -1089,9 +1701,11 @@ Below the abstraction, **transport bindings** adapt SCP's requirements to specif
 - Relay implementation (existing relay software handles this)
 - Relay operations (that's either self-hosting or managed infrastructure)
 
-**Encryption-as-access-control.** Context access control is enforced through encryption, not through relay logic. When a context is created, a context encryption key is generated and distributed only to members. All context events are encrypted with this key before reaching the transport layer. Relays store and forward opaque blobs — they cannot read content, verify membership, or enforce roles. Key distribution is membership. Member removal triggers key rotation. This keeps the relay layer genuinely protocol-unaware and makes any encrypted-blob-capable relay — including existing Nostr relays — usable as SCP transport without modification.
+**Transport security.** All relay connections MUST use TLS 1.3 (TLS 1.2 acceptable as fallback). Certificate pinning is supported for known relays. See §9.13 for the complete transport security specification.
 
-**Blocking shares this cryptographic infrastructure.** DID-to-DID blocking (§3.6) is enforced through the same group encryption mechanism as member removal. When Alice blocks Dave, Alice's encryption keys are rotated and redistributed to all context members except Dave — across every shared context. Dave physically cannot decrypt Alice's future messages. This is not a separate system from member key management; it is the same key rotation machinery applied to a different trigger. The choice of group encryption protocol (MLS vs Sender Keys — see §16) determines the scaling characteristics of both member removal and blocking simultaneously.
+**Encryption-as-access-control.** Context access control is enforced through encryption, not through relay logic. Specifically, each context maps to one MLS group (§9.7.1); the MLS group key material is the access credential. All context events are encrypted with the current MLS epoch secrets before reaching the transport layer. Relays store and forward opaque blobs — they cannot read content, verify membership, or enforce roles. Key distribution is membership. Member removal triggers MLS Remove Commit + epoch advancement — the removed member does not possess the new epoch's key material and physically cannot decrypt subsequent messages. This keeps the relay layer genuinely protocol-unaware and makes any encrypted-blob-capable relay — including existing Nostr relays — usable as SCP transport without modification.
+
+**Blocking shares this cryptographic infrastructure.** DID-to-DID blocking (§3.6) is enforced through the same MLS group encryption mechanism as member removal. When Alice blocks Dave, the MLS group advances an epoch excluding Dave — across every shared context. Dave physically cannot decrypt Alice's future messages. This is not a separate system from member key management; it is the same MLS Commit + epoch advancement machinery applied to a different trigger. MLS tree-based key management provides O(log N) member exclusion, scaling efficiently for large contexts (§9.7).
 
 ### 10.6 Content and Data Sovereignty
 
@@ -1287,7 +1901,7 @@ All content entering an SCP context through a bridge carries a **provenance chai
 - The bridge operating mode
 - The shadow identity it's attributed to (or the native DID if claimed)
 
-This provenance is structural, not content-level. It flows through the content provenance system (§9.2) and is available to any agent evaluating trust.
+This provenance is structural, not content-level. It flows through the data provenance system (§7.7) and is available to any agent evaluating trust.
 
 Trust evaluation for bridged content is necessarily weaker than for native content. The hierarchy reflects two independent axes — **identity confidence** (who is the author?) and **transport confidence** (how did the content arrive?):
 
@@ -1443,10 +2057,10 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 - **Minimum viable agent specification.** What does the simplest possible agent look like? The "transparent pipe" agent that just forwards human input needs a reference implementation that's trivially embeddable.
 - **Relay protocol specification.** What does the relay interface look like? Must be simple enough to self-host on consumer hardware. Encrypted payload in, encrypted payload out. (Partially resolved by §10.5 — may be delegated to existing transport if binding-first approach is taken.)
 - **Cooperative mode trust tiers.** How much does cooperative mode actually improve trust provenance for bridged content? Need to define the specific trust differential that incentivizes platforms.
-- **Primary transport binding.** SCP defines its own transport abstraction with bindings to existing transports. The choice of first reference binding determines which ecosystem SCP builds alongside. Nostr is architecturally closest but SCP's encryption and key management requirements go beyond unmodified Nostr relays. Decision is driven by expediency and scalability, not ecosystem allegiance.
+- **~~Primary transport binding.~~** ✅ **Resolved.** Nostr selected as primary binding (architectural alignment confirmed in planning session 04). Transport security requirements specified in §9.13 (TLS 1.3 required). Relay threat model formalized in §9.9. Relay list authentication specified in §9.6.3.
 - **Transport abstraction interface.** Exact contract between SCP protocol logic and transport bindings. Must be thin enough that bindings are simple to write, rich enough that protocol logic doesn't leak transport assumptions.
-- **Context key management.** Encryption-as-access-control requires group key distribution, key rotation on member removal, and forward secrecy. These are solved problems (MLS, Signal's Sender Keys) but the specific approach needs selection. This is the first implementation domino — the choice also determines the mechanics of DID-to-DID blocking (§3.6, §10.5), which uses the same key rotation infrastructure. MLS (tree-based, O(log N) member exclusion) scales better for large contexts; Sender Keys (per-sender, O(N) distribution) are simpler for small ones.
-- **Metadata privacy.** Relays see context_ids, sender identifiers, timing, and volume. How much metadata leakage is acceptable? Do we need mixnet-style protections, or is encrypted content + substitutable relays sufficient for v1?
+- **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 ciphersuite. Full specification in §9.7 (group key management), §9.5 (cryptographic primitives), §9.8 (message security). MLS tree-based key management provides O(log N) member exclusion. Blocking uses the same epoch advancement machinery.
+- **~~Metadata privacy.~~** ✅ **Resolved for v1.** Encrypted content + substitutable relays + cross-context key isolation is the v1 posture. §9.10 documents exactly what metadata is exposed to relays, the correlation risks, and why mixnet/cover traffic/PIR are explicitly out of scope for v1. Honest about the limitation rather than claiming false protection.
 - **Verifiable event log format.** §7.3.1 specifies Merkle trees per context for event ordering and tamper detection. The concrete format — tree structure, hash algorithm, leaf schema, proof format — is not yet specified. Must be efficient enough for device-as-node participation. Candidates: sparse Merkle trees, append-only log trees (Certificate Transparency style), or Prolly trees.
 - **Behavioral record schema.** §7.3.2 defines what facts are derivable from event logs, but the record format is unspecified. How are behavioral records serialized, exchanged between agents, and verified against source logs? Must be compact enough for inline presentation and rich enough for meaningful evaluation.
 - **Challenge suite standards.** §7.3.4 introduces challenge-response verification for agent capabilities but doesn't define the challenge suites themselves. What tests constitute "prompt injection resistance"? Who defines and maintains challenge suites? How are custom challenges validated as fair? Need a registry or discovery mechanism.
@@ -1456,11 +2070,21 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 - **Threshold independence verification.** §7.3.5 says the protocol can check attestor independence via shared memberships and mutual endorsements. The specific independence metric and correlation thresholds need definition.
 - **Identity private state size constraints.** §3.7 introduces identity-scoped private state for block lists, preferences, and personal annotations. Block lists are small; agent memory or annotations could grow. Does identity private state follow the same minimal-state principle as context state, or is the single-owner case less constrained?
 - **Identity private state relay obligations.** Do relays treat identity private state the same as context events? Same retention, storage class, availability guarantees? Or is there a differentiated commitment?
-- **Identity key rotation and private state re-encryption.** When an identity key rotates (recovery scenario), private state must be re-encrypted. Single-owner simplifies this (no group redistribution) but the migration step needs specification — especially for large private state.
+- **Identity key rotation and private state re-encryption.** When an identity key rotates (recovery scenario), private state must be re-encrypted. Single-owner simplifies this (no group redistribution) but the migration step needs specification — especially for large private state. (Key rotation triggers and the compromise recovery flow are specified in §9.7.4 and §9.12.)
 - **Identity private state discovery pointer.** Does the DID document explicitly signal where private state is stored, or is it implicit from the relay list? Relays need to distinguish between "context events involving this DID" and "this DID's private state."
+
+### Agent-to-Agent Communication
+
+- **Proposal rate limits.** How many context proposals can an agent send per time period? Earned capacity (§9.3) applies, but defaults need setting. This is the primary Sybil defense for A2A. Too restrictive limits legitimate agent coordination; too permissive enables spam floods.
+- **Registry governance.** Who runs registries? Community-operated, app-specific, protocol-seeded? How to prevent registry capture — one dominant registry becoming a gatekeeper? The protocol provides the mechanism (registries are contexts); governance norms need specification.
+- **Memory scope enforcement boundary.** Ephemeral key destruction is protocol-enforceable. Local agent memory is not. The spec acknowledges this (§5.11), but the boundary between "protocol can enforce" and "protocol can only signal" needs precise documentation for implementers. (§9.15 specifies the three trust levels for key destruction verification — hardware-attested, software-only, no attestation — which partially addresses this, but the agent-side memory boundary remains unspecified.)
+- **Context promotion mechanics.** When an ephemeral context "promotes" to persistent (both parties agree to continue), what happens? Options: (a) new context created, referencing the closed ephemeral one, or (b) same context with TTL removed and keys preserved. Option (a) is cleaner for the security model; option (b) preserves continuity. Needs decision.
+- **Referral chain depth.** Maximum depth for trust-carrying referrals. Likely 2-3, but needs analysis against real social graph data. Deeper chains may carry marginal trust signal; shallower limits may miss legitimate introductions.
+- **Summary generation mechanics.** For summary memory scope (§5.11): how is the summary produced? Who generates it — the context's tools, the participants collaboratively, or the protocol? What happens if participants disagree on the summary? What's the verification window before keys are destroyed?
+- **A2A activity in behavioral records.** What A2A metadata is included in behavioral records? Proposal counts (sent, accepted, rejected), A2A context participation, A2A context purposes? How granular? Controlled by the same social graph visibility (§3.6), but the specific data points need definition.
 
 ### Uncovered Areas
 
-- **Transport layer specifics.** Transport abstraction interface design, reference binding implementation, relay discovery protocol. (Framework established in §10.4–10.5, but implementation specifics remain.)
+- **Transport layer specifics.** Transport abstraction interface design, reference binding implementation, relay discovery protocol. (Framework established in §10.4–10.5. Transport security requirements specified in §9.13. Relay threat model and multi-relay strategy specified in §9.9. Implementation specifics for the transport abstraction interface and reference binding remain.)
 - **Cronica as first client.** How quests, the AI Guide, and quest communities map onto SCP.
 - **Offline/local-first behavior.** Disconnection handling, sync, conflict resolution mechanics. (Informed by device-as-node §10.2, but mechanics unspecified.)
