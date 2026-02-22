@@ -56,18 +56,28 @@ Use agents eagerly for focus, expertise, and parallelization — especially code
 
 ### Agentic harness & artifacts:
 
+**Ralph loop rules for success:**
+- **Atomic stories.** One subagent, one iteration (~15-30 min). Coupled work (model + migration + route) stays together; unrelated work does not.
+- **Machine-verifiable acceptance criteria.** Not "it works" but "POST /api/x returns 200 with a JWT". If you can't write a test for it, Ralph can't verify it.
+- **File isolation for parallelism.** Stories that touch the same files cannot run in the same batch. Set `blockedBy` for true data dependencies only.
+- **Green tests are a hard gate.** Never commit failing code. Failures go to status.md for the next iteration. 3 fix attempts max per iteration.
+- **Context is scarce.** Read prd.json in jq waves of 10. Use dedicated tools (Read, Grep, Glob) not shell. status.md is the only cross-iteration continuity — write it thoroughly.
+- **Search before building.** Always search the codebase before assuming something is missing.
+- **Scope is sacred.** Implement only the assigned story. Don't "fix" adjacent code or add unrequested features.
+
 .ralph/              # Autonomous dev loop — dispatches parallel subagents from a PRD
 ├── prd.json         # Structured stories with gates (P0/P1/P2), deps, acceptance criteria
 ├── prompt.md        # Autonomous iteration instructions (story selection, execution, commit)
 ├── directive.md     # Single-task mode instructions (execute one directive, signal result)
 ├── status.md        # Current iteration state (read at start, written at end of each cycle)
+├── ralph-prd.sh     # Standalone PRD generator (wraps claude -p)
 ├── specs/           # Reference specs and ticket tracking for Ralph
 └── hooks/           # Guard rails: stop signals, interactive blocking, subagent limits
 
 .claude/             # Claude's project-wide operating instructions and tools
 ├── agents/          # 21 agent definitions — 8 core specialists + 13 reviewers (see agents/README.md)
 ├── agent-memory/    # Per-agent persistent memory (each dir maps to an agent)
-└── skills/          # Slash commands (/prd, /ralph)
+└── skills/          # Skills (/prd, /ralph)
 
 .docs/               # Project knowledge — one root instance, additional local instances per feature
 ├── adrs/            # Architectural Decision Records — how to build (phase-1, phase-2, phase-3)
