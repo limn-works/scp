@@ -1446,25 +1446,24 @@ context_pseudonym = context_keypair.public_key
 
 #### 9.10.5 Connection Privacy
 
-1. **SCP native relays MUST support Tor hidden service exposure.** Configuration flag, not protocol change.
-2. **SDK MUST support connecting to relays via Tor.** Tor client libraries for all platforms (arti for Rust).
-3. **Persistent connections mandatory on desktop/workstation/server.** Constant connection to each relay regardless of activity. Prevents connection-timing correlation.
-4. **Mobile: push-wake + Tor-connected burst.** Opaque push wakes device, SDK connects via Tor, exchanges messages, disconnects.
-5. **No custom mix network, no custom proxy protocol.** Tor is existing infrastructure. Custom proxies are new infrastructure that contradicts the no-operator principle.
+1. **Persistent connections mandatory on desktop/workstation/server.** Constant connection to each relay regardless of activity. Prevents connection-timing correlation.
+2. **Mobile: push-wake + burst.** Opaque push wakes device, SDK connects to relays, exchanges messages, disconnects.
+3. **TLS 1.3 required for all relay connections** (§9.13). Relay operators see the client's IP address — the same information any web server sees. Combined with per-context pseudonyms (§9.10.4), the relay cannot link the IP to a specific identity or correlate activity across contexts.
+4. **No custom mix network, no custom proxy protocol.** The protocol does not mandate IP-layer anonymization. The privacy posture already exceeds any conventional app: relays see only pseudonyms, bucketed blob sizes, and TTLs. Clients concerned about IP-level privacy can route through a VPN or Tor at the transport layer — this is a client configuration choice, not a protocol requirement.
 
 #### 9.10.6 Cover Traffic
 
 1. **Persistent connections: constant-rate, mandatory.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding.
-2. **Push-wake connections: no cover traffic.** Connection is transient. Tor hides which device is behind the burst.
+2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
 3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
 
 #### 9.10.7 DID Resolution Privacy
 
-1. **Desktop/workstation/server: local Mainline DHT node, mandatory.** DID resolution queries become indistinguishable from DHT routing traffic.
-2. **Mobile: Tor-routed DHT queries.** 2-5 second latency per resolution, acceptable since resolution is infrequent (once per first contact, then cached).
+1. **Desktop/workstation/server: local Mainline DHT node, mandatory.** DID resolution queries become indistinguishable from DHT routing traffic. The device participates as a full DHT node, routing queries for others as well as itself.
+2. **Mobile: DHT queries via standard HTTPS gateway or lightweight DHT client.** Resolution is infrequent (once per first contact, then cached), so latency is acceptable.
 3. **Aggressive caching:** 24-hour refresh for active contacts, 7-day for inactive. Stale documents detected via BEP44 sequence number comparison. Key change alerts trigger immediate re-resolution.
-4. **No batch/prefetch, no resolution proxy.** Local DHT node and Tor provide better privacy with less waste and no new infrastructure.
+4. **No batch/prefetch, no resolution proxy.** Local DHT node on desktop and caching on mobile provide practical privacy without new infrastructure.
 
 #### 9.10.8 Relay Query Privacy
 
@@ -1483,7 +1482,7 @@ Each SCP context is a separate MLS group with independent key material. Compromi
 
 Even with all protections in this section, the following metadata leaks remain:
 
-- **Tor exit/entry correlation:** A global passive adversary observing both Tor entry and exit nodes can correlate connections. This is a fundamental limitation of Tor, not SCP.
+- **IP visibility:** Relay operators see the client's IP address (same as any web service). Per-context pseudonyms prevent linking IPs to identities, but a relay operator with access to IP logs could correlate connection patterns. Clients requiring IP anonymity can use a VPN or Tor at the transport layer.
 - **Cover traffic timing analysis:** Sophisticated statistical analysis may distinguish real message patterns within constant-rate cover traffic. The constant rate makes this significantly harder but not provably impossible.
 - **Push notification timing:** Apple/Google learn that a device received a notification at a specific time. Content and source remain opaque (§10.7).
 - **DHT participation patterns:** On desktop, DHT routing traffic is mixed with resolution queries, but a network observer can see DHT participation.
@@ -1715,7 +1714,7 @@ Devices that aren't always online need relays for message delivery. Relays hold 
 
 **Honest constraints:**
 
-- **Metadata exposure.** Traffic analysis is powerful even with encrypted payloads. The protocol provides layered metadata privacy protections: minimal outer envelopes with per-context pseudonyms, fixed bucket padding, Tor integration, constant-rate cover traffic, relay set partitioning, and subscription mixing. (See §9.9.1 for the formal relay threat model — what relays CAN and CANNOT do — and §9.10 for the complete metadata privacy architecture.)
+- **Metadata exposure.** Traffic analysis is powerful even with encrypted payloads. The protocol provides layered metadata privacy protections: minimal outer envelopes with per-context pseudonyms, fixed bucket padding, persistent connections, constant-rate cover traffic, relay set partitioning, and subscription mixing. (See §9.9.1 for the formal relay threat model — what relays CAN and CANNOT do — and §9.10 for the complete metadata privacy architecture.)
 - **Relay discovery.** If Alice wants to reach Bob, she needs to know Bob's relay. If Bob switches relays, Alice needs to discover the new one. This requires either a centralized directory (defeats the purpose), a distributed discovery mechanism (adds complexity and latency), or multi-relay registration (Bob publishes to several relays, Alice checks all of them). Nostr's experience: users publish a relay list, clients check multiple relays. Workable but not seamless. Relay list authentication is specified in §9.6.3 — NIP-65 signed events prevent relay list substitution attacks.
 - **Operational complexity.** A production relay needs reliable delivery, ordering, deduplication, rate limiting, and abuse prevention. "Simple message queue" undersells this. A reference implementation should exist, but running it reliably is a server operations task — not "install an app" level.
 - **Gravitational pull.** In theory relays are commodity. In practice, network effects apply to infrastructure. Nostr shows this: a few popular relays handle most traffic. The protocol can't prevent this concentration, but DID-based identity ensures it doesn't create lock-in — popular relay dies, users switch, identity survives. The agent workstation trend (§10.2) may significantly weaken centralization pressure — if most users run their own always-on node, personal relays become the default rather than the exception.
@@ -1798,7 +1797,7 @@ Deployment spectrum for content/data:
 
 Mobile devices need push notifications. On iOS the only mechanism is APNs (Apple Push Notification service). On Android, FCM (Firebase Cloud Messaging). Both are platform-mediated — Apple and Google are in the delivery path.
 
-**Push notification opacity is mandatory.** Push payloads MUST contain a wake signal and nothing else. No context ID, no sender DID, no message preview, no metadata of any kind. The device wakes, connects to relays (via Tor per §9.10.5), pulls encrypted envelopes, and decrypts locally. Apple/Google learn only that the device received a notification at a specific time.
+**Push notification opacity is mandatory.** Push payloads MUST contain a wake signal and nothing else. No context ID, no sender DID, no message preview, no metadata of any kind. The device wakes, connects to relays, pulls encrypted envelopes, and decrypts locally. Apple/Google learn only that the device received a notification at a specific time.
 
 - **Push payloads are fully opaque.** The push payload contains exactly one piece of information: "wake up." No sender, no context, no count, no preview. The SCP agent on the device connects to its relay set and pulls all pending envelopes.
 - **The push service knows timing, not content or source.** Apple/Google learn when a device received a notification. They cannot determine which context, which sender, or even whether the notification corresponds to one message or many.

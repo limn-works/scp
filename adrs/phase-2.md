@@ -637,7 +637,7 @@ pub struct ConsistencyCheckpoint {
 
 SCP is transport-independent (architecture.md section 10). No single transport is primary. The `TransportAdapter` trait (ADR-005) defines the contract each adapter implements, and the `TransportManager` (ADR-005 acceptance criterion 3) was stubbed in Phase 1 to support a single adapter. Phase 2 completes the `TransportManager` with multi-transport routing: sending envelopes to multiple relays for suppression resistance, partitioning relay sets across contexts for metadata privacy, mixing real and decoy subscriptions, and scoring relay reliability.
 
-Decision 10 mandates relay set partitioning, subscription mixing, and multi-relay publishing. Decision 6 mandates Tor support for all relay connections. These metadata privacy measures are enforced at the transport routing layer, transparent to the context and envelope layers above.
+Decision 10 mandates relay set partitioning, subscription mixing, and multi-relay publishing. Decision 6 mandates persistent connections and TLS for all relay connections. These metadata privacy measures are enforced at the transport routing layer, transparent to the context and envelope layers above.
 
 ### Decision
 

@@ -333,13 +333,12 @@ The SCP native relay exists because no external transport (Nostr, Matrix, etc.) 
 
 ### Decision
 
-Implement a WebSocket-based store-and-forward relay server and its corresponding client adapter. The relay protocol has exactly 6 operations. The relay must support Tor hidden service exposure (Decision 6).
+Implement a WebSocket-based store-and-forward relay server and its corresponding client adapter. The relay protocol has exactly 6 operations.
 
 ### Rationale
 
 - **Purpose-built simplicity:** Nostr relays carry conceptual overhead (event kinds, NIP compliance, signature verification, tag indexing). The SCP native relay stores opaque blobs indexed by `routing_id` with a `blob_ttl`. Nothing else.
 - **Transport independence:** By defining and shipping its own relay, SCP proves it works without any external infrastructure dependency. Other transports are optional enhancers.
-- **Tor compatibility:** Decision 6 mandates Tor hidden service support. The relay must be exposable as a `.onion` service. This is a configuration flag, not a protocol change — the WebSocket protocol works identically over Tor.
 - **No authentication required:** The relay does not authenticate clients. Encryption-as-access-control (spec section 10.5) means that only group members can read content. The relay cannot even tell if a subscriber is a legitimate group member. This simplifies the relay to a pure storage/routing service.
 
 ### Implementation
@@ -392,7 +391,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 - No blob inspection: the relay never parses, validates, or inspects blob contents.
 - No client authentication: any WebSocket client can connect, publish, subscribe, query.
 - Connection multiplexing: one WebSocket connection supports multiple subscriptions.
-- Tor-compatible: the relay binds to a configurable address. Exposing as a Tor hidden service is a deployment configuration, not a code change.
+- Bind address is configurable (supports deployment behind reverse proxies, VPNs, or other network configurations).
 
 **Client adapter:**
 

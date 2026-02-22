@@ -95,15 +95,15 @@ Cross-context tool calls with stateful sessions (§6.2) cover all governed inter
 
 ---
 
-## Decision 6: Connection Privacy — Tor + Persistent Connections
+## Decision 6: Connection Privacy — Persistent Connections + TLS
 
-**Decision: Tor hidden service support for relays + persistent connections where platform allows. No custom proxy infrastructure.**
+**Decision: Persistent connections where platform allows. TLS 1.3 required. No IP-layer anonymization mandate.**
 
-1. **SCP native relays MUST support Tor hidden service exposure.** Configuration flag, not protocol change.
-2. **SDK MUST support connecting to relays via Tor.** Tor client libraries for all platforms (arti for Rust).
-3. **Persistent connections mandatory on desktop/workstation/server.** Constant connection to each relay regardless of activity. Prevents connection-timing correlation.
-4. **Mobile: push-wake + Tor-connected burst.** Opaque push wakes device, SDK connects via Tor, exchanges messages, disconnects.
-5. **No custom mix network, no custom proxy protocol.** Tor is existing infrastructure. Proxies are new infrastructure that contradicts no-operator principle.
+1. **Persistent connections mandatory on desktop/workstation/server.** Constant connection to each relay regardless of activity. Prevents connection-timing correlation.
+2. **Mobile: push-wake + burst.** Opaque push wakes device, SDK connects to relays, exchanges messages, disconnects.
+3. **TLS 1.3 required for all relay connections.** Relay operators see client IP addresses — the same information any web server sees. Combined with per-context pseudonyms, relay cannot link IP to identity.
+4. **No IP-layer anonymization mandate.** The protocol does not require Tor, VPN, or mix networks. The privacy posture already exceeds any conventional app. Clients with heightened privacy needs can route through Tor or a VPN at the transport layer — this is a client configuration choice, not a protocol requirement.
+5. **No custom mix network, no custom proxy protocol.** No new infrastructure required.
 
 **Write into:** spec §9.10 (new subsection on connection privacy).
 
@@ -136,7 +136,7 @@ context_pseudonym = context_keypair.public_key
 **Decision: Constant-rate cover traffic on persistent connections. Not applicable on push-wake connections.**
 
 1. **Persistent connections: constant-rate, mandatory.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding.
-2. **Push-wake connections: no cover traffic.** Connection is transient. Tor hides which device is behind the burst.
+2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
 3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
 
@@ -144,14 +144,14 @@ context_pseudonym = context_keypair.public_key
 
 ---
 
-## Decision 9: DID Resolution Privacy — Local DHT Node + Tor
+## Decision 9: DID Resolution Privacy — Local DHT Node + Caching
 
-**Decision: Local DHT node on persistent devices. Tor-routed resolution on mobile. Aggressive caching.**
+**Decision: Local DHT node on persistent devices. Lightweight resolution on mobile. Aggressive caching.**
 
 1. **Desktop/workstation/server: local Mainline DHT node, mandatory.** DID resolution queries become indistinguishable from DHT routing traffic.
-2. **Mobile: Tor-routed DHT queries.** 2-5 second latency per resolution, acceptable since resolution is infrequent (once per first contact, then cached).
+2. **Mobile: DHT queries via standard HTTPS gateway or lightweight DHT client.** Resolution is infrequent (once per first contact, then cached), so latency is acceptable.
 3. **Aggressive caching:** 24-hour refresh for active contacts, 7-day for inactive. Stale documents detected via BEP44 sequence number comparison. Key change alerts trigger immediate re-resolution.
-4. **No batch/prefetch, no resolution proxy.** Local DHT node and Tor provide better privacy with less waste and no new infrastructure.
+4. **No batch/prefetch, no resolution proxy.** Local DHT node on desktop and caching on mobile provide practical privacy without new infrastructure.
 
 **Write into:** spec §9.10 (new subsection on resolution privacy).
 
@@ -178,9 +178,9 @@ All 10 questions resolved. All suggestions confirmed. The decisions collectively
 
 - **Envelope layer:** Minimal outer envelope with pseudonyms (#2, #7)
 - **Content layer:** Fixed bucket padding (#3)
-- **Connection layer:** Tor + persistent connections (#6)
+- **Connection layer:** Persistent connections + TLS (#6)
 - **Traffic layer:** Constant-rate cover traffic (#8)
-- **Resolution layer:** Local DHT + Tor (#9)
+- **Resolution layer:** Local DHT + caching (#9)
 - **Query layer:** Partitioning + mixing (#10)
 - **Push layer:** Fully opaque (#1)
 - **Blocking layer:** AES-256 sender-side keys (#5)

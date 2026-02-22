@@ -103,10 +103,10 @@ All 10 questions from open-questions.md have been resolved. Decisions documented
 | **3** | Message size normalization | Fixed bucket padding (256B–256KB) | spec §9.10.3 |
 | **4** | A2A propose/accept | Removed entirely | spec, sketch, architecture (all A2A sections removed) |
 | **5** | Sender-side key layer | AES-256 symmetric, MLS-distributed, mutual block | spec §9.16 |
-| **6** | Connection privacy | Tor + persistent connections | spec §9.10.5 |
+| **6** | Connection privacy | Persistent connections + TLS | spec §9.10.5 |
 | **7** | Per-context pseudonyms | HKDF-derived, inside-encryption verification | spec §9.10.4 |
 | **8** | Cover traffic | Constant-rate on persistent connections | spec §9.10.6 |
-| **9** | DID resolution privacy | Local DHT node + Tor mobile | spec §9.10.7 |
+| **9** | DID resolution privacy | Local DHT node + caching | spec §9.10.7 |
 | **10** | Relay query privacy | Pseudonyms + partitioning + subscription mixing | spec §9.10.8 |
 
 ---
