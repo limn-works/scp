@@ -1142,7 +1142,7 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
 
-**Envelope signature scope:** The Ed25519 signature on every SCP envelope covers: `SHA256(context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash)`. This binds every field to the signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures.
+**Envelope signature scope:** The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by the sender's identity key: `SHA256(context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash)`. This binds every field to the signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs), which is by design — verification is the responsibility of context members who can decrypt the payload.
 
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay.
 
@@ -1397,9 +1397,9 @@ A specific relay attack: suppress an MLS Remove Commit to keep an excluded membe
 
 **Mitigation:** MLS Commits are high-priority messages that SHOULD be published to all relays with delivery confirmation. If any member detects they are behind on epochs (they receive a message for epoch N+1 but are on epoch N), they MUST request the missing Commit from other members or other relays.
 
-### 9.10 Metadata Privacy — Honest Limitations
+### 9.10 Metadata Privacy Architecture
 
-This section documents what the protocol protects and what it does not. Honesty about limitations is preferable to implying protections that don't exist.
+The protocol provides layered metadata privacy protections. This section specifies what the protocol protects, how it protects it, and what residual risks remain.
 
 #### 9.10.1 What Is Confidential
 
@@ -1407,37 +1407,87 @@ This section documents what the protocol protects and what it does not. Honesty 
 - Context-internal state: roles, tools, governance actions, event log content (all encrypted within the MLS group)
 - Identity private state (encrypted to owner's key, §3.7)
 - UCAN token contents (within encrypted envelopes)
+- Sender identity, timestamps, sequence numbers, epoch, generation (all inside encrypted payload)
 
-#### 9.10.2 What Is Exposed to Relays
+#### 9.10.2 Minimal Outer Envelope
 
-- Sender DID (as Nostr npub) — visible in the `pubkey` field of Nostr events
-- Context ID — visible in the `d` tag of Nostr events
-- Recipient DIDs — visible in `p` tags for directed messages
-- Timestamps — visible in `created_at` field
-- Message sizes
-- Connection timing and duration (WebSocket metadata)
-- Relay list (published in DID document and NIP-65)
+The outer envelope — what relays see — contains only:
 
-#### 9.10.3 Correlation Risks
+1. **Routing identifier** — per-context pseudonym (§9.10.4)
+2. **Recipient hint** — recipient pseudonym for directed messages, or broadcast marker
+3. **Blob TTL** — how long the relay should store before deletion
+4. **Encrypted blob** — everything else
 
-- **Cross-context correlation:** A relay serving multiple contexts can correlate a DID's activity across those contexts — which contexts they participate in, when they are active in each.
-- **Traffic analysis:** Message timing and volume patterns can reveal social graph information even without reading content.
-- **Device fingerprinting:** Connection metadata (IP address, TLS fingerprint, WebSocket behavior) can identify devices.
+Sender identity, timestamps, sequence numbers, epoch, generation — all reside inside the encrypted payload. The relay is a dumb pipe that holds encrypted blobs for a specified duration and delivers them to subscribers of a routing ID. Relay-side ordering, dedup, and expiry are NOT the relay's job. The SDK handles all of this client-side.
 
-#### 9.10.4 Cross-Context Key Isolation
+#### 9.10.3 Fixed Bucket Padding
 
-Each SCP context is a separate MLS group with independent key material. Compromising one context's keys reveals nothing about any other context's keys. The identity key (Ed25519) is shared across contexts but signs actions — it never directly encrypts group content. MLS handles group encryption with ephemeral key material derived independently per group.
+Pad plaintext to the next bucket boundary before encryption to prevent message size analysis.
 
-#### 9.10.5 Future Mitigations (Explicitly Out of Scope for v1)
+**Bucket sizes:** 256B, 1KB, 4KB, 16KB, 64KB, 256KB.
 
-The following metadata privacy techniques are acknowledged but not included in v1:
+Messages larger than 256KB are chunked into 256KB blocks. Padding happens below the application layer and above the transport layer — the SDK handles it transparently. Application developers never see it. Relay operators see uniform bucket-sized blobs.
 
-- Mixnet or onion routing for relay connections
-- Cover traffic (dummy messages to obscure activity patterns)
-- Private information retrieval for relay queries
-- DID unlinkability across contexts (separate pseudonymous DIDs per context with zero-knowledge proof of underlying identity)
+#### 9.10.4 Per-Context Pseudonyms
 
-These are not rejected — they may be appropriate for future protocol versions. They are excluded from v1 because they add substantial complexity, have unresolved scalability issues, and would delay the protocol's availability.
+Each participant derives a per-context keypair that replaces their DID in all outer-envelope fields:
+
+```
+context_seed = HKDF(identity_private_key, context_id, "scp-context-pseudonym")
+context_keypair = Ed25519_keygen(context_seed)
+context_pseudonym = context_keypair.public_key
+```
+
+- **Deterministic:** Same identity + same context = same pseudonym.
+- **Unlinkable across contexts:** Different context_id = different pseudonym. Relays cannot correlate activity across contexts.
+- **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
+- **No ZK proofs** — unnecessary complexity since only group members need to verify the mapping.
+- The SDK handles derivation, caching, and verification transparently.
+
+#### 9.10.5 Connection Privacy
+
+1. **SCP native relays MUST support Tor hidden service exposure.** Configuration flag, not protocol change.
+2. **SDK MUST support connecting to relays via Tor.** Tor client libraries for all platforms (arti for Rust).
+3. **Persistent connections mandatory on desktop/workstation/server.** Constant connection to each relay regardless of activity. Prevents connection-timing correlation.
+4. **Mobile: push-wake + Tor-connected burst.** Opaque push wakes device, SDK connects via Tor, exchanges messages, disconnects.
+5. **No custom mix network, no custom proxy protocol.** Tor is existing infrastructure. Custom proxies are new infrastructure that contradicts the no-operator principle.
+
+#### 9.10.6 Cover Traffic
+
+1. **Persistent connections: constant-rate, mandatory.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding.
+2. **Push-wake connections: no cover traffic.** Connection is transient. Tor hides which device is behind the burst.
+3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
+4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
+
+#### 9.10.7 DID Resolution Privacy
+
+1. **Desktop/workstation/server: local Mainline DHT node, mandatory.** DID resolution queries become indistinguishable from DHT routing traffic.
+2. **Mobile: Tor-routed DHT queries.** 2-5 second latency per resolution, acceptable since resolution is infrequent (once per first contact, then cached).
+3. **Aggressive caching:** 24-hour refresh for active contacts, 7-day for inactive. Stale documents detected via BEP44 sequence number comparison. Key change alerts trigger immediate re-resolution.
+4. **No batch/prefetch, no resolution proxy.** Local DHT node and Tor provide better privacy with less waste and no new infrastructure.
+
+#### 9.10.8 Relay Query Privacy
+
+1. **Per-context pseudonyms (§9.10.4) are the foundation.** Relay cannot link subscriptions across contexts.
+2. **Relay set partitioning, mandatory.** Each context SHOULD use different relays from the client's other contexts. SDK distributes contexts across relays to minimize overlap.
+3. **Subscription mixing, mandatory.** Client subscribes to real contexts plus ~3-5x decoy context IDs per relay. Decoy contexts should have similar activity levels.
+4. **No PIR.** Not ready for production. Protocol structures designed so PIR can be swapped in later.
+
+**Combined effect:** Relay sees a pseudonym (unlinkable to identity) subscribing to N contexts (most are decoys), on a relay that hosts only a fraction of the client's total context set.
+
+#### 9.10.9 Cross-Context Key Isolation
+
+Each SCP context is a separate MLS group with independent key material. Compromising one context's keys reveals nothing about any other context's keys. The identity key (Ed25519) is shared across contexts but signs actions — it never directly encrypts group content. MLS handles group encryption with ephemeral key material derived independently per group. Per-context pseudonyms (§9.10.4) prevent the identity key from being visible outside encrypted payloads.
+
+#### 9.10.10 Residual Risks
+
+Even with all protections in this section, the following metadata leaks remain:
+
+- **Tor exit/entry correlation:** A global passive adversary observing both Tor entry and exit nodes can correlate connections. This is a fundamental limitation of Tor, not SCP.
+- **Cover traffic timing analysis:** Sophisticated statistical analysis may distinguish real message patterns within constant-rate cover traffic. The constant rate makes this significantly harder but not provably impossible.
+- **Push notification timing:** Apple/Google learn that a device received a notification at a specific time. Content and source remain opaque (§10.7).
+- **DHT participation patterns:** On desktop, DHT routing traffic is mixed with resolution queries, but a network observer can see DHT participation.
+- **Relay trust:** Relays see blob sizes (bucketed), TTLs, and pseudonyms. A relay colluding with a context member could correlate pseudonyms to identities for that context only.
 
 ### 9.11 Key Continuity Verification
 
@@ -1540,6 +1590,52 @@ KeyDestructionAttestation {
 
 The protocol provides the strongest guarantees the hardware supports and is explicit about where those guarantees end. This is consistent with the honest limitations acknowledged in §5.11.
 
+### 9.16 Sender-Side Key Layer (Blocking)
+
+The MLS group key provides confidentiality against outsiders but not against other group members. Blocking a participant within a context requires a cryptographic layer below MLS that allows selective readability.
+
+#### 9.16.1 Key Architecture
+
+Each participant in a context holds one AES-256 symmetric sender key. All messages are encrypted with the sender's key before being encrypted with MLS. Blocked parties can decrypt the MLS layer but receive opaque ciphertext from the blocking party.
+
+- **Key type:** AES-256-GCM symmetric. One key per sender per context.
+- **Key size:** 32 bytes per sender key per context member. Storage is trivial.
+- **Encryption order:** Sender-first (AES-256-GCM), then MLS. Recipients decrypt MLS layer, then decrypt sender layer with the cached sender key.
+
+#### 9.16.2 Key Distribution
+
+Sender keys are distributed via MLS application messages (encrypted to the group).
+
+- **New member join:** Existing members send their current sender keys to the new member as individual MLS application messages. The new member receives a key bundle containing all active sender keys for the context.
+- **Normal operation:** Sender key is stable — it does not rotate on MLS epoch advances. This is intentional: old sender keys are retained for historical message decryption. Blocking is about future messages, not retroactive access.
+
+#### 9.16.3 Block Protocol
+
+When Alice blocks Bob:
+
+1. Alice generates a new AES-256-GCM sender key.
+2. Alice distributes the new sender key as individual MLS application messages to each member EXCEPT Bob. This is NOT a broadcast — each non-blocked member receives the key separately.
+3. Alice sends a block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice"}`. This notifies Bob's client that Alice has blocked him.
+4. Bob's client, upon receiving the block notification, automatically rotates Bob's sender key, distributing the new key to each member EXCEPT Alice.
+
+**Result:** Both Alice and Bob have new sender keys that exclude each other. Neither can read the other's future messages. Other context members can read both. The entire exchange completes within one message round-trip.
+
+#### 9.16.4 Blocking vs. Removal
+
+Blocking and removal are distinct operations with different mechanisms:
+
+- **Blocking** (§9.16): Sender-side key rotation. The blocked party remains in the MLS group. They can see encrypted blobs from the blocker but cannot decrypt them. They retain access to messages from non-blocking members. Blocking is a per-relationship decision, not a group decision.
+- **Removal** (§9.7): MLS group epoch advance excluding the removed member. The removed party loses access to all future messages in the context. Removal requires governance authority (admin role or context rules). Removal implies blocking but blocking does not imply removal.
+
+#### 9.16.5 Forward Secrecy Interaction
+
+Sender keys rotate ONLY on block events, not on MLS epoch advances. This is a deliberate design choice:
+
+- MLS provides forward secrecy for group-level encryption via epoch advancement.
+- Sender keys provide selective readability within the group.
+- Rotating sender keys on every epoch would require O(N) individual key distributions per epoch advance — prohibitive for active contexts.
+- Old sender keys are retained for historical message decryption. A member who joins and receives the current sender keys can decrypt all messages encrypted with those keys (forward and backward within the sender key's lifetime). Historical access boundaries are defined by block events and member joins, not by time.
+
 ---
 
 ## 10. Infrastructure and Self-Hosting
@@ -1619,7 +1715,7 @@ Devices that aren't always online need relays for message delivery. Relays hold 
 
 **Honest constraints:**
 
-- **Metadata exposure.** Relays see who talks to whom, when, and how much, even with encrypted payloads. Traffic analysis is powerful. Mitigating this (mixnets, onion routing, cover traffic) is an unsolved-at-scale problem. The protocol should acknowledge this gap rather than claim relays are fully untrusted. (See §9.9.1 for the formal relay threat model — what relays CAN and CANNOT do — and §9.10 for the complete metadata privacy analysis.)
+- **Metadata exposure.** Traffic analysis is powerful even with encrypted payloads. The protocol provides layered metadata privacy protections: minimal outer envelopes with per-context pseudonyms, fixed bucket padding, Tor integration, constant-rate cover traffic, relay set partitioning, and subscription mixing. (See §9.9.1 for the formal relay threat model — what relays CAN and CANNOT do — and §9.10 for the complete metadata privacy architecture.)
 - **Relay discovery.** If Alice wants to reach Bob, she needs to know Bob's relay. If Bob switches relays, Alice needs to discover the new one. This requires either a centralized directory (defeats the purpose), a distributed discovery mechanism (adds complexity and latency), or multi-relay registration (Bob publishes to several relays, Alice checks all of them). Nostr's experience: users publish a relay list, clients check multiple relays. Workable but not seamless. Relay list authentication is specified in §9.6.3 — NIP-65 signed events prevent relay list substitution attacks.
 - **Operational complexity.** A production relay needs reliable delivery, ordering, deduplication, rate limiting, and abuse prevention. "Simple message queue" undersells this. A reference implementation should exist, but running it reliably is a server operations task — not "install an app" level.
 - **Gravitational pull.** In theory relays are commodity. In practice, network effects apply to infrastructure. Nostr shows this: a few popular relays handle most traffic. The protocol can't prevent this concentration, but DID-based identity ensures it doesn't create lock-in — popular relay dies, users switch, identity survives. The agent workstation trend (§10.2) may significantly weaken centralization pressure — if most users run their own always-on node, personal relays become the default rather than the exception.
@@ -1702,11 +1798,11 @@ Deployment spectrum for content/data:
 
 Mobile devices need push notifications. On iOS the only mechanism is APNs (Apple Push Notification service). On Android, FCM (Firebase Cloud Messaging). Both are platform-mediated — Apple and Google are in the delivery path.
 
-This contradicts the sovereignty model. The protocol acknowledges the tension honestly:
+**Push notification opacity is mandatory.** Push payloads MUST contain a wake signal and nothing else. No context ID, no sender DID, no message preview, no metadata of any kind. The device wakes, connects to relays (via Tor per §9.10.5), pulls encrypted envelopes, and decrypts locally. Apple/Google learn only that the device received a notification at a specific time.
 
-- **For v1, push notifications depend on platform services.** This is a pragmatic reality. No mobile app can notify users without APNs/FCM. The SCP agent on a mobile device registers with its platform's push service. Relays or managed infrastructure trigger push notifications when messages arrive for offline devices. The notification payload is opaque (no content in the push itself — just a wake signal). The agent wakes, pulls encrypted envelopes from relays, and decrypts locally.
-- **The push service knows when you're receiving messages, not what they say.** This is the same trade-off Signal, WhatsApp, and every other encrypted messenger makes. Content confidentiality is preserved. Metadata (timing, frequency) leaks to the push provider.
-- **A sovereign push alternative is desirable but not blocking.** If a mechanism emerges that enables push without platform gatekeepers, the protocol should adopt it. For now, this is an accepted constraint.
+- **Push payloads are fully opaque.** The push payload contains exactly one piece of information: "wake up." No sender, no context, no count, no preview. The SCP agent on the device connects to its relay set and pulls all pending envelopes.
+- **The push service knows timing, not content or source.** Apple/Google learn when a device received a notification. They cannot determine which context, which sender, or even whether the notification corresponds to one message or many.
+- **A sovereign push alternative is desirable but not blocking.** If a mechanism emerges that enables push without platform gatekeepers, the protocol should adopt it. For now, this is an accepted constraint with the opacity guarantee limiting metadata exposure to timing only.
 
 ### 10.8 Multi-Device
 
@@ -2017,10 +2113,10 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 - **Minimum viable agent specification.** What does the simplest possible agent look like? The "transparent pipe" agent that just forwards human input needs a reference implementation that's trivially embeddable.
 - **Relay protocol specification.** What does the relay interface look like? Must be simple enough to self-host on consumer hardware. Encrypted payload in, encrypted payload out. (Partially resolved by §10.5 — may be delegated to existing transport if binding-first approach is taken.)
 - **Cooperative mode trust tiers.** How much does cooperative mode actually improve trust provenance for bridged content? Need to define the specific trust differential that incentivizes platforms.
-- **~~Primary transport binding.~~** ✅ **Resolved.** Nostr selected as primary binding (architectural alignment confirmed in planning session 04). Transport security requirements specified in §9.13 (TLS 1.3 required). Relay threat model formalized in §9.9. Relay list authentication specified in §9.6.3.
+- **~~Primary transport binding.~~** ✅ **Resolved.** SCP native relay protocol is the canonical transport. Transport is fully abstracted — 17 adapter options listed, no structural dependency on any single transport. Transport security requirements specified in §9.13 (TLS 1.3 required). Relay threat model formalized in §9.9.
 - **Transport abstraction interface.** Exact contract between SCP protocol logic and transport bindings. Must be thin enough that bindings are simple to write, rich enough that protocol logic doesn't leak transport assumptions.
 - **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 ciphersuite. Full specification in §9.7 (group key management), §9.5 (cryptographic primitives), §9.8 (message security). MLS tree-based key management provides O(log N) member exclusion. Blocking uses the same epoch advancement machinery.
-- **~~Metadata privacy.~~** ✅ **Resolved for v1.** Encrypted content + substitutable relays + cross-context key isolation is the v1 posture. §9.10 documents exactly what metadata is exposed to relays, the correlation risks, and why mixnet/cover traffic/PIR are explicitly out of scope for v1. Honest about the limitation rather than claiming false protection.
+- **~~Metadata privacy.~~** ✅ **Fully resolved.** Comprehensive metadata privacy architecture specified in §9.10: minimal outer envelope (§9.10.2), fixed bucket padding (§9.10.3), per-context pseudonyms (§9.10.4), Tor + persistent connections (§9.10.5), constant-rate cover traffic (§9.10.6), DID resolution privacy (§9.10.7), relay query privacy via partitioning + subscription mixing (§9.10.8). Push notification opacity mandated in §10.7. Sender-side key layer for blocking specified in §9.16.
 - **Verifiable event log format.** §7.3.1 specifies Merkle trees per context for event ordering and tamper detection. The concrete format — tree structure, hash algorithm, leaf schema, proof format — is not yet specified. Must be efficient enough for device-as-node participation. Candidates: sparse Merkle trees, append-only log trees (Certificate Transparency style), or Prolly trees.
 - **Behavioral record schema.** §7.3.2 defines what facts are derivable from event logs, but the record format is unspecified. How are behavioral records serialized, exchanged between agents, and verified against source logs? Must be compact enough for inline presentation and rich enough for meaningful evaluation.
 - **Challenge suite standards.** §7.3.4 introduces challenge-response verification for agent capabilities but doesn't define the challenge suites themselves. What tests constitute "prompt injection resistance"? Who defines and maintains challenge suites? How are custom challenges validated as fair? Need a registry or discovery mechanism.
@@ -2033,14 +2129,11 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 - **Identity key rotation and private state re-encryption.** When an identity key rotates (recovery scenario), private state must be re-encrypted. Single-owner simplifies this (no group redistribution) but the migration step needs specification — especially for large private state. (Key rotation triggers and the compromise recovery flow are specified in §9.7.4 and §9.12.)
 - **Identity private state discovery pointer.** Does the DID document explicitly signal where private state is stored, or is it implicit from the relay list? Relays need to distinguish between "context events involving this DID" and "this DID's private state."
 
-### Agent-to-Agent Communication
+### Context Lifecycle and Governance
 
-- **Registry governance.** Who runs registries? Community-operated, app-specific, protocol-seeded? How to prevent registry capture — one dominant registry becoming a gatekeeper? The protocol provides the mechanism (registries are contexts); governance norms need specification.
 - **Memory scope enforcement boundary.** Ephemeral key destruction is protocol-enforceable. Local agent memory is not. The spec acknowledges this (§5.11), but the boundary between "protocol can enforce" and "protocol can only signal" needs precise documentation for implementers. (§9.15 specifies the three trust levels for key destruction verification — hardware-attested, software-only, no attestation — which partially addresses this, but the agent-side memory boundary remains unspecified.)
 - **Context promotion mechanics.** When an ephemeral context "promotes" to persistent (both parties agree to continue), what happens? Options: (a) new context created, referencing the closed ephemeral one, or (b) same context with TTL removed and keys preserved. Option (a) is cleaner for the security model; option (b) preserves continuity. Needs decision.
-- **Referral chain depth.** Maximum depth for trust-carrying referrals. Likely 2-3, but needs analysis against real social graph data. Deeper chains may carry marginal trust signal; shallower limits may miss legitimate introductions.
 - **Summary generation mechanics.** For summary memory scope (§5.11): how is the summary produced? Who generates it — the context's tools, the participants collaboratively, or the protocol? What happens if participants disagree on the summary? What's the verification window before keys are destroyed?
-- **A2A activity in behavioral records.** What A2A metadata is included in behavioral records? A2A context participation, A2A context purposes? How granular? Controlled by the same social graph visibility (§3.6), but the specific data points need definition.
 
 ### Uncovered Areas
 

@@ -71,160 +71,126 @@ These designs are settled. No open questions block them.
 | **Bridges — Operating modes** | spec §12.4 | Ready | Relay, puppet, API, cooperative. |
 | **Bridges — Content provenance** | spec §12.5 | Ready | Trust hierarchy with identity × transport axes. |
 
-### Closed — Needs Spec Cleanup
+### Spec Cleanup — Completed
 
-Design is settled, but spec text needs updating based on session 06 decisions.
+All spec cleanup from session 06 decisions has been completed:
 
-| Area | Section | Cleanup Needed |
-|------|---------|----------------|
-| **Social graph — A2A visibility** | spec §3.6 | Remove A2A activity visibility paragraph if A2A removed (#4). |
-| **Contexts — Propose/accept** | spec §5.12 | Remove entirely if A2A removed (#4). |
-| **Cross-context — A2A isolation** | spec §6.1 | Remove A2A isolation paragraph if A2A removed (#4). |
-| **Cross-context — Human as bridge** | spec §6.3 | Remove propose/accept reference, revert to original framing if A2A removed. |
-| **Cross-context — Agent discovery** | spec §6.4 | Remove registries (§6.4.2), referrals (§6.4.3), keep context-mediated (§6.4.1) as tool-interface-only if A2A removed. |
-| **Security — A2A threats** | spec §9.2 | Remove prompt injection via proposals, Sybil flooding, memory-based attacks, discovery manipulation if A2A removed. |
-| **Security — Metadata privacy** | spec §9.10.5 | Currently says "out of scope for v1" — contradicts session 06 "no deferral." Must be rewritten once metadata privacy decisions (#1-3, #6-10) are confirmed. |
-| **Envelope signature scope** | spec §9.5 | Currently includes context_id and sender_did in outer signature. Must update for minimal outer envelope (#2) and per-context pseudonyms (#7). |
-| **Architecture — MVSDK** | architecture.md §5 | Lists did:web and Nostr as v1 targets, A2A as "v1.1." Must update: did:dht, SCP native relay, no A2A. |
-| **Architecture — Build phases** | architecture.md §6 | Phase 1 references Nostr, Phase 4 references A2A, Phase 6 references "did:dht migration." All need updating. |
-| **Architecture — Data flows** | architecture.md §2.2–2.3 | §2.2 references Nostr relay/events. §2.3 is A2A proposal flow — remove if A2A removed. |
-| **Architecture — Discovery Engine** | architecture.md §3.2 | References registries, referrals, introduction tokens. Simplify if A2A removed. |
-| **Architecture — Crate structure** | architecture.md §3.1 | References updated in session 06 but may still have stale A2A references. |
-| **Sketch — Propose/accept APIs** | sketch.md §2 | Remove propose/accept/reject/listProposals if A2A removed. |
-| **Sketch — Context proposal envelope** | sketch.md §11 | Remove context_proposal wire format if A2A removed. |
-| **Sketch — Introduction token** | sketch.md §11 | Remove introduction token wire format if A2A removed. |
-| **Sketch — A2A use cases** | sketch.md §14 | Remove entirely if A2A removed. |
-| **Sketch — Agent discovery** | sketch.md §12 | Keep context-mediated. Remove registry and referral APIs if A2A removed. |
-| **Sketch — What's Not Here Yet** | sketch.md §15 | Update to reflect current state. Several items resolved. |
+| Area | Status |
+|------|--------|
+| A2A removal (spec §5.12, §6.1, §6.3, §6.4, §9.2, §3.6) | ✅ Removed |
+| A2A removal (sketch §2, §11, §12, §14) | ✅ Removed |
+| A2A removal (architecture §2.3, §3.1, §3.2, §5, §6) | ✅ Removed |
+| Metadata privacy architecture (spec §9.10) | ✅ Rewritten — 10 subsections covering full privacy architecture |
+| Sender-side key layer (spec §9.16) | ✅ Written — 5 subsections covering key architecture, distribution, block protocol, blocking vs removal, forward secrecy |
+| Envelope signature scope (spec §9.5) | ✅ Updated for minimal outer envelope |
+| Push notification opacity (spec §10.7) | ✅ Mandated fully opaque |
+| Wire format (sketch §11) | ✅ Updated for minimal outer envelope |
+| "What's Not Here Yet" sections | ✅ Updated in both spec and sketch |
+| Architecture MVSDK tables (§5) | ✅ Updated |
+| Architecture build phases (§6) | ✅ Updated |
+| Architecture data flows (§2.2) | ✅ Updated for transport independence |
 
 ---
 
-## B. Open Questions (Need Decisions)
+## B. Open Questions — All Resolved
 
-All 10 from open-questions.md. Each has a concrete suggestion. Listed in recommended decision order.
+All 10 questions from open-questions.md have been resolved. Decisions documented in `decisions.md` and written into the spec.
 
-### Independent decisions (no dependencies)
-
-| # | Question | Suggestion | Blocked Sections | Dependencies |
-|---|----------|------------|-----------------|--------------|
-| **1** | Push notification opacity | Fully opaque, mandate it | spec §10.7 | None |
-| **4** | A2A propose/accept | Remove entirely | spec §5.12, §6.1, §6.3, §6.4, §9.2; sketch §2, §11, §12, §14; architecture §2.3, §3.2, §5, §6 | None (highest architectural impact) |
-| **5** | Sender-side key layer design | AES-256 symmetric, MLS-distributed, sender-first encryption, protocol-notified mutual block | spec §3.6, §10.5 (needs new §9.16) | None |
-
-### Dependent decisions (must follow order)
-
-| # | Question | Suggestion | Blocked Sections | Depends On |
-|---|----------|------------|-----------------|------------|
-| **2** | Envelope format metadata | Minimal outer envelope (routing pseudonym + blob TTL + encrypted blob) | spec §9.5 (signature scope), §9.10; sketch §11 (wire format) | None, but pairs with #7 |
-| **7** | Per-context pseudonyms | Yes, HKDF-derived, inside-encryption verification | spec §9.10, §10.5 (envelope format) | #2 |
-| **3** | Message size normalization | Fixed bucket padding (256B/1KB/4KB/16KB/64KB/256KB) | spec §9.10 | None, but pairs with #8 |
-| **6** | Connection privacy | Tor hidden services for relays + persistent connections | spec §9.10 | None, but relates to #9 |
-| **8** | Cover traffic | Mandatory on persistent connections, not on push-wake | spec §9.10 | Pairs with #3 |
-| **9** | DID resolution privacy | Local DHT node on persistent devices, Tor on mobile | spec §9.10 | Relates to #6 |
-| **10** | Relay query privacy | Pseudonyms + relay set partitioning + subscription mixing | spec §9.10 | #7 |
-
-### Inter-question dependencies
-
-```
-#2 (Envelope opacity) → #7 (Pseudonyms) → #10 (Relay query privacy)
-#6 (Connection privacy) → #9 (DID resolution privacy)
-#3 (Message size) + #8 (Cover traffic) → combined traffic analysis defense
-#4 (A2A) independent but highest architectural impact
-#5 (Sender-side blocking) independent
-#1 (Push opacity) independent
-```
+| # | Question | Decision | Written Into |
+|---|----------|----------|-------------|
+| **1** | Push notification opacity | Fully opaque, mandatory | spec §10.7 |
+| **2** | Envelope format metadata | Minimal outer envelope | spec §9.10.2, §9.5, sketch §11 |
+| **3** | Message size normalization | Fixed bucket padding (256B–256KB) | spec §9.10.3 |
+| **4** | A2A propose/accept | Removed entirely | spec, sketch, architecture (all A2A sections removed) |
+| **5** | Sender-side key layer | AES-256 symmetric, MLS-distributed, mutual block | spec §9.16 |
+| **6** | Connection privacy | Tor + persistent connections | spec §9.10.5 |
+| **7** | Per-context pseudonyms | HKDF-derived, inside-encryption verification | spec §9.10.4 |
+| **8** | Cover traffic | Constant-rate on persistent connections | spec §9.10.6 |
+| **9** | DID resolution privacy | Local DHT node + Tor mobile | spec §9.10.7 |
+| **10** | Relay query privacy | Pseudonyms + partitioning + subscription mixing | spec §9.10.8 |
 
 ---
 
 ## C. Missing Specifications
 
-Designs that have been decided directionally but need full protocol-level specification before implementation.
+Designs that need protocol-level specification to complete. All open questions are resolved — remaining gaps are implementation details.
 
 ### Critical Path (blocks Phase 1)
 
-| Missing Spec | Status | Decided? | What's Needed |
-|-------------|--------|----------|---------------|
-| **SCP native relay protocol** | Not designed | Direction decided (session 06 §1.6) | Full protocol spec: message format, subscription mechanism, delivery receipts, deletion requests, blob TTL, authentication (if any), error codes. The simplest possible store-and-forward relay. |
-| **Sender-side key layer protocol** | Partially designed | Direction decided (session 06 §1.1), detailed in OQ #5 | Full spec as §9.16: key generation, distribution via MLS, encryption order, mutual block notification, key rotation on block, storage requirements, forward secrecy interaction. Blocked by OQ #5 confirmation. |
-| **Envelope format** | Partially designed | Outer envelope described in spec §9.5, sketch §11 | Must be redesigned for minimal outer envelope (OQ #2), per-context pseudonyms (OQ #7), blob TTL. Inner format mostly specified. |
-| **Transport abstraction trait** | Conceptual | Transport independence decided | Formal Rust trait definition: 5-6 methods (send, subscribe, unsubscribe, query, delete). Error types. Async interface. Connection lifecycle. |
+| Missing Spec | Status | What's Needed |
+|-------------|--------|---------------|
+| **SCP native relay protocol** | Not designed | Full protocol spec: message format (minimal outer envelope is specified in §9.10.2), subscription mechanism, delivery receipts, deletion requests, blob TTL enforcement, error codes. The simplest possible store-and-forward relay. ADR-004 captures implementation approach. |
+| **Transport abstraction trait** | ADR written (ADR-005) | Formal Rust trait definition with async interface. ADR provides the approach; trait definition is straightforward to implement. |
 
 ### Critical Path (blocks Phase 2)
 
-| Missing Spec | Status | Decided? | What's Needed |
-|-------------|--------|----------|---------------|
-| **Context lifecycle state machine** | Conceptual | Core concepts decided | Formal state machine: states (creating, active, closing, closed, expired), transitions, events that trigger each transition, invariants at each state. |
-| **Event log format** | Conceptual | Merkle tree decided (spec §7.3.1, §9.5) | Concrete format: event entry structure, hash chain construction, proof format, checkpoint format, pruning rules, storage requirements. |
-| **UCAN capability schema** | Partially specified | UCAN selected (planning-session-04) | Concrete capability types (scp:ctx:{id}/messages, scp:ctx:{id}/tools/{name}, etc.), delegation chain rules, revocation list format, nonce generation. |
-| **Stateful tool session protocol** | Conceptual | Concept in spec §6.2.1 | Session ID format, session state management, TTL enforcement, session-scoped governance, wire format for session calls. |
+| Missing Spec | Status | What's Needed |
+|-------------|--------|---------------|
+| **Context lifecycle state machine** | ADR written (ADR-008) | Formal state machine: states, transitions, invariants. ADR provides the approach. |
+| **Event log format** | ADR written (ADR-011) | Concrete format: entry structure, hash chain, proof format, pruning rules. |
+| **UCAN capability schema** | ADR written (ADR-016) | Concrete capability types, delegation chain rules, revocation list format, nonce generation. |
+| **Stateful tool session protocol** | ADR written (ADR-010) | Session ID format, state management, TTL enforcement, wire format. |
 
 ### Important but not blocking early phases
 
-| Missing Spec | Status | Decided? | What's Needed |
-|-------------|--------|----------|---------------|
-| **Behavioral record schema** | Conceptual | Record types listed in spec §7.3.2 | Formal schema: field names, types, derivation rules, aggregation across contexts, privacy (what's public vs what requires capability). |
-| **Offline/sync strategy** | Flagged as "hardest unsolved problem" | Not decided | MLS group state sync after extended offline. Pending proposal accumulation. Group state reset triggers. This is the highest-risk design gap. |
-| **Summary generation protocol** | Conceptual | Lifecycle hooks described in spec §5.11 | Pre-close summary generation, verification window, summary format (or format freedom), both-party verification flow, key destruction timing. |
-| **Governance interface** | Conceptual | Pluggable model decided | Minimum viable interface: propose/approve/reject. How custom governance models register. State machine for governance proposals. |
-| **Per-context pseudonym protocol** | Partially designed | Direction in OQ #7 | HKDF derivation spec, pseudonym-to-DID verification protocol, caching rules, new-member onboarding flow. Blocked by OQ #7 confirmation. |
-| **Cover traffic protocol** | Partially designed | Direction in OQ #8 | Dummy message format, constant-rate specification, real/dummy multiplexing, recipient discard protocol. Blocked by OQ #8 confirmation. |
-| **Metadata privacy mechanisms** | Partially designed | Directions in OQ #1-3, #6-10 | Each confirmed OQ needs protocol-level specification. These collectively form the metadata privacy architecture. |
-| **Context promotion** | Not designed | Not decided | When ephemeral/TTL context needs to become persistent. New context referencing old, or same context with TTL removed? |
-| **Capability declaration format** | Conceptual | App interface decided | JSON schema for app manifests. LLM-parseable. Versioning. |
-| **Registry tool schema standard** | Not designed | Registries are standard contexts | Recommended tool schema for interoperability across registries. Lower priority if A2A removed. |
-| **Referral chain mechanics** | Partially designed | Concept in spec §6.4.3 | IntroductionToken wire format, chain depth limits, trust decay function. Irrelevant if A2A removed. |
+| Missing Spec | Status | What's Needed |
+|-------------|--------|---------------|
+| **Behavioral record schema** | Conceptual | Formal schema: field names, types, derivation rules, aggregation, privacy levels. |
+| **Offline/sync strategy** | Highest-risk design gap | MLS group state sync after extended offline. Pending proposal accumulation. Group state reset triggers. |
+| **Summary generation protocol** | Conceptual | Pre-close summary generation, verification window, format, both-party verification flow. |
+| **Governance interface** | Conceptual | Minimum viable interface: propose/approve/reject. Custom governance model registration. |
+| **Context promotion** | Not designed | Ephemeral→persistent: new context referencing old, or same context with TTL removed? |
+| **Capability declaration format** | Conceptual | JSON schema for app manifests. LLM-parseable. |
 
 ---
 
 ## D. Implementation Readiness by Build Phase
 
-### Phase 1 — Crypto Proof
+### Phase 1 — Crypto Proof (ADRs 001–007)
 
-| Component | Ready? | Blockers |
-|-----------|--------|----------|
-| MLS wrapper (OpenMLS) | **Yes** | None — spec §9.7 is complete |
-| Envelope creation/signing/verification | **Partially** | Envelope format needs redesign for minimal outer envelope (OQ #2) |
-| DID creation (did:dht) | **Yes** | None — direction clear, libraries exist |
-| SCP native relay protocol + adapter | **No** | Protocol not yet designed |
-| In-memory key storage (testing) | **Yes** | None — standard testing adapter |
-| Sender-side key layer | **No** | Needs OQ #5 confirmation + full spec |
+| Component | ADR | Ready? | Blockers |
+|-----------|-----|--------|----------|
+| MLS wrapper (OpenMLS) | ADR-001 | **Yes** | None |
+| Envelope creation/signing/verification | ADR-002 | **Yes** | Envelope format now specified (§9.10.2, sketch §11) |
+| DID creation (did:dht) | ADR-003 | **Yes** | None |
+| SCP native relay protocol + adapter | ADR-004 | **Mostly** | Relay protocol needs detailed spec (envelope format is done) |
+| Transport abstraction trait | ADR-005 | **Yes** | None |
+| In-memory platform adapter (testing) | ADR-006 | **Yes** | None |
+| Sender-side key layer | ADR-007 | **Yes** | Spec written as §9.16 |
 
-**Phase 1 blockers:** Envelope format (OQ #2), native relay protocol (undesigned), sender-side key layer (OQ #5 + spec needed).
+**Phase 1 status:** All ADRs written. All open questions resolved. Relay protocol detail is the only remaining design gap — envelope format and transport trait are specified.
 
-**Phase 1 unblocked work:** MLS wrapper, DID creation, in-memory key storage, transport trait definition, basic envelope (can start with current format, redesign later).
+### Phase 2 — Context + Transport (ADRs 008–012)
 
-### Phase 2 — Context + Transport
+| Component | ADR | Ready? | Blockers |
+|-----------|-----|--------|----------|
+| Context lifecycle state machine | ADR-008 | **Yes** | None |
+| Role assignment / capability ceiling | ADR-009 | **Yes** | None |
+| Tool registration and invocation | ADR-010 | **Yes** | None |
+| Verifiable event log (Merkle tree) | ADR-011 | **Yes** | None |
+| Multi-transport routing | ADR-012 | **Yes** | None |
 
-| Component | Ready? | Blockers |
-|-----------|--------|----------|
-| Context lifecycle state machine | **No** | Needs formal state machine spec |
-| Role assignment / capability ceiling | **Yes** | Spec complete |
-| Tool registration and invocation | **Yes** | Spec complete |
-| Stateful tool sessions | **No** | Needs wire format spec |
-| Event log (Merkle tree) | **No** | Needs concrete format spec |
-| Transport abstraction trait | **No** | Needs formal trait definition |
-| Multi-transport routing | **Partially** | Trait needed first |
+**Phase 2 status:** All ADRs written. No blockers.
 
-### Phase 3 — Python SDK
+### Phase 3 — Python SDK (ADRs 013–016)
 
-| Component | Ready? | Blockers |
-|-----------|--------|----------|
-| PyO3 bridge layer | **Yes** | Depends on scp-core completion |
-| Python wrappers | **Yes** | Depends on API surface stability |
-| MCP adapter | **Yes** | Spec complete |
-| UCAN validation | **No** | Needs capability schema spec |
+| Component | ADR | Ready? | Blockers |
+|-----------|-----|--------|----------|
+| PyO3 bridge layer | ADR-013 | **Yes** | Depends on scp-core (Phase 1+2) |
+| Python SDK wrappers | ADR-014 | **Yes** | Depends on ADR-013 |
+| MCP adapter | ADR-015 | **Yes** | Depends on ADR-013, ADR-014 |
+| UCAN validation | ADR-016 | **Yes** | Depends on ADR-013 |
+
+**Phase 3 status:** All ADRs written. Blocked only on Phase 1+2 completion.
 
 ---
 
-## E. Recommended Sequence
+## E. Recommended Next Steps
 
-1. **Decide all 10 open questions** — unblocks everything else
-2. **Write sender-side key layer spec (§9.16)** — unlocks Phase 1
-3. **Design SCP native relay protocol** — unlocks Phase 1
-4. **Define transport abstraction trait** — unlocks Phase 1 and 2
-5. **Redesign envelope format** — affects Phase 1
-6. **Spec cleanup** (remove A2A if decided, update metadata privacy sections)
-7. **Formal state machines** (context lifecycle, tool sessions)
-8. **Event log format** — unlocks Phase 2
-9. **UCAN capability schema** — unlocks Phase 2/3
-10. **ADRs for Phase 1 components** — code follows immediately
+All open questions are resolved. All ADRs are written. The project is ready for implementation.
+
+1. **Design SCP native relay protocol detail** — the one remaining design gap. Envelope format is specified; relay needs subscription mechanism, delivery receipts, deletion requests, error codes.
+2. **Begin Phase 1 implementation** — start with MLS wrapper (ADR-001) and DID creation (ADR-003) in parallel, then transport trait (ADR-005), envelope (ADR-002), relay (ADR-004), sender-side keys (ADR-007).
+3. **Phase 2 implementation** — context lifecycle (ADR-008), then roles (ADR-009), tools (ADR-010), event log (ADR-011), multi-transport (ADR-012).
+4. **Phase 3 implementation** — PyO3 bridge (ADR-013), Python wrappers (ADR-014), MCP adapter (ADR-015), UCAN validation (ADR-016).
+5. **Address remaining design gaps as they arise** — offline/sync strategy, behavioral record schema, governance interface, context promotion.

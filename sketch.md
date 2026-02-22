@@ -914,28 +914,35 @@ let recipes = try await SCP.ToolInterface.call(
 
 What actually moves on the network. All messages are encrypted with the context key before reaching transport — relays only see opaque blobs.
 
-### Encrypted Envelope (what the relay sees)
+### Outer Envelope (what the relay sees)
 
 ```json
 {
   "protocol": "scp/1.0",
-  "context_id": "ctx:z6Mkq8...",
-  "sender_did": "did:key:z6Mkf5rG...",
-  "encrypted_payload": "base64...",
-  "timestamp": "2026-02-14T15:30:00Z",
-  "signature": "z3hR9xK..."
+  "routing_id": "z4K9xR...",
+  "recipient_hint": "z7Lm3Q...",
+  "ttl": 604800,
+  "blob": "base64..."
 }
 ```
 
-Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if you have the context key, you're a member.
+The outer envelope is minimal by design (spec §9.10.2). The relay sees only:
+- **routing_id** — per-context pseudonym derived via HKDF (spec §9.10.4). Unlinkable across contexts.
+- **recipient_hint** — recipient's per-context pseudonym for directed messages, or `"*"` for broadcast.
+- **ttl** — seconds until the relay should delete this blob.
+- **blob** — the encrypted payload. Everything else is inside.
 
-### Decrypted Payload (what members see)
+No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pipe.
+
+### Decrypted Payload (what members see after MLS + sender-key decryption)
 
 ```json
 {
   "type": "agent_action",
+  "context_id": "ctx:z6Mkq8...",
   "from": {
-    "did": "did:key:z6Mkf5rG...",
+    "did": "did:dht:z6Mkf5rG...",
+    "pseudonym": "z4K9xR...",
     "agent_id": "agent:z6Mkf5rG:ctx:z6Mkq8...",
     "capability_token": "eyJhbGciOiJFZERTQSIs..."
   },
@@ -946,8 +953,12 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
       "query": "butter substitute in cookies"
     }
   },
-  "nonce": "a1b2c3d4",
-  "event_sequence": 4782
+  "epoch": 42,
+  "generation": 7,
+  "sequence": 4782,
+  "timestamp": "2026-02-14T15:30:00Z",
+  "signature": "z3hR9xK...",
+  "nonce": "a1b2c3d4"
 }
 ```
 
@@ -961,7 +972,7 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
   "ceiling": ["messaging", "media", "tool_invocation", "progress_tracking"],
   "governance": {
     "model": "single_admin",
-    "admin": "did:key:z6MkpT..."
+    "admin": "did:dht:z6MkpT..."
   },
   "roles": {
     "admin": { "capabilities": ["*"] },
@@ -976,7 +987,7 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
       "output_schema": { "type": "object", "properties": { "answer": { "type": "string" } } },
       "required_role": "member",
       "implementation_hash": "sha256:abc123...",
-      "operator": "did:key:z6MkpT...",
+      "operator": "did:dht:z6MkpT...",
       "test_vectors": 3
     }
   ],
@@ -987,13 +998,13 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
     { "trigger": "message_velocity > 50/min", "action": "capability_suspension", "duration": "1h" }
   ],
   "bridges": [
-    { "platform": "x", "mode": "relay", "operator": "did:key:z6MkpT...", "shadows": 12 }
+    { "platform": "x", "mode": "relay", "operator": "did:dht:z6MkpT...", "shadows": 12 }
   ],
   "ttl": null,
   "memory_scope": "full",
   "members": 47,
   "created": "2026-01-20T10:00:00Z",
-  "creator": "did:key:z6MkpT..."
+  "creator": "did:dht:z6MkpT..."
 }
 ```
 
@@ -1003,7 +1014,7 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
 {
   "header": { "alg": "EdDSA", "typ": "JWT", "ucv": "0.10.0" },
   "payload": {
-    "iss": "did:key:z6MkpT...",
+    "iss": "did:dht:z6MkpT...",
     "aud": "agent:z6MkpT:ctx:z6Mkq8...",
     "att": [
       { "with": "scp:ctx:z6Mkq8/tool/recipe_assistant", "can": "invoke" },
@@ -1023,8 +1034,8 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
 {
   "id": "att:z6Mk...",
   "type": "identity_link",
-  "issuer": "did:key:z6Mkf5rG...",
-  "subject": "did:key:z6Mkf5rG...",
+  "issuer": "did:dht:z6Mkf5rG...",
+  "subject": "did:dht:z6Mkf5rG...",
   "claim": {
     "platform": "x",
     "handle": "@alice",
@@ -1037,7 +1048,7 @@ Relay stores and forwards. Cannot read payload. Encryption-as-access-control: if
   "issued_at": "2026-02-14T12:00:00Z",
   "expires": "2026-03-14T12:00:00Z",
   "renewed_at": null,
-  "revocation": "did:key:z6Mkf5rG.../revocations",
+  "revocation": "did:dht:z6Mkf5rG.../revocations",
   "signature": "..."
 }
 ```
@@ -1051,7 +1062,7 @@ Attached to data crossing context boundaries:
   "provenance": {
     "source_context": "ctx:z6Mkq8...",
     "source_type": "ephemeral",
-    "counterparties": ["did:key:z6MkpT..."],
+    "counterparties": ["did:dht:z6MkpT..."],
     "purpose": "Scheduling discussion",
     "discovery_method": {
       "type": "shared_context",
