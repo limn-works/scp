@@ -1531,7 +1531,7 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 
 - **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in spec.md §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §16 below.
 - **Transport abstraction interface.** The 5-6 methods. Envelope format. SCP defines its own transport abstraction with bindings to existing transports (Nostr, Matrix, WebSocket). The binding approach — not building directly on any single transport.
-- **~~DID method selection.~~** ✅ **Resolved.** did:dht selected as target method (self-certifying, key rotation via DID document versioning). did:web as v1 stepping stone. See spec.md §9.6 for security properties of each.
+- **~~DID method selection.~~** ✅ **Resolved.** did:dht selected as primary method (self-certifying, key rotation via DID document versioning). did:web exists as contingency fallback only if did:dht libraries prove unusable — not a planned deployment path. See spec.md §9.6 for security properties of each.
 - **UCAN capability schema.** Concrete capability types, token format, delegation chains.
 - **Context lifecycle state machine.** Event sequence for create, join, leave, destroy, expire (TTL), and propose/accept. Minimum viable context.
 - **Minimum viable agent.** Likely a passthrough that takes human input, wraps it in SCP envelopes, signs, and sends. Reference implementation that's trivially embeddable.

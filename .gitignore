@@ -1,0 +1,10 @@
+.DS_Store
+
+# Ralph autonomous loop
+.ralph/logs/
+.ralph/.stop
+.ralph/.pid
+.ralph/.directive
+.ralph/.piped_directive
+.ralph/.iteration_marker
+.ralph/ralph.log

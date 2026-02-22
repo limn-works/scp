@@ -19,6 +19,15 @@ The protocol is designed for a world where:
 - The gap between self-hosting and managed infrastructure is negligible.
 - The big 3 (Apple, Google, Meta) will build closed versions of this. This is the open alternative.
 
+### Core Principles
+
+1. **Identity.** Every actor has a cryptographically verifiable identity (DID). Actions trace to identities. Identities trace to humans.
+2. **Context isolation.** All interaction happens within contexts. Agents are separate instances per context. Cross-context data flow is explicit and governed.
+3. **Provenance.** All non-private data carries verifiable origin metadata. Every message, tool output, attestation, and cross-context data transfer is traceable to its source. Provenance is not a feature — it is a foundational property of every protocol action. The absence of provenance on data is itself a signal ("this has no verified origin"). Provenance enables Sybil detection, governance enforcement, trust evaluation, and accountability.
+4. **Encryption-as-access-control.** Context membership is enforced cryptographically. If you don't have the key, you can't read the data. No relay or intermediary enforces access — the math does.
+5. **Legibility before opt-in.** Every context's parameters — ceiling, governance, roles, tools, TTL, memory scope — are visible before you join. No hidden terms.
+6. **Human accountability.** Every agent traces to a human DID. Behavioral records are durable. Actions have consequences that persist across contexts.
+
 ---
 
 ## 2. System Design
@@ -331,7 +340,7 @@ This extends to relationship metadata — not just whether a connection exists, 
 
 **Block/mute** is stored in identity private state (§3.7) — persistent, portable, encrypted.
 
-**Block** is DID-to-DID and bidirectional. When Alice blocks Dave, neither can see the other — across all shared contexts. Blocking is cryptographically enforced through the group encryption protocol (§10.5). When a block is issued, the blocker's encryption keys are rotated and redistributed to all context members except the blocked party. The blocked party physically cannot decrypt the blocker's future messages. This is the same key management mechanism used for member removal — blocking and removal share cryptographic infrastructure. Blocks can optionally be scoped to a specific context, but the default and most common case is DID-to-DID across all shared contexts.
+**Block** is DID-to-DID and bidirectional. When Alice blocks Dave, neither can see the other — across all shared contexts. Blocking is cryptographically enforced through a **sender-side key layer** (§10.5), which is distinct from MLS group membership. When a block is issued, the blocker rotates their personal sender key and redistributes it to all context members except the blocked party. The blocked party physically cannot decrypt the blocker's future messages. Critically, blocking does NOT remove the blocked party from the MLS group — they remain a context member and can still see other members' messages. Blocking is a unilateral, per-relationship action by the blocker; it does not require group coordination or affect the blocked party's relationship with other context members. This is fundamentally different from member removal, which IS a group action (MLS Remove Commit + epoch advancement). Blocks can optionally be scoped to a specific context, but the default and most common case is DID-to-DID across all shared contexts.
 
 **Mute** is unidirectional. Alice mutes Dave; Alice no longer sees Dave's content. Dave is unaffected and can still see Alice. Muting is a protocol rule enforced in the SDK — apps built on the SDK inherit this behavior. Because the muter is not adversarial against themselves (they chose the mute), SDK-level enforcement is sufficient; cryptographic exclusion is not required.
 
@@ -383,7 +392,7 @@ DID resolution is the trust root for the entire protocol. If resolution can be M
 
 **did:dht (target method):** Self-certifying. The DID string encodes the public key. DID documents are signed via BEP44 and verifiable against the DID without trusting any intermediary. MITM on resolution is impossible given the correct DID. Stale documents are rejected via sequence numbers. See §9.6 for full specification.
 
-**did:web (v1 stepping stone):** NOT self-certifying. Security depends on DNS + TLS + server integrity. The SDK MUST use TLS pinning + TOFU (Trust On First Use) + key change alerts to mitigate. See §9.6.2 for required mitigations.
+**did:web (fallback only):** NOT self-certifying. Security depends on DNS + TLS + server integrity. The SDK MUST use TLS pinning + TOFU (Trust On First Use) + key change alerts to mitigate. did:web exists as a fallback if did:dht libraries prove unusable — not as a planned stepping stone. See §9.6.2 for required mitigations.
 
 **Key Continuity Verification:** Signal-style safety numbers for DIDs, enabling out-of-band verification that two parties have the correct keys for each other. See §9.11.
 
@@ -558,7 +567,9 @@ Contexts gain a declared memory scope — what happens to the context's data whe
 
 Three scopes:
 
-**Ephemeral.** Context encryption keys are destroyed on close. Content is physically unreadable — anyone who didn't participate at the time cannot recover the interaction, and participants' protocol-level access to the content is severed. Durable metadata persists: who participated, when, the declared purpose, behavioral contributions (participation counts, tool invocations), and discovery provenance. An agent's local orchestration (above the protocol boundary) may retain information from the interaction, but any data the agent subsequently uses elsewhere carries provenance at the protocol level: "sourced from closed ephemeral context."
+**Ephemeral.** Context encryption keys are destroyed on close AND the SDK issues deletion requests to relays for all encrypted event data associated with the context. Content is physically unreadable (keys destroyed) and actively cleaned up (ciphertext deleted where relays comply). Durable metadata persists: who participated, when, the declared purpose, behavioral contributions (participation counts, tool invocations), and discovery provenance. An agent's local orchestration (above the protocol boundary) may retain information from the interaction, but any data the agent subsequently uses elsewhere carries provenance at the protocol level: "sourced from closed ephemeral context."
+
+Relay deletion is best-effort — relays are untrusted infrastructure and cannot be forced to delete. Defense in depth: even if a relay retains the encrypted blobs, the keys are destroyed and the data is unreadable. Relay compliance with deletion requests is tracked as part of relay reliability scoring (§9.9.2) — relays that retain data they were asked to delete are scored lower and deprioritized for future context creation.
 
 **Summary.** Context produces a structured summary on close. Full content is destroyed (keys destroyed as with ephemeral). The summary persists with full provenance. Both parties can verify the summary against the event log before keys are destroyed. The summary format is defined by the context (via tools or governance), not by the protocol — the protocol provides the lifecycle hooks (pre-close summary generation, verification window, key destruction) but does not prescribe summary content.
 
@@ -619,14 +630,50 @@ Agent isolation is preserved even with propose/accept context creation (§5.12).
 
 ### 6.2 Context-to-Context Tool Interfaces
 
-Contexts can expose tool endpoints to other contexts. These are stateless, structured interfaces. Both contexts must explicitly opt in to establish the interface. Data flows through defined function signatures, not through agent memory or discretion.
+Contexts can expose tool endpoints to other contexts. **The context governs the tool call, not the agent.** An agent in Context A does not directly contact Context B — the agent requests from Context A, Context A's governance decides whether to permit the outbound call, and Context B's governance decides whether to permit the inbound call and how to respond. Both contexts mediate. The agent never directly touches the other context.
+
+This is the mechanism for all structured inter-agent interaction across context boundaries. It is strictly stronger governance than any agent-to-agent direct channel because both contexts' governance models, capability ceilings, and role permissions gate every interaction.
 
 Properties:
 
-- Both contexts opt in explicitly.
-- Interfaces are stateless: input in, output out.
-- Auditable: every call through an interface is logged structurally.
-- Tool interfaces carry provenance: data received through an interface knows its origin context.
+- Both contexts opt in explicitly (bidirectional consent at the context level, not the agent level).
+- Data flows through defined function signatures, not through agent memory or discretion.
+- Auditable: every call through an interface is logged in both contexts' event logs with full provenance (§7.7).
+- Tool interfaces carry provenance: data received through an interface carries its origin context, invoking agent, and timestamp.
+- Rate-limited: both contexts can enforce rate limits on interface calls.
+
+#### 6.2.1 Stateful Tool Sessions
+
+Tool interfaces support optional session-based multi-turn interaction. A tool can accept a session identifier and maintain state across sequential invocations. This enables multi-step workflows (negotiation, coordination, iterative refinement) within the governed tool call framework.
+
+```
+// First call: initiate a scheduling session
+Context A → Context B tool "schedule_meeting":
+  input:  { action: "propose", times: ["Tue 3pm", "Thu 2pm"] }
+  output: { session_id: "sched:abc123", status: "pending", counter: ["Tue 4pm"] }
+
+// Second call: continue the session
+Context A → Context B tool "schedule_meeting":
+  input:  { session_id: "sched:abc123", action: "accept", time: "Tue 4pm" }
+  output: { session_id: "sched:abc123", status: "confirmed", time: "Tue 4pm" }
+```
+
+Session state is maintained by the tool's context (Context B), not by the calling agent. Each call in the session is individually governed — Context A's governance permits each outbound call, Context B's governance permits each inbound call. The session does not create a persistent channel; it is a sequence of governed tool calls that share state via an opaque session identifier.
+
+Sessions have a TTL set by the tool's context. Expired sessions are cleaned up. Session state is internal to the tool's context and not visible to the calling context beyond the tool's defined output schema.
+
+#### 6.2.2 Discovery via Tool Interfaces
+
+Agent discovery across contexts is achievable through tool interfaces. A context can expose a discovery tool (e.g., member search, capability lookup) that other contexts can invoke. This does not require a separate discovery primitive — discovery is just another tool call between contexts that opt in.
+
+```
+// Context A queries a registry context's search tool
+Context A → Registry Context tool "agent_search":
+  input:  { capability: "japanese_cooking", min_history: 5 }
+  output: { results: [{ did: "did:dht:...", capabilities: [...], behavioral_summary: {...} }] }
+```
+
+Registry contexts (§6.4.2) are standard contexts that expose discovery tools. The discovery mechanism inherits all context-governed properties: both contexts opt in, calls are rate-limited and auditable, results carry provenance.
 
 ### 6.3 The Human as Bridge
 
@@ -946,14 +993,14 @@ Attestation is not a feature of any single section of SCP — it is a primitive 
 - **Agents (§4):** Agent capability metadata is a self-attestation about what the agent can do.
 - **Contexts (§5):** Role assignments are attestations by governance about an agent's permissions. Tool registrations include integrity attestations.
 - **Trust (§7):** Capability tokens (UCAN) are delegation attestations. Endorsements are trust attestations. Behavioral records are computed from verified event attestations.
-- **Security (§9):** Provenance chains are sequences of attestations about where data came from.
+- **Security (§9):** Provenance chains are sequences of attestations about where data came from. Provenance is a core protocol principle (§1) — all non-private data carries verifiable origin.
 - **Bridges (§12):** Shadow identity claims are bridge operator attestations. Identity claiming is a self-attestation verified against the shadow.
 
 The common envelope format (§7.4.1) unifies these under a single verifiable structure. The verification mechanics are the same regardless of attestation type: check signature, check evidence, check expiry, check revocation. What varies is the claim content and how it's evaluated.
 
 ### 7.7 Data Provenance
 
-When data moves from one context to another — through any protocol mechanism — it carries provenance metadata. This is the protocol making data flow legible without prohibiting it.
+Provenance is a core principle of SCP (§1): all non-private data carries verifiable origin metadata. This section specifies how provenance is implemented for data that crosses context boundaries. Provenance applies protocol-wide — messages carry sender provenance (DID + context + timestamp), attestations carry issuer provenance (DID + evidence + expiry), tool outputs carry invocation provenance (tool + invoking agent + context), and cross-context data carries origin provenance (source context + counterparties + discovery method). The absence of provenance on any data is itself a signal that the data has no verified origin.
 
 #### 7.7.1 Provenance Format
 
@@ -1217,18 +1264,18 @@ The did:dht method (target DID method for SCP) is **self-certifying**: the DID s
 
 #### 9.6.2 did:web Security Properties and Limitations
 
-did:web (v1 stepping stone) resolves via HTTPS to a well-known path on the authority domain. Security depends on DNS integrity, TLS certificate validity, and server integrity.
+did:web (fallback only — used only if did:dht libraries prove unusable) resolves via HTTPS to a well-known path on the authority domain. Security depends on DNS integrity, TLS certificate validity, and server integrity.
 
-**did:web is NOT self-certifying.** A compromised server, DNS hijack, or CA compromise can serve a fraudulent DID document indistinguishable from a legitimate one. This is the fundamental reason did:web is a stepping stone, not the target method.
+**did:web is NOT self-certifying.** A compromised server, DNS hijack, or CA compromise can serve a fraudulent DID document indistinguishable from a legitimate one. did:web introduces a server dependency that contradicts SCP's infrastructure-minimal design. It exists as a contingency fallback, not a planned deployment path.
 
-**Required mitigations for did:web in v1:**
+**Required mitigations if did:web is used:**
 
 - The SDK MUST pin the TLS certificate of the did:web resolution server.
 - The SDK MUST verify that the DID document's verification method key matches the key used for all prior interactions with this DID (key continuity check / TOFU — Trust On First Use).
 - The SDK MUST alert the user on any key change, with maximum severity.
 - The SDK SHOULD record the did:web key fingerprint in identity private state (§3.7) for cross-device consistency of TOFU state.
 
-**Migration from did:web to did:dht:** The migration must be signed by the old did:web key, creating a verifiable authorization chain: "the identity formerly at did:web:example.com is now at did:dht:z6Mk...". Both DIDs temporarily resolve to the same public key during the transition.
+**Migration from did:web to did:dht (if fallback was used):** If a deployment started with did:web as a fallback, migration to did:dht must be signed by the old did:web key, creating a verifiable authorization chain: "the identity formerly at did:web:example.com is now at did:dht:z6Mk...". Both DIDs temporarily resolve to the same public key during the transition. This migration path exists for contingency recovery, not as a planned lifecycle.
 
 #### 9.6.3 Relay List Authentication
 
@@ -1543,7 +1590,7 @@ When a key is known or suspected to be compromised, the following ordered steps 
 
 **Certificate validation:** Standard WebPKI validation. The SDK MUST reject self-signed certificates for relay connections unless the user has explicitly configured a self-hosted relay with a pinned certificate.
 
-**Certificate pinning:** The SDK SHOULD support certificate pinning for known relays. This is particularly important for the did:web resolution server during the v1 period.
+**Certificate pinning:** The SDK SHOULD support certificate pinning for known relays. If did:web is used as a fallback, certificate pinning for the resolution server is mandatory.
 
 **Relay authentication:** NIP-42 (Nostr relay authentication) is supported but not required. SCP does not depend on relay authentication — encryption-as-access-control (§10.5) makes it unnecessary for confidentiality. Relay authentication may be useful for relays that want to limit their user base or implement per-user rate limiting.
 
@@ -1692,20 +1739,32 @@ Below the abstraction, **transport bindings** adapt SCP's requirements to specif
 
 - Encrypted envelope format (SCP's responsibility — the payload the transport carries)
 - Transport abstraction interface (SCP's responsibility — the contract bindings must implement)
-- Reference transport binding (SCP ships this — likely Nostr-first given architectural alignment, but the abstraction is designed before the first binding, not extracted from it after)
-- Reference relay configuration for the primary binding (SCP provides this — how to run a relay for self-hosters)
+- SCP native relay protocol (SCP specifies this — the simplest possible store-and-forward relay purpose-built for SCP envelopes)
+- Reference relay implementation (SCP ships this — a minimal relay for self-hosters)
+- Transport adapter implementations for existing infrastructure (Nostr, Matrix, Holepunch/Hyperswarm, libp2p, WebSocket, WebRTC, QUIC, BLE, Tor, I2P, SSB, MQTT, NATS, ZeroMQ, Yggdrasil, cjdns)
+
+The SCP native relay is the canonical reference — the simplest possible thing that satisfies SCP's transport needs: accept encrypted blobs, store them, forward to subscribers by context ID and/or recipient DID, respond with delivery receipts, honor deletion requests. All other adapters map the transport abstraction to their respective protocols.
 
 **What SCP does not specify:**
 
-- Relay protocol internals (that's Nostr's/Matrix's spec, not SCP's)
-- Relay implementation (existing relay software handles this)
+- Third-party relay protocol internals (that's Nostr's/Matrix's/etc. spec, not SCP's)
+- Third-party relay implementation
 - Relay operations (that's either self-hosting or managed infrastructure)
+
+**No fundamental dependency on any single transport.** The protocol must function correctly on any transport that implements the abstraction interface. SCP native relays are the default, but the protocol does not assume or require them. A deployment using only Hyperswarm, or only Matrix, or only direct WebSocket, is equally valid.
 
 **Transport security.** All relay connections MUST use TLS 1.3 (TLS 1.2 acceptable as fallback). Certificate pinning is supported for known relays. See §9.13 for the complete transport security specification.
 
 **Encryption-as-access-control.** Context access control is enforced through encryption, not through relay logic. Specifically, each context maps to one MLS group (§9.7.1); the MLS group key material is the access credential. All context events are encrypted with the current MLS epoch secrets before reaching the transport layer. Relays store and forward opaque blobs — they cannot read content, verify membership, or enforce roles. Key distribution is membership. Member removal triggers MLS Remove Commit + epoch advancement — the removed member does not possess the new epoch's key material and physically cannot decrypt subsequent messages. This keeps the relay layer genuinely protocol-unaware and makes any encrypted-blob-capable relay — including existing Nostr relays — usable as SCP transport without modification.
 
-**Blocking shares this cryptographic infrastructure.** DID-to-DID blocking (§3.6) is enforced through the same MLS group encryption mechanism as member removal. When Alice blocks Dave, the MLS group advances an epoch excluding Dave — across every shared context. Dave physically cannot decrypt Alice's future messages. This is not a separate system from member key management; it is the same MLS Commit + epoch advancement machinery applied to a different trigger. MLS tree-based key management provides O(log N) member exclusion, scaling efficiently for large contexts (§9.7).
+**Blocking uses a separate sender-side key layer, not MLS group membership.** DID-to-DID blocking (§3.6) is a unilateral, per-relationship action — it does not require group coordination and does not affect the blocked party's membership in the context. When Alice blocks Dave, Alice rotates her personal sender key and redistributes it to all context members except Dave. Dave physically cannot decrypt Alice's future messages. Dave remains an MLS group member and can still decrypt messages from other members.
+
+This is architecturally distinct from member removal, which IS a group action: MLS Remove Commit advances the entire group to a new epoch, and the removed member loses access to ALL future messages from ALL members. Blocking and removal serve different purposes and use different cryptographic mechanisms:
+
+- **Blocking** (sender-side key layer): Unilateral. Per-relationship. Blocker writes; no group coordination. Blocked party loses access to blocker's messages only. O(n) key redistribution per block (distribute to n-1 members).
+- **Removal** (MLS epoch advancement): Group action. Affects all members. Removed party loses access to all future messages. O(log n) via MLS tree ratcheting.
+
+The sender-side key layer works as follows: each member maintains a personal sender key alongside their MLS leaf key. Messages are double-encrypted — first with the sender's personal key, then with the MLS group key. All members hold all other members' sender keys (distributed via MLS application messages). When a block is issued, the blocker generates a new sender key and distributes it to all members except the blocked party via individual MLS application messages. The blocked party can still decrypt the MLS layer but encounters ciphertext from the blocker that they cannot decrypt.
 
 ### 10.6 Content and Data Sovereignty
 

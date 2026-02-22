@@ -103,10 +103,14 @@ MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exp
 │  │  │  ┌──────────┐ ┌─────────┴┐ ┌──────────┐ ┌───────────┐ │ │  │
 │  │  │  │Transport │ │ Platform │ │ MCP      │ │ Bridge    │ │ │  │
 │  │  │  │          │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • Nostr  │ │ • Keys   │ │ • Server │ │ • X       │ │ │  │
-│  │  │  │ • Matrix │ │ • Attest  │ │ • Client │ │ • Bluesky │ │ │  │
-│  │  │  │ • WS     │ │ • Push   │ │          │ │ • Discord │ │ │  │
-│  │  │  │          │ │ • Storage│ │          │ │           │ │ │  │
+│  │  │  │ • SCP    │ │ • Keys   │ │ • Server │ │ • X       │ │ │  │
+│  │  │  │   native │ │ • Attest  │ │ • Client │ │ • Bluesky │ │ │  │
+│  │  │  │ • Nostr  │ │ • Push   │ │          │ │ • Discord │ │ │  │
+│  │  │  │ • Matrix │ │ • Storage│ │          │ │           │ │ │  │
+│  │  │  │ • Hyper* │ │          │ │          │ │           │ │ │  │
+│  │  │  │ • libp2p │ │          │ │          │ │           │ │ │  │
+│  │  │  │ • WS/RTC │ │          │ │          │ │           │ │ │  │
+│  │  │  │ • +more  │ │          │ │          │ │           │ │ │  │
 │  │  │  └──────────┘ └──────────┘ └──────────┘ └───────────┘ │ │  │
 │  │  └──────────────────────────────────────────────────────────┘ │  │
 │  └───────────────────────────────────────────────────────────────┘  │
@@ -114,7 +118,8 @@ MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exp
 │  ┌────────────────────────────────────────────────────────────┐    │
 │  │  INFRASTRUCTURE (not owned — existing)                      │    │
 │  │                                                             │    │
-│  │  Nostr relays │ Mainline DHT │ APNs/FCM │ MLS delivery     │    │
+│  │  SCP relays │ Nostr relays │ Mainline DHT │ APNs/FCM       │    │
+│  │  Hyperswarm │ libp2p nodes │ Matrix homeservers             │    │
 │  └────────────────────────────────────────────────────────────┘    │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
@@ -333,8 +338,13 @@ scp/
 │   │
 │   ├── scp-transport/         # Transport abstraction + adapters
 │   │   ├── trait.rs           # TransportAdapter trait
-│   │   ├── nostr/             # Nostr adapter (primary)
+│   │   ├── native/            # SCP native relay adapter (canonical reference)
+│   │   ├── nostr/             # Nostr adapter
+│   │   ├── matrix/            # Matrix adapter
+│   │   ├── hyperswarm/        # Holepunch/Hyperswarm adapter (DHT + NAT traversal)
+│   │   ├── libp2p/            # libp2p adapter (modular p2p)
 │   │   ├── websocket/         # Direct WebSocket (testing/local)
+│   │   ├── webrtc/            # WebRTC adapter (browser p2p)
 │   │   └── manager.rs         # Multi-transport routing
 │   │
 │   ├── scp-platform/          # Platform-specific adapters
@@ -452,7 +462,7 @@ State:
 
 ```
 Responsibilities:
-  • DID creation (did:web for v1, did:dht target)
+  • DID creation (did:dht primary, did:web fallback only)
   • DID resolution with security verification (§9.6)
     - did:dht: self-certification check (BEP44 signature + sequence number)
     - did:web: TLS pinning + TOFU key recording + key change alerts
@@ -997,25 +1007,31 @@ Test:
 
 ## 8. Infrastructure Decisions
 
-### What We Run (Minimal)
+### Design Principle: The Protocol Requires No Operator
 
-| Infrastructure | Purpose | Why we run it |
+The protocol is designed so that no entity — including Limn — needs to run infrastructure for it to function. SCP must work with zero Limn involvement. Limn may choose to operate infrastructure (relays, registries, documentation) for convenience or ecosystem bootstrapping, but the protocol cannot depend on this. If Limn disappeared tomorrow, SCP must continue to function exactly as designed.
+
+This is a hard requirement, not an aspiration. Every protocol mechanism must be evaluated against: "does this work if no one runs centralized infrastructure?"
+
+### What The Protocol Requires (None of It From Limn)
+
+| Infrastructure | Who runs it | Why it works without Limn |
 |---|---|---|
-| did:web server | DID resolution for v1 | did:web requires a web server. Migrate to did:dht (no server) later. |
-| PyPI/npm packages | SDK distribution | Standard package distribution. |
-| Documentation site | Developer docs | Standard. |
+| Transport relays | Users, communities, anyone | SCP native relay is trivially self-hostable. Existing infrastructure (Nostr relays, Hyperswarm, libp2p, Matrix homeservers) also works. Multiple transports, no single dependency. |
+| DID resolution | Mainline DHT (existing) | did:dht resolves via BitTorrent's Mainline DHT — millions of existing nodes. No server to operate. Self-certifying. |
+| SDK packages | PyPI, npm, crates.io | Standard open-source package distribution. Forkable. |
+| Key storage | User devices | Secure Enclave, Android Keystore, WebCrypto. On-device. |
 
-### What We Don't Run
+### What Does Not Exist In The Protocol
 
-| Infrastructure | Why not |
+| Non-infrastructure | Why |
 |---|---|
-| Nostr relays | Existing relays work. SCP envelopes are opaque Nostr events. |
-| Chat servers | SCP is the protocol. Apps run on user devices. |
-| User databases | DIDs are self-sovereign. No user database. |
-| Key servers | Keys are in Secure Enclave / Keystore. No key server. |
-| Application servers | Apps are client-side. SDK handles everything. |
-
-The protocol is designed so that Limn runs almost nothing. The infrastructure is existing (Nostr relays, Mainline DHT) or user-owned (devices, keys).
+| Central relay | No privileged relay. All relays are substitutable and untrusted. |
+| User database | DIDs are self-sovereign. No registry of users. |
+| Key server | Keys are in hardware security modules on user devices. |
+| Application server | Apps are client-side. SDK handles everything. |
+| Identity provider | DIDs are self-issued. No sign-up, no approval. |
+| Certificate authority | did:dht is self-certifying. No CA chain. |
 
 ---
 
@@ -1027,9 +1043,9 @@ The protocol is designed so that Limn runs almost nothing. The infrastructure is
 |---|---|---|---|
 | OpenMLS immaturity | Medium | High | OpenMLS is the most mature MLS library in Rust but may have edge cases. Fallback: mls-rs. Both are active. |
 | PyO3 async complexity | Medium | Medium | Rust async (tokio) ↔ Python async (asyncio) bridging is tricky. Mitigate with synchronous Python API as fallback. |
-| did:dht library gaps | Medium | Low | did:web is the v1 fallback. did:dht migration is transparent to apps. |
+| did:dht library gaps | Medium | Medium | did:dht is the primary method. If libraries hit a wall, did:web is the contingency fallback (not a planned path). SDK abstracts the DID method so the fallback is transparent to apps. |
 | WASM limitations | Low | Medium | Browser WASM can't access Secure Enclave. Web SDK uses WebCrypto (software keys). Acceptable for web; native is stronger. |
-| Nostr relay reliability | Low | Medium | Multi-relay strategy (send to 3+). SCP is transport-agnostic — add Matrix or direct WS if Nostr fails. |
+| Transport adapter availability | Low | Low | SCP native relay is canonical and purpose-built. Multiple adapter options (Nostr, Hyperswarm, libp2p, Matrix, etc.) provide redundancy. No single-transport dependency. |
 | MLS group state sync (offline) | High | High | Offline members accumulate pending proposals. Extended offline (days) may require group state reset. This is the hardest unsolved problem. |
 
 ### Strategic Risks
@@ -1052,14 +1068,14 @@ The protocol is designed so that Limn runs almost nothing. The infrastructure is
 | Second binding | TypeScript (wasm-bindgen/napi-rs) | Web + Node coverage. |
 | Third binding | Swift (UniFFI) | Cronica (iOS). |
 | Core language | Rust | Crypto libraries, performance, cross-platform via FFI. |
-| DID method (v1) | did:web | Simple, fast, reliable. Migrate to did:dht transparently. |
-| DID method (target) | did:dht | Decentralized, key rotation, no server dependency. |
+| DID method (primary) | did:dht | Self-certifying, decentralized, key rotation, no server dependency. No migration path. |
+| DID method (fallback) | did:web | Contingency only if did:dht libraries prove unusable. Not a planned deployment. |
 | Group encryption | MLS (OpenMLS) | O(log n) removal, forward secrecy, clean key destruction. |
-| Primary transport | Nostr | Existing relays, WebSocket, mature ecosystem. |
+| Transport | SCP native relay (canonical) + adapters | No dependency on any single transport. SCP native relay is simplest reference. Adapters: Nostr, Matrix, Holepunch/Hyperswarm, libp2p, WebSocket, WebRTC, QUIC, BLE, Tor, I2P, SSB, MQTT, NATS, ZeroMQ, Yggdrasil, cjdns. |
 | Capability tokens | UCAN (rs-ucan) | Per-agent, per-context, per-capability, revocable. |
 | License | Apache 2.0 | Permissive. Compatible with most ecosystems. |
 | Spec status | Ships with SDK, iterates | Don't wait for perfect spec. Working code first. |
-| Infrastructure owned | Almost nothing | did:web server (temporary). Everything else is existing or user-owned. |
+| Infrastructure owned | Almost nothing | did:dht uses Mainline DHT (existing). Everything else is existing or user-owned. |
 | MCP integration | SCP agent as MCP server | Every MCP-compatible model works with SCP. Zero model-side integration. |
 
 ---
