@@ -9,8 +9,6 @@
 
 SCP is a protocol for agent social infrastructure (identity, trust, contexts, encryption, governance, provenance). It currently exists as spec documents only — no code. A comprehensive design review was just completed (planning-session-06.md) which made several architectural corrections and identified 10 open questions.
 
-The repo is on the `architecture` branch with uncommitted changes from the review.
-
 ## Key Files to Read (in this order)
 
 1. **planning-session-06.md** — Summary of ALL decisions and changes from the review. Start here.
@@ -132,7 +130,3 @@ These came from the review and must be preserved in all future work:
 6. **Transport independence.** No structural coupling to any transport. SCP native relay is canonical but not required.
 7. **Blocking != removal.** These are different operations with different cryptographic mechanisms.
 8. **Encryption-as-access-control.** Relays are untrusted dumb pipes. The math enforces access, not the relay.
-
-## Current Branch State
-
-On `architecture` branch. Uncommitted changes from the review session include modifications to spec.md, sketch.md, and architecture.md, plus new files (planning-session-06.md, open-questions.md, this file). These should be committed before starting new work.
