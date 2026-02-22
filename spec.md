@@ -624,18 +624,71 @@ Session state is maintained by the tool's context (Context B), not by the callin
 
 Sessions have a TTL set by the tool's context. Expired sessions are cleaned up. Session state is internal to the tool's context and not visible to the calling context beyond the tool's defined output schema.
 
-#### 6.2.2 Discovery via Tool Interfaces
+#### 6.2.2 Protocol-Level Discovery
 
-Agent discovery across contexts is achievable through tool interfaces. A context can expose a discovery tool (e.g., member search, capability lookup) that other contexts can invoke. This does not require a separate discovery primitive — discovery is just another tool call between contexts that opt in.
+With no separate discovery primitive (A2A removed), discovery is built from two complementary mechanisms: DID document capabilities (direct lookup) and discovery contexts (searchable registries). Together, these provide 0-setup discovery that makes SCP inherently social.
+
+##### A. DID Document Capabilities
+
+Every agent MAY publish structured capabilities in their DID document's `service` array. These are resolved via did:dht — always available, 0-setup, no context required. Any agent that knows a DID can resolve the document and inspect capabilities directly.
+
+```json
+{
+  "id": "#scp-capabilities",
+  "type": "SCPCapabilities",
+  "serviceEndpoint": {
+    "capabilities": ["translation", "japanese", "english"],
+    "version": "scp/1.0"
+  }
+}
+```
+
+DID document capabilities provide direct lookup for any known DID. They do not provide search or browsing — for that, discovery contexts are needed.
+
+##### B. Discovery Contexts
+
+Discovery contexts are standard SCP contexts with open join policies and standardized discovery tools. Anyone can create one. No central authority, no operator dependency. They inherit all context-governed properties: tool calls are rate-limited and auditable, results carry provenance.
+
+**Standard discovery tool schemas** — minimum interoperable interface:
 
 ```
-// Context A queries a registry context's search tool
-Context A → Registry Context tool "agent_search":
-  input:  { capability: "japanese_cooking", min_history: 5 }
-  output: { results: [{ did: "did:dht:...", capabilities: [...], behavioral_summary: {...} }] }
+agent_search(query) → results
+  input:  { capability: string?, keywords: [string]?, min_history: int? }
+  output: { results: [{ did: DID, capabilities: [string], behavioral_summary: object }] }
+
+agent_register(did, capabilities, metadata) → confirmation
+  input:  { did: DID, capabilities: [string], metadata: { description: string?, tags: [string]? } }
+  output: { registered: bool, entry_id: string }
+
+agent_deregister(did) → removal
+  input:  { did: DID }
+  output: { removed: bool }
 ```
 
-Registry contexts are standard contexts that expose discovery tools. The discovery mechanism inherits all context-governed properties: both contexts opt in, calls are rate-limited and auditable, results carry provenance.
+These are conventions, not mandates — discovery contexts can add custom tools (e.g., reputation scoring, category browsing, geographic filtering) beyond the standard schema.
+
+**Open join model.** Discovery contexts use open join policies so any agent can join to search or register. Joining is a standard SCP context join (MLS group add). One-time cost; subsequent searches are fast tool calls within the context.
+
+**Bootstrap / cold-start.** How agents find their first discovery context:
+
+- SDK ships with default discovery context IDs (configurable, analogous to browser CA lists or DNS root servers). These are not privileged — they are starting points.
+- Apps can add domain-specific discovery contexts (e.g., a cooking community registry, a translation services directory).
+- On first identity creation, the SDK auto-joins default discovery contexts and optionally self-registers (opt-out via configuration).
+- If all defaults are unavailable, agents fall back to direct DID resolution for known contacts and manual context ID sharing.
+
+**Operation model.** Anyone can run a discovery context:
+
+- Creator sets governance: who can register, metadata requirements, moderation rules (via standard context governance).
+- Storage: structured metadata entries (~100-500 bytes per agent), not conversation history. 10K agents ≈ 5MB.
+- No operator dependency: if one registry disappears, agents use others. DID + capabilities persist in the agent's DID document regardless.
+
+**SDK unification.** The SDK provides a unified discovery API:
+
+- Searches local contact index (cache of previously resolved DID documents — instant)
+- Queries each known discovery context (standard tool calls)
+- Returns merged, deduplicated results ranked by relevance
+
+**Privacy.** Registration is opt-in per discovery context. Agents control what metadata they publish in each registry. Registration can be withdrawn at any time via `agent_deregister`. An agent can be registered in one discovery context with full capabilities listed and in another with only a subset. DID document capabilities are controlled by the agent via DID document updates.
 
 ### 6.3 The Human as Bridge
 
@@ -1144,7 +1197,7 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **Envelope signature scope:** The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by the sender's identity key: `SHA256(context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash)`. This binds every field to the signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs), which is by design — verification is the responsibility of context members who can decrypt the payload.
 
-**UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay.
+**UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction.
 
 **Why single ciphersuite:** Ciphersuite negotiation adds complexity and introduces downgrade attack vectors. For v1, every implementation uses exactly these algorithms. Future protocol versions may introduce additional ciphersuites with a secure negotiation mechanism, but v1 prioritizes simplicity and auditability.
 
@@ -1281,19 +1334,19 @@ This section specifies how SCP prevents message forgery, replay attacks, and ord
 
 #### 9.8.1 Envelope Integrity (Two Independent Checks)
 
-Every SCP message has two independent integrity verifications:
+Every SCP message has two independent integrity verifications, both inside the encrypted payload. Neither is verifiable by relays — relays see only opaque blobs.
 
-**Outer check — Ed25519 envelope signature.** The sender signs the entire SCP envelope with their DID key. Recipients verify the signature before MLS decryption. A failed signature means the envelope was tampered with in transit (or entirely forged) and MUST be rejected. This check is verifiable by anyone — including relays (though relays are not required to perform it).
+**Inner check 1 — Ed25519 identity signature.** The sender signs the payload with their DID key: `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash)`. This signature is created before sender-key encryption and MLS encryption, and verified after MLS decryption and sender-key decryption. A failed signature means the envelope was tampered with or forged and MUST be rejected.
 
-**Inner check — MLS membership_tag.** After MLS decryption, the MLS PrivateMessage format includes an HMAC (membership_tag) that proves the sender is a group member with correct epoch secrets. This check is verifiable only by group members. It provides authentication independent of the outer signature — even if an attacker obtained the DID private key, they cannot produce a valid membership_tag without the MLS epoch secrets.
+**Inner check 2 — MLS membership_tag.** The MLS PrivateMessage format includes an HMAC (membership_tag) that proves the sender is a group member with correct epoch secrets. This is verified during MLS decryption. It provides authentication independent of the identity signature — even if an attacker obtained the DID private key, they cannot produce a valid membership_tag without the MLS epoch secrets.
 
-Both checks MUST pass for a message to be accepted. This defense-in-depth means an attacker must compromise BOTH the identity key AND the MLS group state to forge a message.
+Both checks MUST pass for a message to be accepted. This defense-in-depth means an attacker must compromise BOTH the identity key AND the MLS group state to forge a message. Both checks are member-only verifiable — the outer envelope is unsigned by design (§9.10.2), ensuring relays learn nothing about message authenticity or sender identity.
 
 #### 9.8.2 Replay Prevention (Three-Layer Defense)
 
 **(a) MLS generation numbers.** MLS assigns each sender a generation counter that increments with every message. Recipients track the highest generation number seen per sender per epoch. A message with a generation number less than or equal to the highest seen is a replay and MUST be rejected. This catches exact replays within a single MLS epoch.
 
-**(b) Hash-based deduplication.** The SDK maintains a deduplication cache keyed by `SHA256(envelope_signature)`. Any envelope with a previously-seen signature hash is a replay and MUST be dropped silently. Cache size: bounded by a sliding window of the most recent 10,000 envelopes or 24 hours, whichever is larger. This catches replays across MLS epochs.
+**(b) Hash-based deduplication.** The SDK maintains a deduplication cache keyed by `SHA256(encrypted_blob)` — the hash of the outer envelope's encrypted blob, which is visible without decryption. Any envelope with a previously-seen blob hash is a replay and MUST be dropped silently. Cache size: bounded by a sliding window of the most recent 10,000 envelopes or 24 hours, whichever is larger. This catches replays across MLS epochs.
 
 **(c) Timestamp bounds.** Every SCP envelope includes a `created_at` timestamp. Recipients MUST reject envelopes with timestamps more than 5 minutes in the future (clock skew tolerance). Within a sequence of messages from the same sender in the same context, timestamps must be monotonically non-decreasing within the clock skew tolerance. This catches time-shifted replays.
 
@@ -1311,7 +1364,7 @@ The Merkle event log records events in append order. Each event references the p
 
 #### 9.8.4 Forgery Prevention
 
-**Message forgery:** Prevented by Ed25519 envelope signature + MLS membership_tag. An attacker who does not hold a member's private key cannot produce a valid envelope.
+**Message forgery:** Prevented by Ed25519 inner signature + MLS membership_tag. Both checks are inside the encrypted payload (§9.8.1). An attacker who does not hold a member's private key cannot produce a valid inner envelope, and an attacker without MLS epoch secrets cannot produce a valid membership_tag.
 
 **Attestation forgery:** Attestations (§7.4) are signed by their issuer's DID key. Forgery requires the issuer's private key.
 
@@ -1333,7 +1386,7 @@ Relays are untrusted infrastructure (§10.4). This section formally defines the 
 
 A relay CAN:
 
-- **Read metadata:** context IDs, sender/recipient DIDs (as Nostr npubs), timestamps, message sizes, connection timing. Relay CANNOT read encrypted content.
+- **Read metadata:** routing IDs (per-context pseudonyms, §9.10.4), recipient hints (pseudonyms), blob TTLs, padded blob sizes, and connection timing. Context IDs, sender/recipient DIDs, and timestamps are inside the encrypted payload and NOT visible to relays (§9.10.2). Relay CANNOT read encrypted content.
 - **Drop messages (suppression):** Silently discard envelopes. The sender believes delivery succeeded; the recipient never sees the message.
 - **Delay messages:** Hold envelopes and deliver them later. Architecturally identical to slow network conditions.
 - **Replay messages:** Re-deliver previously delivered envelopes. Mitigated by §9.8.2.
@@ -1342,9 +1395,9 @@ A relay CAN:
 
 A relay CANNOT:
 
-- **Forge messages.** Requires the sender's private key for envelope signature.
-- **Decrypt content.** Requires MLS group key.
-- **Modify messages.** Envelope signature verification fails.
+- **Forge messages.** Requires the sender's private key (for the inner Ed25519 signature, §9.8.1) and MLS epoch secrets (for the membership_tag).
+- **Decrypt content.** Requires MLS group key and sender-side key (§9.16).
+- **Modify messages.** Inner signature verification and MLS membership_tag verification fail after decryption.
 - **Inject members into contexts.** Requires MLS Welcome message encrypted to the joiner's KeyPackage.
 
 #### 9.9.2 Suppression Detection
@@ -1453,7 +1506,9 @@ context_pseudonym = context_keypair.public_key
 
 #### 9.10.6 Cover Traffic
 
-1. **Persistent connections: constant-rate, mandatory.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding.
+Cover traffic is **enabled by default and configurable per-client.** The SDK ships with cover traffic on. Clients or operators may disable it via SDK configuration. Disabling degrades traffic analysis resistance but has no functional impact on message delivery or protocol correctness.
+
+1. **Persistent connections: constant-rate, default on.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding.
 2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
 3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
@@ -1469,10 +1524,8 @@ context_pseudonym = context_keypair.public_key
 
 1. **Per-context pseudonyms (§9.10.4) are the foundation.** Relay cannot link subscriptions across contexts.
 2. **Relay set partitioning, mandatory.** Each context SHOULD use different relays from the client's other contexts. SDK distributes contexts across relays to minimize overlap.
-3. **Subscription mixing, mandatory.** Client subscribes to real contexts plus ~3-5x decoy context IDs per relay. Decoy contexts should have similar activity levels.
-4. **No PIR.** Not ready for production. Protocol structures designed so PIR can be swapped in later.
 
-**Combined effect:** Relay sees a pseudonym (unlinkable to identity) subscribing to N contexts (most are decoys), on a relay that hosts only a fraction of the client's total context set.
+**Combined effect:** Relay sees pseudonyms (unlinkable to identity) on a relay hosting only a fraction of the client's total context set. Per-context pseudonyms prevent cross-context linkage; relay partitioning limits the fraction of a client's activity visible to any single relay.
 
 #### 9.10.9 Cross-Context Key Isolation
 
@@ -1603,9 +1656,10 @@ Each participant in a context holds one AES-256 symmetric sender key. All messag
 
 #### 9.16.2 Key Distribution
 
-Sender keys are distributed via MLS application messages (encrypted to the group).
+Sender keys are distributed inside MLS application messages (encrypted to the group), but the key payload itself is HPKE-encrypted to each individual recipient's public key. This is necessary because MLS application messages are readable by all group members — without per-recipient HPKE wrapping, a blocked party could decrypt the MLS layer and read the new sender key.
 
-- **New member join:** Existing members send their current sender keys to the new member as individual MLS application messages. The new member receives a key bundle containing all active sender keys for the context.
+- **Key wrapping:** Each sender key distribution message contains per-recipient HPKE-encrypted payloads: `{recipient_did, HPKE_Seal(recipient_pubkey, sender_key)}`. The recipient's public key is the X25519 key from their MLS LeafNode (the same key used for MLS key agreement). The MLS message is readable by all group members, but only the intended recipient can unwrap the actual sender key.
+- **New member join:** Existing members each send their current sender key to the new member as an MLS application message containing a single HPKE-encrypted payload for the new member. The new member accumulates sender keys from each existing member.
 - **Normal operation:** Sender key is stable — it does not rotate on MLS epoch advances. This is intentional: old sender keys are retained for historical message decryption. Blocking is about future messages, not retroactive access.
 
 #### 9.16.3 Block Protocol
@@ -1613,9 +1667,11 @@ Sender keys are distributed via MLS application messages (encrypted to the group
 When Alice blocks Bob:
 
 1. Alice generates a new AES-256-GCM sender key.
-2. Alice distributes the new sender key as individual MLS application messages to each member EXCEPT Bob. This is NOT a broadcast — each non-blocked member receives the key separately.
+2. Alice sends a single MLS application message containing HPKE-encrypted payloads for each non-blocked member: `[{did: "charlie", key: HPKE(charlie_pk, new_key)}, {did: "dave", key: HPKE(dave_pk, new_key)}, ...]`. Bob can see this MLS message (it's group-encrypted) and can observe the recipient list, but Bob cannot unwrap any key payload.
 3. Alice sends a block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice"}`. This notifies Bob's client that Alice has blocked him.
-4. Bob's client, upon receiving the block notification, automatically rotates Bob's sender key, distributing the new key to each member EXCEPT Alice.
+4. Bob's client, upon receiving the block notification, automatically rotates Bob's sender key, distributing the new key via HPKE-encrypted payloads to each member EXCEPT Alice.
+
+**Block event observability:** Block events are observable to the group. Alice distributed keys excluding Bob — other members can see the recipient list and infer the block. This is an acceptable tradeoff, consistent with how other messaging systems handle blocks (some explicitly announce "Alice blocked Bob," others simply stop showing messages). The protocol prioritizes cryptographic enforcement of the block over concealing the block event.
 
 **Result:** Both Alice and Bob have new sender keys that exclude each other. Neither can read the other's future messages. Other context members can read both. The entire exchange completes within one message round-trip.
 
@@ -1714,7 +1770,7 @@ Devices that aren't always online need relays for message delivery. Relays hold 
 
 **Honest constraints:**
 
-- **Metadata exposure.** Traffic analysis is powerful even with encrypted payloads. The protocol provides layered metadata privacy protections: minimal outer envelopes with per-context pseudonyms, fixed bucket padding, persistent connections, constant-rate cover traffic, relay set partitioning, and subscription mixing. (See §9.9.1 for the formal relay threat model — what relays CAN and CANNOT do — and §9.10 for the complete metadata privacy architecture.)
+- **Metadata exposure.** Traffic analysis is powerful even with encrypted payloads. The protocol provides layered metadata privacy protections: minimal outer envelopes with per-context pseudonyms, fixed bucket padding, persistent connections, constant-rate cover traffic, and relay set partitioning. (See §9.9.1 for the formal relay threat model — what relays CAN and CANNOT do — and §9.10 for the complete metadata privacy architecture.)
 - **Relay discovery.** If Alice wants to reach Bob, she needs to know Bob's relay. If Bob switches relays, Alice needs to discover the new one. This requires either a centralized directory (defeats the purpose), a distributed discovery mechanism (adds complexity and latency), or multi-relay registration (Bob publishes to several relays, Alice checks all of them). Nostr's experience: users publish a relay list, clients check multiple relays. Workable but not seamless. Relay list authentication is specified in §9.6.3 — NIP-65 signed events prevent relay list substitution attacks.
 - **Operational complexity.** A production relay needs reliable delivery, ordering, deduplication, rate limiting, and abuse prevention. "Simple message queue" undersells this. A reference implementation should exist, but running it reliably is a server operations task — not "install an app" level.
 - **Gravitational pull.** In theory relays are commodity. In practice, network effects apply to infrastructure. Nostr shows this: a few popular relays handle most traffic. The protocol can't prevent this concentration, but DID-based identity ensures it doesn't create lock-in — popular relay dies, users switch, identity survives. The agent workstation trend (§10.2) may significantly weaken centralization pressure — if most users run their own always-on node, personal relays become the default rather than the exception.
@@ -2115,7 +2171,7 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 - **~~Primary transport binding.~~** ✅ **Resolved.** SCP native relay protocol is the canonical transport. Transport is fully abstracted — 17 adapter options listed, no structural dependency on any single transport. Transport security requirements specified in §9.13 (TLS 1.3 required). Relay threat model formalized in §9.9.
 - **Transport abstraction interface.** Exact contract between SCP protocol logic and transport bindings. Must be thin enough that bindings are simple to write, rich enough that protocol logic doesn't leak transport assumptions.
 - **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 ciphersuite. Full specification in §9.7 (group key management), §9.5 (cryptographic primitives), §9.8 (message security). MLS tree-based key management provides O(log N) member exclusion. Blocking uses the same epoch advancement machinery.
-- **~~Metadata privacy.~~** ✅ **Fully resolved.** Comprehensive metadata privacy architecture specified in §9.10: minimal outer envelope (§9.10.2), fixed bucket padding (§9.10.3), per-context pseudonyms (§9.10.4), Tor + persistent connections (§9.10.5), constant-rate cover traffic (§9.10.6), DID resolution privacy (§9.10.7), relay query privacy via partitioning + subscription mixing (§9.10.8). Push notification opacity mandated in §10.7. Sender-side key layer for blocking specified in §9.16.
+- **~~Metadata privacy.~~** ✅ **Fully resolved.** Comprehensive metadata privacy architecture specified in §9.10: minimal outer envelope (§9.10.2), fixed bucket padding (§9.10.3), per-context pseudonyms (§9.10.4), persistent connections + TLS (§9.10.5), cover traffic configurable default-on (§9.10.6), DID resolution privacy (§9.10.7), relay query privacy via pseudonyms + partitioning (§9.10.8). Push notification opacity mandated in §10.7. Sender-side key layer for blocking specified in §9.16 with HPKE-wrapped per-recipient key distribution.
 - **Verifiable event log format.** §7.3.1 specifies Merkle trees per context for event ordering and tamper detection. The concrete format — tree structure, hash algorithm, leaf schema, proof format — is not yet specified. Must be efficient enough for device-as-node participation. Candidates: sparse Merkle trees, append-only log trees (Certificate Transparency style), or Prolly trees.
 - **Behavioral record schema.** §7.3.2 defines what facts are derivable from event logs, but the record format is unspecified. How are behavioral records serialized, exchanged between agents, and verified against source logs? Must be compact enough for inline presentation and rich enough for meaningful evaluation.
 - **Challenge suite standards.** §7.3.4 introduces challenge-response verification for agent capabilities but doesn't define the challenge suites themselves. What tests constitute "prompt injection resistance"? Who defines and maintains challenge suites? How are custom challenges validated as fair? Need a registry or discovery mechanism.

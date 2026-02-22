@@ -1157,7 +1157,77 @@ agent.send(
 
 ---
 
-## 13. What's Not Here Yet
+## 13. Discovery (§6.2.2)
+
+### Unified Discovery
+
+The SDK provides a single entry point that searches local contacts and all known discovery contexts.
+
+```
+SCP.Discovery.search(
+  query: DiscoveryQuery {
+    capability: String?,           // e.g., "translation"
+    keywords: [String]?,           // free-text search terms
+    minHistory: Int?               // minimum context participation count
+  }
+) → [DiscoveryResult] {
+  did: DID,
+  capabilities: [String],          // from DID document + registry metadata
+  behavioralSummary: BehavioralSummary?,
+  source: .localContact            // cached DID document
+        | .discoveryContext(contextID),
+  provenance: DataProvenance        // where the result came from
+}
+```
+
+### Registration
+
+Agents register in discovery contexts to make themselves findable.
+
+```
+// Register in a discovery context
+SCP.Discovery.register(
+  context: contextID,              // the discovery context to register in
+  identity: Identity,
+  capabilities: [String],
+  metadata: {
+    description: String?,
+    tags: [String]?
+  }
+) → RegistrationResult { registered: Bool, entryID: String }
+
+// Remove registration
+SCP.Discovery.deregister(
+  context: contextID,
+  identity: Identity
+) → void
+
+// Update DID document capabilities (published via did:dht)
+SCP.Discovery.publishCapabilities(
+  identity: Identity,
+  capabilities: [String],
+  version: String = "scp/1.0"
+) → void
+```
+
+### Bootstrap
+
+```
+// Join default discovery contexts on first identity creation
+SCP.Discovery.bootstrap(
+  identity: Identity,
+  autoRegister: Bool = true        // opt-out via config
+) → [contextID]                    // discovery contexts joined
+
+// Add a custom discovery context
+SCP.Discovery.addContext(
+  contextID: contextID
+) → void
+```
+
+---
+
+## 14. What's Not Here Yet
 
 Implementation specifics that require Tier 1/Tier 2 design work:
 
@@ -1180,7 +1250,7 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 
 ---
 
-## 14. Security APIs (§9 — Cryptographic Security Model)
+## 15. Security APIs (§9 — Cryptographic Security Model)
 
 Security-related APIs that surface the cryptographic security model defined in spec.md §9.
 

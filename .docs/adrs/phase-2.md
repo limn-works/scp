@@ -637,19 +637,18 @@ pub struct ConsistencyCheckpoint {
 
 SCP is transport-independent (architecture.md section 10). No single transport is primary. The `TransportAdapter` trait (ADR-005) defines the contract each adapter implements, and the `TransportManager` (ADR-005 acceptance criterion 3) was stubbed in Phase 1 to support a single adapter. Phase 2 completes the `TransportManager` with multi-transport routing: sending envelopes to multiple relays for suppression resistance, partitioning relay sets across contexts for metadata privacy, mixing real and decoy subscriptions, and scoring relay reliability.
 
-Decision 10 mandates relay set partitioning, subscription mixing, and multi-relay publishing. Decision 6 mandates persistent connections and TLS for all relay connections. These metadata privacy measures are enforced at the transport routing layer, transparent to the context and envelope layers above.
+Decision 10 mandates relay set partitioning and multi-relay publishing. Decision 6 mandates persistent connections and TLS for all relay connections. These metadata privacy measures are enforced at the transport routing layer, transparent to the context and envelope layers above.
 
 ### Decision
 
-Implement the full `TransportManager` in `scp-transport/manager.rs` with multi-adapter routing, per-context relay set assignment, suppression-resistant multi-relay publishing (3+ relays per context), subscription mixing with decoy contexts, and per-relay reliability scoring. The TransportManager is the single entry point for all transport operations — the context layer never interacts with individual adapters directly.
+Implement the full `TransportManager` in `scp-transport/manager.rs` with multi-adapter routing, per-context relay set assignment, suppression-resistant multi-relay publishing (3+ relays per context), and per-relay reliability scoring. The TransportManager is the single entry point for all transport operations — the context layer never interacts with individual adapters directly.
 
 ### Rationale
 
 - **Multi-relay publishing for suppression resistance (spec section 9.9.2):** Publishing to a single relay gives that relay veto power over message delivery. Publishing to 3+ relays means all 3 must collude to suppress a message. The TransportManager handles multi-relay fanout transparently.
 - **Relay set partitioning (Decision 10):** Each context SHOULD use different relays. If Context A and Context B share the same relay, that relay can correlate the client's activity across both contexts (even with per-context pseudonyms, the connection source is the same). Partitioning distributes contexts across the available relay pool to minimize overlap.
-- **Subscription mixing (Decision 10):** The client subscribes to real contexts plus 3-5x decoy context IDs per relay. The relay cannot distinguish real subscriptions from decoys. Combined with partitioning, the relay sees pseudonymous subscriptions to N contexts (most fake) on a relay that hosts only a fraction of the client's total context set.
 - **Per-relay reliability scoring:** Relays are untrusted (spec section 9.9.1). A relay that drops messages, delays delivery, or retains data after deletion requests should be deprioritized. The TransportManager tracks delivery success rates, latency, and deletion compliance per relay and routes accordingly.
-- **Single entry point:** The context layer calls `transport_manager.send(envelope)` and `transport_manager.subscribe(routing_id)`. It does not know or care how many relays are involved, which adapters are used, or what decoy traffic is generated. This separation keeps the context layer clean and the transport layer independently evolvable.
+- **Single entry point:** The context layer calls `transport_manager.send(envelope)` and `transport_manager.subscribe(routing_id)`. It does not know or care how many relays are involved or which adapters are used. This separation keeps the context layer clean and the transport layer independently evolvable.
 
 ### Implementation
 
@@ -676,7 +675,6 @@ pub struct TransportManager {
     adapters: Vec<Box<dyn TransportAdapter>>,
     relay_assignments: HashMap<ContextId, Vec<usize>>,  // Context -> adapter indices
     reliability_scores: HashMap<String, ReliabilityScore>,
-    decoy_subscriptions: HashMap<usize, Vec<RoutingId>>, // Adapter index -> decoy IDs
     dedup_cache: LruCache<BlobId, ()>,                   // Seen blob IDs
 }
 ```
@@ -702,14 +700,7 @@ pub struct TransportManager {
    - Selects at least 3 relays per context.
    - Prefers relays with higher reliability scores.
 
-5. **`setup_decoy_subscriptions(manager: &mut TransportManager, adapter_index: usize, count: usize) -> Result<(), TransportError>`**
-   - Generates `count` random routing IDs as decoy subscriptions (Decision 10: subscription mixing).
-   - Subscribes to decoy routing IDs on the specified adapter.
-   - Decoy count: 3-5x the number of real subscriptions per relay.
-   - Decoy streams are consumed and discarded silently.
-   - Decoy IDs are rotated periodically (recommended: every 1 hour) to prevent long-term correlation.
-
-6. **`ReliabilityScore` and scoring:**
+5. **`ReliabilityScore` and scoring:**
 
 ```rust
 pub struct ReliabilityScore {
@@ -740,9 +731,8 @@ pub struct ReliabilityScore {
 
 | File | Purpose |
 |------|---------|
-| `manager.rs` | `TransportManager` — send with multi-relay fanout, subscribe with stream merging and dedup, relay set assignment, decoy management, reliability scoring, cross-check |
+| `manager.rs` | `TransportManager` — send with multi-relay fanout, subscribe with stream merging and dedup, relay set assignment, reliability scoring, cross-check |
 | `scoring.rs` | `ReliabilityScore`, score update logic, exponential moving average, relay ranking |
-| `decoy.rs` | Decoy subscription management — generation, rotation, lifecycle |
 
 **Estimated functions:** ~15-18 public functions, ~10-12 internal helpers.
 
@@ -773,7 +763,7 @@ The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with
     Relay deletion requests are sent for all context blobs.
 11. The event log's Merkle tree remains — the structure (hashes, proofs) survives even though
     the encrypted content is now unreadable.
-12. Throughout: decoy subscriptions are active on all relays (ADR-012), relay reliability
+12. Throughout: relay reliability
     is tracked, and relay sets are partitioned across contexts.
 ```
 

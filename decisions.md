@@ -80,14 +80,15 @@ Cross-context tool calls with stateful sessions (§6.2) cover all governed inter
 
 ---
 
-## Decision 5: Sender-Side Key Layer — AES-256 Symmetric
+## Decision 5: Sender-Side Key Layer — AES-256 Symmetric, HPKE-Wrapped Distribution
 
-**Decision: Symmetric AES-256 sender keys, MLS-distributed, sender-first encryption, protocol-notified mutual block.**
+**Decision: Symmetric AES-256 sender keys, HPKE-wrapped per-recipient distribution via MLS, sender-first encryption, protocol-notified mutual block.**
 
 - **Key type:** AES-256 symmetric. One key per sender per context.
-- **Distribution:** Via MLS application messages. New members receive all current sender keys via key-bundle on join. Key rotation for blocking: new key sent as individual MLS application messages to each non-blocked member (NOT broadcast).
-- **Encryption order:** Sender-first, then MLS. Blocked party can decrypt MLS layer but gets opaque ciphertext from the blocker.
+- **Distribution:** Via MLS application messages, but each sender key is HPKE-encrypted to individual recipients' X25519 public keys (from their MLS LeafNode). MLS application messages are group-readable, so HPKE wrapping prevents blocked parties from reading the new key. New members receive sender keys from each existing member individually. Key rotation for blocking: HPKE-encrypted payloads for each non-blocked member in a single MLS message.
+- **Encryption order:** Sender-first (AES-256-GCM), then MLS. Blocked party can decrypt MLS layer but gets opaque ciphertext from the blocker.
 - **Mutual blocking:** Protocol sends block notification (MLS application message: "you have been blocked by DID X"). Dave's client automatically rotates Dave's sender key excluding Alice. Both sides complete within one message round-trip.
+- **Block observability:** Block events are observable to the group (the recipient list of HPKE payloads reveals who was excluded). Acceptable tradeoff — cryptographic enforcement is prioritized over concealing block events.
 - **Storage:** 32 bytes per sender key per context member. Trivial.
 - **Forward secrecy interaction:** Sender keys rotate ONLY on block events, NOT on MLS epoch advances. Old sender keys retained for historical message decryption. Blocking is about future messages, not retroactive access.
 
@@ -131,11 +132,11 @@ context_pseudonym = context_keypair.public_key
 
 ---
 
-## Decision 8: Cover Traffic — Mandatory on Persistent Connections
+## Decision 8: Cover Traffic — Configurable, Default On
 
-**Decision: Constant-rate cover traffic on persistent connections. Not applicable on push-wake connections.**
+**Decision: Constant-rate cover traffic on persistent connections, enabled by default, configurable per-client. Not applicable on push-wake connections.**
 
-1. **Persistent connections: constant-rate, mandatory.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding.
+1. **Persistent connections: constant-rate, default on.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding. Clients or operators may disable via SDK configuration; disabling degrades traffic analysis resistance but has no functional impact.
 2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
 3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
@@ -157,18 +158,16 @@ context_pseudonym = context_keypair.public_key
 
 ---
 
-## Decision 10: Relay Query Privacy — Pseudonyms + Partitioning + Mixing
+## Decision 10: Relay Query Privacy — Pseudonyms + Partitioning
 
-**Decision: Per-context pseudonyms + mandatory relay set partitioning + subscription mixing. No PIR.**
+**Decision: Per-context pseudonyms + mandatory relay set partitioning. No subscription mixing (removed — decoy routing IDs receive zero traffic, making them trivially distinguishable from real subscriptions). No PIR.**
 
 1. **Per-context pseudonyms (from Decision 7) are the foundation.** Relay can't link subscriptions across contexts.
 2. **Relay set partitioning, mandatory.** Each context SHOULD use different relays from the client's other contexts. SDK distributes contexts across relays to minimize overlap.
-3. **Subscription mixing, mandatory.** Client subscribes to real contexts plus ~3-5x decoy context IDs per relay. Decoy contexts should have similar activity levels.
-4. **No PIR.** Not ready for production. Protocol structures designed so PIR can be swapped in later.
 
-**Combined effect:** Relay sees a pseudonym (unlinkable to identity) subscribing to N contexts (most are decoys), on a relay that hosts only a fraction of the client's total context set.
+**Combined effect:** Relay sees pseudonyms (unlinkable to identity) on a relay hosting only a fraction of the client's total context set.
 
-**Write into:** spec §9.10 (rewrite — currently says "out of scope for v1," now all in scope).
+**Write into:** spec §9.10.8.
 
 ---
 
@@ -181,7 +180,7 @@ All 10 questions resolved. All suggestions confirmed. The decisions collectively
 - **Connection layer:** Persistent connections + TLS (#6)
 - **Traffic layer:** Constant-rate cover traffic (#8)
 - **Resolution layer:** Local DHT + caching (#9)
-- **Query layer:** Partitioning + mixing (#10)
+- **Query layer:** Pseudonyms + partitioning (#10)
 - **Push layer:** Fully opaque (#1)
 - **Blocking layer:** AES-256 sender-side keys (#5)
 - **Interaction layer:** No A2A — tool interfaces only (#4)

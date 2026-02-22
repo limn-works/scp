@@ -35,7 +35,7 @@ These designs are settled. No open questions block them.
 | **Contexts — Memory scope** | spec §5.11 | Ready | Ephemeral (destroy keys + delete ciphertext), summary, full. Decided in session 06 §1.5. |
 | **Cross-context — Agent isolation** | spec §6.1 | Ready | Absolute at protocol level. |
 | **Cross-context — Tool interfaces** | spec §6.2 | Ready | Context governs, not agents. Bidirectional consent. Decided in session 06 §1.4. |
-| **Cross-context — Discovery via tools** | spec §6.2.2 | Ready | Registry contexts expose search tools through standard tool call mechanism. |
+| **Cross-context — Protocol-level discovery** | spec §6.2.2 | Ready | DID document capabilities + discovery contexts with standard tool schemas (agent_search, agent_register, agent_deregister). Bootstrap via SDK defaults. Unified SDK search API. |
 | **Cross-context — Human as bridge** | spec §6.3 | Ready | Local coordination, no network mechanism needed. |
 | **Trust — Four-layer model** | spec §7.1 | Ready | Protocol enforcement → behavioral validation → attestation authenticity → trust evaluation. |
 | **Trust — Protocol enforcement (L1)** | spec §7.2 | Ready | UCAN validation on every action. Zero-trust. |
@@ -52,7 +52,7 @@ These designs are settled. No open questions block them.
 | **Security — Crypto primitives** | spec §9.5 | Ready | Single ciphersuite. Ed25519, MLS_128, HPKE, SHA-256. |
 | **Security — Identity verification** | spec §9.6 | Ready | did:dht self-certification, did:web mitigations, relay list auth, first-contact bootstrapping. |
 | **Security — MLS integration** | spec §9.7 | Ready | 1:1 context↔group mapping. Forward secrecy. PCS (24h default). Key lifecycle. |
-| **Security — Message security** | spec §9.8 | Ready | Two integrity checks (outer Ed25519 + inner MLS membership_tag). Three-layer replay prevention. Sequence validation. |
+| **Security — Message security** | spec §9.8 | Ready | Two integrity checks (inner Ed25519 signature + MLS membership_tag, both inside encryption, member-only verifiable). Three-layer replay prevention. Sequence validation. UCAN expiry ≤ 24h constraint (§9.5). |
 | **Security — Relay threat model** | spec §9.9 | Ready | CAN/CANNOT list. Suppression detection. Equivocation detection (Relay Consistency Protocol). |
 | **Security — Clock model** | spec §9.14 | Ready | 5-min skew tolerance. Merkle log order authoritative. |
 | **Security — Key destruction** | spec §9.15 | Ready | Platform-attested where available. Honest about limitations. |
@@ -89,6 +89,16 @@ All spec cleanup from session 06 decisions has been completed:
 | Architecture MVSDK tables (§5) | ✅ Updated |
 | Architecture build phases (§6) | ✅ Updated |
 | Architecture data flows (§2.2) | ✅ Updated for transport independence |
+| Architecture data flow diagram (§2.2) | ✅ Rewritten — reflects actual encryption stack (inner sign → sender-key → pad → MLS → minimal outer envelope) |
+| Architecture discovery engine (§3.2) | ✅ Updated — DID doc capabilities, discovery contexts, unified search, bootstrap |
+| Sender-side key HPKE wrapping (spec §9.16.2-3) | ✅ Fixed — keys HPKE-encrypted per recipient, block observability acknowledged |
+| Envelope integrity (spec §9.8.1) | ✅ Fixed — both checks now inside encryption, member-only verifiable |
+| Dedup cache key (spec §9.8.2) | ✅ Fixed — uses SHA256(encrypted_blob) instead of SHA256(envelope_signature) |
+| UCAN nonce pruning (spec §9.5) | ✅ Added — token expiry ≤ 24h constraint |
+| Subscription mixing (spec §9.10.8) | ✅ Removed — decoy routing IDs get zero traffic, mechanism broken |
+| Cover traffic (spec §9.10.6) | ✅ Changed from mandatory to configurable, default on |
+| Discovery expansion (spec §6.2.2) | ✅ Expanded — DID doc capabilities, discovery contexts, standard schemas, bootstrap, SDK unification |
+| Discovery API (sketch §13) | ✅ Added — scp.discover, scp.register, bootstrap APIs |
 
 ---
 
@@ -102,12 +112,12 @@ All 10 questions from open-questions.md have been resolved. Decisions documented
 | **2** | Envelope format metadata | Minimal outer envelope | spec §9.10.2, §9.5, sketch §11 |
 | **3** | Message size normalization | Fixed bucket padding (256B–256KB) | spec §9.10.3 |
 | **4** | A2A propose/accept | Removed entirely | spec, sketch, architecture (all A2A sections removed) |
-| **5** | Sender-side key layer | AES-256 symmetric, MLS-distributed, mutual block | spec §9.16 |
+| **5** | Sender-side key layer | AES-256 symmetric, HPKE-wrapped per-recipient distribution, mutual block, block observability acknowledged | spec §9.16 |
 | **6** | Connection privacy | Persistent connections + TLS | spec §9.10.5 |
 | **7** | Per-context pseudonyms | HKDF-derived, inside-encryption verification | spec §9.10.4 |
-| **8** | Cover traffic | Constant-rate on persistent connections | spec §9.10.6 |
+| **8** | Cover traffic | Configurable, default on (constant-rate on persistent connections) | spec §9.10.6 |
 | **9** | DID resolution privacy | Local DHT node + caching | spec §9.10.7 |
-| **10** | Relay query privacy | Pseudonyms + partitioning + subscription mixing | spec §9.10.8 |
+| **10** | Relay query privacy | Pseudonyms + partitioning (subscription mixing removed — broken mechanism) | spec §9.10.8 |
 
 ---
 

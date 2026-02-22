@@ -148,41 +148,66 @@ Sequence Manager: assign SCP sequence number (per-sender monotonic)
 Event Log: append event, compute Merkle proof
     │
     ▼
+Provenance Tagger: attach provenance metadata for cross-context data
+    │
+    ▼
+Inner Envelope Builder: sign inside encrypted payload
+    │  Sign: Ed25519 over SHA256(context_id || sender_did || epoch ||
+    │         generation || sequence || timestamp || payload_hash)
+    │           🔒 Ed25519 inner signature — member-only verifiable (§9.8.1)
+    │           🔒 Timestamp for replay bounds (§9.8.2)
+    ▼
+Sender-Side Key Encrypt: AES-256-GCM with Alice's sender key (§9.16)
+    │           🔒 Selective readability — blocked parties see opaque ciphertext
+    ▼
+Bucket Padding: pad to next boundary (256B/1KB/4KB/16KB/64KB/256KB)
+    │           🔒 Fixed bucket sizes prevent message size analysis (§9.10.3)
+    ▼
 MLS Encrypt: encrypt with context group key (current epoch)
     │           🔒 Forward secrecy: old epoch keys already deleted (§9.7.2)
     │           🔒 MLS membership_tag HMAC — inner authentication (§9.8.1)
     │           🔒 MLS generation number assigned — replay prevention (§9.8.2)
     ▼
-Envelope Builder: wrap in SCP envelope
-    │  Sign: SHA256(context_id || sender_did || epoch || generation || timestamp || payload_hash)
-    │           🔒 Ed25519 outer signature — verifiable by anyone (§9.8.1)
-    │           🔒 Timestamp for replay bounds (§9.8.2)
+Outer Envelope Builder: minimal envelope — NO signature
+    │  routing_id: per-context pseudonym (§9.10.4)
+    │  recipient_hint: recipient's pseudonym or "*" for broadcast
+    │  ttl: seconds until relay deletes blob
+    │  blob: the encrypted payload
     ▼
-Transport Adapter: sign envelope, publish to 3+ relays
+Transport Adapter: publish to 3+ relays
     │           🔒 TLS 1.3 to all relays (§9.13)
     │           🔒 Multi-relay publishing for suppression resistance (§9.9.2)
     ▼
 ═══════════════════ NETWORK ═══════════════════
     │
     ▼
-Relay: stores encrypted envelope (cannot read content)
+Relay: stores opaque blob (cannot read content, cannot verify sender)
     │           🔒 Relay threat model: can drop/delay/replay, cannot forge/decrypt (§9.9.1)
     ▼
 Bob's Transport Adapter: receives via relay subscription (TLS 1.3)
     │
     ▼
-Envelope Parser: verify Ed25519 outer signature
-    │           🔒 Signature verification — reject forged envelopes (§9.8.4)
+Outer Envelope Parser: extract routing_id, look up context
+    │
     ▼
 Deduplication: check hash cache + sequence + timestamp bounds
     │           🔒 Three-layer replay prevention (§9.8.2):
-    │             • Hash dedup: SHA256 of signature, 10K sliding window
-    │             • Sequence: per-sender expected-next tracking
-    │             • Timestamp: 5-min future bound, monotonic per-sender
+    │             • Hash dedup: SHA256 of encrypted blob, 10K sliding window
+    │             • Sequence: per-sender expected-next tracking (after decrypt)
+    │             • Timestamp: 5-min future bound, monotonic per-sender (after decrypt)
     ▼
 MLS Decrypt: decrypt with Bob's leaf key in the group tree
     │           🔒 MLS membership_tag verification — sender is group member (§9.8.1)
     │           🔒 MLS generation number check — reject within-epoch replays (§9.8.2)
+    ▼
+Bucket Unpad: strip padding to recover plaintext size
+    │
+    ▼
+Sender-Side Key Decrypt: AES-256-GCM with sender's cached key (§9.16)
+    │
+    ▼
+Inner Envelope Verify: verify Ed25519 signature over payload
+    │           🔒 Ed25519 inner signature — reject forged envelopes (§9.8.1)
     ▼
 UCAN Validator: verify sender's capability token
     │           🔒 UCAN signature chain + nonce validation (§9.5)
@@ -196,7 +221,7 @@ Context Manager: deliver to context, check provenance
 SDK Public API: callback/stream delivers "hello" to Bob's app
 ```
 
-**Security checkpoint count:** 14 independent verification steps protect each message. The two most critical are Ed25519 outer signature (non-member verifiable) and MLS membership_tag (member-only verifiable) — two independent integrity checks at different trust levels.
+**Security checkpoint count:** 14 independent verification steps protect each message. The two most critical are Ed25519 inner signature and MLS membership_tag — two independent integrity checks (identity key and MLS epoch secrets), both inside encryption, both member-only verifiable. Relays see only opaque blobs and cannot verify, forge, or inspect any message content or metadata.
 
 ### 2.3 Data Flow: MCP Integration
 
@@ -452,15 +477,21 @@ State:
 
 ```
 Responsibilities:
-  • Context-mediated discovery (member list queries)
-  • Tool-interface discovery (§6.2.2) — agents discovered via tools they expose
+  • DID document capability resolution — resolve capabilities from DID service arrays
+  • Discovery context management — join/leave discovery contexts, bootstrap defaults
+  • Unified search — merge results from local contacts and discovery contexts
+  • Agent registration/deregistration in discovery contexts
+  • Local contact index — cache of resolved DID documents for instant lookup
 
 Depends on:
-  • Context Manager (member lists, tool invocation)
-  • Identity Manager (DID verification)
+  • Context Manager (discovery contexts are standard contexts — join, tool invocation)
+  • Identity Manager (DID resolution for capability lookup, DID document updates)
+  • Transport Adapter (DID document publication)
 
 State:
-  • Discovery cache (TTL-based)
+  • Local contact index (cached DID documents, TTL-based refresh)
+  • Known discovery context IDs (defaults + user-added)
+  • Registration state per discovery context
 ```
 
 **Crypto Layer** (wraps external libraries — see spec.md §9.5 for primitive specification, §9.7 for MLS integration):
