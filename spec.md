@@ -935,7 +935,7 @@ DataProvenance {
 
 Note: `sourceType` describes the current availability of the source data, not the context's creation-time memory scope setting. A context created with `memoryScope: .full` that is still open has `sourceType: .persistent` (data is still accessible and verifiable). A context that used `memoryScope: .ephemeral` has `sourceType: .ephemeral` (keys destroyed, data unrecoverable). The distinction is operational: "can the source data be independently verified right now?"
 
-Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms: cross-context tool calls (§6.2), structured messages carrying references to other contexts, and data included in context proposals (§5.12).
+Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms: cross-context tool calls (§6.2) and structured messages carrying references to other contexts.
 
 #### 7.7.2 Provenance Evaluation
 
@@ -1138,7 +1138,7 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **MLS ciphersuite:** MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (RFC 9420 §17.1). This provides: X25519 for key agreement (HPKE KEM), AES-128-GCM for symmetric encryption (AEAD), SHA-256 for hashing, Ed25519 for signing.
 
-**DID-to-DID encryption:** HPKE (RFC 9180) with suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Used for context proposals (§5.12) and MLS Welcome messages. The HPKE suite matches the MLS ciphersuite to minimize the cryptographic surface area.
+**DID-to-DID encryption:** HPKE (RFC 9180) with suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Used for MLS Welcome messages. The HPKE suite matches the MLS ciphersuite to minimize the cryptographic surface area.
 
 **Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
 
@@ -1197,7 +1197,6 @@ When Alice first encounters Bob's DID (via shared context membership, registry d
 
 - **For did:dht:** Alice resolves the DID document and verifies it against the DID string. The binding is cryptographically verified. No MITM is possible.
 - **For did:web:** Alice resolves over HTTPS and trusts the web PKI. The SDK records Bob's key on first contact (TOFU) and alerts on any subsequent change.
-- **For context proposals (§5.12):** The proposal is encrypted to Bob's public key from DID resolution. If resolution was MITMed (did:web only), the encrypted proposal goes to the attacker, not Bob. This manifests as a delivery failure (Bob never receives the proposal), not a confidentiality breach — assuming the attacker cannot also intercept Bob's relay traffic.
 
 ### 9.7 Group Key Management — MLS Integration
 
@@ -1320,8 +1319,6 @@ The Merkle event log records events in append order. Each event references the p
 
 **Provenance forgery:** Data provenance records (§7.7) are attached by the SDK and signed as part of the enclosing envelope. An agent cannot fabricate a provenance claim for data sourced from a context it was never in, because provenance records are verifiable against the source context's Merkle root (for persistent-scope sources).
 
-**Proposal forgery:** Context proposals (§5.12) are signed by the proposer's DID and encrypted to the recipient's DID. Forging requires the proposer's private key. Reading requires the recipient's private key.
-
 #### 9.8.5 Sequence Validation
 
 Each sender in a context maintains a monotonically increasing SCP sequence number (distinct from MLS generation numbers, which are MLS-internal). This sequence number is included in the envelope and the Merkle event log entry.
@@ -1415,7 +1412,7 @@ This section documents what the protocol protects and what it does not. Honesty 
 
 - Sender DID (as Nostr npub) — visible in the `pubkey` field of Nostr events
 - Context ID — visible in the `d` tag of Nostr events
-- Recipient DIDs — visible in `p` tags for directed messages and proposals
+- Recipient DIDs — visible in `p` tags for directed messages
 - Timestamps — visible in `created_at` field
 - Message sizes
 - Connection timing and duration (WebSocket metadata)
@@ -2038,13 +2035,12 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 
 ### Agent-to-Agent Communication
 
-- **Proposal rate limits.** How many context proposals can an agent send per time period? Earned capacity (§9.3) applies, but defaults need setting. This is the primary Sybil defense for A2A. Too restrictive limits legitimate agent coordination; too permissive enables spam floods.
 - **Registry governance.** Who runs registries? Community-operated, app-specific, protocol-seeded? How to prevent registry capture — one dominant registry becoming a gatekeeper? The protocol provides the mechanism (registries are contexts); governance norms need specification.
 - **Memory scope enforcement boundary.** Ephemeral key destruction is protocol-enforceable. Local agent memory is not. The spec acknowledges this (§5.11), but the boundary between "protocol can enforce" and "protocol can only signal" needs precise documentation for implementers. (§9.15 specifies the three trust levels for key destruction verification — hardware-attested, software-only, no attestation — which partially addresses this, but the agent-side memory boundary remains unspecified.)
 - **Context promotion mechanics.** When an ephemeral context "promotes" to persistent (both parties agree to continue), what happens? Options: (a) new context created, referencing the closed ephemeral one, or (b) same context with TTL removed and keys preserved. Option (a) is cleaner for the security model; option (b) preserves continuity. Needs decision.
 - **Referral chain depth.** Maximum depth for trust-carrying referrals. Likely 2-3, but needs analysis against real social graph data. Deeper chains may carry marginal trust signal; shallower limits may miss legitimate introductions.
 - **Summary generation mechanics.** For summary memory scope (§5.11): how is the summary produced? Who generates it — the context's tools, the participants collaboratively, or the protocol? What happens if participants disagree on the summary? What's the verification window before keys are destroyed?
-- **A2A activity in behavioral records.** What A2A metadata is included in behavioral records? Proposal counts (sent, accepted, rejected), A2A context participation, A2A context purposes? How granular? Controlled by the same social graph visibility (§3.6), but the specific data points need definition.
+- **A2A activity in behavioral records.** What A2A metadata is included in behavioral records? A2A context participation, A2A context purposes? How granular? Controlled by the same social graph visibility (§3.6), but the specific data points need definition.
 
 ### Uncovered Areas
 

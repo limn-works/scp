@@ -158,17 +158,17 @@ Envelope Builder: wrap in SCP envelope
     │           🔒 Ed25519 outer signature — verifiable by anyone (§9.8.1)
     │           🔒 Timestamp for replay bounds (§9.8.2)
     ▼
-Transport Adapter (Nostr): encode as kind:30078 event, sign, publish to 3+ relays
+Transport Adapter: sign envelope, publish to 3+ relays
     │           🔒 TLS 1.3 to all relays (§9.13)
     │           🔒 Multi-relay publishing for suppression resistance (§9.9.2)
     ▼
 ═══════════════════ NETWORK ═══════════════════
     │
     ▼
-Nostr Relay: stores signed event (cannot read encrypted content)
+Relay: stores encrypted envelope (cannot read content)
     │           🔒 Relay threat model: can drop/delay/replay, cannot forge/decrypt (§9.9.1)
     ▼
-Bob's Transport Adapter: receives via WebSocket subscription (TLS 1.3)
+Bob's Transport Adapter: receives via relay subscription (TLS 1.3)
     │
     ▼
 Envelope Parser: verify Ed25519 outer signature
@@ -198,64 +198,7 @@ SDK Public API: callback/stream delivers "hello" to Bob's app
 
 **Security checkpoint count:** 14 independent verification steps protect each message. The two most critical are Ed25519 outer signature (non-member verifiable) and MLS membership_tag (member-only verifiable) — two independent integrity checks at different trust levels.
 
-### 2.3 Data Flow: A2A Context Proposal
-
-```
-Alice's agent                          Bob's agent
-     │                                      │
-     ▼                                      │
-SCP.Context.propose(                        │
-  to: bob.did,                              │
-  purpose: "Schedule meeting",              │
-  ttl: 10min,                               │
-  memoryScope: .ephemeral,                  │
-  discoveryProvenance: .sharedContext(...)   │
-)                                           │
-     │                                      │
-     ▼                                      │
-Trust Engine: attach Alice's behavioral     │
-  record summary to proposal                │
-     │                                      │
-     ▼                                      │
-Envelope: encrypt proposal to               │
-  Bob's DID public key                      │
-     │                                      │
-     ▼                                      │
-Transport: send as Nostr kind:30079         │
-     │                                      │
-     ╌╌╌╌╌╌╌╌╌ NETWORK ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▶ │
-                                            ▼
-                                   Transport: receive proposal
-                                            │
-                                            ▼
-                                   Envelope: decrypt with Bob's key
-                                            │
-                                            ▼
-                                   Trust Engine: full 4-layer evaluation
-                                     • Alice's DID valid?
-                                     • Capability tokens?
-                                     • Behavioral record?
-                                     • Discovery provenance legit?
-                                            │
-                                            ▼
-                                   Client Policy: auto-accept? ask human?
-                                     (project co-member + scheduling +
-                                      TTL<30min → auto-accept)
-                                            │
-                                            ▼
-                                   SCP.Context.acceptProposal(id)
-                                            │
-                                   ◄╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
-     │                                      │
-     ▼                                      ▼
-MLS: create group with Alice + Bob    MLS: join group
-     │                                      │
-     ▼                                      ▼
-Context active. Multi-turn negotiation happens.
-TTL expires → keys destroyed → summary persists.
-```
-
-### 2.4 Data Flow: MCP Integration
+### 2.3 Data Flow: MCP Integration
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -290,12 +233,12 @@ TTL expires → keys destroyed → summary persists.
 └─────────┼────────────────────────────────────────────────────┘
           │ encrypted envelopes
           ▼
-    Nostr relays / transport
+    SCP relays / transport
 ```
 
 The model never knows SCP exists. It sees MCP tools namespaced by context. The MCP adapter handles the translation. This means every existing MCP-compatible model is already compatible with SCP — zero integration work on the model side.
 
-### 2.5 WebMCP + UCP Integration Points
+### 2.4 WebMCP + UCP Integration Points
 
 ```
 Browser-based SCP agent
@@ -330,7 +273,7 @@ scp/
 │   │   ├── context/           # Context lifecycle, membership, roles, governance
 │   │   ├── identity/          # DID operations, key management
 │   │   ├── trust/             # 4-layer trust evaluation, behavioral records
-│   │   ├── discovery/         # Registry search, referrals, context-mediated
+│   │   ├── discovery/         # Tool-interface discovery (§6.2.2)
 │   │   ├── crypto/            # MLS wrapper, UCAN wrapper, Merkle trees
 │   │   ├── envelope/          # SCP envelope creation, parsing, validation
 │   │   ├── provenance/        # Data provenance tagging
@@ -405,12 +348,10 @@ scp/
 ├── examples/
 │   ├── python/
 │   │   ├── hello_scp.py       # Minimal: create identity, create context
-│   │   ├── a2a_scheduling.py  # Two agents negotiate a meeting
 │   │   └── mcp_agent.py       # Agent that exposes SCP tools via MCP
 │   │
 │   ├── typescript/
-│   │   ├── hello_scp.ts
-│   │   └── a2a_scheduling.ts
+│   │   └── hello_scp.ts
 │   │
 │   └── swift/
 │       └── CronicaQuest.swift # Cronica quest as SCP context
@@ -418,7 +359,6 @@ scp/
 └── tests/
     ├── integration/           # Multi-party tests
     │   ├── two_party_messaging.rs
-    │   ├── context_proposal.rs
     │   ├── ephemeral_key_destruction.rs
     │   └── mcp_bridge.rs
     │
@@ -443,7 +383,6 @@ Responsibilities:
   • Governance proposal processing
   • TTL timer management and expiry handling
   • Memory scope enforcement (key destruction triggers)
-  • Proposal creation, delivery, acceptance/rejection
 
 Depends on:
   • Crypto Layer (MLS group management, UCAN validation)
@@ -453,7 +392,6 @@ Depends on:
 
 State:
   • Active contexts (in-memory + persisted to secure storage)
-  • Pending proposals (inbound + outbound)
   • TTL timers
   • Role/capability maps per context
 ```
@@ -515,18 +453,14 @@ State:
 ```
 Responsibilities:
   • Context-mediated discovery (member list queries)
-  • Registry context interaction (search tools)
-  • Referral/introduction token creation and verification
-  • Referral chain depth tracking
+  • Tool-interface discovery (§6.2.2) — agents discovered via tools they expose
 
 Depends on:
   • Context Manager (member lists, tool invocation)
-  • Trust Engine (behavioral records for referrals)
   • Identity Manager (DID verification)
 
 State:
-  • Introduction tokens (issued + received)
-  • Registry context memberships
+  • Discovery cache (TTL-based)
 ```
 
 **Crypto Layer** (wraps external libraries — see spec.md §9.5 for primitive specification, §9.7 for MLS integration):
@@ -580,7 +514,7 @@ State:
 │    MLS Group       = SCP Context                                 │
 │    MLS Member      = SCP Agent (DID + context role)              │
 │    MLS Epoch       = SCP Context epoch                           │
-│    MLS DS          = Nostr relay(s) — explicitly untrusted       │
+│    MLS DS          = SCP relay(s) — explicitly untrusted         │
 │    MLS AS          = DID resolution + UCAN validation            │
 │    MLS KeyPackage  = Pre-key bundle for offline member addition  │
 │                                                                  │
@@ -663,35 +597,6 @@ await ctx.send("Hello from Python")
 result = await ctx.invoke("assistant", {"query": "help me"})
 ```
 
-**A2A in Python:**
-
-```python
-import scp
-
-alice = await scp.Identity.load()
-bob_did = "did:dht:z6MkpT..."
-
-# Propose an ephemeral context
-proposal = await scp.Context.propose(
-    to=bob_did,
-    purpose="Schedule standup",
-    ttl=scp.Duration.minutes(10),
-    memory_scope="ephemeral",
-    discovery=scp.Discovery.shared_context(project_ctx_id),
-)
-
-# When accepted, interact
-ctx = await proposal.wait_for_acceptance()
-await ctx.send("What time works for standup tomorrow?")
-
-async for msg in ctx.messages():
-    print(f"{msg.sender}: {msg.content}")
-    if "agreed" in msg.content.lower():
-        break
-
-# Context auto-closes at TTL. Keys destroyed.
-```
-
 **MCP server in Python (expose SCP agent to any AI model):**
 
 ```python
@@ -733,7 +638,7 @@ agent.invoke({"input": "Schedule a meeting with Bob"})
 Python (scp_sdk/)              PyO3 (scp-ffi/pyo3/)         Rust (scp-core/)
 
 scp.Identity.create()    →    py_identity_create()     →    Identity::create()
-scp.Context.propose()    →    py_context_propose()     →    ContextManager::propose()
+scp.Context.create()     →    py_context_create()      →    ContextManager::create()
 ctx.send()               →    py_context_send()        →    Context::send()
 ctx.invoke()             →    py_tool_invoke()         →    Context::invoke_tool()
 ```
@@ -793,11 +698,11 @@ The smallest SDK that is useful. This is what ships first.
 
 | Feature | Why it's minimum |
 |---|---|
-| Identity creation (did:web) | Can't do anything without identity |
+| Identity creation (did:dht) | Can't do anything without identity |
 | Context create/join/leave | The fundamental interaction primitive |
 | Message send/receive | Minimum useful communication |
 | MLS encryption/decryption | Messages must be encrypted — non-negotiable |
-| Nostr transport | Must move over the network |
+| SCP native relay transport | Must move over the network |
 | UCAN token creation | Capability enforcement is core to the model |
 | Basic role enforcement | Admin/member/observer — the minimum role set |
 | Event log (append + verify) | Accountability is a protocol guarantee |
@@ -806,13 +711,13 @@ The smallest SDK that is useful. This is what ships first.
 
 | Feature | Why it can wait |
 |---|---|
-| A2A proposals | Agents can share contexts first; bilateral negotiation is v1.1 |
-| Discovery (registries, referrals) | Agents find each other through shared contexts first |
+| ~~A2A proposals~~ | Removed from protocol |
+| ~~Discovery (registries, referrals)~~ | Removed — tool-interface discovery only (§6.2.2) |
 | TTL and memory scope | Contexts persist; ephemeral is an optimization |
 | Bridge adapters | External platforms are a growth feature |
 | Behavioral records | Trust evaluation ships after basic communication works |
 | Challenge-response | Agent verification is a trust feature, not a messaging feature |
-| did:dht resolution | did:web works for launch; dht migrates later |
+| ~~did:dht resolution~~ | did:dht IS the v1 method — moved to "What's In" |
 | Governance (multi-sig, consensus) | Single-admin governance is sufficient for launch |
 
 ### MVSDK Success Criteria
@@ -820,7 +725,7 @@ The smallest SDK that is useful. This is what ships first.
 Two Python agents on different machines can:
 1. Create identities
 2. Create a shared context
-3. Exchange encrypted messages through Nostr relays
+3. Exchange encrypted messages through SCP relays
 4. Invoke tools within the context
 5. All messages are E2E encrypted — the relay sees nothing
 6. All actions are logged in a verifiable event log
@@ -833,18 +738,18 @@ If this works in 20 lines of Python, the SDK is viable.
 
 ### Phase 1: Crypto Proof (Weeks 1-4)
 
-**Goal:** Prove the crypto stack works. Two Rust processes exchange encrypted messages through a local Nostr relay.
+**Goal:** Prove the crypto stack works. Two Rust processes exchange encrypted messages through a local SCP relay.
 
 ```
 Build:
   • scp-core/crypto/ — MLS wrapper (OpenMLS), UCAN wrapper (rs-ucan)
   • scp-core/envelope/ — SCP envelope creation, signing, verification
-  • scp-core/identity/ — DID creation (did:key for now)
-  • scp-transport/nostr/ — Nostr adapter (single relay)
+  • scp-core/identity/ — DID creation (did:dht)
+  • scp-transport/native/ — SCP native relay adapter (single relay)
   • scp-platform/testing/ — In-memory key storage
 
 Test:
-  • Process A creates MLS group, encrypts message, publishes to local relay
+  • Process A creates MLS group, encrypts message, publishes to local SCP relay
   • Process B subscribes, receives, decrypts
   • Relay has no idea what's inside
 
@@ -853,7 +758,7 @@ Deliverable: ~500 lines of Rust. Two terminals exchanging encrypted messages.
 
 ### Phase 2: Context + Transport (Weeks 5-8)
 
-**Goal:** Full context lifecycle over real Nostr relays.
+**Goal:** Full context lifecycle over real SCP relays.
 
 ```
 Build:
@@ -862,7 +767,7 @@ Build:
   • scp-core/context/ — tool registration and invocation
   • scp-core/event_log/ — Merkle tree, append, prove, verify
   • scp-transport/ — transport abstraction trait
-  • scp-transport/nostr/ — production relay pool, multi-relay
+  • scp-transport/native/ — production SCP relay pool, multi-relay
   • scp-transport/websocket/ — direct device-to-device (for testing)
 
 Test:
@@ -871,7 +776,7 @@ Test:
   • Event log integrity verification
   • Multi-relay delivery (send to 3 relays, receive from any)
 
-Deliverable: Two devices with full context lifecycle over real Nostr relays.
+Deliverable: Two devices with full context lifecycle over real SCP relays.
 ```
 
 ### Phase 3: Python SDK + MCP (Weeks 9-12)
@@ -901,31 +806,29 @@ Ship:
 Deliverable: Working Python SDK on PyPI. Open source. Agents can use SCP.
 ```
 
-### Phase 4: Trust + A2A + TypeScript (Weeks 13-16)
+### Phase 4: Trust + TypeScript (Weeks 13-16)
 
-**Goal:** Full trust model, A2A proposals, TypeScript SDK.
+**Goal:** Full trust model, TTL/memory scope, TypeScript SDK.
 
 ```
 Build:
   • scp-core/trust/ — four-layer evaluation, behavioral records
-  • scp-core/context/ — propose/accept/reject, TTL, memory scope
-  • scp-core/discovery/ — context-mediated discovery, registry context tools
+  • scp-core/context/ — TTL, memory scope
+  • scp-core/discovery/ — tool-interface discovery (§6.2.2)
   • scp-core/provenance/ — data provenance tagging
   • scp-ffi/uniffi/ — UniFFI definitions (prepares Swift/Kotlin)
   • bindings/typescript/ — TypeScript SDK (wasm-bindgen for browser, napi-rs for Node)
 
 Test:
-  • A2A: two agents propose, negotiate, complete ephemeral interaction
   • Key destruction: verify ephemeral context keys are unrecoverable
-  • Trust evaluation: proposal evaluation with behavioral record checks
+  • Trust evaluation: behavioral record checks
   • TypeScript: same test suite as Python, in TypeScript
 
 Ship:
-  • PyPI: scp-sdk v0.2.0 (with A2A)
+  • PyPI: scp-sdk v0.2.0 (with trust model)
   • npm: @scp/sdk v0.1.0
-  • Updated docs with A2A examples
 
-Deliverable: A2A works. TypeScript SDK ships. Two languages supported.
+Deliverable: Trust model works. TypeScript SDK ships. Two languages supported.
 ```
 
 ### Phase 5: Platform Adapters + Swift + Cronica (Weeks 17-20)
@@ -938,7 +841,6 @@ Build:
   • bindings/swift/ — UniFFI-generated + Swift ergonomics layer
   • scp-bridge/x/ — X bridge adapter (relay mode)
   • scp-bridge/bluesky/ — Bluesky bridge adapter (API mode)
-  • scp-core/discovery/ — referral/introduction protocol
   • Cronica integration: quests as contexts, AI Guide as agent
 
 Test:
@@ -961,7 +863,6 @@ Deliverable: Cronica runs on SCP. Cross-platform: Python ↔ Swift ↔ TypeScrip
 Build:
   • scp-platform/android/ — Keystore, Play Integrity, FCM
   • bindings/kotlin/ — UniFFI-generated
-  • did:dht migration (from did:web)
   • Offline/sync strategy
   • Event log pruning/checkpointing
   • Performance optimization
@@ -992,8 +893,7 @@ Test:
 ### Month 4+ (Ecosystem Building)
 - Integration guides: LangChain, CrewAI, AutoGen, custom agents
 - npm: `@scp/sdk` v0.1.0
-- Registry context reference implementation
-- Community-operated Nostr relays for SCP traffic
+- Community-operated SCP relays
 - SDK contribution guide
 - Protocol governance: how spec changes are proposed and accepted
 
@@ -1086,7 +986,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 - **Protocol semantics.** See spec.md for the full protocol design.
 - **Cryptographic security model.** See spec.md §9.5–§9.15 for the full security specification (MITM prevention, replay prevention, relay threat model, key lifecycle, forward secrecy, PCS, compromise recovery). See planning-session-05.md for the security design rationale.
 - **Technology selection rationale.** See planning-session-04.md for why MLS over Sender Keys, why did:dht, etc.
-- **A2A architecture decisions.** See planning-session-03.md for the Moltbook analysis and context extension design.
+- **Context extension design.** See planning-session-03.md for the Moltbook analysis and context extension design. (A2A propose/accept has been removed from the protocol.)
 - **Adapter trait definitions.** See planning-session-04.md for full Rust trait definitions.
 - **Governance and deployment operations.** Undesigned. Needed before launch.
 - **Pricing/business model.** Out of scope for this document.
