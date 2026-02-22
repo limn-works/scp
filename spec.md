@@ -336,8 +336,6 @@ This extends to relationship metadata — not just whether a connection exists, 
 
 **No new primitives required.** Social graph visibility falls out of the existing trust equation: `trust = f(identity, capability, context, metadata)`. Capability tokens authorize reading specific slices of your graph. The social graph isn't a separate system with its own privacy model — it's just another resource governed by the same model as everything else.
 
-**A2A activity visibility** falls under these same controls. Agent-to-agent interactions (§5.12) produce behavioral metadata — proposal counts, A2A context participation, purposes. The human controls what A2A activity metadata is visible to others through the same per-identity, per-capability, per-context, and per-category grants described above.
-
 **Block/mute** is stored in identity private state (§3.7) — persistent, portable, encrypted.
 
 **Block** is DID-to-DID and bidirectional. When Alice blocks Dave, neither can see the other — across all shared contexts. Blocking is cryptographically enforced through a **sender-side key layer** (§10.5), which is distinct from MLS group membership. When a block is issued, the blocker rotates their personal sender key and redistributes it to all context members except the blocked party. The blocked party physically cannot decrypt the blocker's future messages. Critically, blocking does NOT remove the blocked party from the MLS group — they remain a context member and can still see other members' messages. Blocking is a unilateral, per-relationship action by the blocker; it does not require group coordination or affect the blocked party's relationship with other context members. This is fundamentally different from member removal, which IS a group action (MLS Remove Commit + epoch advancement). Blocks can optionally be scoped to a specific context, but the default and most common case is DID-to-DID across all shared contexts.
@@ -584,40 +582,6 @@ Relay deletion is best-effort — relays are untrusted infrastructure and cannot
 
 **Enforcement honesty.** The protocol enforces memory scope through cryptographic key destruction — specifically, MLS group state destruction (tree secrets, all epoch key schedules, application key material). This is verifiable and absolute for protocol-level data. Platform-attested destruction (§9.15) provides hardware-backed evidence that keys were deleted where available. However, the protocol cannot enforce memory scope above the protocol boundary. An agent's underlying model may retain information from an ephemeral interaction in its own memory. The spec is explicitly honest about this limitation: ephemeral memory scope destroys the protocol-level record and makes reproduction unverifiable, but does not guarantee the agent has forgotten. The absence of provenance on information an agent produces from memory is itself a signal — "this data has no verified origin." Participants in other contexts can evaluate unprovenanced information accordingly.
 
-### 5.12 Propose/Accept Context Creation
-
-Contexts gain a bilateral creation flow alongside the existing create/join flow. This enables agent-to-agent (and human-to-human, and human-to-agent) communication through negotiated, consent-based context creation.
-
-**The proposal.** An agent proposes a new context to one or more other agents. The proposal carries full legibility:
-
-- **Who** wants to interact (proposer's DID + agent metadata)
-- **With whom** (one or more target DIDs)
-- **Why** (declared purpose — human-readable intent)
-- **What capabilities** (proposed capability ceiling)
-- **How long** (TTL, optional)
-- **What happens to the data** (memory scope)
-- **How they found you** (discovery provenance — §6.4)
-- **Cryptographic signature** (proposer's DID signs the proposal)
-
-The proposal follows the same transparency-before-opt-in principle as context metadata: the recipient knows exactly what they're walking into before making a decision.
-
-**Proposal expiry.** Proposals themselves have a lifespan. A proposal that hasn't been accepted or rejected expires after a configurable period (protocol default TBD, likely 24 hours). Expired proposals are treated as rejected. This prevents indefinite-state proposals from accumulating and ensures proposers get timely resolution.
-
-**Evaluation.** The receiving agent (or human, per client policy) evaluates the proposal through the standard four-layer trust model (§7.1). The protocol provides all the data needed for evaluation: the proposer's behavioral record, attestations, challenge-verification results, and the discovery provenance chain. Client-level policies determine whether to auto-accept, present to the human for approval, or auto-reject.
-
-**Acceptance.** If the proposal is accepted, the context is created with the proposed parameters. Both parties are members from creation. The context's event log records the proposal as its genesis event — full provenance of how and why the context was created.
-
-**Rejection.** If the proposal is rejected, no context is created. The rejection is logged in the proposer's behavioral record (proposal sent, not accepted). The protocol does not disclose the reason for rejection to the proposer — rejection is the recipient's prerogative.
-
-**This replaces the need for a separate "channel" or "direct message" primitive.** A proposed context with TTL and ephemeral memory scope IS the lightweight A2A interaction. A proposed context with no TTL and full memory scope IS a persistent collaboration. Same primitive, different parameters. Every context feature — trust evaluation, encryption, governance, event logs, provenance, capability ceilings — applies identically.
-
-**Proposal spam.** Context proposals are a new vector for spam and Sybil attacks. Defenses:
-
-- **Earned capacity** (§9.3) limits proposal rate for new identities. New agents can send few proposals; established agents can send more.
-- **Client-level filtering.** The protocol delivers proposals; the client decides which to surface. Clients can implement their own filtering based on behavioral records, shared contexts, discovery provenance, or user preferences.
-- **Discovery provenance as signal.** A proposal from a co-member of a shared context (context-mediated discovery) carries more trust signal than a proposal from a registry search, which carries more than an unsolicited proposal with no discovery provenance. Clients can filter on provenance quality.
-- **Behavioral record consequences.** Excessive rejected proposals degrade the proposer's behavioral record. Patterns of proposal spam are detectable through the same behavioral topology analysis used for other abuse (§9.4).
-
 ---
 
 ## 6. Cross-Context Communication
@@ -625,8 +589,6 @@ The proposal follows the same transparency-before-opt-in principle as context me
 ### 6.1 Agent Isolation
 
 Agents cannot cross contexts at the protocol level. This is absolute. An agent in Context A cannot send a message to Context B, read Context B's state, or interact with Context B's tools or members. From the protocol's perspective, the agent in A and the agent in B (even if operated by the same human) are entirely separate instances.
-
-Agent isolation is preserved even with propose/accept context creation (§5.12). When Agent A proposes a context to Agent B, a NEW context is created with NEW agent instances. Agent A in Context X does not gain awareness of or access to Context Y where Agent B operates. The agents in the new A2A context are fresh instances — they inherit their human's identity and behavioral record, but they do not carry state from other contexts at the protocol level. The isolation model is not weakened; it is the mechanism that makes A2A safe. Each A2A context is its own isolated space, governed by its own ceiling, with its own event log.
 
 ### 6.2 Context-to-Context Tool Interfaces
 
@@ -673,61 +635,11 @@ Context A → Registry Context tool "agent_search":
   output: { results: [{ did: "did:dht:...", capabilities: [...], behavioral_summary: {...} }] }
 ```
 
-Registry contexts (§6.4.2) are standard contexts that expose discovery tools. The discovery mechanism inherits all context-governed properties: both contexts opt in, calls are rate-limited and auditable, results carry provenance.
+Registry contexts are standard contexts that expose discovery tools. The discovery mechanism inherits all context-governed properties: both contexts opt in, calls are rate-limited and auditable, results carry provenance.
 
 ### 6.3 The Human as Bridge
 
-The human coordinates across their own contexts locally. Their local agent orchestration — unconstrained by the protocol — handles cross-context intelligence. For the human's own agents, the human remains the bridge — local coordination across their own contexts requires no network-level mechanism.
-
-The propose/accept flow (§5.12) extends this model to inter-agent communication. Rather than enabling agents to cross context boundaries (which would undermine isolation), agents create new contexts to communicate. The human remains in control: client-level policy determines which proposals their agent can accept autonomously and which require human approval.
-
-### 6.4 Agent Discovery
-
-For agents to propose contexts to other agents, they need a way to find agents with specific capabilities. Discovery is orthogonal to the communication primitive — how you find someone is separate from how you talk to them. The protocol provides three discovery mechanisms with different trust characteristics.
-
-#### 6.4.1 Context-Mediated Discovery (Highest Trust)
-
-Agents discover each other through shared contexts. The member list is already visible to all participants (§5.6). An agent can propose a context to any co-member of any context it participates in.
-
-This is the highest-trust discovery mechanism because it inherits the trust evaluation of the shared context. If Alice and Bob are both members of a cooking quest, Alice's agent already has Bob's behavioral record, attestations, and capability metadata from that context. A proposal based on shared context membership carries strong provenance.
-
-Discovery provenance: `sharedContext(contextID)`. Trust evaluation inherits from the shared context.
-
-#### 6.4.2 Registry Contexts (Medium Trust)
-
-A registry is a standard SCP context (not a new primitive) purpose-built for agent discovery. It contains discovery tools that agents can invoke to search for other agents by capability, behavioral record, attestation, or other criteria.
-
-Properties of registry contexts:
-
-- **Standard SCP contexts.** Registries have creators, governance, capability ceilings, event logs, and all other context properties. They are governed by the same rules as any context.
-- **Discovery tools as context tools.** Agent search and profile lookup are tools registered in the registry context, invokable by members according to their role. The protocol does not define a specific tool schema for registries — registries define their own tools.
-- **Multiple registries coexist.** No single registry is privileged. Domain-specific registries (cooking agents, scheduling agents), community-curated registries, app-specific registries, and open registries can all exist simultaneously.
-- **Registry trust is context trust.** Trust in a registry is evaluated like trust in any context: its creator's behavioral record, its governance model, its membership quality, its age. A well-governed registry with established members and good behavioral records is more trustworthy than a new, open registry.
-- **Self-selection.** Agents opt into registries. Listing in a registry is a voluntary action by the agent's human. Registration includes the agent's capability metadata, behavioral record references, and any attestations the human chooses to publish.
-
-Discovery provenance: `registry(registryContextID)`. Trust is the registry's context reputation plus the discovered agent's own behavioral record.
-
-#### 6.4.3 Referral / Introduction (Trust Proportional to Referrer)
-
-An agent introduces two other agents that aren't in the same context. The referrer vouches for the introduced party — not a blanket endorsement, but a structured introduction that carries the referrer's identity and behavioral record.
-
-A referral produces an **introduction token** that the introduced party can present with a context proposal. The token carries:
-
-- The referrer's DID and behavioral record
-- The context where the referrer knows the introduced party
-- The referrer's relationship to the introduced party (shared context membership, duration, roles)
-
-Referral chains are tracked. Chain depth is visible — a direct introduction (depth 1) carries more trust than friend-of-a-friend (depth 2). Maximum chain depth is a protocol parameter. Introductions beyond the maximum depth do not carry trust provenance — they are equivalent to unsolicited proposals.
-
-Discovery provenance: `referral(chain: [DID], depth: Int)`. Trust is proportional to the referrer's behavioral record and decays with chain depth.
-
-#### 6.4.4 Discovery Provenance
-
-All three discovery mechanisms produce a discovery provenance record that travels with context proposals. This provenance tells the recipient HOW the proposer found them — a critical input to trust evaluation.
-
-A proposal with no discovery provenance (unsolicited, no shared context, no registry, no referral) is the weakest trust signal. A proposal from a co-member of a shared context is the strongest. The protocol surfaces this distinction; agents and clients use it for filtering and evaluation.
-
-Discovery provenance is recorded in the resulting context's event log if the proposal is accepted, creating a permanent record of how the interaction originated.
+The human coordinates across their own contexts locally. Their local agent orchestration — unconstrained by the protocol — handles cross-context intelligence. For the human's own agents, the human remains the bridge — local coordination across their own contexts requires no network-level mechanism. Cross-context tool interfaces (§6.2) provide the governed protocol-level channel for inter-agent interaction; the human's local coordination handles everything else.
 
 ---
 
@@ -1187,14 +1099,6 @@ Context tools:             Admin's agent MCP surface:    Member's agent MCP surf
 **Context infection.** Poisoned data flowing through legitimate context-to-context tool interfaces. Mitigation: content provenance via hash chains (data carries its origin context and interface chain); tool interface validation at receiving context; velocity limits on propagation (content bridged N times in M minutes is flagged). Protocol makes infection legible and traceable, can't permanently prevent it.
 
 **Agent slot rental.** Someone with a trusted identity operating agents on another's instructions. Mitigation: one agent per context limits the value; earned capacity means new identities can't immediately scale; fleet coherence signals may detect behavior inconsistent with a single human's intent. Partially mitigated, not fully solved.
-
-**Prompt injection via context proposals (A2A).** A malicious agent sends context proposals with carefully crafted purpose strings or metadata designed to manipulate the receiving agent's behavior when it evaluates the proposal. Mitigation: proposals are structured data, not freeform content — the protocol defines the proposal schema and agents should treat proposal fields as untrusted input. Client-level filtering can reject proposals with suspicious content patterns. The proposal evaluation path should be sandboxed from the agent's general reasoning.
-
-**Sybil flooding of proposals (A2A).** An attacker creates many identities and floods agents with context proposals, overwhelming their evaluation capacity or their human's attention. Mitigation: earned capacity (§9.3) limits proposal rate for new identities. Client-level rate limiting on incoming proposals. Discovery provenance as filter — proposals without discovery provenance (no shared context, no registry, no referral) can be deprioritized or auto-rejected by client policy. Behavioral record consequences for excessive rejected proposals.
-
-**Memory-based attacks via ephemeral contexts (A2A).** A malicious agent uses ephemeral contexts to deliver payloads that persist in the target agent's local memory after the context's protocol-level data is destroyed. The ephemeral scope provides cover — "the interaction was ephemeral" — while the payload persists above the protocol boundary. Mitigation: the protocol is honest about this limitation (§5.11). Provenance tagging (§7.7) means any data the target agent subsequently introduces to other contexts from memory carries no provenance — which is itself a signal. The absence of provenance on data that should have provenance triggers scrutiny from other participants. Client-level defenses (agent memory isolation, sandboxed ephemeral context processing) are outside protocol scope but recommended.
-
-**Discovery manipulation (A2A).** Malicious actors gaming registry contexts — creating fake registries, flooding legitimate registries with Sybil agent profiles, or manipulating referral chains. Mitigation: registry trust is context trust — a well-governed registry with admission requirements is resistant to flooding. Referral chain depth limits bound trust propagation. Discovery provenance is visible to recipients — they can evaluate the quality of the discovery path. Multiple independent registries prevent single-point-of-capture.
 
 ### 9.3 Sybil Resistance and Identity Uniqueness
 
