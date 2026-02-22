@@ -1,69 +1,76 @@
 # Social Context Protocol (SCP)
 
-This is a fully agentic code base. 100% of code is written by AI. None of it is written by humans. Humans are creating the product decisions, guidelines, and specifications; writing documentation and guidelines for implementing them in conversation with AI. AI is taking that input and turning it into actionable items to give to itself to execute and write code. With this in mind, understand that:
-- There is no such thing as MVP, or a partial state of completion, or the next iteration. The most valuable thing that can be done is specc'ing out things to completion and executing them to completion
-- Deferring work is almost always harmful unless there's no other choice. It is almost never helpful or strategically advisable
-- Tests and gates are of the utmost importance to verify that work is functional, correct, and bug-free
-- Artifacts of all sorts are extremely important for persisting information across contexts
-- Context rot and drift are some of the most insidious problems that can cause issues with the code over time, and should be avoided at all costs
+## Vision
+
+Software is shifting from something we labor to craft into something manufactured on demand. We are early in this transition, but the trajectory is clear: production-ready apps built entirely by agents in hours or days — work that would have taken teams weeks or months, at a fraction of the cost. These apps are being commissioned by non-technical people operating agentic flows like OpenClaw, not by engineers writing code. Everything points to a world in the near future where software is on-demand, disposable, and highly personal. Agents will soon be building an overwhelming majority of the world's software. Without a guarantee that these ephemeral clients can exchange durable state, and without a strong, agent-optimized protocol for doing so, the result is fragmented apps saved only by monolithic solutions from established enterprises like Apple, Google, and Meta. SCP is the open, functional answer — not just an ethical alternative to platform lock-in, but the functionally preferable one: no opinions, easy adoption, collective contribution, and unlimited integration.
+
+SCP (Social Context Protocol) is an open, ecosystem-agnostic infrastructure protocol that provides the social layer for software built by and for AI agents: cryptographically verifiable identity (DID), governed interaction spaces (contexts), trustworthy communication channels (MLS encryption), capability-based authorization (UCAN), and transparent provenance. App generation is becoming trivial — agents increasingly build ephemeral, personalized software on demand. What remains hard is the connective tissue between these clients and the humans and agents using them: identity, trust, relationships, and accountability. SCP is that connective tissue. The core is implemented in Rust with language bindings via PyO3 (Python), UniFFI (Swift, Kotlin), and wasm-bindgen (TypeScript). Client SDKs handle identity management, context participation, encryption, and transport — everything a client needs to join and interact within contexts. Server SDKs handle relay operation, message routing, and storage — everything needed to run SCP infrastructure. Both are optional and independent: a client can connect to any conforming relay, and relay operators need no knowledge of client implementations. All interaction happens within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. Transport is fully abstracted behind an adapter trait with an SCP native relay as the canonical reference and 17 additional adapters (Nostr, Matrix, libp2p, Hyperswarm, WebSocket, etc.). The build follows three phases: Phase 1 (crypto foundation — MLS, DID, envelopes, transport trait, sender-side keys), Phase 2 (context lifecycle, roles, tools, event log, multi-transport routing), Phase 3 (Python SDK via PyO3).
+
+### Protocol tenets
+
+- **Provenance everywhere.** All non-private data carries verifiable origin metadata. Every message, tool output, attestation, and cross-context data transfer is traceable to its source. The absence of provenance is itself a signal.
+- **Human accountability.** Every agent traces to a human DID. No anonymous actors. Actions have consequences that persist across contexts.
+- **Context isolation.** All interaction happens within bounded contexts. Cross-context data flow is explicit and governed. This is the security boundary.
+- **Encryption-as-access-control.** Context membership is enforced cryptographically through MLS group keys. Relays are untrusted dumb pipes; the math enforces access, not infrastructure.
+- **Legibility before opt-in.** Every context's parameters — capability ceiling, governance, roles, tools, TTL, memory scope — are visible before joining. No hidden terms. Informed consent is mechanical.
+- **Protocol requires no operator.** Every mechanism must work if no one runs centralized infrastructure. If Limn disappears tomorrow, SCP works exactly as designed.
+- **Transport independence.** No structural coupling to any single transport. The protocol drives transport choice, not the reverse.
+- **Agents are participants, not enforcers.** Agents use contexts and tools like any other participant. The protocol doesn't distinguish between a sophisticated autonomous agent and a simple passthrough — both are human-bound participants with the same rules.
+- **Trust is contextual.** Trust is a function of identity, capability, context, and behavior — not a binary property. Alice might trust Bob in one context but not another. The protocol enables that granularity.
+
+### Builder tenets
+
+- **No deferral.** Everything discussed gets specced and implemented. Nothing is "v2" or "future." Metadata privacy, sender-side key layer, transport independence — all implemented now.
+- **No DOA decisions.** Don't ship into something you plan to abandon. Design decisions are permanent commitments, not stepping stones. If it needs replacing later, it's the wrong choice now.
+- **Simple over complex.** Prefer elegant, low-overhead solutions — but never at the expense of functionality, security, or completeness.
+- **Completeness is the baseline.** Plan and execute at maximum breadth. Use time to improve and expand post-completion, not to reach the completed state.
+- **SDK first.** Ship Rust core + language bindings before any app. The agent ecosystem is the audience.
+- **Enforce mechanically.** Invariants are enforced by linters, structural tests, and the type system — not by documentation. Documentation drifts; automation doesn't.
+- **Artifacts are the system of record.** All knowledge — decisions, patterns, constraints, product context — lives in-repo as discoverable artifacts. If an agent can't find it, it doesn't exist.
+- **Root-cause orientation.** Bugs come from poor decisions upstream. Treat them first as architecture flaws, second as local defects. Don't patch around bad foundations — fix or replace them.
+- **No shortcuts.** The best solution is the right one. No force unwraps, no placeholder implementations, no "good enough." Ship excellent, complete, production-ready code.
 
 ## Rules
-
-These shape every interaction. Violations cause damage.
 
 **Operating model:**
 - Humans steer. Agents execute. No human written code
 - Context is scarce — give agents a map, not a manual. Monolithic artifacts rot
-- Enforce invariants mechanically (linters, structural tests, type system), not via documentation
-- Abandon classical notions of scope, timeline, MVP, and next-iterations that are derived from human limitations. When agents write 100% of the code, it becomes cheap and malleable. Completeness is the baseline requirement. By default, always execute and plan at maximum currently established breadth to achieve completeness.
-
-**Code quality:**
-- Enterprise grade, battle-ready, prinicpal quality, defect free
-- Bugs typically come from poor decisions upstream due to bad architecture or assumptions. Treat them first as such, and as local defects second. Find root causes, and do not be afraid to abandon and rewrite things that don't are problematic (be sure to update artifacts when you do).
-- Do not leave work for todos, the next version/iteration, or later, unless you have been explicitly told to. Everything is to be done to completion, regardless of what you think about the scope.
-- The best solution is the right one; no shortcuts just to move on.
-- Be autonomous: infer from context, code, artifacts. Escalate only for genuine judgment calls.
-- APIs: self-evident, one happy path. 
+- Be autonomous: infer from context, code, artifacts. Escalate only for genuine judgment calls
 
 **Workflow:**
 - Plan mode for all non-trivial tasks (3+ steps or architectural decisions)
-- Aggressively reference content in `.docs/`
-- Repository is the system of record — always capture and update knowledge in relevant `.docs/` before session ends
-- After any correction or remediated error (human or agent): add a lesson to the relevant `.docs/lessons/`
+- Aggressively reference and update `.docs/`; add lessons after any correction
+- Check `.docs/standards/` before writing code — read and follow them
 - Subagents: use liberally, one task each, keep main context clean
-- No TODOs, FIXMEs, placeholders, or "good enough." Ship excellent, complete, production ready code
 - Verify all gates, tests, and builds pass before deciding you are done
 
 **Architecture:**
-- Layers: UI → Domain → AI → Data → Network. Dependencies flow down only
 - Protocol-first design; inject through initializers; no singletons
-
-## Standards
-
-When writing code, always check for applicable docs at the root `.docs` directory, and any relevant local `.docs` directories that may be present. If there are relevant files in `standards/`, you must ALWAYS read and FOLLOW them.
+- APIs: self-evident, one happy path
 
 ## Agents
 
-Use agents eagerly. Any time a relevant agent/s can provide focus and expertise, as well as a chance to parallelize work, use it/them — espescially for code reviews.
-
-See `agents/README.md` for the full roster, triggers, and coordination.
+Use agents eagerly for focus, expertise, and parallelization — especially code reviews. See `agents/README.md` for the full roster.
 
 ## Project Map
 
 ### Agentic harness & artifacts:
 
-.ralph/              # Agentic coding loop for tasks of any size. Only one at root.
-├── prd.json         # tk
-├── tk/              # tk
-└── tk/              # tk
+.ralph/              # Autonomous dev loop — dispatches parallel subagents from a PRD
+├── prd.json         # Structured stories with gates (P0/P1/P2), deps, acceptance criteria
+├── prompt.md        # Autonomous iteration instructions (story selection, execution, commit)
+├── directive.md     # Single-task mode instructions (execute one directive, signal result)
+├── status.md        # Current iteration state (read at start, written at end of each cycle)
+├── specs/           # Reference specs and ticket tracking for Ralph
+└── hooks/           # Guard rails: stop signals, interactive blocking, subagent limits
 
-.claude/             # Claude's project-wide operating instructions and tools. Only one at root.
-├── agent-memory/    # Agent-specific memories (each dir maps to an agent)
-├── agents/          # Agent definitions for specialized work
-└── skills/          # Slash command definitions
+.claude/             # Claude's project-wide operating instructions and tools
+├── agents/          # 21 agent definitions — 8 core specialists + 13 reviewers (see agents/README.md)
+├── agent-memory/    # Per-agent persistent memory (each dir maps to an agent)
+└── skills/          # Slash commands (/prd, /ralph)
 
-.docs/               # One project-wide version at root, with any number of additional versions local to features.
-├── adrs/            # ADRs (how to build)
-├── lessons/         # Evergreen learnings (one per file)
-├── specs/           # Product/project specs (what to build)
+.docs/               # Project knowledge — one root instance, additional local instances per feature
+├── adrs/            # Architectural Decision Records — how to build (phase-1, phase-2, phase-3)
+├── lessons/         # Evergreen learnings, one per file, grouped by topic (e.g. lessons/swift/)
+├── specs/           # Product and project specifications — what to build
 └── standards/       # Coding and workflow standards. NON-NEGOTIABLE
