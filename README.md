@@ -41,7 +41,7 @@ Encryption combines MLS for group forward secrecy with a sender-side AES-256 lay
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  SCP SDK                                             │  │
 │  │                                                      │  │
-│  │  Public API (~30 methods)                            │  │
+│  │  Public API                                           │  │
 │  │  Python · Swift · TypeScript · Kotlin · Rust         │  │
 │  │                                                      │  │
 │  │  ┌────────────────────────────────────────────────┐  │  │

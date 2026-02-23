@@ -91,4 +91,4 @@ Use agents eagerly for focus, expertise, and parallelization — especially code
 
 ### Memory
 
-In addition to permanent context provided by artifacts, you have access to an MCP sever for memory called "vestige". Liberally read and write to this memory during all operation modalities, and ensure subagents do the same.
+In addition to permanent context provided by artifacts, you have access to an MCP server for memory called "vestige". Liberally read and write to this memory during all operation modalities, and ensure subagents do the same.
