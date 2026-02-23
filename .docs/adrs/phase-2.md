@@ -834,7 +834,7 @@ pub struct ConsistencyCheckpoint {
 ```
 
    - **`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state.
-   - **`compare_checkpoint(local_log: &EventLog, remote_checkpoint: &ConsistencyCheckpoint) -> CheckpointComparison`**: Compares a received checkpoint against local state. Returns `Consistent`, `Divergent { first_divergent_event: u64 }`, or `Behind { missing_events: u64 }`.
+   - **`compare_checkpoint(local_log: &EventLog, remote_checkpoint: &ConsistencyCheckpoint) -> CheckpointComparison`**: Compares a received checkpoint against local state. Returns `Consistent`, `Divergent { first_divergent_event: Option<u64> }`, `Behind { missing_events: u64 }`, or `Ahead { extra_events: u64 }`.
    - Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3).
    - Checkpoints are sent as regular MLS application messages.
    - Divergent Merkle roots for the same event count indicate equivocation — trigger alert and divergence resolution.

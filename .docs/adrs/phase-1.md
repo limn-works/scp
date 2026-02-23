@@ -1050,10 +1050,10 @@ The ultimate acceptance criterion for Phase 1 is a single integration test that 
 1. Alice creates a did:dht identity (ADR-003) using in-memory key custody (ADR-006)
 2. Bob creates a did:dht identity (ADR-003) using in-memory key custody (ADR-006)
 3. Alice creates an MLS group (ADR-001)
-4. Alice generates a sender key (ADR-007) and distributes it to the group
+4. Alice generates a sender key (ADR-007) and publishes a SenderKeyEpochAdvance
 5. Bob publishes KeyPackages (ADR-001)
 6. Alice adds Bob to the group using his KeyPackage (ADR-001)
-7. Alice distributes the sender key bundle to Bob (ADR-007)
+7. Bob requests and receives Alice's sender key via pull-based protocol (ADR-007)
 8. Alice creates a message, encrypts with sender key (ADR-007), wraps in inner envelope (ADR-002), encrypts with MLS (ADR-001), wraps in outer envelope with pseudonym routing (ADR-002)
 9. Alice sends the outer envelope via the native relay (ADR-004) using the transport trait (ADR-005)
 10. Bob receives the outer envelope via relay subscription (ADR-004, ADR-005)
