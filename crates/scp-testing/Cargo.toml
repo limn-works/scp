@@ -1,0 +1,27 @@
+[package]
+name = "scp-testing"
+version = "0.1.0"
+description = "SCP network simulation test harness and trait conformance macros"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+proptest.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+scp-core = { path = "../scp-core" }
+scp-transport = { path = "../scp-transport" }
+scp-platform = { path = "../scp-platform" }

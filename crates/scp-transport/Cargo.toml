@@ -1,0 +1,28 @@
+[package]
+name = "scp-transport"
+version = "0.1.0"
+description = "SCP transport abstraction and native relay implementation"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tokio-tungstenite.workspace = true
+async-trait.workspace = true
+rmp-serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+scp-testing = { path = "../scp-testing" }

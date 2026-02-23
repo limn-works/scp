@@ -1,0 +1,40 @@
+[package]
+name = "scp-core"
+version = "0.1.0"
+description = "SCP core protocol types, cryptographic operations, and envelope format"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+openmls.workspace = true
+openmls_traits.workspace = true
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+aes-gcm.workspace = true
+rmp-serde.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+scp-platform = { path = "../scp-platform" }
+scp-testing = { path = "../scp-testing" }

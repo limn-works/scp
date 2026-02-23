@@ -1,0 +1,31 @@
+[package]
+name = "scp-platform"
+version = "0.1.0"
+description = "SCP platform abstraction traits for key custody, storage, attestation, and push"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
