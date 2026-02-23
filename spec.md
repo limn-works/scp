@@ -65,7 +65,8 @@ The protocol is designed for a world where:
         ╳               ╳              ╳              ╳
    No protocol-level communication between agents across contexts.
    Agent isolation is absolute — agents are separate instances per context.
-   Information may cross context boundaries only through opt-in tool interfaces (§2.3).
+   Information may cross context boundaries only through opt-in tool interfaces (§6.2)
+   or multi-parent child contexts (§5.13). See §2.3.
 ```
 
 The **protocol boundary** encompasses everything that touches the network — contexts, identity state (both public and private), encrypted envelopes, relay interactions, and attestations. Identity private state (§3.7) is protocol-governed even though it exists outside any context — it is encrypted data stored on relays, subject to protocol rules. Above the boundary, local agent orchestration and client behavior are unconstrained. Below it, all data and interactions are protocol-governed and cryptographically enforced.
@@ -148,19 +149,27 @@ The **protocol boundary** encompasses everything that touches the network — co
           │     (unconstrained)        │
           └────────────────────────────┘
 
-  Cross-context tool interfaces are the ONLY protocol-level
-  channel for information to cross context boundaries:
+  Two protocol-level mechanisms allow information to cross
+  context boundaries:
 
-  - Both contexts must explicitly opt in (mutual consent)
-  - Calls are stateless — no session, no persistent channel
-  - Data flows through declared tool schemas, not agent memory
-  - Every call is logged in the verifiable event log
-  - Results carry provenance (originating context, tool, operator)
+  1. TOOL INTERFACES (asymmetric, §6.2):
+     - Both contexts explicitly opt in (mutual consent)
+     - Calls are stateless (with optional sessions)
+     - Data flows through declared tool schemas
+     - Every call is logged in the verifiable event log
+     - Results carry provenance
 
-  This is a controlled crossing, not a breach of isolation.
-  Agent isolation remains absolute: no agent instance spans contexts,
-  no agent in Context B can see Context A's keys, members, or state.
-  The tool interface exposes only what the tool's schema declares.
+  2. MULTI-PARENT CHILD CONTEXTS (symmetric, §5.13):
+     - All parents' governance explicitly consents
+     - Child is a full context (messages, tools, roles)
+     - Child ceiling ≤ intersection of parent ceilings
+     - Members from different parents interact as peers
+     - Lifecycle coupled to parents (no orphans)
+
+  Both are controlled crossings, not breaches of isolation.
+  Agent isolation remains absolute: no agent instance spans contexts.
+  Tool interfaces expose only what schemas declare.
+  Child contexts are independent MLS groups with their own keys.
 ```
 
 ### 2.4 Trust and Capability Model
@@ -474,11 +483,21 @@ The number of contexts a person can participate in may be an earned resource —
 
 ### 5.1 Definition
 
-All interaction happens within contexts. A context is a shared space with defined boundaries: capabilities, tools, roles, membership, and governance. A group chat is a context. A Cronica quest is a context. A generated Discord alternative is a context. DMs are a two-party context.
+All interaction happens within contexts. There is no concept of off-context communication at the protocol level. A context is a bounded, encrypted, governed space — a cryptographic entity (one MLS group per context) with its own key tree, event log (append-only Merkle tree), governance model, membership roster, and capability ceiling. A group chat is a context. A Cronica quest is a context. A generated Discord alternative is a context. DMs are a two-party context. An entire app's backend is a context (or set of contexts).
+
+**Contexts are spaces, not actors.** They do not initiate, do not act, and have no agency. They hold the rules, the keys, and the audit trail. Agents (always bound to humans, §4) do the acting within them. Tools (§5.4) do the computing within them. The context itself is passive infrastructure.
+
+**Contexts are runtime objects, not infrastructure to deploy.** Creating a context is a runtime operation (~5-15ms local computation, ~200ms wall clock with network — see §5.12.4). Contexts are created, used, and destroyed during normal application operation. They survive process restarts (state is persisted) but are created as fluidly as opening a connection.
+
+**Contexts are where apps live.** What people experience as "an app" is a composite: a context (or set of contexts) + members + tools + data (§8.1). Long-lived contexts with no TTL host persistent applications — games, workspaces, social platforms. Ephemeral contexts with TTL host bounded tasks. The context is the app's lifecycle boundary. Protocol state (membership, roles, trust) is portable and survives app death; app state is the app's concern (§8.3).
+
+**Every context contains:** a capability ceiling (§5.3), roles with permission sets (§5.5), a governance model (§5.9), tools (§5.4), an optional TTL (§5.10), a memory scope (§5.11), and transparent metadata visible before opt-in (§5.7). These are all declared at creation. Contexts may be created from well-known templates (§5.12) for common patterns or from explicit parameters. Contexts can have parent-child relationships (§5.13) for sub-spaces and governed cross-context bridges.
+
+**Two protocol-level mechanisms allow information to cross context boundaries:** tool interfaces (§6.2) for asymmetric, structured, request/response interactions, and multi-parent child contexts (§5.13) for symmetric collaboration. Both require governance consent from all involved contexts. Agent isolation is absolute — no agent instance spans contexts (§6.1).
 
 ### 5.2 Creation
 
-Contexts are created by accountable identities only. Anonymous or unbound entities cannot create contexts. Creating a context is an act of social infrastructure — you're defining a space where autonomous software operates on people.
+Contexts are created by accountable identities only. Anonymous or unbound entities cannot create contexts. Creating a context is an act of social infrastructure — you're defining a space where autonomous software operates on people. Contexts may be created from well-known templates (§5.12) for common patterns, or from explicit parameters for bespoke configurations. Both paths produce identical contexts; templates are the fast path.
 
 ### 5.3 Capability Ceiling
 
@@ -520,6 +539,7 @@ One agent per human per context. Membership is transparent — participants can 
 
 The following are visible before opting in to any context:
 
+- Template ID, if created from a well-known template (§5.12)
 - Capability ceiling
 - Available roles and their permission sets
 - Governance model
@@ -528,8 +548,10 @@ The following are visible before opting in to any context:
 - Context age
 - TTL / time-to-live, if set (§5.10)
 - Memory scope (§5.11)
+- Active tool interface count (inbound and outbound, §6.2, §9.2.1)
+- For child contexts (§5.13): parent context IDs, parent metadata summaries, parent governance configuration, and the prospective member's eligibility basis (§5.13.6)
 
-This is protocol-level metadata, not optional. Full legibility of any space before you enter it.
+This is protocol-level metadata, not optional. Full legibility of any space before you enter it. When a template ID is present, the joining party can evaluate the context with a single template-level check rather than inspecting each parameter individually — the template is a commitment that the parameters match the well-known definition exactly (§5.12.1).
 
 ### 5.8 Context Identity
 
@@ -582,6 +604,522 @@ Relay deletion is best-effort — relays are untrusted infrastructure and cannot
 
 **Enforcement honesty.** The protocol enforces memory scope through cryptographic key destruction — specifically, MLS group state destruction (tree secrets, all epoch key schedules, application key material). This is verifiable and absolute for protocol-level data. Platform-attested destruction (§9.15) provides hardware-backed evidence that keys were deleted where available. However, the protocol cannot enforce memory scope above the protocol boundary. An agent's underlying model may retain information from an ephemeral interaction in its own memory. The spec is explicitly honest about this limitation: ephemeral memory scope destroys the protocol-level record and makes reproduction unverifiable, but does not guarantee the agent has forgotten. The absence of provenance on information an agent produces from memory is itself a signal — "this data has no verified origin." Participants in other contexts can evaluate unprovenanced information accordingly.
 
+### 5.12 Context Templates and Lightweight Creation
+
+Context creation requires specifying a ceiling, roles, governance model, memory scope, TTL, and tools. For durable, bespoke contexts this is appropriate — the creator is designing a space. But contexts must also be cheap and disposable. If "spin up a quick context" requires manual configuration of six parameters, agents will route around the protocol for lightweight coordination. Context templates solve this.
+
+#### 5.12.1 Well-Known Templates
+
+The protocol defines a set of well-known templates — named parameter bundles with fixed, predictable configurations. Templates are protocol-level identifiers, not SDK convenience wrappers. Both the creator and the joining party recognize the template ID and know exactly what it means without inspecting individual parameters.
+
+```
+Template: "scp:template/bilateral-ephemeral"
+  ceiling:     [MessagesRead, MessagesWrite]
+  roles:       [admin (creator), member (joiner)]
+  governance:  single-admin
+  memory_scope: ephemeral
+  ttl:         required (creator sets duration, no default — forces intentionality)
+  tools:       none
+
+Template: "scp:template/bilateral-persistent"
+  ceiling:     [MessagesRead, MessagesWrite]
+  roles:       [admin (creator), member (joiner)]
+  governance:  single-admin
+  memory_scope: full
+  ttl:         none
+  tools:       none
+
+Template: "scp:template/coordination"
+  ceiling:     [MessagesRead, MessagesWrite, ToolInvokeAll]
+  roles:       [admin (creator), member (joiner)]
+  governance:  single-admin
+  memory_scope: summary
+  ttl:         required (creator sets duration)
+  tools:       creator-defined at creation
+
+Template: "scp:template/group-discussion"
+  ceiling:     [MessagesRead, MessagesWrite, MemberInvite]
+  roles:       [admin, member, observer]
+  governance:  single-admin
+  memory_scope: full
+  ttl:         optional
+  tools:       none
+```
+
+Templates are not extensible by users — they are protocol constants. A template ID is a commitment: "this context has exactly these properties." If you need something a template doesn't cover, use explicit `ContextParams`. Templates and explicit params are equally valid; templates are just the fast path for common cases.
+
+**Template in metadata.** When a context is created from a template, the template ID appears in context metadata (§5.7). This means the joining party sees `template: "scp:template/bilateral-ephemeral", ttl: 300s` instead of evaluating six independent parameters. Template-based evaluation is a single check: "do I accept this template from this DID at this TTL?"
+
+#### 5.12.2 Auto-Accept Policies
+
+Agents MAY configure policies for automatic context acceptance — rules that allow the SDK to join contexts without human-in-the-loop confirmation. Auto-accept policies are local to the agent (never shared with the network) and evaluated entirely in the SDK.
+
+Policy structure:
+
+```
+AutoAcceptPolicy {
+  template:        TemplateID          // Which template(s) to auto-accept
+  from:            TrustRequirement    // Who can trigger auto-accept
+  max_ttl:         Duration?           // Maximum TTL to accept (optional cap)
+  rate_limit:      Rate?               // Max auto-accepts per time window
+}
+
+TrustRequirement:
+  | shared_context    // DID shares at least one active context with me
+  | known_did(list)   // DID is in an explicit allowlist
+  | discovery_context // DID is registered in a discovery context I trust
+```
+
+Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID I share at least one context with, if TTL ≤ 10 minutes, at most 5 per hour."
+
+**Security properties:**
+- Policies never auto-accept contexts with tool capabilities (ceiling containing `ToolInvoke*`). Tool access always requires explicit confirmation. This is non-overridable.
+- Rate limiting prevents a compromised contact from flooding auto-accepts.
+- The `shared_context` trust requirement means strangers can never trigger auto-accept — the existing shared context provides the trust baseline.
+- Auto-accept policies are enforced in the SDK, not the protocol. The protocol sees a normal context join. The policy just determines whether the SDK prompts the human or acts autonomously.
+
+**No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `ToolInvokeAll`, `ToolInvokeSpecific`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
+
+#### 5.12.3 SDK Convenience Surface
+
+The SDK provides template-based creation as the primary context creation path, with explicit `ContextParams` as the advanced path. Template-based creation is a single call that handles MLS group setup, sender key generation, event log initialization, and transport publishing internally.
+
+```
+// Primary path: template-based creation
+sdk.create_context(
+  template: "bilateral-ephemeral",
+  peer: bob_did,                      // For bilateral templates
+  ttl: Duration::minutes(5)
+) → ContextHandle
+
+// Equivalent explicit path (same result, more configuration)
+sdk.create_context(params: ContextParams {
+  ceiling: [MessagesRead, MessagesWrite],
+  roles: [admin, member],
+  governance: SingleAdmin,
+  memory_scope: Ephemeral,
+  ttl: Duration::minutes(5),
+  tools: [],
+  template_id: None,                  // No template — custom params
+}) → ContextHandle
+```
+
+**Bilateral shorthand.** For bilateral templates, the SDK accepts a peer DID directly and handles the invitation internally. The creator creates the context and immediately sends the invitation. If the peer has an auto-accept policy that matches, the join is automatic. If not, the peer's agent is prompted.
+
+**Invitation bundling.** When creating a bilateral context with a peer, the SDK bundles the context metadata and MLS Welcome message into a single transport delivery. The peer receives everything needed to evaluate and join in one message — no roundtrip to fetch metadata before deciding.
+
+#### 5.12.4 Context Creation as a Runtime Operation
+
+Context creation is not infrastructure provisioning. It is a runtime operation — comparable in weight to opening a TLS connection, not to deploying a database. Understanding this is critical to the protocol's viability: if context creation feels like a build action, agents will treat it as one and route around it for lightweight coordination. Context creation must be (and is) as fluid as `connect()`.
+
+**Computational profile of context creation:**
+
+```
+Operation                              Time          Analogy
+─────────────────────────────────────────────────────────────────
+Template params lookup                 <1μs          HashMap::get()
+MLS group init (2-member)              1-5ms         TLS handshake
+Sender key generation (HKDF+Ed25519)   <1ms          Key derivation
+Event log init (empty Merkle tree)     <1ms          Allocate a buffer
+UCAN token minting (Ed25519 sign)      1-2ms         Sign a JWT
+Pseudonym derivation (HKDF)            <1ms          KDF
+State persistence (serialize+write)    1-5ms         Write to keychain
+─────────────────────────────────────────────────────────────────
+Total local computation                ~5-15ms
+```
+
+No disk provisioning. No schema migrations. No index building. No connection pooling. The local computation is a handful of key derivations and one signature. The real cost is network: delivering the invitation to the peer and receiving their join response.
+
+**Network profile — first contact:**
+
+```
+Creator                        Relay                          Peer
+   │                              │                              │
+   ├─── create (local, ~10ms) ───►│                              │
+   │                              │                              │
+   ├─── invitation bundle ───────►├─── deliver to peer ─────────►│
+   │    (metadata + MLS Welcome)  │                              │
+   │                              │                              ├── evaluate
+   │                              │                              │   (local, <1ms
+   │                              │                              │    with template)
+   │                              │                              │
+   │                              │◄── MLS join + sender key ───┤
+   │◄── relay forward ───────────┤                              │
+   │                              │                              │
+   ├── context Active ────────────┼──────────────────────────────┤
+   │                              │                              │
+   Total: ~10ms local + 2 relay hops (1 roundtrip with bundling)
+   Wall clock: 100-500ms depending on transport latency.
+   With auto-accept: no human delay. Fully autonomous.
+```
+
+With invitation bundling (§5.12.3), the peer receives metadata and MLS Welcome in one delivery. The peer evaluates the template, auto-accepts (or prompts), and joins — sending their MLS join response and sender key in one return delivery. Two relay hops total. With WebSocket transport to a shared relay, this is sub-200ms.
+
+**Network profile — message in standing context (steady state):**
+
+```
+Sender                         Relay                          Receiver
+   │                              │                              │
+   ├── encrypt (local, <1ms) ────►│                              │
+   ├── outer envelope ───────────►├── route to receiver ────────►│
+   │                              │                              ├── decrypt
+   │                              │                              │   (local, <1ms)
+   │                              │                              │
+   Total: 1 relay hop. Sub-50ms on WebSocket. Sub-100ms cross-relay.
+```
+
+Once a context exists, message exchange is one transport hop with sub-millisecond local crypto on each side. This is the steady-state performance for all contexts — standing or ephemeral.
+
+#### 5.12.5 Context Lifecycle in Application Architecture
+
+Contexts are runtime objects. They are created, used, and destroyed during normal application operation — not provisioned ahead of time, not deployed as infrastructure. The SDK manages context lifecycle the same way a network library manages connections.
+
+**Application startup:**
+
+```
+1. sdk.init(identity, storage, transport_config)
+   ├── Load identity from secure storage
+   ├── Load persisted context state (all Active contexts survive restart)
+   ├── Reconnect transport for all Active contexts (background, non-blocking)
+   └── Begin processing queued invitations
+
+2. Standing channels are immediately available.
+   Messages sent before transport reconnects are queued locally.
+   Messages received while offline are retrieved from relay on reconnect.
+```
+
+**During operation — contexts are created and destroyed fluidly:**
+
+```
+Agent lifecycle                              Context operations
+──────────────────────────────────────────────────────────────────
+
+Receives task: "coordinate with Bob"
+  └── sdk.standing_channel(bob_did)          [get-or-create, ~0ms or ~200ms]
+      └── channel.send("sync on project?")   [send, 1 hop]
+
+Receives task: "negotiate contract terms"
+  └── sdk.create_context(                    [create, ~200ms]
+        template: "bilateral-ephemeral",
+        peer: vendor_did,
+        ttl: 30.minutes)
+      └── ctx.send(proposal)                 [send, 1 hop]
+      └── ... negotiate ...
+      └── [TTL expires, context auto-closes, keys destroyed]
+
+Receives task: "start team discussion"
+  └── sdk.create_context(                    [create, ~200ms]
+        template: "group-discussion")
+      └── ctx.add_member(alice_did)          [MLS add, 1 roundtrip]
+      └── ctx.add_member(carol_did)          [MLS add, 1 roundtrip]
+      └── ctx.send("kick off meeting")       [send, 1 hop]
+
+Application shutdown:
+  └── sdk.shutdown()
+      ├── Persist all Active context state
+      ├── Flush pending event log entries
+      └── Close transport connections
+      // Contexts survive. On next startup, they reconnect.
+```
+
+**Key property: contexts survive process restarts.** Context state (MLS group state, sender keys, event log position) is persisted to secure storage on every state transition (ADR-008). When the application restarts, all Active contexts are restored and transport is reconnected. No re-creation, no re-invitation, no re-negotiation. This is why standing channels work — they persist across application sessions, device reboots, and network interruptions.
+
+**Contexts are not connections.** A TCP connection dies when the process exits. A context does not. A context is a durable cryptographic group that happens to use connections for transport. The transport layer is replaceable (§8, ADR-012) and reconnectable. The context is the stable entity; the transport is ephemeral plumbing underneath.
+
+#### 5.12.6 The Contact Graph
+
+Agents that coordinate regularly maintain **standing bilateral contexts** — the agent's contact graph. A standing channel is a `bilateral-persistent` context with no TTL, created once and kept alive for the duration of the relationship.
+
+**Lifecycle of a standing channel:**
+
+```
+Relationship stage        Protocol action                Cost
+──────────────────────────────────────────────────────────────────
+First contact             create_context + invitation    ~200ms (one-time)
+Ongoing communication     send/receive in context        <100ms per message
+Idle period               nothing (context persists)     0 (no keepalive)
+Reconnect after offline   transport reconnect            background, automatic
+Relationship ends         close_context                  one-time, keys preserved or destroyed per memory scope
+```
+
+**Standing channels have zero idle cost.** No keepalives, no heartbeats, no periodic key rotation (MLS key updates happen on message send, not on a timer). An agent with 500 standing channels and no active conversations uses zero network bandwidth. The only cost is local storage for persisted MLS state — approximately 2-5KB per bilateral context (two-leaf ratchet tree, sender key material, minimal event log metadata).
+
+**Standing channels vs. ephemeral contexts — when to use which:**
+
+| | Standing channel | Ephemeral context |
+|---|---|---|
+| Template | `bilateral-persistent` | `bilateral-ephemeral` |
+| TTL | None (lives indefinitely) | Required (forces intentionality) |
+| Memory scope | Full (history preserved) | Ephemeral (keys destroyed on close) |
+| Use case | Ongoing relationship, general communication | Bounded task, sensitive negotiation, time-boxed coordination |
+| Analogy | Phone contact | Phone call |
+| Creation | Once per relationship | Once per interaction |
+
+An agent typically has a standing channel with every peer it communicates with regularly, and creates ephemeral contexts on top of that for specific bounded tasks — especially tasks involving sensitive data that should not persist.
+
+**First-contact optimization.** When two agents already share a context (e.g., both are members of a group), creating a standing channel between them is faster: both agents already have each other's DID documents and MLS key packages cached from the shared context. The SDK SHOULD use this cached key material to skip DID resolution, reducing first-contact setup to a single relay roundtrip.
+
+### 5.13 Context Nesting
+
+Contexts can have parent-child relationships. A child context is a full context — its own MLS group, event log, governance, roles, tools, ceiling, and membership — that is structurally and cryptographically linked to one or more parent contexts. The parent relationship constrains the child (ceiling inheritance, lifecycle coupling, membership eligibility), is visible in metadata, and is bound into the child's MLS group identity so that lineage cannot be forged or rewritten after creation.
+
+Nesting serves two distinct purposes depending on parent count:
+
+- **Single-parent child** — a sub-space within a context. Per-task rooms, per-topic channels, per-match game instances. The parent contains the child; the child narrows the parent's scope.
+- **Multi-parent child** — a governed bridge between contexts. A shared collaboration space where members from different parent contexts interact as peers. This is the protocol's structural mechanism for symmetric cross-context communication.
+
+```
+Single-parent (sub-space):              Multi-parent (bridge):
+
+  Context A                               Context A ──┐
+    │                                                  ├── Child C
+    └── Child C                           Context B ──┘
+        (sub-space of A)                      (bridge between A and B)
+
+
+Multi-parent chain:
+
+  Context A ──┐
+              ├── Child C ──┐
+  Context B ──┘             ├── Grandchild E
+                Context D ──┘
+```
+
+#### 5.13.1 Ceiling Inheritance
+
+A child's capability ceiling is the intersection of all parent ceilings. This is enforced at creation time and is the hard security boundary that prevents capability escalation through nesting.
+
+```
+Parent A ceiling: [MessagesRead, MessagesWrite, ToolInvokeAll, Media]
+Parent B ceiling: [MessagesRead, MessagesWrite, ToolInvokeAll]
+
+Child ceiling ≤ intersection = [MessagesRead, MessagesWrite, ToolInvokeAll]
+```
+
+The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[MessagesRead, MessagesWrite]` even if the intersection would allow tools.
+
+If the protocol later adopts mutable ceilings (§5.3), and a parent's ceiling is reduced, the child's ceiling is retrospectively reduced to maintain the intersection invariant. If this makes the child's ceiling empty (no capabilities remain), the child closes automatically. This cascade is logged in both the parent's and child's event logs.
+
+#### 5.13.2 Membership Eligibility
+
+A member of a child context must be a member of **at least one** parent context. This is the eligibility pool — the set of identities that are permitted to join the child. The child's own governance (roles, admission requirements) determines who actually joins from that pool.
+
+```
+Parent A members: [Alice, Carol, Eve]
+Parent B members: [Bob, Carol, Dave]
+
+Eligible pool for child: [Alice, Bob, Carol, Dave, Eve]
+  - Alice can join (via A)
+  - Bob can join (via B)
+  - Carol can join (via A or B — multi-anchored)
+  - Dave can join (via B)
+  - Eve can join (via A)
+  - Frank cannot join (not in any parent)
+```
+
+**Eligibility is continuous, not one-time.** If a member is removed from their only active parent (i.e., the parent is still open but the member is individually removed from it), they lose eligibility in the child. The child's SDK detects the loss of eligibility and evicts the member — MLS remove_member, sender key rotation, event log entry. If the member is in multiple parents and loses one, they retain eligibility through the remaining parent(s).
+
+**Detection mechanism.** Eligibility enforcement operates through the local agent orchestration layer (above the protocol boundary). The SDK maintains awareness of the user's membership across contexts locally — when local state reflects a membership loss in a parent, the SDK evaluates child eligibility and acts. This does not require cross-context protocol communication; it uses the same local state that the SDK already maintains for context management.
+
+**Distinction from parent sever.** Individual member removal from an active parent triggers continuous eligibility enforcement. When a parent itself severs (closes or is disconnected), the outcome is governed by the `on_sever` configuration agreed upon at creation (§5.13.4), which may differ from the continuous eligibility default.
+
+**Joining a child does not grant membership in any parent.** Bob joining child C (via eligibility through parent B) does not make Bob a member of parent A. Parent membership is independent. The child is a meeting point, not a gateway.
+
+**Children do not confer eligibility for other children.** Membership in a child context does not make a member eligible for sibling children of the same parent, or for children of other parents. Eligibility flows downward (parent → child), never upward or sideways.
+
+#### 5.13.3 Creation
+
+Child context creation requires governance approval from every parent context. The creator does not need to be in all parents — they need creation rights in one parent, and governance in each additional parent must independently approve.
+
+**Creation scenarios:**
+
+**A. Single creator with standing in multiple parents.** Alice is a member of both A and B. She has creation rights (via her role) in both. She creates child C with parents [A, B]. Both A and B's governance approve based on Alice's standing.
+
+```
+Alice (in A + B) → sdk.create_child_context(
+  parents: [context_a, context_b],
+  ceiling: [MessagesRead, MessagesWrite],
+  ttl: .hours(2)
+)
+→ A's governance approves (Alice has ContextCreate capability in A)
+→ B's governance approves (Alice has ContextCreate capability in B)
+→ Child C created
+```
+
+**B. Coordinated creation across contexts.** Alice is in A with creation rights. Bob is in B with creation rights. Neither is in the other's context. They coordinate (via a bilateral context, shared context, or out-of-band) to create child C.
+
+Coordination uses an intrinsic tool call available within each context's governance. Alice invokes the child-creation tool in A with the proposed child params and the list of co-parents. A's governance evaluates and, if approved, publishes a **child creation proposal** — a signed, content-addressed record of the approved params. Bob does the same in B. The protocol matches proposals by their content hash: when all proposed parents have published matching proposals (identical child params), the child is created. Proposals expire after a configurable timeout (suggested default: 1 hour).
+
+```
+Alice (in A) → invokes child creation tool → A's governance approves
+             → A publishes proposal { hash(child_params), parent_list, approval_sig }
+Bob (in B)   → invokes child creation tool → B's governance approves
+             → B publishes proposal { hash(child_params), parent_list, approval_sig }
+Protocol matches proposals by content hash
+→ Child C created
+→ Both Alice and Bob are initial members
+```
+
+This reuses the existing tool call model — no new protocol primitive. The child creation tool is intrinsic to contexts that include the `ChildContextCreate` capability in their ceiling.
+
+**C. Member proposal without creation rights.** Alice is in A but her role doesn't include creation rights. She proposes the child through A's governance (§5.9). A's governance evaluates and either approves or rejects the proposal. If approved, the governance itself authorizes the creation on A's behalf. Same process on B's side.
+
+**Creation protocol:**
+
+1. **Initiator constructs child params:** ceiling (must be ≤ intersection of parent ceilings), governance model, roles, TTL (must be ≤ minimum parent TTL if parents have TTLs), memory scope, tools, and the parent governance configuration (§5.13.4).
+2. **Governance proposal sent to each parent.** The proposal includes the full child params plus the list of all proposed parents. Each parent's governance evaluates independently.
+3. **All parents approve.** The child context is created. Creation is logged in every parent's event log and in the child's event log.
+4. **Any parent rejects.** Creation fails. No child is created. The rejection is not logged (the proposal never materialized).
+
+**Cryptographic binding.** When the child's MLS group is initialized (step 3), the parent context IDs and the content hash of the parent governance configuration are included in the MLS `group_context` extensions field. This makes the parent lineage part of the child's cryptographic group identity — the `group_id` derived from the `group_context` is a function of the parent references. Consequences:
+
+- **Lineage is unforgeable.** Claiming different parents after creation would require creating a new MLS group with a different `group_id`. Any member can verify the parent lineage by inspecting the `group_context` extensions — no trust in metadata required.
+- **Two independent verification paths.** The parent relationship is recorded in both the MLS `group_context` (cryptographic, part of the group identity) and the event log (Merkle tree, signed entries). Both would need to be compromised to forge lineage.
+- **Governance config is tamper-evident.** The content hash of the `ParentGovernanceConfig` in the `group_context` means any discrepancy between the claimed governance configuration and the cryptographically committed one is detectable.
+
+**Parent awareness.** When Context A's governance receives a child creation proposal that includes Context B as a co-parent, A's governance sees B's context metadata (§5.7) — ceiling, member count, governance model, age, etc. This is the same metadata visible to anyone inspecting a context before joining. A's governance can evaluate whether a relationship with B is acceptable based on this metadata.
+
+#### 5.13.4 Parent Governance Configuration
+
+The governance relationship between parents and child is configurable at creation time — not prescribed by the protocol. The creators (with parent governance approval) configure a set of parent governance permissions that define what authority each parent retains over the child after creation.
+
+**Configurable permissions (per parent):**
+
+```
+ParentGovernanceConfig {
+  can_close_child:       Bool    // Can this parent unilaterally close the child?
+  can_evict_members:     Bool    // Can this parent evict members from the child?
+  can_restrict_ceiling:  Bool    // Can this parent further restrict the child's ceiling?
+  requires_approval_for: [       // What child operations require this parent's approval?
+    | GovernanceChange           // Child governance model changes
+    | ToolRegistration           // New tools added to child
+    | CeilingChange              // Child ceiling modifications (if mutable)
+    | MembershipChange           // Members added/removed
+  ]
+  on_sever: .evict_unique_members  // When this parent severs: evict members eligible only through this parent
+          | .cascade_close          // When this parent severs: close the child entirely
+          | .preserve_membership    // When this parent severs: child continues, current members retain membership
+                                    // (members lose their eligibility anchor but keep their seat — a deliberate
+                                    // governance choice to prioritize continuity over strict eligibility enforcement)
+}
+```
+
+**Both parents agree on EACH OTHER'S configuration at creation time.** This is mutual consent — A sees what governance authority B will have over the child, and vice versa. The configuration is visible in the child's metadata (§5.7) so members can evaluate the governance structure before joining.
+
+**Examples of common configurations:**
+
+**Symmetric collaboration** (two teams working together):
+```
+Parent A config: { can_close: false, can_evict: false, can_restrict: false,
+                   requires_approval_for: [], on_sever: .evict_unique_members }
+Parent B config: { same as A }
+// Neither parent can unilaterally control the child. Severing removes that
+// parent's unique members. The child governs itself within the ceiling.
+```
+
+**Durable joint venture** (relationship outlives either parent):
+```
+Parent A config: { can_close: false, can_evict: false, can_restrict: false,
+                   requires_approval_for: [], on_sever: .preserve_membership }
+Parent B config: { same as A }
+// If either parent closes, the child continues with all current members.
+// Members who were eligible only through the severed parent keep their seat.
+// The child's own governance takes over fully. Use when the child's work
+// should survive parent reorganization.
+```
+
+**Service relationship** (B provides a service to A's members):
+```
+Parent A config: { can_close: true, can_evict: false, can_restrict: false,
+                   requires_approval_for: [], on_sever: .cascade_close }
+Parent B config: { can_close: false, can_evict: false, can_restrict: true,
+                   requires_approval_for: [ToolRegistration], on_sever: .cascade_close }
+// A can shut down the relationship. B controls the tools (it's the service provider).
+// If either severs, the child closes entirely.
+```
+
+**Supervised sub-space** (single-parent nesting):
+```
+Parent A config: { can_close: true, can_evict: true, can_restrict: true,
+                   requires_approval_for: [GovernanceChange, CeilingChange],
+                   on_sever: .cascade_close }
+// Full parental authority. The child is a room within A.
+```
+
+**The parent governance configuration is immutable after creation.** Changing it would require creating a new child with different configuration. This prevents governance bait-and-switch — members join the child knowing exactly what authority each parent has, and that doesn't change.
+
+#### 5.13.5 Lifecycle Coupling
+
+**Children cannot outlive all parents. No orphans.**
+
+- When a parent context closes (manually or via TTL expiry), the parent-child relationship severs. The `on_sever` action configured for that parent executes.
+- If the last parent closes, the child closes regardless of `on_sever` configuration. A child with no parents has no trust anchors and no structural governance authority. It closes. Even `.preserve_membership` cannot prevent this — the option preserves membership through individual parent severances, not through the loss of all parents.
+- Children can close independently without affecting any parent. A child closing is logged in every parent's event log.
+
+**TTL inheritance.** A child's TTL cannot exceed the minimum TTL of its parents (among parents that have TTLs). If parent A has TTL = 1 hour and parent B has no TTL, the child's TTL is bounded by 1 hour. If neither parent has a TTL, the child's TTL is unconstrained.
+
+Rationale: TTL is part of the opt-in contract (§5.10). Parent A's members consented to a 1-hour interaction. A child that outlives A would extend the interaction's footprint beyond what A's members expected. Bounding the child's TTL by the parent's prevents this.
+
+**Lifecycle event log entries:**
+
+```
+In parent's event log:
+  ChildCreated { child_id, co_parents: [contextID], creator: DID, ceiling, config }
+  ChildClosed  { child_id, reason: .manual | .ttl_expiry | .parent_sever | .orphaned }
+
+In child's event log:
+  Created           { parents: [contextID], ceiling, config }
+  ParentSevered     { parent_id, reason: .closed | .manual_sever, action: on_sever }
+  MemberEvicted     { did, reason: .parent_sever(parent_id) }
+  ClosedByOrphan    { last_parent_id }
+```
+
+#### 5.13.6 Metadata and Legibility
+
+Child context metadata (§5.7) includes all standard context metadata plus:
+
+- **Parent context IDs.** The full list of parent contexts.
+- **Parent metadata summaries.** For each parent: ceiling, governance model, member count, age. Enough to evaluate the trust basis without joining the parent.
+- **Parent governance configuration.** What authority each parent has over the child (§5.13.4).
+- **Eligibility basis.** Which parent(s) the prospective member would join through.
+
+This means a member evaluating whether to join a child sees: "This is a child of contexts A and B. A has 30 members, single-admin governance, ceiling [msg, tools]. B has 15 members, multi-sig governance, ceiling [msg]. The child's ceiling is [msg]. Parent A can close the child unilaterally. Parent B cannot. If A severs, members from A only are evicted."
+
+Full legibility before opt-in applies to nesting relationships the same as everything else in the protocol. No hidden parent governance. No undisclosed co-parents.
+
+#### 5.13.7 Interaction with Other Mechanisms
+
+**Templates.** Well-known templates (§5.12.1) can be used for child contexts. The template constrains the child's params as usual; the parent relationship adds the ceiling intersection and lifecycle coupling on top. A child created from `bilateral-ephemeral` with two parents is an ephemeral bridge — TTL'd, keys destroyed on close, ceiling ≤ intersection.
+
+**Standing channels.** A standing channel (§5.12.6) between Alice and Bob can be modeled as a multi-parent child of whatever context(s) Alice and Bob share. This is not required — standing channels remain lightweight bilateral contexts that work without nesting. But if structural governance over the standing channel is desired (a parent context's governance should have authority over the channel), nesting provides that.
+
+**Tool interfaces.** Tool interfaces (§6.2) and multi-parent children serve different purposes and coexist:
+
+| | Tool interface | Multi-parent child |
+|---|---|---|
+| Relationship | Asymmetric (caller/tool) | Symmetric (peers) |
+| Data flow | Structured (schema-declared) | Full context (messages, tools, everything) |
+| Governance | Both contexts govern each call | Configured at creation, child self-governs |
+| Duration | Per-call (or per-session) | Persistent (until closed or TTL) |
+| Use case | Service calls, data queries | Collaboration, negotiation, ongoing A2A |
+
+A context might use both: tool interfaces for structured service queries and a multi-parent child for ongoing collaboration with the same counterpart.
+
+**Provenance.** Data originating in a child context carries provenance (§7.7) that includes the child's parent lineage. When data from a child crosses another context boundary (via tool interface or further nesting), the provenance chain includes the child and its parents. This makes the trust basis structurally legible: "this data came from a child of A and B" tells the receiver more than "this data came from some context."
+
+**Auto-accept policies.** Auto-accept policies (§5.12.2) can be extended to cover child context invitations. A policy might specify: "auto-accept invitations to children of contexts I'm already in, with ceiling ≤ [MessagesRead, MessagesWrite], TTL ≤ 10 minutes." The parent lineage provides a stronger trust signal than a standalone context invitation — the member knows the child is governed by contexts they already participate in.
+
+#### 5.13.8 Nesting Depth
+
+The protocol enforces a maximum nesting depth (suggested default: 3 levels). A child of a child of a child is permitted; a fourth level is rejected. This bounds:
+
+- Governance complexity (each level adds configurable permissions)
+- Ceiling reduction (each level can only narrow, so deep nesting converges on empty ceilings)
+- Lifecycle cascade depth (closing a grandparent cascades through children and grandchildren)
+- Trust evaluation complexity (provenance with deep nesting lineage is harder to evaluate)
+
+The nesting depth limit is a protocol constant, not configurable per context. It applies to the longest path from any root ancestor to the context being created.
+
 ---
 
 ## 6. Cross-Context Communication
@@ -589,6 +1127,13 @@ Relay deletion is best-effort — relays are untrusted infrastructure and cannot
 ### 6.1 Agent Isolation
 
 Agents cannot cross contexts at the protocol level. This is absolute. An agent in Context A cannot send a message to Context B, read Context B's state, or interact with Context B's tools or members. From the protocol's perspective, the agent in A and the agent in B (even if operated by the same human) are entirely separate instances.
+
+Information may cross context boundaries through two protocol-level mechanisms:
+
+1. **Cross-context tool interfaces (§6.2)** — asymmetric, structured, request/response. One context queries another's tool. Governed by both contexts per call.
+2. **Multi-parent child contexts (§5.13)** — symmetric, full context. A shared space governed by multiple parent contexts. Members from different parents interact as peers.
+
+Both mechanisms require explicit consent from all involved contexts. Neither allows agents to directly access another context's state. The first is for service-style interactions; the second is for collaborative ones.
 
 ### 6.2 Context-to-Context Tool Interfaces
 
@@ -601,8 +1146,10 @@ Properties:
 - Both contexts opt in explicitly (bidirectional consent at the context level, not the agent level).
 - Data flows through defined function signatures, not through agent memory or discretion.
 - Auditable: every call through an interface is logged in both contexts' event logs with full provenance (§7.7).
-- Tool interfaces carry provenance: data received through an interface carries its origin context, invoking agent, and timestamp.
+- Tool interfaces carry provenance: data received through an interface carries its origin context, invoking agent, timestamp, and chain depth (§7.7.1).
 - Rate-limited: both contexts can enforce rate limits on interface calls.
+- **Chain depth limit.** Cross-context tool calls carry a `chain_depth` counter, incremented on each hop. A tool call at maximum depth (protocol default: 3) cannot trigger further cross-context tool calls. This bounds amplification and makes transitive provenance degradation mechanically enforced (§9.2.1).
+- **Schema constraints.** Tool schemas must satisfy a structural specificity floor at registration time — no unbounded string-only interfaces, minimum two distinct fields in input or output. This prevents degenerate broad-schema tools that function as arbitrary message channels (§9.2.1).
 
 #### 6.2.1 Stateful Tool Sessions
 
@@ -622,7 +1169,7 @@ Context A → Context B tool "schedule_meeting":
 
 Session state is maintained by the tool's context (Context B), not by the calling agent. Each call in the session is individually governed — Context A's governance permits each outbound call, Context B's governance permits each inbound call. The session does not create a persistent channel; it is a sequence of governed tool calls that share state via an opaque session identifier.
 
-Sessions have a TTL set by the tool's context. Expired sessions are cleaned up. Session state is internal to the tool's context and not visible to the calling context beyond the tool's defined output schema.
+Sessions have an optional TTL set by the tool's context. When set, expired sessions are garbage-collected automatically. Sessions without a TTL persist for the lifetime of the context — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context itself is the session's lifecycle boundary. Contexts enforce a per-caller session cap (suggested default: 5 concurrent sessions per calling context) to prevent session exhaustion attacks regardless of TTL (§9.2.1). Session state is internal to the tool's context and not visible to the calling context beyond the tool's defined output schema.
 
 #### 6.2.2 Protocol-Level Discovery
 
@@ -667,19 +1214,25 @@ agent_deregister(did) → removal
 
 These are conventions, not mandates — discovery contexts can add custom tools (e.g., reputation scoring, category browsing, geographic filtering) beyond the standard schema.
 
-**Open join model.** Discovery contexts use open join policies so any agent can join to search or register. Joining is a standard SCP context join (MLS group add). One-time cost; subsequent searches are fast tool calls within the context.
+**Two-tier membership model.** Discovery contexts use a two-tier architecture to support unbounded scale while maintaining MLS-based governance:
+
+- **Writer tier (MLS members, bounded).** Writers are standard MLS group members. They can register/deregister entries, modify governance, and process registration requests. The MLS group is bounded at ~500 members to maintain practical epoch advance costs (O(N) cost per MLS Update). Writers are typically registry operators, curators, and high-volume registrants.
+- **Reader tier (DID-authenticated, unbounded).** Readers query the discovery context's tool endpoints via DID-signed requests without joining the MLS group. They can search (`agent_search`), inspect entries, and request inclusion proofs from the Merkle event log. No MLS membership required, no epoch advance cost. Reader capacity is unbounded.
+- **Registration flow.** A reader (non-MLS-member) registers by sending a DID-signed registration request to the context's `agent_register` tool endpoint. A writer processes the request and records it as an MLS application message in the event log. The registrant does NOT become an MLS member — their entry is stored in the context's registry data, and they can update or deregister via subsequent DID-authenticated requests to tool endpoints, processed by writers.
+- **Self-service updates.** Registered agents update their entries via DID-authenticated requests to tool endpoints. Writers verify the DID signature matches the entry owner and process the update.
+- **Consistency.** All writes are recorded in the Merkle event log. Readers can request inclusion proofs to verify their registration was recorded and to audit the registry's integrity.
 
 **Bootstrap / cold-start.** How agents find their first discovery context:
 
 - SDK ships with default discovery context IDs (configurable, analogous to browser CA lists or DNS root servers). These are not privileged — they are starting points.
 - Apps can add domain-specific discovery contexts (e.g., a cooking community registry, a translation services directory).
-- On first identity creation, the SDK auto-joins default discovery contexts and optionally self-registers (opt-out via configuration).
+- On first identity creation, the SDK auto-queries default discovery contexts and optionally self-registers (opt-out via configuration). Registration does not require MLS group membership.
 - If all defaults are unavailable, agents fall back to direct DID resolution for known contacts and manual context ID sharing.
 
 **Operation model.** Anyone can run a discovery context:
 
-- Creator sets governance: who can register, metadata requirements, moderation rules (via standard context governance).
-- Storage: structured metadata entries (~100-500 bytes per agent), not conversation history. 10K agents ≈ 5MB.
+- Creator sets governance: who can register, metadata requirements, moderation rules (via standard context governance, enforced by writers).
+- Storage: structured metadata entries (~100-500 bytes per agent), not conversation history. Scale is limited only by relay storage capacity — the MLS group (writers) stays small regardless of registry size.
 - No operator dependency: if one registry disappears, agents use others. DID + capabilities persist in the agent's DID document regardless.
 
 **SDK unification.** The SDK provides a unified discovery API:
@@ -692,7 +1245,16 @@ These are conventions, not mandates — discovery contexts can add custom tools 
 
 ### 6.3 The Human as Bridge
 
-The human coordinates across their own contexts locally. Their local agent orchestration — unconstrained by the protocol — handles cross-context intelligence. For the human's own agents, the human remains the bridge — local coordination across their own contexts requires no network-level mechanism. Cross-context tool interfaces (§6.2) provide the governed protocol-level channel for inter-agent interaction; the human's local coordination handles everything else.
+The human coordinates across their own contexts locally. Their local agent orchestration — unconstrained by the protocol — handles cross-context intelligence. For the human's own agents, the human remains the bridge — local coordination across their own contexts requires no network-level mechanism.
+
+Two protocol-level mechanisms formalize cross-context relationships: tool interfaces (§6.2) for asymmetric service-style interactions, and multi-parent child contexts (§5.13) for symmetric collaboration. Both require governance consent from all involved contexts. The human's local coordination handles everything that doesn't need to be on the network — and when a cross-context relationship should be visible, governed, and persistent, a multi-parent child context makes the bridge structural rather than implicit.
+
+**Two-tier interaction model.** The protocol provides two tiers of cross-agent communication with different overhead appropriate to different risk profiles:
+
+- **Shared contexts** (bilateral or multi-party) for lightweight, symmetric, low-ceremony communication. A message in a shared context is encrypt-send-decrypt with no per-message governance overhead. All the protocol's trust and encryption properties apply. This is the equivalent of a text message.
+- **Tool interfaces** for formal, structured, asymmetric cross-context data exchange. Full governance mediation on both sides, schema-declared data flow, audit logging, rate limiting, provenance attachment. This is the equivalent of an API call.
+
+Agents use whichever tier fits the interaction. Lightweight coordination ("are you available?", "quick update") flows through shared contexts. Formal cross-context data queries flow through tool interfaces. Both are governed; the difference is in ceremony and auditability per interaction.
 
 ---
 
@@ -979,10 +1541,11 @@ DataProvenance {
   purpose:           String                  // declared purpose of source context
   discoveryMethod:   .sharedContext(contextID)
                    | .registry(registryContextID)
-                   | .referral(chain: [DID], depth: Int)
                    | .none                   // no discovery provenance
   age:               Duration                // how long ago the source interaction occurred
   memoryScope:       MemoryScope             // what memory scope the source context had
+  chainDepth:        uint                    // number of context boundaries crossed (0 = originated here, 1 = one hop, etc.)
+  chainPath:         [contextID]?            // optional: ordered list of intermediary context IDs in the chain
 }
 ```
 
@@ -1129,7 +1692,7 @@ Context tools:             Admin's agent MCP surface:    Member's agent MCP surf
 2. **Agents are context-bound.** No protocol-level cross-context awareness or communication for agents.
 3. **Tools are stateless and non-agentic.** They compute, they don't act.
 4. **One agent per person per context.** No fleet multiplication within a space.
-5. **Contexts are isolated by default.** No transitive exposure. Cross-context data flow only through explicit, opt-in, stateless tool interfaces.
+5. **Contexts are isolated by default.** No transitive exposure. Cross-context data flow only through two explicit, opt-in mechanisms: tool interfaces (asymmetric, §6.2) and multi-parent child contexts (symmetric, §5.13).
 6. **Role assignment is non-negotiable.** Agents cannot request elevated permissions.
 7. **Context metadata is transparent.** Full legibility before opt-in.
 
@@ -1145,13 +1708,129 @@ Context tools:             Admin's agent MCP surface:    Member's agent MCP surf
 
 **Permission creep.** Gradual expansion of what a context demands. Mitigation: capability ceilings. If mutable, mutations require governance approval and are visible to all members.
 
-**Metastatic growth (cancer).** Legitimate-looking cascading expansion through the network. Mitigation: agents can't cross contexts (primary defense); context participation rate limits per human; bridging only through stateless tool interfaces, not agent memory.
+**Metastatic growth (cancer).** Legitimate-looking cascading expansion through the network. Mitigation: agents can't cross contexts (primary defense); context participation rate limits per human; bridging only through governed tool interfaces (§6.2) or multi-parent child contexts (§5.13) — both require explicit governance consent. Nesting depth limits (§5.13.8) bound cascading expansion through child contexts. Ceiling intersection (§5.13.1) means each level of nesting can only narrow capabilities, converging on empty ceilings at depth.
 
 **Betrayer / insider threat.** Compromised accountable identity using legitimate trust to cause damage. Mitigation: granular revocation (per-capability, per-agent, per-context); damage contained to contexts the betrayer is in; agents can't carry damage across context boundaries.
 
-**Context infection.** Poisoned data flowing through legitimate context-to-context tool interfaces. Mitigation: content provenance via hash chains (data carries its origin context and interface chain); tool interface validation at receiving context; velocity limits on propagation (content bridged N times in M minutes is flagged). Protocol makes infection legible and traceable, can't permanently prevent it.
+**Context infection.** Poisoned data flowing through legitimate cross-context mechanisms — tool interfaces (§6.2) or multi-parent child contexts (§5.13). Mitigation: content provenance via hash chains (data carries its origin context and chain path, §7.7.1); tool interface validation at receiving context; velocity limits on propagation (content bridged N times in M minutes is flagged); child context ceiling intersection (§5.13.1) limits what capabilities poisoned data can exploit at each nesting level. Protocol makes infection legible and traceable, can't permanently prevent it.
 
 **Agent slot rental.** Someone with a trusted identity operating agents on another's instructions. Mitigation: one agent per context limits the value; earned capacity means new identities can't immediately scale; fleet coherence signals may detect behavior inconsistent with a single human's intent. Partially mitigated, not fully solved.
+
+#### 9.2.1 Tool Interface Abuse Vectors and Mitigations
+
+Information crosses context boundaries through two protocol-level mechanisms: tool interfaces (§6.2) for asymmetric, structured interactions and multi-parent child contexts (§5.13) for symmetric collaboration. With A2A propose/accept removed, all inter-agent coordination flows through these governed mechanisms. Tool interfaces concentrate structured cross-context data flow on a single, auditable surface. The following abuse patterns target that surface specifically. Nesting-related security properties are addressed in §5.13.1 (ceiling inheritance), §5.13.2 (eligibility enforcement), and §5.13.5 (lifecycle coupling).
+
+**1. Broad-schema tools as covert messaging channels.**
+
+*Attack:* A context exposes a tool with a deliberately broad schema — `input: { payload: string }, output: { response: string }` — creating a de facto free-form messaging channel that wears the governance mask of a "tool call." Both contexts opted in, the schema is valid, rate limits pass, provenance is attached, but the semantic constraint that tool calls carry structured, bounded data is gone.
+
+*Mitigation — minimum viable tool schema.* Tool schemas MUST satisfy structural constraints enforced at registration time (§5.4). The protocol rejects tool registrations that violate these constraints:
+
+- **No unbounded string-only interfaces.** A tool schema where both the input and output consist solely of unconstrained string or bytes fields is rejected. At least one input or output field must be a non-string primitive, enum, array with typed elements, or structured object. This prevents the degenerate case of arbitrary message pipes while permitting legitimate tools that accept or return text alongside structured data.
+- **Schema specificity floor.** Tool schemas must declare at least two distinct fields in either input or output (or both). A single-field `{ query: string } → { result: string }` interface is the minimum viable message pipe; requiring structural complexity makes it harder to masquerade.
+- **Schema is immutable per registration.** Modifying a tool's schema creates a new registration with a new implementation hash (§5.4). Counterparties that connected to the old schema must re-consent to the new one. This prevents gradual schema broadening after trust is established.
+
+These constraints don't prevent a sufficiently creative attacker from encoding arbitrary messages in structured fields (steganography). The defense is not impermeability — it's raising the cost and making the attempt legible. A tool schema that looks suspiciously like a messaging pipe (e.g., `{ message_type: enum, payload: string }`) is a signal that governance tools and behavioral analysis can flag.
+
+**2. Hub contexts as cross-context data aggregators.**
+
+*Attack:* A single context accumulates tool interfaces to many other contexts, becoming a hub that aggregates cross-context information flowing through its interfaces. Each interface is bilateral and governed, but the hub sees data from all of them — a surveillance context masquerading as infrastructure.
+
+*Mitigation — interface count as observable metadata.*
+
+- **Interface count is visible in context metadata (§5.7).** The number of active inbound and outbound tool interfaces is part of a context's legible metadata. Before joining a context or connecting a tool interface to it, agents can see how many other interfaces it maintains. A context with 50 outbound interfaces is visibly different from one with 2 — and that visibility enables informed decisions.
+- **Behavioral topology signals.** The systemic defense philosophy (§9.4) applies: monitor structural metadata, not content. A context that rapidly accumulates interfaces, maintains interfaces to contexts in unrelated domains, or exhibits high-volume cross-interface data flow is topologically anomalous. These patterns are detectable by network-level behavioral analysis without inspecting content.
+- **Provenance chain depth.** Data flowing through a hub carries provenance (§7.7). If data enters the hub from Context A and exits to Context C, the provenance chain records both hops. Context C sees that data originated in A and passed through the hub. Deep provenance chains — data that has crossed multiple context boundaries — naturally attract additional scrutiny (§7.7.2). This is a feature, not a limitation: trust should degrade with indirection.
+
+*Design note:* This vector is partially inherent to any system that allows cross-boundary data flow. The protocol's contribution is making the aggregation visible and the data flow traceable, not preventing hub formation entirely. Legitimate service contexts (discovery registries, translation services) are hubs by design — the difference is that their interface patterns are consistent with their declared purpose.
+
+**3. Chained tool calls as amplification.**
+
+*Attack:* Context A calls Context B's tool. B's implementation calls Context C's tool. C calls D. A single call from A cascades with potential exponential fanout. Each hop is independently rate-limited, but A's rate limit only constrains the first hop.
+
+*Mitigation — chain depth limit and provenance-based cost attribution.*
+
+- **Protocol-enforced chain depth limit.** Tool calls carry a `chain_depth` counter, incremented on each cross-context hop. The protocol enforces a maximum chain depth (suggested default: 3 hops). A tool call at the depth limit cannot trigger further cross-context tool calls. This is a hard protocol limit, not a governance option — it bounds the worst-case amplification factor.
+- **Provenance carries chain depth.** The provenance record (§7.7.1) includes the chain depth at each hop. Receiving contexts see how many boundaries the data has crossed. This enables depth-aware trust evaluation: data at chain depth 1 (direct tool call) carries stronger provenance than data at chain depth 3 (three intermediaries).
+- **Per-window rate limiting across chains.** Each context enforces rate limits on both inbound and outbound tool calls within a sliding time window. A context that receives a burst of inbound tool calls (even from different source contexts) throttles proportionally. This prevents amplification where many chains converge on a single target.
+- **Provenance degradation as trust signal.** Transitive provenance degradation is not a flaw — it is the protocol working as designed. Data from many degrees of separation away should be less trusted, the same way a message from a stranger deserves more scrutiny than one from a known contact. The chain depth in provenance gives the receiving agent the information to calibrate trust: "this data originated three hops away in a context I have no relationship with" is a meaningful signal. The protocol ensures this signal is always available; the agent decides how to weight it.
+
+**4. Stateful tool session resource exhaustion.**
+
+*Attack:* An attacker opens many stateful tool sessions (§6.2.1) against a target context, never closing them. Session state accumulates, exhausting the target's resources.
+
+*Mitigation — per-caller session cap and optional TTL.*
+
+- **Per-caller session cap.** A context limits the number of concurrent active sessions per calling context (suggested default: 5). Attempts to open additional sessions from the same caller are rejected until existing sessions close or expire. This is the primary resource exhaustion defense — it bounds the damage any single caller can inflict regardless of session duration.
+- **Optional TTL for time-bounded sessions.** The tool's context MAY set a TTL on sessions. When set, expired sessions are garbage-collected automatically. When not set, sessions persist for the context's lifetime — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context is the lifecycle boundary.
+- **Session cost is borne by the tool's context.** Session state is internal to the tool's context. The tool's context chooses to offer stateful sessions, chooses whether to impose TTLs, and accepts the storage cost. This aligns incentives: contexts that offer sessions manage their own resource budget.
+
+**5. Context proliferation for connectivity.**
+
+*Concern:* Without A2A propose/accept, agents that need to coordinate must share a context. This creates pressure to join or create many contexts solely for connectivity, degenerating into thin wrappers around bilateral communication.
+
+*Resolution — standing channels make this a non-problem.*
+
+Standing bilateral contexts (§5.12.4-§5.12.6) are the protocol's answer to this concern. They are designed for exactly this purpose: persistent, low-overhead communication channels between two agents, created once and maintained indefinitely. Context creation is a runtime operation (~200ms, §5.12.4) — not infrastructure provisioning.
+
+The "proliferation" concern assumes context creation is heavy enough to be problematic at scale. It is not. An agent with 100 standing channels has ~200-500KB of local storage overhead and zero network cost when idle. The proliferation is the feature — a rich contact graph of standing channels is the desired state, not a degenerate one.
+
+The distinction that matters is between **meaningful proliferation** (standing channels representing real relationships) and **wasteful proliferation** (ephemeral contexts created and immediately discarded for a single exchange). Templates and TTL address the latter: ephemeral contexts are cheap to create, automatically cleaned up, and their ephemerality is declared upfront. There is no accumulation of dead contexts.
+
+**6. Human coordination bottleneck.**
+
+*Concern:* The human is the bridge for cross-context coordination (§6.3). New agent relationships require human facilitation. An attacker could overload this bottleneck.
+
+*Mitigation — rate limiting and auto-accept absorb the load.*
+
+- **Auto-accept policies (§5.12.2)** handle the common case autonomously. For contexts matching a known template from a known DID with acceptable TTL, the SDK joins without human involvement. The human is only in the loop for novel or high-risk invitations.
+- **Invitation rate limiting.** The SDK rate-limits inbound invitations per source DID and globally. An attacker flooding invitations from multiple DIDs is bounded by the global rate limit. Invitations that exceed the rate limit are queued (not dropped) with decreasing priority.
+- **The bottleneck is intentional.** For novel relationships (strangers, unusual templates, tool-bearing contexts), human facilitation is the correct behavior — the protocol forces deliberate evaluation where trust hasn't been established. This is the security boundary working as designed, not a flaw. The same way a firewall throttles unknown connections, the human bridge throttles unknown relationships.
+
+**7. Governance capture over interface decisions.**
+
+*Concern:* Context admins unilaterally control which tool interfaces to expose and connect. In single-admin governance, members have no visibility into or veto over interface decisions.
+
+*Mitigation — event log transparency and governance evolution.*
+
+- **All interface operations are logged.** Tool interface creation, connection, disconnection, and modification are protocol events recorded in the verifiable event log (§7.3.1). Members can see every interface decision the admin has made, when, and to which contexts. No silent interface changes.
+- **Interface metadata is visible.** Active tool interfaces are part of context metadata (§5.7). Members see what interfaces exist before joining and while participating.
+- **Governance evolution.** Single-admin governance is the Phase 2 minimum. The pluggable governance interface (§5.9) supports multi-sig, consensus, and voting models where interface decisions require member approval. Contexts that need member control over interfaces use governance models that provide it. This is not deferred — the governance interface is specified; specific multi-party models beyond single-admin are Phase 2+.
+- **Exit as veto.** Any member can leave a context at any time. If the admin connects the context to an interface the member disagrees with, the member leaves. In an environment where context creation is cheap (§5.12), members can create a new context without the objectionable interface and migrate — the social graph is portable (§8.3).
+
+**8. Caller/tool asymmetry in peer interactions.**
+
+*Concern:* Tool calls have inherent caller/tool asymmetry. One side requests, the other responds. This forces symmetric interactions (negotiation, collaboration) into a client/server pattern.
+
+*Resolution — shared contexts provide symmetric interaction; tool calls serve asymmetric use cases.*
+
+This is not a flaw — it is correct role assignment. Tool calls are inherently asymmetric because cross-context data flow should be structured, directional, and governed. Symmetric peer interaction — two agents collaborating as equals — belongs in a shared context where both have equivalent roles and permissions.
+
+The protocol provides both patterns:
+
+- **Symmetric interaction:** Create a shared context (standing channel or ephemeral). Both agents have messaging capability. Both can read and write. No caller/tool asymmetry.
+- **Asymmetric interaction:** One context exposes a tool to another. The tool provider is a service; the caller is a consumer. The asymmetry reflects the actual relationship.
+
+Stateful tool sessions (§6.2.1) partially bridge this: a multi-turn session allows both sides to influence the outcome iteratively. The tool provider responds with counterproposals; the caller adjusts. This isn't true symmetry, but it covers negotiation patterns within the governed tool call framework.
+
+If two agents need truly symmetric, ongoing interaction, the answer is unambiguous: share a context. Context creation is a runtime operation (§5.12.4). Standing channels exist for exactly this purpose (§5.12.6).
+
+**9. Shadow channel incentivization.**
+
+*Concern:* The overhead of governed tool interfaces (mutual opt-in, schema declaration, governance approval, rate limits, provenance, audit logging) may be disproportionate for lightweight coordination, pushing agents to communicate through ungoverned channels (HTTP, direct API calls).
+
+*Resolution — the overhead concern dissolves with standing channels.*
+
+Lightweight coordination ("is your agent available?", "can you check something?", "here's a quick update") does not flow through tool interfaces. It flows through standing bilateral contexts — which have no per-message overhead beyond standard context messaging (encrypt, send, decrypt). There is no schema declaration, no governance approval, no tool registration. A message in a standing channel is as lightweight as a message in any context.
+
+The governed tool interface overhead applies to formal cross-context data flow — where one context's tool is invoked by another context's agent. This overhead is appropriate for that use case because cross-context data flow carries real risk (§6.2) and should be auditable, rate-limited, and governed.
+
+The two-tier model:
+
+- **Standing channels** for lightweight, symmetric, low-ceremony communication. All the protocol's trust and encryption properties. No tool interface overhead.
+- **Tool interfaces** for formal, structured, asymmetric cross-context data exchange. Full governance, provenance, and auditability.
+
+This is analogous to the distinction between a text message and an API call. Both are communication; they have different overhead appropriate to their different risk profiles. The protocol provides both, and agents use whichever fits the interaction.
 
 ### 9.3 Sybil Resistance and Identity Uniqueness
 
@@ -1271,6 +1950,8 @@ MLS (RFC 9420) provides the group encryption layer for SCP. This section specifi
 | Delivery Service (DS) | Nostr relay(s) | The untrusted store-and-forward layer. |
 | Authentication Service (AS) | DID resolution + UCAN validation | SCP's identity layer serves as MLS's AS. No separate trusted server. |
 
+**Group context extensions for nesting.** Child contexts include parent context IDs and governance configuration hashes in the MLS `group_context` extensions field (§5.13.3). This cryptographically binds the parent lineage to the child's group identity — the derived `group_id` is a function of the parent references. Root contexts (no parents) have empty nesting extensions.
+
 **Authentication Service design:** MLS delegates identity verification to an Authentication Service (AS). In SCP, the AS is fully decentralized: DID resolution provides the public key binding, and UCAN validation provides the capability binding. No centralized AS server exists. Each participant independently verifies credentials by resolving the DID and validating the UCAN chain.
 
 #### 9.7.2 Forward Secrecy
@@ -1376,7 +2057,16 @@ The Merkle event log records events in append order. Each event references the p
 
 Each sender in a context maintains a monotonically increasing SCP sequence number (distinct from MLS generation numbers, which are MLS-internal). This sequence number is included in the envelope and the Merkle event log entry.
 
-Recipients MUST reject envelopes with a sequence number that does not equal the expected next sequence number from that sender (expected = last_seen + 1). A gap indicates possible message loss or suppression (§9.9). A duplicate indicates replay (caught by §9.8.2).
+Recipients MUST accept all authenticated messages regardless of sequence order and apply reorder-before-delivery semantics. Multi-relay delivery (§10.4, ADR-012) guarantees that messages may arrive out of order; strict rejection would cause guaranteed message loss.
+
+**Reorder buffer.** Each recipient maintains a per-(context, sender) reorder buffer:
+
+- Messages arriving in order (sequence == expected next) are delivered immediately to the application layer.
+- Messages arriving ahead of their predecessors (sequence > expected next) are buffered pending delivery of the missing predecessors.
+- When a buffered message's predecessors arrive, the entire contiguous run is delivered in sequence order.
+- **Gap timeout:** If a gap persists for more than 30 seconds, the recipient raises a suppression alert (§9.9), delivers all buffered messages (recording the gap in the event log), and advances the expected sequence number past the gap.
+- **Buffer bound:** The reorder buffer is bounded at 100 messages per sender per context to prevent resource exhaustion. If the buffer fills, the oldest gap is force-closed (with suppression alert) and buffered messages are delivered.
+- A duplicate sequence number indicates replay (caught by §9.8.2).
 
 ### 9.9 Relay Threat Model and Mitigations
 
@@ -1496,6 +2186,7 @@ context_pseudonym = context_keypair.public_key
 - **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
 - **No ZK proofs** — unnecessary complexity since only group members need to verify the mapping.
 - The SDK handles derivation, caching, and verification transparently.
+- **HSM compatibility.** The standard derivation uses raw `identity_private_key` bytes, which are not exportable from HSM-backed key storage (Secure Enclave, Android Keystore). For HSM-backed identity keys, pseudonym derivation uses an HSM-internal HMAC operation: `context_seed = HMAC-SHA256(identity_key_handle, context_id || "scp-context-pseudonym")`. The HSM performs the HMAC internally and returns the seed without exporting the private key. If the HSM does not support HMAC, a separate non-HSM pseudonym derivation key is derived during identity creation and stored alongside (but outside) the HSM. This key is used exclusively for pseudonym derivation and does not grant signing or decryption capability.
 
 #### 9.10.5 Connection Privacy
 
@@ -1654,11 +2345,13 @@ Each participant in a context holds one AES-256 symmetric sender key. All messag
 - **Key size:** 32 bytes per sender key per context member. Storage is trivial.
 - **Encryption order:** Sender-first (AES-256-GCM), then MLS. Recipients decrypt MLS layer, then decrypt sender layer with the cached sender key.
 
+**Stable wrapping keypair.** Each member maintains a dedicated X25519 keypair per context, used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
+
 #### 9.16.2 Key Distribution
 
 Sender keys are distributed inside MLS application messages (encrypted to the group), but the key payload itself is HPKE-encrypted to each individual recipient's public key. This is necessary because MLS application messages are readable by all group members — without per-recipient HPKE wrapping, a blocked party could decrypt the MLS layer and read the new sender key.
 
-- **Key wrapping:** Each sender key distribution message contains per-recipient HPKE-encrypted payloads: `{recipient_did, HPKE_Seal(recipient_pubkey, sender_key)}`. The recipient's public key is the X25519 key from their MLS LeafNode (the same key used for MLS key agreement). The MLS message is readable by all group members, but only the intended recipient can unwrap the actual sender key.
+- **Key wrapping:** Each sender key distribution message contains per-recipient HPKE-encrypted payloads: `{recipient_did, HPKE_Seal(recipient_wrapping_pubkey, sender_key)}`. The recipient's wrapping public key is the stable X25519 key from their MLS LeafNode extension `scp_wrapping_key` (§9.16.1) — NOT the MLS leaf HPKE key, which rotates on epoch advances. Using a stable wrapping key ensures that offline members and members who join after an epoch advance can still unwrap sender key distributions. The MLS message is readable by all group members, but only the intended recipient can unwrap the actual sender key.
 - **New member join:** Existing members each send their current sender key to the new member as an MLS application message containing a single HPKE-encrypted payload for the new member. The new member accumulates sender keys from each existing member.
 - **Normal operation:** Sender key is stable — it does not rotate on MLS epoch advances. This is intentional: old sender keys are retained for historical message decryption. Blocking is about future messages, not retroactive access.
 
@@ -1667,7 +2360,7 @@ Sender keys are distributed inside MLS application messages (encrypted to the gr
 When Alice blocks Bob:
 
 1. Alice generates a new AES-256-GCM sender key.
-2. Alice sends a single MLS application message containing HPKE-encrypted payloads for each non-blocked member: `[{did: "charlie", key: HPKE(charlie_pk, new_key)}, {did: "dave", key: HPKE(dave_pk, new_key)}, ...]`. Bob can see this MLS message (it's group-encrypted) and can observe the recipient list, but Bob cannot unwrap any key payload.
+2. Alice sends a single MLS application message containing HPKE-encrypted payloads for each non-blocked member: `[{did: "charlie", key: HPKE(charlie_wrapping_pk, new_key)}, {did: "dave", key: HPKE(dave_wrapping_pk, new_key)}, ...]`, using each recipient's stable wrapping public key (§9.16.1). Bob can see this MLS message (it's group-encrypted) and can observe the recipient list, but Bob cannot unwrap any key payload.
 3. Alice sends a block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice"}`. This notifies Bob's client that Alice has blocked him.
 4. Bob's client, upon receiving the block notification, automatically rotates Bob's sender key, distributing the new key via HPKE-encrypted payloads to each member EXCEPT Alice.
 
@@ -1901,7 +2594,7 @@ The protocol should define its transport requirements abstractly and provide ref
 
 ---
 
-## 11. What Existing Standards Cover
+## 11. Prior Art
 
 | Component | Existing Standard/Technology | SCP Relationship |
 |---|---|---|
@@ -2151,11 +2844,12 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 ### Design Decisions Pending
 
 - **Context capability ceiling mutability.** Leaning toward immutable (stronger security, requires migration to expand — analogous to onchain programs). Mutable under governance is the alternative (more flexible, enables creep). Undecided; depends on solving artifact portability and context migration tooling.
-- **Context governance primitives.** Governance implementations are pluggable — the protocol defines the interface (propose, approve, reject), not the implementations. Remaining question: what is the minimum viable governance interface that all models must conform to?
+- **~~Context governance primitives.~~** ✅ **Partially resolved.** ADR-008 specifies context lifecycle state machine with single-admin governance. ADR-009 specifies role assignment and capability ceiling enforcement. The pluggable governance interface for multi-sig/consensus models remains unspecified — not blocking for initial implementation (single-admin is sufficient).
+- **~~A2A propose/accept.~~** ✅ **Resolved — removed.** Replaced by two complementary mechanisms: standing bilateral contexts (§5.12.6) for lightweight direct communication, and multi-parent child contexts (§5.13) for governed, symmetric cross-context collaboration. Tool interfaces (§6.2) handle asymmetric service-style interactions. No separate A2A negotiation primitive needed.
 - **Context-to-context tool interface mechanics.** How do contexts discover, negotiate, and establish interop interfaces? Specifics TBD.
 - **Earned capacity mechanisms.** How do new identities earn more agent slots / context participation capacity? What signals are used? Not gamifiable.
 - **Agent capability metadata standard.** What's surfaced, how it's structured, how it's verified.
-- **Content provenance system.** Hash chains, origin tracking, interface chain tracing. Identified as needed, not designed.
+- **~~Content provenance system.~~** ✅ **Resolved.** DataProvenance format specified in §7.7.1. Provenance attached automatically by protocol on context boundary crossings. Provenance evaluation rules in §7.7.2. Absence-as-signal principle established. Cross-context tool calls and structured messages carry provenance.
 - **Rate limiting defaults.** Context creation limits, context participation limits per human. Surfaces identified, defaults not set.
 - **Identity attestation discovery.** Likely direction: attestations are discoverable through the contexts and platforms where they're relevant. If Alice wants to find Bob's SCP identity from his X handle, she queries through X's context or bridge — platforms store attestation data alongside their own data. This may eliminate the need for separate discovery infrastructure (DHT, registry), but the mechanics need specification.
 - **Identity attestation verification methods.** Platform-specific verification flows (OAuth, signed posts, DNS records, etc.) need standardization per platform.
@@ -2166,13 +2860,13 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 - **Capability declaration format.** What does the machine-readable app capability manifest look like? JSON schema, protocol buffers, something else? Must be parseable by LLMs generating apps.
 - **Context state portability format.** What's the serialization format for context state that enables app switching? Must be complete enough that a new app can render a context without loss.
 - **Minimum viable agent specification.** What does the simplest possible agent look like? The "transparent pipe" agent that just forwards human input needs a reference implementation that's trivially embeddable.
-- **Relay protocol specification.** What does the relay interface look like? Must be simple enough to self-host on consumer hardware. Encrypted payload in, encrypted payload out. (Partially resolved by §10.5 — may be delegated to existing transport if binding-first approach is taken.)
+- **~~Relay protocol specification.~~** ✅ **Resolved.** ADR-004 specifies the SCP native relay protocol: PUBLISH/SUBSCRIBE/UNSUBSCRIBE operations over WebSocket, blob TTL enforcement, recipient_hint for directed delivery. Minimal outer envelope format specified in §9.10.2.
 - **Cooperative mode trust tiers.** How much does cooperative mode actually improve trust provenance for bridged content? Need to define the specific trust differential that incentivizes platforms.
 - **~~Primary transport binding.~~** ✅ **Resolved.** SCP native relay protocol is the canonical transport. Transport is fully abstracted — 17 adapter options listed, no structural dependency on any single transport. Transport security requirements specified in §9.13 (TLS 1.3 required). Relay threat model formalized in §9.9.
-- **Transport abstraction interface.** Exact contract between SCP protocol logic and transport bindings. Must be thin enough that bindings are simple to write, rich enough that protocol logic doesn't leak transport assumptions.
-- **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 ciphersuite. Full specification in §9.7 (group key management), §9.5 (cryptographic primitives), §9.8 (message security). MLS tree-based key management provides O(log N) member exclusion. Blocking uses the same epoch advancement machinery.
+- **~~Transport abstraction interface.~~** ✅ **Resolved.** ADR-005 specifies the `TransportAdapter` trait: connect, send, subscribe, query, disconnect. Async interface, error types defined. SCP native relay is the canonical implementation.
+- **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 ciphersuite. Full specification in §9.7 (group key management), §9.5 (cryptographic primitives), §9.8 (message security). MLS tree-based key management provides O(log N) member exclusion. Blocking uses a separate sender-side key layer (§9.16) that operates independently of MLS epoch advancement.
 - **~~Metadata privacy.~~** ✅ **Fully resolved.** Comprehensive metadata privacy architecture specified in §9.10: minimal outer envelope (§9.10.2), fixed bucket padding (§9.10.3), per-context pseudonyms (§9.10.4), persistent connections + TLS (§9.10.5), cover traffic configurable default-on (§9.10.6), DID resolution privacy (§9.10.7), relay query privacy via pseudonyms + partitioning (§9.10.8). Push notification opacity mandated in §10.7. Sender-side key layer for blocking specified in §9.16 with HPKE-wrapped per-recipient key distribution.
-- **Verifiable event log format.** §7.3.1 specifies Merkle trees per context for event ordering and tamper detection. The concrete format — tree structure, hash algorithm, leaf schema, proof format — is not yet specified. Must be efficient enough for device-as-node participation. Candidates: sparse Merkle trees, append-only log trees (Certificate Transparency style), or Prolly trees.
+- **~~Verifiable event log format.~~** ✅ **Resolved.** ADR-011 specifies the event log: append-only Merkle tree per context, SHA-256 hash chain, entry structure (event type, sender DID, sequence number, timestamp, payload hash), inclusion proofs, consistency checkpoints. Efficient enough for device-as-node participation.
 - **Behavioral record schema.** §7.3.2 defines what facts are derivable from event logs, but the record format is unspecified. How are behavioral records serialized, exchanged between agents, and verified against source logs? Must be compact enough for inline presentation and rich enough for meaningful evaluation.
 - **Challenge suite standards.** §7.3.4 introduces challenge-response verification for agent capabilities but doesn't define the challenge suites themselves. What tests constitute "prompt injection resistance"? Who defines and maintains challenge suites? How are custom challenges validated as fair? Need a registry or discovery mechanism.
 - **Consequence mechanism defaults.** §7.3.7 defines automated consequence rules but leaves threshold values and escalation curves to individual contexts. Should the protocol define recommended defaults? Minimum consequence severity for certain violations? How do contexts communicate their consequence structure in a comparable format?
@@ -2192,6 +2886,6 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 
 ### Uncovered Areas
 
-- **Transport layer specifics.** Transport abstraction interface design, reference binding implementation, relay discovery protocol. (Framework established in §10.4–10.5. Transport security requirements specified in §9.13. Relay threat model and multi-relay strategy specified in §9.9. Implementation specifics for the transport abstraction interface and reference binding remain.)
+- **~~Transport layer specifics.~~** ✅ **Largely resolved.** ADR-005 specifies the `TransportAdapter` trait. ADR-004 specifies the SCP native relay protocol. Transport security in §9.13. Relay threat model in §9.9. Remaining: relay discovery protocol (how clients find relays).
 - **Cronica as first client.** How quests, the AI Guide, and quest communities map onto SCP.
 - **Offline/local-first behavior.** Disconnection handling, sync, conflict resolution mechanics. (Informed by device-as-node §10.2, but mechanics unspecified.)
