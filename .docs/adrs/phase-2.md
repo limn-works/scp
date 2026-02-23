@@ -106,8 +106,8 @@ Invalid transitions (must return error):
 
    ```rust
    struct CreationReceipt {
-       mls_group: Option<MlsGroup>,
-       sender_key: Option<SenderKey>,
+       mls_group: Option<MlsGroup>,       // None for Broadcast mode
+       sender_key: Option<SenderKey>,      // Sender key (Encrypted) or broadcast key (Broadcast)
        event_log: Option<EventLog>,
        published: bool,
    }
@@ -115,8 +115,8 @@ Invalid transitions (must return error):
 
    Steps:
    1. Transition state to `Creating`.
-   2. Create MLS group via ADR-001 `create_group()`. On failure: drop `Creating` state, return error.
-   3. Generate creator's sender key via ADR-007 `generate_sender_key()`. On failure: destroy MLS group, return error.
+   2. If `mode == Encrypted`: Create MLS group via ADR-001 `create_group()`. If `mode == Broadcast`: Initialize creator's broadcast key (epoch 0) — no MLS group. On failure: drop `Creating` state, return error.
+   3. If `mode == Encrypted`: Generate creator's sender key via ADR-007 `generate_sender_key()`. If `mode == Broadcast`: Broadcast key already initialized in step 2. On failure: destroy MLS group, return error.
    4. Initialize empty event log (ADR-011). On failure: destroy sender key, destroy MLS group, return error.
    5. Publish context to transport. On failure: drop event log, destroy sender key, destroy MLS group, return error.
    6. Transition state to `Active`.
@@ -182,7 +182,10 @@ Invalid transitions (must return error):
 
 ```rust
 pub struct ContextParams {
-    pub ceiling: Vec<Capability>,        // Immutable capability ceiling
+    pub mode: ContextMode,               // Encrypted (default) or Broadcast (§5.14)
+    pub ceiling: Vec<Capability>,        // Capability ceiling (bounded by ceiling_policy)
+    pub ceiling_policy: CeilingPolicy,   // Whether the ceiling is immutable or governed (§5.3)
+    pub promotion_policy: PromotionPolicy, // Whether context promotion is allowed (§5.10)
     pub roles: Vec<RoleDefinition>,      // Role definitions with permission sets
     pub tools: Vec<ToolRegistration>,    // Initial tool registrations
     pub ttl: Option<Duration>,           // Optional TTL
@@ -190,6 +193,60 @@ pub struct ContextParams {
     pub governance: GovernanceModel,     // Single-admin for Phase 2
     pub template_id: Option<TemplateId>, // Well-known template ID if created from template (§5.12)
 }
+
+/// Ceiling mutability policy. Declared at creation, immutable thereafter.
+/// Determines whether the capability ceiling can be modified after context creation.
+pub enum CeilingPolicy {
+    /// Ceiling is fixed at creation. Any attempt to modify returns
+    /// `ContextError::CeilingImmutable`. This is the default and the
+    /// security-conservative choice — members see the ceiling before
+    /// joining, and it cannot change (no bait-and-switch).
+    Immutable,
+    /// Ceiling can be modified through the context's governance model.
+    /// Changes require governance approval (e.g., unanimous consent,
+    /// admin decision). Ceiling can only be narrowed (capabilities
+    /// removed), never expanded beyond the original creation ceiling.
+    Governed,
+}
+
+/// Context promotion policy. Declared at creation, immutable thereafter.
+/// Controls whether a context can be promoted (e.g., from ephemeral
+/// to persistent, or from child to standalone).
+pub enum PromotionPolicy {
+    /// Context cannot be promoted. Immutable lifecycle constraints.
+    NoPromotion,
+    /// Context can be promoted through governance approval.
+    /// Promotion conditions and requirements are governed by the
+    /// context's governance model.
+    Promotable,
+}
+
+/// Context processing mode. Immutable after creation.
+pub enum ContextMode {
+    Encrypted,  // MLS-backed, sender-side keys, full forward secrecy (default)
+    Broadcast,  // Per-author broadcast keys, no MLS, mandatory subscriber registration (§5.14)
+}
+
+// Broadcast mode acceptance criteria (§5.14):
+//
+// When `mode == Broadcast`:
+// - No MLS group is created. Context uses per-author AES-256-GCM broadcast keys
+//   instead of MLS group keys.
+// - Subscriber count is unlimited (no MLS group size bound).
+// - The context's public `routing_id` is derived as `SHA-256(context_id)` —
+//   deterministic and discoverable by any agent that knows the context_id.
+// - Authors are bounded participants who hold `MessagesWrite` capability.
+//   Each author maintains their own broadcast key with independent epoch rotation.
+// - Subscribers hold `MessagesRead` capability and receive broadcast keys via
+//   HPKE-wrapped key distribution (no MLS Welcome messages).
+// - `create_context` skips MLS group creation (step 2) and instead initializes
+//   the creator's broadcast key at epoch 0.
+// - `join_context` for subscribers registers DID-authenticated subscription
+//   without MLS add_member.
+// - `send_message` encrypts with the author's current broadcast key, wraps in
+//   `BroadcastEnvelope` (§5.14.5), and publishes to the public routing_id.
+// - All other context lifecycle operations (close, expire, TTL, event log)
+//   operate identically regardless of mode.
 
 /// Well-known context templates (spec §5.12.1).
 /// Templates are protocol constants — not user-extensible.
@@ -199,6 +256,8 @@ pub enum TemplateId {
     BilateralPersistent,  // Messaging-only, full memory, no TTL
     Coordination,         // Messaging + tools, summary memory, TTL required
     GroupDiscussion,      // Messaging + invites, full memory, optional TTL
+    PublicBroadcast,      // Broadcast mode, open subscriber registration (§5.14)
+    GatedBroadcast,       // Broadcast mode, UCAN-gated subscriber access (§5.14)
 }
 
 pub enum MemoryScope {
@@ -292,6 +351,8 @@ pub enum Capability {
 }
 ```
 
+   **Mode-agnostic capabilities.** `MessagesRead` and `MessagesWrite` apply to both Encrypted and Broadcast modes. The abstract capability to read/write in a context is independent of the encryption pipeline — `ContextMode` determines processing, not authorization. No new capability variants are needed for broadcast mode.
+
    - Ceiling is set at context creation via `ContextParams.ceiling`.
    - Ceiling is immutable. Any attempt to modify returns `ContextError::CeilingImmutable`.
    - Role permission sets are validated against the ceiling at role definition time. A role cannot grant capabilities outside the ceiling.
@@ -311,6 +372,12 @@ pub struct RoleDefinition {
    - `observer` — `MessagesRead` only.
    Custom roles are defined at context creation with arbitrary capability subsets of the ceiling.
 
+   **Broadcast-specific roles.** Broadcast contexts (§5.14) add two roles that reuse existing primitives:
+   - `author` — `MessagesWrite`, `MessagesRead`, `ToolInvokeAll`. Authors are bounded. Added via `RoleAssigned` event.
+   - `subscriber` — `MessagesRead` only. In open broadcast contexts (`public-broadcast` template), `MessagesRead` is auto-granted on DID-authenticated registration, following the discovery context reader-tier pattern (§6.2.2B). In gated broadcast contexts (`gated-broadcast` template), `MessagesRead` requires an explicit admin-issued UCAN.
+
+   The auto-grant subscriber pattern extends the discovery context two-tier model — it is not a new primitive.
+
 3. **`assign_role(context: &ContextHandle, member_did: &DID, role: &str, assigner_did: &DID) -> Result<Vec<UcanToken>, ContextError>`**
    - Verifies assigner has `RoleAssign` capability (via UCAN validation).
    - Validates role exists in context's role definitions.
@@ -322,6 +389,9 @@ pub struct RoleDefinition {
    - Returns the minted tokens.
 
 4. **`validate_ucan(context: &ContextHandle, token: &UcanToken, required_capability: &Capability) -> Result<(), UcanError>`**
+
+   > **Note:** This defines the base 8-check validation for Phase 2. ADR-016 (Phase 3) extends this to an 11-check pipeline that adds chain verification (step 3), attenuation checking (step 7), and structured nonce validation (step 9). The implementation SHOULD build the full 11-check version from ADR-016 directly — ADR-016 is a strict superset, not a replacement. The 8 checks below are listed for Phase 2 scoping; they map to ADR-016 steps 1-2, 4-6, 8-11.
+
    - Verifies UCAN signature chain: each delegation signature is valid.
    - Verifies root issuer is the context creator.
    - Verifies audience matches the presenting agent's DID.
@@ -671,6 +741,7 @@ pub enum EventType {
     ConsistencyCheckpoint,
     AbsenceProofRequested,
     MemberBlocked,          // ADR-007: Signed block notification recorded for auditability
+    KeyEpochAdvance,        // ADR-007: Sender key epoch rotation (shared across Encrypted and Broadcast modes)
 }
 ```
 
@@ -756,7 +827,7 @@ pub struct ConsistencyCheckpoint {
     pub sender_did: DID,
     pub event_count: u64,
     pub merkle_root: [u8; 32],
-    pub epoch: u64,                 // Current MLS epoch
+    pub epoch: Option<u64>,         // Current MLS epoch (None for Broadcast contexts)
     pub timestamp: u64,
     pub signature: Ed25519Signature,
 }
@@ -843,6 +914,7 @@ pub struct TransportManager {
 
 3. **`subscribe(manager: &TransportManager, routing_id: &RoutingId, context_id: &ContextId, since: Option<u64>) -> Result<Pin<Box<dyn Stream<Item = TransportEvent> + Send>>, TransportError>`**
    - Subscribes to the routing_id on all relays in the context's relay set.
+   - For broadcast contexts, `routing_id` is the public `SHA-256(context_id)` — any subscriber that knows the context_id can derive the routing_id and subscribe without prior membership negotiation.
    - Merges streams from all relays into a single deduplicated stream.
    - Deduplication applies to `TransportEvent::Envelope` variants: envelopes with the same `blob_id` (SHA-256 of the blob) are delivered only once. The dedup cache is an LRU with a 10,000-entry capacity.
    - Returns the merged, deduplicated stream.

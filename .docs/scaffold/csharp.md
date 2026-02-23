@@ -137,7 +137,7 @@ internal sealed class ContextHandle : SafeHandle
     <Version>0.1.0</Version>
     <Description>Social Context Protocol SDK for .NET</Description>
     <Authors>Limn</Authors>
-    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <!-- License TBD -->
     <RepositoryUrl>https://github.com/limn/scp</RepositoryUrl>
   </PropertyGroup>
 

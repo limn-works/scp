@@ -180,7 +180,7 @@ Key principles:
 
 The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. This eliminates downgrade attacks and simplifies implementation.
 
-**Signature algorithm:** Ed25519 (RFC 8032). All DID keys, SCP envelope signatures, Nostr event signatures, UCAN token signatures, and MLS leaf node credentials use Ed25519.
+**Signature algorithm:** Ed25519 (RFC 8032). All DID keys, SCP envelope signatures, UCAN token signatures, and MLS leaf node credentials use Ed25519.
 
 **MLS ciphersuite:** MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (RFC 9420 §17.1). This provides: X25519 for key agreement (HPKE KEM), AES-128-GCM for symmetric encryption (AEAD), SHA-256 for hashing, Ed25519 for signing.
 
@@ -188,7 +188,9 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
 
-**Envelope signature scope:** The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by the sender's identity key: `SHA256(context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash)`. This binds every field to the signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs), which is by design — verification is the responsibility of context members who can decrypt the payload.
+**Envelope signature scope:** The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by the sender's identity key: `SHA256(context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash)` where `payload_hash = SHA256(original_plaintext)` (before padding) and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. This binds both payload content and provenance metadata to the signature — neither can be stripped, modified, or fabricated without invalidating the envelope signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs), which is by design — verification is the responsibility of context members who can decrypt the payload.
+
+**Broadcast envelope signature scope:** Broadcast contexts (§5.14) use a different envelope format (`BroadcastEnvelope`) where the sender identity is visible (not inside MLS encryption). The signature covers: `SHA256(context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash)` where `content_hash = SHA256(original_plaintext)` and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. This is structurally consistent with the InnerEnvelope signature — it replaces `epoch || generation` (MLS-specific) with `key_epoch` (broadcast-specific) and omits MLS generation numbers (broadcast uses per-sender sequence numbers only). The signature is verified by subscribers against the author's known Active Signing Key (resolved from the author's DID document).
 
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction.
 
@@ -229,13 +231,13 @@ did:web (fallback only — used only if did:dht libraries prove unusable) resolv
 
 ### 9.6.3 Relay List Authentication
 
-A DID's relay list (service endpoints) is published in the DID document and as NIP-65 Nostr events (kind:10002).
+A DID's relay list (service endpoints) is published in the DID document.
 
 **For did:dht:** The relay list in the DID document is self-certified (BEP44 signature). Substituting a relay list requires the identity's private key.
 
-**For Nostr:** The NIP-65 relay list event is signed by the Nostr keypair derived from the DID key. This provides relay list authentication independent of the DID method.
+**For transport adapters with native relay lists:** Some transport adapters (e.g., Nostr via NIP-65) publish relay lists in transport-specific formats signed by a keypair derived from the DID key. This provides relay list authentication independent of the DID method but is adapter-specific, not a protocol requirement.
 
-**Attack: relay list substitution.** A compromised DHT node or Nostr relay could serve a stale relay list, directing messages to relays the recipient no longer uses. Defense: sequence numbers in BEP44 records ensure freshness. Clients MUST reject relay lists with lower sequence numbers than previously observed.
+**Attack: relay list substitution.** A compromised DHT node or relay could serve a stale relay list, directing messages to relays the recipient no longer uses. Defense: sequence numbers in BEP44 records ensure freshness. Clients MUST reject relay lists with lower sequence numbers than previously observed.
 
 ### 9.6.4 First-Contact Trust Bootstrapping
 
@@ -261,7 +263,7 @@ MLS (RFC 9420) provides the group encryption layer for SCP. This section specifi
 | Proposal (Add/Remove/Update) | Governance action | MLS membership proposals map to SCP membership changes. |
 | Commit | Governance commit | Finalizes pending proposals and advances the epoch. |
 | Application message | SCP envelope payload | The encrypted content within an SCP envelope. |
-| Delivery Service (DS) | Nostr relay(s) | The untrusted store-and-forward layer. |
+| Delivery Service (DS) | SCP relay(s) | The untrusted store-and-forward layer. Any transport adapter (native relay, Nostr, Matrix, etc.) serves this role. |
 | Authentication Service (AS) | DID resolution + UCAN validation | SCP's identity layer serves as MLS's AS. No separate trusted server. |
 
 **Group context extensions for nesting.** Child contexts include parent context IDs and governance configuration hashes in the MLS `group_context` extensions field (§5.13.3). This cryptographically binds the parent lineage to the child's group identity — the derived `group_id` is a function of the parent references. Root contexts (no parents) have empty nesting extensions.
@@ -274,7 +276,7 @@ MLS provides forward secrecy through epoch-based key ratcheting. After a Commit 
 
 **SDK requirements:**
 
-- The SDK MUST delete old epoch key material immediately after processing a Commit. Old epoch secrets, application key schedules, and ratchet tree states for past epochs MUST NOT be persisted.
+- The SDK MUST delete old epoch key material after processing a Commit, subject to a **grace window** for in-flight messages. Old epoch keys are retained in volatile memory only (never persisted) for the shorter of: (a) all members have sent at least one message in the new epoch, or (b) 30 seconds from local Commit processing time. After the grace window closes, old epoch secrets, application key schedules, and ratchet tree states for past epochs are destroyed and MUST NOT be recoverable. See ADR-001 criterion 6 for the full grace window specification.
 - Historical epoch keys MUST be treated as equivalent to ephemeral Diffie-Hellman parameters: used once, then destroyed.
 - Members who want to re-read historical messages must retain the decrypted plaintext locally. They cannot re-derive old epoch keys from current state.
 
@@ -292,7 +294,8 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 
 - The SDK MUST periodically issue MLS Update proposals. Recommended interval: every 24 hours for active contexts, or immediately after any suspected compromise.
 - The SDK SHOULD issue an Update after re-establishing connectivity following an offline period.
-- When a DID's key rotates (recovery scenario, §3.3), the agent MUST issue an MLS Update in every active context. This synchronizes DID-level key rotation with MLS-level post-compromise security.
+- When an Active Signing Key rotates (ADR-003 §4a), the agent MUST issue an MLS Update in every active context with the new credential. This synchronizes key rotation with MLS-level post-compromise security.
+- When an Identity Key migrates (ADR-003 §4b), the agent MUST send a `DidRotationEvent` in every active context and issue MLS Updates with the new credential under the new DID.
 
 **PCS Update interval as context parameter:** High-security contexts may configure shorter PCS Update intervals (e.g., 1 hour). The interval is a context-level parameter set at creation, defaulting to 24 hours.
 
@@ -300,22 +303,25 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 
 **Key generation:**
 
-- Identity key (Ed25519): Generated in hardware security module where available (Secure Enclave, Android Keystore). Private key never exported from the secure element.
+- Identity Key (Ed25519): Generated in hardware security module where available (Secure Enclave, Android Keystore). Private key never exported from the secure element. Used ONLY for DID document updates and signing pre-rotation commitments. The DID string is derived from this key and never changes.
+- Active Signing Key (Ed25519): Generated via KeyCustody. Used for MLS credentials, inner envelope signatures, UCAN issuance. Rotatable via DID document update signed by the Identity Key (ADR-003 §4a). The DID string does NOT change on active key rotation.
+- Pre-Rotation Key (Ed25519): Generated at identity creation, stored in cold/offline custody. `SHA-256(public_key)` is published as a PreRotationCommitment in the DID document. Revealed only during Identity Key migration (ADR-003 §4b) to prove legitimate rotation.
 - MLS leaf key (X25519): Generated by the MLS library per the selected ciphersuite. Stored in platform secure storage.
 - KeyPackages: Pre-generated and published to relays. Each KeyPackage is single-use. The SDK MUST maintain a buffer of at least 10 unused KeyPackages per identity on relays. Replenished when the buffer drops below 5.
-- UCAN signing key: Same as identity key (Ed25519). UCAN tokens are signed by the human's DID key.
+- UCAN signing key: Active Signing Key (Ed25519). UCAN tokens are signed by the human's Active Signing Key — NOT the Identity Key (ADR-003 §4a). On active key rotation, existing UCAN tokens are revoked and reissued under the new Active Signing Key.
 
 **Key distribution:**
 
 - Identity public key: Distributed via DID document (DHT resolution or web resolution).
-- KeyPackages: Published to relays as Nostr events. Any party wanting to add this identity to a group fetches a KeyPackage from their relay.
+- KeyPackages: Published to relays via the transport adapter. Any party wanting to add this identity to a group fetches a KeyPackage from their relay.
 - Context group key: Distributed via MLS Welcome message, encrypted to the new member's KeyPackage. Only the intended recipient can decrypt.
 
 **Key rotation:**
 
-- Identity key: Rotated via DID document update. For did:dht, the new document is signed by the old key (authorization chain) and published with an incremented sequence number. All active MLS groups receive an Update proposal with the new credential.
+- Active Signing Key: Rotated via `rotate_active_key` (ADR-003 §4a). DID document is updated with new verification method, signed by the Identity Key, published to DHT with incremented sequence number. All active MLS groups receive an Update proposal with the new credential. The DID string does NOT change.
+- Identity Key: Migrated via `migrate_identity` (ADR-003 §4b) — rare operation. Creates a new DID with the pre-rotation key as the new Identity Key. Old DID document updated with `alsoKnownAs` forwarding. `DidRotationEvent` sent to all active contexts. Pre-rotation proof resolves ambiguity if the old key was compromised.
 - MLS epoch keys: Rotated automatically on every Commit (membership change or Update).
-- UCAN tokens: Expire per their `exp` field. Re-issued by the human's DID. Revocation published to a revocation list referenced in the UCAN's revocation field.
+- UCAN tokens: Expire per their `exp` field. Re-issued by the human's Active Signing Key. On active key rotation (ADR-003 §4a), all UCAN tokens signed by the old Active Signing Key are revoked and reissued under the new key. Revocation published to a revocation list referenced in the UCAN's revocation field.
 
 **Key destruction:**
 
@@ -331,7 +337,7 @@ This section specifies how SCP prevents message forgery, replay attacks, and ord
 
 Every SCP message has two independent integrity verifications, both inside the encrypted payload. Neither is verifiable by relays — relays see only opaque blobs.
 
-**Inner check 1 — Ed25519 identity signature.** The sender signs the payload with their DID key: `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash)`. This signature is created before sender-key encryption and MLS encryption, and verified after MLS decryption and sender-key decryption. A failed signature means the envelope was tampered with or forged and MUST be rejected.
+**Inner check 1 — Ed25519 identity signature.** The sender signs the payload with their Active Signing Key (see ADR-003 §4a): `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash)` where `payload_hash` covers the original plaintext (before padding) and `provenance_hash` covers serialized provenance metadata (or `SHA256(0x00)` if absent). Processing order: hash plaintext -> hash provenance -> sign -> pad -> sender-key encrypt -> MLS encrypt. Reverse on receipt: MLS decrypt -> sender-key decrypt -> strip padding -> verify signature -> verify payload_hash -> verify provenance_hash. A failed signature means the envelope was tampered with or forged and MUST be rejected.
 
 **Inner check 2 — MLS membership_tag.** The MLS PrivateMessage format includes an HMAC (membership_tag) that proves the sender is a group member with correct epoch secrets. This is verified during MLS decryption. It provides authentication independent of the identity signature — even if an attacker obtained the DID private key, they cannot produce a valid membership_tag without the MLS epoch secrets.
 
@@ -347,13 +353,15 @@ Both checks MUST pass for a message to be accepted. This defense-in-depth means 
 
 The past-bound is relative, not absolute, to handle offline delivery: if Bob comes online after 3 hours, he accepts messages from the past 3 hours. But timestamps from a single sender must not regress.
 
+**Broadcast mode replay prevention.** Broadcast contexts use the same three-layer defense with the following mode-specific adaptations: (a) No MLS generation numbers — broadcast uses per-sender SCP sequence numbers as the primary per-sender ordering mechanism. (b) Hash-based deduplication operates identically on outer envelope blob hashes. (c) Timestamp bounds are identical. Additionally, the `key_epoch` field in `BroadcastEnvelope` provides a fourth signal: a message encrypted with an epoch lower than the subscriber's current cached epoch for that author is suspect (may be a replay of pre-rotation content).
+
 ### 9.8.3 Message Ordering
 
 Within a context, messages are ordered by: `(epoch, sender_generation_number, timestamp)`. This gives a total order per-sender and a causal order across senders — epoch boundaries are synchronization points.
 
 The Merkle event log records events in append order. Each event references the previous event's hash, creating a hash chain. If two events reference the same parent, the log has forked — possible equivocation (see §9.9).
 
-**Interaction with relay ordering:** Nostr relays do not guarantee message ordering. The SDK MUST re-order messages locally using `(epoch, generation, timestamp)` before presenting them to the application layer.
+**Interaction with relay ordering:** Relays do not guarantee message ordering. The SDK MUST re-order messages locally using `(epoch, generation, timestamp)` before presenting them to the application layer.
 
 **Authoritative ordering:** The Merkle log order is authoritative, not timestamps. Timestamps are hints for the SDK to reconstruct order in real-time. Once events are committed to the log, the log order is the permanent record.
 
@@ -396,6 +404,7 @@ A relay CAN:
 - **Replay messages:** Re-deliver previously delivered envelopes. Mitigated by §9.8.2.
 - **Equivocate:** Show different message histories to different members of the same context.
 - **Correlate traffic:** Link activities across contexts based on timing, DID, and connection patterns.
+- **Identify broadcast authors (Broadcast mode only):** In broadcast contexts, the `BroadcastEnvelope` sender DID is visible to relays (not hidden inside MLS encryption). This is an accepted tradeoff — broadcast authors are public figures whose identity is part of the content's value. Relay operators see who is publishing to a broadcast context, but cannot read the encrypted content.
 
 A relay CANNOT:
 
@@ -403,6 +412,7 @@ A relay CANNOT:
 - **Decrypt content.** Requires MLS group key and sender-side key (§9.16).
 - **Modify messages.** Inner signature verification and MLS membership_tag verification fail after decryption.
 - **Inject members into contexts.** Requires MLS Welcome message encrypted to the joiner's KeyPackage.
+- **Read broadcast content.** Broadcast content is AES-256-GCM encrypted with author broadcast keys. Relays see encrypted blobs and author DIDs, but cannot decrypt without the broadcast key (which is distributed only to registered, non-blocked subscribers via HPKE).
 
 ### 9.9.2 Suppression Detection
 
@@ -478,6 +488,8 @@ This section specifies what the protocol protects, how it protects it, and what 
 - UCAN token contents (within encrypted envelopes)
 - Sender identity, timestamps, sequence numbers, epoch, generation (all inside encrypted payload)
 
+**Broadcast mode confidentiality differences:** In broadcast contexts, the following are NOT confidential (by design): author DID (visible in BroadcastEnvelope), routing_id (publicly derived from context_id via SHA-256), key epoch number. These are acceptable because broadcast authors are public figures and the routing_id must be discoverable for subscribers to subscribe. Message content, subscriber identities (in key request/response exchanges), and block lists remain confidential.
+
 ### 9.10.2 Minimal Outer Envelope
 
 The outer envelope — what relays see — contains only:
@@ -488,6 +500,8 @@ The outer envelope — what relays see — contains only:
 4. **Encrypted blob** — everything else
 
 Sender identity, timestamps, sequence numbers, epoch, generation — all reside inside the encrypted payload. The relay is a dumb pipe that holds encrypted blobs for a specified duration and delivers them to subscribers of a routing ID. Relay-side ordering, dedup, and expiry are NOT the relay's job. The SDK handles all of this client-side.
+
+**Broadcast mode outer envelope.** Broadcast contexts wrap `BroadcastEnvelope` in the same `OuterEnvelope` format. The `routing_id` is `SHA-256(context_id)` (publicly derivable, unlike encrypted contexts which use HKDF-derived pseudonyms). The `encrypted_blob` contains the serialized `BroadcastEnvelope` — the author DID and metadata are visible after deserialization, but the actual content remains encrypted with the author's broadcast key. The relay sees author identity and envelope metadata but cannot read message content.
 
 ### 9.10.3 Fixed Bucket Padding
 
@@ -502,8 +516,8 @@ Messages larger than 256KB are chunked into 256KB blocks. Padding happens below 
 Each participant derives a per-context keypair that replaces their DID in all outer-envelope fields:
 
 ```
-context_seed = HKDF(identity_private_key, context_id, "scp-context-pseudonym")
-context_keypair = Ed25519_keygen(context_seed)
+context_seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")
+context_keypair = Ed25519_keygen(context_seed[0..32])
 context_pseudonym = context_keypair.public_key
 ```
 
@@ -512,7 +526,8 @@ context_pseudonym = context_keypair.public_key
 - **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
 - **No ZK proofs** — unnecessary complexity since only group members need to verify the mapping.
 - The SDK handles derivation, caching, and verification transparently.
-- **HSM compatibility.** The standard derivation uses raw `identity_private_key` bytes, which are not exportable from HSM-backed key storage (Secure Enclave, Android Keystore). For HSM-backed identity keys, pseudonym derivation uses an HSM-internal HMAC operation: `context_seed = HMAC-SHA256(identity_key_handle, context_id || "scp-context-pseudonym")`. The HSM performs the HMAC internally and returns the seed without exporting the private key. If the HSM does not support HMAC, a separate non-HSM pseudonym derivation key is derived during identity creation and stored alongside (but outside) the HSM. This key is used exclusively for pseudonym derivation and does not grant signing or decryption capability.
+- **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses the raw Ed25519 private key bytes. All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
+- **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a publicly derivable identifier: `metadata_routing_id = SHA-256(context_id || "scp-metadata")`. This identifier is distinct from the per-member pseudonyms used for message routing and does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the `metadata_routing_id` on the context's relays.
 
 ### 9.10.5 Connection Privacy
 
@@ -592,7 +607,11 @@ Displayed as:
 
 When a key is known or suspected to be compromised, the following ordered steps constitute the recovery protocol:
 
-**1. Key rotation on trusted device.** Generate new identity keypair on a trusted device. For did:dht: publish new DID document signed by the old key (if available) or via social recovery. For did:web: update the hosted DID document.
+**1. Key rotation on trusted device.**
+- **Active Signing Key compromise (common case):** Call `rotate_active_key` (ADR-003 §4a). Generate new active signing keypair, update DID document signed by Identity Key, publish to DHT. The DID string does NOT change. No identity migration needed.
+- **Identity Key compromise (rare, severe):** Call `migrate_identity` (ADR-003 §4b) using the pre-rotation key from cold storage. The pre-rotation commitment in the old DID document proves the legitimate owner is rotating, not the attacker. Creates a new DID. Old DID document updated with forwarding record. `DidRotationEvent` sent to all contexts with pre-rotation proof.
+- **Both keys compromised, pre-rotation key available:** Same as Identity Key compromise — the pre-rotation key resolves the race condition.
+- **All keys compromised:** Social recovery via trusted contacts with admin roles removing and re-adding the member under a new identity.
 
 **2. MLS Update in all active contexts.** Issue MLS Update proposals in every context. This provides post-compromise security: new epoch keys are derived from the new key material, making the compromised old key useless for future messages. If the old key is unavailable (device stolen), a trusted co-member with admin role must remove and re-add the member.
 
@@ -614,7 +633,7 @@ When a key is known or suspected to be compromised, the following ordered steps 
 
 **Certificate pinning:** The SDK SHOULD support certificate pinning for known relays. If did:web is used as a fallback, certificate pinning for the resolution server is mandatory.
 
-**Relay authentication:** NIP-42 (Nostr relay authentication) is supported but not required. SCP does not depend on relay authentication — encryption-as-access-control (§10.5) makes it unnecessary for confidentiality. Relay authentication may be useful for relays that want to limit their user base or implement per-user rate limiting.
+**Relay authentication:** SCP does not depend on relay authentication — encryption-as-access-control (§10.5) makes it unnecessary for confidentiality. Individual transport adapters may support adapter-specific authentication mechanisms (e.g., NIP-42 for Nostr relays). Relay authentication may be useful for relays that want to limit their user base or implement per-user rate limiting.
 
 **Direct connections:** For the direct WebSocket transport adapter, connections between devices MUST use TLS (wss://) unless both devices are on the same local network AND the user has explicitly accepted the risk.
 
@@ -673,28 +692,46 @@ Each participant in a context holds one AES-256 symmetric sender key. All messag
 - **Key size:** 32 bytes per sender key per context member. Storage is trivial.
 - **Encryption order:** Sender-first (AES-256-GCM), then MLS. Recipients decrypt MLS layer, then decrypt sender layer with the cached sender key.
 
+**Wrapping key terminology.** The sender-side key layer uses two distinct wrapping keys, both HPKE-based but serving different roles: (1) the **stable wrapping keypair** (below) protects the persistent per-sender AES-256 symmetric key during key distribution — it is long-lived and published in the MLS LeafNode; (2) the **ephemeral wrapping keypair** (§9.16.2) protects per-request key material during individual key exchanges — it is generated fresh for each `SenderKeyRequest` and discarded after use. Both use X25519 + HPKE for key encapsulation, but the stable key enables offline key distribution while the ephemeral key provides forward secrecy for individual key exchanges.
+
 **Stable wrapping keypair.** Each member maintains a dedicated X25519 keypair per context, used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
 
-### 9.16.2 Key Distribution
+### 9.16.2 Key Distribution (Pull-Based)
 
-Sender keys are distributed inside MLS application messages (encrypted to the group), but the key payload itself is HPKE-encrypted to each individual recipient's public key. This is necessary because MLS application messages are readable by all group members — without per-recipient HPKE wrapping, a blocked party could decrypt the MLS layer and read the new sender key.
+Sender keys are distributed via a pull-based request/response protocol. When a sender generates or rotates a key, they publish a lightweight epoch advance notification as an MLS application message. Members request the actual key material on demand via directed MLS application messages. This replaces a push-based model where the sender would HPKE-encrypt the key to every recipient in a single message — the pull model reduces block cost from O(N) to O(1) on the sender side and naturally load-balances key distribution.
 
-- **Key wrapping:** Each sender key distribution message contains per-recipient HPKE-encrypted payloads: `{recipient_did, HPKE_Seal(recipient_wrapping_pubkey, sender_key)}`. The recipient's wrapping public key is the stable X25519 key from their MLS LeafNode extension `scp_wrapping_key` (§9.16.1) — NOT the MLS leaf HPKE key, which rotates on epoch advances. Using a stable wrapping key ensures that offline members and members who join after an epoch advance can still unwrap sender key distributions. The MLS message is readable by all group members, but only the intended recipient can unwrap the actual sender key.
-- **New member join:** Existing members each send their current sender key to the new member as an MLS application message containing a single HPKE-encrypted payload for the new member. The new member accumulates sender keys from each existing member.
-- **Normal operation:** Sender key is stable — it does not rotate on MLS epoch advances. This is intentional: old sender keys are retained for historical message decryption. Blocking is about future messages, not retroactive access.
+**Protocol flow:**
+
+1. **Epoch advance notification.** When a sender generates or rotates their key, they publish a `SenderKeyEpochAdvance { sender_did, epoch, signature }` as an MLS application message. The signature covers `context_id || sender_did || "key_epoch" || epoch`, signed by the sender's Active Signing Key. This is **O(1)** regardless of group size.
+
+2. **Key request.** Members who need the key (because they see a new epoch, or because they just joined) send a `SenderKeyRequest { requester_did, sender_did, epoch, wrapping_pubkey, signature }` as an MLS application message with `recipient_hint` directed to the key holder. The `wrapping_pubkey` is a fresh ephemeral X25519 key generated per request.
+
+3. **Key response.** The key holder's SDK processes the request: verifies the signature, checks the block list. If the requester is not blocked, responds with `SenderKeyResponse { sender_did, epoch, hpke_sealed_key, ephemeral_pubkey }` via an MLS application message with `recipient_hint` to the requester. The sender key is HPKE-encrypted to the requester's ephemeral wrapping pubkey. If blocked, no response — the blocked party cannot obtain the key.
+
+**HPKE assembly:** (1) Generate ephemeral X25519 keypair (software-managed), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. The ephemeral public key is included in the response for decryption.
+
+**HPKE open (recipient-side):** Uses `key_custody.dh_agree(wrapping_key_handle, ephemeral_pk)` to compute the shared secret inside the custody boundary, then KDF + AEAD in software to recover the sender key. The wrapping private key never leaves KeyCustody.
+
+**New member join (pull-based):** When a new member joins the group, they observe each existing member's current sender key epoch from the group state. The new member publishes a `SenderKeyRequest` for each member whose key they need. Each member's SDK responds automatically (checking block list). Same O(N) total work as a push model, but demand-driven and naturally load-balanced.
+
+**Grace period.** When an epoch advances, the sender SHOULD continue accepting the old key for decryption of in-flight messages for 30 seconds (same grace window as MLS epoch keys, §9.7.2, ADR-001 criterion 6). Messages encrypted with the new key and old key coexist briefly.
+
+**Normal operation:** Sender keys do not rotate on MLS epoch advances. This is intentional: old sender keys are retained for historical message decryption. Blocking is about future messages, not retroactive access.
 
 ### 9.16.3 Block Protocol
 
 When Alice blocks Bob:
 
-1. Alice generates a new AES-256-GCM sender key.
-2. Alice sends a single MLS application message containing HPKE-encrypted payloads for each non-blocked member: `[{did: "charlie", key: HPKE(charlie_wrapping_pk, new_key)}, {did: "dave", key: HPKE(dave_wrapping_pk, new_key)}, ...]`, using each recipient's stable wrapping public key (§9.16.1). Bob can see this MLS message (it's group-encrypted) and can observe the recipient list, but Bob cannot unwrap any key payload.
-3. Alice sends a block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice"}`. This notifies Bob's client that Alice has blocked him.
-4. Bob's client, upon receiving the block notification, automatically rotates Bob's sender key, distributing the new key via HPKE-encrypted payloads to each member EXCEPT Alice.
+1. Alice generates a new AES-256-GCM sender key and increments her `sender_key_epoch`.
+2. Alice publishes `SenderKeyEpochAdvance { sender_did: alice_did, epoch: N, signature }` as an MLS application message. **O(1) cost** — no per-recipient HPKE payloads. All group members see the epoch advance.
+3. Alice sends a **signed** block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice", "blocked": "did:dht:bob", "timestamp": unix_ms, "signature": Ed25519_sign(alice_active_signing_key, SHA-256(context_id || "block" || alice_did || bob_did || timestamp))}`. The signature prevents forgery — without it, any group member could impersonate Alice and trick Bob into rotating his sender key. MLS application messages prove group membership but not individual sender identity within the message payload.
+4. Non-blocked members observe the epoch advance and send `SenderKeyRequest` for Alice's new key (§9.16.2). Alice's SDK checks the block list for each request — responds with the HPKE-encrypted key for non-blocked members, ignores requests from Bob. **O(1) per response.**
+5. Bob's client **verifies the block notification signature** against Alice's known Active Signing Key (from her MLS LeafNode `scp_signing_key` extension). If verification fails, the notification is discarded and logged for anomaly detection. If verification succeeds, Bob's client automatically rotates Bob's sender key (incrementing his own epoch), publishes his own `SenderKeyEpochAdvance`, and adds Alice to Bob's block list. When members request Bob's new key, Bob's SDK responds to everyone except Alice.
+6. The block event is recorded in the context event log with `EventType::MemberBlocked { blocker, blocked, signature }` for auditability.
 
-**Block event observability:** Block events are observable to the group. Alice distributed keys excluding Bob — other members can see the recipient list and infer the block. This is an acceptable tradeoff, consistent with how other messaging systems handle blocks (some explicitly announce "Alice blocked Bob," others simply stop showing messages). The protocol prioritizes cryptographic enforcement of the block over concealing the block event.
+**Block event observability:** Block events are observable to the group. The epoch advance notifications are visible to all members, and the block notification is an MLS application message. Other members can infer the block. This is an acceptable tradeoff, consistent with how other messaging systems handle blocks. The protocol prioritizes cryptographic enforcement of the block over concealing the block event.
 
-**Result:** Both Alice and Bob have new sender keys that exclude each other. Neither can read the other's future messages. Other context members can read both. The entire exchange completes within one message round-trip.
+**Result:** Both Alice and Bob have new sender keys that exclude each other. Neither can read the other's future messages. Other context members request and receive both new keys. The block completes with O(1) sender cost (epoch advance + block notification), with key distribution costs naturally spread across individual member requests.
 
 ### 9.16.4 Blocking vs. Removal
 
@@ -709,5 +746,7 @@ Sender keys rotate ONLY on block events, not on MLS epoch advances. This is a de
 
 - MLS provides forward secrecy for group-level encryption via epoch advancement.
 - Sender keys provide selective readability within the group.
-- Rotating sender keys on every epoch would require O(N) individual key distributions per epoch advance — prohibitive for active contexts.
+- Rotating sender keys on every epoch would require O(N) individual key requests per epoch advance — prohibitive for active contexts.
 - Old sender keys are retained for historical message decryption. A member who joins and receives the current sender keys can decrypt all messages encrypted with those keys (forward and backward within the sender key's lifetime). Historical access boundaries are defined by block events and member joins, not by time.
+
+**Sender key epoch counter.** Each sender maintains a monotonic `sender_key_epoch` counter (starting at 0 on key generation, incremented on each rotation). The epoch counter is included in `SenderKeyEpochAdvance` notifications and `SenderKeyRequest`/`SenderKeyResponse` messages. This enables members to detect missed rotations (gap in observed epochs), detect stale keys (epoch lower than expected), and correctly associate cached keys with the epoch they belong to. The `KeyEpochAdvance` event type (ADR-011) records epoch advances in the context event log for auditability.

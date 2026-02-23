@@ -13,6 +13,16 @@ Both mechanisms require explicit consent from all involved contexts. Neither all
 
 ## 6.2 Context-to-Context Tool Interfaces
 
+### 6.2.0 Tool Interface Transport
+
+Cross-context tool calls require a physical transport mechanism to bridge the boundary between two isolated contexts. Two protocol-level mechanisms provide this:
+
+1. **Shared-member bridging (primary).** When a human participates in both contexts, their SDK bridges tool requests and responses locally. The human's agent in Context A makes a tool call targeting Context B; the SDK routes the request through the human's membership in Context B, executes the call under Context B's governance, and returns the response to Context A. No relay-level cross-context routing is needed — the bridge operates entirely within the human's local SDK. Both contexts' governance is enforced: Context A's outbound policy and Context B's inbound policy are validated before the call proceeds. The human's SDK is the transport, and both event logs record the interaction with full provenance.
+
+2. **Multi-parent child contexts (fallback).** For cases without a shared member, a child context with parents from both the source and target contexts can serve as a bridge (§5.13). The child context inherits capability ceilings from both parents (intersection). Members from both parent contexts who join the child context can mediate tool calls within the child's governed space. This is heavier than shared-member bridging but covers the case where no single human has membership in both contexts.
+
+These two mechanisms cover all cross-context tool call scenarios. Direct agent-to-agent communication is not needed — tool interfaces with stateful sessions (§6.2.1) provide the same functional coverage (negotiation, coordination, multi-step workflows) with stronger security guarantees: every interaction is context-governed, schema-declared, rate-limited, and auditable. The context governs the tool call, not the agent.
+
 Contexts can expose tool endpoints to other contexts. **The context governs the tool call, not the agent.** An agent in Context A does not directly contact Context B — the agent requests from Context A, Context A's governance decides whether to permit the outbound call, and Context B's governance decides whether to permit the inbound call and how to respond. Both contexts mediate. The agent never directly touches the other context.
 
 This is the mechanism for all structured inter-agent interaction across context boundaries. Both contexts' governance models, capability ceilings, and role permissions gate every interaction.
@@ -118,6 +128,14 @@ These are conventions, not mandates — discovery contexts can add custom tools 
 - Returns merged, deduplicated results ranked by relevance
 
 **Privacy.** Registration is opt-in per discovery context. Agents control what metadata they publish in each registry. Registration can be withdrawn at any time via `agent_deregister`. An agent can be registered in one discovery context with full capabilities listed and in another with only a subset. DID document capabilities are controlled by the agent via DID document updates.
+
+### 6.2.3 Broadcast Context Interactions
+
+Tool interfaces (§6.2) work with broadcast contexts. A broadcast context can expose tools via the standard tool interface mechanism — the context's governance mediates, the tool schemas are declared, and calls are logged. Tool invocation requires the invoker to hold the appropriate UCAN (`ToolInvoke` or `ToolInvokeAll`), which is governed by the broadcast context's role system.
+
+**Mixed-mode nesting (§5.13).** Child contexts may have a different `ContextMode` than their parents. A Broadcast child of Encrypted parents enables public read access to curated content from a private group. An Encrypted child of Broadcast parents enables private discussion among subscribers. Ceiling inheritance, eligibility enforcement, and lifecycle coupling operate identically regardless of mode.
+
+**Discovery metadata.** When broadcast contexts register in discovery contexts (§6.2.2B), the registration metadata includes the context mode. Agents searching for broadcast feeds can filter by mode. DID document `SCPBroadcastContext` service endpoints (§5.14.11) provide direct lookup for broadcast contexts without discovery context queries.
 
 ## 6.3 The Human as Bridge
 

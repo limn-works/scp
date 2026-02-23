@@ -37,24 +37,24 @@ PyO3 is the established Rust-Python FFI framework, and maturin is the standard b
 
 ### Decision
 
-Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. The bridge exposes a flat set of `#[pyfunction]` and `#[pyclass]` definitions that map directly to scp-core's public API. Async functions use `pyo3-asyncio-0.21` (or latest compatible version) to bridge Rust futures (tokio) to Python coroutines (asyncio). Rust `Result<T, E>` types are mapped to Python exceptions via a unified error hierarchy. All SCP domain types (Identity, ContextHandle, OuterEnvelope, UcanToken, etc.) are exposed as opaque Python objects with attribute access — no raw structs, no Rust generics, no lifetime markers visible to Python.
+Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. The bridge exposes a flat set of `#[pyfunction]` and `#[pyclass]` definitions that map directly to scp-core's public API. Async functions use PyO3's native async support (`#[pyfunction] async fn`) to bridge Rust futures (tokio) to Python coroutines (asyncio). Rust `Result<T, E>` types are mapped to Python exceptions via a unified error hierarchy. All SCP domain types (Identity, ContextHandle, OuterEnvelope, UcanToken, etc.) are exposed as opaque Python objects with attribute access — no raw structs, no Rust generics, no lifetime markers visible to Python.
 
 ### Rationale
 
 - **PyO3 over cffi/ctypes:** PyO3 generates native Python extension modules with automatic type conversion, exception mapping, and GIL management. cffi/ctypes require manual C ABI definitions and offer no async bridging. PyO3 is the Rust-Python standard with mature tooling.
 - **maturin over setuptools-rust:** maturin is purpose-built for PyO3/Rust-Python projects. It handles cross-compilation, wheel building for multiple platforms (manylinux, macOS universal2, Windows), and integrates with PyPI publishing. setuptools-rust requires more configuration and has fewer CI/CD integrations.
-- **pyo3-asyncio for async bridging:** Rust's tokio runtime and Python's asyncio are fundamentally different async models. pyo3-asyncio bridges them by running a tokio runtime in a background thread and converting Rust `Future`s into Python `asyncio.Future`s. This is the only production-tested approach for Rust-Python async interop. The alternative — blocking Python threads on Rust futures — defeats the purpose of async and blocks the Python event loop.
+- **Native async bridging (PyO3 0.22+):** PyO3 natively supports `async fn` in `#[pyfunction]` and `#[pymethods]`, converting Rust `Future`s into Python coroutines directly. The tokio runtime runs in a background thread pool; async functions declared with `async fn` automatically bridge between the two event loops. The deprecated `pyo3-asyncio` crate is no longer needed.
 - **Flat function surface:** The bridge layer is deliberately flat (no deep class hierarchies). Each Python-visible function maps to one Rust function. The Pythonic API (context managers, method chaining, iterators) is built in the pure Python wrapper layer (ADR-014), not in the FFI bridge. This keeps the bridge thin and testable.
 - **Opaque types over data transfer:** SCP types like `Identity`, `ContextHandle`, and `MlsGroup` contain crypto state that must not be serialized to Python objects. They are exposed as opaque PyO3 classes with getter methods for safe fields (DID string, context ID, state) and no access to internal key material.
 
 ### Implementation
 
 - **Language:** Rust (PyO3 macros) + Python (type stubs)
-- **Libraries:** `pyo3` (0.21+), `pyo3-asyncio` (0.21+, tokio variant), `maturin` (build tool)
+- **Libraries:** `pyo3` (0.22+), `maturin` (build tool)
 - **Crate:** `scp-ffi` (workspace member)
 - **Module:** `scp-ffi/pyo3/`
 - **Build output:** Python extension module `_scp_core` (imported by the `scp_sdk` Python package)
-- **Async runtime:** A single tokio `Runtime` is created at module import time and shared across all async calls. The runtime runs in a background thread pool managed by pyo3-asyncio.
+- **Async runtime:** A single tokio `Runtime` is created at module import time and shared across all async calls. The runtime runs in a background thread pool managed by PyO3's native async machinery.
 - **Platform wheels:** maturin builds wheels for manylinux (x86_64, aarch64), macOS (x86_64, arm64 universal2), and Windows (x86_64). CI/CD via GitHub Actions with maturin's `maturin-action`.
 
 ### Dependencies
@@ -66,19 +66,18 @@ Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. Th
 
 1. **Tokio runtime initialization:**
    - A tokio `Runtime` is created once at Python module import (`_scp_core.__init__`).
-   - The runtime is multi-threaded (default thread count).
-   - All async bridge functions use this shared runtime via `pyo3_asyncio::tokio::future_into_py()`.
-   - Runtime shutdown is handled on module finalization (Python interpreter exit).
+   - The runtime is multi-threaded (default thread count) and stored in a `OnceCell<Runtime>`.
+   - All async bridge functions declared with `async fn` use PyO3's native async support, which automatically bridges between the tokio runtime and Python's asyncio event loop.
+   - **Runtime isolation:** The tokio runtime is NEVER accessed via `block_on` from within an async context. All sync->async bridging happens in the Python layer (via `run_coroutine_threadsafe` to a dedicated asyncio loop), which then calls the async bridge functions normally. The Rust side only ever sees async function calls driven by PyO3's native async machinery.
+   - Runtime shutdown is handled on module finalization (Python interpreter exit). The `Runtime` is dropped, which waits for in-flight tasks to complete (with a 5-second timeout).
 
 2. **Identity bridge functions:**
 
    ```rust
    #[pyfunction]
-   fn py_identity_create<'py>(py: Python<'py>, custody: &str) -> PyResult<Bound<'py, PyAny>> {
-       pyo3_asyncio::tokio::future_into_py(py, async move {
-           let identity = Identity::create(parse_custody(custody)?).await?;
-           Ok(PyIdentity::from(identity))
-       })
+   async fn py_identity_create(custody: &str) -> PyResult<PyIdentity> {
+       let identity = Identity::create(parse_custody(custody)?).await?;
+       Ok(PyIdentity::from(identity))
    }
 
    #[pyfunction]
@@ -367,18 +366,41 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 6. **Sync convenience API:**
 
    ```python
-   # Every async method has a sync counterpart via a module-level helper
+   import asyncio
+   import threading
+
+   # Dedicated background event loop for sync wrappers.
+   # Created lazily on first sync call. Runs in a daemon thread.
+   _sync_loop: asyncio.AbstractEventLoop | None = None
+   _sync_loop_lock = threading.Lock()
+
+   def _get_sync_loop() -> asyncio.AbstractEventLoop:
+       global _sync_loop
+       if _sync_loop is None or _sync_loop.is_closed():
+           with _sync_loop_lock:
+               if _sync_loop is None or _sync_loop.is_closed():
+                   _sync_loop = asyncio.new_event_loop()
+                   t = threading.Thread(target=_sync_loop.run_forever, daemon=True)
+                   t.start()
+       return _sync_loop
+
    def run_sync(coro):
-       """Run an async coroutine synchronously."""
-       try:
-           loop = asyncio.get_running_loop()
-           raise RuntimeError("Cannot use sync API inside an async context. Use the async API instead.")
-       except RuntimeError:
-           return asyncio.run(coro)
+       """Run an async coroutine synchronously.
+
+       Safe to call from any context:
+       - From a non-async context: uses a dedicated background event loop.
+       - From an async context (Jupyter, nested): uses the background loop
+         via run_coroutine_threadsafe, avoiding deadlock.
+       """
+       loop = _get_sync_loop()
+       future = asyncio.run_coroutine_threadsafe(coro, loop)
+       return future.result()  # Blocks the calling thread until complete
    ```
 
    - Sync methods are named `*_sync` (e.g., `Identity.create_sync()`).
-   - Sync methods raise `RuntimeError` if called from within an existing event loop (prevents deadlocks).
+   - `run_sync` is safe in ALL contexts: plain scripts, Jupyter notebooks, inside async functions, inside other frameworks' event loops. It never calls `asyncio.run()` (which fails inside running loops) and never calls `block_on` (which panics inside tokio).
+   - The background event loop is a daemon thread that dies with the process.
+   - Thread safety: `run_coroutine_threadsafe` is the asyncio-blessed mechanism for cross-thread coroutine submission.
 
 7. **Module-level convenience functions:**
 
@@ -687,7 +709,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    - **Step 6 — Capability match:** Verify the token's `att` includes the `required_capability`. Capability matching supports wildcards (`scp:ctx:*/messages:write` matches any context).
    - **Step 7 — Attenuation:** Verify each delegation in the chain narrows or preserves capabilities (never widens). A child token cannot grant capabilities its parent does not have.
    - **Step 8 — Ceiling:** Verify the `required_capability` is within the context's immutable capability ceiling.
-   - **Step 9 — Nonce:** Verify `nnc` has not been seen before in this context. Record the nonce in the context's nonce tracker.
+   - **Step 9 — Nonce:** Validate nonce format (`{unix_millis}-{hex16}`). Validate nonce freshness (timestamp within ± 5 minutes of now). Verify `nnc` has not been seen before in this context. Record the nonce with the token's `exp` in the context's nonce tracker.
    - **Step 10 — Revocation:** Verify the token's CID is not in the context's revocation list.
    - **Step 11 — Expiry:** Verify `exp > now` and `nbf <= now` (if present).
    - Returns `Ok(())` if all 11 checks pass. Returns a specific `UcanError` variant indicating which check failed.
@@ -717,18 +739,25 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
    ```rust
    pub struct NonceTracker {
-       seen: HashMap<String, u64>,     // nonce -> timestamp when first seen
+       /// Map of nonce -> (first_seen_timestamp, token_expiry_timestamp).
+       seen: HashMap<String, (u64, u64)>,
        context_id: ContextId,
    }
 
    impl NonceTracker {
-       pub fn check_and_record(&mut self, nonce: &str) -> Result<(), UcanError> { ... }
-       pub fn prune(&mut self, max_age_secs: u64) { ... }  // Remove nonces older than max_age
+       pub fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> { ... }
+       pub fn prune(&mut self) { ... }
    }
    ```
 
-   - `check_and_record()` returns `UcanError::NonceReused` if the nonce was seen before.
-   - `prune()` removes nonces older than 24 hours (called periodically or on every Nth check).
+   **Nonce format:** `{unix_millis_timestamp}-{16_random_bytes_hex}`. The timestamp prefix enables efficient pruning; the random suffix ensures uniqueness.
+
+   **Nonce freshness check:** The timestamp prefix MUST be within `now ± 5 minutes` (matching clock skew tolerance from §9.14). Nonces outside this window are rejected as `UcanError::NonceTooOld` or `UcanError::NonceFuture`.
+
+   **Replay window:** A nonce is retained until `max(token_expiry + 5 minutes, first_seen + 24 hours)`.
+
+   - `check_and_record(nonce, token_expiry)` validates format, validates freshness, returns `UcanError::NonceReused` if seen before, records `(now, token_expiry)` if new.
+   - `prune()` removes entries where `now > max(token_expiry + 300, first_seen + 86400)`. Runs every 1000 checks or 10 minutes.
    - State is persisted to `scp-platform` Storage for crash recovery.
 
 7. **`RevocationList` (per-context):**
@@ -863,7 +892,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
 6. Bob receives the message via async iterator:
    async for msg in ctx.receive():
        print(msg.content)  # "Hello from Python"
-   Async iterator bridges tokio stream → Python asyncio via pyo3-asyncio (ADR-013).
+   Async iterator bridges tokio stream → Python asyncio via PyO3 native async (ADR-013).
 
 7. Bob invokes the calculator tool:
    result = await ctx.invoke("calculator", {"operation": "add", "a": 1, "b": 2})

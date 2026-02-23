@@ -539,6 +539,8 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 | `sender_key_roundtrip` | Store sender key, load, verify key matches |
 | `did_cache_roundtrip` | Cache DID document, load, verify matches |
 | `relay_score_list` | Store scores for 3 relays, list all, verify all returned |
+| `mls_group_state_roundtrip` | Create MLS group, persist via `MlsStorageBridge` (§17.9), reload, verify group state matches |
+| `mls_state_isolated_per_context` | Two contexts with MLS groups via `MlsStorageBridge`, verify state does not leak between contexts |
 
 ## 17.14 Phase Integration
 

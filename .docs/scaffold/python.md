@@ -49,7 +49,7 @@ build-backend = "maturin"
 name = "scp-sdk"
 description = "Social Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
 requires-python = ">=3.12"
-license = "MIT OR Apache-2.0"
+# license = TBD
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

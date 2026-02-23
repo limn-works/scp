@@ -17,7 +17,13 @@ SCP.Identity.create(
   custody: .secureEnclave | .passkey | .platform(apple|google) | .selfManaged,
   recovery: [.trustedDevice, .socialRecovery, .platformBacked],
   deviceAttestation: DeviceAttestation     // Apple App Attest / Google Play Integrity
-) → Identity { did, publicKey, custodyMethod }
+) → Identity {
+  did,
+  identityKey,          // Ed25519 — derives the DID string, highest-security custody (ADR-003)
+  activeSigningKey,     // Ed25519 — MLS credentials, envelope signatures, UCAN issuance (rotatable)
+  preRotationCommitment, // SHA-256(pre-rotation key public) — cold/offline custody
+  custodyMethod
+}
 ```
 
 Device attestation binds one DID to one physical device. Sybil resistance starts here — creating identities costs the price of a device.
@@ -160,7 +166,9 @@ SCP.Context.create(
   template: .bilateralEphemeral     // messages only, ephemeral, TTL required
           | .bilateralPersistent    // messages only, full memory, no TTL
           | .coordination           // messages + tools, summary memory, TTL required
-          | .groupDiscussion,       // messages + invite, full memory, optional TTL
+          | .groupDiscussion        // messages + invite, full memory, optional TTL
+          | .publicBroadcast        // broadcast mode, auto-granted subscriber reads, optional TTL
+          | .gatedBroadcast,        // broadcast mode, admin-issued subscriber reads, optional TTL
   peer: DID?,                       // for bilateral templates — handles invitation internally
   ttl: Duration?,                   // required for some templates, optional for others
   tools: [ToolDefinition]?          // only for templates that allow tools (coordination)
@@ -1172,7 +1180,7 @@ What actually moves on the network. All messages are encrypted with the context 
 ```
 
 The outer envelope is minimal by design (spec §9.10.2). The relay sees only:
-- **routing_id** — per-context pseudonym derived via HKDF (spec §9.10.4). Unlinkable across contexts.
+- **routing_id** — per-context pseudonym derived via HMAC-SHA256 (spec §9.10.4). Unlinkable across contexts.
 - **recipient_hint** — recipient's per-context pseudonym for directed messages, or `"*"` for broadcast.
 - **ttl** — seconds until the relay should delete this blob.
 - **blob** — the encrypted payload. Everything else is inside.
@@ -1487,12 +1495,12 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 - **~~Transport abstraction interface.~~** ✅ **Resolved.** ADR-005 specifies the `TransportAdapter` trait (connect, send, subscribe, query, disconnect). Envelope format specified in .docs/specs/ §9.10.2 (minimal outer envelope).
 - **~~SCP native relay protocol.~~** ✅ **Resolved.** ADR-004 specifies the relay: PUBLISH/SUBSCRIBE/UNSUBSCRIBE over WebSocket, blob TTL enforcement, recipient_hint for directed delivery.
 - **~~Sender-side key layer protocol (§9.16).~~** ✅ **Resolved.** Full specification in .docs/specs/ §9.16 (5 subsections). ADR-007 specifies implementation. AES-256-GCM sender keys, HPKE-wrapped per-recipient distribution using stable wrapping keypairs, block protocol, forward secrecy interaction.
-- **~~Per-context pseudonym derivation and verification protocol.~~** ✅ **Resolved.** Specified in .docs/specs/ §9.10.4. HKDF derivation, inside-encryption verification, caching.
+- **~~Per-context pseudonym derivation and verification protocol.~~** ✅ **Resolved.** Specified in .docs/specs/ §9.10.4. HMAC-SHA256 derivation, inside-encryption verification, caching.
 - **~~Cover traffic protocol specification.~~** ✅ **Resolved.** Specified in .docs/specs/ §9.10.6. Configurable, default on for persistent connections.
 - **~~Metadata privacy mechanisms.~~** ✅ **Resolved.** All 10 decisions implemented. Full architecture in .docs/specs/ §9.10 (8 subsections).
 - **~~UCAN capability schema.~~** ✅ **Resolved.** ADR-016 specifies concrete capability types, 11-step validation pipeline, delegation chains, nonce replay rejection, ceiling enforcement.
-- **~~Context lifecycle state machine.~~** ✅ **Resolved.** ADR-008 specifies states (Created, Active, Suspended, Closing, Closed, Expired), transitions, TTL management, governance enforcement.
-- **~~Context templates and lightweight creation.~~** ✅ **Resolved.** .docs/specs/ §5.12 specifies 4 well-known templates, auto-accept policies, invitation bundling, computational profile, standing bilateral contexts. sdk-common.md specifies cross-language SDK surface.
+- **~~Context lifecycle state machine.~~** ✅ **Resolved.** ADR-008 specifies states (Creating, Active, Closing, Closed, Expired), transitions, TTL management, governance enforcement.
+- **~~Context templates and lightweight creation.~~** ✅ **Resolved.** .docs/specs/ §5.12 specifies 6 well-known templates (4 encrypted + 2 broadcast), auto-accept policies, invitation bundling, computational profile, standing bilateral contexts. sdk-common.md specifies cross-language SDK surface.
 - **~~Context nesting.~~** ✅ **Resolved.** .docs/specs/ §5.13 specifies parent-child relationships (8 subsections): ceiling inheritance, membership eligibility, creation protocol, parent governance configuration, lifecycle coupling, metadata/legibility, interaction with other mechanisms, depth limits. Cryptographic binding via MLS `group_context` extensions. ADR phase-2 includes `nesting.rs` and `ChildContextCreate` capability.
 - **~~Cross-context provenance chain tracking.~~** ✅ **Resolved.** DataProvenance type includes `chainDepth` (boundary hop count) and `chainPath` (intermediary context IDs). Chain depth limit (default: 3) enforced at protocol level. .docs/specs/ §7.7.1.
 - **Minimum viable agent.** Likely a passthrough that takes human input, wraps it in SCP envelopes, signs, and sends. Reference implementation that's trivially embeddable.

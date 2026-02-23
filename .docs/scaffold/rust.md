@@ -18,6 +18,7 @@ crates/
         mls/                # ADR-001: MLS wrapper
           storage.rs        # MlsStorageBridge — OpenMLS StorageProvider impl (§17.9)
         sender_keys/        # ADR-007: Sender-side key layer
+          key_protocol.rs   # Pull-based key distribution: SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse
         ucan/               # ADR-009/016: UCAN validation
       store/                # §17.4: ProtocolStore — typed domain storage layer
         mod.rs              # ProtocolStore struct, StoreError, StoredValue<T>
@@ -29,7 +30,9 @@ crates/
         transport.rs        # Relay scores, key packages
       identity/             # ADR-003: DID creation
       envelope/             # ADR-002: Envelope format
+        broadcast.rs        # BroadcastEnvelope variant (§5.14.5)
       context/              # ADR-008: Context lifecycle
+        mode.rs             # ContextMode enum (§5.14.1)
         tools/              # ADR-010: Tool registration/invocation
         roles.rs            # ADR-009: Role assignment
       event_log/            # ADR-011: Verifiable Merkle event log
@@ -145,7 +148,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+# license = TBD
 repository = "https://github.com/limn/scp"
 
 [workspace.dependencies]

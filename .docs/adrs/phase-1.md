@@ -146,7 +146,7 @@ The envelope design implements the metadata privacy architecture from the resolv
 Two-layer envelope format:
 
 **Outer envelope** (what relays and the network see):
-- `routing_id` — per-context pseudonym derived via HKDF (Decision 7)
+- `routing_id` — per-context pseudonym derived via HMAC-SHA256 (Decision 7)
 - `recipient_hint` — recipient pseudonym for directed messages, or broadcast marker
 - `blob_ttl` — how long the relay should store before deletion (seconds)
 - `encrypted_blob` — everything else, MLS-encrypted
@@ -171,7 +171,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 ### Rationale
 
 - **Minimal outer envelope:** Relays are dumb pipes. They route by `routing_id`, store for `blob_ttl`, and delete. They learn nothing about who sent the message, what context it belongs to (only the pseudonym), or what it contains. This is the core of Decision 2.
-- **Per-context pseudonyms:** `routing_id` is derived deterministically from the sender's identity key and context ID via HKDF. Same identity + same context = same pseudonym. Different context = different pseudonym. Relays cannot link activity across contexts (Decision 7).
+- **Per-context pseudonyms:** `routing_id` is derived deterministically from the sender's identity key and context ID via HMAC-SHA256. Same identity + same context = same pseudonym. Different context = different pseudonym. Relays cannot link activity across contexts (Decision 7).
 - **Signature inside encryption:** Moving the Ed25519 signature inside the encrypted blob hides the signer's identity from relays. Group members verify after decryption. This is a departure from the original spec (which had an outer Ed25519 signature) — the updated design per Decision 2 eliminates outer sender identity exposure.
 - **Bucket padding:** Plaintext is padded to fixed buckets (256B, 1KB, 4KB, 16KB, 64KB, 256KB) before encryption (Decision 3). This prevents relays from correlating message types by size. **Processing order: hash original plaintext -> hash provenance -> sign (covering both hashes) -> pad to bucket boundary -> sender-key encrypt -> MLS encrypt.** Padding occurs after signing so the signature covers the real payload content, not padding bytes. Padding integrity is guaranteed by the AEAD authenticated encryption layers (AES-256-GCM sender key and MLS), not by the inner signature.
 
@@ -180,8 +180,8 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 - **Language:** Rust
 - **Signing:** Ed25519 via the `ed25519-dalek` crate (or via OpenMLS's signing primitives)
 - **Hashing:** SHA-256 via the `sha2` crate
-- **Pseudonym derivation:** HKDF via the `hkdf` crate with SHA-256
-- **Serialization:** `serde` with a binary format (MessagePack via `rmp-serde` or CBOR via `ciborium` — choose whichever is more compact)
+- **Pseudonym derivation:** HMAC-SHA256 via the `hmac` and `sha2` crates
+- **Serialization:** `serde` with MessagePack via `rmp-serde`
 - **Crate:** `scp-core`
 - **Module:** `scp-core/envelope/`
 
@@ -189,7 +189,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 
 - **ADR-001 (MLS):** Envelope creation calls `mls.encrypt()` on the serialized inner envelope to produce the `encrypted_blob`. Envelope parsing calls `mls.decrypt()` to recover the inner envelope.
 - **ADR-003 (DID):** The `sender_did` field references the DID created by the identity module. Pseudonym derivation requires the identity's private key.
-- **Decision 7 (per-context pseudonyms):** The `routing_id` and `recipient_hint` are derived via HKDF from identity key + context ID.
+- **Decision 7 (per-context pseudonyms):** The `routing_id` and `recipient_hint` are derived via HMAC-SHA256 from identity key + context ID.
 
 ### Acceptance Criteria
 
@@ -242,7 +242,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 | `inner.rs` | `InnerEnvelope` struct, `create_inner_envelope`, `verify_inner_signature`, serialization |
 | `outer.rs` | `OuterEnvelope` struct, `create_outer_envelope`, serialization, `seal_envelope`, `open_envelope` |
 | `padding.rs` | Bucket padding: `pad_to_bucket`, `strip_padding`, bucket size constants |
-| `pseudonym.rs` | `derive_pseudonym` — HKDF derivation, pseudonym-to-DID verification cache |
+| `pseudonym.rs` | `derive_pseudonym` — HMAC-SHA256 derivation, pseudonym-to-DID verification cache |
 
 **Estimated functions:** ~10-12 public functions, ~5-8 internal helpers.
 
@@ -301,6 +301,14 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
    - The item is signed by the identity's Ed25519 key.
    - Includes a sequence number (monotonically increasing) for ordered updates.
    - Idempotent: re-publishing with the same sequence number is a no-op on the DHT.
+
+   **DHT republishing strategy:** DIDs published via did:dht require periodic republishing to remain resolvable — Mainline DHT records expire if not refreshed. The SDK handles this automatically for all active identities (identities loaded into memory with an active signing key):
+
+   - **Republish interval:** Every 2 hours. This is well within typical DHT record expiry windows (which vary by implementation but are generally 1-2 hours for Mainline DHT BEP44 items).
+   - **Failure handling:** Exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m. Each retry re-resolves DHT bootstrap nodes to handle network topology changes. After 6 consecutive failures, the SDK emits a `DhtPublishDegraded` warning to the application layer.
+   - **Automatic lifecycle:** Republishing starts when an identity is loaded (`Identity::load` or `Identity::create`) and stops when the identity is unloaded or the SDK shuts down. The republish task is a background tokio task managed by the identity module — no caller action required.
+   - **Stale DID resolution:** When `resolve_did` returns a cached result that has not been refreshed within the expected republish window (2 hours + 30 minute grace), the result includes a `staleness` indicator: `DIDResolutionResult { document, staleness: Staleness::Fresh | Staleness::Stale { last_verified: u64 } }`. Callers SHOULD treat stale results as valid but degraded — the DID document may be outdated (e.g., a key rotation may have occurred). The SDK logs a warning for stale resolutions. Critical operations (UCAN validation, MLS credential verification) SHOULD attempt a fresh DHT resolution before rejecting a stale result.
+   - **Startup republish:** On SDK initialization, all persisted active identities are republished immediately (not waiting for the 2-hour interval) to ensure availability after process restarts or network outages.
 
 3. **`resolve_did(did_string) -> DIDDocument`**
    - Resolves a did:dht identifier via Mainline DHT lookup.
@@ -473,6 +481,8 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 6. **`ACK { blob_id }`**
    - Delivery receipt. Client acknowledges receipt of a blob.
    - The relay MAY use ACKs from all known subscribers to garbage-collect blobs before TTL expiry.
+
+**Context metadata retrieval:** Contexts publish their parameters (capability ceiling, governance policy, roles, TTL, memory scope, etc.) to a publicly derivable routing ID: `metadata_routing_id = SHA-256(context_id || "scp-metadata")`. Any participant can SUBSCRIBE or QUERY this routing ID to inspect a context's parameters before joining. The metadata blob is a signed, unencrypted envelope containing the context's `ContextParameters` struct (spec §5.3). This enables the "legibility before opt-in" tenet — informed consent is mechanical, not social.
 
 **Relay server requirements:**
 
@@ -936,18 +946,70 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    - Verifies the authentication tag. Rejects if verification fails.
    - Returns the plaintext.
 
-4. **`distribute_sender_key(key_custody, mls_group, sender_key, recipients) -> MlsMessage`**
-   - Distributes the sender key to specified recipients as a single MLS application message containing per-recipient HPKE-encrypted payloads.
-   - Each payload: `{recipient_did, hpke_seal(recipient_wrapping_pubkey, sender_key)}` where the HPKE seal operation uses an ephemeral X25519 keypair (software-generated) for the sender side and the recipient's stable wrapping public key from their MLS LeafNode extension `scp_wrapping_key` (spec §9.16.1).
-   - HPKE assembly: (1) generate ephemeral X25519 keypair, (2) ECDH between ephemeral secret and recipient wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. The ephemeral public key is included in the payload for decryption.
-   - The MLS message is readable by all group members, but only the intended recipients can unwrap the sender key.
-   - For new member join: existing members each call `distribute_sender_key` with a single-recipient payload for the new member.
+4. **Pull-based sender key distribution protocol**
 
-5. **`rotate_sender_key_for_block(key_custody, mls_group, blocked_did) -> SenderKey`**
-   - Generates a new sender key.
-   - Distributes the new key to all group members EXCEPT the blocked party via `distribute_sender_key` (criterion 4) with the blocked party excluded from the recipient list.
-   - HPKE open (recipient-side decryption) uses `key_custody.dh_agree(wrapping_key_handle, ephemeral_pk)` to compute the shared secret inside the custody boundary, then KDF + AEAD in software to recover the sender key. The wrapping private key never leaves KeyCustody.
-   - The blocked party can see the MLS message and the recipient list but cannot unwrap any key payload.
+   Sender keys are distributed via a pull-based request/response protocol. When a sender generates or rotates a key, they publish a lightweight epoch advance notification. Members request the actual key material on demand. This replaces the push-based model where the sender HPKE-encrypted the key to every recipient in a single message.
+
+   **Wire types (inside MLS application messages):**
+
+   ```rust
+   /// Sender key epoch advanced — author rotated their key.
+   /// Published as an MLS application message (broadcast to group).
+   pub struct SenderKeyEpochAdvance {
+       pub sender_did: DID,
+       pub epoch: u64,
+       pub signature: Ed25519Signature,  // Signs context_id || sender_did || "key_epoch" || epoch
+   }
+
+   /// Request for a sender's current key at a specific epoch.
+   /// Sent as an MLS application message with recipient_hint to the key holder.
+   pub struct SenderKeyRequest {
+       pub requester_did: DID,
+       pub sender_did: DID,        // Whose key is being requested
+       pub epoch: u64,
+       pub wrapping_pubkey: X25519PublicKey,
+       pub signature: Ed25519Signature,
+   }
+
+   /// Response with HPKE-encrypted sender key.
+   /// Sent as an MLS application message with recipient_hint to the requester.
+   pub struct SenderKeyResponse {
+       pub sender_did: DID,
+       pub epoch: u64,
+       pub hpke_sealed_key: Vec<u8>,   // HPKE(requester_wrapping_pubkey, sender_key)
+       pub ephemeral_pubkey: X25519PublicKey,
+   }
+   ```
+
+   **4a. `publish_sender_key_epoch_advance(key_custody, mls_group, context_id, sender_did, epoch) -> MlsMessage`**
+   - Constructs a `SenderKeyEpochAdvance` signed by the sender's Active Signing Key: `Ed25519_sign(active_signing_key, SHA-256(context_id || sender_did || "key_epoch" || epoch))`.
+   - Sends as an MLS application message (broadcast to all group members). **O(1) cost** regardless of group size.
+   - Recipients verify the signature and record the new epoch for this sender.
+
+   **4b. `handle_sender_key_request(key_custody, mls_group, request, block_list) -> Option<MlsMessage>`**
+   - Receives a `SenderKeyRequest` from another member.
+   - Verifies the request signature against `requester_did`.
+   - Checks block list: if `requester_did` is blocked, returns `None` (no response, the requester cannot obtain the key).
+   - If not blocked: HPKE-encrypts the current sender key to the requester's `wrapping_pubkey`. HPKE assembly: (1) generate ephemeral X25519 keypair (software-generated), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. The ephemeral public key is included in the response.
+   - Returns `Some(MlsMessage)` containing the `SenderKeyResponse`, sent with `recipient_hint` to the requester. **O(1) cost per request.**
+
+   **4c. `request_sender_key(key_custody, mls_group, sender_did, epoch) -> MlsMessage`**
+   - Constructs a `SenderKeyRequest` with a fresh ephemeral X25519 wrapping keypair.
+   - Signs the request with the requester's Active Signing Key.
+   - Sends as an MLS application message with `recipient_hint` to the sender. **O(1) cost.**
+
+   **HPKE open (recipient-side decryption):** Uses `key_custody.dh_agree(wrapping_key_handle, ephemeral_pk)` to compute the shared secret inside the custody boundary, then KDF + AEAD in software to recover the sender key. The wrapping private key never leaves KeyCustody.
+
+   **New member join (pull-based):** When a new member joins the group, they observe each existing member's current `sender_key_epoch` from the group state. The new member publishes a `SenderKeyRequest` for each author whose key they need. Each author's SDK responds automatically (checking block list). Same O(N) total work as push-based, but demand-driven and naturally load-balanced — the new member drives the process, not N existing members racing to push.
+
+   **Grace period:** When an epoch advances, the sender SHOULD continue accepting the old key for decryption of in-flight messages for 30 seconds (same grace window as MLS epoch keys, ADR-001 criterion 6). Messages encrypted with the new key and old key coexist briefly.
+
+5. **`rotate_sender_key_for_block(mls_group, blocked_did) -> SenderKey`**
+   - Generates a new sender key and increments the sender's `sender_key_epoch`.
+   - Publishes a `SenderKeyEpochAdvance` via criterion 4a. **O(1) cost** — no per-recipient HPKE payloads on block.
+   - Adds `blocked_did` to the sender's block list.
+   - Non-blocked members observe the epoch advance, send `SenderKeyRequest` (criterion 4c), and receive the new key via `handle_sender_key_request` (criterion 4b) which checks the block list.
+   - The blocked party can send a `SenderKeyRequest` but receives no response — they cannot obtain the new key.
    - Returns the new sender key.
 
 6. **`send_block_notification(key_custody, mls_group, context_id, blocked_did, blocker_did) -> MlsMessage`**
@@ -974,7 +1036,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
 |------|---------|
 | `mod.rs` | Module root, `SenderKey` type, `SenderKeyStore` struct, re-exports |
 | `encrypt.rs` | `encrypt_sender_layer`, `decrypt_sender_layer` (AES-256-GCM operations) |
-| `distribute.rs` | `distribute_sender_key`, `rotate_sender_key_for_block`, `send_block_notification`, key bundle creation for new members |
+| `key_protocol.rs` | `SenderKeyEpochAdvance`, `SenderKeyRequest`, `SenderKeyResponse` types, `publish_sender_key_epoch_advance`, `handle_sender_key_request`, `request_sender_key`, `rotate_sender_key_for_block`, `send_block_notification` |
 
 **Estimated functions:** ~10 public functions, ~5 internal helpers.
 

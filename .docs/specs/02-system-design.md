@@ -39,6 +39,8 @@
 
 The **protocol boundary** encompasses everything that touches the network — contexts, identity state (both public and private), encrypted envelopes, relay interactions, and attestations. Identity private state (§3.7) is protocol-governed even though it exists outside any context — it is encrypted data stored on relays, subject to protocol rules. Above the boundary, local agent orchestration and client behavior are unconstrained. Below it, all data and interactions are protocol-governed and cryptographically enforced.
 
+**Context modes.** Contexts operate in one of two modes: **Encrypted** (MLS-backed, sender-side keys, full forward secrecy — the default) or **Broadcast** (per-author broadcast keys, no MLS, mandatory subscriber registration — for feed/broadcast patterns at unlimited scale). The mode is set at creation and is immutable. Both modes produce contexts with the same structural properties — event logs, governance, roles, capabilities, metadata — and use the same relay/transport infrastructure. The mode determines the encryption pipeline, not the context's architectural role. See §5.14 for the full broadcast specification.
+
 ## 2.2 Context Interior
 
 ```

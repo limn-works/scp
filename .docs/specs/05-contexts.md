@@ -2,7 +2,7 @@
 
 ## 5.1 Definition
 
-All interaction happens within contexts. There is no concept of off-context communication at the protocol level. A context is a bounded, encrypted, governed space — a cryptographic entity (one MLS group per context) with its own key tree, event log (append-only Merkle tree), governance model, membership roster, and capability ceiling. A group chat is a context. A collaborative quest is a context. A generated Discord alternative is a context. DMs are a two-party context. An entire app's backend is a context (or set of contexts).
+All interaction happens within contexts. There is no concept of off-context communication at the protocol level. A context is a bounded, governed space — a cryptographic entity with its own key material, event log (append-only Merkle tree), governance model, membership roster, and capability ceiling. Contexts operate in one of two modes: **Encrypted** (one MLS group per context, sender-side keys, full forward secrecy) or **Broadcast** (per-author broadcast keys, no MLS, mandatory subscriber registration). The mode is set at creation and is immutable. A group chat is a context. A collaborative quest is a context. A generated Discord alternative is a context. DMs are a two-party context. An entire app's backend is a context (or set of contexts).
 
 **Contexts are spaces, not actors.** They do not initiate, do not act, and have no agency. They hold the rules, the keys, and the audit trail. Agents (always bound to humans, §4) do the acting within them. Tools (§5.4) do the computing within them. The context itself is passive infrastructure.
 
@@ -18,6 +18,8 @@ All interaction happens within contexts. There is no concept of off-context comm
 
 Contexts are created by accountable identities only. Anonymous or unbound entities cannot create contexts. Creating a context is an act of social infrastructure — you're defining a space where autonomous software operates on people. Contexts may be created from well-known templates (§5.12) for common patterns, or from explicit parameters for bespoke configurations. Both paths produce identical contexts; templates are the fast path.
 
+Context creation branches on `ContextMode` (§5.14). Encrypted contexts create an MLS group during the `Creating → Active` transition. Broadcast contexts skip MLS group creation and instead initialize the creator's broadcast key (epoch 0). Both modes produce a context with an event log, governance model, roles, and transport subscriptions — the mode determines the encryption pipeline, not the context's structural properties.
+
 ## 5.3 Capability Ceiling
 
 Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what tools can do, what roles can grant, and what agents can exercise. Standard capability categories include:
@@ -32,6 +34,8 @@ Every context declares a capability ceiling at creation: the maximum set of thin
 - **`childContext`** — creating child contexts (§5.13)
 
 Media capabilities (`media.*`) enable the delegated media transport model (§10.9.1) where the context establishes identity, trust, and governance while media flows over WebRTC/DTLS-SRTP. A context without media capabilities in its ceiling cannot initiate voice or video sessions regardless of participant roles.
+
+Capability categories apply uniformly across context modes. `messagesRead` and `messagesWrite` retain the same abstract meaning in both Encrypted and Broadcast modes — the `ContextMode` determines the encryption pipeline, not the capability semantics. A `messagesWrite` UCAN in an Encrypted context authorizes MLS-encrypted message sending; the same capability in a Broadcast context authorizes broadcast-key-encrypted publishing.
 
 Every context also declares a **ceiling policy** at creation — whether the ceiling can change and how. The ceiling policy itself is immutable (locked at creation, cannot be changed). Two policies are available:
 
@@ -66,9 +70,18 @@ Properties of roles:
 - **Defined by context creator.** Custom roles beyond defaults are context-specific.
 - **Governed by context governance model.** Role changes require whatever governance the context uses.
 
+**Broadcast context roles.** Broadcast contexts (§5.14) extend the role system with two mode-specific roles that reuse existing primitives:
+
+- **Author** — holds `messagesWrite` UCAN. Can publish broadcast-key-encrypted content. Authors are bounded (added via `roleAssigned` events with role `author`). Each author maintains their own broadcast key with an independent epoch counter.
+- **Subscriber** — holds `messagesRead` (auto-granted on DID-authenticated registration in open broadcast contexts, or requiring an explicit admin-issued UCAN in gated broadcast contexts). Subscribers receive author broadcast keys on request. Subscribers are unbounded.
+
+The author/subscriber distinction mirrors the writer/reader two-tier model from discovery contexts (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as discovery context reader-tier access.
+
 ## 5.6 Membership
 
 One agent per human per context. Membership is transparent — participants can see the member list, roles, and agent capability metadata. When you opt into a context, you know what you're walking into.
+
+**Broadcast context membership.** Broadcast contexts use a two-tier membership model: authors (MLS-equivalent bounded writers) and subscribers (unbounded readers registered via DID-signed requests). Subscriber registration records membership via `MemberJoined` events with role `subscriber`. The member list includes both tiers. Subscriber count is visible in metadata.
 
 ## 5.7 Metadata
 
@@ -84,10 +97,25 @@ The following are visible before opting in to any context:
 - TTL / time-to-live, if set (§5.10)
 - Promotion policy (`no_promotion` or `promotable`), if context has a TTL (§5.10)
 - Memory scope (§5.11)
+- Context mode (`Encrypted` or `Broadcast`, §5.14)
 - Active tool interface count (inbound and outbound, §6.2, §9.2.1)
 - For child contexts (§5.13): parent context IDs, parent metadata summaries, parent governance configuration, and the prospective member's eligibility basis (§5.13.6)
 
 This is protocol-level metadata, not optional. Full legibility of any space before you enter it. When a template ID is present, the joining party can evaluate the context with a single template-level check rather than inspecting each parameter individually — the template is a commitment that the parameters match the well-known definition exactly (§5.12.1).
+
+### 5.7.1 Metadata Publication and Retrieval
+
+Contexts publish their parameters to a publicly derivable routing address, enabling pre-join inspection per the legibility principle (§1). The metadata routing address is derived deterministically from the context ID:
+
+```
+metadata_routing_id = SHA-256(context_id || "scp-metadata")
+```
+
+Published metadata includes: name, description, capability ceiling, ceiling policy, governance mode, TTL, memory scope, context mode, roles, and membership requirements. This is the same parameter set listed in §5.7, serialized as a signed metadata record by the context creator (or governance delegate).
+
+Prospective members retrieve context parameters by subscribing to the `metadata_routing_id` on the relay without joining the context. The metadata record is signed by a current context admin, enabling verification of authenticity without membership. This makes the legibility guarantee mechanical — any identity with the context ID can derive the metadata address and inspect the context's parameters before deciding whether to join.
+
+Metadata updates (e.g., member count changes, governance-driven ceiling modifications in `governed` contexts) are republished to the same routing address. Relays treat metadata records as standard relay messages — no special relay-side logic is required.
 
 ## 5.8 Context Identity
 
@@ -138,6 +166,8 @@ Relay deletion is best-effort — relays are untrusted infrastructure and cannot
 
 **Full.** Standard behavior. Context persists indefinitely. No memory restrictions. Content remains accessible to members. This is the default when no memory scope is specified.
 
+**Broadcast context memory scope.** Broadcast contexts support `Full` memory scope only. Ephemeral and Summary scopes require MLS group state destruction for forward secrecy guarantees — broadcast contexts do not have MLS group state. Broadcast key destruction on context close is still performed, but without MLS epoch-based forward secrecy, the security properties of Ephemeral/Summary are weaker. Future protocol versions may define broadcast-specific ephemeral semantics; v1 restricts broadcast to Full scope.
+
 **The Moltbook defense.** Memory scope + provenance tagging (§7.7) prevents time-shifted prompt injection — the attack pattern where malicious payloads are planted in one interaction and activate in a later interaction:
 
 - Ephemeral contexts destroy the source material at the protocol level
@@ -157,7 +187,7 @@ The protocol defines a set of well-known templates — named parameter bundles w
 
 ```
 Template: "scp:template/bilateral-ephemeral"
-  ceiling:     [MessagesRead, MessagesWrite]
+  ceiling:     [messagesRead, messagesWrite]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: ephemeral
@@ -165,7 +195,7 @@ Template: "scp:template/bilateral-ephemeral"
   tools:       none
 
 Template: "scp:template/bilateral-persistent"
-  ceiling:     [MessagesRead, MessagesWrite]
+  ceiling:     [messagesRead, messagesWrite]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: full
@@ -173,7 +203,7 @@ Template: "scp:template/bilateral-persistent"
   tools:       none
 
 Template: "scp:template/coordination"
-  ceiling:     [MessagesRead, MessagesWrite, ToolInvokeAll]
+  ceiling:     [messagesRead, messagesWrite, toolInvokeAll]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: summary
@@ -181,13 +211,37 @@ Template: "scp:template/coordination"
   tools:       creator-defined at creation
 
 Template: "scp:template/group-discussion"
-  ceiling:     [MessagesRead, MessagesWrite, MemberInvite]
+  ceiling:     [messagesRead, messagesWrite, memberInvite]
   roles:       [admin, member, observer]
   governance:  single-admin
   memory_scope: full
   ttl:         optional
   tools:       none
+
+Template: "scp:template/public-broadcast"
+  mode:          Broadcast
+  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  roles:
+    owner:       all capabilities in ceiling + memberInvite, roleAssign, contextClose
+    author:      messagesWrite, messagesRead, toolInvokeAll
+    subscriber:  messagesRead (auto-granted on DID-authenticated registration)
+  governance:    single-admin
+  memory_scope:  full
+  ttl:           optional
+
+Template: "scp:template/gated-broadcast"
+  mode:          Broadcast
+  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  roles:
+    owner:       all capabilities in ceiling + memberInvite, roleAssign, contextClose
+    author:      messagesWrite, messagesRead, toolInvokeAll
+    subscriber:  messagesRead (requires admin-issued UCAN)
+  governance:    single-admin
+  memory_scope:  full
+  ttl:           optional
 ```
+
+The ONLY difference between `public-broadcast` and `gated-broadcast` is whether the subscriber role's `messagesRead` is auto-granted (DID-authenticated, following the discovery context reader-tier pattern §6.2.2B) or requires an explicit admin-issued UCAN (like encrypted context membership). The open/gated distinction is expressed through the template's role definitions, not through a new enum type.
 
 Templates are not extensible by users — they are protocol constants. A template ID is a commitment: "this context has exactly these properties." If you need something a template doesn't cover, use explicit `ContextParams`. Templates and explicit params are equally valid; templates are just the fast path for common cases.
 
@@ -216,12 +270,12 @@ TrustRequirement:
 Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID I share at least one context with, if TTL ≤ 10 minutes, at most 5 per hour."
 
 **Security properties:**
-- Policies never auto-accept contexts with tool capabilities (ceiling containing `ToolInvoke*`). Tool access always requires explicit confirmation. This is non-overridable.
+- Policies never auto-accept contexts with tool capabilities (ceiling containing `toolInvoke*`). Tool access always requires explicit confirmation. This is non-overridable.
 - Rate limiting prevents a compromised contact from flooding auto-accepts.
 - The `shared_context` trust requirement means strangers can never trigger auto-accept — the existing shared context provides the trust baseline.
 - Auto-accept policies are enforced in the SDK, not the protocol. The protocol sees a normal context join. The policy just determines whether the SDK prompts the human or acts autonomously.
 
-**No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `ToolInvokeAll`, `ToolInvokeSpecific`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
+**No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `toolInvokeAll`, `toolInvokeSpecific`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
 
 ### 5.12.3 SDK Convenience Surface
 
@@ -237,7 +291,7 @@ sdk.create_context(
 
 // Equivalent explicit path (same result, more configuration)
 sdk.create_context(params: ContextParams {
-  ceiling: [MessagesRead, MessagesWrite],
+  ceiling: [messagesRead, messagesWrite],
   roles: [admin, member],
   governance: SingleAdmin,
   memory_scope: Ephemeral,
@@ -265,7 +319,7 @@ MLS group init (2-member)              1-5ms         TLS handshake
 Sender key generation (HKDF+Ed25519)   <1ms          Key derivation
 Event log init (empty Merkle tree)     <1ms          Allocate a buffer
 UCAN token minting (Ed25519 sign)      1-2ms         Sign a JWT
-Pseudonym derivation (HKDF)            <1ms          KDF
+Pseudonym derivation (HMAC-SHA256)     <1ms          HMAC
 State persistence (serialize+write)    1-5ms         Write to keychain
 ─────────────────────────────────────────────────────────────────
 Total local computation                ~5-15ms
@@ -433,13 +487,13 @@ Multi-parent chain:
 A child's capability ceiling is the intersection of all parent ceilings. This is enforced at creation time and is the hard security boundary that prevents capability escalation through nesting.
 
 ```
-Parent A ceiling: [MessagesRead, MessagesWrite, ToolInvokeAll, Media]
-Parent B ceiling: [MessagesRead, MessagesWrite, ToolInvokeAll]
+Parent A ceiling: [messagesRead, messagesWrite, toolInvokeAll, media]
+Parent B ceiling: [messagesRead, messagesWrite, toolInvokeAll]
 
-Child ceiling ≤ intersection = [MessagesRead, MessagesWrite, ToolInvokeAll]
+Child ceiling ≤ intersection = [messagesRead, messagesWrite, toolInvokeAll]
 ```
 
-The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[MessagesRead, MessagesWrite]` even if the intersection would allow tools.
+The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messagesRead, messagesWrite]` even if the intersection would allow tools.
 
 If a parent has a `governed` ceiling policy (§5.3) and its ceiling is *reduced*, the child's ceiling is retrospectively reduced to maintain the intersection invariant. If this makes the child's ceiling empty (no capabilities remain), the child closes automatically. This cascade is logged in both the parent's and child's event logs. If a parent's ceiling is *expanded*, the child's ceiling does not automatically expand — the child's own ceiling policy governs.
 
@@ -462,7 +516,11 @@ Eligible pool for child: [Alice, Bob, Carol, Dave, Eve]
 
 **Eligibility is continuous, not one-time.** If a member is removed from their only active parent (i.e., the parent is still open but the member is individually removed from it), they lose eligibility in the child. The child's SDK detects the loss of eligibility and evicts the member — MLS remove_member, sender key rotation, event log entry. If the member is in multiple parents and loses one, they retain eligibility through the remaining parent(s).
 
-**Detection mechanism.** Eligibility enforcement operates through the local agent orchestration layer (above the protocol boundary). The SDK maintains awareness of the user's membership across contexts locally — when local state reflects a membership loss in a parent, the SDK evaluates child eligibility and acts. This does not require cross-context protocol communication; it uses the same local state that the SDK already maintains for context management.
+**Enforcement mechanism.** Eligibility enforcement operates at two levels to prevent non-compliant SDKs from bypassing constraints:
+
+1. **SDK-level validation.** The creating member's SDK validates eligibility at creation time — verifying that all proposed initial members belong to at least one parent context's membership roster. The SDK also monitors local membership state continuously: when local state reflects a membership loss in a parent, the SDK evaluates child eligibility and initiates eviction (MLS remove_member, sender key rotation, event log entry).
+
+2. **Relay-level validation.** Relay infrastructure independently validates eligibility constraints on child context creation messages and membership addition messages. The relay verifies that (a) the child's declared ceiling is a subset of the intersection of all parent ceilings, and (b) each member being added is present in at least one parent context's membership roster. Relay-side validation is independent of SDK behavior — a non-compliant SDK that attempts to create a child context violating parent ceiling constraints or add ineligible members will have its messages rejected by the relay. This makes eligibility enforcement a protocol-level guarantee, not an SDK honor system.
 
 **Distinction from parent sever.** Individual member removal from an active parent triggers continuous eligibility enforcement. When a parent itself severs (closes or is disconnected), the outcome is governed by the `on_sever` configuration agreed upon at creation (§5.13.4), which may differ from the continuous eligibility default.
 
@@ -481,11 +539,11 @@ Child context creation requires governance approval from every parent context. T
 ```
 Alice (in A + B) → sdk.create_child_context(
   parents: [context_a, context_b],
-  ceiling: [MessagesRead, MessagesWrite],
+  ceiling: [messagesRead, messagesWrite],
   ttl: .hours(2)
 )
-→ A's governance approves (Alice has ContextCreate capability in A)
-→ B's governance approves (Alice has ContextCreate capability in B)
+→ A's governance approves (Alice has contextCreate capability in A)
+→ B's governance approves (Alice has contextCreate capability in B)
 → Child C created
 ```
 
@@ -503,7 +561,7 @@ Protocol matches proposals by content hash
 → Both Alice and Bob are initial members
 ```
 
-This reuses the existing tool call model — no new protocol primitive. The child creation tool is intrinsic to contexts that include the `ChildContextCreate` capability in their ceiling.
+This reuses the existing tool call model — no new protocol primitive. The child creation tool is intrinsic to contexts that include the `childContextCreate` capability in their ceiling.
 
 **C. Member proposal without creation rights.** Alice is in A but her role doesn't include creation rights. She proposes the child through A's governance (§5.9). A's governance evaluates and either approves or rejects the proposal. If approved, the governance itself authorizes the creation on A's behalf. Same process on B's side.
 
@@ -534,10 +592,10 @@ ParentGovernanceConfig {
   can_evict_members:     Bool    // Can this parent evict members from the child?
   can_restrict_ceiling:  Bool    // Can this parent further restrict the child's ceiling?
   requires_approval_for: [       // What child operations require this parent's approval?
-    | GovernanceChange           // Child governance model changes
-    | ToolRegistration           // New tools added to child
-    | CeilingChange              // Child ceiling modifications (only applicable if child has `governed` ceiling policy, §5.3)
-    | MembershipChange           // Members added/removed
+    | governanceChange           // Child governance model changes
+    | toolRegistration           // New tools added to child
+    | ceilingChange              // Child ceiling modifications (only applicable if child has `governed` ceiling policy, §5.3)
+    | membershipChange           // Members added/removed
   ]
   on_sever: .evict_unique_members  // When this parent severs: evict members eligible only through this parent
           | .cascade_close          // When this parent severs: close the child entirely
@@ -576,7 +634,7 @@ Parent B config: { same as A }
 Parent A config: { can_close: true, can_evict: false, can_restrict: false,
                    requires_approval_for: [], on_sever: .cascade_close }
 Parent B config: { can_close: false, can_evict: false, can_restrict: true,
-                   requires_approval_for: [ToolRegistration], on_sever: .cascade_close }
+                   requires_approval_for: [toolRegistration], on_sever: .cascade_close }
 // A can shut down the relationship. B controls the tools (it's the service provider).
 // If either severs, the child closes entirely.
 ```
@@ -584,7 +642,7 @@ Parent B config: { can_close: false, can_evict: false, can_restrict: true,
 **Supervised sub-space** (single-parent nesting):
 ```
 Parent A config: { can_close: true, can_evict: true, can_restrict: true,
-                   requires_approval_for: [GovernanceChange, CeilingChange],
+                   requires_approval_for: [governanceChange, ceilingChange],
                    on_sever: .cascade_close }
 // Full parental authority. The child is a room within A.
 ```
@@ -650,7 +708,9 @@ A context might use both: tool interfaces for structured service queries and a m
 
 **Provenance.** Data originating in a child context carries provenance (§7.7) that includes the child's parent lineage. When data from a child crosses another context boundary (via tool interface or further nesting), the provenance chain includes the child and its parents. This makes the trust basis structurally legible: "this data came from a child of A and B" tells the receiver more than "this data came from some context."
 
-**Auto-accept policies.** Auto-accept policies (§5.12.2) can be extended to cover child context invitations. A policy might specify: "auto-accept invitations to children of contexts I'm already in, with ceiling ≤ [MessagesRead, MessagesWrite], TTL ≤ 10 minutes." The parent lineage provides a stronger trust signal than a standalone context invitation — the member knows the child is governed by contexts they already participate in.
+**Auto-accept policies.** Auto-accept policies (§5.12.2) can be extended to cover child context invitations. A policy might specify: "auto-accept invitations to children of contexts I'm already in, with ceiling ≤ [messagesRead, messagesWrite], TTL ≤ 10 minutes." The parent lineage provides a stronger trust signal than a standalone context invitation — the member knows the child is governed by contexts they already participate in.
+
+**Mixed-mode nesting.** A child context may have a different `ContextMode` than its parents. A Broadcast child of Encrypted parents enables public read access to curated content from a private group. An Encrypted child of Broadcast parents enables private discussion among subscribers. Ceiling inheritance (§5.13.1) and eligibility enforcement (§5.13.2) operate identically regardless of mode — they are structural properties, not encryption properties. The child's mode is declared at creation and visible in metadata.
 
 ### 5.13.8 Nesting Depth
 
@@ -662,3 +722,156 @@ The protocol enforces a maximum nesting depth (suggested default: 3 levels). A c
 - Trust evaluation complexity (provenance with deep nesting lineage is harder to evaluate)
 
 The nesting depth limit is a protocol constant, not configurable per context. It applies to the longest path from any root ancestor to the context being created.
+
+## 5.14 Broadcast Contexts
+
+Broadcast contexts (`ContextMode::Broadcast`) provide a feed/broadcast pattern for one-to-many communication at unlimited subscriber scale. Authors publish broadcast-key-encrypted content; subscribers request author keys and decrypt locally. No MLS group is required — the protocol substitutes per-author AES-256 broadcast keys with a pull-based distribution protocol identical to the one used for sender keys in encrypted contexts (§9.16.2).
+
+### 5.14.1 ContextMode
+
+```rust
+pub enum ContextMode {
+    Encrypted,  // MLS-backed, sender-side keys, full forward secrecy (default)
+    Broadcast,  // Per-author broadcast keys, no MLS, mandatory subscriber registration
+}
+```
+
+Added to `ContextParams`. Immutable after creation. Encrypted is the default for all contexts that do not explicitly specify a mode.
+
+### 5.14.2 Author Broadcast Keys
+
+Each author holds an AES-256-GCM broadcast key with a monotonic epoch counter. The mechanism is identical to encrypted-context sender keys (§9.16), but without MLS underneath — key distribution uses the same pull-based protocol over plain relay messages instead of MLS application messages.
+
+**Key lifecycle:**
+
+1. Author generates initial broadcast key (epoch 0) on role grant.
+2. Normal operation: encrypt content with current key.
+3. On block: increment epoch, generate new key, publish `KeyEpochAdvance` notification.
+4. Subscriber requests new key → author checks block list → responds with HPKE-encrypted key or ignores.
+5. On unblock: author can redistribute key to previously blocked DID on their next request.
+
+**Key derivation:** New keys on rotation are freshly generated random 32-byte AES-256 keys (not HKDF-derived from a master secret). This provides key independence — compromise of one epoch's key reveals nothing about other epochs.
+
+### 5.14.3 Subscriber Registration
+
+Broadcast contexts reuse the two-tier membership model from discovery contexts (§6.2.2B):
+
+- **Writer tier (authors):** Hold `messagesWrite` UCAN. Bounded. Manage content and key distribution.
+- **Reader tier (subscribers):** DID-authenticated (open) or UCAN-authenticated (gated). Unbounded. Receive author broadcast keys on request.
+
+Subscribers register via DID-signed requests — the same pattern discovery context readers use:
+
+```rust
+pub struct SubscriberRegistration {
+    pub subscriber_did: DID,
+    pub wrapping_pubkey: X25519PublicKey,
+    pub ucan: Option<UcanToken>,   // Required for gated contexts (messagesRead UCAN)
+    pub timestamp: u64,
+    pub signature: Ed25519Signature,
+}
+```
+
+- Published to the context's `routing_id` as a structured relay message.
+- Author SDKs process registrations, respond with current broadcast key via the pull-based key protocol.
+- Event log records registration via `MemberJoined` with role `subscriber`.
+
+### 5.14.4 Open vs. Gated Broadcast
+
+The distinction between open and gated broadcast is expressed through the existing role/UCAN system at the template level, not through a new enum:
+
+**Open broadcast** (`public-broadcast` template): The subscriber role's `messagesRead` capability is granted on DID-authenticated registration — no admin-issued UCAN required. This mirrors discovery context readers who query via DID-signed requests without UCAN.
+
+**Gated broadcast** (`gated-broadcast` template): The subscriber role requires an explicit `messagesRead` UCAN from the context admin. Same as encrypted context membership — capabilities require admin-issued tokens.
+
+**Key request validation:**
+- Open: author checks block list only. Not blocked → respond with key.
+- Gated: author checks (1) valid `messagesRead` UCAN, (2) block list. Both pass → respond with key.
+
+Gated contexts enable: paid subscriptions (admin grants `messagesRead` after payment verification), invite-only communities (admin grants `messagesRead` to approved members), and tiered access (scoped UCANs for different content levels).
+
+### 5.14.5 BroadcastEnvelope
+
+```rust
+pub struct BroadcastEnvelope {
+    pub context_id: ContextId,
+    pub sender_did: DID,
+    pub sequence: u64,
+    pub key_epoch: u64,
+    pub timestamp: u64,
+    pub content_hash: [u8; 32],  // SHA-256 of plaintext content
+    pub content: Vec<u8>,        // AES-256-GCM encrypted with author broadcast key
+    pub provenance: Option<DataProvenance>,
+    pub signature: Ed25519Signature,
+}
+```
+
+**Signature formula:**
+```
+Ed25519_sign(active_signing_key, SHA-256(
+    context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash
+))
+```
+
+Where `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent (same sentinel as InnerEnvelope, ADR-002).
+
+**Send path:** validate UCAN (`messagesWrite`) → assign sequence number → hash plaintext → hash provenance → sign → AES-256-GCM encrypt with author broadcast key → serialize → wrap in OuterEnvelope → relay PUBLISH.
+
+**Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's known Active Signing Key → decrypt with cached author broadcast key for this epoch → verify `content_hash == SHA-256(decrypted_content)` → verify author UCAN → replay check (sequence number) → deliver to application layer.
+
+### 5.14.6 Routing
+
+`routing_id = SHA-256(context_id)` — publicly derivable. Subscribers can subscribe to the relay topic, but cannot read content without author broadcast keys. This differs from encrypted context routing where `routing_id` is derived via HKDF from identity key material (§9.10.4) — broadcast contexts use a public derivation because author identity is visible in the BroadcastEnvelope (not hidden inside MLS encryption).
+
+### 5.14.7 Membership
+
+| Role | UCAN | Registered | Write | Read |
+|---|---|---|---|---|
+| Owner | Yes (full) | Yes | Yes | Yes |
+| Author | Yes (`messagesWrite`) | Yes | Yes | Yes |
+| Subscriber (open) | No (DID-auth only) | Yes (DID + wrapping key) | No | Yes |
+| Subscriber (gated) | Yes (`messagesRead`) | Yes (DID + wrapping key + UCAN) | No | Yes |
+
+### 5.14.8 Blocking
+
+Author-level, cryptographic, pull-based — the same protocol as encrypted contexts (§9.16.3):
+
+1. Author adds DID to block list, increments key epoch.
+2. Publishes `KeyEpochAdvance` notification (relay message, not MLS).
+3. Blocked subscriber requests new key → no response → cannot decrypt future content.
+4. Non-blocked subscribers request → get HPKE-encrypted key → continue reading.
+
+Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
+
+### 5.14.9 Capabilities
+
+No new capability variants. `messagesWrite` and `messagesRead` apply to both Encrypted and Broadcast modes — the abstract capability to write/read in a context. `ContextMode` determines the processing pipeline.
+
+### 5.14.10 Event Log
+
+Reuses existing event types wherever possible. Only one genuinely new type:
+
+- `MessageSent` — reused for broadcast (same event, mode determines semantics)
+- `roleAssigned` — reused for author grant (role: `author`) and subscriber registration (role: `subscriber`)
+- `MemberJoined` — reused for subscriber registration
+- `TokenRevoked` — reused for author removal and gated subscriber revocation
+- **`KeyEpochAdvance { sender_did, epoch }`** — NEW event type, shared across both Encrypted and Broadcast modes
+
+`ConsistencyCheckpoint.epoch` becomes `Option<u64>` (`None` for broadcast contexts, which have no MLS epoch).
+
+### 5.14.11 Discovery
+
+Broadcast contexts are discoverable through three mechanisms:
+
+1. **DID document service endpoint.** Authors MAY publish an `SCPBroadcastContext` service entry in their DID document with the context ID and relay URLs.
+2. **Discovery contexts.** Authors register broadcast contexts via `agent_register` in discovery contexts (§6.2.2B), with metadata indicating the context mode.
+3. **Out-of-band.** URI format: `scp://broadcast/<context_id_hex>?relay=<url>`.
+
+### 5.14.12 Security Model Delta
+
+Relative to Encrypted contexts, Broadcast contexts have the following security property changes:
+
+**Retained:** Ed25519 authentication, content integrity (content_hash + signature), provenance, non-repudiation, UCAN authorization, event log, human accountability.
+
+**Changed:** Confidentiality via per-author broadcast key (not MLS). No MLS `membership_tag` (authentication is signature-only). No MLS forward secrecy (mitigated by key epoch rotation on block events). Public `routing_id` (SHA-256 of context_id, not HKDF-derived). Author identity visible to relays in the outer envelope (authors are public figures in a broadcast context — this is a feature, not a leak).
+
+See §9.5, §9.8, §9.9, and §9.10 for the full broadcast security analysis.
