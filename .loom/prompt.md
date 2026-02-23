@@ -61,11 +61,12 @@ Assign **exactly one story (or one test-fix)** per subagent. Launch **all** suba
 
 Each subagent prompt **must** include:
 
-1. The full story object (id, title, description, acceptanceCriteria, files) — or the full failing-test details.
+1. The full story object (id, title, description, acceptanceCriteria, files, sources, details) — or the full failing-test details.
 2. Clear, unambiguous instructions: implement the feature / fix the test.
 3. A reminder to write clean, minimal code — no over-engineering.
 4. A reminder to **search the codebase before assuming something is missing** — don't reimplement what already exists.
 5. A reminder to **only implement the assigned story** — do not "fix" existing code that seems inconsistent with other specs.
+6. If the story has `sources` entries, a reminder that **the source documents are the source of truth** — the subagent should read the referenced source file and section, and if the story's fields conflict with or omit details from the source, follow the source.
 
 Do **not** combine multiple stories into a single subagent.
 
@@ -127,19 +128,20 @@ Before writing status.md, output a result signal on its own line so the loop con
 
 Overwrite `.loom/status.md` with a fresh report containing:
 
-| Section | Content |
-|---|---|
-| **Failing Tests** | Every currently-failing test: name, file, error message. |
-| **Uncommitted Changes** | If tests failed and changes were not committed, list what's uncommitted and why. |
-| **Fixed This Iteration** | Any previously-failing tests that now pass. |
-| **Tests Added / Updated** | List of new or modified test files. |
-| **Subagent Outcomes** | For each subagent: story ID, pass/fail, brief summary. |
+| Section                   | Content                                                                          |
+| ------------------------- | -------------------------------------------------------------------------------- |
+| **Failing Tests**         | Every currently-failing test: name, file, error message.                         |
+| **Uncommitted Changes**   | If tests failed and changes were not committed, list what's uncommitted and why. |
+| **Fixed This Iteration**  | Any previously-failing tests that now pass.                                      |
+| **Tests Added / Updated** | List of new or modified test files.                                              |
+| **Subagent Outcomes**     | For each subagent: story ID, pass/fail, brief summary.                           |
 
 ---
 
 ## Rules
 
 - **Closed stories do not exist.** Never read, reference, or act on stories with any status other than `"pending"` or `"in_progress"`.
+- **Source backlinks are the source of truth.** When a story has a `sources` array, the referenced files and sections are the authoritative specification. If the story's fields conflict with or are less detailed than the source documents, follow the source. Subagents should read the referenced source file when available. As such, stories and sources should be kept in sync.
 - **One story per subagent.** No exceptions.
 - **Search before assuming.** Always search the codebase before concluding something is missing or needs to be built.
 - **Only commit green code.** Never commit if tests are failing. Leave changes uncommitted for the next iteration.
@@ -151,10 +153,6 @@ Overwrite `.loom/status.md` with a fresh report containing:
 - **NEVER call `EnterPlanMode`.** Execute directly.
 - **NEVER call `AskUserQuestion`.** No human is present.
 - **NEVER call `TaskOutput`.** Background subagent results are delivered automatically.
-
-## PR Pipeline
-
-Do **not** push branches or create pull requests. The loop controller handles branch push and PR creation automatically after the loop completes. Your job is to commit work to the local branch — the controller takes it from there.
 
 ## Shell & Tool Hygiene
 

@@ -95,3 +95,34 @@ Use agents eagerly for focus, expertise, and parallelization — especially code
 ### Memory
 
 In addition to permanent context provided by artifacts, you have access to an MCP server for memory called "vestige". Liberally read and write to this memory during all operation modalities, and ensure subagents do the same.
+
+<!-- loom:begin -->
+## Loom — Autonomous Development Loop
+
+Loom runs Claude Code in a continuous loop: read tasks from a PRD, dispatch parallel subagents, run tests, commit green code, repeat.
+
+```
+.loom/               # Autonomous dev loop — dispatches parallel subagents from a PRD
+├── prd.json         # Structured stories with gates (P0/P1/P2), deps, acceptance criteria
+├── prompt.md        # Autonomous iteration instructions (story selection, execution, commit)
+├── directive.md     # Single-task mode instructions (execute one directive, signal result)
+├── status.md        # Current iteration state (read at start, written at end of each cycle)
+├── prd.sh           # Standalone PRD generator (wraps claude -p)
+└── hooks/           # Guard rails: stop signals, interactive blocking, subagent limits
+```
+
+### Rules for success
+
+**Stories must be atomic.** Each story is executed by a single subagent in one iteration (~15-30 min). If it can't be done in one shot, split it. Coupled work (model + migration + route) stays together; unrelated work does not.
+
+**Acceptance criteria must be machine-verifiable.** Not "it works" but "POST /api/x returns 200 with a JWT". If you can't write a test for it, Loom can't verify it.
+
+**Parallelism requires file isolation.** Stories that touch the same files cannot run in the same batch. Set `blockedBy` for true data dependencies; leave it empty otherwise to maximize parallelism.
+
+**Green tests are a hard gate.** Loom never commits failing code. Test failures are recorded in status.md and become top priority for the next iteration. After 3 failed fix attempts within one iteration, Loom stops and records the state.
+
+**Context is the scarcest resource.** Read prd.json in jq waves of 10. Never cat entire files. Use dedicated tools (Read, Grep, Glob) instead of shell commands. status.md is the only continuity across loop restarts — write it thoroughly.
+
+**Search before building.** Subagents must search the codebase before assuming something is missing. Reimplementing existing code is a common failure mode.
+
+**Scope is sacred.** Implement only the assigned story. Do not "fix" adjacent code, add unrequested features, or refactor code that seems inconsistent with other specs.

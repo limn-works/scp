@@ -127,12 +127,14 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --worktree)
-      USE_WORKTREE="yes"
-      shift
+      [[ $# -ge 2 ]] || die "$1 requires true or false"
+      USE_WORKTREE=$([ "$2" = "true" ] && echo "yes" || echo "no")
+      shift 2
       ;;
     --pr)
-      CREATE_PR="yes"
-      shift
+      [[ $# -ge 2 ]] || die "$1 requires true or false"
+      CREATE_PR=$([ "$2" = "true" ] && echo "yes" || echo "no")
+      shift 2
       ;;
     --resume)
       [[ $# -ge 2 ]] || die "$1 requires a worktree path or branch name"
@@ -184,7 +186,7 @@ done
 
 # ─── Piped stdin ─────────────────────────────────────────────────
 if [ ! -t 0 ]; then
-  PIPED="$(cat)"
+  PIPED="$(timeout 1 cat 2>/dev/null || true)"
   if [ -n "$PIPED" ]; then
     SOURCES_PIPED="$PIPED"
   fi
@@ -478,7 +480,12 @@ create_pr() {
 
   case "$MODE_LABEL" in
     *github*)
-      local issue_num="$SOURCES_GITHUB"
+      # Extract issue number from URL if present, otherwise use as-is
+      if [[ "$SOURCES_GITHUB" =~ /issues/([0-9]+) ]]; then
+        local issue_num="${BASH_REMATCH[1]}"
+      else
+        local issue_num="$SOURCES_GITHUB"
+      fi
       pr_title="fix(loom): resolve #${issue_num}"
       pr_body="## Summary
 Automated implementation for issue #${issue_num}.
@@ -547,6 +554,9 @@ Automated changes by Loom.
       ;;
   esac
 
+  # Ensure the label exists (create it if missing)
+  gh label create "$pr_labels" --description "Automated by Loom" --color "6A0DAD" 2>/dev/null || true
+
   # Create the PR
   log "${CYAN}Creating PR...${NC}"
   local pr_url
@@ -558,9 +568,8 @@ Automated changes by Loom.
     --label "$pr_labels" \
     2>>"$LOG_FILE") || true
 
-  PR_CREATED=true
-
   if [ -n "$pr_url" ]; then
+    PR_CREATED=true
     log "${GREEN}${BOLD}PR created:${NC} $pr_url"
     mkdir -p "$LOOM_DIR/logs"
     echo "$(date '+%Y-%m-%d %H:%M:%S') | PR | $pr_url | $WORKTREE_BRANCH" >> "$LOOM_DIR/logs/master.log"
@@ -719,10 +728,11 @@ if $USE_TMUX; then
     FORWARD_FLAGS="$FORWARD_FLAGS --prompt $(printf '%q' "$SOURCES_PROMPT")"
   fi
 
-  # Forward worktree override
+  # Forward worktree and PR overrides
   if [ "$USE_WORKTREE" = "yes" ] && [ -z "$RESUME_WORKTREE" ]; then
-    FORWARD_FLAGS="$FORWARD_FLAGS --worktree"
+    FORWARD_FLAGS="$FORWARD_FLAGS --worktree true"
   fi
+  [ "$CREATE_PR" = "no" ] && FORWARD_FLAGS="$FORWARD_FLAGS --pr false"
   if [ -n "$RESUME_WORKTREE" ]; then
     FORWARD_FLAGS="$FORWARD_FLAGS --resume $(printf '%q' "$RESUME_WORKTREE")"
   fi
