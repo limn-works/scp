@@ -38,6 +38,7 @@ USE_WORKTREE=""         # "" = auto, "yes", "no"
 WORKTREE_DIR=""
 WORKTREE_BRANCH=""
 RESUME_WORKTREE=""
+CREATE_PR="yes"         # "yes" = push + PR after loop, "no" = skip
 
 # ─── Colors (terminal only — stripped from log file) ─────────────
 RED='\033[0;31m'
@@ -120,6 +121,10 @@ while [[ $# -gt 0 ]]; do
       USE_WORKTREE="no"
       shift
       ;;
+    --no-pr)
+      CREATE_PR="no"
+      shift
+      ;;
     --resume)
       [[ $# -ge 2 ]] || die "$1 requires a worktree path or branch name"
       RESUME_WORKTREE="$2"
@@ -154,9 +159,12 @@ Worktree:
   --worktree              Force git worktree mode
   --no-worktree           Disable git worktree mode
   --resume PATH_OR_BRANCH Reuse existing worktree
+  --no-pr                 Skip push + PR creation after loop
 
-  Worktree is on by default for --linear and --github,
-  off for PRD, --prompt, --slack, and piped stdin.
+  Worktree is on by default for all modes. When a worktree loop
+  completes, the branch is pushed and a PR is created automatically.
+  Use --no-pr to skip PR creation. Use --no-worktree to disable
+  worktree mode entirely (also skips PR creation).
 
 Graceful stop:
   touch .loom/.stop      Stop after the current iteration finishes
@@ -305,12 +313,7 @@ fi
 # ─── Worktree Auto-Detection ────────────────────────────────────
 resolve_worktree() {
   if [ -z "$USE_WORKTREE" ]; then
-    # Auto: on if any issue-tracker source is active
-    if [ -n "$SOURCES_LINEAR" ] || [ -n "$SOURCES_GITHUB" ]; then
-      USE_WORKTREE="yes"
-    else
-      USE_WORKTREE="no"
-    fi
+    USE_WORKTREE="yes"
   fi
 }
 
@@ -378,11 +381,147 @@ cleanup_worktree() {
     if git -C "$WORKTREE_DIR" diff --quiet 2>/dev/null && \
        git -C "$WORKTREE_DIR" diff --cached --quiet 2>/dev/null; then
       git -C "$PROJECT_DIR" worktree remove "$WORKTREE_DIR" 2>/dev/null || true
-      git -C "$PROJECT_DIR" branch -d "$WORKTREE_BRANCH" 2>/dev/null || true
+      # Only delete branch locally if it hasn't been pushed to a remote
+      if ! git -C "$PROJECT_DIR" ls-remote --heads origin "$WORKTREE_BRANCH" 2>/dev/null | grep -q .; then
+        git -C "$PROJECT_DIR" branch -d "$WORKTREE_BRANCH" 2>/dev/null || true
+      fi
       log "${DIM}Worktree cleaned up: $WORKTREE_DIR${NC}"
     else
       log "${YELLOW}Worktree has uncommitted changes, keeping: $WORKTREE_DIR${NC}"
     fi
+  fi
+}
+
+PR_CREATED=false
+
+# ─── PR Creation ──────────────────────────────────────────────────
+create_pr() {
+  # Idempotent — only run once per loop
+  if $PR_CREATED; then return 0; fi
+
+  # Guard: only create PR if worktree mode and PR creation are both enabled
+  if [ "$USE_WORKTREE" != "yes" ] || [ "$CREATE_PR" != "yes" ]; then
+    return 0
+  fi
+
+  # Guard: need a branch name
+  if [ -z "$WORKTREE_BRANCH" ]; then
+    return 0
+  fi
+
+  # Guard: skip if no commits ahead of main
+  local main_branch
+  main_branch=$(git -C "$PROJECT_DIR" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+  local commits_ahead
+  commits_ahead=$(git -C "$PROJECT_DIR" rev-list --count "${main_branch}..${WORKTREE_BRANCH}" 2>/dev/null || echo "0")
+  if [ "$commits_ahead" -eq 0 ]; then
+    log "${DIM}No commits on $WORKTREE_BRANCH — skipping PR creation${NC}"
+    return 0
+  fi
+
+  # Push branch to origin
+  log "${CYAN}Pushing branch $WORKTREE_BRANCH to origin...${NC}"
+  if ! git -C "$PROJECT_DIR" push -u origin "$WORKTREE_BRANCH" 2>>"$LOG_FILE"; then
+    log "${YELLOW}Failed to push branch — skipping PR creation${NC}"
+    return 0
+  fi
+
+  # Build PR title and body based on mode
+  local pr_title pr_body pr_labels="loom"
+
+  case "$MODE_LABEL" in
+    *github*)
+      # Extract issue number for GitHub mode
+      local issue_num="$SOURCES_GITHUB"
+      pr_title="fix(loom): resolve #${issue_num}"
+      pr_body="## Summary
+Automated implementation for issue #${issue_num}.
+
+Closes #${issue_num}
+
+## Loom Run
+- Branch: \`${WORKTREE_BRANCH}\`
+- Mode: ${MODE_LABEL}
+- Commits: ${commits_ahead}"
+      ;;
+    *linear*)
+      local ticket_id="$SOURCES_LINEAR"
+      pr_title="feat(loom): implement ${ticket_id}"
+      pr_body="## Summary
+Automated implementation for Linear ticket ${ticket_id}.
+
+## Loom Run
+- Branch: \`${WORKTREE_BRANCH}\`
+- Mode: ${MODE_LABEL}
+- Commits: ${commits_ahead}"
+      ;;
+    *prompt*)
+      # Use first 50 chars of prompt for title
+      local short_prompt
+      if [ -f "$SOURCES_PROMPT" ]; then
+        short_prompt=$(head -c 50 "$SOURCES_PROMPT" | tr '\n' ' ')
+      else
+        short_prompt=$(echo "$SOURCES_PROMPT" | head -c 50 | tr '\n' ' ')
+      fi
+      pr_title="feat(loom): ${short_prompt}"
+      pr_body="## Summary
+Automated implementation from prompt directive.
+
+## Loom Run
+- Branch: \`${WORKTREE_BRANCH}\`
+- Mode: ${MODE_LABEL}
+- Commits: ${commits_ahead}"
+      ;;
+    prd)
+      # Collect completed story IDs from this run's commits
+      local story_ids
+      story_ids=$(git -C "$PROJECT_DIR" log "${main_branch}..${WORKTREE_BRANCH}" --format="%s" 2>/dev/null | \
+        grep -oE 'SCP-[0-9]+' | sort -u | tr '\n' ' ' || true)
+      if [ -n "$story_ids" ]; then
+        pr_title="feat(loom): complete stories ${story_ids}"
+      else
+        pr_title="feat(loom): PRD iteration work"
+      fi
+      pr_body="## Summary
+Automated PRD implementation by Loom.
+
+## Loom Run
+- Branch: \`${WORKTREE_BRANCH}\`
+- Mode: ${MODE_LABEL}
+- Commits: ${commits_ahead}
+- Stories: ${story_ids:-none detected}"
+      ;;
+    *)
+      pr_title="feat(loom): automated changes (${MODE_LABEL})"
+      pr_body="## Summary
+Automated changes by Loom.
+
+## Loom Run
+- Branch: \`${WORKTREE_BRANCH}\`
+- Mode: ${MODE_LABEL}
+- Commits: ${commits_ahead}"
+      ;;
+  esac
+
+  # Create the PR
+  log "${CYAN}Creating PR...${NC}"
+  local pr_url
+  pr_url=$(gh pr create \
+    --head "$WORKTREE_BRANCH" \
+    --base "$main_branch" \
+    --title "$pr_title" \
+    --body "$pr_body" \
+    --label "$pr_labels" \
+    2>>"$LOG_FILE") || true
+
+  PR_CREATED=true
+
+  if [ -n "$pr_url" ]; then
+    log "${GREEN}${BOLD}PR created:${NC} $pr_url"
+    mkdir -p "$LOOM_DIR/logs"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | PR | $pr_url | $WORKTREE_BRANCH" >> "$LOOM_DIR/logs/master.log"
+  else
+    log "${YELLOW}PR creation failed — branch pushed but PR not created${NC}"
   fi
 }
 
@@ -478,6 +617,9 @@ export LOOM_ACTIVE=1
 
 # ─── Cleanup ─────────────────────────────────────────────────────
 cleanup() {
+  # Attempt PR creation if the loop produced useful work.
+  # create_pr guards internally — safe to call unconditionally.
+  create_pr 2>/dev/null || true
   rm -f "$LOOM_DIR/.directive" "$LOOM_DIR/.piped_directive" "$LOOM_DIR/.iteration_marker" "$LOOM_DIR/.stop" "$LOOM_DIR/.pid"
   cleanup_worktree
 }
@@ -531,11 +673,14 @@ if $USE_TMUX; then
     FORWARD_FLAGS="$FORWARD_FLAGS --prompt $(printf '%q' "$SOURCES_PROMPT")"
   fi
 
-  # Forward worktree overrides
+  # Forward worktree and PR overrides
   if [ "$USE_WORKTREE" = "yes" ] && [ -z "$RESUME_WORKTREE" ]; then
     FORWARD_FLAGS="$FORWARD_FLAGS --worktree"
   elif [ "$USE_WORKTREE" = "no" ]; then
     FORWARD_FLAGS="$FORWARD_FLAGS --no-worktree"
+  fi
+  if [ "$CREATE_PR" = "no" ]; then
+    FORWARD_FLAGS="$FORWARD_FLAGS --no-pr"
   fi
   if [ -n "$RESUME_WORKTREE" ]; then
     FORWARD_FLAGS="$FORWARD_FLAGS --resume $(printf '%q' "$RESUME_WORKTREE")"
@@ -778,6 +923,7 @@ DRYEOF
   # ─── Done: no remaining work ──
   if [ "$RESULT_SIGNAL" = "DONE" ]; then
     log "${GREEN}${BOLD}All work complete.${NC} Halting loop."
+    create_pr
     break
   fi
 
@@ -804,4 +950,5 @@ done
 if ! $DRY_RUN && [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
   log "${YELLOW}${BOLD}Loom completed $MAX_ITERATIONS iterations. Halting.${NC}"
   master_log "$ITERATION" "$MODE_LABEL" "MAX_ITER" "0" "Reached max iterations"
+  create_pr
 fi

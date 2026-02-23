@@ -90,6 +90,10 @@ Overwrite `.loom/status.md` with a fresh report:
 
 ---
 
+## PR Pipeline
+
+Do **not** push branches or create pull requests. The loop controller handles branch push and PR creation automatically after the loop completes. Your job is to commit work to the local branch — the controller takes it from there.
+
 ## Rules
 
 - **Search before assuming.** Always search the codebase before concluding something is missing or needs to be built.

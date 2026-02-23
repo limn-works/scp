@@ -152,6 +152,10 @@ Overwrite `.loom/status.md` with a fresh report containing:
 - **NEVER call `AskUserQuestion`.** No human is present.
 - **NEVER call `TaskOutput`.** Background subagent results are delivered automatically.
 
+## PR Pipeline
+
+Do **not** push branches or create pull requests. The loop controller handles branch push and PR creation automatically after the loop completes. Your job is to commit work to the local branch — the controller takes it from there.
+
 ## Shell & Tool Hygiene
 
 - **Use the Read tool to read files.** Do not use `cat`, `head`, `tail`, or `sed` to read files.

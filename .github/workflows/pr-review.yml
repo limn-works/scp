@@ -1,0 +1,91 @@
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+jobs:
+  review:
+    if: |
+      github.event.pull_request.draft == false &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude PR review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: claude-opus-4-20250514
+          max_turns: 40
+          timeout_minutes: 60
+          direct_prompt: |
+            You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
+
+            Perform a comprehensive multi-perspective review of this PR. For each perspective,
+            read the corresponding agent definition file under `.claude/agents/` to understand
+            the review criteria, then apply those criteria to the PR's changes.
+
+            ## Setup
+
+            First, understand the PR:
+            ```bash
+            gh pr diff ${{ github.event.pull_request.number }}
+            gh pr view ${{ github.event.pull_request.number }} --json title,body,files
+            ```
+
+            ## Perspectives
+
+            Review the PR from these 5 perspectives. For each, read the agent file first:
+
+            ### 1. Architecture (read `.claude/agents/architecture-reviewer.md`)
+            - Completeness, scalability, maintainability
+            - ADR compliance — do changes follow existing decisions?
+            - Pattern consistency — does this establish or break patterns?
+
+            ### 2. Security (read `.claude/agents/security-reviewer.md`)
+            - Authentication/authorization issues
+            - Input validation, injection risks
+            - Secrets exposure, error message leakage
+
+            ### 3. Alignment (read `.claude/agents/alignment-reviewer.md`)
+            - Does implementation match the spec/issue it addresses?
+            - Does it serve the product vision from `.docs/architecture.md`?
+            - Will it create problems for future phases?
+
+            ### 4. API Design (read `.claude/agents/api-design-reviewer.md`)
+            - Discoverability, misuse resistance
+            - Consistency with existing APIs
+            - Developer experience
+
+            ### 5. Code Quality (read `.claude/agents/bug-catcher.md`)
+            - Actual bugs: crashes, logic errors, concurrency issues
+            - Incorrect assumptions about data or state
+            - Edge cases and error handling gaps
+
+            ## Output
+
+            For each issue found, post an inline review comment on the specific line(s) using:
+            ```bash
+            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
+              -f body="<comment>" -f path="<file>" -f commit_id="<sha>" -F line=<line> -f side=RIGHT
+            ```
+
+            Then post a summary comment on the PR:
+            ```bash
+            gh pr comment ${{ github.event.pull_request.number }} --body "<summary>"
+            ```
+
+            The summary should include:
+            - A brief overall assessment (approve / request changes / comments only)
+            - A section per perspective with key findings (or "No issues found")
+            - Total issue count by severity (critical / warning / note)
+
+            If no issues are found across all perspectives, say so clearly — don't invent problems.
