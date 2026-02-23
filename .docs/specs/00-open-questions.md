@@ -6,7 +6,7 @@
 - **~~Context governance primitives.~~** ✅ **Partially resolved.** ADR-008 specifies context lifecycle state machine with single-admin governance. ADR-009 specifies role assignment and capability ceiling enforcement. The pluggable governance interface for multi-sig/consensus models remains unspecified — not blocking for initial implementation (single-admin is sufficient).
 - **Direct agent-to-agent negotiation primitive.** Considered and rejected. The protocol does not and will not include a mechanism for agents to contact agents they share no context with. Cross-context interaction uses tool interfaces (§6.2) for asymmetric service calls, multi-parent child contexts (§5.13) for symmetric collaboration, and standing bilateral contexts (§5.12.6) for persistent direct communication. All three require existing context membership or human facilitation. This is intentional: context isolation is the security boundary, and any mechanism that lets agents bypass it reintroduces the attack surface isolation was designed to eliminate. See planning-session-06.md §2 for the full analysis.
 - **~~Context-to-context tool interface mechanics.~~** ✅ **Resolved.** §6.2 specifies bidirectional consent, schema constraints, rate limits, chain depth limits. §6.2.1 specifies stateful sessions with optional TTL and per-caller cap. §6.2.2 specifies discovery via DID document capabilities and discovery contexts with standard tool schemas.
-- **Earned capacity mechanisms.** How do new identities earn more agent slots / context participation capacity? What signals are used? Not gamifiable.
+- **Sybil resistance enforcement.** §9.3 describes three layers (device attestation, earned capacity, context thresholds) but provides no concrete algorithms, thresholds, or enforcement mechanisms for any of them. Currently architectural intention only. Key sub-question: how do new identities earn more agent slots / context participation capacity? What signals are used? Must not be gamifiable.
 - **Agent capability metadata standard.** What's surfaced, how it's structured, how it's verified.
 - **~~Content provenance system.~~** ✅ **Resolved.** DataProvenance format specified in §7.7.1. Provenance attached automatically by protocol on context boundary crossings. Provenance evaluation rules in §7.7.2. Absence-as-signal principle established. Cross-context tool calls and structured messages carry provenance.
 - **Rate limiting defaults.** Context creation limits, context participation limits per human. Surfaces identified, defaults not set.
@@ -42,6 +42,18 @@
 - **Memory scope enforcement boundary.** Ephemeral key destruction is protocol-enforceable. Local agent memory is not. The spec acknowledges this (§5.11), but the boundary between "protocol can enforce" and "protocol can only signal" needs precise documentation for implementers. (§9.15 specifies the three trust levels for key destruction verification — hardware-attested, software-only, no attestation — which partially addresses this, but the agent-side memory boundary remains unspecified.)
 - **~~Context promotion mechanics.~~** ✅ **Resolved.** Promotion policy declared at context creation (`no_promotion` or `promotable`). Policy itself is immutable. Default for ephemeral templates is `no_promotion`. See §5.10.
 - **Summary generation mechanics.** For summary memory scope (§5.11): how is the summary produced? Who generates it — the context's tools, the participants collaboratively, or the protocol? What happens if participants disagree on the summary? What's the verification window before keys are destroyed?
+
+## Crypto and Security
+
+- **Offline member MLS re-sync.** Members offline for extended periods accumulate pending MLS proposals. Architecture.md §9 acknowledges this as "the hardest unsolved problem." Current mitigation: "group state reset" — but trigger conditions, initiation protocol, and context lifecycle during reset are unspecified. Must be designed before Phase 2 context lifecycle work.
+- **Commit delivery assurance under adversarial relays.** Relays can suppress MLS Commits. Spec says "publish to all relays with delivery confirmation" but: (1) "delivery confirmation" semantics are undefined (ACK from relay? from recipients?), (2) recovery mechanism for split-brain state (some members got the Commit, some didn't) is unspecified.
+- **Cover traffic parameters.** Constant-rate cover traffic is mandatory on persistent connections (Decision 8). Suggested rate: 1 message per 30 seconds. Not finalized. Dummy message format specified (single-byte flag inside encrypted payload) but relay-side distinguishability analysis is incomplete.
+- **Compromise recovery orchestration.** §9.12 lists 6 recovery steps but does not specify ordering constraints, atomicity guarantees, or partial failure handling (e.g., if MLS Update fails in one context but succeeds in others).
+- **UCAN revocation mechanism.** §9.5 mentions "revocation list" but does not specify: list format, check frequency, or behavior when revocation check fails (network error, stale list).
+
+## Tools and Verification
+
+- **Tool integrity verification execution.** §5.4 requires "deterministic testing" of tools but does not specify: who runs tests, execution environment, what constitutes pass/fail, how many agents must verify.
 
 ## Uncovered Areas
 
