@@ -1,7 +1,7 @@
 ---
 name: loom
 description: Start the Loom autonomous development loop. Launches a tmux session that continuously reads tasks from a PRD, dispatches parallel subagents, runs tests, and commits passing code.
-argument-hint: "[flags or directive text]"
+argument-hint: "[status|stop|kill|dry-run|linear|github|issue|slack|<prompt text>]"
 disable-model-invocation: true
 allowed-tools: Bash
 ---
@@ -46,7 +46,20 @@ Immediate kill (terminates the tmux session without waiting):
 tmux kill-session -t "loom-$(basename "$PWD")" 2>/dev/null && echo "Loom killed." || echo "Loom is not running."
 ```
 
-### Case 5: `linear <query_or_url>`
+### Case 5: `dry-run` or `dry-run <rest>`
+
+Dry-run mode — analyze without executing. Optional additional args passed through:
+
+```bash
+unset CLAUDECODE && .loom/loom.sh --dry-run $REST
+```
+
+Where `$REST` is everything after `dry-run` (may be empty). Each remaining token is translated as below (Case 10 rules), e.g.:
+
+- `/loom dry-run` → `.loom/loom.sh --dry-run`
+- `/loom dry-run linear PHN-42` → `.loom/loom.sh --dry-run --linear PHN-42`
+
+### Case 6: `linear <query_or_url>`
 
 Linear mode — fetch from Linear, implement, update ticket:
 
@@ -56,7 +69,7 @@ unset CLAUDECODE && .loom/loom.sh --linear "$REST"
 
 Where `$REST` is everything after the word `linear`.
 
-### Case 6: `github <query_or_url>`
+### Case 7: `github <query_or_url>`
 
 GitHub mode — fetch from GitHub, implement, close issues:
 
@@ -66,7 +79,7 @@ unset CLAUDECODE && .loom/loom.sh --github "$REST"
 
 Where `$REST` is everything after the word `github`.
 
-### Case 7: `issue <number>`
+### Case 8: `issue <number>`
 
 Shorthand for GitHub issue mode:
 
@@ -74,26 +87,13 @@ Shorthand for GitHub issue mode:
 unset CLAUDECODE && .loom/loom.sh --github "$NUMBER"
 ```
 
-### Case 8: `slack <url>`
+### Case 9: `slack <url>`
 
 Slack mode — fetch Slack message, implement:
 
 ```bash
 unset CLAUDECODE && .loom/loom.sh --slack "$URL"
 ```
-
-### Case 9: Arguments start with `-` (flags only)
-
-Pass flags through directly:
-
-```bash
-unset CLAUDECODE && .loom/loom.sh $ARGUMENTS
-```
-
-Examples:
-- `/loom --dry-run` → `unset CLAUDECODE && .loom/loom.sh --dry-run`
-- `/loom -m 10` → `unset CLAUDECODE && .loom/loom.sh -m 10`
-- `/loom --dry-run --prompt path/to/file.md` → `unset CLAUDECODE && .loom/loom.sh --dry-run --prompt path/to/file.md`
 
 ### Case 10: Arguments are plain text (a prompt)
 
@@ -104,7 +104,7 @@ printf '%s' '$ARGUMENTS' > .loom/.directive && unset CLAUDECODE && .loom/loom.sh
 ```
 
 Examples:
-- `/loom Fix all lint errors` → writes "Fix all lint errors" to `.loom/.directive`, then runs with `--prompt .loom/.directive`
+- `/loom Fix all lint errors` → writes to `.loom/.directive`, runs with `--prompt .loom/.directive`
 - `/loom Refactor all callbacks to async/await` → same pattern
 
 ### How to tell the difference
@@ -113,11 +113,11 @@ Examples:
 2. If `$ARGUMENTS` equals `status` → Case 2
 3. If `$ARGUMENTS` equals `stop` → Case 3
 4. If `$ARGUMENTS` equals `kill` → Case 4
-5. If `$ARGUMENTS` starts with `linear ` → Case 5
-6. If `$ARGUMENTS` starts with `github ` → Case 6
-7. If `$ARGUMENTS` starts with `issue ` → Case 7
-8. If `$ARGUMENTS` starts with `slack ` → Case 8
-9. If `$ARGUMENTS` starts with `--` or `-` → Case 9
+5. If `$ARGUMENTS` starts with `dry-run` → Case 5
+6. If `$ARGUMENTS` starts with `linear ` → Case 6
+7. If `$ARGUMENTS` starts with `github ` → Case 7
+8. If `$ARGUMENTS` starts with `issue ` → Case 8
+9. If `$ARGUMENTS` starts with `slack ` → Case 9
 10. Otherwise → Case 10
 
 ## After launching
