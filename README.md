@@ -29,7 +29,7 @@ Each participant operates as a separate agent instance per context. A single hum
 
 Identity is DID-based, and authorization uses UCANs — capability tokens that are cryptographically verifiable without a central authority. Together, the protocol can verify who you are and what you’re allowed to do without calling home to any server.
 
-Encryption combines MLS for group forward secrecy with a sender-side AES-256 layer for selective readability within contexts. Each message passes through 14 independent security checkpoints between sender and recipient. Provenance is structural — every message, tool output, and cross-context data transfer carries verifiable origin metadata.
+Encryption combines MLS for group forward secrecy with a sender-side AES-256 layer for selective readability within contexts. Each message is signed, encrypted twice, padded, pseudonymized on send, then verified, decrypted, checked for replay, validated against capability tokens, and authenticated on receive. Provenance is structural — every message, tool output, and cross-context data transfer carries verifiable origin metadata.
 
 ```
 ┌────────────────────────────────────────────────────────────┐

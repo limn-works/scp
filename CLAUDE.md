@@ -50,37 +50,45 @@ SCP (Social Context Protocol) is an open, ecosystem-agnostic infrastructure prot
 
 ## Agents
 
-Use agents eagerly for focus, expertise, and parallelization — especially code reviews. See `agents/README.md` for the full roster.
+Use agents eagerly for focus, expertise, and parallelization — especially code reviews. See `.claude/agents/README.md` for the full roster.
 
 ## Project Map
 
 ### Agentic harness & artifacts:
 
-**Ralph loop rules for success:**
+**Loom loop rules for success:**
 - **Atomic stories.** One subagent, one iteration (~15-30 min). Coupled work (model + migration + route) stays together; unrelated work does not.
-- **Machine-verifiable acceptance criteria.** Not "it works" but "POST /api/x returns 200 with a JWT". If you can't write a test for it, Ralph can't verify it.
+- **Machine-verifiable acceptance criteria.** Not "it works" but "POST /api/x returns 200 with a JWT". If you can't write a test for it, Loom can't verify it.
 - **File isolation for parallelism.** Stories that touch the same files cannot run in the same batch. Set `blockedBy` for true data dependencies only.
 - **Green tests are a hard gate.** Never commit failing code. Failures go to status.md for the next iteration. 3 fix attempts max per iteration.
 - **Context is scarce.** Read prd.json in jq waves of 10. Use dedicated tools (Read, Grep, Glob) not shell. status.md is the only cross-iteration continuity — write it thoroughly.
 - **Search before building.** Always search the codebase before assuming something is missing.
 - **Scope is sacred.** Implement only the assigned story. Don't "fix" adjacent code or add unrequested features.
 
-.ralph/              # Autonomous dev loop — dispatches parallel subagents from a PRD
+.loom/               # Autonomous dev loop — dispatches parallel subagents from a PRD
 ├── prd.json         # Structured stories with gates (P0/P1/P2), deps, acceptance criteria
 ├── prompt.md        # Autonomous iteration instructions (story selection, execution, commit)
 ├── directive.md     # Single-task mode instructions (execute one directive, signal result)
 ├── status.md        # Current iteration state (read at start, written at end of each cycle)
-├── ralph-prd.sh     # Standalone PRD generator (wraps claude -p)
-├── specs/           # Reference specs and ticket tracking for Ralph
+├── loom-prd.sh      # Standalone PRD generator (wraps claude -p)
+├── specs/           # Reference specs and ticket tracking for Loom
 └── hooks/           # Guard rails: stop signals, interactive blocking, subagent limits
 
 .claude/             # Claude's project-wide operating instructions and tools
 ├── agents/          # 21 agent definitions — 8 core specialists + 13 reviewers (see agents/README.md)
 ├── agent-memory/    # Per-agent persistent memory (each dir maps to an agent)
-└── skills/          # Skills (/prd, /ralph)
+└── skills/          # Skills (/-commands executable by the user and Claude)
 
-.docs/               # Project knowledge — one root instance, additional local instances per feature
+.docs/               # Project knowledge — one root instance, additional local instances per feature (may have different contents)
+├── architecture.md  # Engineering blueprint — build phases, SDK strategy, crate layout
+├── sketch.md        # API surface sketches — pseudocode for all protocol operations
 ├── adrs/            # Architectural Decision Records — how to build (phase-1, phase-2, phase-3)
 ├── lessons/         # Evergreen learnings, one per file, grouped by topic (e.g. lessons/swift/)
-├── specs/           # Product and project specifications — what to build
+├── planning-sessions/ # Historical planning session records
+├── scaffold/        # Global and per-language SDK operational setup plans (covers *how*, not *what*)
+├── specs/           # Product and project specifications — what to build (includes open questions)
 └── standards/       # Coding and workflow standards. NON-NEGOTIABLE
+
+### Memory
+
+In addition to permanent context provided by artifacts, you have access to an MCP sever for memory called "vestige". Liberally read and write to this memory during all operation modalities, and ensure subagents do the same.
