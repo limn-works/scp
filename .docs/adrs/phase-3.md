@@ -31,9 +31,9 @@ Build order: ADR-013 (depends on all Phase 1 + Phase 2 Rust crates) --> ADR-014 
 
 ### Context
 
-The Python SDK is the most critical language binding for SCP. The agent ecosystem — LangChain, CrewAI, AutoGen, custom agents — is overwhelmingly Python (architecture.md section 1). If agents cannot `import scp`, the protocol does not exist to them. The bridge layer is the boundary between the Rust protocol engine (scp-core, scp-transport, scp-platform) and the Python world. It must expose core SCP types and operations to Python without leaking Rust concepts, while bridging async runtimes (tokio on the Rust side, asyncio on the Python side).
+The Python SDK is the most critical language binding for SCP. The agent ecosystem — LangChain, CrewAI, AutoGen, custom agents — is overwhelmingly Python (architecture.md section 3.1). If agents cannot `import scp`, the protocol does not exist to them. The bridge layer is the boundary between the Rust protocol engine (scp-core, scp-transport, scp-platform) and the Python world. It must expose core SCP types and operations to Python without leaking Rust concepts, while bridging async runtimes (tokio on the Rust side, asyncio on the Python side).
 
-PyO3 is the established Rust-Python FFI framework, and maturin is the standard build tool for PyO3 projects. Together they produce Python wheels with the compiled Rust binary embedded — users run `pip install scp-sdk` and get a working binary extension with zero Rust toolchain requirement (architecture.md section 4.1).
+PyO3 is the established Rust-Python FFI framework, and maturin is the standard build tool for PyO3 projects. Together they produce Python wheels with the compiled Rust binary embedded — users run `pip install scp-sdk` and get a working binary extension with zero Rust toolchain requirement (architecture.md section 3.1).
 
 ### Decision
 
@@ -181,7 +181,7 @@ Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. Th
 
 ### Context
 
-The PyO3 bridge (ADR-013) exposes raw Rust operations to Python as flat functions and opaque types. While functional, this surface is not Pythonic — it lacks context managers, method chaining, async iterators, and the ergonomic patterns Python developers expect. The Python SDK wrapper layer transforms the bridge into a natural Python API that feels like it was designed in Python from the start, matching the "20-line agent" target from architecture.md section 4.1.
+The PyO3 bridge (ADR-013) exposes raw Rust operations to Python as flat functions and opaque types. While functional, this surface is not Pythonic — it lacks context managers, method chaining, async iterators, and the ergonomic patterns Python developers expect. The Python SDK wrapper layer transforms the bridge into a natural Python API that feels like it was designed in Python from the start, matching the "20-line agent" target from architecture.md section 3.1.
 
 The wrapper layer is pure Python. It imports `_scp_core` (the PyO3 extension module) and builds high-level classes on top. This separation means Pythonic ergonomics can be iterated rapidly without rebuilding Rust, and the wrapper can add Python-ecosystem integrations (logging, context managers, dataclasses) that have no Rust equivalent.
 
@@ -416,7 +416,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
    ```
 
    - Top-level imports: `import scp_sdk` or `from scp_sdk import Identity, Context`.
-   - The `scp` namespace alias: `import scp_sdk as scp` enables the 20-line agent from architecture.md section 4.1.
+   - The `scp` namespace alias: `import scp_sdk as scp` enables the 20-line agent from architecture.md section 3.1.
 
 8. **Event log query API:**
 
@@ -472,7 +472,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 
 ### Context
 
-MCP (Model Context Protocol) defines how AI models connect to tools and data sources locally via JSON-RPC (spec section 8.5). The SCP agent acts as an MCP server from the model's perspective and an SCP protocol participant from the network's perspective. Any MCP-compatible model (Claude, GPT, Gemini, open-source models) can participate in SCP contexts without knowing SCP exists — it sees MCP tools namespaced by context, calls them, and gets results. The MCP adapter is the translation layer that makes this work (architecture.md section 2.3).
+MCP (Model Context Protocol) defines how AI models connect to tools and data sources locally via JSON-RPC (spec section 8.5). The SCP agent acts as an MCP server from the model's perspective and an SCP protocol participant from the network's perspective. Any MCP-compatible model (Claude, GPT, Gemini, open-source models) can participate in SCP contexts without knowing SCP exists — it sees MCP tools namespaced by context, calls them, and gets results. The MCP adapter is the translation layer that makes this work (architecture.md section 1.3).
 
 The adapter must map SCP tool interfaces to MCP tool definitions, filter tools by the agent's role and UCAN capabilities (so models never see tools they cannot access), handle MCP protocol mechanics (JSON-RPC over stdio or SSE), and route tool invocations through the SCP protocol engine with full authentication, encryption, and provenance.
 

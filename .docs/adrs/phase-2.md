@@ -31,7 +31,7 @@ Build order: ADR-008 + ADR-011 (parallel, both depend on Phase 1) --> ADR-009 --
 
 ### Context
 
-The context is the fundamental interaction primitive in SCP. All communication, tool invocation, role assignment, and governance happens within a context. A context is backed by exactly one MLS group (spec section 9.7.1: MLS Group = SCP Context). The Context Manager is the central coordinator of the protocol engine (architecture.md section 3.2): it owns the state machine, membership tracking, role enforcement, tool routing, TTL management, and memory scope enforcement.
+The context is the fundamental interaction primitive in SCP. All communication, tool invocation, role assignment, and governance happens within a context. A context is backed by exactly one MLS group (spec section 9.7.1: MLS Group = SCP Context). The Context Manager is the central coordinator of the protocol engine (architecture.md section 2.2): it owns the state machine, membership tracking, role enforcement, tool routing, TTL management, and memory scope enforcement.
 
 Phase 1 proved the crypto stack works (MLS groups, envelopes, transport). Phase 2 wraps that crypto in the context abstraction — the user-facing unit of interaction that carries governance, roles, tools, and lifecycle semantics on top of the raw encryption.
 
@@ -469,7 +469,7 @@ Implement tool registration, invocation, and cross-context interfaces in `scp-co
 
 ### Rationale
 
-- **MCP-compatible schema:** Tools use JSON Schema for input/output definitions (spec section 8.5). This means any MCP-compatible model can invoke SCP tools through the MCP adapter (architecture.md section 2.4) without modification. Schema compatibility is a requirement, not a nice-to-have.
+- **MCP-compatible schema:** Tools use JSON Schema for input/output definitions (spec section 8.5). This means any MCP-compatible model can invoke SCP tools through the MCP adapter (architecture.md section 1.4) without modification. Schema compatibility is a requirement, not a nice-to-have.
 - **Implementation hash for integrity:** The content-addressable hash of a tool's implementation is recorded at registration. Any change to the implementation produces a new hash, which is recorded as a mutation event in the event log. Silent tool modification is impossible — all members see the change (spec section 5.4).
 - **Test vectors for continuous verification:** Any agent can call a tool with test vector inputs and verify outputs match (spec section 7.3.3). This enables threshold confidence: if N agents independently verify, the tool is almost certainly behaving correctly.
 - **Context governs, not agent (spec section 6.2):** Cross-context tool calls are mediated by both contexts. An agent in Context A requests a tool call to Context B. Context A's governance decides whether to permit the outbound call. Context B's governance decides whether to permit the inbound call. The agent never directly touches the other context.
@@ -860,7 +860,7 @@ pub struct ConsistencyCheckpoint {
 
 ### Context
 
-SCP is transport-independent (architecture.md section 10). No single transport is primary. The `TransportAdapter` trait (ADR-005) defines the contract each adapter implements, and the `TransportManager` (ADR-005 acceptance criterion 3) was stubbed in Phase 1 to support a single adapter. Phase 2 completes the `TransportManager` with multi-transport routing: sending envelopes to multiple relays for suppression resistance, partitioning relay sets across contexts for metadata privacy, mixing real and decoy subscriptions, and scoring relay reliability.
+SCP is transport-independent (architecture.md section 7). No single transport is primary. The `TransportAdapter` trait (ADR-005) defines the contract each adapter implements, and the `TransportManager` (ADR-005 acceptance criterion 3) was stubbed in Phase 1 to support a single adapter. Phase 2 completes the `TransportManager` with multi-transport routing: sending envelopes to multiple relays for suppression resistance, partitioning relay sets across contexts for metadata privacy, mixing real and decoy subscriptions, and scoring relay reliability.
 
 Decision 10 mandates relay set partitioning and multi-relay publishing. Decision 6 mandates persistent connections and TLS for all relay connections. These metadata privacy measures are enforced at the transport routing layer, transparent to the context and envelope layers above.
 

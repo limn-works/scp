@@ -45,7 +45,7 @@
 
 ## Crypto and Security
 
-- **Offline member MLS re-sync.** Members offline for extended periods accumulate pending MLS proposals. Architecture.md §9 acknowledges this as "the hardest unsolved problem." Current mitigation: "group state reset" — but trigger conditions, initiation protocol, and context lifecycle during reset are unspecified. Must be designed before Phase 2 context lifecycle work.
+- **Offline member MLS re-sync.** Members offline for extended periods accumulate pending MLS proposals. Architecture.md §6 acknowledges this as "the hardest unsolved problem." Current mitigation: "group state reset" — but trigger conditions, initiation protocol, and context lifecycle during reset are unspecified. Must be designed before Phase 2 context lifecycle work.
 - **Commit delivery assurance under adversarial relays.** Relays can suppress MLS Commits. Spec says "publish to all relays with delivery confirmation" but: (1) "delivery confirmation" semantics are undefined (ACK from relay? from recipients?), (2) recovery mechanism for split-brain state (some members got the Commit, some didn't) is unspecified.
 - **Cover traffic parameters.** Constant-rate cover traffic is mandatory on persistent connections (Decision 8). Suggested rate: 1 message per 30 seconds. Not finalized. Dummy message format specified (single-byte flag inside encrypted payload) but relay-side distinguishability analysis is incomplete.
 - **Compromise recovery orchestration.** §9.12 lists 6 recovery steps but does not specify ordering constraints, atomicity guarantees, or partial failure handling (e.g., if MLS Update fails in one context but succeeds in others).

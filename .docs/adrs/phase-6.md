@@ -123,7 +123,7 @@ Write after ADR-026 (Swift SDK). Mirror Swift ergonomics decisions where applica
 
 ### Why This Is the Hardest Problem
 
-Architecture.md §9 explicitly flags offline MLS re-sync as "the hardest unsolved problem." Members offline for extended periods accumulate pending MLS proposals. Group state reset trigger conditions, initiation protocol, and context lifecycle during reset are all unspecified.
+Architecture.md §6 explicitly flags offline MLS re-sync as "the hardest unsolved problem." Members offline for extended periods accumulate pending MLS proposals. Group state reset trigger conditions, initiation protocol, and context lifecycle during reset are all unspecified.
 
 ### What This ADR Will Decide
 

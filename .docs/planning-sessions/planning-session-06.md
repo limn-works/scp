@@ -37,7 +37,7 @@ Full review of PR #1 ("Arch thought process") which added architecture.md, plann
 
 **Rationale:** did:dht libraries exist in Rust. The risk of library issues is medium but the mitigation (fall back to did:web) is available without building it upfront. Starting with did:dht avoids building infrastructure (did:web resolution server) that the protocol doesn't need.
 
-**Updated:** .docs/specs/ §3.8, §9.6.2, §9.13. architecture.md §3.2, §8, §9, §10. sketch.md §15.
+**Updated:** .docs/specs/ §3.8, §9.6.2, §9.13. architecture.md §2.2, §5, §6, §7. sketch.md §15.
 
 ### 1.3 Provenance Is a Core Principle
 
@@ -106,17 +106,17 @@ Discovery is achievable via tool interfaces (§6.2.2) — registry contexts expo
 - Yggdrasil
 - cjdns
 
-**Updated:** .docs/specs/ §10.5. architecture.md §2.1, §3.1, §8, §9, §10.
+**Updated:** .docs/specs/ §10.5. architecture.md §1.1, §2.1, §5, §6, §7.
 
 ### 1.7 The Protocol Requires No Operator
 
-**Problem:** architecture.md §8 had a "What We Run" table listing infrastructure Limn operates. This implies the protocol depends on Limn running things.
+**Problem:** architecture.md §5 had a "What We Run" table listing infrastructure Limn operates. This implies the protocol depends on Limn running things.
 
 **Decision:** The protocol is designed so that no entity — including Limn — needs to run infrastructure for it to function. If Limn disappeared tomorrow, SCP must work exactly as designed. Limn may choose to operate infrastructure for ecosystem bootstrapping, but the protocol cannot depend on this.
 
 Every protocol mechanism must pass the test: "does this work if no one runs centralized infrastructure?"
 
-**Updated:** architecture.md §8 (rewritten — "What We Run" replaced with "Design Principle: The Protocol Requires No Operator").
+**Updated:** architecture.md §5 (rewritten — "What We Run" replaced with "Design Principle: The Protocol Requires No Operator").
 
 ---
 

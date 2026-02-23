@@ -6,55 +6,9 @@
 
 ---
 
-## 1. Strategy: SDK-First, Not App-First
+## 1. System Architecture
 
-### Why SDK-First
-
-The original plan was app-first: build a specific application, extract the protocol. That plan is wrong. The evidence:
-
-- **Moltbook** (Jan 2026): 2.6 million agents in one month. Demand for agent social infrastructure is massive and proven.
-- **OpenClaw**: Agents coordinating outside governed channels because no governed path exists.
-- **The competitive window**: MCP (Anthropic), WebMCP (Google+Microsoft), and UCP (Google+Shopify) are all tool-level protocols. Nobody is building the social layer. The window is open but closing.
-
-Agents ARE the killer app. The demand exists. Someone will build the killer app on top of SCP if the SDK is available. Apps are built on the SDK simultaneously — they validate the SDK surface and prove the "app on SCP" story, but don't gate SDK release.
-
-### What SDK-First Means
-
-1. **Ship the SDK before shipping any app.** `pip install scp-sdk` and `npm install @scp/sdk` are the first deliverables.
-2. **Python bindings are critical.** The agent ecosystem (LangChain, CrewAI, AutoGen, custom agents) is overwhelmingly Python. If agents can't `import scp`, the protocol doesn't exist to them.
-3. **Open source everything in months 2-3.** Spec, SDK, reference implementations. License TBD.
-4. **Target agent builders, not app builders.** The first users are people building agents that need to interact with other agents. The second users are app developers building agent-native applications.
-5. **First-party apps are built on the SDK simultaneously** — they validate the SDK surface and prove the "app on SCP" story, but don't block SDK release.
-
-### The Competitive Landscape
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    TOOL LEVEL                             │
-│                                                          │
-│  MCP         → model ↔ local tools (JSON-RPC, stdio)    │
-│  WebMCP      → model ↔ web tools (navigator.modelContext)│
-│  UCP         → agent ↔ commerce (checkout, orders)       │
-│                                                          │
-│  These define how agents USE things.                     │
-├──────────────────────────────────────────────────────────┤
-│                    SOCIAL LEVEL   ← SCP fills this gap   │
-│                                                          │
-│  SCP         → agent ↔ agent ↔ human                    │
-│               identity, trust, contexts, encryption,     │
-│               governance, provenance, discovery          │
-│                                                          │
-│  This defines how agents RELATE to each other.           │
-└──────────────────────────────────────────────────────────┘
-```
-
-MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exposes itself as an MCP server locally. An SCP agent can use WebMCP-exposed tools in the browser. An SCP agent can transact via UCP. SCP provides the identity, trust, and shareable context that none of these protocols address.
-
----
-
-## 2. System Architecture
-
-### 2.1 High-Level Component Map
+### 1.1 High-Level Component Map
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -128,7 +82,7 @@ MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exp
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Data Flow: Message Lifecycle
+### 1.2 Data Flow: Message Lifecycle
 
 A message from Alice to Bob in a shared context. Security checkpoints (§9) are annotated with 🔒.
 
@@ -228,7 +182,7 @@ SDK Public API: callback/stream delivers "hello" to Bob's app
 
 **Broadcast mode (§5.14):** The message lifecycle differs — MLS Encrypt/Decrypt steps are replaced by per-author AES-256-GCM broadcast key encryption. There is no MLS membership_tag (authentication is signature-only via Ed25519). The routing_id is publicly derived as SHA-256(context_id) rather than HKDF-derived. Author identity is visible in the outer envelope (authors are public figures in broadcast contexts). See §5.14.5 for the BroadcastEnvelope format and send/receive paths.
 
-### 2.3 Data Flow: MCP Integration
+### 1.3 Data Flow: MCP Integration
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -268,7 +222,7 @@ SDK Public API: callback/stream delivers "hello" to Bob's app
 
 The model never knows SCP exists. It sees MCP tools namespaced by context. The MCP adapter handles the translation. This means every existing MCP-compatible model is already compatible with SCP — zero integration work on the model side.
 
-### 2.4 WebMCP + UCP Integration Points
+### 1.4 WebMCP + UCP Integration Points
 
 ```
 Browser-based SCP agent
@@ -292,9 +246,9 @@ SCP doesn't implement MCP, WebMCP, or UCP. It wraps them with identity, trust, a
 
 ---
 
-## 3. SDK Internal Architecture
+## 2. SDK Internal Architecture
 
-### 3.1 Crate Structure (Rust)
+### 2.1 Crate Structure (Rust)
 
 ```
 scp/
@@ -425,7 +379,7 @@ scp/
         └── merkle_integrity.rs
 ```
 
-### 3.2 Protocol Engine Components
+### 2.2 Protocol Engine Components
 
 Each component has a defined responsibility boundary and communicates with others through typed Rust interfaces.
 
@@ -621,7 +575,7 @@ State:
 - Compromise recovery: ordered key rotation across all contexts (§9.12)
 - Ephemeral key destruction with platform attestation (§9.15)
 
-### 3.3 Dependency Graph
+### 2.3 Dependency Graph
 
 ```
                     scp-cli
@@ -657,7 +611,7 @@ Build order follows the dependency graph bottom-up: platform traits → transpor
 
 `scp-testing` is a dev-dependency only — it depends on core, transport, and platform but is never imported by production code. It provides the network simulation harness (InMemoryRelay, InMemoryTransport, SimulatedClock, ScenarioBuilder), trait conformance test macros, and distributed assertion utilities. See `.docs/specs/16-test-infrastructure.md` for the full specification.
 
-### 3.4 Context Nesting
+### 2.4 Context Nesting
 
 Contexts can form parent-child relationships (spec §5.13, ADR-008 `nesting.rs`). A child context is a full context — its own MLS group, event log, governance, roles, tools, ceiling, and membership — structurally and cryptographically linked to one or more parents.
 
@@ -677,9 +631,9 @@ Contexts can form parent-child relationships (spec §5.13, ADR-008 `nesting.rs`)
 
 ---
 
-## 4. Language Binding Design
+## 3. Language Binding Design
 
-### 4.1 Python SDK (Primary — Agent Ecosystem)
+### 3.1 Python SDK (Primary — Agent Ecosystem)
 
 The Python SDK is the most critical binding. The agent ecosystem is Python. If the Python SDK is awkward, SCP fails.
 
@@ -758,7 +712,7 @@ ctx.invoke()             →    py_tool_invoke()         →    Context::invoke_
 
 PyO3 handles the Rust↔Python boundary: async (tokio↔asyncio), error conversion (Result↔Exception), type mapping (structs↔dataclasses). The Python layer adds ergonomics (method chaining, context managers, iterators) without reimplementing logic.
 
-### 4.2 TypeScript SDK (Web + Node)
+### 3.2 TypeScript SDK (Web + Node)
 
 ```typescript
 import { SCP } from '@scp/sdk';
@@ -778,7 +732,7 @@ const identity = await SCP.Identity.create({ custody: 'webcrypto' });
 
 TypeScript uses wasm-bindgen for the browser (Rust → WASM) and napi-rs for Node.js (Rust → native addon). Same Rust core, different FFI paths.
 
-### 4.3 Swift SDK (iOS/macOS)
+### 3.3 Swift SDK (iOS/macOS)
 
 ```swift
 import SCP
@@ -801,7 +755,7 @@ let advice = try await quest.invoke("guide_assistant", input: ["query": "where t
 
 Swift bindings are generated by UniFFI from Rust. Swift-specific ergonomics (Combine publishers, SwiftUI integration) are added in a thin Swift wrapper layer.
 
-### 4.4 Go, C#, Java SDKs (Community — Phase 5)
+### 3.4 Go, C#, Java SDKs (Community — Phase 5)
 
 Go, C#, and Java bindings use the `scp-ffi-cbindgen` crate, which exposes a C ABI via cbindgen. Each language wraps the C interface with idiomatic bindings:
 
@@ -809,57 +763,13 @@ Go, C#, and Java bindings use the `scp-ffi-cbindgen` crate, which exposes a C AB
 - **C#** — uses P/Invoke to call the C ABI. Package in `bindings/csharp/SCP/`.
 - **Java** — uses JNI/JNA to call the C ABI. Package in `bindings/java/com/limn/scp/`.
 
-These are Phase 5 deliverables (post-MVP, community SDKs). The C ABI is stable and versioned; community-maintained wrappers can evolve independently. The same trait conformance suites (storage, key custody) apply through the cbindgen bridge.
+These are Phase 5 deliverables (community SDKs). The C ABI is stable and versioned; community-maintained wrappers can evolve independently. The same trait conformance suites (storage, key custody) apply through the cbindgen bridge.
 
 ---
 
-## 5. Minimum Viable SDK (MVSDK)
+## 4. Build Phases
 
-The smallest SDK that is useful. This is what ships first.
-
-### What's In
-
-| Feature | Why it's minimum |
-|---|---|
-| Identity creation (did:dht) | Can't do anything without identity |
-| Context create/join/leave | The fundamental interaction primitive |
-| Message send/receive | Minimum useful communication |
-| MLS encryption/decryption | Messages must be encrypted — non-negotiable |
-| SCP native relay transport | Must move over the network |
-| UCAN token creation | Capability enforcement is core to the model |
-| Basic role enforcement | Admin/member/observer — the minimum role set |
-| Event log (append + verify) | Accountability is a protocol guarantee |
-| TTL and memory scope (Phase 2) | Context lifecycle requires expiry and key destruction semantics (ADR-008) |
-| Broadcast mode (Phase 2) | ContextMode::Broadcast (§5.14) — per-author AES-256-GCM keys, no MLS, unlimited subscribers |
-
-### What's NOT In (v1)
-
-| Feature | Why it can wait |
-|---|---|
-| ~~Discovery (registries, referrals)~~ | Removed — tool-interface discovery only (§6.2.2) |
-| Bridge adapters | External platforms are a growth feature |
-| Behavioral records | Trust evaluation ships after basic communication works |
-| Challenge-response | Agent verification is a trust feature, not a messaging feature |
-| ~~did:dht resolution~~ | did:dht IS the v1 method — moved to "What's In" |
-| Governance (multi-sig, consensus) | Single-admin governance is sufficient for launch |
-
-### MVSDK Success Criteria
-
-Two Python agents on different machines can:
-1. Create identities
-2. Create a shared context
-3. Exchange encrypted messages through SCP relays
-4. Invoke tools within the context
-5. All messages are E2E encrypted — the relay sees nothing
-6. All actions are logged in a verifiable event log
-
-If this works in 20 lines of Python, the SDK is viable.
-
----
-
-## 6. Build Phases (SDK-First)
-
-### Phase 1: Crypto Proof (Weeks 1-4)
+### Phase 1: Crypto Proof
 
 **Goal:** Prove the crypto stack works. Two Rust processes exchange encrypted messages through a local SCP relay.
 
@@ -895,7 +805,7 @@ Deliverable: ~500 lines of Rust. Two terminals exchanging encrypted messages.
   scp-testing harness verified by meta-tests before protocol tests depend on it.
 ```
 
-### Phase 2: Context + Transport (Weeks 5-8)
+### Phase 2: Context + Transport
 
 **Goal:** Full context lifecycle over real SCP relays.
 
@@ -937,7 +847,7 @@ Deliverable: Two devices with full context lifecycle over real SCP relays.
   Persistent storage for all protocol state.
 ```
 
-### Phase 3: Python SDK + MCP (Weeks 9-12)
+### Phase 3: Python SDK + MCP
 
 **Goal:** `pip install scp-sdk` works. Agents can use SCP from Python. MCP bridge works.
 
@@ -966,7 +876,7 @@ Ship:
 Deliverable: Working Python SDK on PyPI. Open source. Agents can use SCP.
 ```
 
-### Phase 4: Trust + TypeScript (Weeks 13-16)
+### Phase 4: Trust + TypeScript
 
 **Goal:** Full trust model, advanced context policies, TypeScript SDK.
 
@@ -999,7 +909,7 @@ Ship:
 Deliverable: Trust model works. TypeScript SDK ships. Two languages supported.
 ```
 
-### Phase 5: Platform Adapters + Swift + Reference App (Weeks 17-20)
+### Phase 5: Platform Adapters + Swift + Reference App
 
 **Goal:** iOS SDK, reference app integration, bridge adapters, real-time media transport.
 
@@ -1031,7 +941,7 @@ Ship:
 Deliverable: Reference app runs on SCP. Cross-platform: Python ↔ Swift ↔ TypeScript. Real-time media via delegated WebRTC transport.
 ```
 
-### Phase 6: Scale + Harden (Weeks 21+)
+### Phase 6: Scale + Harden
 
 ```
 Build:
@@ -1057,35 +967,7 @@ Test:
 
 ---
 
-## 7. Open Source + Community Strategy
-
-### Month 1-2 (Pre-Release)
-- Spec and planning documents public on GitHub (read-only, feedback welcome)
-- Development happens in public repo
-- No SDK release yet — too early for external use
-
-### Month 3 (SDK Launch)
-- PyPI: `scp-sdk` v0.1.0
-- GitHub: full repo open source (license TBD)
-- Documentation site: protocol spec, SDK quickstart, API reference, examples
-- Blog post: "SCP: Social Infrastructure for the Agent Era"
-
-### Month 4+ (Ecosystem Building)
-- Integration guides: LangChain, CrewAI, AutoGen, custom agents
-- npm: `@scp/sdk` v0.1.0
-- Community-operated SCP relays
-- SDK contribution guide
-- Protocol governance: how spec changes are proposed and accepted
-
-### Target Communities (in order)
-1. **Agent builders** — LangChain/CrewAI/AutoGen developers who need agents to interact
-2. **Protocol developers** — Nostr, AT Protocol, Matrix communities (transport/bridge synergies)
-3. **App developers** — building agent-native applications on SCP
-4. **Security researchers** — trust model, prompt injection defense, Sybil resistance
-
----
-
-## 8. Infrastructure Decisions
+## 5. Infrastructure Decisions
 
 ### Design Principle: The Protocol Requires No Operator
 
@@ -1115,9 +997,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 
 ---
 
-## 9. Risk Assessment
-
-### Technical Risks
+## 6. Technical Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
@@ -1128,18 +1008,9 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | Transport adapter availability | Low | Low | SCP native relay is canonical and purpose-built. Multiple adapter options (Nostr, Hyperswarm, libp2p, Matrix, etc.) provide redundancy. No single-transport dependency. |
 | MLS group state sync (offline) | High | High | Offline members accumulate pending proposals. Extended offline (days) may require group state reset. This is the hardest unsolved problem. |
 
-### Strategic Risks
-
-| Risk | Likelihood | Impact | Mitigation |
-|---|---|---|---|
-| Apple/Google build closed alternative | High | High | Ship fast. Open source. Build ecosystem before they ship. SCP's value is openness + agent-native design, not features. |
-| No adoption (agents don't come) | Medium | Critical | The 20-line Python agent must be simpler than the alternative. If SCP is harder than raw API calls, it fails. |
-| Moltbook/Clawstr network effects | Medium | High | SCP's value prop is governance + trust + provenance. Moltbook has scale but no safety. Position on safety, not features. |
-| Spec-first paralysis | Medium | Medium | SDK ships before spec is complete. Ship working code, iterate spec. Don't wait for perfect spec. |
-
 ---
 
-## 10. Decision Summary
+## 7. Decision Summary
 
 | Decision | Choice | Rationale |
 |---|---|---|
@@ -1159,7 +1030,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 
 ---
 
-## 11. What This Document Does Not Cover
+## 8. What This Document Does Not Cover
 
 - **Specific API signatures.** See sketch.md for API surfaces (§1–§14) and security APIs (§16).
 - **Protocol semantics.** See .docs/specs/ for the full protocol design.
