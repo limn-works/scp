@@ -47,7 +47,7 @@ build-backend = "maturin"
 
 [project]
 name = "scp-sdk"
-description = "Social Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
+description = "Shareable Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
 requires-python = ">=3.12"
 # license = TBD
 classifiers = [

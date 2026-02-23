@@ -22,7 +22,7 @@ Alec rejected the advice to build Cronica first and extract the protocol later. 
 
 ## Naming
 
-The protocol is called the **Social Context Protocol (SCP)**. The name reflects that the core abstraction is socially-scoped contexts in which agents operate.
+The protocol is called the **Shareable Context Protocol (SCP)**. The name reflects that the core abstraction is shareable contexts — bounded, encrypted spaces that can be shared between participants but don't require multi-party use.
 
 ---
 
@@ -290,7 +290,7 @@ Alec compared this to how search engines work — detecting coordination through
 
 **Business model direction:** Managed infrastructure and media/content hosting are the probable revenue surfaces. Heavy content (video, large files, real-time streams) has real storage and bandwidth costs. Self-hosters shoulder their own costs; managed infrastructure does it for a fee.
 
-**Build on existing infrastructure:** Transport, data sovereignty, and self-hosting are the least novel parts. Existing technologies (Matrix, libp2p, Solid-style data stores) provide foundations. The novel work is the Social Context Layer on top.
+**Build on existing infrastructure:** Transport, data sovereignty, and self-hosting are the least novel parts. Existing technologies (Matrix, libp2p, Solid-style data stores) provide foundations. The novel work is the Shareable Context Layer on top.
 
 ---
 

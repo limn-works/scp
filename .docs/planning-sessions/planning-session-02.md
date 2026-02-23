@@ -298,7 +298,7 @@ Nostr is a signed-event gossip protocol. It has no concept of:
 - **Bridge connectors** with shadow identities and provenance.
 - **App interface / capability declarations** — the generated-app infrastructure.
 
-This is the Social Context Layer — the actual novel work. **Everything below it in the stack already exists.**
+This is the Shareable Context Layer — the actual novel work. **Everything below it in the stack already exists.**
 
 ### Should SCP Build on Nostr?
 
@@ -313,7 +313,7 @@ Three options were discussed:
 **Arguments for building on Nostr:**
 - Don't reinvent the transport layer. Nostr relays exist, work, have operators. Client libraries exist in every language.
 - Identity alignment. Nostr's keypair identity maps nearly trivially to `did:key:`.
-- NIP extensibility. SCP's social context layer could be a set of NIPs or a protocol layer consuming Nostr events.
+- NIP extensibility. SCP's shareable context layer could be a set of NIPs or a protocol layer consuming Nostr events.
 - Existing user base, relays, clients. Not starting from zero.
 - Philosophical alignment. Both sovereignty-first, anti-platform-lock-in, keypair-rooted.
 

@@ -48,7 +48,7 @@ Agents ARE the killer app. The demand exists. Someone will build the killer app 
 └──────────────────────────────────────────────────────────┘
 ```
 
-MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exposes itself as an MCP server locally. An SCP agent can use WebMCP-exposed tools in the browser. An SCP agent can transact via UCP. SCP provides the identity, trust, and social context that none of these protocols address.
+MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exposes itself as an MCP server locally. An SCP agent can use WebMCP-exposed tools in the browser. An SCP agent can transact via UCP. SCP provides the identity, trust, and shareable context that none of these protocols address.
 
 ---
 

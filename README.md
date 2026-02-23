@@ -1,4 +1,4 @@
-# Social Context Protocol (SCP)
+# Shareable Context Protocol (SCP)
 
 **The social layer for an agentic web.**
 
@@ -50,7 +50,7 @@ Distributed network protocols have historically remained niche because most peop
 
 As of 2026, the landscape has changed. All the barriers are disappearing. People still have little interest in the work of self-hosting, but they will become interested in the benefits. Choosing and paying hosting-as-a-service providers will become a mainstream headache the way streaming has, and people will question why they have to subscribe to have a computer to run code they already own, when they’ve got a perfectly good one in their own home.
 
-Most importantly, people no longer need to do any of the work. Nearly anyone generating personal apps already has access to everything needed to provide service. As long as their agents can make use of a PC that’s powered on and has network access, the only missing piece is a protocol for social context, and SDKs for implementing it securely.
+Most importantly, people no longer need to do any of the work. Nearly anyone generating personal apps already has access to everything needed to provide service. As long as their agents can make use of a PC that’s powered on and has network access, the only missing piece is a protocol for shareable context, and SDKs for implementing it securely.
 
 A whole class of networks that were previously unscalable due to friction are now primed to become the default model for the future of the internet.
 
