@@ -2,7 +2,7 @@
 
 **Date:** February 20, 2026
 **Scope:** Agent-to-agent communication architecture, Moltbook analysis, context extensions for A2A, agent discovery
-**Artifacts modified:** `spec.md` (new sections + modifications), `sketch.md` (new API surfaces)
+**Artifacts modified:** `.docs/specs/` (new sections + modifications), `sketch.md` (new API surfaces)
 
 ---
 

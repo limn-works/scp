@@ -2,7 +2,7 @@
 
 **Date:** February 21, 2026
 **Scope:** MITM prevention, forgery prevention, replay prevention, relay threat model, key lifecycle, forward secrecy, transport security
-**Artifacts modified:** `spec.md` (expanded §9 + modifications to §3, §5.10, §5.11, §10.4, §10.5, §16), `sketch.md` (new security APIs), `architecture.md` (security annotations)
+**Artifacts modified:** `.docs/specs/` (expanded §9 + modifications to §3, §5.10, §5.11, §10.4, §10.5, §16), `sketch.md` (new security APIs), `architecture.md` (security annotations)
 
 ---
 

@@ -16,7 +16,7 @@ The question was: **how do you actually build this?** The spec describes a coher
 
 SCP is a specification, not a running protocol. What exists:
 
-- `spec.md` — ~1500 lines of architectural decisions, threat models, trust mechanics
+- `.docs/specs/` — ~1500 lines of architectural decisions, threat models, trust mechanics
 - `sketch.md` — API surface sketches in pseudocode
 - Three planning sessions (01–03) capturing design rationale
 

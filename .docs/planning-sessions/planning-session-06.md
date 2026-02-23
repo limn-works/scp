@@ -2,13 +2,13 @@
 
 **Date:** February 22, 2026
 **Scope:** Review of PR #1 (architecture branch). Corrections to blocking mechanism, DID method ordering, transport independence, provenance elevation, cross-context tool call governance, ephemeral deletion, metadata privacy, A2A reconsideration, infrastructure independence.
-**Artifacts modified:** `spec.md`, `sketch.md`, `architecture.md` (changes committed to architecture branch). `open-questions.md` (new file).
+**Artifacts modified:** `.docs/specs/`, `sketch.md`, `architecture.md` (changes committed to architecture branch). `open-questions.md` (new file).
 
 ---
 
 ## How This Session Started
 
-Full review of PR #1 ("Arch thought process") which added architecture.md, planning sessions 03–05, and major updates to spec.md and sketch.md. The review identified several architectural corrections needed, elevated provenance to a core principle, and surfaced 10 open questions requiring decisions before implementation can begin.
+Full review of PR #1 ("Arch thought process") which added architecture.md, planning sessions 03–05, and major updates to .docs/specs/ and sketch.md. The review identified several architectural corrections needed, elevated provenance to a core principle, and surfaced 10 open questions requiring decisions before implementation can begin.
 
 ---
 
@@ -27,7 +27,7 @@ Full review of PR #1 ("Arch thought process") which added architecture.md, plann
 - MLS group membership is unchanged — blocked party remains in the context
 - This is architecturally distinct from member removal (MLS Remove Commit + epoch advancement)
 
-**Updated:** spec.md §3.6, §10.5
+**Updated:** .docs/specs/ §3.6, §10.5
 
 ### 1.2 did:dht First, did:web Fallback Only
 
@@ -37,7 +37,7 @@ Full review of PR #1 ("Arch thought process") which added architecture.md, plann
 
 **Rationale:** did:dht libraries exist in Rust. The risk of library issues is medium but the mitigation (fall back to did:web) is available without building it upfront. Starting with did:dht avoids building infrastructure (did:web resolution server) that the protocol doesn't need.
 
-**Updated:** spec.md §3.8, §9.6.2, §9.13. architecture.md §3.2, §8, §9, §10. sketch.md §15.
+**Updated:** .docs/specs/ §3.8, §9.6.2, §9.13. architecture.md §3.2, §8, §9, §10. sketch.md §15.
 
 ### 1.3 Provenance Is a Core Principle
 
@@ -47,7 +47,7 @@ Full review of PR #1 ("Arch thought process") which added architecture.md, plann
 
 **Rationale:** Provenance is not about cross-context data flow — it's about accountability and verifiability throughout the protocol. It strengthens Sybil detection (correlated provenance patterns), governance enforcement (traceable actions), and trust evaluation (verifiable claims).
 
-**Updated:** spec.md §1 (new Core Principles section), §7.6, §7.7.
+**Updated:** .docs/specs/ §1 (new Core Principles section), §7.6, §7.7.
 
 ### 1.4 Context Governs Tool Calls, Not Agents
 
@@ -65,7 +65,7 @@ Discovery is achievable via tool interfaces (§6.2.2) — registry contexts expo
 
 **Rationale:** This is strictly stronger governance than A2A propose/accept because both contexts mediate every interaction. It also addresses the "multi-turn gap" that was the main argument for A2A contexts. Stateful sessions with context governance cover scheduling, negotiation, and coordination without creating agent-governed channels.
 
-**Updated:** spec.md §6.2 (rewritten), new §6.2.1 (Stateful Tool Sessions), new §6.2.2 (Discovery via Tool Interfaces).
+**Updated:** .docs/specs/ §6.2 (rewritten), new §6.2.1 (Stateful Tool Sessions), new §6.2.2 (Discovery via Tool Interfaces).
 
 ### 1.5 Ephemeral Contexts: Delete Ciphertext + Destroy Keys
 
@@ -78,7 +78,7 @@ Discovery is achievable via tool interfaces (§6.2.2) — registry contexts expo
 - Relay compliance with deletion requests is tracked via relay reliability scoring
 - Relays that retain data they were asked to delete are scored lower and deprioritized
 
-**Updated:** spec.md §5.11.
+**Updated:** .docs/specs/ §5.11.
 
 ### 1.6 Transport Independence — No Single-Transport Dependency
 
@@ -106,7 +106,7 @@ Discovery is achievable via tool interfaces (§6.2.2) — registry contexts expo
 - Yggdrasil
 - cjdns
 
-**Updated:** spec.md §10.5. architecture.md §2.1, §3.1, §8, §9, §10.
+**Updated:** .docs/specs/ §10.5. architecture.md §2.1, §3.1, §8, §9, §10.
 
 ### 1.7 The Protocol Requires No Operator
 
@@ -163,7 +163,7 @@ These suggestions form a coherent metadata privacy architecture. See open-questi
 
 ### Files Modified (on architecture branch):
 
-**spec.md:**
+**.docs/specs/:**
 - Added Core Principles section to §1 (identity, isolation, provenance, encryption, legibility, accountability)
 - §3.6: Blocking rewritten — sender-side key layer, not MLS removal
 - §3.8: did:web reframed as fallback only
