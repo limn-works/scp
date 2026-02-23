@@ -881,7 +881,7 @@ Deliverable: Trust model works. TypeScript SDK ships. Two languages supported.
 
 ### Phase 5: Platform Adapters + Swift + Reference App (Weeks 17-20)
 
-**Goal:** iOS SDK, reference app integration, bridge adapters.
+**Goal:** iOS SDK, reference app integration, bridge adapters, real-time media transport.
 
 ```
 Build:
@@ -889,6 +889,7 @@ Build:
   • bindings/swift/ — UniFFI-generated + Swift ergonomics layer
   • scp-bridge/x/ — X bridge adapter (relay mode)
   • scp-bridge/bluesky/ — Bluesky bridge adapter (API mode)
+  • scp-media/ — WebRTC adapter, MLS key export for DTLS-SRTP (§10.9.1), signaling via context messages
   • Reference app integration: quests as contexts, AI guide as agent
 
 Test:
@@ -896,13 +897,15 @@ Test:
   • Quest runs as SCP context
   • Bridge: X user participates in quest via bridge
   • End-to-end: Python agent ↔ Swift app via SCP
+  • Media: voice/video call between two context members, keys derived from MLS group state
 
 Ship:
   • Swift package
   • Reference app beta with SCP
   • Bridge adapters
+  • Media transport with WebRTC
 
-Deliverable: Reference app runs on SCP. Cross-platform: Python ↔ Swift ↔ TypeScript.
+Deliverable: Reference app runs on SCP. Cross-platform: Python ↔ Swift ↔ TypeScript. Real-time media via delegated WebRTC transport.
 ```
 
 ### Phase 6: Scale + Harden (Weeks 21+)

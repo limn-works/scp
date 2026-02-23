@@ -1089,7 +1089,73 @@ let recipes = try await SCP.ToolInterface.call(
 
 ---
 
-## 11. Wire Format Sketch
+## 11. Real-Time Media (§10.9.1)
+
+Media sessions use the delegated transport model: SCP governs identity, trust, and signaling; WebRTC handles media transport. The context's capability ceiling must include the relevant `media.*` capability.
+
+### Initiate Media Session
+
+```
+SCP.Media.initiate(
+  context: contextID,
+  as: Identity,
+  capabilities: [.voice] | [.voice, .video] | [.screenShare],
+  participants: [DID]?   // nil = all context members
+) → MediaSession {
+  sessionID: string,
+  mediaKeys: MediaKeyMaterial,  // MLS-exported keying material
+  signalingChannel: contextID   // signaling flows through the context
+}
+```
+
+The SDK exports keying material from the MLS group's key schedule (RFC 9420 §8, MLS exporter) bound to the session ID. This key material is used to derive DTLS-SRTP keys for media encryption. Only current MLS group members can derive the keys — membership enforcement is cryptographic.
+
+### Exchange Signaling
+
+WebRTC signaling (SDP offers/answers, ICE candidates) flows as standard SCP messages within the context. This means signaling is end-to-end encrypted and authenticated.
+
+```
+SCP.Media.signal(
+  session: sessionID,
+  context: contextID,
+  as: Identity,
+  payload: SDPOffer | SDPAnswer | ICECandidate
+)
+```
+
+### Export Media Keys
+
+Derives DTLS-SRTP key material from the MLS group state, bound to the session.
+
+```
+SCP.Media.exportKeys(
+  session: sessionID,
+  context: contextID,
+  as: Identity
+) → MediaKeyMaterial {
+  dtlsFingerprint: bytes,
+  srtpMasterKey: bytes,
+  srtpMasterSalt: bytes
+}
+```
+
+Key material is re-exported on MLS epoch advances. If a member is removed from the context (and thus from the MLS group), they lose the ability to derive current media keys — the media session enforces the same membership as the context.
+
+### End Media Session
+
+```
+SCP.Media.end(
+  session: sessionID,
+  context: contextID,
+  as: Identity
+)
+```
+
+Termination is signaled through the context. Participants tear down WebRTC connections. Session end is recorded in the event log.
+
+---
+
+## 12. Wire Format Sketch
 
 What actually moves on the network. All messages are encrypted with the context key before reaching transport — relays only see opaque blobs.
 
@@ -1260,7 +1326,7 @@ Attached to data crossing context boundaries:
 
 ---
 
-## 12. Data Provenance (§7.7)
+## 13. Data Provenance (§7.7)
 
 ### Provenance Type
 
@@ -1342,7 +1408,7 @@ agent.send(
 
 ---
 
-## 13. Discovery (§6.2.2)
+## 14. Discovery (§6.2.2)
 
 ### Unified Discovery
 
@@ -1412,11 +1478,11 @@ SCP.Discovery.addContext(
 
 ---
 
-## 14. What's Not Here Yet
+## 15. What's Not Here Yet
 
 Implementation specifics that require Tier 1/Tier 2 design work:
 
-- **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in .docs/specs/ §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §14 below.
+- **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in .docs/specs/ §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §16 below.
 - **~~DID method selection.~~** ✅ **Resolved.** did:dht selected as primary method (self-certifying, key rotation via DID document versioning). did:web exists as contingency fallback only if did:dht libraries prove unusable — not a planned deployment path. See .docs/specs/ §9.6 for security properties of each.
 - **~~Transport abstraction interface.~~** ✅ **Resolved.** ADR-005 specifies the `TransportAdapter` trait (connect, send, subscribe, query, disconnect). Envelope format specified in .docs/specs/ §9.10.2 (minimal outer envelope).
 - **~~SCP native relay protocol.~~** ✅ **Resolved.** ADR-004 specifies the relay: PUBLISH/SUBSCRIBE/UNSUBSCRIBE over WebSocket, blob TTL enforcement, recipient_hint for directed delivery.
@@ -1438,7 +1504,7 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 
 ---
 
-## 15. Security APIs (§9 — Cryptographic Security Model)
+## 16. Security APIs (§9 — Cryptographic Security Model)
 
 Security-related APIs that surface the cryptographic security model defined in .docs/specs/ §9.
 
