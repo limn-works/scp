@@ -32,47 +32,21 @@ Identity is DID-based, and authorization uses UCANs — capability tokens that a
 Encryption combines MLS for group forward secrecy with a sender-side AES-256 layer for selective readability within contexts. Each message is signed, encrypted twice, padded, pseudonymized on send, then verified, decrypted, checked for replay, validated against capability tokens, and authenticated on receive. Provenance is structural — every message, tool output, and cross-context data transfer carries verifiable origin metadata.
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│  APPLICATIONS                                              │
-│  Apps · Agent scripts · LLM-built clients                  │
-│                                                            │
-│  ════════════════════════════════════════════════════════  │
-│                                                            │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  SCP SDK                                             │  │
-│  │                                                      │  │
-│  │  Public API                                           │  │
-│  │  Python · Swift · TypeScript · Kotlin · Rust         │  │
-│  │                                                      │  │
-│  │  ┌────────────────────────────────────────────────┐  │  │
-│  │  │  Protocol Engine (Rust)                        │  │  │
-│  │  │  Context · Identity · Trust · Discovery        │  │  │
-│  │  │                                                │  │  │
-│  │  │  ┌──────────────────────────────────────────┐  │  │  │
-│  │  │  │  Crypto: MLS · UCAN · Merkle trees       │  │  │  │
-│  │  │  └──────────────────────────────────────────┘  │  │  │
-│  │  └────────────────────────────────────────────────┘  │  │
-│  │                                                      │  │
-│  │  ┌────────────────────────────────────────────────┐  │  │
-│  │  │  Adapters                                      │  │  │
-│  │  │  Transport: SCP native · Nostr · Matrix ·      │  │  │
-│  │  │    libp2p · Hyperswarm · WebSocket · +more     │  │  │
-│  │  │  Platform: Keys · Storage · Push               │  │  │
-│  │  │  Bridges: X · Bluesky · Discord                │  │  │
-│  │  └────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                            │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Infrastructure (existing, not owned)                │  │
-│  │  SCP relays · Nostr relays · DHT · Hyperswarm ·      │  │
-│  │  libp2p · Matrix homeservers                         │  │
-│  └──────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────┘
+  Applications — apps, agent scripts, LLM-built clients
+        ↕
+  Client SDK — identity, contexts, encryption, transport
+  Server SDK — relay operation, message routing, storage
+        ↕
+  Protocol Engine (Rust) — contexts, identity, trust, discovery
+        ↕
+  Crypto — MLS · UCAN · Merkle trees
+        ↕
+  Transport — SCP relay, Nostr, Matrix, libp2p, WebSocket, +more
 ```
 
 ## Why This Works
 
-For decades, distributed networks have remained niche interests that generally don’t scale. The ones that get significant adoption typically end up being single-client anyway, with the creator as the primary operator. Adoption has never become viral mainly because most people — even the technically inclined — simply do not want to set up and manage a server.
+Distributed network protocols have historically remained niche because most people — even the technically inclined — simply do not want to set up and manage a server.
 
 As of 2026, the landscape has changed. All the barriers are disappearing. People still have little interest in the work of self-hosting, but they will become interested in the benefits. Choosing and paying hosting-as-a-service providers will become a mainstream headache the way streaming has, and people will question why they have to subscribe to have a computer to run code they already own, when they’ve got a perfectly good one in their own home.
 
@@ -131,28 +105,3 @@ The protocol engine is written in Rust, with bindings targeting the ecosystems w
 The SDK ships as two independent halves. The **Client SDK** handles identity management, context participation, encryption, and transport — everything an application needs to join contexts. The **Server SDK** handles relay operation, message routing, and storage — everything needed to run SCP infrastructure. Any client can connect to any conforming relay; relay operators need no knowledge of client implementations.
 
 Transport is fully abstracted behind an adapter trait. The SCP native relay is the canonical reference implementation, with adapters for Nostr, Matrix, libp2p, Hyperswarm, WebSocket/WebRTC, and more.
-
-## Project Structure
-
-```
-scp/
-└── .docs/
-    ├── architecture.md  # Engineering blueprint
-    ├── sketch.md        # API surface sketches
-    ├── adrs/            # Architecture Decision Records (3 phases)
-    ├── specs/           # Protocol specification (including open questions)
-    ├── standards/       # Coding and workflow standards
-    └── lessons/         # Evergreen learnings
-```
-
-## Contributing
-
-SCP is being built in the open. The best way to get oriented:
-
-1. **Start with the spec.** [`.docs/specs/`](.docs/specs/) is the protocol design — what SCP is and how it works. [`.docs/architecture.md`](.docs/architecture.md) is the engineering blueprint.
-2. **Read the ADRs.** [`.docs/adrs/`](.docs/adrs/) covers all three build phases with full Architecture Decision Records.
-3. **Weigh in on open questions.** [`.docs/specs/00-open-questions.md`](.docs/specs/00-open-questions.md) has design decisions that would benefit from more perspectives.
-
-## License
-
-TBD
