@@ -15,6 +15,7 @@ jobs:
       contents: write
       pull-requests: write
       actions: read
+      id-token: write
     steps:
       - name: Get PR info
         id: pr
@@ -59,10 +60,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: claude-sonnet-4-20250514
-          max_turns: 20
-          timeout_minutes: 30
-          direct_prompt: |
+          claude_args: "--model claude-sonnet-4-20250514 --max-turns 20"
+          prompt: |
             CI has failed on PR #${{ steps.pr.outputs.number }} (branch: ${{ steps.pr.outputs.branch }}).
 
             ## Step 1: Get the failure logs

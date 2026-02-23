@@ -12,6 +12,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,10 +23,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: claude-opus-4-20250514
-          max_turns: 30
-          timeout_minutes: 45
-          direct_prompt: |
+          claude_args: "--model claude-opus-4-20250514 --max-turns 30"
+          prompt: |
             You are an artifact health auditor for the SCP project. Your job is to read
             all documentation artifacts under `.docs/` and check for staleness,
             contradictions, misalignment, and open question hygiene.

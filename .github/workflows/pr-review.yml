@@ -13,6 +13,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,10 +24,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: claude-opus-4-20250514
-          max_turns: 40
-          timeout_minutes: 60
-          direct_prompt: |
+          claude_args: "--model claude-opus-4-20250514 --max-turns 40"
+          prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
 
             Perform a comprehensive multi-perspective review of this PR. For each perspective,

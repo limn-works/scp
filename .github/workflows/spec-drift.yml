@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,10 +26,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: claude-sonnet-4-20250514
-          max_turns: 15
-          timeout_minutes: 20
-          direct_prompt: |
+          claude_args: "--model claude-sonnet-4-20250514 --max-turns 15"
+          prompt: |
             Check PR #${{ github.event.pull_request.number }} for spec drift — implementation
             that diverges from the project's specifications.
 

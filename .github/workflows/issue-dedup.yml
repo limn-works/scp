@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       issues: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,10 +18,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: claude-sonnet-4-20250514
-          max_turns: 10
-          timeout_minutes: 10
-          direct_prompt: |
+          claude_args: "--model claude-sonnet-4-20250514 --max-turns 10"
+          prompt: |
             Check if issue #${{ github.event.issue.number }} is a duplicate.
 
             New issue title: "${{ github.event.issue.title }}"
