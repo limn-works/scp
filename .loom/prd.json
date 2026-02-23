@@ -7,56 +7,85 @@
       "name": "Workspace Foundation",
       "priority": "P0",
       "status": "pending",
-      "stories": ["SCP-001"]
+      "stories": [
+        "SCP-001"
+      ]
     },
     {
       "id": "gate-platform",
       "name": "Platform Abstractions (ADR-006)",
       "priority": "P0",
       "status": "pending",
-      "stories": ["SCP-002", "SCP-003"]
+      "stories": [
+        "SCP-002",
+        "SCP-003"
+      ]
     },
     {
       "id": "gate-identity",
       "name": "Decentralized Identity (ADR-003)",
       "priority": "P0",
       "status": "pending",
-      "stories": ["SCP-004", "SCP-005", "SCP-006"]
+      "stories": [
+        "SCP-004",
+        "SCP-005",
+        "SCP-006"
+      ]
     },
     {
       "id": "gate-mls",
       "name": "MLS Encryption Wrapper (ADR-001)",
       "priority": "P0",
       "status": "pending",
-      "stories": ["SCP-007", "SCP-008", "SCP-009", "SCP-010"]
+      "stories": [
+        "SCP-007",
+        "SCP-008",
+        "SCP-009",
+        "SCP-010"
+      ]
     },
     {
       "id": "gate-envelope",
       "name": "Envelope Format (ADR-002)",
       "priority": "P0",
       "status": "pending",
-      "stories": ["SCP-011", "SCP-012", "SCP-013"]
+      "stories": [
+        "SCP-011",
+        "SCP-012",
+        "SCP-013"
+      ]
     },
     {
       "id": "gate-sender-keys",
       "name": "Sender-Side Key Layer (ADR-007)",
       "priority": "P0",
       "status": "pending",
-      "stories": ["SCP-014", "SCP-015", "SCP-016"]
+      "stories": [
+        "SCP-014",
+        "SCP-015",
+        "SCP-016"
+      ]
     },
     {
       "id": "gate-transport",
       "name": "Transport + Native Relay (ADR-005, ADR-004)",
       "priority": "P0",
       "status": "pending",
-      "stories": ["SCP-017", "SCP-018", "SCP-019", "SCP-020"]
+      "stories": [
+        "SCP-017",
+        "SCP-018",
+        "SCP-019",
+        "SCP-020"
+      ]
     },
     {
       "id": "gate-integration",
       "name": "Phase 1 Integration Test",
       "priority": "P0",
       "status": "pending",
-      "stories": ["SCP-021"]
+      "stories": [
+        "SCP-021"
+      ]
     }
   ],
   "stories": [
@@ -66,7 +95,7 @@
       "gate": "gate-foundation",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "Cargo.toml",
         "rustfmt.toml",
@@ -114,7 +143,8 @@
       "details": {
         "scaffoldRef": ".docs/scaffold/rust.md",
         "standardsRef": ".docs/standards/rust.md"
-      }
+      },
+      "result": "Workspace scaffold created with 4 crates, all deps declared, cargo build/clippy/fmt all pass clean. Notable: lint group priorities set to -1, multiple_crate_versions allowed for transitive deps, unstable rustfmt options removed."
     },
     {
       "id": "SCP-002",
@@ -146,7 +176,9 @@
         "Define DeviceAttestationToken, PushToken, WakeSignal",
         "Update lib.rs with pub mod traits and re-exports"
       ],
-      "blockedBy": ["SCP-001"],
+      "blockedBy": [
+        "SCP-001"
+      ],
       "details": {
         "adr": "ADR-006",
         "protocolSection": "§16"
@@ -190,7 +222,9 @@
         "Add proptest for crypto operations",
         "Update lib.rs to add pub mod testing"
       ],
-      "blockedBy": ["SCP-002"],
+      "blockedBy": [
+        "SCP-002"
+      ],
       "details": {
         "adr": "ADR-006",
         "protocolSection": "§16"
@@ -229,7 +263,9 @@
         "Implement DID Document construction in identity/document.rs",
         "Write tests using InMemoryKeyCustody"
       ],
-      "blockedBy": ["SCP-003"],
+      "blockedBy": [
+        "SCP-003"
+      ],
       "details": {
         "adr": "ADR-003",
         "protocolSection": "§3",
@@ -264,7 +300,9 @@
         "Implement background republish task with exponential backoff",
         "Write tests (may need pkarr test utilities or mock DHT)"
       ],
-      "blockedBy": ["SCP-004"],
+      "blockedBy": [
+        "SCP-004"
+      ],
       "details": {
         "adr": "ADR-003",
         "protocolSection": "§3"
@@ -299,7 +337,9 @@
         "Define DidRotationEvent, MigrationProof, PreRotationProof structs",
         "Write tests for all rotation scenarios"
       ],
-      "blockedBy": ["SCP-005"],
+      "blockedBy": [
+        "SCP-005"
+      ],
       "details": {
         "adr": "ADR-003",
         "protocolSection": "§3.3"
@@ -335,7 +375,9 @@
         "Define MlsError in error.rs with thiserror",
         "Update mls/mod.rs with pub mod declarations"
       ],
-      "blockedBy": ["SCP-001"],
+      "blockedBy": [
+        "SCP-001"
+      ],
       "details": {
         "adr": "ADR-001",
         "protocolSection": "§9.5, §9.7.1, §17.9"
@@ -372,7 +414,10 @@
         "Implement generate_key_package with buffer management in key_package.rs",
         "Write tests for full group lifecycle"
       ],
-      "blockedBy": ["SCP-007", "SCP-003"],
+      "blockedBy": [
+        "SCP-007",
+        "SCP-003"
+      ],
       "details": {
         "adr": "ADR-001",
         "protocolSection": "§9.7"
@@ -402,7 +447,9 @@
         "Add generation number tracking for replay prevention",
         "Write unit tests and proptest for roundtrip"
       ],
-      "blockedBy": ["SCP-008"],
+      "blockedBy": [
+        "SCP-008"
+      ],
       "details": {
         "adr": "ADR-001",
         "protocolSection": "§9.8.1, §9.8.2"
@@ -437,7 +484,9 @@
         "Implement update for PCS",
         "Write tests including timing-sensitive grace window tests"
       ],
-      "blockedBy": ["SCP-009"],
+      "blockedBy": [
+        "SCP-009"
+      ],
       "details": {
         "adr": "ADR-001",
         "protocolSection": "§9.7.2, §9.7.3"
@@ -477,7 +526,9 @@
         "Update envelope/mod.rs with sub-module declarations",
         "Write unit tests and proptest for padding roundtrip"
       ],
-      "blockedBy": ["SCP-001"],
+      "blockedBy": [
+        "SCP-001"
+      ],
       "details": {
         "adr": "ADR-002",
         "protocolSection": "§9.10.3"
@@ -512,7 +563,10 @@
         "Implement verify_inner_signature in inner.rs",
         "Write tests using InMemoryKeyCustody for signing/verification"
       ],
-      "blockedBy": ["SCP-011", "SCP-003"],
+      "blockedBy": [
+        "SCP-011",
+        "SCP-003"
+      ],
       "details": {
         "adr": "ADR-002",
         "protocolSection": "§9.8.1, §9.10.4"
@@ -542,7 +596,10 @@
         "Implement open_envelope in outer.rs",
         "Write integration tests with MLS encrypt/decrypt from SCP-009"
       ],
-      "blockedBy": ["SCP-012", "SCP-009"],
+      "blockedBy": [
+        "SCP-012",
+        "SCP-009"
+      ],
       "details": {
         "adr": "ADR-002",
         "protocolSection": "§9.8"
@@ -576,7 +633,9 @@
         "Implement SenderKeyStore with HashMap in mod.rs",
         "Write unit tests and proptest"
       ],
-      "blockedBy": ["SCP-001"],
+      "blockedBy": [
+        "SCP-001"
+      ],
       "details": {
         "adr": "ADR-007",
         "protocolSection": "§9.16"
@@ -610,7 +669,10 @@
         "Implement HPKE open (recipient-side decryption)",
         "Write tests for the full key exchange flow"
       ],
-      "blockedBy": ["SCP-014", "SCP-008"],
+      "blockedBy": [
+        "SCP-014",
+        "SCP-008"
+      ],
       "details": {
         "adr": "ADR-007",
         "protocolSection": "§9.16.2"
@@ -643,7 +705,9 @@
         "Implement auto-rotation response to block notification",
         "Write tests for mutual block scenario"
       ],
-      "blockedBy": ["SCP-015"],
+      "blockedBy": [
+        "SCP-015"
+      ],
       "details": {
         "adr": "ADR-007",
         "protocolSection": "§9.16"
@@ -677,7 +741,9 @@
         "Implement TransportManager with single-adapter delegation in manager.rs",
         "Update lib.rs with module declarations and re-exports"
       ],
-      "blockedBy": ["SCP-011"],
+      "blockedBy": [
+        "SCP-011"
+      ],
       "details": {
         "adr": "ADR-005",
         "protocolSection": "§9.9"
@@ -712,7 +778,9 @@
         "Define error code constants in error.rs",
         "Write roundtrip serialization tests for all variants"
       ],
-      "blockedBy": ["SCP-001"],
+      "blockedBy": [
+        "SCP-001"
+      ],
       "details": {
         "adr": "ADR-004",
         "protocolSection": "§Wire Format section of ADR-004"
@@ -754,7 +822,9 @@
         "Implement PING/PONG keepalive",
         "Write integration tests: publish then subscribe, backfill, expiry"
       ],
-      "blockedBy": ["SCP-018"],
+      "blockedBy": [
+        "SCP-018"
+      ],
       "details": {
         "adr": "ADR-004",
         "protocolSection": "§9.9, §10.5"
@@ -794,7 +864,10 @@
         "Map all TransportAdapter methods to relay protocol operations",
         "Write integration tests against the relay server from SCP-019"
       ],
-      "blockedBy": ["SCP-019", "SCP-017"],
+      "blockedBy": [
+        "SCP-019",
+        "SCP-017"
+      ],
       "details": {
         "adr": "ADR-004, ADR-005",
         "protocolSection": "§9.9, §9.13"
@@ -832,7 +905,12 @@
         "Assert all verification steps pass",
         "Assert relay opacity (only routing_id visible, content encrypted)"
       ],
-      "blockedBy": ["SCP-004", "SCP-013", "SCP-015", "SCP-020"],
+      "blockedBy": [
+        "SCP-004",
+        "SCP-013",
+        "SCP-015",
+        "SCP-020"
+      ],
       "details": {
         "adr": "Phase 1 Integration Test (end of ADR document)",
         "protocolSection": "All",
