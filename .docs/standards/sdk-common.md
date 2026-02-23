@@ -213,7 +213,11 @@ try await channel.send("Are you available for the 3pm sync?")
 
 ## CI Matrix
 
-Every SDK has a CI pipeline that runs on every PR:
+SDK CI follows the same three-tier structure as the Rust core. See `specs/16-test-infrastructure.md` §16.15 for the full tier definitions. Each language-specific standards file inherits these tiers and may add language-specific jobs.
+
+### Tier 1 — PR Checks
+
+Every push to a PR branch. Target: < 3 minutes. Must pass before review.
 
 | Check | All SDKs |
 |-------|----------|
@@ -221,10 +225,33 @@ Every SDK has a CI pipeline that runs on every PR:
 | Format | Language-specific formatter (see per-language standards) |
 | Type check | Static type analysis where available |
 | Unit tests | Language test framework |
-| Conformance tests | Cross-language JSON fixtures |
 | Security scan | Dependency audit and vulnerability scanning (cargo-deny, pip-audit, npm audit, etc.) |
 | Build | Release build for all target platforms |
 | Docs | Documentation generation (verify no broken links) |
+
+### Tier 2 — Merge Gate
+
+Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
+
+| Check | All SDKs |
+|-------|----------|
+| All Tier 1 checks | (same as above) |
+| Conformance tests | Cross-language JSON fixtures (wrapping key lifecycle, reorder buffer, error hierarchy, etc.) |
+| Binding integration tests | End-to-end through FFI bridge: identity creation → context join → message roundtrip |
+
+Conformance tests exercise cross-language fixtures that validate protocol behavior across SDK boundaries. They are more thorough than unit tests and require the Rust core to be built, so they run at the merge gate rather than on every push.
+
+### Tier 3 — Nightly / Pre-Release
+
+Scheduled (nightly) or manual trigger. Uncapped duration. Failures create issues but do not block merges.
+
+| Check | All SDKs |
+|-------|----------|
+| All Tier 2 checks | (same as above) |
+| Extended conformance | Full fixture suite with edge cases and adversarial inputs |
+| Multi-platform matrix | All target platforms × all supported language versions |
+
+No SDK release without 100% conformance pass (see `.docs/scaffold/shared.md`).
 
 ## Conformance Test Descriptions
 

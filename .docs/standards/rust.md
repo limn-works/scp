@@ -168,12 +168,46 @@ cargo doc --workspace --no-deps
 
 ## CI Matrix
 
-| Job | Runs on | Trigger |
+Tests are organized into three tiers. See `specs/16-test-infrastructure.md` §16.15 for the full tier definitions, §16.13 test assignments, and feature flag conventions.
+
+### Tier 1 — PR Checks
+
+Every push to a PR branch. Target: < 3 minutes.
+
+| Job | Runs on | Command |
 |-----|---------|---------|
-| fmt | ubuntu-latest | Every PR |
-| clippy | ubuntu-latest | Every PR |
-| test | ubuntu-latest, macos-latest | Every PR |
-| build-release | ubuntu-latest, macos-latest, windows-latest | Every PR |
-| doc | ubuntu-latest | Every PR |
-| deny | ubuntu-latest | Every PR, weekly |
-| proptest (extended) | ubuntu-latest | Nightly, pre-release |
+| fmt | ubuntu-latest | `cargo fmt --all -- --check` |
+| clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings` |
+| test | ubuntu-latest, macos-latest | `cargo nextest run --workspace` |
+| build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
+| doc | ubuntu-latest | `cargo test --workspace --doc && cargo doc --workspace --no-deps` |
+| deny | ubuntu-latest | `cargo deny check` |
+
+Unit tests and conformance macro suites (`transport_conformance!()`, `storage_conformance!()`, etc.) run as part of `cargo nextest run --workspace` against in-memory implementations.
+
+### Tier 2 — Merge Gate
+
+Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
+
+| Job | Runs on | Command |
+|-----|---------|---------|
+| All Tier 1 jobs | (same as above) | (same as above) |
+| harness meta-tests | ubuntu-latest, macos-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2` |
+| phase integration | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2 -E 'test(phase_integration)'` |
+
+Harness meta-tests cover §16.13.1–10: InMemoryRelay, InMemoryTransport, SimulatedClock, NetworkTopology, ScenarioBuilder, determinism, ProtocolStore, MlsStorageBridge, assertion library, and preset scenario validation. Phase integration runs the current phase's end-to-end test (P1 in Phase 1, P2 in Phase 2, etc.).
+
+### Tier 3 — Nightly / Pre-Release
+
+Scheduled (nightly) or manual trigger. Uncapped duration. Failures create issues but do not block merges.
+
+| Job | Runs on | Command |
+|-----|---------|---------|
+| All Tier 2 jobs | (same as above) | (same as above) |
+| proptest extended | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier3 -E 'test(proptest)'` |
+| N-party simulation (multi-seed) | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier3 -E 'test(preset_.*_all_seeds)'` |
+| persistent backend conformance | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier3 -E 'test(conformance.*sqlite\|conformance.*redb)'` |
+| wasm conformance | ubuntu-latest | `wasm-pack test --headless --chrome crates/scp-platform-web` (Phase 4+) |
+| load testing | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier3 -E 'test(load_test)'` (Phase 6) |
+
+`deny` also runs weekly on a schedule independent of all tiers.
