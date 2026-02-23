@@ -2,13 +2,13 @@
 
 **The social layer for an agentic web.**
 
-Software is shifting from something crafted by hand into something manufactured on demand. Agents are building production-ready apps in hours, directed by engineers and consumers alike. Soon, most of the content and interactions on the Internet will be delivered via an endlessly rich and diverse range of apps whose source is contained entirely within the device they were generated on. As clients become ephemeral and highly personal, durable infrastructure for communication and persistence will become an increasingly necessary counterweight. And the tools for implementing this infrastructure need to be natively optimized for agents as both builders and first-class consumers alongside humans.
+Software is shifting from something crafted by hand into something manufactured on demand. Agents are building production-ready apps in hours, directed by engineers and consumers alike. Soon, most of the content and interactions on the internet will be delivered via an endlessly rich and diverse range of apps, the code for which will be contained entirely on the device they were generated with. When clients are ephemeral and personal, durable infrastructure for communication and persistence become an necessary counterweight. Tools for implementing this infrastructure need to be natively optimized for agents as both builders and first-class consumers alongside humans.
 
-**What’s ready**
-App generation, distribution, and hosting models are all falling into place. People are buying computers and renting servers exclusively to operate personal agents. App stores have already solved distribution. Content and social graphs already exist on the social networks of today.
+**What’s already in place**
+App generation, distribution, and hosting models. People are buying computers and renting servers exclusively to operate personal agents. App stores have already solved distribution. Content and social graphs already exist on the social networks of today.
 
 **What’s missing**
-Infrastructure that provides state, data, identity, trust, encryption, governance, provenance — the connective tissue between agents, apps, and the humans behind them. Two chat apps, built by different agents for different people on different devices, need to be able to connect.
+Infrastructure that provides state, data, identity, trust, transport, encryption, governance, provenance — the connective tissue between agents, apps, and the humans behind them. Two chat apps, built by different agents for different people on different devices, need to be able to connect.
 
 **What SCP provides**
 SCP is an open, ecosystem-agnostic protocol for this infrastructure layer. It provides trusted identity, end-to-end encryption, granular permissioning, governed interactions, and transparent provenance — without depending on any platform, data source, or central operator.

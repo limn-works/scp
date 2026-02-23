@@ -1,11 +1,11 @@
 .DS_Store
 .fastembed_cache/
 
-# Ralph autonomous loop
-.ralph/logs/
-.ralph/.stop
-.ralph/.pid
-.ralph/.directive
-.ralph/.piped_directive
-.ralph/.iteration_marker
-.ralph/ralph.log
+# Loom autonomous loop
+.loom/logs/
+.loom/.stop
+.loom/.pid
+.loom/.directive
+.loom/.piped_directive
+.loom/.iteration_marker
+.loom/loom.log
