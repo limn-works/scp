@@ -1,35 +1,843 @@
 {
-  "project": "my-project",
-  "description": "Replace this with your project description.",
+  "project": "scp",
+  "description": "Phase 1 Crypto Proof — all 7 ADRs. Two Rust processes exchange encrypted messages through the SCP native relay. The relay sees nothing.",
   "gates": [
     {
-      "id": "gate-1",
-      "name": "Example Gate — replace with your own",
+      "id": "gate-foundation",
+      "name": "Workspace Foundation",
       "priority": "P0",
       "status": "pending",
-      "stories": ["EXAMPLE-001"]
+      "stories": ["SCP-001"]
+    },
+    {
+      "id": "gate-platform",
+      "name": "Platform Abstractions (ADR-006)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": ["SCP-002", "SCP-003"]
+    },
+    {
+      "id": "gate-identity",
+      "name": "Decentralized Identity (ADR-003)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": ["SCP-004", "SCP-005", "SCP-006"]
+    },
+    {
+      "id": "gate-mls",
+      "name": "MLS Encryption Wrapper (ADR-001)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": ["SCP-007", "SCP-008", "SCP-009", "SCP-010"]
+    },
+    {
+      "id": "gate-envelope",
+      "name": "Envelope Format (ADR-002)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": ["SCP-011", "SCP-012", "SCP-013"]
+    },
+    {
+      "id": "gate-sender-keys",
+      "name": "Sender-Side Key Layer (ADR-007)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": ["SCP-014", "SCP-015", "SCP-016"]
+    },
+    {
+      "id": "gate-transport",
+      "name": "Transport + Native Relay (ADR-005, ADR-004)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": ["SCP-017", "SCP-018", "SCP-019", "SCP-020"]
+    },
+    {
+      "id": "gate-integration",
+      "name": "Phase 1 Integration Test",
+      "priority": "P0",
+      "status": "pending",
+      "stories": ["SCP-021"]
     }
   ],
   "stories": [
     {
-      "id": "EXAMPLE-001",
-      "title": "Example story — delete this and add your own",
-      "gate": "gate-1",
+      "id": "SCP-001",
+      "title": "Initialize Rust workspace with all crate stubs and tooling",
+      "gate": "gate-foundation",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "Cargo.toml",
+        "rustfmt.toml",
+        ".clippy.toml",
+        "crates/scp-core/Cargo.toml",
+        "crates/scp-core/src/lib.rs",
+        "crates/scp-core/src/crypto/mod.rs",
+        "crates/scp-core/src/crypto/mls/mod.rs",
+        "crates/scp-core/src/crypto/sender_keys/mod.rs",
+        "crates/scp-core/src/identity/mod.rs",
+        "crates/scp-core/src/envelope/mod.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/lib.rs",
+        "crates/scp-transport/src/native/mod.rs",
+        "crates/scp-platform/Cargo.toml",
+        "crates/scp-platform/src/lib.rs",
+        "crates/scp-testing/Cargo.toml",
+        "crates/scp-testing/src/lib.rs"
+      ],
+      "description": "Create the Rust workspace skeleton for all SCP crates. Pure scaffolding — no business logic, no trait definitions. Directory structure, Cargo.toml files with ALL dependencies declared, empty module stubs, and tooling config.\n\nLayout follows `.docs/scaffold/rust.md`. Standards from `.docs/standards/rust.md`: edition 2024, `#![forbid(unsafe_code)]` on every crate, workspace-level clippy lints.\n\nDeclare ALL workspace dependencies upfront in `[workspace.dependencies]` so no subsequent story needs to modify any Cargo.toml. Individual crates reference these with `dep.workspace = true`.\n\nAll module stubs are valid empty Rust modules with `//!` doc comments. Parent mod.rs files declare all sub-modules with `pub mod` so downstream stories populate child files without touching parents.",
+      "acceptanceCriteria": [
+        "`cargo build --workspace` succeeds with zero errors",
+        "`cargo clippy --workspace --all-targets -- -D warnings` produces zero warnings",
+        "`cargo fmt --all -- --check` passes",
+        "Workspace root Cargo.toml has resolver=\"2\", members: scp-core, scp-transport, scp-platform, scp-testing",
+        "[workspace.package] sets edition=\"2024\"",
+        "[workspace.dependencies] declares: openmls, tokio, serde, serde_json, thiserror, ed25519-dalek, x25519-dalek, pkarr, z-base-32, sha2, hmac, hkdf, aes-gcm, rmp-serde, rand, rand_chacha, futures, tracing, tracing-subscriber, tokio-tungstenite, async-trait, proptest (dev)",
+        "[workspace.lints.clippy] sets: all=warn, pedantic=warn, nursery=warn, cargo=warn, unwrap_used=deny, expect_used=deny, panic=deny",
+        "Every crate lib.rs has `#![forbid(unsafe_code)]`",
+        "rustfmt.toml: edition=2024, max_width=100, tab_spaces=4, use_field_init_shorthand=true, use_try_shorthand=true, imports_granularity=Crate, group_imports=StdExternalCrate",
+        ".clippy.toml: cognitive-complexity-threshold = 25",
+        "scp-core declares modules: crypto, identity, envelope",
+        "crypto/mod.rs declares: mls, sender_keys",
+        "scp-transport declares: native"
+      ],
+      "actionItems": [
+        "Create workspace root Cargo.toml",
+        "Create rustfmt.toml and .clippy.toml",
+        "Create all 4 crate Cargo.toml files with workspace dep references",
+        "Create all lib.rs files with module declarations and #![forbid(unsafe_code)]",
+        "Create all sub-module mod.rs stubs with //! doc comments",
+        "Verify cargo build, clippy, fmt all pass"
+      ],
+      "blockedBy": [],
+      "details": {
+        "scaffoldRef": ".docs/scaffold/rust.md",
+        "standardsRef": ".docs/standards/rust.md"
+      }
+    },
+    {
+      "id": "SCP-002",
+      "title": "Define platform abstraction traits and supporting types",
+      "gate": "gate-platform",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/traits.rs",
+        "crates/scp-platform/src/lib.rs"
+      ],
+      "description": "Define the four platform abstraction traits and all supporting types in `crates/scp-platform/src/traits.rs`. The trait signatures MUST match ADR-006 acceptance criteria 5 exactly.\n\nKey constraints:\n- `KeyHandle` is opaque: `pub struct KeyHandle(pub(crate) u64)` — pub(crate) lets testing adapters create handles.\n- All traits are `Send + Sync` bounded.\n- Use `#[async_trait]` for object safety (`Box<dyn KeyCustody>` must work).\n- `derive_pseudonym` doc comment must specify the exact algorithm: HMAC-SHA256(key_material, context_id || \"scp-pseudonym\") -> Ed25519_keygen(seed[0..32]).\n\nUpdate lib.rs to `pub mod traits; pub use traits::*;`.",
+      "acceptanceCriteria": [
+        "`cargo build -p scp-platform` succeeds with zero warnings",
+        "KeyCustody trait has 7 methods: generate_keypair, sign, public_key, destroy_key, dh_agree, derive_pseudonym, custody_type",
+        "Storage trait has 6 methods: store, retrieve, delete, list_keys, delete_prefix, exists",
+        "DeviceAttestation trait has 2 methods: attest, verify",
+        "Push trait has 2 methods: register, handle_notification",
+        "KeyType enum: Ed25519, X25519 — derives Debug, Clone, Copy, PartialEq, Eq",
+        "KeyHandle is newtype around u64 with pub(crate) field",
+        "PlatformError has at least: KeyNotFound, InvalidKeyType, CustodyUnavailable, StorageError, SigningFailed",
+        "All traits are Send + Sync",
+        "All public items have /// doc comments"
+      ],
+      "actionItems": [
+        "Create traits.rs with all four traits per ADR-006",
+        "Define KeyHandle, KeyType, CustodyType, PseudonymKeypair, Signature, SharedSecret, PublicKey, PlatformError",
+        "Define DeviceAttestationToken, PushToken, WakeSignal",
+        "Update lib.rs with pub mod traits and re-exports"
+      ],
+      "blockedBy": ["SCP-001"],
+      "details": {
+        "adr": "ADR-006",
+        "protocolSection": "§16"
+      }
+    },
+    {
+      "id": "SCP-003",
+      "title": "Implement all in-memory platform testing adapters",
+      "gate": "gate-platform",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/testing/mod.rs",
+        "crates/scp-platform/src/testing/key_custody.rs",
+        "crates/scp-platform/src/testing/storage.rs",
+        "crates/scp-platform/src/testing/attestation.rs",
+        "crates/scp-platform/src/testing/push.rs",
+        "crates/scp-platform/src/lib.rs"
+      ],
+      "description": "Implement in-memory versions of all four platform traits for testing.\n\n**InMemoryKeyCustody**: HashMap<u64, SigningKey> for Ed25519, HashMap<u64, StaticSecret> for X25519. AtomicU64 handle counter. `derive_pseudonym`: HMAC-SHA256(secret_bytes, context_id || b\"scp-pseudonym\") → Ed25519 seed from first 32 bytes. `with_seed(u64)` constructor for deterministic tests via ChaCha20Rng.\n\n**InMemoryStorage**: RwLock<HashMap<String, Vec<u8>>>. list_keys sorts lexicographically. delete_prefix uses retain.\n\n**InMemoryDeviceAttestation**: Fixed synthetic tokens. verify returns true for own tokens.\n\n**InMemoryPush**: Random hex PushToken. Passthrough notification.\n\nAll use tokio::sync::RwLock for Send + Sync. Comprehensive tests including proptest for crypto roundtrips.",
+      "acceptanceCriteria": [
+        "`cargo test -p scp-platform` all green",
+        "Ed25519 sign then verify roundtrip succeeds",
+        "X25519 DH agreement is symmetric (Alice+Bob == Bob+Alice)",
+        "derive_pseudonym is deterministic for same inputs",
+        "derive_pseudonym differs for different context_ids",
+        "sign returns error for X25519 handles, dh_agree returns error for Ed25519 handles",
+        "destroy_key makes handle unusable",
+        "with_seed produces reproducible key sequences",
+        "Storage store/retrieve roundtrip works",
+        "Storage list_keys returns sorted, prefix-filtered results",
+        "Storage delete_prefix removes matches, returns count",
+        "At least one proptest for sign/verify roundtrip"
+      ],
+      "actionItems": [
+        "Create testing/mod.rs with sub-module declarations",
+        "Implement InMemoryKeyCustody with seeded constructor",
+        "Implement InMemoryStorage, InMemoryDeviceAttestation, InMemoryPush",
+        "Write unit tests for all methods and error cases",
+        "Add proptest for crypto operations",
+        "Update lib.rs to add pub mod testing"
+      ],
+      "blockedBy": ["SCP-002"],
+      "details": {
+        "adr": "ADR-006",
+        "protocolSection": "§16"
+      }
+    },
+    {
+      "id": "SCP-004",
+      "title": "Implement DID creation, verification, and DidMethod trait",
+      "gate": "gate-identity",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/mod.rs",
+        "crates/scp-core/src/identity/dht.rs",
+        "crates/scp-core/src/identity/document.rs"
+      ],
+      "description": "Implement DID creation per ADR-003. This is local-only — no DHT publishing or resolution (that's SCP-005).\n\n`create_identity(key_custody)` generates three keypairs: Identity Key (Ed25519, derives DID string), Active Signing Key (Ed25519, rotatable), Pre-Rotation Key (Ed25519, commitment only). DID string: `did:dht:` + z-base-32(identity_key.public). Constructs DID Document with verification methods.\n\n`verify_did(did_string, public_key)` is a local self-certification check: decode z-base-32 suffix, compare to public key.\n\n`DidMethod` trait abstracts the DID method. `DidDht` implements it.\n\nScpIdentity struct holds: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8;32]), did (String).\n\nDID Document: standard W3C format with verification methods #0 (identity), #active (signing), PreRotationCommitment service.",
+      "acceptanceCriteria": [
+        "`cargo test -p scp-core` identity tests all green",
+        "create_identity returns ScpIdentity with valid did:dht: string",
+        "DID string is z-base-32 encoding of the identity key's public key",
+        "verify_did returns true when public key matches DID suffix",
+        "verify_did returns false for mismatched public key",
+        "DID Document contains verification method #0 (identity key)",
+        "DID Document contains verification method #active (signing key)",
+        "DID Document contains PreRotationCommitment service with SHA-256 hash",
+        "pre_rotation_commitment == SHA-256(pre_rotation_public_key)",
+        "DidMethod trait compiles with create, publish, resolve, verify methods"
+      ],
+      "actionItems": [
+        "Define ScpIdentity struct and IdentityError in identity/mod.rs",
+        "Define DidMethod trait with async methods",
+        "Implement DidDht::create_identity in identity/dht.rs",
+        "Implement verify_did as local z-base-32 decode + compare",
+        "Implement DID Document construction in identity/document.rs",
+        "Write tests using InMemoryKeyCustody"
+      ],
+      "blockedBy": ["SCP-003"],
+      "details": {
+        "adr": "ADR-003",
+        "protocolSection": "§3",
+        "notes": "Use pkarr for z-base-32 encoding. DID Document is JSON-LD — use serde_json for serialization. Do NOT implement publish/resolve here."
+      }
+    },
+    {
+      "id": "SCP-005",
+      "title": "Implement DID publishing and resolution via Mainline DHT",
+      "gate": "gate-identity",
       "priority": "P0",
       "severity": "major",
       "status": "pending",
-      "files": ["src/example.ts"],
-      "description": "Describe what needs to be built or changed.",
+      "files": [
+        "crates/scp-core/src/identity/dht.rs",
+        "crates/scp-core/src/identity/cache.rs"
+      ],
+      "description": "Implement publish_did_document and resolve_did per ADR-003 criteria 2-3.\n\n`publish_did_document(identity)`: publish DID Document to Mainline DHT as BEP44 signed mutable item via pkarr. Monotonically increasing sequence number. Idempotent.\n\nRepublishing strategy: background tokio task every 2 hours. Exponential backoff on failure (30s→30m cap). DhtPublishDegraded warning after 6 failures. Auto-start on identity load, stop on unload.\n\n`resolve_did(did_string)`: resolve via DHT lookup. Verify self-certification (z-base-32 matches key). Verify BEP44 signature. Cache results: 24h refresh for active, 7d for inactive. Return staleness indicator.\n\nResolution cache in identity/cache.rs: TTL-based, BEP44 sequence comparison.",
       "acceptanceCriteria": [
-        "First acceptance criterion",
-        "Second acceptance criterion"
+        "publish_did_document publishes via pkarr to DHT with BEP44 signature",
+        "resolve_did retrieves and verifies DID Document from DHT",
+        "resolve_did verifies self-certification (DID suffix matches public key)",
+        "Resolution cache returns cached results within TTL",
+        "Staleness indicator present when cache entry exceeds 2h + 30m grace",
+        "Republish background task starts on identity creation"
       ],
       "actionItems": [
-        "First implementation step",
-        "Second implementation step"
+        "Implement publish_did_document using pkarr crate for BEP44 mutable items",
+        "Implement DID Document → DNS resource record encoding for did:dht",
+        "Implement resolve_did with DHT lookup and verification",
+        "Create resolution cache with TTL management in cache.rs",
+        "Implement background republish task with exponential backoff",
+        "Write tests (may need pkarr test utilities or mock DHT)"
       ],
-      "blockedBy": [],
-      "details": {}
+      "blockedBy": ["SCP-004"],
+      "details": {
+        "adr": "ADR-003",
+        "protocolSection": "§3"
+      }
+    },
+    {
+      "id": "SCP-006",
+      "title": "Implement DID key rotation and identity migration",
+      "gate": "gate-identity",
+      "priority": "P0",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/dht.rs",
+        "crates/scp-core/src/identity/document.rs"
+      ],
+      "description": "Implement ADR-003 criteria 4a-4c: the three-layer key rotation architecture.\n\n**Layer 1 — rotate_active_key**: Generate new Active Signing Key. Update DID Document (new verification method, retire old as #retired-{seq}). Sign with Identity Key. Publish to DHT with incremented sequence. DID string does NOT change.\n\n**Layer 2 — migrate_identity**: Create new DID using pre-rotation key. Link old → new DID via alsoKnownAs. Old Identity Key signs new. Publish both documents. Return DidRotationEvent.\n\n**Layer 3 — verify_migration**: Verify cryptographic linkage (old key signed new key). Verify pre-rotation proof if present (SHA-256 commitment match). Return strong/moderate assurance level.\n\nDefine DidRotationEvent, MigrationProof, PreRotationProof structs per ADR-003.",
+      "acceptanceCriteria": [
+        "rotate_active_key returns updated Identity with new signing key, same DID",
+        "After rotation, DID Document has new #active method and retired old key",
+        "migrate_identity returns new Identity with different DID string",
+        "Old DID Document has alsoKnownAs pointing to new DID",
+        "verify_migration returns true for valid migration proof",
+        "verify_migration with pre-rotation proof provides strong assurance",
+        "DidRotationEvent contains old_did, new_did, migration_proof, optional pre_rotation_proof"
+      ],
+      "actionItems": [
+        "Implement rotate_active_key in dht.rs",
+        "Update DID Document methods for key retirement in document.rs",
+        "Implement migrate_identity with dual DHT publish",
+        "Implement verify_migration with cryptographic linkage checks",
+        "Define DidRotationEvent, MigrationProof, PreRotationProof structs",
+        "Write tests for all rotation scenarios"
+      ],
+      "blockedBy": ["SCP-005"],
+      "details": {
+        "adr": "ADR-003",
+        "protocolSection": "§3.3"
+      }
+    },
+    {
+      "id": "SCP-007",
+      "title": "Define SCP MLS credential type, storage bridge, and error types",
+      "gate": "gate-mls",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/mod.rs",
+        "crates/scp-core/src/crypto/mls/credential.rs",
+        "crates/scp-core/src/crypto/mls/storage.rs",
+        "crates/scp-core/src/crypto/mls/error.rs"
+      ],
+      "description": "Foundation types for the MLS wrapper. No group operations yet — those are SCP-008.\n\n**credential.rs**: ScpCredential struct containing DID string and UCAN bytes. Must implement OpenMLS's credential interface for use in MLS LeafNode credential field. The ciphersuite is fixed: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519.\n\n**storage.rs**: MlsStorageBridge that wraps scp-platform's Storage trait to implement OpenMLS's StorageProvider trait. Phase 1 uses InMemoryStorage underneath. This bridges OpenMLS's storage needs to SCP's platform abstraction.\n\n**error.rs**: MlsError enum wrapping OpenMLS errors + SCP-specific error variants (EpochExpired, StaleMessage, GroupDestroyed, etc.).\n\nUpdate mod.rs with sub-module declarations.",
+      "acceptanceCriteria": [
+        "`cargo build -p scp-core` succeeds",
+        "ScpCredential holds DID string and UCAN bytes",
+        "ScpCredential can be used with OpenMLS credential types",
+        "MlsStorageBridge implements OpenMLS StorageProvider trait",
+        "MlsStorageBridge delegates to scp-platform Storage trait",
+        "MlsError wraps OpenMLS errors with From impls",
+        "Single ciphersuite constant defined: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
+      ],
+      "actionItems": [
+        "Define ScpCredential in credential.rs",
+        "Define ciphersuite constant",
+        "Implement MlsStorageBridge in storage.rs wrapping platform Storage",
+        "Define MlsError in error.rs with thiserror",
+        "Update mls/mod.rs with pub mod declarations"
+      ],
+      "blockedBy": ["SCP-001"],
+      "details": {
+        "adr": "ADR-001",
+        "protocolSection": "§9.5, §9.7.1, §17.9"
+      }
+    },
+    {
+      "id": "SCP-008",
+      "title": "Implement MLS group lifecycle and KeyPackage generation",
+      "gate": "gate-mls",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/group.rs",
+        "crates/scp-core/src/crypto/mls/key_package.rs",
+        "crates/scp-core/src/crypto/mls/mod.rs"
+      ],
+      "description": "Implement ADR-001 criteria 1-3, 8-9: group lifecycle and KeyPackage management.\n\n**group.rs** — ScpMlsGroup wrapper around OpenMLS MlsGroup:\n- `create_group(credential, storage)`: create MLS group with fixed ciphersuite, one member (creator). Returns ScpMlsGroup handle.\n- `add_member(group, key_package)`: add member via KeyPackage. Returns (Welcome, Commit).\n- `remove_member(group, leaf_index)`: remove member. Returns Commit. O(log n) cost.\n- `destroy_group(group)`: destroy all MLS state — tree secrets, epoch keys, application keys.\n\n**key_package.rs**:\n- `generate_key_package(identity, credential, storage)`: generate single-use KeyPackage signed by Ed25519 key. Buffer of 10 unused KeyPackages, replenish when below 5.\n\nTest using InMemoryKeyCustody + InMemoryStorage.",
+      "acceptanceCriteria": [
+        "create_group returns a group with exactly one member",
+        "add_member returns Welcome message and Commit",
+        "After add_member, group has two members",
+        "remove_member returns Commit and advances epoch",
+        "After remove_member, removed member cannot derive new keys",
+        "destroy_group makes all subsequent operations fail",
+        "generate_key_package returns a valid KeyPackage signed by identity",
+        "KeyPackage buffer replenishes when below 5"
+      ],
+      "actionItems": [
+        "Define ScpMlsGroup wrapper in group.rs",
+        "Implement create_group with fixed ciphersuite",
+        "Implement add_member and remove_member",
+        "Implement destroy_group with complete state destruction",
+        "Implement generate_key_package with buffer management in key_package.rs",
+        "Write tests for full group lifecycle"
+      ],
+      "blockedBy": ["SCP-007", "SCP-003"],
+      "details": {
+        "adr": "ADR-001",
+        "protocolSection": "§9.7"
+      }
+    },
+    {
+      "id": "SCP-009",
+      "title": "Implement MLS encrypt and decrypt with replay prevention",
+      "gate": "gate-mls",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/encrypt.rs"
+      ],
+      "description": "Implement ADR-001 criteria 4-5.\n\n**encrypt(group, plaintext)**: encrypt as MLS PrivateMessage (application message). Ciphertext includes membership_tag HMAC (§9.8.1 inner check). MLS assigns generation number automatically (§9.8.2 layer a).\n\n**decrypt(group, ciphertext)**: decrypt MLS PrivateMessage. Verify membership_tag — reject if sender is not valid group member. Verify generation number — reject if <= highest seen for this sender in this epoch (replay prevention). Return decrypted plaintext.\n\nGeneration number tracking: maintain per-sender, per-epoch highest-seen counter. Reject out-of-order duplicates.",
+      "acceptanceCriteria": [
+        "encrypt then decrypt roundtrip returns original plaintext",
+        "decrypt rejects ciphertext from non-group-member",
+        "decrypt rejects replayed ciphertext (same generation number)",
+        "Generation number tracking is per-sender per-epoch",
+        "Proptest: encrypt/decrypt roundtrip with arbitrary plaintext succeeds"
+      ],
+      "actionItems": [
+        "Implement encrypt in encrypt.rs wrapping OpenMLS create_message",
+        "Implement decrypt wrapping OpenMLS process_message",
+        "Add generation number tracking for replay prevention",
+        "Write unit tests and proptest for roundtrip"
+      ],
+      "blockedBy": ["SCP-008"],
+      "details": {
+        "adr": "ADR-001",
+        "protocolSection": "§9.8.1, §9.8.2"
+      }
+    },
+    {
+      "id": "SCP-010",
+      "title": "Implement MLS epoch ratcheting with EpochGraceStore and update proposals",
+      "gate": "gate-mls",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/ratchet.rs",
+        "crates/scp-core/src/crypto/mls/epoch_grace.rs"
+      ],
+      "description": "Implement ADR-001 criteria 6-7.\n\n**ratchet(group, commit)**: process Commit, advance to new epoch. Old epoch keys enter grace window. Grace window closes when: (a) all members sent in new epoch, or (b) 30 seconds (hard ceiling). After grace closes, old keys destroyed — forward secrecy. Messages arriving after grace are unrecoverable → emit StaleEpochMessage event.\n\n**EpochGraceStore** (epoch_grace.rs): in-memory only, indexed by epoch number, auto-purged by timer. NOT accessible to any code path other than decrypt with matching epoch. Uses tokio::time::sleep for 30s ceiling.\n\n**update(group)**: issue MLS Update proposal — fresh HPKE keypair, ratchet sender's tree path. Post-compromise security. Returns (UpdateProposal, Commit).",
+      "acceptanceCriteria": [
+        "ratchet advances group to new epoch",
+        "Old epoch keys are retained during 30-second grace window",
+        "decrypt with old epoch key succeeds during grace window",
+        "decrypt with old epoch key fails after grace window closes",
+        "StaleEpochMessage event emitted for messages after grace",
+        "EpochGraceStore is in-memory only, not persisted",
+        "update returns UpdateProposal and Commit",
+        "After update is processed, old state compromise doesn't affect new messages"
+      ],
+      "actionItems": [
+        "Implement ratchet in ratchet.rs wrapping OpenMLS commit processing",
+        "Create EpochGraceStore in epoch_grace.rs with timer-based purge",
+        "Implement grace window logic (30s ceiling, all-members-acked fast path)",
+        "Implement update for PCS",
+        "Write tests including timing-sensitive grace window tests"
+      ],
+      "blockedBy": ["SCP-009"],
+      "details": {
+        "adr": "ADR-001",
+        "protocolSection": "§9.7.2, §9.7.3"
+      }
+    },
+    {
+      "id": "SCP-011",
+      "title": "Define envelope structs, bucket padding, and serialization",
+      "gate": "gate-envelope",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/envelope/mod.rs",
+        "crates/scp-core/src/envelope/inner.rs",
+        "crates/scp-core/src/envelope/outer.rs",
+        "crates/scp-core/src/envelope/padding.rs"
+      ],
+      "description": "Define the two-layer envelope format per ADR-002. Struct definitions, MessagePack serialization, and bucket padding. No encryption/signing logic yet (those are SCP-012/013).\n\n**InnerEnvelope** (inner.rs): context_id, sender_did, epoch, generation, sequence, timestamp, payload_hash ([u8;32]), payload (Vec<u8>), provenance (Option<Provenance>), signature ([u8;64]).\n\n**OuterEnvelope** (outer.rs): routing_id ([u8;32]), recipient_hint (Option<[u8;32]>), blob_ttl (u32), encrypted_blob (Vec<u8>). create_outer_envelope constructor.\n\n**Bucket padding** (padding.rs): buckets 256B, 1KB, 4KB, 16KB, 64KB, 256KB. pad_to_bucket appends padding + 4-byte big-endian original length suffix. strip_padding reads length suffix, truncates. Padding format: payload || padding_bytes || length_u32_be.\n\nAll structs derive Serialize/Deserialize for MessagePack via rmp-serde. Proptest for padding roundtrip.",
+      "acceptanceCriteria": [
+        "InnerEnvelope serializes to and deserializes from MessagePack",
+        "OuterEnvelope serializes to and deserializes from MessagePack",
+        "pad_to_bucket pads to correct bucket boundary (256, 1024, 4096, 16384, 65536, 262144)",
+        "strip_padding recovers original payload exactly",
+        "Padding roundtrip: strip_padding(pad_to_bucket(data)) == data for all sizes",
+        "Empty payload pads to 256B bucket",
+        "255-byte payload pads to 256B bucket",
+        "257-byte payload pads to 1KB bucket",
+        "Proptest: padding roundtrip with arbitrary Vec<u8>"
+      ],
+      "actionItems": [
+        "Define InnerEnvelope struct with serde derives in inner.rs",
+        "Define OuterEnvelope struct with serde derives in outer.rs",
+        "Define Provenance struct (basic fields for now)",
+        "Implement pad_to_bucket and strip_padding in padding.rs",
+        "Define bucket size constants",
+        "Update envelope/mod.rs with sub-module declarations",
+        "Write unit tests and proptest for padding roundtrip"
+      ],
+      "blockedBy": ["SCP-001"],
+      "details": {
+        "adr": "ADR-002",
+        "protocolSection": "§9.10.3"
+      }
+    },
+    {
+      "id": "SCP-012",
+      "title": "Implement pseudonym derivation and inner envelope creation with signing",
+      "gate": "gate-envelope",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/envelope/pseudonym.rs",
+        "crates/scp-core/src/envelope/inner.rs"
+      ],
+      "description": "Implement ADR-002 criteria 1-2, 6.\n\n**derive_pseudonym(key_custody, identity_key_handle, context_id)**: delegates to key_custody.derive_pseudonym. Deterministic: same key + context = same pseudonym. Different context = different, unlinkable pseudonym. The pseudonym public key is the routing_id for outer envelopes.\n\n**create_inner_envelope(...)**: compute payload_hash = SHA-256(payload) BEFORE padding. Compute provenance_hash = SHA-256(serialize(provenance)) or SHA-256(0x00) if absent. Sign: Ed25519_sign(SHA-256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash)). Pad payload AFTER signing. Return complete InnerEnvelope.\n\n**verify_inner_signature(inner_envelope, sender_public_key)**: recompute hash, verify Ed25519 signature. Reject if mismatch (payload or provenance tampered).",
+      "acceptanceCriteria": [
+        "derive_pseudonym is deterministic: same inputs → same output",
+        "derive_pseudonym with different context_ids produces different pseudonyms",
+        "create_inner_envelope computes correct payload_hash before padding",
+        "create_inner_envelope signs over context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash",
+        "Payload is padded AFTER signing (signature covers original, not padded, content)",
+        "verify_inner_signature returns true for valid envelope",
+        "verify_inner_signature returns false if payload was tampered",
+        "verify_inner_signature returns false if provenance was stripped or modified",
+        "Absent provenance uses SHA-256(0x00) sentinel in signature"
+      ],
+      "actionItems": [
+        "Implement derive_pseudonym in pseudonym.rs",
+        "Implement create_inner_envelope in inner.rs",
+        "Implement verify_inner_signature in inner.rs",
+        "Write tests using InMemoryKeyCustody for signing/verification"
+      ],
+      "blockedBy": ["SCP-011", "SCP-003"],
+      "details": {
+        "adr": "ADR-002",
+        "protocolSection": "§9.8.1, §9.10.4"
+      }
+    },
+    {
+      "id": "SCP-013",
+      "title": "Implement envelope seal and open pipeline",
+      "gate": "gate-envelope",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/envelope/outer.rs"
+      ],
+      "description": "Implement ADR-002 criteria 4-5, 7: the high-level send/receive pipeline.\n\n**seal_envelope(inner_envelope, mls_group, routing_id, recipient_hint, blob_ttl)**: serialize inner envelope (MessagePack), encrypt via MLS, wrap in OuterEnvelope. This is the primary send path.\n\n**open_envelope(outer_envelope, mls_group, sender_public_key)**: decrypt MLS layer, deserialize inner envelope, verify inner signature, verify payload_hash == SHA-256(stripped_payload). Reject on signature mismatch, hash mismatch, or MLS replay.\n\nThese functions compose ADR-001 (MLS encrypt/decrypt) with ADR-002 (envelope format) into a single call each.",
+      "acceptanceCriteria": [
+        "seal_envelope produces a valid OuterEnvelope with encrypted blob",
+        "open_envelope(seal_envelope(inner)) recovers the original inner envelope",
+        "open_envelope rejects tampered encrypted_blob",
+        "open_envelope verifies inner signature after MLS decryption",
+        "open_envelope verifies payload_hash matches stripped payload",
+        "Full roundtrip: create inner → seal → open → verify matches original"
+      ],
+      "actionItems": [
+        "Implement seal_envelope in outer.rs",
+        "Implement open_envelope in outer.rs",
+        "Write integration tests with MLS encrypt/decrypt from SCP-009"
+      ],
+      "blockedBy": ["SCP-012", "SCP-009"],
+      "details": {
+        "adr": "ADR-002",
+        "protocolSection": "§9.8"
+      }
+    },
+    {
+      "id": "SCP-014",
+      "title": "Implement sender key AES-256-GCM encryption and SenderKeyStore",
+      "gate": "gate-sender-keys",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/mod.rs",
+        "crates/scp-core/src/crypto/sender_keys/encrypt.rs"
+      ],
+      "description": "Implement ADR-007 criteria 1-3, 7: sender key generation, encryption/decryption, and storage.\n\n**generate_sender_key()**: 32 random bytes for AES-256 key.\n\n**encrypt_sender_layer(sender_key, plaintext)**: AES-256-GCM with random 12-byte nonce. Returns nonce || ciphertext || auth_tag.\n\n**decrypt_sender_layer(sender_key, ciphertext)**: decrypt and verify auth tag. Reject on tag mismatch.\n\n**SenderKeyStore**: stores sender keys per (context_id, sender_did). Methods: get, set, remove, get_all. Phase 1 uses in-memory HashMap.",
+      "acceptanceCriteria": [
+        "generate_sender_key produces 32-byte key",
+        "encrypt_sender_layer then decrypt_sender_layer returns original plaintext",
+        "decrypt_sender_layer rejects tampered ciphertext (auth tag fails)",
+        "decrypt_sender_layer rejects wrong key",
+        "SenderKeyStore get/set roundtrip works",
+        "SenderKeyStore remove makes get return None",
+        "SenderKeyStore get_all returns all keys for a context",
+        "Proptest: encrypt/decrypt roundtrip with arbitrary plaintext"
+      ],
+      "actionItems": [
+        "Define SenderKey type and generate_sender_key in mod.rs",
+        "Implement encrypt_sender_layer and decrypt_sender_layer in encrypt.rs using aes-gcm crate",
+        "Implement SenderKeyStore with HashMap in mod.rs",
+        "Write unit tests and proptest"
+      ],
+      "blockedBy": ["SCP-001"],
+      "details": {
+        "adr": "ADR-007",
+        "protocolSection": "§9.16"
+      }
+    },
+    {
+      "id": "SCP-015",
+      "title": "Implement pull-based sender key distribution protocol",
+      "gate": "gate-sender-keys",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/key_protocol.rs",
+        "crates/scp-core/src/crypto/sender_keys/mod.rs"
+      ],
+      "description": "Implement ADR-007 criteria 4a-4c: pull-based sender key distribution.\n\n**Wire types** (MLS application messages):\n- SenderKeyEpochAdvance: sender_did, epoch, signature (signs context_id || sender_did || \"key_epoch\" || epoch)\n- SenderKeyRequest: requester_did, sender_did, epoch, wrapping_pubkey (X25519), signature\n- SenderKeyResponse: sender_did, epoch, hpke_sealed_key, ephemeral_pubkey (X25519)\n\n**publish_sender_key_epoch_advance**: sign and broadcast. O(1) cost.\n**request_sender_key**: generate ephemeral X25519 wrapping key, sign request, send with recipient_hint. O(1).\n**handle_sender_key_request**: verify signature, check block list, HPKE-encrypt sender key to requester's wrapping key. O(1).\n\nHPKE assembly: ephemeral X25519 keypair → ECDH → HKDF → AES-128-GCM encrypt sender key. Ephemeral public in response.",
+      "acceptanceCriteria": [
+        "SenderKeyEpochAdvance signature verifies correctly",
+        "request_sender_key creates valid signed request with X25519 wrapping key",
+        "handle_sender_key_request returns HPKE-sealed key for non-blocked requester",
+        "handle_sender_key_request returns None for blocked requester",
+        "Recipient can decrypt HPKE-sealed key using their wrapping private key",
+        "Full flow: publish advance → request → handle request → decrypt response → sender key matches original"
+      ],
+      "actionItems": [
+        "Define SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse structs",
+        "Implement publish_sender_key_epoch_advance",
+        "Implement request_sender_key with ephemeral X25519 key generation",
+        "Implement handle_sender_key_request with HPKE encryption",
+        "Implement HPKE open (recipient-side decryption)",
+        "Write tests for the full key exchange flow"
+      ],
+      "blockedBy": ["SCP-014", "SCP-008"],
+      "details": {
+        "adr": "ADR-007",
+        "protocolSection": "§9.16.2"
+      }
+    },
+    {
+      "id": "SCP-016",
+      "title": "Implement block notification and sender key rotation for block",
+      "gate": "gate-sender-keys",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
+      ],
+      "description": "Implement ADR-007 criteria 5-6: blocking via sender key rotation.\n\n**rotate_sender_key_for_block(mls_group, blocked_did)**: generate new sender key, increment epoch, publish SenderKeyEpochAdvance. Add blocked_did to block list. Non-blocked members request new key normally; blocked party's request gets no response.\n\n**send_block_notification(key_custody, mls_group, context_id, blocked_did, blocker_did)**: send signed MLS application message. Signature: Ed25519_sign(SHA-256(context_id || \"block\" || blocker_did || blocked_did || timestamp)). On receipt, blocked party's client auto-rotates their sender key excluding the blocker. Mutual block completes in one round-trip.\n\nVerification on receipt: check Ed25519 signature against blocker's known signing key from MLS LeafNode. Discard if invalid.",
+      "acceptanceCriteria": [
+        "rotate_sender_key_for_block generates new key and increments epoch",
+        "Blocked DID is added to block list",
+        "handle_sender_key_request returns None for blocked DID after rotation",
+        "Non-blocked members can still obtain the new key",
+        "send_block_notification produces valid signed message",
+        "Block notification signature verifies against blocker's public key",
+        "Recipient of block notification auto-rotates excluding the blocker"
+      ],
+      "actionItems": [
+        "Implement rotate_sender_key_for_block",
+        "Implement send_block_notification with Ed25519 signature",
+        "Implement block notification verification on receipt",
+        "Implement auto-rotation response to block notification",
+        "Write tests for mutual block scenario"
+      ],
+      "blockedBy": ["SCP-015"],
+      "details": {
+        "adr": "ADR-007",
+        "protocolSection": "§9.16"
+      }
+    },
+    {
+      "id": "SCP-017",
+      "title": "Define TransportAdapter trait, supporting types, and TransportManager",
+      "gate": "gate-transport",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/lib.rs",
+        "crates/scp-transport/src/transport_trait.rs",
+        "crates/scp-transport/src/manager.rs"
+      ],
+      "description": "Implement ADR-005: the transport abstraction trait.\n\n**TransportAdapter trait** (5 async methods): send, subscribe (returns Stream<TransportEvent>), unsubscribe, query, delete. Operates on OuterEnvelope. Send + Sync bounded.\n\n**Supporting types**: BlobId([u8;32]), RoutingId([u8;32]), TransportError (ConnectionFailed, SendFailed, SubscriptionFailed, NotConnected, Timeout, ProtocolError), TransportEvent (Envelope, Error, BackfillComplete, Reconnected, Terminated).\n\n**TransportManager**: holds Vec<Box<dyn TransportAdapter>>. Phase 1: single adapter (native relay). send/subscribe/query delegate to the single adapter. Multi-adapter routing is Phase 2+.",
+      "acceptanceCriteria": [
+        "`cargo build -p scp-transport` succeeds",
+        "TransportAdapter trait has 5 methods: send, subscribe, unsubscribe, query, delete",
+        "subscribe returns Pin<Box<dyn Stream<Item=TransportEvent> + Send>>",
+        "BlobId and RoutingId are 32-byte newtypes",
+        "TransportError has all 6 variants",
+        "TransportEvent has all 5 variants: Envelope, Error, BackfillComplete, Reconnected, Terminated",
+        "TransportManager compiles with single-adapter support"
+      ],
+      "actionItems": [
+        "Define TransportAdapter trait in transport_trait.rs",
+        "Define BlobId, RoutingId, TransportError, TransportEvent",
+        "Implement TransportManager with single-adapter delegation in manager.rs",
+        "Update lib.rs with module declarations and re-exports"
+      ],
+      "blockedBy": ["SCP-011"],
+      "details": {
+        "adr": "ADR-005",
+        "protocolSection": "§9.9"
+      }
+    },
+    {
+      "id": "SCP-018",
+      "title": "Define native relay protocol types and MessagePack wire format",
+      "gate": "gate-transport",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/mod.rs",
+        "crates/scp-transport/src/native/protocol.rs",
+        "crates/scp-transport/src/native/error.rs"
+      ],
+      "description": "Implement the wire format for ADR-004: message types, serialization, error codes.\n\n**ClientMessage enum**: Publish, Subscribe, Unsubscribe, Query, Delete, Ack, Ping — with all fields per ADR-004 wire format table. Tagged enum serialization with `op` field.\n\n**RelayMessage enum**: Ok, Err, Blob, Event, Pong — per ADR-004.\n\n**Error codes**: 4000-4021 (client), 5000-5002 (server).\n\n**Constraints**: blob_ttl 1-604800, blob max 262144 bytes, routing_id/recipient_hint/blob_id exactly 32 bytes as MessagePack bin.\n\nSerialization via rmp-serde over WebSocket binary frames. Include roundtrip tests for all message types.",
+      "acceptanceCriteria": [
+        "ClientMessage serializes to and deserializes from MessagePack",
+        "RelayMessage serializes to and deserializes from MessagePack",
+        "All 7 ClientMessage variants have correct fields per ADR-004",
+        "All 5 RelayMessage variants have correct fields per ADR-004",
+        "Error codes defined as constants: 4000-4021, 5000-5002",
+        "Binary fields (routing_id, blob_id) are 32 bytes in MessagePack bin format",
+        "Roundtrip test: serialize then deserialize all message variants"
+      ],
+      "actionItems": [
+        "Define ClientMessage enum in protocol.rs per ADR-004 reference types",
+        "Define RelayMessage enum in protocol.rs",
+        "Configure serde for tagged enum serialization with op field",
+        "Define error code constants in error.rs",
+        "Write roundtrip serialization tests for all variants"
+      ],
+      "blockedBy": ["SCP-001"],
+      "details": {
+        "adr": "ADR-004",
+        "protocolSection": "§Wire Format section of ADR-004"
+      }
+    },
+    {
+      "id": "SCP-019",
+      "title": "Implement native relay server",
+      "gate": "gate-transport",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/native/storage.rs"
+      ],
+      "description": "Implement ADR-004 relay server: WebSocket store-and-forward.\n\n**server.rs**: tokio + tokio-tungstenite WebSocket server. Accept connections at `wss://<host>/scp/v1`. Handle all 7 client message types. Subscription registry maps routing_id → set of subscriber connections. PUBLISH stores blob and delivers to matching subscribers (filter by recipient_hint if present). SUBSCRIBE with since= backfills stored blobs (oldest-first). Connection multiplexing: one WS supports multiple subscriptions.\n\n**storage.rs**: BlobStore trait + InMemoryBlobStore. Keyed by (routing_id, blob_id). TTL tracking. Background task deletes expired blobs.\n\nServer config: configurable bind address, max_blob_size (default 262144), max_blob_ttl (default 604800), max_subscriptions_per_connection (default 100), rate limits.\n\nRelay is a dumb pipe: no blob inspection, no client auth, no content validation.",
+      "acceptanceCriteria": [
+        "Relay server starts and accepts WebSocket connections",
+        "PUBLISH stores blob and returns OK with blob_id (SHA-256 of blob)",
+        "SUBSCRIBE streams new blobs matching routing_id to subscriber",
+        "SUBSCRIBE with since= backfills stored blobs oldest-first then emits backfill_complete",
+        "UNSUBSCRIBE stops delivery for that routing_id",
+        "QUERY returns stored blobs matching routing_id without creating subscription",
+        "DELETE removes blob (best-effort)",
+        "ACK is fire-and-forget (no response)",
+        "Expired blobs are cleaned up by background TTL task",
+        "PING returns PONG",
+        "Relay rejects blobs exceeding max_blob_size with ERR 4010",
+        "One connection supports multiple concurrent subscriptions"
+      ],
+      "actionItems": [
+        "Define BlobStore trait in storage.rs",
+        "Implement InMemoryBlobStore with HashMap and TTL tracking",
+        "Implement relay server in server.rs with tokio-tungstenite",
+        "Implement message routing: deserialize → dispatch → serialize response",
+        "Implement subscription registry with routing_id → subscribers mapping",
+        "Implement TTL expiry background task",
+        "Implement PING/PONG keepalive",
+        "Write integration tests: publish then subscribe, backfill, expiry"
+      ],
+      "blockedBy": ["SCP-018"],
+      "details": {
+        "adr": "ADR-004",
+        "protocolSection": "§9.9, §10.5"
+      }
+    },
+    {
+      "id": "SCP-020",
+      "title": "Implement relay client and NativeRelayAdapter",
+      "gate": "gate-transport",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/client.rs",
+        "crates/scp-transport/src/native/adapter.rs"
+      ],
+      "description": "Implement ADR-004 client + ADR-005 adapter.\n\n**client.rs**: WebSocket client using tokio-tungstenite. Connect to relay URL. Send ClientMessage, receive RelayMessage. Reconnection with exponential backoff (1s→30s cap). On reconnect, re-issue SUBSCRIBE with since = last stored_at - 5s overlap. PING every 30s keepalive. Deduplication by blob_id.\n\n**adapter.rs**: NativeRelayAdapter implements TransportAdapter trait. Maps: send→PUBLISH, subscribe→SUBSCRIBE+stream, unsubscribe→UNSUBSCRIBE, query→QUERY, delete→DELETE. Converts RelayMessage::Blob into TransportEvent::Envelope (parse OuterEnvelope from blob bytes).",
+      "acceptanceCriteria": [
+        "Client connects to relay via WebSocket",
+        "Client sends PUBLISH and receives OK with blob_id",
+        "Client SUBSCRIBE receives streamed blobs",
+        "Client reconnects with exponential backoff on disconnect",
+        "On reconnect, re-subscribes with since=last_stored_at - 5s",
+        "Client deduplicates by blob_id",
+        "Client sends PING every 30 seconds",
+        "NativeRelayAdapter implements TransportAdapter trait",
+        "adapter.send maps to PUBLISH",
+        "adapter.subscribe returns Stream<TransportEvent>",
+        "Integration test: adapter publish → adapter subscribe → receive matches"
+      ],
+      "actionItems": [
+        "Implement relay client in client.rs with tokio-tungstenite",
+        "Implement reconnection logic with exponential backoff",
+        "Implement keepalive PING every 30s",
+        "Implement blob_id deduplication cache",
+        "Implement NativeRelayAdapter in adapter.rs",
+        "Map all TransportAdapter methods to relay protocol operations",
+        "Write integration tests against the relay server from SCP-019"
+      ],
+      "blockedBy": ["SCP-019", "SCP-017"],
+      "details": {
+        "adr": "ADR-004, ADR-005",
+        "protocolSection": "§9.9, §9.13"
+      }
+    },
+    {
+      "id": "SCP-021",
+      "title": "Phase 1 end-to-end integration test",
+      "gate": "gate-integration",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/tests/phase1_integration.rs",
+        "crates/scp-testing/src/lib.rs"
+      ],
+      "description": "The ultimate Phase 1 acceptance criterion: a single test exercising all 7 ADRs.\n\n1. Alice creates a did:dht identity (ADR-003) using in-memory key custody (ADR-006)\n2. Bob creates a did:dht identity (ADR-003) using in-memory key custody (ADR-006)\n3. Alice creates an MLS group (ADR-001)\n4. Alice generates a sender key (ADR-007) and publishes epoch advance\n5. Bob publishes KeyPackages (ADR-001)\n6. Alice adds Bob to the group using his KeyPackage (ADR-001)\n7. Bob requests and receives Alice's sender key (ADR-007)\n8. Alice creates a message, encrypts with sender key (ADR-007), wraps in inner envelope (ADR-002), encrypts with MLS (ADR-001), wraps in outer envelope with pseudonym routing (ADR-002)\n9. Alice sends the outer envelope via the native relay (ADR-004) using the transport trait (ADR-005)\n10. Bob receives the outer envelope via relay subscription (ADR-004, ADR-005)\n11. Bob decrypts MLS layer (ADR-001), decrypts sender key layer (ADR-007), verifies inner envelope signature (ADR-002)\n12. Bob reads Alice's message — it matches what Alice sent\n13. Assert: the relay never saw Alice's DID, Bob's DID, the context ID, or message content\n\nRun relay server in-process as a tokio task. Use localhost WebSocket.",
+      "acceptanceCriteria": [
+        "Test runs end-to-end without manual intervention",
+        "Alice's message arrives at Bob intact after full encrypt/decrypt pipeline",
+        "MLS decryption succeeds (Bob is a valid group member)",
+        "Sender key decryption succeeds (Bob obtained Alice's sender key)",
+        "Inner envelope signature verification succeeds",
+        "payload_hash matches stripped payload after decryption",
+        "The relay server only handled opaque blobs — assert it never accessed plaintext",
+        "Routing was by pseudonym, not by DID"
+      ],
+      "actionItems": [
+        "Create phase1_integration.rs in scp-testing/tests/",
+        "Set up in-memory platform adapters for Alice and Bob",
+        "Create identities, MLS group, sender keys",
+        "Spawn relay server as tokio task on localhost",
+        "Connect Alice and Bob clients via NativeRelayAdapter",
+        "Execute the 13-step message exchange",
+        "Assert all verification steps pass",
+        "Assert relay opacity (only routing_id visible, content encrypted)"
+      ],
+      "blockedBy": ["SCP-004", "SCP-013", "SCP-015", "SCP-020"],
+      "details": {
+        "adr": "Phase 1 Integration Test (end of ADR document)",
+        "protocolSection": "All",
+        "notes": "This test does NOT require DHT publishing — Alice and Bob share keys directly through the MLS group. DID resolution is not exercised. The test proves: identity works, encryption works, envelope format works, sender keys work, relay is a dumb pipe, transport abstraction is functional."
+      }
     }
   ]
 }
