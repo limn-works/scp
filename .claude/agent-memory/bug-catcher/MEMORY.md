@@ -9,10 +9,10 @@ Notes:
 ## SCP Project Knowledge
 
 ### Key Files
-- `/Users/alec/Developer/limn/scp/spec.md` — Full protocol spec (~2200 lines). Very large, must read in chunks.
+- `/Users/alec/Developer/limn/scp/.docs/specs/` — Full protocol specs.
 - `/Users/alec/Developer/limn/scp/architecture.md` — Build document (~1024 lines).
 - `/Users/alec/Developer/limn/scp/sketch.md` — API surfaces (~1477 lines).
-- `/Users/alec/Developer/limn/scp/decisions.md` — 10 resolved metadata privacy decisions.
+- `/Users/alec/Developer/limn/scp/.docs/specs/00-open-questions.md` — Open and resolved design decisions.
 - `/Users/alec/Developer/limn/scp/.docs/adrs/phase-2.md` — Phase 2 ADRs (context, roles, tools, events, transport).
 
 ### Known Bug Patterns (Feb 2026 Review)

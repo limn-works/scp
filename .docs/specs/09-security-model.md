@@ -1,0 +1,713 @@
+# 9. Security Model
+
+## 9.1 Core Invariants
+
+1. **Every action traces to a human.** No anonymous actors. No unaccountable software.
+2. **Agents are context-bound.** No protocol-level cross-context awareness or communication for agents.
+3. **Tools are stateless and non-agentic.** They compute, they don't act.
+4. **One agent per person per context.** No fleet multiplication within a space.
+5. **Contexts are isolated by default.** No transitive exposure. Cross-context data flow only through two explicit, opt-in mechanisms: tool interfaces (asymmetric, §6.2) and multi-parent child contexts (symmetric, §5.13).
+6. **Role assignment is non-negotiable.** Agents cannot request elevated permissions.
+7. **Context metadata is transparent.** Full legibility before opt-in.
+
+## 9.2 Identified Threat Vectors and Mitigations
+
+**Context spoofing.** Creating a context that impersonates a legitimate one. Mitigation: contexts are cryptographic entities; you opt into a key, not a name. Name-based spoofing is a client-layer problem.
+
+**Context poisoning.** Degrading a legitimate context from within. Mitigation: role-based permissions limit what members can do; governance model controls who can change configuration; context creators are accountable identities; automated consequence mechanisms (§7.3.7) enforce behavioral boundaries mechanically; verifiable event logs (§7.3.1) make all actions auditable; tool integrity verification (§7.3.3) detects compromised tools. Note: poisoning by a legitimate member acting within their permissions is attributable but not preventable at the protocol level — the protocol makes the poisoner identifiable and the damage legible, enabling governance response.
+
+**Bait and switch.** Attractive context changes its purpose after gaining members. Mitigation: capability ceilings (potentially immutable) limit what a context can ever do. Expanding capabilities requires a new context with fresh opt-ins (if immutability is adopted).
+
+**Social engineering through trusted agents.** A trusted friend's agent recommends a malicious context. Mitigation: limited — the trust signal is real. Network-level pattern detection (many agents recommending the same context rapidly) can surface suspicious coordinated promotion.
+
+**Permission creep.** Gradual expansion of what a context demands. Mitigation: capability ceilings. If mutable, mutations require governance approval and are visible to all members.
+
+**Metastatic growth (cancer).** Legitimate-looking cascading expansion through the network. Mitigation: agents can't cross contexts (primary defense); context participation rate limits per human; bridging only through governed tool interfaces (§6.2) or multi-parent child contexts (§5.13) — both require explicit governance consent. Nesting depth limits (§5.13.8) bound cascading expansion through child contexts. Ceiling intersection (§5.13.1) means each level of nesting can only narrow capabilities, converging on empty ceilings at depth.
+
+**Betrayer / insider threat.** Compromised accountable identity using legitimate trust to cause damage. Mitigation: granular revocation (per-capability, per-agent, per-context); damage contained to contexts the betrayer is in; agents can't carry damage across context boundaries.
+
+**Context infection.** Poisoned data flowing through legitimate cross-context mechanisms — tool interfaces (§6.2) or multi-parent child contexts (§5.13). Mitigation: content provenance via hash chains (data carries its origin context and chain path, §7.7.1); tool interface validation at receiving context; velocity limits on propagation (content bridged N times in M minutes is flagged); child context ceiling intersection (§5.13.1) limits what capabilities poisoned data can exploit at each nesting level. Protocol makes infection legible and traceable, can't permanently prevent it.
+
+**Agent slot rental.** Someone with a trusted identity operating agents on another's instructions. Mitigation: one agent per context limits the value; earned capacity means new identities can't immediately scale; fleet coherence signals may detect behavior inconsistent with a single human's intent. Partially mitigated, not fully solved.
+
+### 9.2.1 Tool Interface Abuse Vectors and Mitigations
+
+Information crosses context boundaries through two protocol-level mechanisms: tool interfaces (§6.2) for asymmetric, structured interactions and multi-parent child contexts (§5.13) for symmetric collaboration. All inter-agent coordination flows through these governed mechanisms. Tool interfaces concentrate structured cross-context data flow on a single, auditable surface. The following abuse patterns target that surface specifically. Nesting-related security properties are addressed in §5.13.1 (ceiling inheritance), §5.13.2 (eligibility enforcement), and §5.13.5 (lifecycle coupling).
+
+**1. Broad-schema tools as covert messaging channels.**
+
+*Attack:* A context exposes a tool with a deliberately broad schema — `input: { payload: string }, output: { response: string }` — creating a de facto free-form messaging channel that wears the governance mask of a "tool call." Both contexts opted in, the schema is valid, rate limits pass, provenance is attached, but the semantic constraint that tool calls carry structured, bounded data is gone.
+
+*Mitigation — minimum viable tool schema.* Tool schemas MUST satisfy structural constraints enforced at registration time (§5.4). The protocol rejects tool registrations that violate these constraints:
+
+- **No unbounded string-only interfaces.** A tool schema where both the input and output consist solely of unconstrained string or bytes fields is rejected. At least one input or output field must be a non-string primitive, enum, array with typed elements, or structured object. This prevents the degenerate case of arbitrary message pipes while permitting legitimate tools that accept or return text alongside structured data.
+- **Schema specificity floor.** Tool schemas must declare at least two distinct fields in either input or output (or both). A single-field `{ query: string } → { result: string }` interface is the minimum viable message pipe; requiring structural complexity makes it harder to masquerade.
+- **Schema is immutable per registration.** Modifying a tool's schema creates a new registration with a new implementation hash (§5.4). Counterparties that connected to the old schema must re-consent to the new one. This prevents gradual schema broadening after trust is established.
+
+These constraints don't prevent a sufficiently creative attacker from encoding arbitrary messages in structured fields (steganography). The defense is not impermeability — it's raising the cost and making the attempt legible. A tool schema that looks suspiciously like a messaging pipe (e.g., `{ message_type: enum, payload: string }`) is a signal that governance tools and behavioral analysis can flag.
+
+**2. Hub contexts as cross-context data aggregators.**
+
+*Attack:* A single context accumulates tool interfaces to many other contexts, becoming a hub that aggregates cross-context information flowing through its interfaces. Each interface is bilateral and governed, but the hub sees data from all of them — a surveillance context masquerading as infrastructure.
+
+*Mitigation — interface count as observable metadata.*
+
+- **Interface count is visible in context metadata (§5.7).** The number of active inbound and outbound tool interfaces is part of a context's legible metadata. Before joining a context or connecting a tool interface to it, agents can see how many other interfaces it maintains. A context with 50 outbound interfaces is visibly different from one with 2 — and that visibility enables informed decisions.
+- **Behavioral topology signals.** The systemic defense philosophy (§9.4) applies: monitor structural metadata, not content. A context that rapidly accumulates interfaces, maintains interfaces to contexts in unrelated domains, or exhibits high-volume cross-interface data flow is topologically anomalous. These patterns are detectable by network-level behavioral analysis without inspecting content.
+- **Provenance chain depth.** Data flowing through a hub carries provenance (§7.7). If data enters the hub from Context A and exits to Context C, the provenance chain records both hops. Context C sees that data originated in A and passed through the hub. Deep provenance chains — data that has crossed multiple context boundaries — naturally attract additional scrutiny (§7.7.2). This is a feature, not a limitation: trust should degrade with indirection.
+
+*Design note:* This vector is partially inherent to any system that allows cross-boundary data flow. The protocol's contribution is making the aggregation visible and the data flow traceable, not preventing hub formation entirely. Legitimate service contexts (discovery registries, translation services) are hubs by design — the difference is that their interface patterns are consistent with their declared purpose.
+
+**3. Chained tool calls as amplification.**
+
+*Attack:* Context A calls Context B's tool. B's implementation calls Context C's tool. C calls D. A single call from A cascades with potential exponential fanout. Each hop is independently rate-limited, but A's rate limit only constrains the first hop.
+
+*Mitigation — chain depth limit and provenance-based cost attribution.*
+
+- **Protocol-enforced chain depth limit.** Tool calls carry a `chain_depth` counter, incremented on each cross-context hop. The protocol enforces a maximum chain depth (suggested default: 3 hops). A tool call at the depth limit cannot trigger further cross-context tool calls. This is a hard protocol limit, not a governance option — it bounds the worst-case amplification factor.
+- **Provenance carries chain depth.** The provenance record (§7.7.1) includes the chain depth at each hop. Receiving contexts see how many boundaries the data has crossed. This enables depth-aware trust evaluation: data at chain depth 1 (direct tool call) carries stronger provenance than data at chain depth 3 (three intermediaries).
+- **Per-window rate limiting across chains.** Each context enforces rate limits on both inbound and outbound tool calls within a sliding time window. A context that receives a burst of inbound tool calls (even from different source contexts) throttles proportionally. This prevents amplification where many chains converge on a single target.
+- **Provenance degradation as trust signal.** Transitive provenance degradation is not a flaw — it is the protocol working as designed. Data from many degrees of separation away should be less trusted, the same way a message from a stranger deserves more scrutiny than one from a known contact. The chain depth in provenance gives the receiving agent the information to calibrate trust: "this data originated three hops away in a context I have no relationship with" is a meaningful signal. The protocol ensures this signal is always available; the agent decides how to weight it.
+
+**4. Stateful tool session resource exhaustion.**
+
+*Attack:* An attacker opens many stateful tool sessions (§6.2.1) against a target context, never closing them. Session state accumulates, exhausting the target's resources.
+
+*Mitigation — per-caller session cap and optional TTL.*
+
+- **Per-caller session cap.** A context limits the number of concurrent active sessions per calling context (suggested default: 5). Attempts to open additional sessions from the same caller are rejected until existing sessions close or expire. This is the primary resource exhaustion defense — it bounds the damage any single caller can inflict regardless of session duration.
+- **Optional TTL for time-bounded sessions.** The tool's context MAY set a TTL on sessions. When set, expired sessions are garbage-collected automatically. When not set, sessions persist for the context's lifetime — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context is the lifecycle boundary.
+- **Session cost is borne by the tool's context.** Session state is internal to the tool's context. The tool's context chooses to offer stateful sessions, chooses whether to impose TTLs, and accepts the storage cost. This aligns incentives: contexts that offer sessions manage their own resource budget.
+
+**5. Context proliferation for connectivity.**
+
+*Concern:* Agents that need to coordinate must share a context. This creates pressure to join or create many contexts solely for connectivity, degenerating into thin wrappers around bilateral communication.
+
+*Resolution — standing channels make this a non-problem.*
+
+Standing bilateral contexts (§5.12.4-§5.12.6) are the protocol's answer to this concern. They are designed for exactly this purpose: persistent, low-overhead communication channels between two agents, created once and maintained indefinitely. Context creation is a runtime operation (~200ms, §5.12.4) — not infrastructure provisioning.
+
+The "proliferation" concern assumes context creation is heavy enough to be problematic at scale. It is not. An agent with 100 standing channels has ~200-500KB of local storage overhead and zero network cost when idle. The proliferation is the feature — a rich contact graph of standing channels is the desired state, not a degenerate one.
+
+The distinction that matters is between **meaningful proliferation** (standing channels representing real relationships) and **wasteful proliferation** (ephemeral contexts created and immediately discarded for a single exchange). Templates and TTL address the latter: ephemeral contexts are cheap to create, automatically cleaned up, and their ephemerality is declared upfront. There is no accumulation of dead contexts.
+
+**6. Human coordination bottleneck.**
+
+*Concern:* The human is the bridge for cross-context coordination (§6.3). New agent relationships require human facilitation. An attacker could overload this bottleneck.
+
+*Mitigation — rate limiting and auto-accept absorb the load.*
+
+- **Auto-accept policies (§5.12.2)** handle the common case autonomously. For contexts matching a known template from a known DID with acceptable TTL, the SDK joins without human involvement. The human is only in the loop for novel or high-risk invitations.
+- **Invitation rate limiting.** The SDK rate-limits inbound invitations per source DID and globally. An attacker flooding invitations from multiple DIDs is bounded by the global rate limit. Invitations that exceed the rate limit are queued (not dropped) with decreasing priority.
+- **The bottleneck is intentional.** For novel relationships (strangers, unusual templates, tool-bearing contexts), human facilitation is the correct behavior — the protocol forces deliberate evaluation where trust hasn't been established. This is the security boundary working as designed, not a flaw. The same way a firewall throttles unknown connections, the human bridge throttles unknown relationships.
+
+**7. Governance capture over interface decisions.**
+
+*Concern:* Context admins unilaterally control which tool interfaces to expose and connect. In single-admin governance, members have no visibility into or veto over interface decisions.
+
+*Mitigation — event log transparency and governance evolution.*
+
+- **All interface operations are logged.** Tool interface creation, connection, disconnection, and modification are protocol events recorded in the verifiable event log (§7.3.1). Members can see every interface decision the admin has made, when, and to which contexts. No silent interface changes.
+- **Interface metadata is visible.** Active tool interfaces are part of context metadata (§5.7). Members see what interfaces exist before joining and while participating.
+- **Governance evolution.** Single-admin governance is the Phase 2 minimum. The pluggable governance interface (§5.9) supports multi-sig, consensus, and voting models where interface decisions require member approval. Contexts that need member control over interfaces use governance models that provide it. This is not deferred — the governance interface is specified; specific multi-party models beyond single-admin are Phase 2+.
+- **Exit as veto.** Any member can leave a context at any time. If the admin connects the context to an interface the member disagrees with, the member leaves. In an environment where context creation is cheap (§5.12), members can create a new context without the objectionable interface and migrate — the social graph is portable (§8.3).
+
+**8. Caller/tool asymmetry in peer interactions.**
+
+*Concern:* Tool calls have inherent caller/tool asymmetry. One side requests, the other responds. This forces symmetric interactions (negotiation, collaboration) into a client/server pattern.
+
+*Resolution — shared contexts provide symmetric interaction; tool calls serve asymmetric use cases.*
+
+This is not a flaw — it is correct role assignment. Tool calls are inherently asymmetric because cross-context data flow should be structured, directional, and governed. Symmetric peer interaction — two agents collaborating as equals — belongs in a shared context where both have equivalent roles and permissions.
+
+The protocol provides both patterns:
+
+- **Symmetric interaction:** Create a shared context (standing channel or ephemeral). Both agents have messaging capability. Both can read and write. No caller/tool asymmetry.
+- **Asymmetric interaction:** One context exposes a tool to another. The tool provider is a service; the caller is a consumer. The asymmetry reflects the actual relationship.
+
+Stateful tool sessions (§6.2.1) partially bridge this: a multi-turn session allows both sides to influence the outcome iteratively. The tool provider responds with counterproposals; the caller adjusts. This isn't true symmetry, but it covers negotiation patterns within the governed tool call framework.
+
+If two agents need truly symmetric, ongoing interaction, the answer is unambiguous: share a context. Context creation is a runtime operation (§5.12.4). Standing channels exist for exactly this purpose (§5.12.6).
+
+**9. Shadow channel incentivization.**
+
+*Concern:* The overhead of governed tool interfaces (mutual opt-in, schema declaration, governance approval, rate limits, provenance, audit logging) may be disproportionate for lightweight coordination, pushing agents to communicate through ungoverned channels (HTTP, direct API calls).
+
+*Resolution — the overhead concern dissolves with standing channels.*
+
+Lightweight coordination ("is your agent available?", "can you check something?", "here's a quick update") does not flow through tool interfaces. It flows through standing bilateral contexts — which have no per-message overhead beyond standard context messaging (encrypt, send, decrypt). There is no schema declaration, no governance approval, no tool registration. A message in a standing channel is as lightweight as a message in any context.
+
+The governed tool interface overhead applies to formal cross-context data flow — where one context's tool is invoked by another context's agent. This overhead is appropriate for that use case because cross-context data flow carries real risk (§6.2) and should be auditable, rate-limited, and governed.
+
+The two-tier model:
+
+- **Standing channels** for lightweight, symmetric, low-ceremony communication. All the protocol's trust and encryption properties. No tool interface overhead.
+- **Tool interfaces** for formal, structured, asymmetric cross-context data exchange. Full governance, provenance, and auditability.
+
+This is analogous to the distinction between a text message and an API call. Both are communication; they have different overhead appropriate to their different risk profiles. The protocol provides both, and agents use whichever fits the interaction.
+
+## 9.3 Sybil Resistance and Identity Uniqueness
+
+The protocol's security model assumes one identity per human. Sybil attacks — one person creating many identities to gain disproportionate influence — undermine every trust mechanism in the spec: behavioral records become meaningless, one-agent-per-context is circumventable, earned capacity is gameable.
+
+Provably guaranteeing one-identity-per-human in a decentralized system without invasive verification (KYC, biometric databases) is an unsolved problem. The protocol's approach is to make sybil attacks **expensive enough to be manageable** through three layered mechanisms:
+
+**Device attestation.** Modern devices provide hardware-backed attestation (Apple App Attest, Google Play Integrity) that can prove: "this is a real, un-jailbroken device and it has not previously created another DID through this protocol." One physical device = one DID creation. This doesn't prove one human (a person with two phones gets two identities), but it makes identity creation cost the price of a physical device. The SDK integrates device attestation as part of DID creation. Device attestation constrains DID **creation** only — a DID created on one device can authenticate on multiple devices freely. Multi-device usage (§10.2) is unaffected; the restriction is on how many identities can be minted, not how many devices can use one.
+
+**Earned capacity.** New identities start with limited capabilities — restricted context creation, limited context participation slots, constrained tool invocation rates. Capacity grows through participation history, behavioral records, and time. Sybil accounts are cheap to create (one device per identity) but expensive to make useful — each needs real participation history. This is the Reddit model: new accounts can browse, established accounts can post in restricted communities.
+
+**Context-level social verification.** Contexts set their own admission thresholds — how much behavioral history, how many endorsements, what attestations are required for participation at each role level. A casual group chat might require nothing beyond a valid DID. A high-trust financial context might require 6 months of behavioral history, 3 independent endorsements, and challenge-verified agent capabilities. The protocol provides the verification data (behavioral records, attestations, challenge results); contexts define their own thresholds.
+
+These three layers compose: device attestation makes identity creation expensive → earned capacity makes new identities limited → context-level thresholds make meaningful participation require real history. A sybil attacker needs many devices AND time AND social verification to gain influence. Not impossible, but expensive enough that the attack scales poorly. Crucially, consequences for coordinated attacks render sybil accounts single-use — once detected and penalized, the investment in aging and building history is lost. This makes sustained sybil campaigns economically irrational even when individual identity creation is feasible.
+
+Sybil resistance is a **deterrent**, not an enforcement guarantee. The protocol concedes that a sufficiently determined attacker with many devices can create multiple identities. The defense is structural: making the attack expensive to mount, expensive to sustain, and costly when detected.
+
+## 9.4 Systemic Defense Philosophy
+
+Static rules cannot permanently defeat emergent threats. The protocol's role is to maximize the surface area of what can be independently verified, and to make whatever remains legible enough for agents and governance to respond.
+
+Key principles:
+
+**Validate, minimize trust.** Every claim that can be mechanically verified should be. The four-layer trust model (§7.1) prioritizes protocol enforcement and behavioral validation over attestation authenticity and subjective trust. The trust surface shrinks as the network accumulates history.
+
+**Don't inspect content, inspect behavior topology.** Monitor structural metadata — growth rates, bridge activity patterns, context creation velocity, invitation patterns, tool invocation anomalies, governance action frequency — not what's being said. The protocol equivalent of metabolic signals, not thoughts.
+
+**Consequences over character.** Where possible, replace "trust that actors will behave" with "verify that misbehavior is irrational given the consequences." Automated consequence mechanisms (§7.3.7) make behavioral boundaries mechanical rather than discretionary.
+
+**Observability is the immune system.** The protocol provides verifiable event logs, behavioral records, tool verification results, challenge-response outcomes, and attestation freshness data. These are the immune system's sensory apparatus. The actual immune response is an evolving network of agents and governance tools that consume this data and get better over time.
+
+## 9.5 Cryptographic Primitive Specification
+
+The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. This eliminates downgrade attacks and simplifies implementation.
+
+**Signature algorithm:** Ed25519 (RFC 8032). All DID keys, SCP envelope signatures, Nostr event signatures, UCAN token signatures, and MLS leaf node credentials use Ed25519.
+
+**MLS ciphersuite:** MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (RFC 9420 §17.1). This provides: X25519 for key agreement (HPKE KEM), AES-128-GCM for symmetric encryption (AEAD), SHA-256 for hashing, Ed25519 for signing.
+
+**DID-to-DID encryption:** HPKE (RFC 9180) with suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Used for MLS Welcome messages. The HPKE suite matches the MLS ciphersuite to minimize the cryptographic surface area.
+
+**Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
+
+**Envelope signature scope:** The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by the sender's identity key: `SHA256(context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash)`. This binds every field to the signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs), which is by design — verification is the responsibility of context members who can decrypt the payload.
+
+**UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction.
+
+**Why single ciphersuite:** Ciphersuite negotiation adds complexity and introduces downgrade attack vectors. For v1, every implementation uses exactly these algorithms. Future protocol versions may introduce additional ciphersuites with a secure negotiation mechanism, but v1 prioritizes simplicity and auditability.
+
+## 9.6 Identity Verification and MITM Prevention
+
+Identity verification is the trust root for the entire protocol. If an attacker can substitute their public key for another identity's, every layer above — encryption, authentication, capability validation — is compromised. This section specifies how SCP prevents MITM attacks on identity resolution.
+
+### 9.6.1 did:dht Self-Certification
+
+The did:dht method (target DID method for SCP) is **self-certifying**: the DID string itself is the z-base-32 encoding of the Ed25519 public key. When resolving a did:dht identifier:
+
+1. The client queries the Mainline DHT for the BEP44 signed record associated with the DID.
+2. The client verifies the BEP44 record signature against the public key encoded in the DID string.
+3. If the signature is valid, the DID document is authentic. No trusted third party is required.
+
+**MITM on did:dht resolution is impossible given the correct DID.** A DHT node cannot serve a fraudulent DID document because the document must be signed by the key embedded in the DID itself. Tampering is detectable without trusting any intermediary.
+
+**Stale document prevention:** BEP44 records include a sequence number. The client MUST reject DID documents with a lower sequence number than previously observed for the same DID. This prevents serving outdated documents.
+
+**The remaining question:** "Is this the right DID?" Self-certification proves the binding between a DID and its key, but cannot prove the binding between a DID and a person. This is an out-of-band verification problem addressed by Key Continuity Verification (§9.11).
+
+### 9.6.2 did:web Security Properties and Limitations
+
+did:web (fallback only — used only if did:dht libraries prove unusable) resolves via HTTPS to a well-known path on the authority domain. Security depends on DNS integrity, TLS certificate validity, and server integrity.
+
+**did:web is NOT self-certifying.** A compromised server, DNS hijack, or CA compromise can serve a fraudulent DID document indistinguishable from a legitimate one. did:web introduces a server dependency that contradicts SCP's infrastructure-minimal design. It exists as a contingency fallback, not a planned deployment path.
+
+**Required mitigations if did:web is used:**
+
+- The SDK MUST pin the TLS certificate of the did:web resolution server.
+- The SDK MUST verify that the DID document's verification method key matches the key used for all prior interactions with this DID (key continuity check / TOFU — Trust On First Use).
+- The SDK MUST alert the user on any key change, with maximum severity.
+- The SDK SHOULD record the did:web key fingerprint in identity private state (§3.7) for cross-device consistency of TOFU state.
+
+**Migration from did:web to did:dht (if fallback was used):** If a deployment started with did:web as a fallback, migration to did:dht must be signed by the old did:web key, creating a verifiable authorization chain: "the identity formerly at did:web:example.com is now at did:dht:z6Mk...". Both DIDs temporarily resolve to the same public key during the transition. This migration path exists for contingency recovery, not as a planned lifecycle.
+
+### 9.6.3 Relay List Authentication
+
+A DID's relay list (service endpoints) is published in the DID document and as NIP-65 Nostr events (kind:10002).
+
+**For did:dht:** The relay list in the DID document is self-certified (BEP44 signature). Substituting a relay list requires the identity's private key.
+
+**For Nostr:** The NIP-65 relay list event is signed by the Nostr keypair derived from the DID key. This provides relay list authentication independent of the DID method.
+
+**Attack: relay list substitution.** A compromised DHT node or Nostr relay could serve a stale relay list, directing messages to relays the recipient no longer uses. Defense: sequence numbers in BEP44 records ensure freshness. Clients MUST reject relay lists with lower sequence numbers than previously observed.
+
+### 9.6.4 First-Contact Trust Bootstrapping
+
+When Alice first encounters Bob's DID (via shared context membership, registry discovery, or referral):
+
+- **For did:dht:** Alice resolves the DID document and verifies it against the DID string. The binding is cryptographically verified. No MITM is possible.
+- **For did:web:** Alice resolves over HTTPS and trusts the web PKI. The SDK records Bob's key on first contact (TOFU) and alerts on any subsequent change.
+
+## 9.7 Group Key Management — MLS Integration
+
+MLS (RFC 9420) provides the group encryption layer for SCP. This section specifies how MLS concepts map to SCP and what security properties the SDK must enforce.
+
+### 9.7.1 MLS-to-SCP Concept Mapping
+
+| MLS Concept | SCP Concept | Notes |
+|---|---|---|
+| Group | Context | 1:1 mapping. Each SCP context is one MLS group. |
+| Member (LeafNode) | Agent (in context) | One MLS leaf node per agent in the context. |
+| Epoch | Context epoch | Increments on every membership change or key update. Included in all SCP envelopes. |
+| LeafNode credential | DID + UCAN | The MLS credential field contains the member's DID and their context-scoped UCAN token. |
+| Welcome message | Context join token | HPKE-encrypted to new member's KeyPackage. Contains the group state needed to decrypt future messages. |
+| KeyPackage | Pre-key bundle | Published to relays so others can add the identity to groups even when offline. Signed by identity key. Single-use. |
+| Proposal (Add/Remove/Update) | Governance action | MLS membership proposals map to SCP membership changes. |
+| Commit | Governance commit | Finalizes pending proposals and advances the epoch. |
+| Application message | SCP envelope payload | The encrypted content within an SCP envelope. |
+| Delivery Service (DS) | Nostr relay(s) | The untrusted store-and-forward layer. |
+| Authentication Service (AS) | DID resolution + UCAN validation | SCP's identity layer serves as MLS's AS. No separate trusted server. |
+
+**Group context extensions for nesting.** Child contexts include parent context IDs and governance configuration hashes in the MLS `group_context` extensions field (§5.13.3). This cryptographically binds the parent lineage to the child's group identity — the derived `group_id` is a function of the parent references. Root contexts (no parents) have empty nesting extensions.
+
+**Authentication Service design:** MLS delegates identity verification to an Authentication Service (AS). In SCP, the AS is fully decentralized: DID resolution provides the public key binding, and UCAN validation provides the capability binding. No centralized AS server exists. Each participant independently verifies credentials by resolving the DID and validating the UCAN chain.
+
+### 9.7.2 Forward Secrecy
+
+MLS provides forward secrecy through epoch-based key ratcheting. After a Commit message advances the group to a new epoch, key material from old epochs is deleted.
+
+**SDK requirements:**
+
+- The SDK MUST delete old epoch key material immediately after processing a Commit. Old epoch secrets, application key schedules, and ratchet tree states for past epochs MUST NOT be persisted.
+- Historical epoch keys MUST be treated as equivalent to ephemeral Diffie-Hellman parameters: used once, then destroyed.
+- Members who want to re-read historical messages must retain the decrypted plaintext locally. They cannot re-derive old epoch keys from current state.
+
+**Interaction with memory scope:**
+
+- For `full` memory scope contexts: forward secrecy protects against future key compromise revealing past messages. Members retain plaintext locally if they want to re-read.
+- For `ephemeral` memory scope contexts: the MLS group state is destroyed on context close. This is the `destroy_keys` operation — destroy tree root, all epoch secrets, all application key material. All historical messages become physically unreadable.
+- For `summary` memory scope contexts: same as ephemeral, but a summary is generated and verified before destruction.
+
+### 9.7.3 Post-Compromise Security (PCS)
+
+MLS provides PCS through the Update proposal mechanism. After a member sends an Update (generating a fresh HPKE key pair and ratcheting their path in the tree), any previous compromise of that member's state becomes useless for future messages.
+
+**SDK requirements:**
+
+- The SDK MUST periodically issue MLS Update proposals. Recommended interval: every 24 hours for active contexts, or immediately after any suspected compromise.
+- The SDK SHOULD issue an Update after re-establishing connectivity following an offline period.
+- When a DID's key rotates (recovery scenario, §3.3), the agent MUST issue an MLS Update in every active context. This synchronizes DID-level key rotation with MLS-level post-compromise security.
+
+**PCS Update interval as context parameter:** High-security contexts may configure shorter PCS Update intervals (e.g., 1 hour). The interval is a context-level parameter set at creation, defaulting to 24 hours.
+
+### 9.7.4 Key Lifecycle
+
+**Key generation:**
+
+- Identity key (Ed25519): Generated in hardware security module where available (Secure Enclave, Android Keystore). Private key never exported from the secure element.
+- MLS leaf key (X25519): Generated by the MLS library per the selected ciphersuite. Stored in platform secure storage.
+- KeyPackages: Pre-generated and published to relays. Each KeyPackage is single-use. The SDK MUST maintain a buffer of at least 10 unused KeyPackages per identity on relays. Replenished when the buffer drops below 5.
+- UCAN signing key: Same as identity key (Ed25519). UCAN tokens are signed by the human's DID key.
+
+**Key distribution:**
+
+- Identity public key: Distributed via DID document (DHT resolution or web resolution).
+- KeyPackages: Published to relays as Nostr events. Any party wanting to add this identity to a group fetches a KeyPackage from their relay.
+- Context group key: Distributed via MLS Welcome message, encrypted to the new member's KeyPackage. Only the intended recipient can decrypt.
+
+**Key rotation:**
+
+- Identity key: Rotated via DID document update. For did:dht, the new document is signed by the old key (authorization chain) and published with an incremented sequence number. All active MLS groups receive an Update proposal with the new credential.
+- MLS epoch keys: Rotated automatically on every Commit (membership change or Update).
+- UCAN tokens: Expire per their `exp` field. Re-issued by the human's DID. Revocation published to a revocation list referenced in the UCAN's revocation field.
+
+**Key destruction:**
+
+- Ephemeral context close: Destroy MLS group state — tree secrets, all epoch key schedules, application key material. See §9.15 for destruction verification.
+- KeyPackage consumption: After a KeyPackage is used in a Welcome message, the SDK deletes the KeyPackage's private key. One-time use is mandatory.
+- Old epoch material: Destroyed after Commit processing (forward secrecy, §9.7.2).
+
+## 9.8 Message Security
+
+This section specifies how SCP prevents message forgery, replay attacks, and ordering manipulation.
+
+### 9.8.1 Envelope Integrity (Two Independent Checks)
+
+Every SCP message has two independent integrity verifications, both inside the encrypted payload. Neither is verifiable by relays — relays see only opaque blobs.
+
+**Inner check 1 — Ed25519 identity signature.** The sender signs the payload with their DID key: `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash)`. This signature is created before sender-key encryption and MLS encryption, and verified after MLS decryption and sender-key decryption. A failed signature means the envelope was tampered with or forged and MUST be rejected.
+
+**Inner check 2 — MLS membership_tag.** The MLS PrivateMessage format includes an HMAC (membership_tag) that proves the sender is a group member with correct epoch secrets. This is verified during MLS decryption. It provides authentication independent of the identity signature — even if an attacker obtained the DID private key, they cannot produce a valid membership_tag without the MLS epoch secrets.
+
+Both checks MUST pass for a message to be accepted. This defense-in-depth means an attacker must compromise BOTH the identity key AND the MLS group state to forge a message. Both checks are member-only verifiable — the outer envelope is unsigned by design (§9.10.2), ensuring relays learn nothing about message authenticity or sender identity.
+
+### 9.8.2 Replay Prevention (Three-Layer Defense)
+
+**(a) MLS generation numbers.** MLS assigns each sender a generation counter that increments with every message. Recipients track the highest generation number seen per sender per epoch. A message with a generation number less than or equal to the highest seen is a replay and MUST be rejected. This catches exact replays within a single MLS epoch.
+
+**(b) Hash-based deduplication.** The SDK maintains a deduplication cache keyed by `SHA256(encrypted_blob)` — the hash of the outer envelope's encrypted blob, which is visible without decryption. Any envelope with a previously-seen blob hash is a replay and MUST be dropped silently. Cache size: bounded by a sliding window of the most recent 10,000 envelopes or 24 hours, whichever is larger. This catches replays across MLS epochs.
+
+**(c) Timestamp bounds.** Every SCP envelope includes a `created_at` timestamp. Recipients MUST reject envelopes with timestamps more than 5 minutes in the future (clock skew tolerance). Within a sequence of messages from the same sender in the same context, timestamps must be monotonically non-decreasing within the clock skew tolerance. This catches time-shifted replays.
+
+The past-bound is relative, not absolute, to handle offline delivery: if Bob comes online after 3 hours, he accepts messages from the past 3 hours. But timestamps from a single sender must not regress.
+
+### 9.8.3 Message Ordering
+
+Within a context, messages are ordered by: `(epoch, sender_generation_number, timestamp)`. This gives a total order per-sender and a causal order across senders — epoch boundaries are synchronization points.
+
+The Merkle event log records events in append order. Each event references the previous event's hash, creating a hash chain. If two events reference the same parent, the log has forked — possible equivocation (see §9.9).
+
+**Interaction with relay ordering:** Nostr relays do not guarantee message ordering. The SDK MUST re-order messages locally using `(epoch, generation, timestamp)` before presenting them to the application layer.
+
+**Authoritative ordering:** The Merkle log order is authoritative, not timestamps. Timestamps are hints for the SDK to reconstruct order in real-time. Once events are committed to the log, the log order is the permanent record.
+
+### 9.8.4 Forgery Prevention
+
+**Message forgery:** Prevented by Ed25519 inner signature + MLS membership_tag. Both checks are inside the encrypted payload (§9.8.1). An attacker who does not hold a member's private key cannot produce a valid inner envelope, and an attacker without MLS epoch secrets cannot produce a valid membership_tag.
+
+**Attestation forgery:** Attestations (§7.4) are signed by their issuer's DID key. Forgery requires the issuer's private key.
+
+**UCAN forgery:** UCAN tokens contain a delegation chain where each delegation is signed. The mandatory `nnc` (nonce) field prevents token reuse outside the intended scope.
+
+**Provenance forgery:** Data provenance records (§7.7) are attached by the SDK and signed as part of the enclosing envelope. An agent cannot fabricate a provenance claim for data sourced from a context it was never in, because provenance records are verifiable against the source context's Merkle root (for persistent-scope sources).
+
+### 9.8.5 Sequence Validation
+
+Each sender in a context maintains a monotonically increasing SCP sequence number (distinct from MLS generation numbers, which are MLS-internal). This sequence number is included in the envelope and the Merkle event log entry.
+
+Recipients MUST accept all authenticated messages regardless of sequence order and apply reorder-before-delivery semantics. Multi-relay delivery (§10.4, ADR-012) guarantees that messages may arrive out of order; strict rejection would cause guaranteed message loss.
+
+**Reorder buffer.** Each recipient maintains a per-(context, sender) reorder buffer:
+
+- Messages arriving in order (sequence == expected next) are delivered immediately to the application layer.
+- Messages arriving ahead of their predecessors (sequence > expected next) are buffered pending delivery of the missing predecessors.
+- When a buffered message's predecessors arrive, the entire contiguous run is delivered in sequence order.
+- **Gap timeout:** If a gap persists for more than 30 seconds, the recipient raises a suppression alert (§9.9), delivers all buffered messages (recording the gap in the event log), and advances the expected sequence number past the gap.
+- **Buffer bound:** The reorder buffer is bounded at 100 messages per sender per context to prevent resource exhaustion. If the buffer fills, the oldest gap is force-closed (with suppression alert) and buffered messages are delivered.
+- A duplicate sequence number indicates replay (caught by §9.8.2).
+
+## 9.9 Relay Threat Model and Mitigations
+
+Relays are untrusted infrastructure (§10.4). This section formally defines the relay threat model and specifies mitigations.
+
+### 9.9.1 Relay Capabilities and Limitations
+
+A relay CAN:
+
+- **Read metadata:** routing IDs (per-context pseudonyms, §9.10.4), recipient hints (pseudonyms), blob TTLs, padded blob sizes, and connection timing. Context IDs, sender/recipient DIDs, and timestamps are inside the encrypted payload and NOT visible to relays (§9.10.2). Relay CANNOT read encrypted content.
+- **Drop messages (suppression):** Silently discard envelopes. The sender believes delivery succeeded; the recipient never sees the message.
+- **Delay messages:** Hold envelopes and deliver them later. Architecturally identical to slow network conditions.
+- **Replay messages:** Re-deliver previously delivered envelopes. Mitigated by §9.8.2.
+- **Equivocate:** Show different message histories to different members of the same context.
+- **Correlate traffic:** Link activities across contexts based on timing, DID, and connection patterns.
+
+A relay CANNOT:
+
+- **Forge messages.** Requires the sender's private key (for the inner Ed25519 signature, §9.8.1) and MLS epoch secrets (for the membership_tag).
+- **Decrypt content.** Requires MLS group key and sender-side key (§9.16).
+- **Modify messages.** Inner signature verification and MLS membership_tag verification fail after decryption.
+- **Inject members into contexts.** Requires MLS Welcome message encrypted to the joiner's KeyPackage.
+
+### 9.9.2 Suppression Detection
+
+**Sequence gap detection:** If a recipient expects sequence #47 from a sender but receives #49, sequences #47 and #48 were suppressed (or delayed). The SDK MUST track expected sequence numbers per (context, sender) pair and alert on gaps.
+
+**Heartbeat messages:** In active contexts, the SDK SHOULD send periodic heartbeat envelopes (recommended interval: 60 seconds when the context has active participants). A heartbeat is a minimal MLS application message with a sequence number but no user content. If heartbeats stop arriving from a participant who was recently active, suppression is suspected.
+
+**Multi-relay cross-check:** Context messages SHOULD be published to at least 2 relays (recommended: 3). Recipients subscribe to all relays in the sender's relay list and merge received envelopes. If relay A delivers an envelope and relay B does not, this is an inconsistency. After a timeout (recommended: 30 seconds), the inconsistent relay is marked as potentially adversarial.
+
+**Response to suspected suppression:** The SDK SHOULD alert the user and attempt delivery via alternative relays. The SDK MUST NOT silently discard the suspicion.
+
+### 9.9.3 Equivocation Detection — Relay Consistency Protocol
+
+The Relay Consistency Protocol detects relay equivocation — a relay showing different event histories to different members.
+
+**Consistency checkpoints:** At regular intervals (recommended: every 50 events or every 10 minutes, whichever comes first), each member computes a signed checkpoint:
+
+```
+ConsistencyCheckpoint {
+  contextID:    String
+  senderDID:    DID
+  eventCount:   UInt64           // number of events in local log
+  merkleRoot:   [UInt8; 32]      // root hash of local event log
+  epoch:        UInt64           // current MLS epoch
+  timestamp:    DateTime
+  signature:    Ed25519Signature // signed by sender's DID key
+}
+```
+
+Checkpoints are sent as regular MLS application messages (encrypted, authenticated).
+
+**Checkpoint comparison:** On receiving a checkpoint from another member, each member compares:
+
+- `eventCount`: Must match (within tolerance for in-flight messages). Divergence of more than 5 events indicates inconsistency.
+- `merkleRoot`: Must match for the same `eventCount`. Divergence indicates equivocation or log corruption.
+- `epoch`: Must match. Divergence indicates a missed MLS Commit (possible suppression).
+
+**Divergence resolution:** If Merkle roots diverge, members exchange event log proofs to identify the first divergent event. This reveals which relay served which version. The context's governance model handles the response.
+
+**Sybil-amplified equivocation defense:** The Relay Consistency Protocol is NOT a majority vote. ANY divergence between ANY two honest members detects equivocation. An attacker who controls Sybil members and a relay can make the Sybil members confirm the attacker's version, but this is irrelevant — two honest members comparing checkpoints will detect the equivocation regardless of how many Sybils agree with the attacker. The defense requires only two honest members in the context.
+
+### 9.9.4 Selective Suppression of MLS Commits
+
+A specific relay attack: suppress an MLS Remove Commit to keep an excluded member in the group.
+
+**Analysis:** After an MLS Remove Commit is processed, new messages use the new epoch key. The removed member does NOT have this key — they physically cannot decrypt new-epoch messages. Even if the relay suppresses the Commit from being delivered to the removed member, confidentiality is preserved.
+
+**Actual risk:** Suppressing the Commit from OTHER members. Members who don't receive the Commit stay in the old epoch and cannot decrypt new-epoch messages. This is a denial-of-service attack (group state divergence), not a confidentiality breach.
+
+**Mitigation:** MLS Commits are high-priority messages that SHOULD be published to all relays with delivery confirmation. If any member detects they are behind on epochs (they receive a message for epoch N+1 but are on epoch N), they MUST request the missing Commit from other members or other relays.
+
+## 9.10 Metadata Privacy Architecture
+
+The protocol provides layered metadata privacy protections. Each layer addresses a distinct attack surface:
+
+- **Envelope layer:** Minimal outer envelope with per-context pseudonyms (§9.10.2, §9.10.4)
+- **Content layer:** Fixed bucket padding normalizes message sizes (§9.10.3)
+- **Connection layer:** Persistent connections + TLS prevent connection-timing correlation (§9.10.5)
+- **Traffic layer:** Constant-rate cover traffic masks activity patterns (§9.10.6)
+- **Resolution layer:** Local DHT + caching prevents resolution-based tracking (§9.10.7)
+- **Query layer:** Pseudonyms + relay partitioning prevent subscription analysis (§9.10.8)
+- **Push layer:** Fully opaque push notifications (§10.7)
+- **Blocking layer:** AES-256 sender-side keys enable cryptographic blocking without MLS group changes (§9.16)
+- **Cross-context key isolation:** Independent MLS key material per context (§9.10.9)
+
+This section specifies what the protocol protects, how it protects it, and what residual risks remain.
+
+### 9.10.1 What Is Confidential
+
+- Message content (MLS encryption)
+- Context-internal state: roles, tools, governance actions, event log content (all encrypted within the MLS group)
+- Identity private state (encrypted to owner's key, §3.7)
+- UCAN token contents (within encrypted envelopes)
+- Sender identity, timestamps, sequence numbers, epoch, generation (all inside encrypted payload)
+
+### 9.10.2 Minimal Outer Envelope
+
+The outer envelope — what relays see — contains only:
+
+1. **Routing identifier** — per-context pseudonym (§9.10.4)
+2. **Recipient hint** — recipient pseudonym for directed messages, or broadcast marker
+3. **Blob TTL** — how long the relay should store before deletion
+4. **Encrypted blob** — everything else
+
+Sender identity, timestamps, sequence numbers, epoch, generation — all reside inside the encrypted payload. The relay is a dumb pipe that holds encrypted blobs for a specified duration and delivers them to subscribers of a routing ID. Relay-side ordering, dedup, and expiry are NOT the relay's job. The SDK handles all of this client-side.
+
+### 9.10.3 Fixed Bucket Padding
+
+Pad plaintext to the next bucket boundary before encryption to prevent message size analysis.
+
+**Bucket sizes:** 256B, 1KB, 4KB, 16KB, 64KB, 256KB.
+
+Messages larger than 256KB are chunked into 256KB blocks. Padding happens below the application layer and above the transport layer — the SDK handles it transparently. Application developers never see it. Relay operators see uniform bucket-sized blobs.
+
+### 9.10.4 Per-Context Pseudonyms
+
+Each participant derives a per-context keypair that replaces their DID in all outer-envelope fields:
+
+```
+context_seed = HKDF(identity_private_key, context_id, "scp-context-pseudonym")
+context_keypair = Ed25519_keygen(context_seed)
+context_pseudonym = context_keypair.public_key
+```
+
+- **Deterministic:** Same identity + same context = same pseudonym.
+- **Unlinkable across contexts:** Different context_id = different pseudonym. Relays cannot correlate activity across contexts.
+- **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
+- **No ZK proofs** — unnecessary complexity since only group members need to verify the mapping.
+- The SDK handles derivation, caching, and verification transparently.
+- **HSM compatibility.** The standard derivation uses raw `identity_private_key` bytes, which are not exportable from HSM-backed key storage (Secure Enclave, Android Keystore). For HSM-backed identity keys, pseudonym derivation uses an HSM-internal HMAC operation: `context_seed = HMAC-SHA256(identity_key_handle, context_id || "scp-context-pseudonym")`. The HSM performs the HMAC internally and returns the seed without exporting the private key. If the HSM does not support HMAC, a separate non-HSM pseudonym derivation key is derived during identity creation and stored alongside (but outside) the HSM. This key is used exclusively for pseudonym derivation and does not grant signing or decryption capability.
+
+### 9.10.5 Connection Privacy
+
+1. **Persistent connections mandatory on desktop/workstation/server.** Constant connection to each relay regardless of activity. Prevents connection-timing correlation.
+2. **Mobile: push-wake + burst.** Opaque push wakes device, SDK connects to relays, exchanges messages, disconnects.
+3. **TLS 1.3 required for all relay connections** (§9.13). Relay operators see the client's IP address — the same information any web server sees. Combined with per-context pseudonyms (§9.10.4), the relay cannot link the IP to a specific identity or correlate activity across contexts.
+4. **No custom mix network, no custom proxy protocol.** The protocol does not mandate IP-layer anonymization. The privacy posture already exceeds any conventional app: relays see only pseudonyms, bucketed blob sizes, and TTLs. Clients concerned about IP-level privacy can route through a VPN or Tor at the transport layer — this is a client configuration choice, not a protocol requirement.
+
+### 9.10.6 Cover Traffic
+
+Cover traffic is **enabled by default and configurable per-client.** The SDK ships with cover traffic on. Clients or operators may disable it via SDK configuration. Disabling degrades traffic analysis resistance but has no functional impact on message delivery or protocol correctness.
+
+1. **Persistent connections: constant-rate, default on.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding.
+2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
+3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
+4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
+
+### 9.10.7 DID Resolution Privacy
+
+1. **Desktop/workstation/server: local Mainline DHT node, mandatory.** DID resolution queries become indistinguishable from DHT routing traffic. The device participates as a full DHT node, routing queries for others as well as itself.
+2. **Mobile: DHT queries via standard HTTPS gateway or lightweight DHT client.** Resolution is infrequent (once per first contact, then cached), so latency is acceptable.
+3. **Aggressive caching:** 24-hour refresh for active contacts, 7-day for inactive. Stale documents detected via BEP44 sequence number comparison. Key change alerts trigger immediate re-resolution.
+4. **No batch/prefetch, no resolution proxy.** Local DHT node on desktop and caching on mobile provide practical privacy without new infrastructure.
+
+### 9.10.8 Relay Query Privacy
+
+1. **Per-context pseudonyms (§9.10.4) are the foundation.** Relay cannot link subscriptions across contexts.
+2. **Relay set partitioning, mandatory.** Each context SHOULD use different relays from the client's other contexts. SDK distributes contexts across relays to minimize overlap.
+
+**Combined effect:** Relay sees pseudonyms (unlinkable to identity) on a relay hosting only a fraction of the client's total context set. Per-context pseudonyms prevent cross-context linkage; relay partitioning limits the fraction of a client's activity visible to any single relay.
+
+**Rejected alternatives:** Subscription mixing (subscribing to decoy routing IDs alongside real ones) was considered and rejected — decoy routing IDs receive zero traffic, making them trivially distinguishable from real subscriptions. Private Information Retrieval (PIR) was considered and rejected — computational overhead is disproportionate to the privacy gain given that pseudonyms and partitioning already prevent the relay from linking subscriptions to identities or contexts.
+
+### 9.10.9 Cross-Context Key Isolation
+
+Each SCP context is a separate MLS group with independent key material. Compromising one context's keys reveals nothing about any other context's keys. The identity key (Ed25519) is shared across contexts but signs actions — it never directly encrypts group content. MLS handles group encryption with ephemeral key material derived independently per group. Per-context pseudonyms (§9.10.4) prevent the identity key from being visible outside encrypted payloads.
+
+### 9.10.10 Residual Risks
+
+Even with all protections in this section, the following metadata leaks remain:
+
+- **IP visibility:** Relay operators see the client's IP address (same as any web service). Per-context pseudonyms prevent linking IPs to identities, but a relay operator with access to IP logs could correlate connection patterns. Clients requiring IP anonymity can use a VPN or Tor at the transport layer.
+- **Cover traffic timing analysis:** Sophisticated statistical analysis may distinguish real message patterns within constant-rate cover traffic. The constant rate makes this significantly harder but not provably impossible.
+- **Push notification timing:** Apple/Google learn that a device received a notification at a specific time. Content and source remain opaque (§10.7).
+- **DHT participation patterns:** On desktop, DHT routing traffic is mixed with resolution queries, but a network observer can see DHT participation.
+- **Relay trust:** Relays see blob sizes (bucketed), TTLs, and pseudonyms. A relay colluding with a context member could correlate pseudonyms to identities for that context only.
+
+## 9.11 Key Continuity Verification
+
+Equivalent to Signal's "safety numbers." Allows two parties to verify they have the correct keys for each other, detecting MITM on DID resolution.
+
+**Fingerprint format:**
+
+```
+fingerprint = SHA256(sort(alice_did, bob_did) || alice_pubkey || bob_pubkey)
+```
+
+Displayed as:
+- A 12-word mnemonic (BIP-39 word list, first 128 bits of the hash)
+- A 60-digit decimal number (first 200 bits)
+- A QR code encoding the full 256-bit hash
+
+**Verification flow:**
+
+1. Alice and Bob each compute the fingerprint using their local knowledge of the other's public key.
+2. They compare fingerprints via an out-of-band channel (in person, voice call, trusted messaging app).
+3. If fingerprints match, key continuity is verified. The SDK records this verification event in identity private state (§3.7).
+4. If fingerprints do not match, a MITM is actively intercepting DID resolution. The SDK MUST alert with maximum severity.
+
+**Key change detection:**
+
+- The SDK records the public key associated with each DID on first encounter (Trust On First Use / TOFU).
+- On any subsequent DID resolution that returns a different public key, the SDK MUST: (a) alert the user that the key has changed, (b) invalidate the previous key continuity verification, (c) refuse to send encrypted content to the new key until the user explicitly accepts the change or completes re-verification.
+- Legitimate key changes (rotation, recovery) are distinguishable: for did:dht, the new DID document is signed by the old key (authorization chain). For social recovery, trusted contacts independently confirm the rotation.
+
+## 9.12 Compromise Recovery Protocol
+
+When a key is known or suspected to be compromised, the following ordered steps constitute the recovery protocol:
+
+**1. Key rotation on trusted device.** Generate new identity keypair on a trusted device. For did:dht: publish new DID document signed by the old key (if available) or via social recovery. For did:web: update the hosted DID document.
+
+**2. MLS Update in all active contexts.** Issue MLS Update proposals in every context. This provides post-compromise security: new epoch keys are derived from the new key material, making the compromised old key useless for future messages. If the old key is unavailable (device stolen), a trusted co-member with admin role must remove and re-add the member.
+
+**3. UCAN revocation.** Revoke all UCAN tokens issued by the compromised key. Publish revocations to the revocation endpoint. Issue new tokens signed by the new key.
+
+**4. KeyPackage rotation.** Delete all outstanding KeyPackages associated with the old key from relays. Publish new KeyPackages signed by the new key.
+
+**5. Contact notification.** The SDK sends a key-change notification to all known contacts. Contacts who completed Key Continuity Verification (§9.11) are alerted that re-verification is needed.
+
+**6. Identity private state re-encryption.** Re-encrypt identity private state (§3.7) under the new key. Publish re-encrypted state to relays.
+
+**Time-shifted key compromise:** An attacker who extracts MLS state at time T can read messages until the next PCS Update. Forward secrecy protects all messages from before T (old epoch keys already deleted). PCS protects all messages after the next Update. The vulnerability window is bounded by the PCS Update interval (§9.7.3).
+
+## 9.13 Transport Security Requirements
+
+**Relay connections MUST use TLS 1.3** (or higher). TLS 1.2 is acceptable only as a fallback when TLS 1.3 is unavailable.
+
+**Certificate validation:** Standard WebPKI validation. The SDK MUST reject self-signed certificates for relay connections unless the user has explicitly configured a self-hosted relay with a pinned certificate.
+
+**Certificate pinning:** The SDK SHOULD support certificate pinning for known relays. If did:web is used as a fallback, certificate pinning for the resolution server is mandatory.
+
+**Relay authentication:** NIP-42 (Nostr relay authentication) is supported but not required. SCP does not depend on relay authentication — encryption-as-access-control (§10.5) makes it unnecessary for confidentiality. Relay authentication may be useful for relays that want to limit their user base or implement per-user rate limiting.
+
+**Direct connections:** For the direct WebSocket transport adapter, connections between devices MUST use TLS (wss://) unless both devices are on the same local network AND the user has explicitly accepted the risk.
+
+## 9.14 Clock and Ordering Model
+
+**Clock model:** SCP does not require synchronized clocks. Timestamps are best-effort, used for ordering hints and replay detection, not for security-critical decisions.
+
+**Clock skew tolerance:** 5 minutes. Messages with timestamps more than 5 minutes in the future are rejected. This is generous enough to handle devices with poorly-set clocks while tight enough to limit replay windows.
+
+**Authoritative ordering:** The Merkle event log order is authoritative. Timestamps inform real-time ordering in the SDK. Once events are committed to the log, the log order is the permanent record.
+
+**Causal ordering:** MLS epoch boundaries serve as synchronization points. Within an epoch, sender generation numbers provide per-sender total ordering. Cross-sender ordering within an epoch relies on timestamps (best-effort) and the Merkle log (authoritative after the fact).
+
+## 9.15 Ephemeral Key Destruction Verification
+
+**Honest limitation:** Proving that a key has been destroyed on a remote device is impossible in the general case. A compromised device can claim destruction while retaining the key. This mechanism provides the strongest verifiable guarantees the hardware supports.
+
+**Platform-attested destruction:** On platforms with hardware security (Secure Enclave, Android Keystore), the SDK requests a destruction attestation from the hardware after deleting key material.
+
+**Destruction protocol for ephemeral context close:**
+
+1. Context TTL expires or participants trigger close.
+2. Each member destroys their MLS group state locally: tree secrets, all epoch key schedules, application key material.
+3. Each member generates a destruction attestation:
+
+```
+KeyDestructionAttestation {
+  contextID:             String
+  memberDID:             DID
+  destroyedAt:           DateTime
+  platformAttestation:   PlatformAttestation?  // hardware-backed if available
+  method:                .hardwareBacked | .softwareOnly
+  signature:             Ed25519Signature       // signed by identity key, NOT the destroyed key
+}
+```
+
+4. Attestations are published to relays (outside the now-destroyed context). They are signed by the identity key so they remain verifiable after context keys are destroyed.
+
+**Trust levels for destruction claims:**
+
+- **Hardware-attested** (Secure Enclave / Keystore attestation): High confidence. The hardware claims the key is gone.
+- **Software-only** (`memset(0)` on key material in memory): Moderate confidence. Memory dumps, swap files, or crash logs may have retained the key.
+- **No attestation** (member went offline before close): No confidence. The member may still have the key.
+
+The protocol provides the strongest guarantees the hardware supports and is explicit about where those guarantees end. This is consistent with the honest limitations acknowledged in §5.11.
+
+## 9.16 Sender-Side Key Layer (Blocking)
+
+The MLS group key provides confidentiality against outsiders but not against other group members. Blocking a participant within a context requires a cryptographic layer below MLS that allows selective readability.
+
+### 9.16.1 Key Architecture
+
+Each participant in a context holds one AES-256 symmetric sender key. All messages are encrypted with the sender's key before being encrypted with MLS. Blocked parties can decrypt the MLS layer but receive opaque ciphertext from the blocking party.
+
+- **Key type:** AES-256-GCM symmetric. One key per sender per context.
+- **Key size:** 32 bytes per sender key per context member. Storage is trivial.
+- **Encryption order:** Sender-first (AES-256-GCM), then MLS. Recipients decrypt MLS layer, then decrypt sender layer with the cached sender key.
+
+**Stable wrapping keypair.** Each member maintains a dedicated X25519 keypair per context, used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
+
+### 9.16.2 Key Distribution
+
+Sender keys are distributed inside MLS application messages (encrypted to the group), but the key payload itself is HPKE-encrypted to each individual recipient's public key. This is necessary because MLS application messages are readable by all group members — without per-recipient HPKE wrapping, a blocked party could decrypt the MLS layer and read the new sender key.
+
+- **Key wrapping:** Each sender key distribution message contains per-recipient HPKE-encrypted payloads: `{recipient_did, HPKE_Seal(recipient_wrapping_pubkey, sender_key)}`. The recipient's wrapping public key is the stable X25519 key from their MLS LeafNode extension `scp_wrapping_key` (§9.16.1) — NOT the MLS leaf HPKE key, which rotates on epoch advances. Using a stable wrapping key ensures that offline members and members who join after an epoch advance can still unwrap sender key distributions. The MLS message is readable by all group members, but only the intended recipient can unwrap the actual sender key.
+- **New member join:** Existing members each send their current sender key to the new member as an MLS application message containing a single HPKE-encrypted payload for the new member. The new member accumulates sender keys from each existing member.
+- **Normal operation:** Sender key is stable — it does not rotate on MLS epoch advances. This is intentional: old sender keys are retained for historical message decryption. Blocking is about future messages, not retroactive access.
+
+### 9.16.3 Block Protocol
+
+When Alice blocks Bob:
+
+1. Alice generates a new AES-256-GCM sender key.
+2. Alice sends a single MLS application message containing HPKE-encrypted payloads for each non-blocked member: `[{did: "charlie", key: HPKE(charlie_wrapping_pk, new_key)}, {did: "dave", key: HPKE(dave_wrapping_pk, new_key)}, ...]`, using each recipient's stable wrapping public key (§9.16.1). Bob can see this MLS message (it's group-encrypted) and can observe the recipient list, but Bob cannot unwrap any key payload.
+3. Alice sends a block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice"}`. This notifies Bob's client that Alice has blocked him.
+4. Bob's client, upon receiving the block notification, automatically rotates Bob's sender key, distributing the new key via HPKE-encrypted payloads to each member EXCEPT Alice.
+
+**Block event observability:** Block events are observable to the group. Alice distributed keys excluding Bob — other members can see the recipient list and infer the block. This is an acceptable tradeoff, consistent with how other messaging systems handle blocks (some explicitly announce "Alice blocked Bob," others simply stop showing messages). The protocol prioritizes cryptographic enforcement of the block over concealing the block event.
+
+**Result:** Both Alice and Bob have new sender keys that exclude each other. Neither can read the other's future messages. Other context members can read both. The entire exchange completes within one message round-trip.
+
+### 9.16.4 Blocking vs. Removal
+
+Blocking and removal are distinct operations with different mechanisms:
+
+- **Blocking** (§9.16): Sender-side key rotation. The blocked party remains in the MLS group. They can see encrypted blobs from the blocker but cannot decrypt them. They retain access to messages from non-blocking members. Blocking is a per-relationship decision, not a group decision.
+- **Removal** (§9.7): MLS group epoch advance excluding the removed member. The removed party loses access to all future messages in the context. Removal requires governance authority (admin role or context rules). Removal implies blocking but blocking does not imply removal.
+
+### 9.16.5 Forward Secrecy Interaction
+
+Sender keys rotate ONLY on block events, not on MLS epoch advances. This is a deliberate design choice:
+
+- MLS provides forward secrecy for group-level encryption via epoch advancement.
+- Sender keys provide selective readability within the group.
+- Rotating sender keys on every epoch would require O(N) individual key distributions per epoch advance — prohibitive for active contexts.
+- Old sender keys are retained for historical message decryption. A member who joins and receives the current sender keys can decrypt all messages encrypted with those keys (forward and backward within the sender key's lifetime). Historical access boundaries are defined by block events and member joins, not by time.
