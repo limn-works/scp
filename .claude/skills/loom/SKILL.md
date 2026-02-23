@@ -1,14 +1,14 @@
 ---
-name: ralph
-description: Start the Ralph autonomous development loop. Launches a tmux session that continuously reads tasks from a PRD, dispatches parallel subagents, runs tests, and commits passing code.
+name: loom
+description: Start the Loom autonomous development loop. Launches a tmux session that continuously reads tasks from a PRD, dispatches parallel subagents, runs tests, and commits passing code.
 argument-hint: "[flags or directive text]"
 disable-model-invocation: true
 allowed-tools: Bash
 ---
 
-# /ralph
+# /loom
 
-Launch the Ralph autonomous development loop. You must `unset CLAUDECODE` before running the script so nested `claude` invocations work.
+Launch the Loom autonomous development loop. You must `unset CLAUDECODE` before running the script so nested `claude` invocations work.
 
 ## Routing
 
@@ -19,7 +19,7 @@ Look at `$ARGUMENTS` and determine which case applies:
 Start the loop:
 
 ```bash
-unset CLAUDECODE && .ralph/ralph.sh
+unset CLAUDECODE && .loom/loom.sh
 ```
 
 ### Case 2: `status`
@@ -27,7 +27,7 @@ unset CLAUDECODE && .ralph/ralph.sh
 Show run summary:
 
 ```bash
-.ralph/ralph-status.sh
+.loom/loom-status.sh
 ```
 
 ### Case 3: `stop`
@@ -35,7 +35,7 @@ Show run summary:
 Graceful stop (finishes current iteration, then halts):
 
 ```bash
-.ralph/stop.sh && echo "Ralph will stop after the current iteration." || echo "Failed to signal stop."
+.loom/stop.sh && echo "Loom will stop after the current iteration." || echo "Failed to signal stop."
 ```
 
 ### Case 4: `kill`
@@ -43,7 +43,7 @@ Graceful stop (finishes current iteration, then halts):
 Immediate kill (terminates the tmux session without waiting):
 
 ```bash
-tmux kill-session -t "ralph-$(basename "$PWD")" 2>/dev/null && echo "Ralph killed." || echo "Ralph is not running."
+tmux kill-session -t "loom-$(basename "$PWD")" 2>/dev/null && echo "Loom killed." || echo "Loom is not running."
 ```
 
 ### Case 5: `linear <query_or_url>`
@@ -51,7 +51,7 @@ tmux kill-session -t "ralph-$(basename "$PWD")" 2>/dev/null && echo "Ralph kille
 Linear mode — fetch from Linear, implement, update ticket:
 
 ```bash
-unset CLAUDECODE && .ralph/ralph.sh --linear "$REST"
+unset CLAUDECODE && .loom/loom.sh --linear "$REST"
 ```
 
 Where `$REST` is everything after the word `linear`.
@@ -61,7 +61,7 @@ Where `$REST` is everything after the word `linear`.
 GitHub mode — fetch from GitHub, implement, close issues:
 
 ```bash
-unset CLAUDECODE && .ralph/ralph.sh --github "$REST"
+unset CLAUDECODE && .loom/loom.sh --github "$REST"
 ```
 
 Where `$REST` is everything after the word `github`.
@@ -71,7 +71,7 @@ Where `$REST` is everything after the word `github`.
 Shorthand for GitHub issue mode:
 
 ```bash
-unset CLAUDECODE && .ralph/ralph.sh --github "$NUMBER"
+unset CLAUDECODE && .loom/loom.sh --github "$NUMBER"
 ```
 
 ### Case 8: `slack <url>`
@@ -79,7 +79,7 @@ unset CLAUDECODE && .ralph/ralph.sh --github "$NUMBER"
 Slack mode — fetch Slack message, implement:
 
 ```bash
-unset CLAUDECODE && .ralph/ralph.sh --slack "$URL"
+unset CLAUDECODE && .loom/loom.sh --slack "$URL"
 ```
 
 ### Case 9: Arguments start with `-` (flags only)
@@ -87,25 +87,25 @@ unset CLAUDECODE && .ralph/ralph.sh --slack "$URL"
 Pass flags through directly:
 
 ```bash
-unset CLAUDECODE && .ralph/ralph.sh $ARGUMENTS
+unset CLAUDECODE && .loom/loom.sh $ARGUMENTS
 ```
 
 Examples:
-- `/ralph --dry-run` → `unset CLAUDECODE && .ralph/ralph.sh --dry-run`
-- `/ralph -m 10` → `unset CLAUDECODE && .ralph/ralph.sh -m 10`
-- `/ralph --dry-run --prompt path/to/file.md` → `unset CLAUDECODE && .ralph/ralph.sh --dry-run --prompt path/to/file.md`
+- `/loom --dry-run` → `unset CLAUDECODE && .loom/loom.sh --dry-run`
+- `/loom -m 10` → `unset CLAUDECODE && .loom/loom.sh -m 10`
+- `/loom --dry-run --prompt path/to/file.md` → `unset CLAUDECODE && .loom/loom.sh --dry-run --prompt path/to/file.md`
 
 ### Case 10: Arguments are plain text (a prompt)
 
 Write the text to a file and pass it via `--prompt`:
 
 ```bash
-printf '%s' '$ARGUMENTS' > .ralph/.directive && unset CLAUDECODE && .ralph/ralph.sh --prompt .ralph/.directive
+printf '%s' '$ARGUMENTS' > .loom/.directive && unset CLAUDECODE && .loom/loom.sh --prompt .loom/.directive
 ```
 
 Examples:
-- `/ralph Fix all lint errors` → writes "Fix all lint errors" to `.ralph/.directive`, then runs with `--prompt .ralph/.directive`
-- `/ralph Refactor all callbacks to async/await` → same pattern
+- `/loom Fix all lint errors` → writes "Fix all lint errors" to `.loom/.directive`, then runs with `--prompt .loom/.directive`
+- `/loom Refactor all callbacks to async/await` → same pattern
 
 ### How to tell the difference
 
@@ -123,5 +123,5 @@ Examples:
 ## After launching
 
 Report back to the user (substitute the actual project directory name):
-- Attach to monitor: `tmux attach -t ralph-<project>`
-- Kill the loop: `tmux kill-session -t ralph-<project>`
+- Attach to monitor: `tmux attach -t loom-<project>`
+- Kill the loop: `tmux kill-session -t loom-<project>`

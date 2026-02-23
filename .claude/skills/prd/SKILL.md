@@ -8,7 +8,7 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Task
 
 # /prd
 
-Generate a structured PRD (`.ralph/prd.json`) from specification documents, planning sessions, design sketches, or any other input files.
+Generate a structured PRD (`.loom/prd.json`) from specification documents, planning sessions, design sketches, or any other input files.
 
 ## Arguments
 
@@ -26,12 +26,12 @@ If `$ARGUMENTS` is empty or `help`, show usage and exit.
 ### Step 1: Read inputs
 
 1. Read each specified file using the Read tool. If a path is a glob (contains `*`), expand it with Glob first.
-2. If `--append` is set and `.ralph/prd.json` exists, read it to understand existing stories (avoid duplicating work, continue ID numbering).
+2. If `--append` is set and `.loom/prd.json` exists, read it to understand existing stories (avoid duplicating work, continue ID numbering).
 3. Read any existing codebase files that help contextualize the spec (look for `src/`, `lib/`, `package.json`, `Cargo.toml`, etc. — keep it lightweight, just enough to understand the tech stack and existing structure).
 
 ### Step 2: Decompose into PRD
 
-Analyze the input documents and generate a complete PRD. The output is a single JSON object written to `.ralph/prd.json`.
+Analyze the input documents and generate a complete PRD. The output is a single JSON object written to `.loom/prd.json`.
 
 #### Schema
 
@@ -84,7 +84,7 @@ Analyze the input documents and generate a complete PRD. The output is a single 
 
 #### Generation rules
 
-1. **Atomic stories** — each story must be completable by a single Claude Code subagent in one Ralph iteration (~15-30 minutes of focused work). If a piece of work would take longer, split it.
+1. **Atomic stories** — each story must be completable by a single Claude Code subagent in one Loom iteration (~15-30 minutes of focused work). If a piece of work would take longer, split it.
 
 2. **ID format** — `PREFIX-NNN` with zero-padded 3-digit numbers. Start at 001 (or continue from the highest existing ID if appending).
 
@@ -94,15 +94,15 @@ Analyze the input documents and generate a complete PRD. The output is a single 
    - **P2**: Nice to have. Polish, cleanup, optimization.
    Order gates by priority, then by logical dependency.
 
-4. **Dependencies** — set `blockedBy` arrays accurately. A story should only list IDs it truly cannot start without. Ralph uses this to maximize parallelism — overly conservative dependencies serialize work unnecessarily.
+4. **Dependencies** — set `blockedBy` arrays accurately. A story should only list IDs it truly cannot start without. Loom uses this to maximize parallelism — overly conservative dependencies serialize work unnecessarily.
 
-5. **Files** — predict which files each story will create or modify. Use the existing codebase structure as a guide. This helps Ralph's subagents find the right context quickly.
+5. **Files** — predict which files each story will create or modify. Use the existing codebase structure as a guide. This helps Loom's subagents find the right context quickly.
 
 6. **Acceptance criteria** — concrete, testable assertions. Not "the feature works" but "POST /auth/login returns a 200 with a JWT when credentials are valid" or "the function returns an empty array when given no input". Each criterion should be verifiable by a test or manual check.
 
 7. **No over-decomposition** — keep naturally coupled work together. Creating a model, its migration, and its route handler is one story, not three. A function and its unit tests belong in the same story.
 
-8. **Critical path first** — arrange gates and story IDs so the critical path (longest dependency chain) uses the lowest numbers. This helps Ralph prioritize correctly.
+8. **Critical path first** — arrange gates and story IDs so the critical path (longest dependency chain) uses the lowest numbers. This helps Loom prioritize correctly.
 
 9. **Description richness** — the description should give the implementer enough context to work autonomously. Include relevant spec references, design decisions, constraints, and gotchas.
 
@@ -114,11 +114,11 @@ Analyze the input documents and generate a complete PRD. The output is a single 
    - Append new stories (don't modify existing stories)
    - Write the merged result
 2. Otherwise:
-   - Write the complete PRD to `.ralph/prd.json`
+   - Write the complete PRD to `.loom/prd.json`
 
 3. Validate the output:
    ```bash
-   jq '.' .ralph/prd.json > /dev/null
+   jq '.' .loom/prd.json > /dev/null
    ```
 
 ### Step 4: Report
@@ -126,7 +126,7 @@ Analyze the input documents and generate a complete PRD. The output is a single 
 Show a summary:
 
 ```
-PRD generated: .ralph/prd.json
+PRD generated: .loom/prd.json
 
   Stories:  47
   Gates:    6 (3×P0, 2×P1, 1×P2)

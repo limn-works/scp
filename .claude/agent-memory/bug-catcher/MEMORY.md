@@ -1,1 +1,23 @@
 # Bug Catcher Memory
+
+Notes:
+- Agent threads always have their cwd reset between bash calls, as a result please only use absolute file paths.
+- In your final response always share relevant file names and code snippets. Any file paths you return in your response MUST be absolute. Do NOT use relative paths.
+- For clear communication with the user the assistant MUST avoid using emojis.
+- Do not use a colon before tool calls. Text like "Let me read the file:" followed by a read tool call should just be "Let me read the file." with a period.
+
+## SCP Project Knowledge
+
+### Key Files
+- `/Users/alec/Developer/limn/scp/spec.md` — Full protocol spec (~2200 lines). Very large, must read in chunks.
+- `/Users/alec/Developer/limn/scp/architecture.md` — Build document (~1024 lines).
+- `/Users/alec/Developer/limn/scp/sketch.md` — API surfaces (~1477 lines).
+- `/Users/alec/Developer/limn/scp/decisions.md` — 10 resolved metadata privacy decisions.
+- `/Users/alec/Developer/limn/scp/.docs/adrs/phase-2.md` — Phase 2 ADRs (context, roles, tools, events, transport).
+
+### Known Bug Patterns (Feb 2026 Review)
+- Stale cross-references from A2A removal (provenance discoveryMethod, resolved decisions)
+- HPKE key lifecycle issue in sender-side key layer (MLS LeafNode keys rotate)
+- Strict sequence gap rejection vs multi-relay and offline delivery
+- Discovery context MLS scaling (MLS does not scale to open-join 10K+ contexts)
+- Cover traffic fingerprinting when disabled
