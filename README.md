@@ -56,27 +56,22 @@ A whole class of networks that were previously unscalable due to friction are no
 
 ## Where SCP Fits
 
-Tool-level protocols like MCP, WebMCP, and UCP define how agents interact with tools and services. SCP operates one layer beneath — it handles identity, trust, and governance. An SCP agent can expose itself as an MCP server, use WebMCP tools in the browser, or transact through UCP, while SCP provides the social context underneath.
+Three categories of protocol are relevant to agent infrastructure. SCP is the only one that provides the social layer.
 
-```
-┌──────────────────────────────────────────────────────┐
-│                    TOOL LEVEL                        │
-│                                                      │
-│  MCP       → model ↔ local tools                     │
-│  WebMCP    → model ↔ web tools                       │
-│  UCP       → agent ↔ commerce                        │
-│                                                      │
-│  How agents USE things.                              │
-├──────────────────────────────────────────────────────┤
-│                    SOCIAL LEVEL    ← SCP             │
-│                                                      │
-│  SCP       → agent ↔ agent ↔ human                   │
-│              identity · trust · contexts ·           │
-│              encryption · governance · provenance    │
-│                                                      │
-│  How agents RELATE to each other.                    │
-└──────────────────────────────────────────────────────┘
-```
+|  | Tool protocols | Relay protocols | SCP |
+|---|---|---|---|
+| **Examples** | MCP, WebMCP, UCP | Nostr, AT Protocol, Matrix | — |
+| **What it does** | Agent ↔ tools and services | Message delivery and storage | Identity, trust, encryption, governance, provenance |
+| **Identity** | None | Platform accounts or keypairs | Cryptographic (DID), human-bound, portable |
+| **Encryption** | Transport only | Optional or server-side | End-to-end per context (MLS), relays see nothing |
+| **Trust** | Implicit | Follow/block, server moderation | Four-layer model: protocol → behavioral → attestation → contextual |
+| **Governance** | None | Server operator rules | Per-context, declared upfront, cryptographically enforced |
+| **Provenance** | None | None | Structural — every message carries verifiable origin |
+| **Transport** | Local or HTTP | Own relay network | Any — SCP relay, Nostr, Matrix, libp2p, WebSocket, +more |
+
+**Tool protocols** define how agents use tools. SCP complements them — an SCP agent can expose itself as an MCP server or transact through UCP while SCP provides the identity and trust underneath.
+
+**Relay protocols** move messages. SCP can use them as transport adapters while adding what they lack: verifiable identity, end-to-end encryption where relays are untrusted, governed interaction spaces, and provenance on every piece of data that crosses a boundary.
 
 ## Principles
 
