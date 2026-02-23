@@ -109,12 +109,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+pkarr = "5"
+z-base-32 = "0.1"
 sha2 = "0.10"
 hkdf = "0.12"
 aes-gcm = "0.10"
 rand = "0.8"
 futures = "0.3"
-async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ```
@@ -132,10 +133,11 @@ tracing-subscriber = "0.3"
 | `tokio-tungstenite` | latest | scp-transport | WebSocket (native relay) |
 | `serde` | 1.x | all crates | Serialization framework |
 | `serde_json` | 1.x | scp-core, scp-mcp | JSON serialization |
-| `rmp-serde` | latest | scp-core | MessagePack binary serialization (envelopes) |
+| `rmp-serde` | latest | scp-core, scp-transport | MessagePack binary serialization (envelopes, relay protocol) |
+| `pkarr` | 5.0.3+ | scp-core | did:dht identity — BEP44 signed mutable items, DNS packets, Mainline DHT publish/resolve (ADR-003) |
+| `z-base-32` | latest | scp-core | z-base-32 encoding for did:dht identifiers (ADR-003) |
 | `thiserror` | 2.x | all crates | Error type derivation |
 | `futures` | 0.3.x | scp-transport | Stream combinators |
-| `async-trait` | 0.1.x | all crates | Async trait support (may be removed — Rust 2024 supports `async fn` in traits natively via RPITIT; keep only if `dyn`-dispatched async traits are needed) |
 | `tracing` | 0.1.x | all crates | Structured logging |
 | `axum` | latest | scp-mcp | HTTP server (MCP SSE transport) |
 | `jsonschema` | latest | scp-core | JSON Schema validation (tool schemas) |

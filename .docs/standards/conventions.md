@@ -1,36 +1,41 @@
 # Conventions
 
-Naming, structure, and git conventions.
+Naming, structure, and git conventions for all SCP development. Language-specific casing and file naming rules are in `sdk-common.md` (cross-language naming table) and each language's standards file.
 
-## File Naming
+## File Naming Per Language
 
-| Type | Convention | Example |
-|------|------------|---------|
-| Swift files | `PascalCase.swift` | `UserRepository.swift` |
-| One primary type per file | File named after type | `User.swift` contains `User` |
-| Views | `*View.swift` | `UserListView.swift` |
-| View Models | `*ViewModel.swift` | `UserListViewModel.swift` |
-| Protocols | `*Protocol.swift` or descriptive | `UserRepository.swift` (protocol) |
-| Extensions | `Type+Extension.swift` | `String+Validation.swift` |
-| Tests | `*Tests.swift` | `UserRepositoryTests.swift` |
+| Language | Source files | Test files | Modules/Packages |
+|----------|-------------|------------|-------------------|
+| Rust | `snake_case.rs` | `snake_case.rs` (in `tests/` or `#[cfg(test)]`) | `snake_case/` |
+| Python | `snake_case.py` | `test_snake_case.py` | `snake_case/` |
+| TypeScript | `kebab-case.ts` | `kebab-case.test.ts` | `kebab-case/` |
+| Swift | `PascalCase.swift` | `PascalCaseTests.swift` | `PascalCase/` |
+| Kotlin | `PascalCase.kt` | `PascalCaseTest.kt` | `lowercase/` |
+| Go | `snake_case.go` | `snake_case_test.go` | `lowercase/` |
+| C# | `PascalCase.cs` | `PascalCaseTests.cs` | `PascalCase/` |
+| Java | `PascalCase.java` | `PascalCaseTest.java` | `lowercase/` |
+
+### General rules
+
+- One primary type per file, file named after the type (adapted to language casing)
+- Tests adjacent to source or in dedicated `tests/` directory per language convention
+- Extensions/mixins: `Type+Extension` pattern where supported (Swift, Kotlin)
+- Configuration files: lowercase with dots (`pyproject.toml`, `Cargo.toml`, `package.json`)
 
 ## Folder Structure
 
-- **PascalCase** for all folders: `Features/`, `Core/`, `Data/`
-- Group by feature first, then by type within feature
-- Shared code lives in `Core/`, `UI/`, `Data/`, `Network/`
-- Feature-specific code lives in `Features/[FeatureName]/`
+- Group by feature/module first, then by type within module
+- Shared code lives in `core/`, `common/`, or `shared/` directories
+- Feature-specific code lives in `features/` or `modules/` directories
+- Language bindings follow the monorepo topology defined in `sdk-common.md`
 
 ## Casing Rules
 
-| Context | Style | Example |
-|---------|-------|---------|
-| Types (class, struct, enum, protocol) | `PascalCase` | `UserRepository` |
-| Functions, methods, properties | `camelCase` | `fetchUsers()` |
-| Constants | `camelCase` | `let maxRetryCount = 3` |
-| Enum cases | `camelCase` | `case inProgress` |
-| Static constants | `camelCase` | `static let defaultTimeout` |
-| Acronyms | Lowercase in middle, uppercase at start | `urlString`, `HTTPClient` |
+See `sdk-common.md` for the full cross-language casing table. Summary of universal rules:
+
+- **Type names** are `PascalCase` in every language
+- **Constants** are `SCREAMING_SNAKE_CASE` in most languages (except Swift: `camelCase`, C#: `PascalCase`)
+- **Acronyms** follow language convention: `URLString` vs `urlString` — see per-language standards
 
 ## Git Commits
 
@@ -49,7 +54,7 @@ Naming, structure, and git conventions.
 - `test` — Adding or updating tests
 - `chore` — Maintenance, dependencies, config
 
-**Scope:** Module or feature affected.
+**Scope:** Module, crate, or language binding affected (e.g., `scp-core`, `python`, `transport`).
 
 **Subject:**
 - Imperative mood ("add" not "added")
@@ -71,45 +76,31 @@ Naming, structure, and git conventions.
 **Examples:**
 ```
 feat/user-profiles
-fix/auth-token-crash
-refactor/repository-protocols
+fix/mls-epoch-rollover
+refactor/transport-trait
+feat/python-sdk
 ```
+
+## Import/Dependency Order
+
+All languages follow the same grouping order, separated by blank lines:
+
+1. Standard library / language built-ins
+2. Platform/framework imports
+3. Third-party dependencies
+4. Local/project modules
+
+See per-language standards files for specific syntax and examples.
 
 ## Code Organization Within Files
 
-```swift
-// MARK: - Type Declaration
-struct SomeViewModel {
+Universal ordering within a file:
 
-    // MARK: - Properties (public, then private)
+1. Type/class declaration
+2. Properties/fields (public, then private)
+3. Initialization/constructors
+4. Public methods
+5. Private methods
+6. Protocol/interface conformances (extensions where supported)
 
-    // MARK: - Initialization
-
-    // MARK: - Public Methods
-
-    // MARK: - Private Methods
-}
-
-// MARK: - Protocol Conformances (each in extension)
-extension SomeViewModel: Identifiable { }
-```
-
-## Import Order
-
-1. Foundation/Swift standard library
-2. Apple frameworks (SwiftUI, SwiftData, etc.)
-3. Third-party dependencies
-4. Local modules
-
-Separate groups with blank line:
-```swift
-import Foundation
-
-import SwiftUI
-import SwiftData
-
-import SomeThirdParty
-
-import Core
-import Data
-```
+Language-specific patterns (e.g., Swift `MARK` comments, Rust `mod` blocks, Python `__all__`) are in per-language standards.

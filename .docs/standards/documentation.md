@@ -22,21 +22,20 @@ Documentation exists to accelerate human understanding. Write docs that help som
 - Private implementation details (unless complex)
 - Code that follows established patterns
 
-## Inline Documentation (Swift)
+## Inline Documentation
 
-Use `///` for API documentation. Focus on **why** and **how to use**, not **what** (the code shows what).
+Use the language's standard doc-comment syntax. Focus on **why** and **how to use**, not **what** (the code shows what).
 
-```swift
-/// Fetches items matching the given criteria.
-///
-/// Results are sorted by creation date (newest first). For large result sets,
-/// consider using `fetchItemsPaginated` instead.
-///
-/// - Parameter filter: Criteria for filtering. Pass `nil` for all items.
-/// - Returns: Array of matching items.
-/// - Throws: `DataError.fetchFailed` if the query cannot be executed.
-func fetchItems(filter: ItemFilter?) async throws -> [Item]
-```
+| Language | Doc syntax | Generator |
+|----------|-----------|-----------|
+| Rust | `///` / `//!` | rustdoc |
+| Python | `"""docstring"""` | pdoc |
+| TypeScript | `/** JSDoc */` | typedoc |
+| Swift | `///` | DocC |
+| Kotlin | `/** KDoc */` | Dokka |
+| Go | `// Comment` | godoc |
+| C# | `/// <summary>` | xmldoc |
+| Java | `/** Javadoc */` | Javadoc |
 
 **Document when:**
 - Behavior isn't obvious from the signature
@@ -45,8 +44,8 @@ func fetchItems(filter: ItemFilter?) async throws -> [Item]
 - Usage patterns matter
 
 **Skip when:**
-- The name says it all: `var title: String`
-- It's a standard pattern: `func save() async throws`
+- The name says it all (simple getters, standard CRUD)
+- It's a standard pattern the team already knows
 
 ## File-Level Documentation
 

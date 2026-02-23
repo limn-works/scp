@@ -1,6 +1,6 @@
-# Swift Coding Standards
+# Swift Standards
 
-Swift conventions, safety rules, and framework-specific patterns.
+Swift conventions, safety rules, framework-specific patterns, and SCP SDK standards. References `sdk-common.md` for cross-language invariants and `conventions.md` for git/branch conventions.
 
 ## Swift Conventions
 
@@ -19,7 +19,7 @@ Swift conventions, safety rules, and framework-specific patterns.
 
 - **No force unwraps** (`!`) in production code
 - **No force try** (`try!`) — handle errors explicitly
-- **No implicitly unwrapped optionals** except for `@IBOutlet`
+- **No implicitly unwrapped optionals**
 - **No `@unchecked Sendable`** — use proper `Sendable` conformance or actors
 - **No `nonisolated(unsafe)`** — prefer making the containing type `nonisolated` (e.g., `nonisolated enum`, `nonisolated struct`) so all its members inherit nonisolated context
 - Use `guard` for early exits
@@ -85,3 +85,85 @@ Two independent build settings:
   ```
 - Prefer pure SwiftUI and CoreGraphics where possible (works everywhere)
 - UIKit-specific code (UIFont, UIColor, UIFontMetrics) requires AppKit equivalents
+
+---
+
+## SCP SDK Standards
+
+The following sections apply to the SCP Swift SDK (`bindings/swift/`). The app-layer standards above also apply when building apps on top of the SDK.
+
+### Toolchain
+
+| Tool | Version | Purpose |
+|------|---------|---------|
+| Swift | 6.2+ | Language version |
+| SPM | (bundled) | Swift Package Manager |
+| UniFFI | latest | FFI bridge from Rust (shared UDL with Kotlin) |
+| Swift Testing | (bundled) | Test framework (`@Test`, `#expect`) |
+| SwiftFormat | latest | Formatter |
+| SwiftLint | latest | Linter |
+
+### Package layout, UniFFI bridge, and type definitions
+
+See `.docs/scaffold/swift.md` for the build blueprint: package structure, UniFFI bridge patterns, XCFramework build, and SDK type definitions (Identity, ScpError, Message, ToolDefinition).
+
+### Testing (Swift Testing)
+
+Use the Swift Testing framework (`@Test`, `#expect`):
+
+```swift
+import Testing
+@testable import SCP
+
+@Test
+func createIdentityReturnsValidDid() async throws {
+    let identity = try await Identity.create(custody: "in_memory")
+    #expect(identity.did.hasPrefix("did:dht:"))
+}
+
+@Test
+func contextSendRequiresActiveState() async throws {
+    // ...
+}
+
+@Test(arguments: [
+    ("messages:write", true),
+    ("context:close", false),
+])
+func validateCapabilityChecksCeiling(capability: String, shouldPass: Bool) async throws {
+    // ...
+}
+```
+
+### CI Commands
+
+```bash
+# Build (iOS + macOS)
+swift build
+xcodebuild build -scheme SCP -destination 'platform=iOS Simulator,name=iPhone 16'
+xcodebuild build -scheme SCP -destination 'platform=macOS'
+
+# Test
+swift test
+xcodebuild test -scheme SCP -destination 'platform=iOS Simulator,name=iPhone 16'
+
+# Lint
+swiftlint lint --strict
+
+# Format
+swiftformat --lint Sources/ Tests/
+```
+
+### CI Matrix
+
+| Job | Runs on | Xcode | Trigger |
+|-----|---------|-------|---------|
+| swiftlint | macos-latest | latest | Every PR |
+| swiftformat | macos-latest | latest | Every PR |
+| dependency-audit | macos-latest | latest | Every PR |
+| build (iOS) | macos-latest | latest | Every PR |
+| build (macOS) | macos-latest | latest | Every PR |
+| test (iOS Simulator) | macos-latest | latest | Every PR |
+| test (macOS) | macos-latest | latest | Every PR |
+| conformance | macos-latest | latest | Every PR |
+| build-xcframework | macos-latest | latest | Tagged release |
