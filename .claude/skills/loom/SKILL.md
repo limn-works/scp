@@ -1,7 +1,7 @@
 ---
 name: loom
 description: Start the Loom autonomous development loop. Launches a tmux session that continuously reads tasks from a PRD, dispatches parallel subagents, runs tests, and commits passing code.
-argument-hint: "[status|stop|kill|dry-run|linear|github|issue|slack|<prompt text>]"
+argument-hint: "[status|stop|kill|dry-run|github|linear|slack|notion|sentry|<directive text>]"
 disable-model-invocation: true
 allowed-tools: Bash
 ---
@@ -46,18 +46,13 @@ Immediate kill (terminates the tmux session without waiting):
 tmux kill-session -t "loom-$(basename "$PWD")" 2>/dev/null && echo "Loom killed." || echo "Loom is not running."
 ```
 
-### Case 5: `dry-run` or `dry-run <rest>`
+### Case 5: `dry-run`
 
-Dry-run mode — analyze without executing. Optional additional args passed through:
+Dry run — analyze one iteration without executing changes:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh --dry-run $REST
+unset CLAUDECODE && .loom/loom.sh --dry-run
 ```
-
-Where `$REST` is everything after `dry-run` (may be empty). Each remaining token is translated as below (Case 10 rules), e.g.:
-
-- `/loom dry-run` → `.loom/loom.sh --dry-run`
-- `/loom dry-run linear PHN-42` → `.loom/loom.sh --dry-run --linear PHN-42`
 
 ### Case 6: `linear <query_or_url>`
 
@@ -95,7 +90,37 @@ Slack mode — fetch Slack message, implement:
 unset CLAUDECODE && .loom/loom.sh --slack "$URL"
 ```
 
-### Case 10: Arguments are plain text (a prompt)
+### Case 10: `notion <query_or_url>`
+
+Notion mode — fetch Notion page, implement:
+
+```bash
+unset CLAUDECODE && .loom/loom.sh --notion "$REST"
+```
+
+Where `$REST` is everything after the word `notion`.
+
+### Case 11: `sentry <query_or_url>`
+
+Sentry mode — fetch Sentry issue, fix the bug:
+
+```bash
+unset CLAUDECODE && .loom/loom.sh --sentry "$REST"
+```
+
+Where `$REST` is everything after the word `sentry`.
+
+### Case 12: Arguments start with `-` (raw flags passthrough)
+
+Pass flags through directly to `loom.sh`:
+
+```bash
+unset CLAUDECODE && .loom/loom.sh $ARGUMENTS
+```
+
+This is a fallback for advanced usage. Most users should use the subcommand forms above.
+
+### Case 13: Arguments are plain text (a prompt)
 
 Write the text to a file and pass it via `--prompt`:
 
@@ -104,7 +129,7 @@ printf '%s' '$ARGUMENTS' > .loom/.directive && unset CLAUDECODE && .loom/loom.sh
 ```
 
 Examples:
-- `/loom Fix all lint errors` → writes to `.loom/.directive`, runs with `--prompt .loom/.directive`
+- `/loom Fix all lint errors` → writes "Fix all lint errors" to `.loom/.directive`, then runs with `--prompt .loom/.directive`
 - `/loom Refactor all callbacks to async/await` → same pattern
 
 ### How to tell the difference
@@ -113,12 +138,15 @@ Examples:
 2. If `$ARGUMENTS` equals `status` → Case 2
 3. If `$ARGUMENTS` equals `stop` → Case 3
 4. If `$ARGUMENTS` equals `kill` → Case 4
-5. If `$ARGUMENTS` starts with `dry-run` → Case 5
+5. If `$ARGUMENTS` equals `dry-run` → Case 5
 6. If `$ARGUMENTS` starts with `linear ` → Case 6
 7. If `$ARGUMENTS` starts with `github ` → Case 7
 8. If `$ARGUMENTS` starts with `issue ` → Case 8
 9. If `$ARGUMENTS` starts with `slack ` → Case 9
-10. Otherwise → Case 10
+10. If `$ARGUMENTS` starts with `notion ` → Case 10
+11. If `$ARGUMENTS` starts with `sentry ` → Case 11
+12. If `$ARGUMENTS` starts with `--` or `-` → Case 12
+13. Otherwise → Case 13
 
 ## After launching
 

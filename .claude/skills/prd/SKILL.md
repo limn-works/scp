@@ -1,7 +1,7 @@
 ---
 name: prd
 description: Generate a structured PRD from spec files, planning docs, or design sketches. Decomposes documents into atomic stories grouped into prioritized gates with dependency tracking.
-argument-hint: "<files...> [append|prefix <PREFIX>|max <N>]"
+argument-hint: "<files...> [append] [prefix PREFIX] [max N]"
 disable-model-invocation: true
 allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Task
 ---
@@ -26,7 +26,7 @@ If `$ARGUMENTS` is empty or `help`, show usage and exit.
 ### Step 1: Read inputs
 
 1. Read each specified file using the Read tool. If a path is a glob (contains `*`), expand it with Glob first.
-2. If `append` is set and `.loom/prd.json` exists, read it to understand existing stories (avoid duplicating work, continue ID numbering).
+2. If `--append` is set and `.loom/prd.json` exists, read it to understand existing stories (avoid duplicating work, continue ID numbering).
 3. Read any existing codebase files that help contextualize the spec (look for `src/`, `lib/`, `package.json`, `Cargo.toml`, etc. — keep it lightweight, just enough to understand the tech stack and existing structure).
 
 ### Step 2: Decompose into PRD
@@ -108,7 +108,7 @@ Analyze the input documents and generate a complete PRD. The output is a single 
 
 ### Step 3: Write output
 
-1. If `append`:
+1. If `--append`:
    - Read the existing PRD
    - Merge new gates (add new ones, don't duplicate existing)
    - Append new stories (don't modify existing stories)
@@ -142,4 +142,4 @@ PRD generated: .loom/prd.json
     gate-6  Polish & Documentation  P2   5 stories
 ```
 
-If the story count exceeds `max`, note which stories were omitted and suggest running `/prd append` with the remaining scope.
+If the story count exceeds `--max`, note which stories were omitted and suggest running `/prd --append` with the remaining scope.
