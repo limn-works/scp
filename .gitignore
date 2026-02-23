@@ -1,0 +1,11 @@
+.DS_Store
+.fastembed_cache/
+
+# Loom autonomous loop
+.loom/logs/
+.loom/.stop
+.loom/.pid
+.loom/.directive
+.loom/.piped_directive
+.loom/.iteration_marker
+.loom/loom.log

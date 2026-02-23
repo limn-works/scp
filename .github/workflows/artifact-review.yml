@@ -1,0 +1,80 @@
+name: Artifact Health Review
+
+on:
+  schedule:
+    # Daily at 3am ET (08:00 UTC)
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  artifact-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude artifact review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--model claude-opus-4-20250514 --max-turns 30"
+          prompt: |
+            You are an artifact health auditor for the SCP project. Your job is to read
+            all documentation artifacts under `.docs/` and check for staleness,
+            contradictions, misalignment, and open question hygiene.
+
+            ## Process
+
+            1. **Read ground truth first:**
+               - `.docs/specs/00-open-questions.md` — the living registry of design decisions
+               - `.docs/architecture.md` — the engineering blueprint
+
+            2. **Read all specs** (`.docs/specs/01-*.md` through all numbered files)
+
+            3. **Read all ADRs** (`.docs/adrs/phase-*.md`)
+
+            4. **Read sketch** (`.docs/sketch.md`)
+
+            5. **Check 4 categories:**
+               - **Staleness:** Sections that reference removed/renamed concepts, outdated phase numbers, or superseded decisions
+               - **Contradiction:** Two artifacts that make incompatible claims about the same mechanism
+               - **Misalignment:** Specs that describe behavior inconsistent with ADRs or architecture.md
+               - **Open question hygiene:** Questions marked resolved in `00-open-questions.md` whose resolution isn't reflected in the relevant spec section, or questions that should be open but aren't tracked
+
+            6. **Report findings** as a GitHub issue comment.
+
+            ## Output
+
+            After reviewing, find or create a GitHub issue with the label `artifact-health`:
+
+            ```bash
+            # Find existing issue
+            gh issue list --label artifact-health --state open --json number --limit 1
+            ```
+
+            If an open issue exists, add a comment with today's findings.
+            If no open issue exists, create one:
+
+            ```bash
+            gh issue create --title "Artifact Health Report" --label artifact-health --body "<findings>"
+            ```
+
+            If the review is clean (no findings), close the issue with a comment:
+            ```bash
+            gh issue close <number> --comment "All clear — no staleness, contradictions, or misalignment found."
+            ```
+
+            ## Finding Format
+
+            For each finding, include:
+            - **Category:** (staleness | contradiction | misalignment | open-question-hygiene)
+            - **File(s):** which artifact(s) are affected
+            - **Section:** specific section reference
+            - **Description:** what's wrong
+            - **Suggested fix:** how to resolve it

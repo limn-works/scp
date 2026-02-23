@@ -1,0 +1,62 @@
+name: Issue Deduplication
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  dedup:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Claude dedup check
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--model claude-sonnet-4-20250514 --max-turns 10"
+          prompt: |
+            Check if issue #${{ github.event.issue.number }} is a duplicate.
+
+            New issue title: "${{ github.event.issue.title }}"
+            New issue body:
+            ${{ github.event.issue.body }}
+
+            ## Step 1: Search existing issues
+
+            ```bash
+            gh issue list --state open --json number,title,body,labels --limit 50
+            ```
+
+            ## Step 2: Check open questions registry
+
+            Read `.docs/specs/00-open-questions.md` and check if this issue describes
+            something already tracked as an open or resolved question.
+
+            ## Step 3: Determine duplicates
+
+            An issue is a **true duplicate** only if another open issue describes the
+            exact same problem or request. Merely related issues are NOT duplicates.
+
+            ### If duplicate found:
+
+            ```bash
+            gh issue edit ${{ github.event.issue.number }} --add-label duplicate
+            gh issue comment ${{ github.event.issue.number }} --body "Possible duplicate of #<original>. The original issue covers the same topic. Keeping this open for maintainer review."
+            ```
+
+            Do NOT close the issue. Just label and comment.
+
+            ### If related open question found (but not a duplicate):
+
+            ```bash
+            gh issue comment ${{ github.event.issue.number }} --body "Related: this topic is tracked in \`.docs/specs/00-open-questions.md\` under [section]. See the existing discussion there for context."
+            ```
+
+            ### If no duplicates or related questions:
+
+            Do nothing. Exit silently.

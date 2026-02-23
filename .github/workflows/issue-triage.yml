@@ -1,0 +1,70 @@
+name: Issue Triage
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Claude triage
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--model claude-sonnet-4-20250514 --max-turns 10"
+          prompt: |
+            Triage issue #${{ github.event.issue.number }}: "${{ github.event.issue.title }}"
+
+            Issue body:
+            ${{ github.event.issue.body }}
+
+            ## Task
+
+            Classify this issue and apply appropriate labels. Read the spec files under
+            `.docs/specs/` to understand the project's spec areas.
+
+            ### 1. Spec Area Labels
+
+            Map the issue to one or more SCP spec areas. Available labels:
+
+            - `spec:identity` — DID, key management, identity resolution (specs 01, 03)
+            - `spec:contexts` — Context lifecycle, governance, membership (spec 05)
+            - `spec:messaging` — Message format, encryption, MLS (specs 04, 06)
+            - `spec:capabilities` — UCAN, delegation, capability chains (spec 07)
+            - `spec:provenance` — Attestations, verification, traceability (spec 08)
+            - `spec:security` — Security model, threat model, privacy (spec 09)
+            - `spec:transport` — Relay, adapters, federation (specs 10, 11)
+            - `spec:discovery` — Context discovery, search, resolution (spec 12)
+            - `spec:governance` — Policy, roles, moderation (spec 13)
+
+            ### 2. Type Label
+
+            Classify the issue type:
+            - `bug` — Something is broken
+            - `feature` — New functionality request
+            - `question` — Needs discussion or clarification
+            - `docs` — Documentation improvement
+
+            ### 3. Priority Label
+
+            Assess priority:
+            - `P0` — Critical: blocks implementation, security issue, or data loss
+            - `P1` — High: important for current phase
+            - `P2` — Medium: should be addressed, not blocking
+            - `P3` — Low: nice to have, future consideration
+
+            ## Apply Labels
+
+            ```bash
+            gh issue edit ${{ github.event.issue.number }} --add-label "<label1>,<label2>,..."
+            ```
+
+            Apply all relevant labels in a single command. Do not comment on the issue —
+            just apply labels silently.
