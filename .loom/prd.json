@@ -152,7 +152,7 @@
       "gate": "gate-platform",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/src/traits.rs",
         "crates/scp-platform/src/lib.rs"
@@ -182,7 +182,8 @@
       "details": {
         "adr": "ADR-006",
         "protocolSection": "§16"
-      }
+      },
+      "result": "All 4 platform traits (KeyCustody, Storage, DeviceAttestation, Push) and supporting types defined. 7+6+2+2 methods. All clippy/build/fmt clean."
     },
     {
       "id": "SCP-003",
@@ -351,7 +352,7 @@
       "gate": "gate-mls",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/mod.rs",
         "crates/scp-core/src/crypto/mls/credential.rs",
@@ -381,7 +382,8 @@
       "details": {
         "adr": "ADR-001",
         "protocolSection": "§9.5, §9.7.1, §17.9"
-      }
+      },
+      "result": "ScpCredential (DID+UCAN), MlsStorageBridge (wraps MemoryStorage via Deref), MlsError (wraps OpenMLS errors), SCP_CIPHERSUITE constant defined. Build clean."
     },
     {
       "id": "SCP-008",
@@ -498,7 +500,7 @@
       "gate": "gate-envelope",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/envelope/mod.rs",
         "crates/scp-core/src/envelope/inner.rs",
@@ -532,7 +534,8 @@
       "details": {
         "adr": "ADR-002",
         "protocolSection": "§9.10.3"
-      }
+      },
+      "result": "InnerEnvelope, OuterEnvelope, Provenance structs with MessagePack serde. Bucket padding (256B-256KB) with pad_to_bucket/strip_padding. 15 tests + proptest."
     },
     {
       "id": "SCP-012",
@@ -611,7 +614,7 @@
       "gate": "gate-sender-keys",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/sender_keys/mod.rs",
         "crates/scp-core/src/crypto/sender_keys/encrypt.rs"
@@ -639,7 +642,8 @@
       "details": {
         "adr": "ADR-007",
         "protocolSection": "§9.16"
-      }
+      },
+      "result": "SenderKey type, generate_sender_key, encrypt/decrypt_sender_layer (AES-256-GCM), SenderKeyStore (tokio RwLock HashMap). 19 tests + proptest."
     },
     {
       "id": "SCP-015",
@@ -755,7 +759,7 @@
       "gate": "gate-transport",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/mod.rs",
         "crates/scp-transport/src/native/protocol.rs",
@@ -784,7 +788,8 @@
       "details": {
         "adr": "ADR-004",
         "protocolSection": "§Wire Format section of ADR-004"
-      }
+      },
+      "result": "ClientMessage (7 variants) and RelayMessage (5 variants) with MessagePack serde. Error codes 4000-4021, 5000-5002. Validation. 41 tests."
     },
     {
       "id": "SCP-019",
