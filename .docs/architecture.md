@@ -2,7 +2,7 @@
 
 **Date:** February 21, 2026
 **Status:** Buildable design — this document is the engineering blueprint
-**Prerequisite reading:** spec.md (protocol design), sketch.md (API surfaces), planning-session-04.md (technology decisions)
+**Prerequisite reading:** specs/ (protocol design), sketch.md (API surfaces), planning-sessions/planning-session-04.md + planning-sessions/planning-session-06.md (technology decisions + resolved open questions)
 
 ---
 
@@ -10,21 +10,21 @@
 
 ### Why SDK-First
 
-The original plan was Cronica-first: build the app, extract the protocol. That plan is wrong. The evidence:
+The original plan was app-first: build a specific application, extract the protocol. That plan is wrong. The evidence:
 
 - **Moltbook** (Jan 2026): 2.6 million agents in one month. Demand for agent social infrastructure is massive and proven.
 - **OpenClaw**: Agents coordinating outside governed channels because no governed path exists.
 - **The competitive window**: MCP (Anthropic), WebMCP (Google+Microsoft), and UCP (Google+Shopify) are all tool-level protocols. Nobody is building the social layer. The window is open but closing.
 
-Agents ARE the killer app. The demand exists. Someone will build the killer app on top of SCP if the SDK is available. Cronica is one app built on the SDK simultaneously — not the gating function.
+Agents ARE the killer app. The demand exists. Someone will build the killer app on top of SCP if the SDK is available. Apps are built on the SDK simultaneously — they validate the SDK surface and prove the "app on SCP" story, but don't gate SDK release.
 
 ### What SDK-First Means
 
-1. **Ship the SDK before shipping any app.** `pip install scp-sdk` and `npm install @scp/sdk` are the first deliverables, not Cronica.
+1. **Ship the SDK before shipping any app.** `pip install scp-sdk` and `npm install @scp/sdk` are the first deliverables.
 2. **Python bindings are critical.** The agent ecosystem (LangChain, CrewAI, AutoGen, custom agents) is overwhelmingly Python. If agents can't `import scp`, the protocol doesn't exist to them.
 3. **Open source everything in months 2-3.** Spec, SDK, reference implementations. Apache 2.0 or MIT.
 4. **Target agent builders, not app builders.** The first users are people building agents that need to interact with other agents. The second users are app developers building agent-native applications.
-5. **Cronica is built on the SDK simultaneously** — it validates the SDK surface and proves the "app on SCP" story, but doesn't block SDK release.
+5. **First-party apps are built on the SDK simultaneously** — they validate the SDK surface and prove the "app on SCP" story, but don't block SDK release.
 
 ### The Competitive Landscape
 
@@ -62,8 +62,8 @@ MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exp
 │  APPLICATIONS                                                      │
 │                                                                    │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │ Cronica  │  │ 3rd-party│  │ Agent    │  │ Generated apps   │  │
-│  │ (iOS)    │  │ apps     │  │ scripts  │  │ (LLM-built)      │  │
+│  │ App      │  │ 3rd-party│  │ Agent    │  │ Generated apps   │  │
+│  │ Layer    │  │ apps     │  │ scripts  │  │ (LLM-built)      │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────────────┘  │
 │       │              │              │              │                │
 │  ═════╪══════════════╪══════════════╪══════════════╪════════════   │
@@ -379,7 +379,7 @@ scp/
 │   │   └── hello_scp.ts
 │   │
 │   └── swift/
-│       └── CronicaQuest.swift # Cronica quest as SCP context
+│       └── ExampleContext.swift # Quest-style context example
 │
 └── tests/
     ├── integration/           # Multi-party tests
@@ -494,7 +494,7 @@ State:
   • Registration state per discovery context
 ```
 
-**Crypto Layer** (wraps external libraries — see spec.md §9.5 for primitive specification, §9.7 for MLS integration):
+**Crypto Layer** (wraps external libraries — see .docs/specs/09-security-model.md §9.5 for primitive specification, §9.7 for MLS integration):
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -592,6 +592,24 @@ State:
 ```
 
 Build order follows the dependency graph bottom-up: platform traits → transport → core → FFI → bindings.
+
+### 3.4 Context Nesting
+
+Contexts can form parent-child relationships (spec §5.13, ADR-008 `nesting.rs`). A child context is a full context — its own MLS group, event log, governance, roles, tools, ceiling, and membership — structurally and cryptographically linked to one or more parents.
+
+**Single-parent nesting** creates sub-spaces within a context: per-task rooms, per-topic channels, breakout sessions. The child narrows the parent's scope. **Multi-parent nesting** creates a governed bridge between contexts — a shared collaboration space where members from different parent contexts interact as peers. This is the symmetric complement to tool interfaces (§6.2): tool interfaces are asymmetric and per-call; multi-parent children are symmetric and persistent.
+
+**Ceiling inheritance.** A child's capability ceiling must be less than or equal to the intersection of all parent ceilings. This is enforced at creation time and prevents capability escalation through nesting. If a parent ceiling shrinks post-creation, the child ceiling is retrospectively reduced to maintain the invariant.
+
+**Membership eligibility.** A member must belong to at least one parent to be eligible for the child. Eligibility is continuous — removal from a member's only parent triggers eviction from the child (MLS `remove_member`, sender key rotation, event log entry). Joining a child never grants membership in any parent, and child membership never confers eligibility for siblings.
+
+**Lifecycle coupling.** No orphans: when the last parent closes, the child closes regardless of configuration. TTL inheritance bounds a child's TTL by the minimum parent TTL. Each parent's `on_sever` behavior is configurable independently — `cascade_close` (child closes), `evict_unique_members` (remove members eligible only through the severed parent), or `preserve_membership` (child continues, members keep their seats).
+
+**Parent governance configuration.** Per-parent authority is configured at creation time and immutable thereafter. Configurable permissions include `canCloseChild`, `canEvictMembers`, `canRestrictCeiling`, and `requiresApprovalFor` (governance changes, tool registration, ceiling changes, membership changes). Both parents see and consent to each other's configuration before the child is created.
+
+**Cryptographic binding.** Parent context IDs and the content hash of the parent governance configuration are included in the MLS `group_context` extensions field. The child's `group_id` is derived from this `group_context`, making the parent lineage part of the cryptographic group identity. Lineage is unforgeable — claiming different parents would require a different MLS group. Two independent verification paths (MLS `group_context` and Merkle-tree event log) must both be compromised to forge lineage.
+
+**Depth limit.** The protocol enforces a maximum nesting depth as a protocol constant (suggested default: 3 levels). This bounds governance complexity, ceiling narrowing (deep nesting converges on empty ceilings), lifecycle cascade depth, and provenance evaluation cost.
 
 ---
 
@@ -696,7 +714,7 @@ const identity = await SCP.Identity.create({ custody: 'webcrypto' });
 
 TypeScript uses wasm-bindgen for the browser (Rust → WASM) and napi-rs for Node.js (Rust → native addon). Same Rust core, different FFI paths.
 
-### 4.3 Swift SDK (iOS/macOS — Cronica)
+### 4.3 Swift SDK (iOS/macOS)
 
 ```swift
 import SCP
@@ -710,8 +728,8 @@ let quest = try await SCP.Context.create(
     metadata: .init(name: "Thai Cooking Quest", isPublic: true)
 )
 
-// Cronica's AI guide joins
-try await quest.addMember(chronicaGuide, role: "guide")
+// AI guide agent joins the context
+try await quest.addMember(guideAgent, role: "guide")
 
 // User's agent invokes the guide
 let advice = try await quest.invoke("guide_assistant", input: ["query": "where to start?"])
@@ -737,14 +755,13 @@ The smallest SDK that is useful. This is what ships first.
 | UCAN token creation | Capability enforcement is core to the model |
 | Basic role enforcement | Admin/member/observer — the minimum role set |
 | Event log (append + verify) | Accountability is a protocol guarantee |
+| TTL and memory scope (Phase 2) | Context lifecycle requires expiry and key destruction semantics (ADR-008) |
 
 ### What's NOT In (v1)
 
 | Feature | Why it can wait |
 |---|---|
-| ~~A2A proposals~~ | Removed from protocol |
 | ~~Discovery (registries, referrals)~~ | Removed — tool-interface discovery only (§6.2.2) |
-| TTL and memory scope | Contexts persist; ephemeral is an optimization |
 | Bridge adapters | External platforms are a growth feature |
 | Behavioral records | Trust evaluation ships after basic communication works |
 | Challenge-response | Agent verification is a trust feature, not a messaging feature |
@@ -862,9 +879,9 @@ Ship:
 Deliverable: Trust model works. TypeScript SDK ships. Two languages supported.
 ```
 
-### Phase 5: Platform Adapters + Swift + Cronica (Weeks 17-20)
+### Phase 5: Platform Adapters + Swift + Reference App (Weeks 17-20)
 
-**Goal:** iOS SDK, Cronica integration, bridge adapters.
+**Goal:** iOS SDK, reference app integration, bridge adapters.
 
 ```
 Build:
@@ -872,20 +889,20 @@ Build:
   • bindings/swift/ — UniFFI-generated + Swift ergonomics layer
   • scp-bridge/x/ — X bridge adapter (relay mode)
   • scp-bridge/bluesky/ — Bluesky bridge adapter (API mode)
-  • Cronica integration: quests as contexts, AI Guide as agent
+  • Reference app integration: quests as contexts, AI guide as agent
 
 Test:
   • iOS app creates identity in Secure Enclave
-  • Cronica quest runs as SCP context
-  • Bridge: X user participates in Cronica quest via bridge
+  • Quest runs as SCP context
+  • Bridge: X user participates in quest via bridge
   • End-to-end: Python agent ↔ Swift app via SCP
 
 Ship:
   • Swift package
-  • Cronica beta with SCP
+  • Reference app beta with SCP
   • Bridge adapters
 
-Deliverable: Cronica runs on SCP. Cross-platform: Python ↔ Swift ↔ TypeScript.
+Deliverable: Reference app runs on SCP. Cross-platform: Python ↔ Swift ↔ TypeScript.
 ```
 
 ### Phase 6: Scale + Harden (Weeks 21+)
@@ -997,7 +1014,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | Ship order | SDK before app | Agents are the killer app. Demand is proven (Moltbook 2.6M). |
 | First binding | Python (PyO3) | Agent ecosystem is overwhelmingly Python. |
 | Second binding | TypeScript (wasm-bindgen/napi-rs) | Web + Node coverage. |
-| Third binding | Swift (UniFFI) | Cronica (iOS). |
+| Third binding | Swift (UniFFI) | iOS/macOS apps. |
 | Core language | Rust | Crypto libraries, performance, cross-platform via FFI. |
 | DID method (primary) | did:dht | Self-certifying, decentralized, key rotation, no server dependency. No migration path. |
 | DID method (fallback) | did:web | Contingency only if did:dht libraries prove unusable. Not a planned deployment. |
@@ -1014,10 +1031,10 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 ## 11. What This Document Does Not Cover
 
 - **Specific API signatures.** See sketch.md for API surfaces (§1–§14) and security APIs (§16).
-- **Protocol semantics.** See spec.md for the full protocol design.
-- **Cryptographic security model.** See spec.md §9.5–§9.15 for the full security specification (MITM prevention, replay prevention, relay threat model, key lifecycle, forward secrecy, PCS, compromise recovery). See planning-session-05.md for the security design rationale.
+- **Protocol semantics.** See .docs/specs/ for the full protocol design.
+- **Cryptographic security model.** See .docs/specs/ 09 §9.5–§9.15 for the full security specification (MITM prevention, replay prevention, relay threat model, key lifecycle, forward secrecy, PCS, compromise recovery). See planning-session-05.md for the security design rationale.
 - **Technology selection rationale.** See planning-session-04.md for why MLS over Sender Keys, why did:dht, etc.
-- **Context extension design.** See planning-session-03.md for the Moltbook analysis and context extension design. (A2A propose/accept has been removed from the protocol.)
+- **Context extension design.** See planning-session-03.md for the Moltbook analysis and context extension design (TTL, memory scope, templates).
 - **Adapter trait definitions.** See planning-session-04.md for full Rust trait definitions.
 - **Governance and deployment operations.** Undesigned. Needed before launch.
 - **Pricing/business model.** Out of scope for this document.

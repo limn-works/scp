@@ -136,9 +136,9 @@ Transport is fully abstracted behind an adapter trait. The SCP native relay is t
 
 ```
 scp/
-├── architecture.md      # Engineering blueprint
-├── sketch.md            # API surface sketches
 └── .docs/
+    ├── architecture.md  # Engineering blueprint
+    ├── sketch.md        # API surface sketches
     ├── adrs/            # Architecture Decision Records (3 phases)
     ├── specs/           # Protocol specification (including open questions)
     ├── standards/       # Coding and workflow standards
@@ -149,9 +149,9 @@ scp/
 
 SCP is being built in the open. The best way to get oriented:
 
-1. **Start with the spec.** [`.docs/specs/`](.docs/specs/) is the protocol design — what SCP is and how it works. [`architecture.md`](architecture.md) is the engineering blueprint.
+1. **Start with the spec.** [`.docs/specs/`](.docs/specs/) is the protocol design — what SCP is and how it works. [`.docs/architecture.md`](.docs/architecture.md) is the engineering blueprint.
 2. **Read the ADRs.** [`.docs/adrs/`](.docs/adrs/) covers all three build phases with full Architecture Decision Records.
-3. **Weigh in on open questions.** [`open-questions.md`](open-questions.md) has design decisions that would benefit from more perspectives.
+3. **Weigh in on open questions.** [`.docs/specs/00-open-questions.md`](.docs/specs/00-open-questions.md) has design decisions that would benefit from more perspectives.
 
 ## License
 

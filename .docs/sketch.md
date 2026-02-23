@@ -2,7 +2,7 @@
 
 **Status:** Working sketch — interfaces, not implementation
 **Purpose:** Make the protocol tangible through concrete API surfaces and use cases
-**Aligned with:** spec.md (working draft, February 2026)
+**Aligned with:** .docs/specs/ (working draft, February 2026), planning-session-06.md (resolved decisions)
 
 ---
 
@@ -148,9 +148,31 @@ SCP.SocialGraph.query(
 
 ## 2. Contexts
 
-### Create
+Contexts are bounded, encrypted, governed spaces — cryptographic entities (one MLS group each) where all protocol-level interaction happens. They are runtime objects (~5-15ms local, ~200ms wall clock to create), not infrastructure to deploy. They survive process restarts. Long-lived contexts are where apps live; ephemeral contexts are where bounded tasks happen.
+
+### Create (template-based — primary path, §5.12)
 
 ```
+// Template-based creation — the fast path for common patterns.
+// Templates are protocol constants with fixed, predictable configurations.
+SCP.Context.create(
+  creator: Identity,
+  template: .bilateralEphemeral     // messages only, ephemeral, TTL required
+          | .bilateralPersistent    // messages only, full memory, no TTL
+          | .coordination           // messages + tools, summary memory, TTL required
+          | .groupDiscussion,       // messages + invite, full memory, optional TTL
+  peer: DID?,                       // for bilateral templates — handles invitation internally
+  ttl: Duration?,                   // required for some templates, optional for others
+  tools: [ToolDefinition]?          // only for templates that allow tools (coordination)
+) → Context { contextID, creatorDID, templateID, ceiling, roles, governance, ttl?, memoryScope }
+```
+
+For bilateral templates, the SDK bundles context metadata + MLS Welcome message into a single transport delivery. The peer receives everything needed to evaluate and join in one message. With auto-accept (§5.12.2), the join is fully autonomous — no human delay.
+
+### Create (explicit params — advanced path)
+
+```
+// For contexts that don't fit a well-known template.
 SCP.Context.create(
   creator: Identity,
   ceiling: [Capability],           // max permissions this context can ever grant
@@ -195,6 +217,67 @@ When TTL expires, the context closes automatically. Key destruction follows the 
 
 In all cases, durable metadata persists: the context's existence, participants, purpose, and behavioral contributions survive.
 
+### Create Child (context nesting, §5.13)
+
+```
+// Single-parent child: sub-space within a context
+SCP.Context.createChild(
+  creator: Identity,
+  parents: [contextID],            // one or more parent contexts
+  ceiling: [Capability],           // must be ≤ intersection of parent ceilings
+  governance: GovernanceModel,
+  roles: { ... },
+  ttl: Duration?,                  // must be ≤ minimum parent TTL (if parents have TTLs)
+  memoryScope: MemoryScope,
+  tools: [ToolDefinition]?,
+  parentGovernanceConfig: {        // per parent — what authority each parent retains
+    [contextID]: ParentGovernanceConfig {
+      canCloseChild: Bool,
+      canEvictMembers: Bool,
+      canRestrictCeiling: Bool,
+      requiresApprovalFor: [.governanceChange | .toolRegistration | .ceilingChange | .membershipChange],
+      onSever: .evictUniqueMembers | .cascadeClose | .preserveMembership
+    }
+  }
+) → Context { contextID, parents, ceiling, roles, governance, parentGovernanceConfig }
+```
+
+For multi-parent children, governance approval from every parent is required. The creator needs creation rights in at least one parent; additional parents approve independently via their own governance. Parent context IDs and governance config hash are bound into the child's MLS `group_context` extensions — lineage is cryptographically unforgeable.
+
+Members must be in at least one parent to join the child. Eligibility is continuous: lose your last parent, lose the child.
+
+### Standing Channel (contact graph, §5.12.6)
+
+```
+// Get-or-create a bilateral-persistent context with a peer.
+// Idempotent: returns existing if one exists.
+SCP.Context.standingChannel(
+  identity: Identity,
+  peer: DID
+) → Context { contextID, peer, template: .bilateralPersistent }
+```
+
+Standing channels are bilateral-persistent contexts used for ongoing direct communication. Zero idle cost (no keepalives, ~2-5KB storage each). Persist across restarts. The agent's contact graph.
+
+### Auto-Accept Policies (§5.12.2)
+
+```
+// Configure local auto-accept policy. Evaluated entirely in the SDK, never shared.
+SCP.Context.setAutoAcceptPolicy(
+  identity: Identity,
+  policy: AutoAcceptPolicy {
+    template: TemplateID,            // which template(s) to auto-accept
+    from: .sharedContext             // DID shares ≥1 active context with me
+        | .knownDID([DID])           // explicit allowlist
+        | .discoveryContext,         // DID registered in trusted discovery context
+    maxTTL: Duration?,               // optional cap
+    rateLimit: Rate?                 // max auto-accepts per time window
+  }
+) → void
+```
+
+**Hard rule (non-overridable):** Auto-accept never applies to contexts with tool capabilities in the ceiling. Tool access always requires explicit confirmation.
+
 ### Inspect (before opt-in)
 
 Anyone can read this. This is the "what am I walking into" view.
@@ -204,6 +287,7 @@ SCP.Context.inspect(
   contextID
 ) → ContextMetadata {
   contextID,
+  templateID: TemplateID?,         // if created from a well-known template (§5.12)
   ceiling: [Capability],
   roles: { name: [Capability] },
   governance: GovernanceModel,
@@ -212,8 +296,21 @@ SCP.Context.inspect(
   creator: DID,
   memberCount: Int,
   age: Date,
+  ttl: Duration?,                  // time-to-live if set (§5.10)
+  memoryScope: MemoryScope,        // ephemeral, summary, or full (§5.11)
   tools: [ToolMetadata],          // name, description, input/output schema
-  bridges: [BridgeInfo]?          // active bridge connectors, if any
+  toolInterfaceCount: { inbound: Int, outbound: Int },  // active cross-context interfaces (§6.2)
+  bridges: [BridgeInfo]?,         // active bridge connectors, if any
+  // For child contexts (§5.13):
+  parents: [{
+    contextID: contextID,
+    ceiling: [Capability],
+    governance: GovernanceModel,
+    memberCount: Int,
+    age: Date,
+    governanceConfig: ParentGovernanceConfig   // what authority this parent has
+  }]?,
+  eligibilityBasis: [contextID]?   // which parent(s) the inspecting DID would join through
 }
 ```
 
@@ -239,6 +336,21 @@ SCP.Context.leave(
 ) → void
 ```
 
+### Remove Member
+
+Governance action. Requires admin role or governance approval.
+
+```
+SCP.Context.removeMember(
+  context: contextID,
+  target: DID,
+  as: Identity,                    // must have admin role or governance authority
+  reason: String?                  // recorded in event log
+) → void
+```
+
+Removal triggers MLS group key rotation — the removed member loses cryptographic access to all future content. Distinct from blocking (which is personal, DID-to-DID, sender-key-based).
+
 ### List
 
 ```
@@ -247,6 +359,24 @@ SCP.Context.list(
   filter: .all | .created | .member | .observer
 ) → [ContextSummary]
 ```
+
+### Receive (streaming)
+
+Stream incoming messages and events from a context. The stream stays open as long as the membership is active.
+
+```
+SCP.Context.receive(
+  context: contextID,
+  as: Identity,
+  filter: .all | .messages | .events | .toolResults
+) → AsyncStream<ContextEvent> {
+  message: Message?,
+  event: ProtocolEvent?,
+  toolResult: ToolResult?
+}
+```
+
+The stream primitive provides real-time delivery of all context activity. Transport-level details (reconnection, backoff, multi-relay fanout) are handled by the SDK. The stream respects the participant's role — events outside their capability ceiling are filtered.
 
 ---
 
@@ -383,9 +513,34 @@ SCP.Tool.verify(
 }
 ```
 
-### Cross-Context Tool Interface
+### Update
 
-Both contexts opt in. Calls are stateless.
+Update a tool's registration (schema, description, test vectors, implementation hash). Records the change in the context event log.
+
+```
+SCP.Tool.update(
+  context: contextID,
+  agent: agentID,
+  tool: "recipe_assistant",
+  changes: {
+    description: String?,
+    input: JSONSchema?,
+    output: JSONSchema?,
+    testVectors: [TestVector]?,
+    implementationHash: ContentHash?
+  }
+) → ToolUpdateResult {
+  previousHash: ContentHash,
+  newHash: ContentHash,
+  eventID: EventID
+}
+```
+
+Only the tool's operator (or context admin) can update. Schema changes that break existing test vectors are rejected. The event log records both the old and new implementation hashes for auditability.
+
+### Cross-Context Tool Interface (§6.2)
+
+Both contexts opt in. Calls carry provenance including chain depth. Schema constraints enforce structural specificity (no unbounded string-only interfaces, minimum two distinct fields). Chain depth limit (protocol default: 3) prevents amplification.
 
 ```
 // Context A exposes a tool to Context B
@@ -401,8 +556,30 @@ SCP.ToolInterface.call(
   interface: interfaceID,
   agent: agentInContextB,          // must have permission in B to use interfaces
   input: { search: "miso paste" }
-) → ToolResult { output, provenance: { originContext: contextA, interface: interfaceID } }
+) → ToolResult {
+  output,
+  provenance: DataProvenance {
+    sourceContext: contextA,
+    chainDepth: 1,                 // one context boundary crossed
+    chainPath: [contextA],
+    ...
+  }
+}
+
+// Stateful sessions (§6.2.1) — optional multi-turn interactions
+SCP.ToolInterface.call(
+  interface: interfaceID,
+  agent: agentInContextB,
+  sessionID: "sched:abc123"?,      // continue existing session (opaque to caller)
+  input: { action: "propose", times: ["Tue 3pm"] }
+) → ToolResult {
+  output: { sessionID: "sched:abc123", status: "pending" },
+  provenance: DataProvenance { ... }
+}
+// Per-caller session cap (default: 5) prevents exhaustion. Optional session TTL.
 ```
+
+**Two cross-context mechanisms** (§6.1). Tool interfaces are asymmetric (caller/tool). Multi-parent child contexts (§5.13) are symmetric — a shared space where members from different parent contexts interact as peers. Use tool interfaces for service calls; use multi-parent children for collaboration.
 
 ---
 
@@ -571,6 +748,8 @@ SCP.Governance.reject(proposalID, by: agentID) → ProposalStatus
 ```
 
 Resolution depends on governance model: single admin auto-approves, multi-sig waits for threshold, consensus waits for all members.
+
+The three-method interface (propose, approve, reject) is the mandatory protocol contract. All governance models must implement it. Single-admin auto-approves; multi-sig waits for threshold; consensus waits for all members. Custom governance models are pluggable within this interface.
 
 ---
 
@@ -746,7 +925,7 @@ SCP.EventLog.verify(
 
 ## 10. Use Cases Mapped to APIs
 
-### Cronica: User Creates a Quest
+### Use Case: Creating a Collaborative Context with Tools
 
 ```swift
 // 1. Create quest as context
@@ -764,10 +943,10 @@ let quest = try await SCP.Context.create(
   metadata: { name: "Learn to Cook Thai Food", public: true }
 )
 
-// 2. Cronica's AI Guide joins with "guide" role
+// 2. The app's AI guide agent joins with "guide" role
 try await SCP.Context.addMember(
   context: quest.contextID,
-  identity: chronicaGuide,       // Cronica's institutional DID
+  identity: guideAgent,          // App operator's institutional DID
   role: "guide"
 )
 
@@ -778,7 +957,7 @@ let advice = try await alice.agent.invoke(
 )
 ```
 
-### Cronica: Someone Joins a Quest Community
+### Use Case: Joining a Public Context
 
 ```swift
 // 1. Bob inspects before joining
@@ -1002,6 +1181,9 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   ],
   "ttl": null,
   "memory_scope": "full",
+  "template_id": null,
+  "tool_interface_count": { "inbound": 3, "outbound": 1 },
+  "parents": null,
   "members": 47,
   "created": "2026-01-20T10:00:00Z",
   "creator": "did:dht:z6MkpT..."
@@ -1069,7 +1251,9 @@ Attached to data crossing context boundaries:
       "context_id": "ctx:z6Mkr7..."
     },
     "age_seconds": 10800,
-    "memory_scope": "ephemeral"
+    "memory_scope": "ephemeral",
+    "chain_depth": 1,
+    "chain_path": ["ctx:z6Mkr7..."]
   }
 }
 ```
@@ -1092,10 +1276,11 @@ DataProvenance {
   purpose: String,                   // declared purpose of source context
   discoveryMethod: .sharedContext(contextID)
                  | .registry(registryContextID)
-                 | .referral(chain: [DID], depth: Int)
                  | .none,
   age: Duration,                     // how long ago the source interaction occurred
-  memoryScope: MemoryScope           // what memory scope the source context had
+  memoryScope: MemoryScope,          // what memory scope the source context had
+  chainDepth: uint,                  // number of context boundaries crossed (0 = originated here)
+  chainPath: [contextID]?            // optional: ordered list of intermediary context IDs
 }
 ```
 
@@ -1116,13 +1301,13 @@ let result = try await SCP.ToolInterface.call(
     sourceType: .persistent,
     counterparties: [contextA.members],
     purpose: "Recipe database",
-    discoveryMethod: .none,          // tool interface, not A2A discovery
+    discoveryMethod: .none,          // tool interface discovery
     age: .zero,                      // live query
     memoryScope: .full
   }
 }
 
-// Data carried into a new A2A context carries provenance
+// Data carried into a new context carries provenance
 agent.send(
   content: "Based on my previous conversation with Bob...",
   provenance: DataProvenance {
@@ -1182,10 +1367,10 @@ SCP.Discovery.search(
 
 ### Registration
 
-Agents register in discovery contexts to make themselves findable.
+Agents register in discovery contexts via DID-authenticated requests to tool endpoints. Registration does not require MLS group membership — registrants are readers, not writers (see spec §6.2.2 two-tier model).
 
 ```
-// Register in a discovery context
+// Register in a discovery context (reader-tier, DID-authenticated)
 SCP.Discovery.register(
   context: contextID,              // the discovery context to register in
   identity: Identity,
@@ -1196,7 +1381,7 @@ SCP.Discovery.register(
   }
 ) → RegistrationResult { registered: Bool, entryID: String }
 
-// Remove registration
+// Remove registration (reader-tier, DID-authenticated)
 SCP.Discovery.deregister(
   context: contextID,
   identity: Identity
@@ -1213,11 +1398,11 @@ SCP.Discovery.publishCapabilities(
 ### Bootstrap
 
 ```
-// Join default discovery contexts on first identity creation
+// Query default discovery contexts on first identity creation (reader-tier)
 SCP.Discovery.bootstrap(
   identity: Identity,
   autoRegister: Bool = true        // opt-out via config
-) → [contextID]                    // discovery contexts joined
+) → [contextID]                    // discovery contexts connected to
 
 // Add a custom discovery context
 SCP.Discovery.addContext(
@@ -1231,16 +1416,19 @@ SCP.Discovery.addContext(
 
 Implementation specifics that require Tier 1/Tier 2 design work:
 
-- **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in spec.md §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §14 below.
-- **~~DID method selection.~~** ✅ **Resolved.** did:dht selected as primary method (self-certifying, key rotation via DID document versioning). did:web exists as contingency fallback only if did:dht libraries prove unusable — not a planned deployment path. See spec.md §9.6 for security properties of each.
-- **Transport abstraction interface.** The 5-6 methods. Envelope format. SCP defines its own transport abstraction with bindings to existing transports (Nostr, Matrix, WebSocket). The binding approach — not building directly on any single transport.
-- **SCP native relay protocol.** Store-and-forward for SCP envelopes — decided as canonical transport but not yet designed.
-- **Sender-side key layer protocol (§9.16).** AES-256 blocking mechanism — direction decided, needs full spec.
-- **Per-context pseudonym derivation and verification protocol.**
-- **Cover traffic protocol specification.**
-- **Metadata privacy mechanisms.** All 10 decisions confirmed, need protocol-level specs.
-- **UCAN capability schema.** Concrete capability types, token format, delegation chains.
-- **Context lifecycle state machine.** Event sequence for create, join, leave, destroy, expire (TTL). Minimum viable context.
+- **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in .docs/specs/ §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §14 below.
+- **~~DID method selection.~~** ✅ **Resolved.** did:dht selected as primary method (self-certifying, key rotation via DID document versioning). did:web exists as contingency fallback only if did:dht libraries prove unusable — not a planned deployment path. See .docs/specs/ §9.6 for security properties of each.
+- **~~Transport abstraction interface.~~** ✅ **Resolved.** ADR-005 specifies the `TransportAdapter` trait (connect, send, subscribe, query, disconnect). Envelope format specified in .docs/specs/ §9.10.2 (minimal outer envelope).
+- **~~SCP native relay protocol.~~** ✅ **Resolved.** ADR-004 specifies the relay: PUBLISH/SUBSCRIBE/UNSUBSCRIBE over WebSocket, blob TTL enforcement, recipient_hint for directed delivery.
+- **~~Sender-side key layer protocol (§9.16).~~** ✅ **Resolved.** Full specification in .docs/specs/ §9.16 (5 subsections). ADR-007 specifies implementation. AES-256-GCM sender keys, HPKE-wrapped per-recipient distribution using stable wrapping keypairs, block protocol, forward secrecy interaction.
+- **~~Per-context pseudonym derivation and verification protocol.~~** ✅ **Resolved.** Specified in .docs/specs/ §9.10.4. HKDF derivation, inside-encryption verification, caching.
+- **~~Cover traffic protocol specification.~~** ✅ **Resolved.** Specified in .docs/specs/ §9.10.6. Configurable, default on for persistent connections.
+- **~~Metadata privacy mechanisms.~~** ✅ **Resolved.** All 10 decisions implemented. Full architecture in .docs/specs/ §9.10 (8 subsections).
+- **~~UCAN capability schema.~~** ✅ **Resolved.** ADR-016 specifies concrete capability types, 11-step validation pipeline, delegation chains, nonce replay rejection, ceiling enforcement.
+- **~~Context lifecycle state machine.~~** ✅ **Resolved.** ADR-008 specifies states (Created, Active, Suspended, Closing, Closed, Expired), transitions, TTL management, governance enforcement.
+- **~~Context templates and lightweight creation.~~** ✅ **Resolved.** .docs/specs/ §5.12 specifies 4 well-known templates, auto-accept policies, invitation bundling, computational profile, standing bilateral contexts. sdk-common.md specifies cross-language SDK surface.
+- **~~Context nesting.~~** ✅ **Resolved.** .docs/specs/ §5.13 specifies parent-child relationships (8 subsections): ceiling inheritance, membership eligibility, creation protocol, parent governance configuration, lifecycle coupling, metadata/legibility, interaction with other mechanisms, depth limits. Cryptographic binding via MLS `group_context` extensions. ADR phase-2 includes `nesting.rs` and `ChildContextCreate` capability.
+- **~~Cross-context provenance chain tracking.~~** ✅ **Resolved.** DataProvenance type includes `chainDepth` (boundary hop count) and `chainPath` (intermediary context IDs). Chain depth limit (default: 3) enforced at protocol level. .docs/specs/ §7.7.1.
 - **Minimum viable agent.** Likely a passthrough that takes human input, wraps it in SCP envelopes, signs, and sends. Reference implementation that's trivially embeddable.
 - **Capability declaration format.** The actual JSON schema for app manifests. Critical surface — this is the interface between "LLMs generate apps" and "SCP provides infrastructure." Must be LLM-parseable.
 - **Offline/local-first.** Disconnection handling, sync, conflict resolution.
@@ -1252,7 +1440,7 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 
 ## 15. Security APIs (§9 — Cryptographic Security Model)
 
-Security-related APIs that surface the cryptographic security model defined in spec.md §9.
+Security-related APIs that surface the cryptographic security model defined in .docs/specs/ §9.
 
 ### Key Continuity Verification (§9.11)
 
