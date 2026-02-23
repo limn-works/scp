@@ -17,3 +17,47 @@ The protocol is designed for a world where:
 4. **Encryption-as-access-control.** Context membership is enforced cryptographically. If you don't have the key, you can't read the data. No relay or intermediary enforces access — the math does.
 5. **Legibility before opt-in.** Every context's parameters — ceiling, governance, roles, tools, TTL, memory scope — are visible before you join. No hidden terms.
 6. **Human accountability.** Every agent traces to a human DID. Behavioral records are durable. Actions have consequences that persist across contexts.
+
+## Strategy: SDK-First, Not App-First
+
+### Why SDK-First
+
+The original plan was app-first: build a specific application, extract the protocol. That plan is wrong. The evidence:
+
+- **Moltbook** (Jan 2026): 2.6 million agents in one month. Demand for agent social infrastructure is massive and proven.
+- **OpenClaw**: Agents coordinating outside governed channels because no governed path exists.
+- **The competitive window**: MCP (Anthropic), WebMCP (Google+Microsoft), and UCP (Google+Shopify) are all tool-level protocols. Nobody is building the social layer. The window is open but closing.
+
+Agents ARE the killer app. The demand exists. Someone will build the killer app on top of SCP if the SDK is available. Apps are built on the SDK simultaneously — they validate the SDK surface and prove the "app on SCP" story, but don't gate SDK release.
+
+### What SDK-First Means
+
+1. **Ship the SDK before shipping any app.** `pip install scp-sdk` and `npm install @scp/sdk` are the first deliverables.
+2. **Python bindings are critical.** The agent ecosystem (LangChain, CrewAI, AutoGen, custom agents) is overwhelmingly Python. If agents can't `import scp`, the protocol doesn't exist to them.
+3. **Open source everything in months 2-3.** Spec, SDK, reference implementations. License TBD.
+4. **Target agent builders, not app builders.** The first users are people building agents that need to interact with other agents. The second users are app developers building agent-native applications.
+5. **First-party apps are built on the SDK simultaneously** — they validate the SDK surface and prove the "app on SCP" story, but don't block SDK release.
+
+### The Competitive Landscape
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    TOOL LEVEL                             │
+│                                                          │
+│  MCP         → model ↔ local tools (JSON-RPC, stdio)    │
+│  WebMCP      → model ↔ web tools (navigator.modelContext)│
+│  UCP         → agent ↔ commerce (checkout, orders)       │
+│                                                          │
+│  These define how agents USE things.                     │
+├──────────────────────────────────────────────────────────┤
+│                    SOCIAL LEVEL   ← SCP fills this gap   │
+│                                                          │
+│  SCP         → agent ↔ agent ↔ human                    │
+│               identity, trust, contexts, encryption,     │
+│               governance, provenance, discovery          │
+│                                                          │
+│  This defines how agents RELATE to each other.           │
+└──────────────────────────────────────────────────────────┘
+```
+
+MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exposes itself as an MCP server locally. An SCP agent can use WebMCP-exposed tools in the browser. An SCP agent can transact via UCP. SCP provides the identity, trust, and shareable context that none of these protocols address.
