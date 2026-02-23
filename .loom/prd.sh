@@ -6,10 +6,10 @@ set -euo pipefail
 # Wraps `claude -p` with a structured generation prompt.
 #
 # Usage:
-#   loom-prd.sh <files...> [--append] [--prefix PREFIX] [--max N]
-#   loom-prd.sh spec.md sketch.md
-#   loom-prd.sh --append planning-session-02.md
-#   loom-prd.sh --prefix SCP spec.md
+#   prd.sh <files...> [--append] [--prefix PREFIX] [--max N]
+#   prd.sh spec.md sketch.md
+#   prd.sh --append planning-session-02.md
+#   prd.sh --prefix SCP spec.md
 # ─────────────────────────────────────────────────────────────────
 
 LOOM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       cat <<'EOF'
-Usage: loom-prd.sh <files...> [OPTIONS]
+Usage: prd.sh <files...> [OPTIONS]
 
 Generates .loom/prd.json from specification documents using Claude.
 
@@ -66,10 +66,10 @@ Options:
   -h, --help            Show this help
 
 Examples:
-  loom-prd.sh spec.md sketch.md
-  loom-prd.sh --append planning-session-02.md
-  loom-prd.sh --prefix SCP --max 60 spec.md
-  loom-prd.sh *.md
+  prd.sh spec.md sketch.md
+  prd.sh --append planning-session-02.md
+  prd.sh --prefix SCP --max 60 spec.md
+  prd.sh *.md
 EOF
       exit 0
       ;;

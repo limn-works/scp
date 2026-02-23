@@ -71,7 +71,7 @@ Use agents eagerly for focus, expertise, and parallelization — especially code
 ├── directive.md     # Single-task mode instructions (execute one directive, signal result)
 ├── prd.json         # Structured stories with gates (P0/P1/P2), deps, acceptance criteria
 ├── status.md        # Current iteration state (read at start, written at end of each cycle)
-├── loom-prd.sh      # Standalone PRD generator (wraps claude -p)
+├── prd.sh           # Standalone PRD generator (wraps claude -p)
 ├── loom-status.sh   # Status display — parses logs and status.md for summary
 ├── stop.sh          # Graceful stop signal
 ├── specs/           # Reference specs and ticket tracking for Loom
