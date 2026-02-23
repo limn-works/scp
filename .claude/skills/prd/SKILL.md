@@ -25,11 +25,21 @@ If `$ARGUMENTS` is empty or `help`, show usage and exit.
 
 ### Step 1: Read inputs
 
-1. Read each specified file using the Read tool. If a path is a glob (contains `*`), expand it with Glob first.
-2. If `append` is set and `.loom/prd.json` exists, read it to understand existing stories (avoid duplicating work, continue ID numbering).
-3. Read any existing codebase files that help contextualize the spec (look for `src/`, `lib/`, `package.json`, `Cargo.toml`, etc. — keep it lightweight, just enough to understand the tech stack and existing structure).
-4. **Preserve source contents verbatim.** For every source file read, retain the full text in working memory. You will copy relevant sections directly into story descriptions — do not paraphrase or summarize unless the original text is ambiguous. The source document is the specification; the PRD is a structured decomposition of it, not a rewrite.
-5. Break excessively large files down into windows and assign to subagents, to avoid hitting token limits for your context window (~150k) or agent return windows (32k).
+1. **Index source structure.** For each `.md` source file, extract the heading tree without reading the full content:
+   ```bash
+   mdq --headings < file.md
+   ```
+   If a path is a glob (contains `*`), expand it with Glob first. This gives you a map of sections without consuming context.
+2. **Extract sections on demand.** Use `mdq` to pull individual sections verbatim:
+   ```bash
+   mdq '## Section Name' < file.md
+   ```
+   Progressively extract the sections you need to completion. Do not read entire large files into context all at once. Do not skip any sections.
+3. If `append` is set and `.loom/prd.json` exists, read its structure and top-level story metadata with `jq` to understand current status (avoid duplicating work, continue ID numbering).
+4. Read any existing codebase files that help contextualize the spec (look for `src/`, `lib/`, `package.json`, `Cargo.toml`, etc. — keep it lightweight, just enough to understand the tech stack and existing structure).
+5. **Preserve source contents verbatim.** The source document is the specification; the PRD is a structured decomposition of it, not a rewrite. Copy relevant sections directly into story fields — do not paraphrase or summarize unless the original text is ambiguous.
+6. Do not omit anything from sources. Expansion is acceptable, but it must build on established patterns, knowledge, or specs, and expansion sources must also be added to story references. Do not expand without referencing expansion sources. Do not paraphrase, reduce, or omit any source content. Do not alter the source's meaning or reduce information density. Only reformat it.
+7. **Dispatch subagents per section.** To avoid hitting context limits (~150k tokens) or agent return windows (32k), dispatch one subagent per source section or unit of work that maps to a story. Each subagent receives only its section's `mdq` output and transforms it mechanically into a story JSON object. Subagents can gather more context if they decide they need to.
 
 ### Step 2: Decompose into PRD
 
