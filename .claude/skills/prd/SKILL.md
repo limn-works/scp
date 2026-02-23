@@ -27,14 +27,14 @@ If `$ARGUMENTS` is empty or `help`, show usage and exit.
 
 1. **Index source structure.** For each `.md` source file, extract the heading tree without reading the full content:
    ```bash
-   mdq --headings < file.md
+   mdq '# *' -o json < file.md | jq -r '[.. | objects | select(has("depth")) | ("  " * (.depth - 1)) + "- " + .title] | .[]'
    ```
-   If a path is a glob (contains `*`), expand it with Glob first. This gives you a map of sections without consuming context.
+   If a path is a glob (contains `*`), expand it with Glob first. This gives you an indented TOC of sections without consuming context.
 2. **Extract sections on demand.** Use `mdq` to pull individual sections verbatim:
    ```bash
-   mdq '## Section Name' < file.md
+   mdq '# Section Name' < file.md
    ```
-   Progressively extract the sections you need to completion. Do not read entire large files into context all at once. Do not skip any sections.
+   `#` is the universal heading selector (matches any depth — h1 through h6). Always use single `#`. Selector values starting with numbers must be quoted (`# "2.1 Crate Structure"`) or use regex (`# /Crate Structure/`). Progressively extract the sections you need to completion. Do not read entire large files into context all at once. Do not skip any sections.
 3. If `append` is set and `.loom/prd.json` exists, read its structure and top-level story metadata with `jq` to understand current status (avoid duplicating work, continue ID numbering).
 4. Read any existing codebase files that help contextualize the spec (look for `src/`, `lib/`, `package.json`, `Cargo.toml`, etc. — keep it lightweight, just enough to understand the tech stack and existing structure).
 5. **Preserve source contents verbatim.** The source document is the specification; the PRD is a structured decomposition of it, not a rewrite. Copy relevant sections directly into story fields — do not paraphrase or summarize unless the original text is ambiguous.
