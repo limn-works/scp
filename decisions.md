@@ -171,9 +171,65 @@ context_pseudonym = context_keypair.public_key
 
 ---
 
+---
+
+## Decision 11: Capability Ceiling Governance
+
+**Decision: Ceiling policy declared at creation. Policy itself is immutable.**
+
+The context creator selects a ceiling policy at creation time. The policy governs whether and how the capability ceiling can change after creation. The policy choice is locked at creation — it cannot be changed.
+
+Available ceiling policies:
+
+- **`immutable`** (default for all well-known templates): Ceiling cannot change. To expand capabilities, create a new context and migrate members. Strongest security guarantee — members know the ceiling they opted into is permanent.
+- **`governed`**: Ceiling can be modified through the context's governance model (admin, multi-sig, consensus — whatever the context uses). Changes are logged in the event log and visible to all members before taking effect. Members who joined under a narrower ceiling are notified of the proposed expansion and may leave before it takes effect.
+
+The ceiling policy is visible in context metadata (§5.7) before opt-in. A prospective member sees both the current ceiling and the policy governing changes. `immutable` is the simpler, safer default; `governed` exists for long-lived contexts where needs evolve.
+
+**Interaction with nesting (§5.13.1):** If a parent has `governed` ceiling policy and its ceiling is *reduced*, the child's ceiling is retrospectively reduced to maintain the intersection invariant. If a parent's ceiling is *expanded*, the child's ceiling does not automatically expand — the child's own ceiling policy governs.
+
+**Write into:** spec §5.3, update §5.13.1 and §5.13.4 `CeilingChange` to reference the ceiling policy.
+
+---
+
+## Decision 12: Context Promotion
+
+**Decision: Promotion policy declared at creation. Policy itself is immutable.**
+
+Context promotion (ephemeral → persistent) is configurable at context creation. The promotion policy is locked at creation.
+
+Available promotion policies:
+
+- **`no_promotion`** (default for ephemeral templates): Context expires per TTL. To continue the relationship, create a new context (which may reference the closed one for continuity). Cleanest security model — separate context IDs, separate key material, clear event log boundary.
+- **`promotable`**: Context can be promoted to persistent via governance. On promotion: TTL is removed, memory scope transitions from ephemeral to full, existing event log and key material are preserved. Promotion requires consent from **all current members** (not just governance approval) because promotion changes the opt-in contract — members consented to ephemeral, and persistence is a material change.
+
+The promotion policy is visible in context metadata (§5.7) before opt-in. Members see whether a context they're joining could later become persistent.
+
+**Write into:** spec §5.10 (TTL section), §5.11 (memory scope section), and update 00-open-questions.md.
+
+---
+
+## Decision 13: Identity Private State
+
+**Decision: Protocol-level constants for identity private state. These are immutable protocol rules, not per-identity choices.**
+
+The four open questions from §3.7 are resolved:
+
+1. **Size constraints:** Less constrained than context state. The single-owner case allows growth (block lists, annotations, agent memory, draft attestations) without imposing storage on other participants. Relays MAY enforce per-DID storage quotas as an operational concern, but the protocol does not mandate minimalism for identity private state. Private state is the owner's data on the owner's relays.
+
+2. **Relay obligations:** Same storage class and retention as context events. No differentiated commitment — relays treat all encrypted blobs uniformly. This is the simplest model and avoids relay-side complexity. A relay that stores context events for a DID stores identity private state for that DID under the same terms.
+
+3. **Key rotation:** On identity key rotation (§9.12), private state is re-encrypted to the new key. Single-owner case requires no group redistribution — the owner re-encrypts and republishes. For large private state, re-encryption is incremental: most recent events first, backfill in background. The event log's append-only structure means old events can be re-encrypted lazily without affecting availability of recent state.
+
+4. **Discovery pointer:** Explicit. The DID document includes a service endpoint of type `IdentityPrivateState` listing relays that store the owner's private state. This cleanly disambiguates "fetch context events involving this DID" from "fetch this DID's private state" without relay-side guessing or implicit conventions. The service endpoint uses the same relay infrastructure — no new systems.
+
+**Write into:** spec §3.7 (replace open questions with these decisions).
+
+---
+
 ## Summary
 
-All 10 questions resolved. All suggestions confirmed. The decisions collectively form a coherent metadata privacy architecture layered on top of the existing cryptographic security model:
+All 13 questions resolved. Decisions 1-10 form the metadata privacy architecture. Decisions 11-13 resolve context governance and identity private state. The decisions collectively form a coherent metadata privacy and governance architecture layered on top of the existing cryptographic security model:
 
 - **Envelope layer:** Minimal outer envelope with pseudonyms (#2, #7)
 - **Content layer:** Fixed bucket padding (#3)
