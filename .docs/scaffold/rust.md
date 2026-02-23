@@ -16,8 +16,17 @@ crates/
       crypto/
         mod.rs
         mls/                # ADR-001: MLS wrapper
+          storage.rs        # MlsStorageBridge — OpenMLS StorageProvider impl (§17.9)
         sender_keys/        # ADR-007: Sender-side key layer
         ucan/               # ADR-009/016: UCAN validation
+      store/                # §17.4: ProtocolStore — typed domain storage layer
+        mod.rs              # ProtocolStore struct, StoreError, StoredValue<T>
+        context.rs          # Context state, params, membership, sender keys
+        event_log.rs        # Event log persistence, tree nodes, roots
+        identity.rs         # Identity documents, private state, TOFU, DID cache
+        nonce.rs            # UCAN nonce tracking, pruning
+        tools.rs            # Tool registration, sessions
+        transport.rs        # Relay scores, key packages
       identity/             # ADR-003: DID creation
       envelope/             # ADR-002: Envelope format
       context/              # ADR-008: Context lifecycle
@@ -155,6 +164,8 @@ rand = "0.8"
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+redb = "2"
 ```
 
 ## Core Dependencies
@@ -170,7 +181,9 @@ tracing-subscriber = "0.3"
 | `tokio-tungstenite` | latest | scp-transport | WebSocket (native relay) |
 | `serde` | 1.x | all crates | Serialization framework |
 | `serde_json` | 1.x | scp-core, scp-mcp | JSON serialization |
-| `rmp-serde` | latest | scp-core, scp-transport | MessagePack binary serialization (envelopes, relay protocol) |
+| `rmp-serde` | latest | scp-core, scp-transport | MessagePack binary serialization (envelopes, relay protocol, ProtocolStore §17.5) |
+| `rusqlite` | latest, `bundled-sqlcipher` feature | scp-platform, scp-transport | SQLite storage: `SqliteStorage` (§17.6), `SqliteBlobStore` (§17.7). Bundled SQLCipher for encryption at rest. |
+| `redb` | latest stable (v3+ on-disk format) | scp-transport | `RedbBlobStore` (§17.7) — pure Rust B-tree DB for medium relay deployments |
 | `pkarr` | 5.0.3+ | scp-core | did:dht identity — BEP44 signed mutable items, DNS packets, Mainline DHT publish/resolve (ADR-003) |
 | `z-base-32` | latest | scp-core | z-base-32 encoding for did:dht identifiers (ADR-003) |
 | `thiserror` | 2.x | all crates | Error type derivation |

@@ -434,7 +434,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 - **Language:** Rust
 - **Server framework:** `tokio` + `tokio-tungstenite` (WebSocket) or `axum` with WebSocket support
 - **Client library:** `tokio-tungstenite` (client-side WebSocket)
-- **Storage:** In-memory for Phase 1 (HashMap keyed by `routing_id`). Persistent storage (SQLite, sled) for production.
+- **Storage:** In-memory for Phase 1 (HashMap keyed by `routing_id`). Persistent storage (SQLite, redb) for production. See §17.7 for first-party BlobStore adapters.
 - **Crate:** `scp-transport`
 - **Module:** `scp-transport/native/`
 
@@ -787,7 +787,9 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
    - `store(key, data) -> ()`: Stores bytes in an internal `HashMap<String, Vec<u8>>`.
    - `retrieve(key) -> Option<Vec<u8>>`: Returns stored data or None.
    - `delete(key) -> ()`: Removes data from the map.
-   - `list_keys(prefix) -> Vec<String>`: Lists keys matching a prefix (useful for KeyPackage buffer management).
+   - `list_keys(prefix) -> Vec<String>`: Lists keys matching a prefix in lexicographic order (useful for KeyPackage buffer management, event log range queries).
+   - `delete_prefix(prefix) -> u64`: Deletes all keys matching a prefix. Returns count deleted. Used for context cleanup (§17.3).
+   - `exists(key) -> bool`: Returns true if the key exists. Used for UCAN nonce replay prevention (§17.3).
 
 5. **Platform trait definitions** (in `scp-platform/trait.rs`, not the testing module):
 
@@ -856,6 +858,10 @@ pub trait Storage: Send + Sync {
     async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError>;
     async fn delete(&self, key: &str) -> Result<(), PlatformError>;
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError>;
+    /// Delete all keys matching a prefix. Returns count deleted. See §17.2.
+    async fn delete_prefix(&self, prefix: &str) -> Result<u64, PlatformError>;
+    /// Check key existence without reading the value. See §17.2.
+    async fn exists(&self, key: &str) -> Result<bool, PlatformError>;
 }
 ```
 
@@ -944,10 +950,14 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    - The blocked party can see the MLS message and the recipient list but cannot unwrap any key payload.
    - Returns the new sender key.
 
-6. **`send_block_notification(mls_group, blocked_did, blocker_did) -> MlsMessage`**
-   - Sends a block notification as an MLS application message.
-   - Message content: `{ "type": "block_notification", "blocker": blocker_did, "blocked": blocked_did }`.
-   - On receipt, the blocked party's client automatically calls `rotate_sender_key_for_block` excluding the blocker.
+6. **`send_block_notification(key_custody, mls_group, context_id, blocked_did, blocker_did) -> MlsMessage`**
+   - Sends a signed block notification as an MLS application message.
+   - The blocker signs the notification with their Active Signing Key to prevent forgery by other group members (MLS authenticates group membership, not individual identity within application messages).
+   - Signature payload: `Ed25519_sign(active_signing_key, SHA-256(context_id || "block" || blocker_did || blocked_did || timestamp))`.
+   - Message content: `{ "type": "block_notification", "blocker": blocker_did, "blocked": blocked_did, "timestamp": unix_ms, "signature": blocker_signature }`.
+   - **Verification on receipt:** The receiver MUST verify the Ed25519 signature against the claimed blocker's known Active Signing Key (from their MLS LeafNode `scp_signing_key` extension). Discard without action if verification fails. Log the discarded notification for anomaly detection.
+   - On successful verification, the blocked party's client automatically calls `rotate_sender_key_for_block` excluding the blocker.
+   - The block event is recorded in the context event log (ADR-011) with `EventType::MemberBlocked { blocker, blocked, signature }`.
 
 7. **`SenderKeyStore` struct**
    - Stores sender keys per (context_id, sender_did).

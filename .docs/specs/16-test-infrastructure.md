@@ -182,8 +182,9 @@ Defined in `scp-transport/native/` (not `scp-testing`), so the relay server can 
 /// scp-transport/src/native/blob_store.rs
 
 /// Storage backend for relay blobs.
-/// Implementations: InMemoryBlobStore (testing/dev), SQLiteBlobStore (small deployments),
-/// and other backends (sled, RocksDB, S3) without changing relay logic.
+/// Implementations: InMemoryBlobStore (testing/dev), SqliteBlobStore (small deployments),
+/// RedbBlobStore (medium relays), and other backends (PostgreSQL, S3) without changing relay logic.
+/// See §17.7 for the full first-party adapter roster.
 #[async_trait]
 pub trait BlobStore: Send + Sync {
     /// Store a blob. Returns the blob_id (SHA-256 of blob content).
@@ -1113,6 +1114,46 @@ macro_rules! storage_conformance {
             async fn list_keys_with_prefix() {
                 // Store "ctx/a", "ctx/b", "other/c",
                 // list_keys("ctx/"), verify ["ctx/a", "ctx/b"].
+            }
+
+            #[tokio::test]
+            async fn delete_prefix_removes_matching() {
+                // Store "ctx/a/1", "ctx/a/2", "ctx/b/1", "other/x".
+                // delete_prefix("ctx/a/") -> returns 2.
+                // Verify "ctx/a/1" and "ctx/a/2" are gone.
+                // Verify "ctx/b/1" and "other/x" still exist.
+            }
+
+            #[tokio::test]
+            async fn delete_prefix_returns_zero_for_no_match() {
+                // delete_prefix("nonexistent/") -> returns 0.
+            }
+
+            #[tokio::test]
+            async fn exists_returns_true_for_stored() {
+                // Store "key", exists("key") -> true.
+            }
+
+            #[tokio::test]
+            async fn exists_returns_false_for_missing() {
+                // exists("missing") -> false.
+            }
+
+            #[tokio::test]
+            async fn exists_returns_false_after_delete() {
+                // Store "key", delete "key", exists("key") -> false.
+            }
+
+            #[tokio::test]
+            async fn list_keys_returns_sorted() {
+                // Store keys "c", "a", "b".
+                // list_keys("") -> ["a", "b", "c"].
+            }
+
+            #[tokio::test]
+            async fn list_keys_prefix_returns_sorted() {
+                // Store "ctx/z", "ctx/a", "ctx/m", "other/x".
+                // list_keys("ctx/") -> ["ctx/a", "ctx/m", "ctx/z"].
             }
 
             #[tokio::test]

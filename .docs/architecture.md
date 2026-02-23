@@ -302,7 +302,8 @@ scp/
 │   │   ├── crypto/            # MLS wrapper, UCAN wrapper, Merkle trees
 │   │   ├── envelope/          # SCP envelope creation, parsing, validation
 │   │   ├── provenance/        # Data provenance tagging
-│   │   └── event_log/         # Append-only verifiable log
+│   │   ├── event_log/         # Append-only verifiable log
+│   │   └── store/             # ProtocolStore — typed domain storage (§17.4)
 │   │
 │   ├── scp-transport/         # Transport abstraction + adapters
 │   │   ├── trait.rs           # TransportAdapter trait
@@ -407,6 +408,27 @@ scp/
 
 Each component has a defined responsibility boundary and communicates with others through typed Rust interfaces.
 
+**ProtocolStore** — typed domain storage layer (§17.4):
+
+```
+Responsibilities:
+  • Maps all structured protocol operations to flat KV Storage calls
+  • Key convention enforcement (§17.3): {namespace}/{entity_id}/{sub_key}
+  • Serialization: MessagePack with version envelopes (StoredValue<T>)
+  • Lazy on-read migration (§17.10)
+  • Context cleanup via delete_prefix
+  • UCAN nonce replay prevention via exists check
+  • OpenMLS StorageProvider bridge (§17.9)
+
+Depends on:
+  • Platform Adapter (Storage trait — 6 async methods)
+
+State:
+  • All protocol state flows through ProtocolStore to Storage:
+    context state, membership, sender keys, event logs, nonces,
+    DID cache, TOFU records, tools, sessions, relay scores, identity
+```
+
 **Context Manager** — the central coordinator:
 
 ```
@@ -424,9 +446,10 @@ Depends on:
   • Identity Manager (DID resolution, agent instantiation)
   • Transport Adapter (envelope delivery)
   • Event Log (append events, generate proofs)
+  • ProtocolStore (context state persistence — §17.4)
 
 State:
-  • Active contexts (in-memory + persisted to secure storage)
+  • Active contexts (in-memory + persisted via ProtocolStore)
   • TTL timers
   • Role/capability maps per context
 ```
@@ -814,7 +837,8 @@ Build:
   • scp-core/clock.rs — Clock trait + SystemClock (§16.3)
   • scp-transport/native/ — SCP native relay adapter (single relay)
   • scp-transport/native/blob_store.rs — BlobStore trait (§16.4.1)
-  • scp-platform/testing/ — In-memory key storage
+  • scp-platform/testing/ — In-memory key storage (delete_prefix, exists — §17.2)
+  • scp-core/store/ — Skeleton ProtocolStore, MlsStorageBridge (§17.4, §17.9)
   • scp-testing/ — Network simulation harness (§16): InMemoryRelay, InMemoryTransport,
     SimulatedClock, ScenarioBuilder, assertion library, trait conformance macros, presets
 
@@ -840,8 +864,12 @@ Build:
   • scp-core/context/ — role assignment, capability ceiling enforcement
   • scp-core/context/ — tool registration and invocation
   • scp-core/event_log/ — Merkle tree, append, prove, verify
+  • scp-core/store/ — Full ProtocolStore with all domain methods (§17.4)
+  • scp-platform/ — SqliteStorage (bundled-sqlcipher, WAL mode — §17.6)
+  • scp-platform/ — FilesystemStorage (§17.6)
   • scp-transport/ — transport abstraction trait
   • scp-transport/native/ — production SCP relay pool, multi-relay
+  • scp-transport/native/ — SqliteBlobStore, RedbBlobStore (§17.7)
   • scp-transport/websocket/ — direct device-to-device (for testing)
 
 Test:
@@ -849,8 +877,12 @@ Test:
   • Role enforcement: member can't do admin things
   • Event log integrity verification
   • Multi-relay delivery (send to 3 relays, receive from any)
+  • Context state persists across process restarts (SqliteStorage)
+  • ProtocolStore integration tests: lifecycle, nonces, event range queries (§17.13)
+  • All new Storage/BlobStore adapters pass conformance suites
 
 Deliverable: Two devices with full context lifecycle over real SCP relays.
+  Persistent storage for all protocol state.
 ```
 
 ### Phase 3: Python SDK + MCP (Weeks 9-12)
