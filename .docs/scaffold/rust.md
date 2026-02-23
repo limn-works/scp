@@ -24,6 +24,7 @@ crates/
         tools/              # ADR-010: Tool registration/invocation
         roles.rs            # ADR-009: Role assignment
       event_log/            # ADR-011: Verifiable Merkle event log
+      clock.rs              # Clock trait + SystemClock (§16.3)
   scp-transport/
     Cargo.toml
     src/
@@ -31,6 +32,41 @@ crates/
       trait.rs              # ADR-005: TransportAdapter trait
       manager.rs            # ADR-012: Multi-transport routing
       native/               # ADR-004: SCP native relay
+        blob_store.rs       # BlobStore trait (§16.4.1) — relay storage abstraction
+  scp-testing/              # §16: Network simulation test harness (dev-dependency only)
+    Cargo.toml
+    src/
+      lib.rs
+      clock.rs              # SimulatedClock (§16.3)
+      relay/                # InMemoryRelay, InMemoryBlobStore, BehaviorMode
+        mod.rs
+        blob_store.rs       # InMemoryBlobStore (§16.4.2)
+        behavior.rs         # BehaviorMode enum, fault injection configs (§16.4.4)
+        subscription.rs     # SubscriptionRegistry (§16.4.5)
+      transport.rs          # InMemoryTransport — TransportAdapter impl (§16.5)
+      simulator/            # NetworkSimulator, topology, fault injection
+        mod.rs              # NetworkSimulator (§16.8)
+        identity.rs         # SimulatedIdentity (§16.6)
+        topology.rs         # NetworkTopology, LinkConfig (§16.7)
+      builder.rs            # ScenarioBuilder (§16.9)
+      assertions/           # Distributed invariant checks (§16.10)
+        mod.rs
+        merkle.rs           # assert_consistent_merkle_roots
+        delivery.rs         # assert_complete_delivery
+        suppression.rs      # assert_suppression_detected
+        ordering.rs         # assert_correct_ordering
+        privacy.rs          # assert_pseudonym_unlinkability
+        blocking.rs         # assert_block_enforced
+        epoch.rs            # assert_epoch_consistency
+      presets.rs            # Canned scenarios (§16.11)
+      conformance/          # Trait conformance test generators (§16.12)
+        mod.rs
+        transport.rs        # transport_conformance!()
+        storage.rs          # storage_conformance!()
+        key_custody.rs      # key_custody_conformance!()
+        attestation.rs      # attestation_conformance!()
+        push.rs             # push_conformance!()
+        blob_store.rs       # blob_store_conformance!()
   scp-platform/
     Cargo.toml
     src/
@@ -95,6 +131,7 @@ members = [
     "crates/scp-ffi/cbindgen",
     "crates/scp-ffi/wasm",
     "crates/scp-ffi/napi",
+    "crates/scp-testing",
 ]
 
 [workspace.package]
@@ -141,7 +178,9 @@ tracing-subscriber = "0.3"
 | `tracing` | 0.1.x | all crates | Structured logging |
 | `axum` | latest | scp-mcp | HTTP server (MCP SSE transport) |
 | `jsonschema` | latest | scp-core | JSON Schema validation (tool schemas) |
+| `async-trait` | latest | scp-transport, scp-testing | Async trait support (BlobStore, TransportAdapter) |
 | `proptest` | 1.x | all crates (dev) | Property-based testing |
+| `scp-testing` | path | all crates (dev) | Network simulation harness, trait conformance macros (§16) |
 | `pyo3` | 0.23+ | scp-ffi/pyo3 | Python FFI |
 | `uniffi` | latest | scp-ffi/uniffi | Swift/Kotlin FFI |
 | `cbindgen` | latest | scp-ffi/cbindgen | C header generation |

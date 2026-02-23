@@ -90,15 +90,42 @@ Invalid transitions (must return error):
 - `Closing -> Active` (no re-opening)
 
 2. **`create_context(params: ContextParams) -> Result<ContextHandle, ContextError>`**
+
+   Context creation uses a **two-phase commit** pattern: validate all preconditions, then execute with rollback on failure.
+
+   **Phase 1 — Validate (no side effects):**
    - Validates `ContextParams`: ceiling, roles, tools, TTL, memory scope, governance model.
-   - Creates MLS group via ADR-001 `create_group()`.
-   - Generates creator's sender key via ADR-007 `generate_sender_key()`.
-   - Initializes empty event log (ADR-011).
-   - Transitions state to `Creating`.
-   - Publishes context to transport.
-   - Transitions state to `Active` on success.
-   - Returns a `ContextHandle` for subsequent operations.
-   - Appends `ContextCreated` event to event log.
+   - If `template_id` is present, validates all params match the template definition exactly.
+   - Validates the creator's identity is valid and the signing key is accessible.
+   - Validates transport is connected and at least one relay is reachable.
+   - If any validation fails, returns `ContextError` immediately. No state has been created.
+
+   **Phase 2 — Execute (with ordered rollback):**
+
+   Each step records its completion in a `CreationReceipt` struct. On failure at any step, all previously completed steps are rolled back in reverse order.
+
+   ```rust
+   struct CreationReceipt {
+       mls_group: Option<MlsGroup>,
+       sender_key: Option<SenderKey>,
+       event_log: Option<EventLog>,
+       published: bool,
+   }
+   ```
+
+   Steps:
+   1. Transition state to `Creating`.
+   2. Create MLS group via ADR-001 `create_group()`. On failure: drop `Creating` state, return error.
+   3. Generate creator's sender key via ADR-007 `generate_sender_key()`. On failure: destroy MLS group, return error.
+   4. Initialize empty event log (ADR-011). On failure: destroy sender key, destroy MLS group, return error.
+   5. Publish context to transport. On failure: drop event log, destroy sender key, destroy MLS group, return error.
+   6. Transition state to `Active`.
+   7. Append `ContextCreated` event to event log.
+   8. Return `ContextHandle`.
+
+   **Rollback guarantees:** After a failed `create_context` call, no MLS group state, no sender key material, and no event log state persists. The operation is atomic from the caller's perspective.
+
+   **Transport publication failure:** If the context was partially published (e.g., sent to 1 of 3 relays before failure), the rollback issues `DELETE` requests for any published blobs. DELETE is best-effort (relays are untrusted), but since no MLS group state survives the rollback, any orphaned blobs on relays are encrypted with destroyed keys and cannot be used.
 
 3. **`join_context(handle: &ContextHandle, key_package: KeyPackage) -> Result<(), ContextError>`**
    - Validates the joiner's key package.
@@ -161,6 +188,17 @@ pub struct ContextParams {
     pub ttl: Option<Duration>,           // Optional TTL
     pub memory_scope: MemoryScope,       // Ephemeral, Summary, or Full
     pub governance: GovernanceModel,     // Single-admin for Phase 2
+    pub template_id: Option<TemplateId>, // Well-known template ID if created from template (§5.12)
+}
+
+/// Well-known context templates (spec §5.12.1).
+/// Templates are protocol constants — not user-extensible.
+/// When present, all other ContextParams fields must match the template definition exactly.
+pub enum TemplateId {
+    BilateralEphemeral,   // Messaging-only, ephemeral, TTL required
+    BilateralPersistent,  // Messaging-only, full memory, no TTL
+    Coordination,         // Messaging + tools, summary memory, TTL required
+    GroupDiscussion,      // Messaging + invites, full memory, optional TTL
 }
 
 pub enum MemoryScope {
@@ -179,9 +217,12 @@ pub enum MemoryScope {
 | `mod.rs` | Module root, `ContextHandle`, `ContextState` enum, re-exports |
 | `state_machine.rs` | State transition logic, validation of legal transitions, transition event emission |
 | `manager.rs` | `ContextManager` struct — create, join, leave, close, send. Coordinates between MLS, envelope, transport, event log |
-| `params.rs` | `ContextParams`, `MemoryScope`, `GovernanceModel` (single-admin for Phase 2), `RoleDefinition` types |
+| `params.rs` | `ContextParams`, `MemoryScope`, `GovernanceModel` (single-admin for Phase 2), `RoleDefinition`, `TemplateId` types |
+| `templates.rs` | Well-known template definitions, template validation (params match template), template-based `ContextParams` construction |
+| `nesting.rs` | Parent-child relationship management: ceiling intersection validation, eligibility enforcement, lifecycle coupling, `ParentGovernanceConfig`, MLS `group_context` extension construction (parent context IDs + governance config content hash) |
 | `ttl.rs` | TTL timer management — spawn, cancel, extend. tokio-based timer tasks |
 | `membership.rs` | Member tracking, role assignment per member, member list queries, member count |
+| `builder.rs` | `CreationReceipt`, two-phase commit logic, ordered rollback, precondition validation |
 
 **Estimated functions:** ~20-25 public functions, ~15-20 internal helpers.
 
@@ -246,6 +287,7 @@ pub enum Capability {
     GovernancePropose,            // Propose governance actions
     GovernanceVote,               // Vote on governance proposals
     ContextClose,                 // Close the context
+    ChildContextCreate,           // Create child contexts with this context as parent (§5.13)
     Custom(String),               // Context-specific custom capability
 }
 ```
@@ -302,9 +344,28 @@ pub struct RoleDefinition {
    - Called at role definition time to validate role permission sets.
 
 7. **`NonceTracker` struct:**
-   - `check_and_record(context_id: &str, nonce: &str) -> Result<(), UcanError>`: Returns error if nonce already seen. Records nonce if new.
-   - Backed by a `HashSet<String>` per context, persisted to storage.
-   - Bounded: nonces older than 24 hours are pruned (tokens should not be reused across sessions).
+
+   ```rust
+   pub struct NonceTracker {
+       /// Map of nonce -> (first_seen_timestamp, token_expiry_timestamp).
+       /// Both timestamps are Unix seconds.
+       seen: HashMap<String, (u64, u64)>,
+       context_id: ContextId,
+   }
+   ```
+
+   **Nonce format:** `{unix_millis_timestamp}-{16_random_bytes_hex}`. Example: `1708646400000-a3f2b1c9d4e5f6071829`. The timestamp prefix enables efficient pruning; the random suffix ensures uniqueness. Implementations MUST validate the nonce format on receipt — malformed nonces are rejected.
+
+   **Nonce freshness check:** The timestamp prefix in the nonce MUST be within `now - 5 minutes` to `now + 5 minutes` (matching the clock skew tolerance from spec §9.14). A nonce with a timestamp outside this window is rejected as `UcanError::NonceTooOld` or `UcanError::NonceFuture`.
+
+   **Replay window:** A nonce is retained in the tracker until `max(token_expiry + 5 minutes, first_seen + 24 hours)`. The 5-minute buffer after token expiry accounts for clock skew. The 24-hour floor provides a safety net for tokens with very short expiry.
+
+   **Pruning:** `prune()` removes entries where `now > max(token_expiry + 300, first_seen + 86400)`. Pruning runs every 1000 `check_and_record` calls or every 10 minutes, whichever comes first.
+
+   - `check_and_record(nonce: &str, token_expiry: u64) -> Result<(), UcanError>`: Validates nonce format, validates freshness, returns `UcanError::NonceReused` if seen before, records `(now, token_expiry)` if new.
+   - Backed by a `HashMap` per context, persisted to `scp-platform` Storage for crash recovery.
+
+   **UCAN token expiry constraint (spec §9.5):** UCAN token `exp` MUST NOT exceed `now + 24 hours`. Tokens with `exp` beyond 24 hours from issuance are rejected at validation time.
 
 ### Scope
 
@@ -404,6 +465,66 @@ pub struct TestVector {
    - Appends `ToolInvoked` event to event log (includes tool_id, invoker_did, input hash, output hash).
    - Returns the tool output.
 
+**Tool execution lifecycle:**
+
+Every tool invocation follows a defined lifecycle with explicit states, timeouts, and error handling.
+
+```rust
+/// A tool invocation request, sent as an MLS application message.
+pub struct ToolRequest {
+    pub request_id: String,          // UUID v4, unique per invocation
+    pub tool_id: ToolId,
+    pub invoker_did: DID,
+    pub input: serde_json::Value,
+    pub timeout_ms: u32,             // Caller-specified timeout (max: context ceiling, default: 30_000)
+    pub session_id: Option<String>,  // For stateful sessions (§6.2.1)
+    pub chain_depth: u8,             // Cross-context chain depth (0 for direct calls)
+    pub timestamp: u64,
+}
+
+/// A tool invocation response, sent as an MLS application message.
+pub struct ToolResponse {
+    pub request_id: String,          // Matches the request
+    pub status: ToolStatus,
+    pub output: Option<serde_json::Value>,
+    pub error: Option<ToolExecutionError>,
+    pub execution_time_ms: u64,
+    pub provenance: Provenance,
+}
+
+pub enum ToolStatus { Success, Error, Timeout, Cancelled }
+
+pub struct ToolExecutionError {
+    pub code: ToolErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+pub enum ToolErrorCode {
+    InputValidationFailed, OutputValidationFailed, ExecutionFailed,
+    Timeout, Cancelled, RateLimited, ToolNotFound, PermissionDenied, InternalError,
+}
+```
+
+**Timeout handling:**
+- Every tool invocation has a timeout. Callers specify `timeout_ms` in the request (default: 30,000ms, maximum: configurable per-context, hard protocol maximum: 300,000ms / 5 minutes).
+- The invoking SDK starts a timer on request submission. If no `ToolResponse` arrives before the timer fires, the SDK synthesizes a `ToolResponse` with `status: Timeout` and delivers it to the caller.
+- Timeout is a client-side contract, not a server-side enforcement.
+
+**Cancellation protocol:**
+- The invoker MAY send a `ToolCancel { request_id, invoker_did, timestamp }` message referencing the `request_id`.
+- On receiving `ToolCancel`, the tool's execution environment SHOULD terminate the invocation and respond with `status: Cancelled`.
+- Cancellation is best-effort. If the tool responds with `Success` before the cancel is processed, the success response takes precedence.
+
+**Error propagation:**
+- Tool execution errors are returned in `ToolResponse.error`, not as protocol-level errors.
+- Schema validation failures are caught by the SDK, not the tool. The SDK rejects invalid input before invoking the tool and rejects invalid output before delivering the response.
+- The `retryable` field indicates whether the caller should attempt the invocation again.
+
+**Event log recording:**
+- `ToolRequest` and `ToolResponse` are both recorded as events in the context's event log (ADR-011).
+- The event includes: `request_id`, `tool_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
+
 4. **`update_tool(context: &ContextHandle, tool_id: &ToolId, new_registration: ToolRegistration, updater_did: &DID) -> Result<(), ToolError>`**
    - Validates updater is the tool's operator DID or has admin role.
    - Records old and new implementation hashes.
@@ -465,6 +586,7 @@ pub struct ToolSession {
 | `interface.rs` | `ToolInterface`, `expose_tool`, `accept_tool_interface`, `invoke_cross_context`, rate limiting |
 | `session.rs` | `ToolSession`, `create_session`, `invoke_session`, TTL cleanup task |
 | `schema.rs` | JSON Schema validation helpers, MCP compatibility utilities |
+| `lifecycle.rs` | `ToolRequest`, `ToolResponse`, `ToolCancel`, `ToolStatus`, timeout management, cancellation handling |
 
 **Estimated functions:** ~18-22 public functions, ~12-15 internal helpers.
 
@@ -547,6 +669,7 @@ pub enum EventType {
     ToolInterfaceEstablished,
     GovernanceAction,
     ConsistencyCheckpoint,
+    AbsenceProofRequested,
 }
 ```
 
@@ -577,10 +700,40 @@ pub struct ProofStep {
 }
 ```
 
-4. **`prove_absence(log: &EventLog, predicate: &dyn Fn(&Event) -> bool) -> Result<AbsenceProof, EventLogError>`**
-   - Scans the log and returns a proof that no event matching the predicate exists.
-   - For an ordered log, this can be an efficient range proof. For general predicates, this requires a full scan with the complete set of leaf hashes.
-   - Returns the root hash and the full leaf hash list (verifier can confirm no leaf matches).
+4. **`prove_absence(log: &EventLog, event_hash: &[u8; 32]) -> Result<AbsenceProof, EventLogError>`**
+
+   Non-membership proofs use a **sorted leaf hash** approach with a documented privacy trade-off.
+
+   ```rust
+   pub struct AbsenceProof {
+       /// The event hash being proven absent.
+       pub query_hash: [u8; 32],
+       /// The two adjacent leaf hashes that bracket the query hash
+       /// in sorted order. If query_hash < all leaves, `lower` is None.
+       /// If query_hash > all leaves, `upper` is None.
+       pub lower: Option<LeafWithProof>,
+       pub upper: Option<LeafWithProof>,
+       /// Merkle root at the time of the proof.
+       pub root: [u8; 32],
+       /// Total number of leaves in the log.
+       pub leaf_count: u64,
+   }
+
+   pub struct LeafWithProof {
+       pub leaf_hash: [u8; 32],
+       pub leaf_index: u64,
+       pub inclusion_proof: InclusionProof,
+   }
+   ```
+
+   **Algorithm:**
+   1. Maintain a sorted index of leaf hashes alongside the append-order Merkle tree (`BTreeSet<([u8; 32], u64)>`).
+   2. To prove absence of `query_hash`: find the two adjacent entries that bracket `query_hash`. Generate inclusion proofs for both.
+   3. The verifier confirms: (a) both adjacent leaves are in the tree, (b) they are truly adjacent in sorted order, (c) `query_hash` falls between them.
+
+   **Privacy analysis:** This approach reveals exactly two leaf hashes (the neighbors of the query point). It does NOT require disclosing the full leaf hash set.
+
+   **Residual privacy risk:** Repeated absence queries can gradually reveal more of the sorted hash set. Mitigation: absence proof requests are rate-limited (maximum 10 per member per hour per context) and logged as `AbsenceProofRequested` events. Context governance can restrict which roles may request absence proofs (default: `admin` only).
 
 5. **`verify_inclusion(proof: &InclusionProof) -> bool`**
    - Recomputes the root hash from the leaf hash and proof path.
@@ -687,10 +840,10 @@ pub struct TransportManager {
    - If fewer than 2 relays succeed, returns an error (insufficient redundancy).
    - Records delivery success/failure per relay for reliability scoring.
 
-3. **`subscribe(manager: &TransportManager, routing_id: &RoutingId, context_id: &ContextId, since: Option<u64>) -> Result<Pin<Box<dyn Stream<Item = OuterEnvelope> + Send>>, TransportError>`**
+3. **`subscribe(manager: &TransportManager, routing_id: &RoutingId, context_id: &ContextId, since: Option<u64>) -> Result<Pin<Box<dyn Stream<Item = TransportEvent> + Send>>, TransportError>`**
    - Subscribes to the routing_id on all relays in the context's relay set.
    - Merges streams from all relays into a single deduplicated stream.
-   - Deduplication: envelopes with the same `blob_id` (SHA-256 of the blob) are delivered only once. The dedup cache is an LRU with a 10,000-entry capacity.
+   - Deduplication applies to `TransportEvent::Envelope` variants: envelopes with the same `blob_id` (SHA-256 of the blob) are delivered only once. The dedup cache is an LRU with a 10,000-entry capacity.
    - Returns the merged, deduplicated stream.
 
 4. **`assign_relay_set(manager: &mut TransportManager, context_id: &ContextId) -> Vec<usize>`**
@@ -735,6 +888,8 @@ pub struct ReliabilityScore {
 | `scoring.rs` | `ReliabilityScore`, score update logic, exponential moving average, relay ranking |
 
 **Estimated functions:** ~15-18 public functions, ~10-12 internal helpers.
+
+**Testing.** The `scp-testing` crate (§16) provides `InMemoryTransport` — a `TransportAdapter` implementation backed by `InMemoryRelay` instances — enabling deterministic testing of `TransportManager` routing logic without network I/O. The `transport_conformance!()` macro (§16.12.1) verifies that every `TransportAdapter` implementation satisfies the trait contract; the `InMemoryTransport` is the reference, and the native relay adapter must pass the same suite. Multi-relay fault scenarios (suppression, equivocation, delay, replay) are tested via `BehaviorMode` configurations on `InMemoryRelay` (§16.4.4).
 
 ---
 

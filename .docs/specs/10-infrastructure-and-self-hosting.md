@@ -84,6 +84,8 @@ Devices that aren't always online need relays for message delivery. Relays hold 
 
 **Multi-relay resilience.** For availability and equivocation resistance, clients SHOULD publish to 3+ relays and maintain per-relay reliability scores (§9.9.2). The Relay Consistency Protocol (§9.9.3) enables members to detect relays that show different event histories to different clients. Combined with per-sender sequence numbers (§9.8.5), clients can detect message suppression and switch to healthier relays automatically.
 
+**Relay conformance testing.** Relay storage backends implement the `BlobStore` trait (§16.4.1) and are verified by the `blob_store_conformance!()` macro (§16.12.6), which tests store/retrieve roundtrips, TTL expiry, listing, deletion, and concurrent access. The `InMemoryRelay` (§16.4.3) is the reference implementation; every production backend (SQLite, sled, etc.) must pass the same suite. Multi-relay adversarial scenarios — suppression, equivocation, delay, replay, Commit suppression — are tested via `BehaviorMode` fault injection in the network simulation harness (§16.4.4).
+
 ## 10.5 SDK Transport Architecture
 
 The SCP SDK owns all protocol logic — contexts, agents, trust, capabilities, governance, bridge connectors, provenance. This is the product. Transport is not the product.
@@ -109,6 +111,8 @@ The SCP native relay is the canonical reference — the simplest possible thing 
 - Relay operations (that's either self-hosting or managed infrastructure)
 
 **No fundamental dependency on any single transport.** The protocol must function correctly on any transport that implements the abstraction interface. SCP native relays are the default, but the protocol does not assume or require them. A deployment using only Hyperswarm, or only Matrix, or only direct WebSocket, is equally valid.
+
+**Transport adapter conformance.** Every `TransportAdapter` implementation is verified by the `transport_conformance!()` macro (§16.12.1), which tests send/subscribe roundtrips, backfill with `since`, unsubscribe, query, delete, and deduplication. The `InMemoryTransport` (§16.5) is the reference implementation that passes conformance first; every production adapter must pass the same suite before being considered complete.
 
 **Transport security.** All relay connections MUST use TLS 1.3 (TLS 1.2 acceptable as fallback). Certificate pinning is supported for known relays. See §9.13 for the complete transport security specification.
 

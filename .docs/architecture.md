@@ -332,6 +332,16 @@ scp/
 │   │   ├── bluesky/           # Bluesky/AT Protocol bridge
 │   │   └── shadow.rs          # Shadow identity management
 │   │
+│   ├── scp-testing/            # Network simulation test harness (§16, dev-dependency)
+│   │   ├── clock.rs           # SimulatedClock (manual time control)
+│   │   ├── relay/             # InMemoryRelay, BlobStore, BehaviorMode, SubscriptionRegistry
+│   │   ├── transport.rs       # InMemoryTransport (TransportAdapter over InMemoryRelay)
+│   │   ├── simulator/         # NetworkSimulator, SimulatedIdentity, NetworkTopology
+│   │   ├── builder.rs         # ScenarioBuilder (fluent API for test setup)
+│   │   ├── assertions/        # Distributed invariant checks (Merkle, delivery, ordering, etc.)
+│   │   ├── presets.rs         # Canned scenarios (two_party_basic, suppression_scenario, etc.)
+│   │   └── conformance/       # Trait conformance macros (transport, storage, key_custody, etc.)
+│   │
 │   ├── scp-ffi/               # Foreign function interface layer
 │   │   ├── uniffi/            # UniFFI definitions → Swift, Kotlin
 │   │   └── pyo3/              # PyO3 definitions → Python
@@ -589,9 +599,17 @@ State:
               ▼
      platform implementations
      (apple / android / web / testing)
+
+   scp-testing (dev-dependency, §16)
+        │
+        ├──► scp-core
+        ├──► scp-transport
+        └──► scp-platform
 ```
 
 Build order follows the dependency graph bottom-up: platform traits → transport → core → FFI → bindings.
+
+`scp-testing` is a dev-dependency only — it depends on core, transport, and platform but is never imported by production code. It provides the network simulation harness (InMemoryRelay, InMemoryTransport, SimulatedClock, ScenarioBuilder), trait conformance test macros, and distributed assertion utilities. See `.docs/specs/16-test-infrastructure.md` for the full specification.
 
 ### 3.4 Context Nesting
 
@@ -793,15 +811,23 @@ Build:
   • scp-core/crypto/ — MLS wrapper (OpenMLS), UCAN wrapper (rs-ucan)
   • scp-core/envelope/ — SCP envelope creation, signing, verification
   • scp-core/identity/ — DID creation (did:dht)
+  • scp-core/clock.rs — Clock trait + SystemClock (§16.3)
   • scp-transport/native/ — SCP native relay adapter (single relay)
+  • scp-transport/native/blob_store.rs — BlobStore trait (§16.4.1)
   • scp-platform/testing/ — In-memory key storage
+  • scp-testing/ — Network simulation harness (§16): InMemoryRelay, InMemoryTransport,
+    SimulatedClock, ScenarioBuilder, assertion library, trait conformance macros, presets
 
 Test:
   • Process A creates MLS group, encrypts message, publishes to local SCP relay
   • Process B subscribes, receives, decrypts
   • Relay has no idea what's inside
+  • Network simulator: N-party scenarios with fault injection, suppression detection,
+    equivocation detection, and deterministic time control (§16.13)
+  • Trait conformance suites pass for all in-memory implementations (§16.12)
 
 Deliverable: ~500 lines of Rust. Two terminals exchanging encrypted messages.
+  scp-testing harness verified by meta-tests before protocol tests depend on it.
 ```
 
 ### Phase 2: Context + Transport (Weeks 5-8)
