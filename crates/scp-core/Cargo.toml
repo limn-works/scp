@@ -25,6 +25,7 @@ z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 hkdf = { workspace = true }
+percent-encoding = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
