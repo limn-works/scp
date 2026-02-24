@@ -28,12 +28,15 @@
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 
+pub mod adapter;
+pub(crate) mod client;
 pub mod error;
 pub mod protocol;
 pub mod server;
 pub mod storage;
 
 // Re-export primary types for convenience.
+pub use adapter::NativeRelayAdapter;
 pub use error::{NativeProtocolError, code};
 pub use protocol::{
     ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT,
