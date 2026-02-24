@@ -24,12 +24,14 @@
 //! - [`DataProvenance`] -- Placeholder provenance metadata (replaced by SCP-070).
 //! - [`DiscoveryError`] -- Error type for discovery operations.
 
+pub mod bootstrap;
 pub mod did_capabilities;
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub use bootstrap::{BootstrapConfig, BootstrapResolver};
 pub use did_capabilities::{CapabilityEntry, resolve_capabilities};
 
 // ---------------------------------------------------------------------------
