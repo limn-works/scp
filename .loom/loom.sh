@@ -807,7 +807,8 @@ if $USE_TMUX; then
   # Base: 3 (box) + 1 (PID/Mode) + 1 (Dir) + 1 (Stop) = 6
   HEADER_HEIGHT=6
   [ -n "$DIRECTIVE_FILE" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
-  [ "$USE_WORKTREE" = "yes" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
+  # Tree line only shown when different from Dir
+  [ "$USE_WORKTREE" = "yes" ] && [ "$WORKTREE_DIR" != "$PROJECT_DIR" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
   [ -n "${LOOM_CAPABILITIES:-}" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
 
   # Use real terminal size so pane proportions are correct on attach
@@ -873,7 +874,7 @@ if [ "${LOOM_TMUX_CHILD:-}" = "1" ]; then
     echo -e "  ${DIM}PID${NC} ${BOLD}$$${NC}  ${DIM}|${NC}  ${DIM}Mode${NC} ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
     echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
     [ -n "$DIRECTIVE_FILE" ] && echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
-    [ "${USE_WORKTREE:-}" = "yes" ] && echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
+    [ "${USE_WORKTREE:-}" = "yes" ] && [ "${WORKTREE_DIR:-}" != "$PROJECT_DIR" ] && echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
     [ -n "${LOOM_CAPABILITIES:-}" ] && echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
     echo -en "  ${DIM}Stop${NC}  ${CYAN}touch $LOOM_DIR/.stop${NC}"
   } > "$LOOM_DIR/.header"
@@ -889,7 +890,7 @@ else
   if [ -n "$DIRECTIVE_FILE" ]; then
     echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
   fi
-  if [ "$USE_WORKTREE" = "yes" ]; then
+  if [ "$USE_WORKTREE" = "yes" ] && [ "${WORKTREE_DIR:-}" != "$PROJECT_DIR" ]; then
     echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
   fi
   if [ -n "$LOOM_CAPABILITIES" ]; then
