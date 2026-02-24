@@ -21,6 +21,7 @@
 //! - [`tree::root`] -- Get the current Merkle root (O(1)).
 //! - [`tree::event_count`] -- Get the number of events in the log.
 
+pub mod proof;
 pub mod tree;
 
 use std::collections::BTreeSet;
@@ -183,6 +184,23 @@ pub enum EventLogError {
         /// The actual sequence number on the event.
         actual: u64,
     },
+
+    /// The requested leaf index is out of bounds.
+    #[error("leaf index {index} out of bounds (log has {count} leaves)")]
+    LeafIndexOutOfBounds {
+        /// The requested leaf index.
+        index: u64,
+        /// The total number of leaves in the log.
+        count: u64,
+    },
+
+    /// The event log is empty.
+    #[error("event log is empty")]
+    EmptyLog,
+
+    /// An absence proof was requested for a hash that IS present in the log.
+    #[error("absence proof requested for event hash that is present in the log")]
+    AbsenceProofForPresentEvent,
 }
 
 // ---------------------------------------------------------------------------
