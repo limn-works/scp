@@ -37,6 +37,14 @@ You must write a fresh status report before exiting:
 
 Also ensure all commits (if tests pass) and Vestige memory storage
 are done before writing status.md — the write triggers an immediate kill.
+
+Documentation reminder: Before finishing, check whether this iteration's
+changes warrant .docs updates:
+  - Root .docs/ for project-wide knowledge (ADRs, specs, lessons, architecture)
+  - Localized .docs/ dirs (e.g. crates/scp-core/.docs/) for crate-specific
+    design notes, API decisions, and internal conventions
+Create localized .docs/ directories when a crate accumulates design context
+worth preserving close to the code.
 MSG
     exit 2
   fi
