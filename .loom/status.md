@@ -1,31 +1,26 @@
 # Loom Status
 
-## Last Iteration: 9 (manual remediation) — SUCCESS
+## Last Iteration — SUCCESS
 
-**Date:** 2026-02-23
+**Date:** 2026-02-24
 
 ## What Happened
 
-Iteration 8 (session 2, #5) dispatched SCP-016, SCP-019, SCP-022, SCP-023 in parallel. It timed out after 3600s waiting for subagents to complete. SCP-016 code was written and tests passed but never committed. SCP-019, SCP-022, SCP-023 produced partial uncommitted files (context builder.rs, manager.rs, roles.rs, templates.rs) but their PRD status was not updated.
+Manual remediation of timed-out iteration. 5 stories (SCP-021, SCP-031, SCP-052, SCP-061, SCP-073) had complete code from subagents but were never committed due to timeout. All code reviewed, tests verified (780 total, 0 failures), clippy clean. Committed discretely per story.
 
-Loom pushed the branch and attempted a PR (already existed from session 1's circuit breaker halt). Loop exited.
+### Stories Completed This Round
 
-## Remediation
-
-Manual intervention committed the orphaned work:
-- `fb4feec` — SCP-016: native relay client adapter (client.rs, adapter.rs, mod.rs, Cargo.toml)
-- `d26eb97` — SCP-018: context builder, manager, roles, templates (files from timed-out subagents)
-
-Audit revealed SCP-016 was missing `TransportEvent::Reconnected` emission — the stream never signaled reconnection to subscribers. A subagent was dispatched to fix it:
-- `aff26ac` — Added `SubscriptionMessage` enum for internal reconnection signaling, wired `Reconnected` event through subscription channels. 3 new tests.
-
-All 20 done stories audited against acceptance criteria — all pass.
+- **SCP-021** (context close/finalize/TTL) — close_context, finalize_close, handle_ttl_expiry, TtlTimer with tokio, TtlExtension unanimous consent. Manager extended. 18 tests.
+- **SCP-031** (Merkle proofs) — prove_inclusion (O(log n)), prove_absence (sorted neighbor), verify_inclusion (stateless). 18 tests.
+- **SCP-052** (UCAN types) — UcanToken/Header/Payload, CapabilityUri parser, wildcard matching, ceiling compliance. ~50 tests incl. proptests.
+- **SCP-061** (trust engine) — BehavioralRecord from event logs, TrustInput four-layer aggregator, placeholder types. 16 tests.
+- **SCP-073** (DID discovery) — SCPCapabilities service resolution via did:dht, DiscoveryQuery/Result types. 14 tests.
 
 ## Cumulative Progress
 
-**Done (20):** SCP-001, SCP-002, SCP-003, SCP-004, SCP-005, SCP-006, SCP-007, SCP-008, SCP-009, SCP-010, SCP-011, SCP-012, SCP-013, SCP-014, SCP-015, SCP-016, SCP-018, SCP-107, SCP-108, SCP-109
+**Done (35):** SCP-001, SCP-002, SCP-003, SCP-004, SCP-005, SCP-006, SCP-007, SCP-008, SCP-009, SCP-010, SCP-011, SCP-012, SCP-013, SCP-014, SCP-015, SCP-016, SCP-017, SCP-018, SCP-019, SCP-020, SCP-021, SCP-022, SCP-023, SCP-030, SCP-031, SCP-052, SCP-061, SCP-073, SCP-107, SCP-108, SCP-109, SCP-140, SCP-142, SCP-143, SCP-150
 
-**Tests:** 424 total (255 scp-core + 44 scp-platform + 122 scp-transport + 3 doctests), 0 failures
+**Tests:** 780 total (606 scp-core + 44 scp-platform + 2 scp-testing + 122 scp-transport + 6 doctests), 0 failures
 **Clippy:** clean (zero warnings with -D warnings)
 
 ## Failing Tests
@@ -38,19 +33,21 @@ None (status.md excluded by convention).
 
 ## Gate Status
 
-**Gate 1 (Phase 1: Crypto Proof):** 16/17 stories done. Only **SCP-017** (Phase 1 integration test) remains.
+**Gate 1 (Phase 1: Crypto Proof):** COMPLETE (17/17 stories done).
+**Gate 2 (Phase 2: Context Lifecycle):** In progress. SCP-024, SCP-025, SCP-026, SCP-027, SCP-028, SCP-029, SCP-032, SCP-033, SCP-034, SCP-035 remain.
 
 ## Next Iteration Candidates
 
-Unblocked and ready:
-- **SCP-017** — Phase 1 integration test (last gate-1 story)
-- **SCP-019** — Context creation with two-phase commit
-- **SCP-022** — Context templates
-- **SCP-023** — Capability ceiling, roles, and role assignment
+Unblocked and ready. Recommended batch with no file overlap:
 
-Recommended batch: SCP-017 + SCP-019 + SCP-022 + SCP-023 (all unblocked, no file overlap)
+- **SCP-024** — UCAN minting and validation pipeline (crypto/ucan/)
+- **SCP-070** — Data provenance types and module root (provenance/mod.rs)
+- **SCP-084** — Bridge core types and module structure (bridge/mod.rs)
+
+SCP-024 is a critical Phase 2 blocker (SCP-025, SCP-026 depend on it).
 
 Blocked:
-- **SCP-020** (context membership) — needs SCP-019
-- **SCP-021** (context close/finalize/TTL) — needs SCP-019
-- **SCP-024** (UCAN minting) — needs SCP-023
+- **SCP-025** (UCAN revocation) — needs SCP-024
+- **SCP-026** (tool registration) — needs SCP-024
+- **SCP-033** (TransportManager) — needs SCP-144
+- **SCP-035** (Phase 2 integration test) — needs all Phase 2 stories
