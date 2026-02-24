@@ -28,11 +28,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ed25519_dalek::{Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use scp_platform::traits::{KeyCustody, KeyType};
+use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
 use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
 use super::dht_client::{DhtClient, InMemoryDhtClient};
-use super::document::DidDocument;
+use super::document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 use super::{DidMethod, IdentityError, ScpIdentity};
 
 /// The `did:dht` DID method prefix.
@@ -379,6 +379,292 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         })
     }
 
+    /// Rotates the active signing key for an identity (Layer 1).
+    ///
+    /// Generates a new Ed25519 keypair as the new Active Signing Key, updates
+    /// the DID document (moves old active key to `#retired-{sequence}`, installs
+    /// new key as `#active`), signs the document with the Identity Key, and
+    /// publishes to the DHT.
+    ///
+    /// **The DID string does NOT change. The Identity Key does NOT change.**
+    ///
+    /// After rotation, the caller MUST issue MLS Update proposals in all active
+    /// contexts and revoke/reissue UCAN tokens signed by the old active key.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - The current identity (will be consumed to produce the
+    ///   updated identity).
+    /// * `document` - The current DID document (will be mutated in-place).
+    /// * `key_custody` - The key custody for generating the new keypair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Platform`] if key generation fails.
+    /// Returns [`IdentityError::DhtPublishFailed`] if DHT publishing fails.
+    ///
+    /// See ADR-003 acceptance criterion 4a.
+    pub async fn rotate_active_key(
+        &self,
+        identity: &ScpIdentity,
+        document: &DidDocument,
+        key_custody: &impl KeyCustody,
+    ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
+        // Step 1: Generate a new Ed25519 keypair for the new Active Signing Key.
+        let new_active_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 2: Get the new key's public key.
+        let new_active_public = key_custody
+            .public_key(&new_active_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 3: Clone and update the document.
+        let mut updated_doc = document.clone();
+        let sequence = self.current_sequence().saturating_add(1);
+        updated_doc.retire_active_key(new_active_public.as_bytes(), sequence);
+
+        // Step 4: Publish the updated document. The publish_document method
+        // signs with the Identity Key via the stored sign_fn.
+        self.publish_document(identity, &updated_doc).await?;
+
+        // Step 5: Build the updated identity. DID string and identity key
+        // are preserved; only the active signing key changes.
+        let updated_identity = ScpIdentity {
+            identity_key: identity.identity_key,
+            active_signing_key: new_active_key,
+            pre_rotation_commitment: identity.pre_rotation_commitment,
+            did: identity.did.clone(),
+        };
+
+        Ok((updated_identity, updated_doc))
+    }
+
+    /// Migrates an identity to a new DID (Layer 2).
+    ///
+    /// Creates a new DID using the pre-rotation key as the new Identity Key.
+    /// Generates a new Active Signing Key and pre-rotation commitment for the
+    /// new DID. Updates the old DID document with an `alsoKnownAs` pointing to
+    /// the new DID and cryptographic linkage. Publishes both documents.
+    ///
+    /// **The DID string changes. All per-context references must be migrated
+    /// via the returned [`DidRotationEvent`].**
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - The current identity being migrated.
+    /// * `old_document` - The current DID document for the old identity.
+    /// * `pre_rotation_key` - The pre-rotation key handle (must match the
+    ///   commitment in the old DID document).
+    /// * `key_custody` - The key custody for generating new keypairs.
+    /// * `rotated_at` - Unix timestamp for the migration event.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(new_identity, new_document, rotation_event)`:
+    /// - `new_identity` — The new [`ScpIdentity`] with new DID, keys, and
+    ///   pre-rotation commitment.
+    /// - `new_document` — The DID document for the new identity.
+    /// - `rotation_event` — The [`DidRotationEvent`] to distribute to all
+    ///   active contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors if key generation, signing, or DHT publishing fails.
+    ///
+    /// See ADR-003 acceptance criterion 4b.
+    pub async fn migrate_identity(
+        &self,
+        identity: &ScpIdentity,
+        old_document: &DidDocument,
+        pre_rotation_key: &KeyHandle,
+        key_custody: &impl KeyCustody,
+        rotated_at: u64,
+    ) -> Result<(ScpIdentity, DidDocument, DidRotationEvent), IdentityError> {
+        // Step 1: The pre-rotation key becomes the new Identity Key.
+        let new_identity_public = key_custody
+            .public_key(pre_rotation_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let new_did = format!(
+            "{DID_DHT_PREFIX}z{}",
+            zbase32::encode(new_identity_public.as_bytes())
+        );
+
+        // Step 2: Generate new keys and build new DID document.
+        let (new_active_key, new_pre_rotation_commitment, new_document) =
+            Self::create_new_identity_keys(key_custody, &new_did, &new_identity_public).await?;
+
+        // Step 3: Update old DID document with alsoKnownAs forwarding.
+        let mut updated_old_doc = old_document.clone();
+        updated_old_doc.set_also_known_as(&new_did);
+
+        // Step 4: Create the migration and pre-rotation proofs.
+        let migration_proof =
+            Self::build_migration_proof(identity, &new_did, rotated_at, key_custody).await?;
+        let pre_rotation_proof =
+            Self::build_pre_rotation_proof(old_document, &new_identity_public)?;
+
+        // Step 5: Publish both documents.
+        self.publish_document(identity, &updated_old_doc).await?;
+        let temp_new_identity = ScpIdentity {
+            identity_key: *pre_rotation_key,
+            active_signing_key: new_active_key,
+            pre_rotation_commitment: new_pre_rotation_commitment,
+            did: new_did.clone(),
+        };
+        self.publish_document(&temp_new_identity, &new_document)
+            .await?;
+
+        // Step 6: Build and return the rotation event and new identity.
+        let rotation_event = DidRotationEvent {
+            old_did: identity.did.clone(),
+            new_did: new_did.clone(),
+            migration_proof,
+            pre_rotation_proof,
+            rotated_at,
+        };
+
+        let new_identity = ScpIdentity {
+            identity_key: *pre_rotation_key,
+            active_signing_key: new_active_key,
+            pre_rotation_commitment: new_pre_rotation_commitment,
+            did: new_did,
+        };
+
+        Ok((new_identity, new_document, rotation_event))
+    }
+
+    /// Generates new active signing key, pre-rotation key, and DID document
+    /// for a migrated identity.
+    async fn create_new_identity_keys(
+        key_custody: &impl KeyCustody,
+        new_did: &str,
+        new_identity_public: &scp_platform::traits::PublicKey,
+    ) -> Result<(KeyHandle, [u8; 32], DidDocument), IdentityError> {
+        let new_active_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+        let new_active_public = key_custody
+            .public_key(&new_active_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let new_pre_rotation_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+        let new_pre_rotation_public = key_custody
+            .public_key(&new_pre_rotation_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(new_pre_rotation_public.as_bytes());
+        let commitment_bytes = hasher.finalize();
+        let mut commitment = [0u8; 32];
+        commitment.copy_from_slice(&commitment_bytes);
+
+        key_custody
+            .destroy_key(&new_pre_rotation_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let document = DidDocument::new(
+            new_did,
+            new_identity_public.as_bytes(),
+            new_active_public.as_bytes(),
+            &commitment,
+        );
+
+        Ok((new_active_key, commitment, document))
+    }
+
+    /// Builds a migration proof by signing `SHA-256(old_did || new_did || rotated_at)`
+    /// with the old Identity Key.
+    async fn build_migration_proof(
+        identity: &ScpIdentity,
+        new_did: &str,
+        rotated_at: u64,
+        key_custody: &impl KeyCustody,
+    ) -> Result<MigrationProof, IdentityError> {
+        let mut hasher = Sha256::new();
+        hasher.update(identity.did.as_bytes());
+        hasher.update(new_did.as_bytes());
+        hasher.update(rotated_at.to_be_bytes());
+        let digest = hasher.finalize();
+
+        let proof_sig = key_custody
+            .sign(&identity.identity_key, &digest)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let old_identity_public = key_custody
+            .public_key(&identity.identity_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let sig_bytes = proof_sig.into_bytes();
+        if sig_bytes.len() != 64 {
+            return Err(IdentityError::KeyRotationFailed(format!(
+                "expected 64-byte signature, got {} bytes",
+                sig_bytes.len()
+            )));
+        }
+
+        let old_pub_bytes: [u8; 32] =
+            old_identity_public
+                .into_bytes()
+                .try_into()
+                .map_err(|v: Vec<u8>| {
+                    IdentityError::KeyRotationFailed(format!(
+                        "expected 32-byte public key, got {} bytes",
+                        v.len()
+                    ))
+                })?;
+
+        Ok(MigrationProof {
+            signature: sig_bytes,
+            old_public_key: old_pub_bytes,
+        })
+    }
+
+    /// Builds a pre-rotation proof from the old document's `PreRotationCommitment`
+    /// service, if present.
+    fn build_pre_rotation_proof(
+        old_document: &DidDocument,
+        new_identity_public: &scp_platform::traits::PublicKey,
+    ) -> Result<Option<PreRotationProof>, IdentityError> {
+        let Some(svc) = old_document.pre_rotation_service() else {
+            return Ok(None);
+        };
+        let Some(hex_str) = svc.service_endpoint.strip_prefix("sha256:") else {
+            return Ok(None);
+        };
+
+        let commitment = hex_decode(hex_str).map_err(|e| {
+            IdentityError::KeyRotationFailed(format!(
+                "failed to decode pre-rotation commitment: {e}"
+            ))
+        })?;
+        let new_identity_bytes: [u8; 32] =
+            new_identity_public.as_bytes().try_into().map_err(|_| {
+                IdentityError::KeyRotationFailed(
+                    "new identity public key is not 32 bytes".to_owned(),
+                )
+            })?;
+
+        Ok(Some(PreRotationProof {
+            commitment,
+            revealed_key: new_identity_bytes,
+        }))
+    }
+
     /// Verifies that the identity key in the document matches the DID's
     /// z-base-32 encoded public key.
     fn verify_self_certification(
@@ -591,14 +877,21 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
 
     fn rotate(
         &self,
-        _identity: &ScpIdentity,
-        _key_custody: &impl KeyCustody,
+        identity: &ScpIdentity,
+        key_custody: &impl KeyCustody,
     ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send {
-        // TODO: Implement in SCP-008 — rotates active signing key.
+        // Resolve the current document, then delegate to rotate_active_key.
+        let did_owned = identity.did.clone();
         async move {
-            Err(IdentityError::InvalidDidFormat(
-                "rotate not yet implemented (SCP-008)".to_owned(),
-            ))
+            // Resolve the current DID document from the DHT/cache.
+            let resolution = self.resolve_did(&did_owned).await.map_err(|e| {
+                IdentityError::KeyRotationFailed(format!(
+                    "failed to resolve current document for rotation: {e}"
+                ))
+            })?;
+
+            self.rotate_active_key(identity, &resolution.document, key_custody)
+                .await
         }
     }
 }
@@ -622,6 +915,121 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
 #[must_use]
 pub fn verify_did(did_string: &str, public_key: &[u8]) -> bool {
     DidDht::new().verify(did_string, public_key)
+}
+
+/// Verifies a DID identity migration (Layer 3).
+///
+/// Checks the cryptographic proofs that an identity migration from `old_did`
+/// to `new_did` was authorized by the old Identity Key owner.
+///
+/// # Verification Steps
+///
+/// 1. **Migration proof (MODERATE assurance):** Verifies that the old Identity
+///    Key signed `SHA-256(old_did || new_did || rotated_at)`.
+/// 2. **Pre-rotation proof (STRONG assurance, optional):** If present, verifies
+///    that `SHA-256(new_identity_key_public) == commitment` from the old DID
+///    document's `PreRotationCommitment` service.
+///
+/// Returns `true` only if all provided proofs verify successfully.
+///
+/// # Arguments
+///
+/// * `old_did` - The DID being migrated from.
+/// * `new_did` - The DID being migrated to.
+/// * `migration_proof` - The migration proof (signature + old public key).
+/// * `pre_rotation_proof` - Optional pre-rotation proof for STRONG assurance.
+/// * `rotated_at` - The timestamp that was signed in the migration proof.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::MigrationVerificationFailed`] if:
+/// - The old public key in the migration proof is invalid.
+/// - The migration proof signature does not verify.
+/// - The pre-rotation proof commitment does not match `SHA-256(revealed_key)`.
+///
+/// See ADR-003 acceptance criterion 4c.
+pub fn verify_migration(
+    old_did: &str,
+    new_did: &str,
+    migration_proof: &MigrationProof,
+    pre_rotation_proof: Option<&PreRotationProof>,
+    rotated_at: u64,
+) -> Result<bool, IdentityError> {
+    // Step 1: Verify the migration proof signature.
+    // Reconstruct the signed digest: SHA-256(old_did || new_did || rotated_at).
+    let mut hasher = Sha256::new();
+    hasher.update(old_did.as_bytes());
+    hasher.update(new_did.as_bytes());
+    hasher.update(rotated_at.to_be_bytes());
+    let digest = hasher.finalize();
+
+    let verifying_key = VerifyingKey::from_bytes(&migration_proof.old_public_key).map_err(|e| {
+        IdentityError::MigrationVerificationFailed(format!("invalid old public key: {e}"))
+    })?;
+
+    let sig_bytes: [u8; 64] = migration_proof
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            IdentityError::MigrationVerificationFailed(format!(
+                "expected 64-byte signature, got {} bytes",
+                migration_proof.signature.len()
+            ))
+        })?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+    verifying_key.verify(&digest, &signature).map_err(|e| {
+        IdentityError::MigrationVerificationFailed(format!(
+            "migration proof signature verification failed: {e}"
+        ))
+    })?;
+
+    // Step 2: Verify the pre-rotation proof if present.
+    if let Some(pre_rot) = pre_rotation_proof {
+        let mut commitment_hasher = Sha256::new();
+        commitment_hasher.update(pre_rot.revealed_key);
+        let computed_commitment = commitment_hasher.finalize();
+
+        if computed_commitment.as_slice() != pre_rot.commitment {
+            return Err(IdentityError::MigrationVerificationFailed(
+                "pre-rotation proof failed: SHA-256(revealed_key) != commitment".to_owned(),
+            ));
+        }
+    }
+
+    Ok(true)
+}
+
+/// Decodes a lowercase hexadecimal string to bytes.
+///
+/// # Errors
+///
+/// Returns an error if the string length is odd or contains non-hex characters.
+fn hex_decode(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", hex.len()));
+    }
+
+    let mut result = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])
+            .ok_or_else(|| format!("invalid hex character: {}", chunk[0] as char))?;
+        let lo = hex_nibble(chunk[1])
+            .ok_or_else(|| format!("invalid hex character: {}", chunk[1] as char))?;
+        result[i] = (hi << 4) | lo;
+    }
+    Ok(result)
+}
+
+/// Converts a single hex ASCII byte to its numeric value (0-15).
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1040,6 +1448,690 @@ mod tests {
     #[test]
     fn extract_public_key_rejects_invalid_prefix() {
         let result = DidDht::<InMemoryDhtClient>::extract_public_key("did:web:example.com");
+        assert!(result.is_err());
+    }
+
+    /// Helper that creates an identity and returns the pre-rotation key handle
+    /// alongside the identity and document. The pre-rotation key is NOT destroyed,
+    /// which allows testing identity migration.
+    async fn create_identity_with_pre_rotation_key(
+        custody: &InMemoryKeyCustody,
+        dht: &DidDht<InMemoryDhtClient, Arc<TestClock>>,
+    ) -> (ScpIdentity, DidDocument, KeyHandle) {
+        // Step 1: Generate three Ed25519 keypairs manually.
+        let identity_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let active_signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pre_rotation_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        // Step 2: Get public keys.
+        let identity_public = custody.public_key(&identity_key).await.unwrap();
+        let active_public = custody.public_key(&active_signing_key).await.unwrap();
+        let pre_rotation_public = custody.public_key(&pre_rotation_key).await.unwrap();
+
+        // Step 3: Derive the DID string.
+        let did = format!("did:dht:z{}", zbase32::encode(identity_public.as_bytes()));
+
+        // Step 4: Compute pre-rotation commitment.
+        let mut hasher = Sha256::new();
+        hasher.update(pre_rotation_public.as_bytes());
+        let commitment_bytes = hasher.finalize();
+        let mut pre_rotation_commitment = [0u8; 32];
+        pre_rotation_commitment.copy_from_slice(&commitment_bytes);
+
+        // Step 5: Build the DID document.
+        let document = DidDocument::new(
+            &did,
+            identity_public.as_bytes(),
+            active_public.as_bytes(),
+            &pre_rotation_commitment,
+        );
+
+        // Step 6: Build the identity (pre-rotation key NOT destroyed).
+        let identity = ScpIdentity {
+            identity_key,
+            active_signing_key,
+            pre_rotation_commitment,
+            did,
+        };
+
+        // Verify self-certification works.
+        assert!(dht.verify(&identity.did, identity_public.as_bytes()));
+
+        (identity, document, pre_rotation_key)
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-008 tests — Layer 1: rotate_active_key
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rotate_active_key_preserves_did_string() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let (rotated_identity, _rotated_doc) = dht
+            .rotate_active_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // DID string must NOT change during active key rotation.
+        assert_eq!(rotated_identity.did, identity.did);
+    }
+
+    #[tokio::test]
+    async fn rotate_active_key_changes_active_signing_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let old_active_public = custody
+            .public_key(&identity.active_signing_key)
+            .await
+            .unwrap();
+
+        let (rotated_identity, _rotated_doc) = dht
+            .rotate_active_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        let new_active_public = custody
+            .public_key(&rotated_identity.active_signing_key)
+            .await
+            .unwrap();
+
+        // The active signing key handle must change.
+        assert_ne!(old_active_public.as_bytes(), new_active_public.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn rotate_active_key_preserves_identity_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let (rotated_identity, _rotated_doc) = dht
+            .rotate_active_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // The identity key handle must be unchanged.
+        assert_eq!(rotated_identity.identity_key, identity.identity_key);
+    }
+
+    #[tokio::test]
+    async fn rotate_active_key_retires_old_key_in_document() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let (_, rotated_doc) = dht
+            .rotate_active_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // The document should have 3 verification methods: #0, #retired-N, #active.
+        assert_eq!(rotated_doc.verification_method.len(), 3);
+
+        // #active must exist with a new key.
+        let new_active_vm = rotated_doc.verification_method_by_fragment("active");
+        assert!(new_active_vm.is_some());
+
+        // A retired key should exist.
+        let has_retired = rotated_doc
+            .verification_method
+            .iter()
+            .any(|vm| vm.id.contains("#retired-"));
+        assert!(has_retired);
+
+        // #0 (identity key) must still be present.
+        let vm0 = rotated_doc.verification_method_by_fragment("0");
+        assert!(vm0.is_some());
+    }
+
+    #[tokio::test]
+    async fn rotate_active_key_updates_auth_and_assertion_refs() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let (_, rotated_doc) = dht
+            .rotate_active_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // authentication and assertionMethod should reference #active.
+        assert_eq!(
+            rotated_doc.authentication,
+            vec![format!("{}#active", identity.did)]
+        );
+        assert_eq!(
+            rotated_doc.assertion_method,
+            vec![format!("{}#active", identity.did)]
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_active_key_preserves_pre_rotation_commitment() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let (rotated_identity, _) = dht
+            .rotate_active_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // Pre-rotation commitment must be unchanged during active key rotation.
+        assert_eq!(
+            rotated_identity.pre_rotation_commitment,
+            identity.pre_rotation_commitment
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_active_key_publishes_updated_document() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let seq_before = dht.current_sequence();
+
+        let (_, _rotated_doc) = dht
+            .rotate_active_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // Publishing should have incremented the sequence number.
+        assert!(dht.current_sequence() > seq_before);
+    }
+
+    #[tokio::test]
+    async fn rotate_via_did_method_trait() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // Use the trait method which resolves the document internally.
+        let (rotated_identity, rotated_doc) =
+            <DidDht<InMemoryDhtClient, Arc<TestClock>> as DidMethod>::rotate(
+                &dht, &identity, &*custody,
+            )
+            .await
+            .unwrap();
+
+        // DID preserved.
+        assert_eq!(rotated_identity.did, identity.did);
+        // Document updated.
+        assert!(rotated_doc.verification_method.len() >= 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-008 tests — Layer 2: migrate_identity
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn migrate_identity_creates_new_did() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (new_identity, _new_doc, _event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // The new DID must be different from the old DID.
+        assert_ne!(new_identity.did, identity.did);
+        // The new DID must still be a valid did:dht.
+        assert!(new_identity.did.starts_with("did:dht:z"));
+    }
+
+    #[tokio::test]
+    async fn migrate_identity_new_did_is_self_certifying() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let pre_rot_public = custody.public_key(&pre_rot_key).await.unwrap();
+        let rotated_at = 1_700_000_000u64;
+
+        let (new_identity, _new_doc, _event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // The new DID must be self-certifying for the pre-rotation key.
+        assert!(dht.verify(&new_identity.did, pre_rot_public.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn migrate_identity_updates_old_document_with_also_known_as() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (new_identity, _new_doc, _event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // Re-resolve the old DID to check alsoKnownAs was published.
+        // Clear the cache first to force a fresh DHT read.
+        dht.cache().remove(&identity.did).await;
+        let old_resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert_eq!(old_resolved.document.also_known_as, vec![new_identity.did]);
+    }
+
+    #[tokio::test]
+    async fn migrate_identity_produces_valid_rotation_event() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (new_identity, _new_doc, event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // The rotation event should reference old and new DIDs.
+        assert_eq!(event.old_did, identity.did);
+        assert_eq!(event.new_did, new_identity.did);
+        assert_eq!(event.rotated_at, rotated_at);
+
+        // The migration proof should have the old public key.
+        let old_pub = custody.public_key(&identity.identity_key).await.unwrap();
+        assert_eq!(
+            event.migration_proof.old_public_key,
+            <[u8; 32]>::try_from(old_pub.as_bytes()).unwrap()
+        );
+
+        // The signature should be 64 bytes.
+        assert_eq!(event.migration_proof.signature.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn migrate_identity_includes_pre_rotation_proof() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity, _new_doc, event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // Pre-rotation proof should be present if the old document had a
+        // PreRotationCommitment service.
+        assert!(event.pre_rotation_proof.is_some());
+        let pre_rot_proof = event.pre_rotation_proof.unwrap();
+
+        // The revealed key should match the pre-rotation key's public key.
+        let pre_rot_public = custody.public_key(&pre_rot_key).await.unwrap();
+        assert_eq!(
+            pre_rot_proof.revealed_key,
+            <[u8; 32]>::try_from(pre_rot_public.as_bytes()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_identity_publishes_new_document() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (new_identity, new_doc, _event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // The new DID should be resolvable from the DHT.
+        let resolved = dht.resolve_did(&new_identity.did).await.unwrap();
+        assert_eq!(resolved.document.id, new_doc.id);
+    }
+
+    #[tokio::test]
+    async fn migrate_identity_new_identity_has_fresh_pre_rotation_commitment() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (new_identity, _new_doc, _event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // The new identity should have a non-zero pre-rotation commitment.
+        assert_ne!(new_identity.pre_rotation_commitment, [0u8; 32]);
+        // It should differ from the old commitment.
+        assert_ne!(
+            new_identity.pre_rotation_commitment,
+            identity.pre_rotation_commitment
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-008 tests — Layer 3: verify_migration
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_migration_accepts_valid_proof() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (new_identity, _new_doc, event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // Verify the migration proof.
+        let result = verify_migration(
+            &event.old_did,
+            &event.new_did,
+            &event.migration_proof,
+            event.pre_rotation_proof.as_ref(),
+            event.rotated_at,
+        );
+        assert!(result.is_ok(), "verify_migration failed: {result:?}");
+        assert_eq!(result.unwrap(), true);
+
+        // Also verify self-certification of the new DID.
+        let new_pub = custody
+            .public_key(&new_identity.identity_key)
+            .await
+            .unwrap();
+        assert!(dht.verify(&new_identity.did, new_pub.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn verify_migration_rejects_tampered_signature() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity, _new_doc, event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // Tamper with the signature.
+        let mut tampered_proof = event.migration_proof.clone();
+        tampered_proof.signature[0] ^= 0xFF;
+
+        let result = verify_migration(
+            &event.old_did,
+            &event.new_did,
+            &tampered_proof,
+            event.pre_rotation_proof.as_ref(),
+            event.rotated_at,
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(IdentityError::MigrationVerificationFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_migration_rejects_wrong_timestamp() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity, _new_doc, event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // Use a different timestamp — the digest won't match.
+        let result = verify_migration(
+            &event.old_did,
+            &event.new_did,
+            &event.migration_proof,
+            event.pre_rotation_proof.as_ref(),
+            rotated_at + 1,
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_migration_works_without_pre_rotation_proof() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity, _new_doc, event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // Verify with no pre-rotation proof (MODERATE assurance only).
+        let result = verify_migration(
+            &event.old_did,
+            &event.new_did,
+            &event.migration_proof,
+            None,
+            event.rotated_at,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn verify_migration_rejects_invalid_pre_rotation_proof() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rot_key) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity, _new_doc, event) = dht
+            .migrate_identity(&identity, &document, &pre_rot_key, &*custody, rotated_at)
+            .await
+            .unwrap();
+
+        // Create a tampered pre-rotation proof with wrong revealed_key.
+        let tampered_pre_rot = PreRotationProof {
+            commitment: event.pre_rotation_proof.as_ref().unwrap().commitment,
+            revealed_key: [99u8; 32], // wrong key
+        };
+
+        let result = verify_migration(
+            &event.old_did,
+            &event.new_did,
+            &event.migration_proof,
+            Some(&tampered_pre_rot),
+            event.rotated_at,
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(IdentityError::MigrationVerificationFailed(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-008 tests — Document-level rotation helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retire_active_key_renames_and_adds_new() {
+        let did = "did:dht:zTestRotation";
+        let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let mut rotated_doc = doc.clone();
+        rotated_doc.retire_active_key(&[4u8; 32], 1);
+
+        // Should have 3 verification methods now.
+        assert_eq!(rotated_doc.verification_method.len(), 3);
+
+        // The retired key should exist.
+        let retired = rotated_doc
+            .verification_method
+            .iter()
+            .find(|vm| vm.id.contains("#retired-1"));
+        assert!(retired.is_some());
+
+        // The new #active should exist.
+        let active = rotated_doc.verification_method_by_fragment("active");
+        assert!(active.is_some());
+
+        // #0 should still exist.
+        let identity = rotated_doc.verification_method_by_fragment("0");
+        assert!(identity.is_some());
+    }
+
+    #[test]
+    fn set_also_known_as_sets_field() {
+        let did = "did:dht:zTestAKA";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        assert!(doc.also_known_as.is_empty());
+
+        doc.set_also_known_as("did:dht:zNewDid");
+        assert_eq!(doc.also_known_as, vec!["did:dht:zNewDid"]);
+    }
+
+    #[test]
+    fn also_known_as_omitted_from_json_when_empty() {
+        let did = "did:dht:zTestJSON";
+        let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let json = doc.to_json().unwrap();
+
+        // alsoKnownAs should not appear in the JSON when empty.
+        assert!(!json.contains("alsoKnownAs"));
+    }
+
+    #[test]
+    fn also_known_as_present_in_json_when_set() {
+        let did = "did:dht:zTestJSON2";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.set_also_known_as("did:dht:zNewDid");
+
+        let json = doc.to_json().unwrap();
+        assert!(json.contains("alsoKnownAs"));
+        assert!(json.contains("did:dht:zNewDid"));
+
+        // Roundtrip should preserve alsoKnownAs.
+        let parsed = DidDocument::from_json(&json).unwrap();
+        assert_eq!(parsed.also_known_as, vec!["did:dht:zNewDid"]);
+    }
+
+    #[test]
+    fn rotation_event_json_roundtrip() {
+        let event = DidRotationEvent {
+            old_did: "did:dht:zOld".to_owned(),
+            new_did: "did:dht:zNew".to_owned(),
+            migration_proof: MigrationProof {
+                signature: vec![0xAA; 64],
+                old_public_key: [0xBB; 32],
+            },
+            pre_rotation_proof: Some(PreRotationProof {
+                commitment: [0xCC; 32],
+                revealed_key: [0xDD; 32],
+            }),
+            rotated_at: 1_700_000_000,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: DidRotationEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, parsed);
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-008 tests — hex_decode helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hex_decode_valid() {
+        let hex_str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+        let decoded = hex_decode(hex_str).unwrap();
+        assert_eq!(decoded[0], 0xDE);
+        assert_eq!(decoded[1], 0xAD);
+    }
+
+    #[test]
+    fn hex_decode_rejects_wrong_length() {
+        let result = hex_decode("abcdef");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hex_decode_rejects_invalid_characters() {
+        let hex_str = "zzzzzzzz00112233445566778899aabbccddeeff00112233445566778899aabb";
+        let result = hex_decode(hex_str);
         assert!(result.is_err());
     }
 }

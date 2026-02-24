@@ -32,9 +32,9 @@ pub mod document;
 pub mod republish;
 
 pub use cache::{DidCache, DidResolutionResult, Staleness};
-pub use dht::DidDht;
+pub use dht::{DidDht, verify_migration};
 pub use dht_client::{DhtClient, InMemoryDhtClient};
-pub use document::DidDocument;
+pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 pub use republish::RepublishManager;
 
 use scp_platform::traits::{KeyCustody, KeyHandle};
@@ -115,6 +115,14 @@ pub enum IdentityError {
     /// The DID was not found on the DHT.
     #[error("DID not found on DHT: {0}")]
     DhtNotFound(String),
+
+    /// Migration verification failed.
+    #[error("migration verification failed: {0}")]
+    MigrationVerificationFailed(String),
+
+    /// Key rotation failed.
+    #[error("key rotation failed: {0}")]
+    KeyRotationFailed(String),
 }
 
 /// Abstract trait for DID method implementations.

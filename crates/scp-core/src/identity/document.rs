@@ -3,7 +3,19 @@
 //! Implements the W3C DID Document JSON-LD format for `did:dht` identities.
 //! The document contains verification methods (Identity Key `#0`, Active Signing
 //! Key `#active`), authentication and assertion method references, and a
-//! `PreRotationCommitment` service. See ADR-003 in `.docs/adrs/phase-1.md`.
+//! `PreRotationCommitment` service.
+//!
+//! # Key Rotation Support (SCP-008)
+//!
+//! The document supports key rotation through:
+//! - [`DidDocument::retire_active_key`] — Retires the current active key and adds
+//!   a new one (Layer 1 rotation).
+//! - [`DidDocument::set_also_known_as`] — Sets the `alsoKnownAs` field for
+//!   identity migration (Layer 2 rotation).
+//! - [`DidRotationEvent`], [`MigrationProof`], [`PreRotationProof`] — Structs for
+//!   distributing and verifying identity migrations.
+//!
+//! See ADR-003 in `.docs/adrs/phase-1.md`.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +53,16 @@ pub struct DidDocument {
     /// References to verification methods authorized for assertion (signing).
     #[serde(rename = "assertionMethod")]
     pub assertion_method: Vec<String>,
+
+    /// Alternate identifiers for this DID subject.
+    ///
+    /// Used during identity migration (Layer 2 rotation) to link the old DID
+    /// to the new DID. The old DID document's `alsoKnownAs` points to the new
+    /// DID string, creating a verifiable forwarding record.
+    ///
+    /// See ADR-003 acceptance criterion 4b.
+    #[serde(rename = "alsoKnownAs", default, skip_serializing_if = "Vec::is_empty")]
+    pub also_known_as: Vec<String>,
 
     /// Services associated with this DID (e.g., `PreRotationCommitment`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -138,6 +160,7 @@ impl DidDocument {
             verification_method: vec![identity_vm, active_vm],
             authentication: vec![format!("{did}#active")],
             assertion_method: vec![format!("{did}#active")],
+            also_known_as: Vec::new(),
             service: vec![pre_rotation_service],
         }
     }
@@ -177,6 +200,111 @@ impl DidDocument {
             .iter()
             .find(|s| s.service_type == "PreRotationCommitment")
     }
+
+    /// Retires the current active signing key and installs a new one.
+    ///
+    /// This is used during Layer 1 key rotation (`rotate_active_key`).
+    /// The old active key is moved to `#retired-{sequence}` and the new key
+    /// becomes `#active`. Authentication and assertion method references are
+    /// updated to point to the new active key.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_active_public_key` - The raw 32-byte Ed25519 public key for the
+    ///   new active signing key.
+    /// * `sequence` - The rotation sequence number, used to name the retired key
+    ///   fragment (e.g., `#retired-1`).
+    pub fn retire_active_key(&mut self, new_active_public_key: &[u8], sequence: u64) {
+        let did = &self.id;
+
+        // Find the current #active verification method and rename it to #retired-{sequence}.
+        for vm in &mut self.verification_method {
+            if vm.id.ends_with("#active") {
+                let retired_fragment = format!("retired-{sequence}");
+                vm.id = format!("{did}#{retired_fragment}");
+            }
+        }
+
+        // Add the new active verification method.
+        let new_active_vm = VerificationMethod {
+            id: format!("{did}#active"),
+            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: multibase_encode(new_active_public_key),
+        };
+        self.verification_method.push(new_active_vm);
+
+        // Update authentication and assertionMethod to reference the new #active key.
+        self.authentication = vec![format!("{did}#active")];
+        self.assertion_method = vec![format!("{did}#active")];
+    }
+
+    /// Sets the `alsoKnownAs` field to point to a new DID.
+    ///
+    /// Used during Layer 2 identity migration to create a forwarding record
+    /// from the old DID to the new DID.
+    pub fn set_also_known_as(&mut self, new_did: &str) {
+        self.also_known_as = vec![new_did.to_owned()];
+    }
+}
+
+/// A DID rotation event distributed to all active contexts during identity
+/// migration (Layer 2 rotation).
+///
+/// Contains the old and new DID strings, cryptographic proofs of the migration,
+/// and a timestamp. Context participants use [`verify_migration`] to verify the
+/// proofs before accepting the new DID.
+///
+/// See ADR-003 acceptance criterion 4b.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DidRotationEvent {
+    /// The DID being migrated from.
+    pub old_did: String,
+    /// The new DID being migrated to.
+    pub new_did: String,
+    /// Cryptographic proof that the old Identity Key authorized the migration.
+    pub migration_proof: MigrationProof,
+    /// Optional pre-rotation proof for STRONG assurance.
+    /// If present, verifies that the new Identity Key was pre-committed in the
+    /// old DID document's `PreRotationCommitment` service.
+    pub pre_rotation_proof: Option<PreRotationProof>,
+    /// Unix timestamp (seconds) when the rotation occurred.
+    pub rotated_at: u64,
+}
+
+/// Proof that the old Identity Key authorized a migration to a new DID.
+///
+/// The signature covers `SHA-256(old_did || new_did || rotated_at)` and is
+/// signed by the old Identity Key. This provides MODERATE assurance that the
+/// migration was authorized by the DID owner.
+///
+/// See ADR-003 acceptance criterion 4c.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationProof {
+    /// Ed25519 signature of `SHA-256(old_did || new_did || rotated_at)`
+    /// signed by the old Identity Key.
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+    /// The old Identity Key's public bytes, for verification without resolving
+    /// the old DID document.
+    pub old_public_key: [u8; 32],
+}
+
+/// Pre-rotation proof providing STRONG assurance for identity migration.
+///
+/// Verifies that the new Identity Key was pre-committed in the old DID
+/// document's `PreRotationCommitment` service: `SHA-256(revealed_key)` must
+/// equal the `commitment` from the service endpoint.
+///
+/// See ADR-003 acceptance criterion 4c.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreRotationProof {
+    /// The commitment published in the old DID document's
+    /// `PreRotationCommitment` service (`sha256:<hex>`).
+    pub commitment: [u8; 32],
+    /// The new Identity Key public bytes. `SHA-256(this)` must equal
+    /// `commitment`.
+    pub revealed_key: [u8; 32],
 }
 
 /// Encodes raw bytes as a multibase string with `z` (base58btc) prefix.
