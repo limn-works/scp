@@ -1,0 +1,14 @@
+[package]
+name = "scp-platform"
+version = "0.1.0"
+description = "Platform abstraction traits for SCP (Shareable Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+tokio.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
