@@ -137,9 +137,14 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --resume)
-      [[ $# -ge 2 ]] || die "$1 requires a worktree path or branch name"
-      RESUME_WORKTREE="$2"
-      shift 2
+      if [[ $# -ge 2 ]] && [[ "$2" != --* ]]; then
+        RESUME_WORKTREE="$2"
+        shift 2
+      else
+        # Default to current directory
+        RESUME_WORKTREE="."
+        shift 1
+      fi
       ;;
     -h|--help)
       cat <<'HELPEOF'
@@ -171,7 +176,7 @@ Sources (can be combined):
 Worktree:
   --worktree              Git worktree isolation (default: on)
   --pr                    Push + PR after loop (default: on)
-  --resume PATH_OR_BRANCH Reuse existing worktree
+  --resume [PATH_OR_BRANCH] Reuse existing worktree (default: current dir)
 
 Graceful stop:
   touch .loom/.stop      Stop after the current iteration finishes
@@ -374,7 +379,7 @@ setup_worktree() {
   if [ -n "$RESUME_WORKTREE" ]; then
     # Resume existing worktree
     if [ -d "$RESUME_WORKTREE" ]; then
-      WORKTREE_DIR="$RESUME_WORKTREE"
+      WORKTREE_DIR="$(cd "$RESUME_WORKTREE" && pwd)"
     elif [ -d "$base_dir/$RESUME_WORKTREE" ]; then
       WORKTREE_DIR="$base_dir/$RESUME_WORKTREE"
     else
@@ -670,9 +675,11 @@ export LOOM_ACTIVE=1
 
 # ─── Cleanup ─────────────────────────────────────────────────────
 cleanup() {
-  # Attempt PR creation if the loop produced useful work.
-  # create_pr guards internally — safe to call unconditionally.
-  create_pr 2>/dev/null || true
+  # Only attempt PR creation if the loop actually ran iterations.
+  # Prevents premature push on early exit (e.g. --resume with no work).
+  if [ "${ITERATION:-0}" -gt 0 ]; then
+    create_pr 2>/dev/null || true
+  fi
   rm -f "$LOOM_DIR/.directive" "$LOOM_DIR/.piped_directive" "$LOOM_DIR/.iteration_marker" "$LOOM_DIR/.stop" "$LOOM_DIR/.pid"
   cleanup_worktree
 }
@@ -827,7 +834,7 @@ if $USE_TMUX; then
   # Focus main pane and lock pane sizes on resize
   tmux select-pane -t "$TMUX_SESSION:0.1"
   tmux set-hook -t "$TMUX_SESSION" client-resized \
-    "resize-pane -t 0.0 -y $HEADER_HEIGHT ; resize-pane -t 0.2 -y 10 ; resize-pane -t 0.3 -y 10"
+    "resize-pane -t 0.0 -y $HEADER_HEIGHT 2>/dev/null ; resize-pane -t 0.2 -y 10 2>/dev/null ; resize-pane -t 0.3 -y 10 2>/dev/null"
 
   echo -e "${GREEN}Loom launched in tmux session '${TMUX_SESSION}'${NC}"
   echo -e "  Attach:  ${BOLD}tmux attach -t $TMUX_SESSION${NC}"
@@ -1071,7 +1078,6 @@ DRYEOF
   # ─── Done: no remaining work ──
   if [ "$RESULT_SIGNAL" = "DONE" ]; then
     log "${GREEN}${BOLD}All work complete.${NC} Halting loop."
-    create_pr
     break
   fi
 
@@ -1098,5 +1104,4 @@ done
 if ! $DRY_RUN && [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
   log "${YELLOW}${BOLD}Loom completed $MAX_ITERATIONS iterations. Halting.${NC}"
   master_log "$ITERATION" "$MODE_LABEL" "MAX_ITER" "0" "Reached max iterations"
-  create_pr
 fi

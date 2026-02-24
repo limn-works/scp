@@ -5,6 +5,7 @@ logs/
 .piped_directive
 .iteration_marker
 *.log
+.header
 
 # Make prd.json local by default. Can be checked in if you choose.
 # prd.json
