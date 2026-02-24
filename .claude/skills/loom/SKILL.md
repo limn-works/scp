@@ -19,7 +19,7 @@ Look at `$ARGUMENTS` and determine which case applies:
 Start the loop:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh
+unset CLAUDECODE && .loom/start.sh
 ```
 
 ### Case 2: `status`
@@ -51,7 +51,7 @@ tmux kill-session -t "loom-$(basename "$PWD")" 2>/dev/null && echo "Loom killed.
 Dry run — analyze one iteration without executing changes:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh --dry-run
+unset CLAUDECODE && .loom/start.sh --dry-run
 ```
 
 ### Case 6: `linear <query_or_url>`
@@ -59,7 +59,7 @@ unset CLAUDECODE && .loom/loom.sh --dry-run
 Linear mode — fetch from Linear, implement, update ticket:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh --linear "$REST"
+unset CLAUDECODE && .loom/start.sh --linear "$REST"
 ```
 
 Where `$REST` is everything after the word `linear`.
@@ -69,7 +69,7 @@ Where `$REST` is everything after the word `linear`.
 GitHub mode — fetch from GitHub, implement, close issues:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh --github "$REST"
+unset CLAUDECODE && .loom/start.sh --github "$REST"
 ```
 
 Where `$REST` is everything after the word `github`.
@@ -79,7 +79,7 @@ Where `$REST` is everything after the word `github`.
 Shorthand for GitHub issue mode:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh --github "$NUMBER"
+unset CLAUDECODE && .loom/start.sh --github "$NUMBER"
 ```
 
 ### Case 9: `slack <url>`
@@ -87,7 +87,7 @@ unset CLAUDECODE && .loom/loom.sh --github "$NUMBER"
 Slack mode — fetch Slack message, implement:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh --slack "$URL"
+unset CLAUDECODE && .loom/start.sh --slack "$URL"
 ```
 
 ### Case 10: `notion <query_or_url>`
@@ -95,7 +95,7 @@ unset CLAUDECODE && .loom/loom.sh --slack "$URL"
 Notion mode — fetch Notion page, implement:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh --notion "$REST"
+unset CLAUDECODE && .loom/start.sh --notion "$REST"
 ```
 
 Where `$REST` is everything after the word `notion`.
@@ -105,17 +105,17 @@ Where `$REST` is everything after the word `notion`.
 Sentry mode — fetch Sentry issue, fix the bug:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh --sentry "$REST"
+unset CLAUDECODE && .loom/start.sh --sentry "$REST"
 ```
 
 Where `$REST` is everything after the word `sentry`.
 
 ### Case 12: Arguments start with `-` (raw flags passthrough)
 
-Pass flags through directly to `loom.sh`:
+Pass flags through directly to `start.sh`:
 
 ```bash
-unset CLAUDECODE && .loom/loom.sh $ARGUMENTS
+unset CLAUDECODE && .loom/start.sh $ARGUMENTS
 ```
 
 This is a fallback for advanced usage. Most users should use the subcommand forms above.
@@ -125,7 +125,7 @@ This is a fallback for advanced usage. Most users should use the subcommand form
 Write the text to a file and pass it via `--prompt`:
 
 ```bash
-printf '%s' '$ARGUMENTS' > .loom/.directive && unset CLAUDECODE && .loom/loom.sh --prompt .loom/.directive
+printf '%s' '$ARGUMENTS' > .loom/.directive && unset CLAUDECODE && .loom/start.sh --prompt .loom/.directive
 ```
 
 Examples:

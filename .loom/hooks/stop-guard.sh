@@ -19,7 +19,7 @@ STOP_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false')
 [ "$STOP_ACTIVE" = "true" ] && exit 0
 
 # ─── Check: status.md updated this iteration ─────────────────────
-# loom.sh touches .iteration_marker at the start of each iteration.
+# start.sh touches .iteration_marker at the start of each iteration.
 # If status.md is older than the marker, the agent skipped the status update.
 
 LOOM_DIR="${CLAUDE_PROJECT_DIR:-.}/.loom"

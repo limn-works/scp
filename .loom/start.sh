@@ -51,6 +51,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
+TERM_WIDTH=$(tput cols 2>/dev/null || echo 120)
 
 # ─── Helpers ─────────────────────────────────────────────────────
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
@@ -148,7 +149,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       cat <<'HELPEOF'
-Usage: loom.sh [OPTIONS]
+Usage: start.sh [OPTIONS]
 
 Options:
   -m, --max-iterations N   Maximum loop iterations (default: 500)
@@ -166,12 +167,12 @@ Sources (can be combined):
   --sentry URL_OR_QUERY   Fetch Sentry issue via MCP, fix the error
 
   Multiple sources can be combined:
-    loom.sh --linear PHN-42 --github 13 --prompt "Also fix lint"
+    start.sh --linear PHN-42 --github 13 --prompt "Also fix lint"
 
   Without a source flag, runs in PRD mode (reads prd.json).
   A directive can also be piped via stdin:
-    echo 'Fix all lint errors' | loom.sh
-    echo 'Only work on AC-001' | loom.sh --dry-run
+    echo 'Fix all lint errors' | start.sh
+    echo 'Only work on AC-001' | start.sh --dry-run
 
 Worktree:
   --worktree              Git worktree isolation (default: on)
@@ -597,7 +598,7 @@ log() {
 }
 
 separator() {
-  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  printf "${DIM}──────────────────────────────────────────────────────${NC}\n"
 }
 
 master_log() {
@@ -762,6 +763,17 @@ detect_mcp_capabilities() {
 
 detect_mcp_capabilities
 
+# ─── Mode label for logging ───────────────────────────────────────
+MODE_LABEL=""
+[ -n "$SOURCES_LINEAR" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}linear"
+[ -n "$SOURCES_GITHUB" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}github"
+[ -n "$SOURCES_SLACK" ]  && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}slack"
+[ -n "$SOURCES_NOTION" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}notion"
+[ -n "$SOURCES_SENTRY" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}sentry"
+[ -n "$SOURCES_PROMPT" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}prompt"
+[ -n "$SOURCES_PIPED" ]  && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}prompt"
+MODE_LABEL="${MODE_LABEL:-prd}"
+
 # ─── Tmux Launch ─────────────────────────────────────────────────
 if $USE_TMUX; then
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -806,8 +818,8 @@ if $USE_TMUX; then
   rm -f "$PID_FILE"
 
   # Compute header height to match content exactly
-  # Base: 3 (box) + 1 (PID/Mode) + 1 (Dir) + 1 (Stop) = 6
-  HEADER_HEIGHT=6
+  # Base: 1 (title) + 1 (PID/Mode) + 1 (Dir) + 1 (Stop) = 4
+  HEADER_HEIGHT=4
   [ -n "$DIRECTIVE_FILE" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
   # Tree line only shown when different from Dir
   [ "$USE_WORKTREE" = "yes" ] && [ "$WORKTREE_DIR" != "$PROJECT_DIR" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
@@ -816,6 +828,18 @@ if $USE_TMUX; then
   # Use real terminal size so pane proportions are correct on attach
   TERM_COLS=$(tput cols 2>/dev/null || echo 80)
   TERM_LINES=$(tput lines 2>/dev/null || echo 50)
+
+  # Write .header before creating tmux so the header pane has content
+  # immediately. The child will overwrite with its own PID on start.
+  {
+    echo -e "  ${BOLD}${CYAN}Loom ∞${NC}"
+    echo -e "  ${DIM}PID${NC} ${BOLD}…${NC}  ${DIM}|${NC}  ${DIM}Mode${NC} ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
+    echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
+    [ -n "$DIRECTIVE_FILE" ] && echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
+    [ "${USE_WORKTREE:-}" = "yes" ] && [ "${WORKTREE_DIR:-}" != "$PROJECT_DIR" ] && echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
+    [ -n "${LOOM_CAPABILITIES:-}" ] && echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
+    echo -en "  ${DIM}Stop${NC}  ${CYAN}touch $LOOM_DIR/.stop${NC}"
+  } > "$LOOM_DIR/.header"
 
   # Main pane: the loom loop (LOOM_TMUX_CHILD tells the child to
   # write its banner to .header instead of stdout)
@@ -834,10 +858,15 @@ if $USE_TMUX; then
   tmux split-window -h -t "$TMUX_SESSION:0.2" \
     "exec tail -f \"$LOOM_DIR/logs/master.log\" 2>/dev/null || tail -f \"$LOG_FILE\""
 
-  # Focus main pane and lock pane sizes on resize
+  # Pin pane sizes: header at top, bottom panes at 10 lines
+  tmux resize-pane -t "$TMUX_SESSION:0.0" -y "$HEADER_HEIGHT" 2>/dev/null || true
+  tmux resize-pane -t "$TMUX_SESSION:0.2" -y 10 2>/dev/null || true
+  tmux resize-pane -t "$TMUX_SESSION:0.3" -y 10 2>/dev/null || true
   tmux select-pane -t "$TMUX_SESSION:0.1"
+  # Hook fires on terminal resize — re-pin header and bottom panes.
+  # run-shell wraps in sh so errors don't propagate to tmux.
   tmux set-hook -t "$TMUX_SESSION" client-resized \
-    "resize-pane -t 0.0 -y $HEADER_HEIGHT 2>/dev/null ; resize-pane -t 0.2 -y 10 2>/dev/null ; resize-pane -t 0.3 -y 10 2>/dev/null"
+    "run-shell 'tmux resize-pane -t 0.0 -y $HEADER_HEIGHT 2>/dev/null; tmux resize-pane -t 0.2 -y 10 2>/dev/null; tmux resize-pane -t 0.3 -y 10 2>/dev/null; true'"
 
   echo -e "${GREEN}Loom launched in tmux session '${TMUX_SESSION}'${NC}"
   echo -e "  Attach:  ${BOLD}tmux attach -t $TMUX_SESSION${NC}"
@@ -855,24 +884,11 @@ if $USE_TMUX; then
   exit 0
 fi
 
-# ─── Mode label for logging ───────────────────────────────────────
-MODE_LABEL=""
-[ -n "$SOURCES_LINEAR" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}linear"
-[ -n "$SOURCES_GITHUB" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}github"
-[ -n "$SOURCES_SLACK" ]  && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}slack"
-[ -n "$SOURCES_NOTION" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}notion"
-[ -n "$SOURCES_SENTRY" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}sentry"
-[ -n "$SOURCES_PROMPT" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}prompt"
-[ -n "$SOURCES_PIPED" ]  && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}prompt"
-MODE_LABEL="${MODE_LABEL:-prd}"
-
 # ─── Banner ──────────────────────────────────────────────────────
 if [ "${LOOM_TMUX_CHILD:-}" = "1" ]; then
   # Compact banner for the fixed tmux header pane
   {
-    echo -e "${CYAN}  ╔═══════════════════════════════════════════╗"
-    echo "  ║             L O O M   L O O P             ║"
-    echo -e "  ╚═══════════════════════════════════════════╝${NC}"
+    echo -e "  ${BOLD}${CYAN}Loom ∞${NC}"
     echo -e "  ${DIM}PID${NC} ${BOLD}$$${NC}  ${DIM}|${NC}  ${DIM}Mode${NC} ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
     echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
     [ -n "$DIRECTIVE_FILE" ] && echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
@@ -881,11 +897,9 @@ if [ "${LOOM_TMUX_CHILD:-}" = "1" ]; then
     echo -en "  ${DIM}Stop${NC}  ${CYAN}touch $LOOM_DIR/.stop${NC}"
   } > "$LOOM_DIR/.header"
 else
-  echo -e "${CYAN}"
-  echo "  ╔═══════════════════════════════════════════╗"
-  echo "  ║             L O O M   L O O P             ║"
-  echo "  ╚═══════════════════════════════════════════╝"
-  echo -e "${NC}"
+  echo ""
+  echo -e "  ${BOLD}${CYAN}Loom ∞${NC}"
+  echo ""
   echo -e "  ${DIM}PID${NC}   ${BOLD}$$${NC}"
   echo -e "  ${DIM}Mode${NC}  ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
   echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
@@ -937,7 +951,7 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
     break
   fi
 
-  separator
+  echo ""
   log "${BOLD}Iteration $ITERATION${NC} (failures: $CONSECUTIVE_FAILURES/$MAX_FAILURES)"
   separator
 
@@ -1038,6 +1052,11 @@ DRYEOF
   SUBAGENT_LOG="$LOOM_DIR/logs/$(date '+%Y%m%d-%H%M%S')-${ITER_LABEL}-subagents.jsonl"
 
   set +e
+  # Pipeline: claude | tee (sidecar) | jq (text extraction) | tee (log capture)
+  # PIPESTATUS[0] = claude (or timeout wrapper)
+  # PIPESTATUS[1] = tee (subagent sidecar fork)
+  # PIPESTATUS[2] = jq text_delta extraction
+  # PIPESTATUS[3] = tee (log capture)
   $CLAUDE_PREFIX claude -p \
     --dangerously-skip-permissions \
     --verbose \
@@ -1046,17 +1065,29 @@ DRYEOF
     "$PROMPT" 2>>"$LOG_FILE" | \
     tee >(jq --unbuffered -c '
       select(.type == "stream_event") |
-      select(
+      if (
         .event.type? == "content_block_start" and
         .event.content_block.type? == "tool_use" and
         .event.content_block.name? == "Task"
-      ) |
-      {
-        ts: now | strftime("%Y-%m-%d %H:%M:%S"),
-        tool_use_id: .event.content_block.id,
-        tool_name: .event.content_block.name
-      }
-    ' >> "$SUBAGENT_LOG" 2>/dev/null) | \
+      ) then
+        {
+          ts: now | strftime("%Y-%m-%d %H:%M:%S"),
+          event: "dispatch",
+          tool_use_id: .event.content_block.id,
+          index: .event.index
+        }
+      elif (
+        .event.type? == "content_block_start" and
+        .event.content_block.type? == "tool_result"
+      ) then
+        {
+          ts: now | strftime("%Y-%m-%d %H:%M:%S"),
+          event: "complete",
+          tool_use_id: .event.content_block.tool_use_id
+        }
+      else empty
+      end
+    ' >> "$SUBAGENT_LOG" 2>/dev/null || true) | \
     jq --unbuffered -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text' 2>/dev/null | \
     tee >(strip_ansi | tee -a "$LOG_FILE" > "$ITER_LOG")
   CLAUDE_EXIT=${PIPESTATUS[0]}
@@ -1065,10 +1096,18 @@ DRYEOF
   ITER_END=$(date +%s)
   ITER_DURATION=$((ITER_END - ITER_START))
 
-  # ─── Count subagent dispatches ──
+  # ─── Count subagent dispatches + detect orphans ──
   SUBAGENT_COUNT=0
-  if [ -f "$SUBAGENT_LOG" ]; then
-    SUBAGENT_COUNT=$(wc -l < "$SUBAGENT_LOG" | tr -d ' ')
+  SUBAGENT_ORPHANED=0
+  if [ -f "$SUBAGENT_LOG" ] && [ -s "$SUBAGENT_LOG" ]; then
+    SUBAGENT_COUNT=$(jq -s '[.[] | select(.event == "dispatch")] | length' "$SUBAGENT_LOG" 2>/dev/null || echo 0)
+    SUBAGENT_ORPHANED=$(jq -s '
+      ([.[] | select(.event == "dispatch") | .tool_use_id]) -
+      ([.[] | select(.event == "complete") | .tool_use_id]) | length
+    ' "$SUBAGENT_LOG" 2>/dev/null || echo 0)
+    if [ "$SUBAGENT_ORPHANED" -gt 0 ]; then
+      log "${YELLOW}$SUBAGENT_ORPHANED of $SUBAGENT_COUNT subagents did not complete${NC}"
+    fi
   fi
 
   # ─── Parse result signal from iteration output ──

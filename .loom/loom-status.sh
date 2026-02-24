@@ -94,6 +94,27 @@ tail -5 "$MASTER_LOG" | while IFS='|' read -r ts iter label status duration reas
   echo -e "$local_line"
 done
 
+# ─── Subagent Breakdown (latest iteration) ────────────────────
+LATEST_SUBAGENT_LOG=$(ls -t "$LOOM_DIR/logs/"*-subagents.jsonl 2>/dev/null | head -1)
+if [ -n "$LATEST_SUBAGENT_LOG" ] && [ -s "$LATEST_SUBAGENT_LOG" ]; then
+  echo ""
+  echo -e "${CYAN}${BOLD}Subagent Breakdown (latest)${NC}"
+  echo -e "${DIM}─────────────────────────────────────────${NC}"
+  jq -s '
+    ([.[] | select(.event == "dispatch")] | length) as $dispatched |
+    ([.[] | select(.event == "complete")] | length) as $completed |
+    "  Dispatched: \($dispatched)  Completed: \($completed)  Orphaned: \($dispatched - $completed)"
+  ' "$LATEST_SUBAGENT_LOG" 2>/dev/null | tr -d '"' || true
+  # Per-subagent timeline
+  jq -r '
+    if .event == "dispatch" then
+      "  \(.ts)  \u001b[0;33mDISPATCH\u001b[0m  \(.tool_use_id)"
+    elif .event == "complete" then
+      "  \(.ts)  \u001b[0;32mCOMPLETE\u001b[0m  \(.tool_use_id)"
+    else empty end
+  ' "$LATEST_SUBAGENT_LOG" 2>/dev/null || true
+fi
+
 # ─── Current status.md ──────────────────────────────────────────
 echo ""
 echo -e "${CYAN}${BOLD}Current Status${NC}"
