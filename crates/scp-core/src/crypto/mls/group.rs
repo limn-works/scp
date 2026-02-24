@@ -53,13 +53,13 @@ pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 /// See ADR-001 for the MLS wrapper design.
 pub struct ScpMlsGroup {
     /// The underlying `OpenMLS` group.
-    group: MlsGroup,
+    pub(crate) group: MlsGroup,
     /// The MLS provider (crypto + storage) for this group.
-    provider: ScpMlsProvider,
+    pub(crate) provider: ScpMlsProvider,
     /// The local member's Ed25519 signing key pair.
-    signer: SignatureKeyPair,
+    pub(crate) signer: SignatureKeyPair,
     /// Whether the group has been destroyed.
-    destroyed: bool,
+    pub(crate) destroyed: bool,
 }
 
 impl ScpMlsGroup {

@@ -25,8 +25,12 @@
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the full MLS wrapper design.
 
 pub mod credential;
+pub mod encrypt;
+pub mod epoch_grace;
 pub mod error;
 pub mod group;
+pub mod key_package;
+pub mod ratchet;
 pub mod storage;
 
 // Re-export primary public API types for convenience.

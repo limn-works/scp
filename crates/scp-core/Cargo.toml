@@ -16,9 +16,16 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 scp-platform = { path = "../scp-platform" }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+z-base-32 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+scp-platform = { path = "../scp-platform", features = ["testing"] }
+proptest = "1"
 
 [lints]
 workspace = true

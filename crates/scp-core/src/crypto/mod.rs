@@ -10,3 +10,4 @@
 //! - `sender_keys/` — Per-sender AES-256 symmetric key layer (ADR-007).
 
 pub mod mls;
+pub mod sender_keys;

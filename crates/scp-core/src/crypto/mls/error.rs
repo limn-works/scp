@@ -55,4 +55,40 @@ pub enum MlsError {
     /// The group has already been destroyed and cannot be used.
     #[error("group has been destroyed")]
     GroupDestroyed,
+
+    /// Failed to encrypt plaintext as an MLS application message.
+    #[error("encryption failed: {0}")]
+    EncryptionFailed(String),
+
+    /// Failed to decrypt an MLS ciphertext.
+    #[error("decryption failed: {0}")]
+    DecryptionFailed(String),
+
+    /// The processed message was not an application message.
+    #[error("not an application message")]
+    NotApplicationMessage,
+
+    /// Failed to process an incoming Commit message.
+    #[error("commit processing failed: {0}")]
+    CommitProcessingFailed(String),
+
+    /// Failed to issue an MLS Update proposal or commit.
+    #[error("update failed: {0}")]
+    UpdateFailed(String),
+
+    /// A message arrived referencing an epoch whose grace window has closed.
+    ///
+    /// The old epoch keys have been destroyed for forward secrecy. The message
+    /// is unrecoverable.
+    #[error("stale epoch message from {sender_did} at epoch {epoch}")]
+    StaleEpochMessage {
+        /// The DID of the sender whose message arrived too late.
+        sender_did: String,
+        /// The epoch number the message was encrypted under.
+        epoch: u64,
+    },
+
+    /// The key package buffer is empty and cannot provide a key package.
+    #[error("key package buffer exhausted")]
+    KeyPackageBufferExhausted,
 }
