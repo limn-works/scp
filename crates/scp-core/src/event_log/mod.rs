@@ -21,6 +21,7 @@
 //! - [`tree::root`] -- Get the current Merkle root (O(1)).
 //! - [`tree::event_count`] -- Get the number of events in the log.
 
+pub mod checkpoint;
 pub mod proof;
 pub mod tree;
 
@@ -201,6 +202,10 @@ pub enum EventLogError {
     /// An absence proof was requested for a hash that IS present in the log.
     #[error("absence proof requested for event hash that is present in the log")]
     AbsenceProofForPresentEvent,
+
+    /// The signing operation failed during checkpoint generation.
+    #[error("signing failed: {0}")]
+    SigningFailed(String),
 }
 
 // ---------------------------------------------------------------------------

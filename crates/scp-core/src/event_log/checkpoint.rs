@@ -1,0 +1,968 @@
+//! Consistency checkpoints for equivocation detection.
+//!
+//! Members periodically exchange signed Merkle roots. If two members have
+//! different roots for the same event count, the relay is equivocating
+//! (showing different histories to different members). Detection requires
+//! only two honest members.
+//!
+//! # Types
+//!
+//! - [`ConsistencyCheckpoint`] -- A signed snapshot of the event log state.
+//! - [`CheckpointComparison`] -- The result of comparing a remote checkpoint
+//!   against local state.
+//! - [`CheckpointScheduler`] -- Tracks when the next checkpoint should be
+//!   generated (every 50 events or 10 minutes, whichever comes first).
+//!
+//! See ADR-011 acceptance criterion 8 in `.docs/adrs/phase-2.md`.
+
+use sha2::{Digest, Sha256};
+
+use scp_platform::traits::{KeyCustody, KeyHandle};
+
+use super::{ContextId, DID, Ed25519Signature, EventLog, EventLogError};
+use crate::event_log::tree;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Number of events between automatic checkpoint generation.
+const CHECKPOINT_EVENT_INTERVAL: u64 = 50;
+
+/// Time interval (in seconds) between automatic checkpoint generation.
+const CHECKPOINT_TIME_INTERVAL_SECS: u64 = 600; // 10 minutes
+
+// ---------------------------------------------------------------------------
+// ConsistencyCheckpoint
+// ---------------------------------------------------------------------------
+
+/// A signed snapshot of the event log state at a point in time.
+///
+/// Exchanged between context members as regular MLS application messages.
+/// If two members produce checkpoints with different Merkle roots for the
+/// same event count, relay equivocation is detected.
+///
+/// See ADR-011 acceptance criterion 8.
+#[derive(Debug, Clone)]
+pub struct ConsistencyCheckpoint {
+    /// The context this checkpoint belongs to.
+    pub context_id: ContextId,
+    /// The DID of the member who generated this checkpoint.
+    pub sender_did: DID,
+    /// The number of events in the log at checkpoint time.
+    pub event_count: u64,
+    /// The Merkle root hash at checkpoint time.
+    pub merkle_root: [u8; 32],
+    /// Current MLS epoch. `None` for Broadcast contexts that do not use MLS.
+    pub epoch: Option<u64>,
+    /// Unix timestamp (seconds) when the checkpoint was generated.
+    pub timestamp: u64,
+    /// Ed25519 signature over the canonical hash of all checkpoint fields
+    /// (excluding the signature itself).
+    pub signature: Ed25519Signature,
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointComparison
+// ---------------------------------------------------------------------------
+
+/// The result of comparing a remote checkpoint against local event log state.
+///
+/// See ADR-011 acceptance criterion 8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointComparison {
+    /// Local and remote logs have the same event count and Merkle root.
+    Consistent,
+    /// Local and remote logs have the same event count but different Merkle
+    /// roots. This indicates relay equivocation.
+    Divergent {
+        /// The first event index where divergence was detected, if known.
+        /// Currently always `None` (pinpointing requires exchanging full
+        /// proof paths). Reserved for future bisection-based detection.
+        first_divergent_event: Option<u64>,
+    },
+    /// The local log has fewer events than the remote checkpoint.
+    Behind {
+        /// The number of events the local log is missing.
+        missing_events: u64,
+    },
+    /// The local log has more events than the remote checkpoint.
+    Ahead {
+        /// The number of extra events in the local log.
+        extra_events: u64,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointScheduler
+// ---------------------------------------------------------------------------
+
+/// Tracks when the next consistency checkpoint should be generated.
+///
+/// A checkpoint is due when either:
+/// - 50 events have been appended since the last checkpoint, or
+/// - 10 minutes have elapsed since the last checkpoint,
+///
+/// whichever comes first. See ADR-011 acceptance criterion 8.
+#[derive(Debug, Clone)]
+pub struct CheckpointScheduler {
+    /// Number of events appended since the last checkpoint.
+    events_since_last: u64,
+    /// Unix timestamp (seconds) of the last checkpoint.
+    last_checkpoint_timestamp: u64,
+}
+
+impl CheckpointScheduler {
+    /// Creates a new scheduler with the given initial timestamp.
+    ///
+    /// The scheduler starts with zero events since the last checkpoint and
+    /// the provided timestamp as the baseline.
+    #[must_use]
+    pub const fn new(initial_timestamp: u64) -> Self {
+        Self {
+            events_since_last: 0,
+            last_checkpoint_timestamp: initial_timestamp,
+        }
+    }
+
+    /// Records that an event was appended to the log.
+    pub const fn record_event(&mut self) {
+        self.events_since_last += 1;
+    }
+
+    /// Returns `true` if a checkpoint should be generated now.
+    ///
+    /// A checkpoint is due when either:
+    /// - [`CHECKPOINT_EVENT_INTERVAL`] events have been appended, or
+    /// - [`CHECKPOINT_TIME_INTERVAL_SECS`] seconds have elapsed.
+    #[must_use]
+    pub const fn is_checkpoint_due(&self, current_timestamp: u64) -> bool {
+        if self.events_since_last >= CHECKPOINT_EVENT_INTERVAL {
+            return true;
+        }
+        let elapsed = current_timestamp.saturating_sub(self.last_checkpoint_timestamp);
+        elapsed >= CHECKPOINT_TIME_INTERVAL_SECS
+    }
+
+    /// Resets the scheduler after a checkpoint has been generated.
+    pub const fn reset(&mut self, checkpoint_timestamp: u64) {
+        self.events_since_last = 0;
+        self.last_checkpoint_timestamp = checkpoint_timestamp;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public operations
+// ---------------------------------------------------------------------------
+
+/// Creates and signs a consistency checkpoint from the current event log state.
+///
+/// The checkpoint captures the current Merkle root, event count, and MLS epoch,
+/// then signs the canonical hash of all checkpoint fields using the provided
+/// key custody and signing key handle.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::SigningFailed`] if the signing operation fails.
+///
+/// See ADR-011 acceptance criterion 8.
+pub async fn generate_checkpoint(
+    log: &EventLog,
+    sender_did: &DID,
+    epoch: u64,
+    key_custody: &impl KeyCustody,
+    signing_key: &KeyHandle,
+) -> Result<ConsistencyCheckpoint, EventLogError> {
+    let context_id = log.context_id().to_owned();
+    let event_count = tree::event_count(log);
+    let merkle_root = tree::root(log);
+    let timestamp = current_timestamp();
+
+    // Compute the canonical hash for signing.
+    let canonical_hash = compute_checkpoint_canonical_hash(
+        &context_id,
+        sender_did,
+        event_count,
+        &merkle_root,
+        Some(epoch),
+        timestamp,
+    );
+
+    // Sign the canonical hash.
+    let signature = key_custody
+        .sign(signing_key, &canonical_hash)
+        .await
+        .map_err(|e| EventLogError::SigningFailed(e.to_string()))?;
+
+    Ok(ConsistencyCheckpoint {
+        context_id,
+        sender_did: sender_did.clone(),
+        event_count,
+        merkle_root,
+        epoch: Some(epoch),
+        timestamp,
+        signature: signature.into_bytes(),
+    })
+}
+
+/// Compares a received remote checkpoint against the local event log state.
+///
+/// The comparison logic:
+/// 1. If event counts differ, the result is [`CheckpointComparison::Behind`]
+///    or [`CheckpointComparison::Ahead`].
+/// 2. If event counts match but Merkle roots differ, the result is
+///    [`CheckpointComparison::Divergent`] -- this indicates equivocation.
+/// 3. If both match, the result is [`CheckpointComparison::Consistent`].
+///
+/// See ADR-011 acceptance criterion 8.
+#[must_use]
+pub fn compare_checkpoint(
+    local_log: &EventLog,
+    remote_checkpoint: &ConsistencyCheckpoint,
+) -> CheckpointComparison {
+    let local_count = tree::event_count(local_log);
+    let remote_count = remote_checkpoint.event_count;
+
+    if local_count < remote_count {
+        return CheckpointComparison::Behind {
+            missing_events: remote_count - local_count,
+        };
+    }
+
+    if local_count > remote_count {
+        return CheckpointComparison::Ahead {
+            extra_events: local_count - remote_count,
+        };
+    }
+
+    // Counts match -- compare Merkle roots.
+    let local_root = tree::root(local_log);
+    if local_root == remote_checkpoint.merkle_root {
+        CheckpointComparison::Consistent
+    } else {
+        CheckpointComparison::Divergent {
+            first_divergent_event: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Computes the canonical hash of a checkpoint for signing/verification.
+///
+/// ```text
+/// SHA-256(context_id || sender_did || event_count_BE || merkle_root
+///         || epoch_flag || epoch_BE || timestamp_BE)
+/// ```
+///
+/// The `epoch_flag` byte is `0x01` if epoch is `Some`, `0x00` if `None`.
+/// When `Some`, the epoch value follows as 8 big-endian bytes.
+fn compute_checkpoint_canonical_hash(
+    context_id: &str,
+    sender_did: &str,
+    event_count: u64,
+    merkle_root: &[u8; 32],
+    epoch: Option<u64>,
+    timestamp: u64,
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(context_id.as_bytes());
+    hasher.update(sender_did.as_bytes());
+    hasher.update(event_count.to_be_bytes());
+    hasher.update(merkle_root);
+    match epoch {
+        Some(e) => {
+            hasher.update([0x01]);
+            hasher.update(e.to_be_bytes());
+        }
+        None => {
+            hasher.update([0x00]);
+        }
+    }
+    hasher.update(timestamp.to_be_bytes());
+    hasher.finalize().to_vec()
+}
+
+/// Returns the current Unix timestamp in seconds.
+///
+/// Uses `std::time::SystemTime` for the timestamp. In production, this would
+/// be injected via a clock trait for testability. For Phase 2, direct system
+/// time is acceptable.
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use ed25519_dalek::{Signer, Verifier};
+    use sha2::{Digest, Sha256};
+
+    use scp_platform::testing::InMemoryKeyCustody;
+    use scp_platform::traits::KeyType;
+
+    use super::*;
+    use crate::event_log::tree::{self, GENESIS_PREV_HASH};
+    use crate::event_log::{Event, EventLog, EventPayload, EventType};
+
+    // -------------------------------------------------------------------
+    // Test helpers
+    // -------------------------------------------------------------------
+
+    /// Helper: create a signing keypair.
+    fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
+        let mut rng = rand::thread_rng();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        (verifying_key, signing_key)
+    }
+
+    /// Helper: encode a public key as a test DID (`did:key:<hex>`).
+    fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
+        let hex: String = verifying_key
+            .as_bytes()
+            .iter()
+            .fold(String::new(), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
+        format!("did:key:{hex}")
+    }
+
+    /// Helper: compute the canonical hash for signing an event.
+    fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(event_type_tag(&event.event_type).to_be_bytes());
+        hasher.update(event.actor_did.as_bytes());
+        hasher.update(event.timestamp.to_be_bytes());
+        hasher.update(event.sequence.to_be_bytes());
+        hasher.update(&event.payload.data);
+        hasher.update(event.prev_hash);
+        hasher.finalize().to_vec()
+    }
+
+    /// Returns a stable numeric tag for each event type variant.
+    const fn event_type_tag(event_type: &EventType) -> u16 {
+        match event_type {
+            EventType::ContextCreated => 0,
+            EventType::ContextClosing => 1,
+            EventType::ContextClosed => 2,
+            EventType::ContextExpired => 3,
+            EventType::MemberJoined => 4,
+            EventType::MemberLeft => 5,
+            EventType::RoleAssigned => 6,
+            EventType::TokenRevoked => 7,
+            EventType::MessageSent => 8,
+            EventType::ToolRegistered => 9,
+            EventType::ToolUpdated => 10,
+            EventType::ToolInvoked => 11,
+            EventType::ToolVerified => 12,
+            EventType::ToolInterfaceEstablished => 13,
+            EventType::GovernanceAction => 14,
+            EventType::ConsistencyCheckpoint => 15,
+            EventType::AbsenceProofRequested => 16,
+            EventType::MemberBlocked => 17,
+            EventType::KeyEpochAdvance => 18,
+        }
+    }
+
+    /// Helper: sign an event.
+    fn sign_event(
+        event_type: EventType,
+        actor_did: &str,
+        timestamp: u64,
+        sequence: u64,
+        payload: Vec<u8>,
+        prev_hash: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Event {
+        let mut event = Event {
+            event_type,
+            actor_did: actor_did.to_owned(),
+            timestamp,
+            sequence,
+            payload: EventPayload { data: payload },
+            prev_hash,
+            signature: Vec::new(),
+        };
+
+        let canonical_hash = compute_event_canonical_hash(&event);
+        let signature = signing_key.sign(&canonical_hash);
+        event.signature = signature.to_bytes().to_vec();
+
+        event
+    }
+
+    /// Helper: build a log with `n` events and return the log, leaf hashes,
+    /// and the DID used for signing.
+    fn build_log(n: u64) -> (EventLog, Vec<[u8; 32]>, String) {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut log = EventLog::new("ctx-checkpoint-test".to_owned());
+        let mut prev_hash = GENESIS_PREV_HASH;
+        let mut leaf_hashes = Vec::new();
+
+        for i in 0..n {
+            let event = sign_event(
+                EventType::MessageSent,
+                &did,
+                1_000_000 + i,
+                i,
+                format!("message {i}").into_bytes(),
+                prev_hash,
+                &signing_key,
+            );
+            tree::append(&mut log, &event).unwrap();
+            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            leaf_hashes.push(leaf_hash);
+            prev_hash = leaf_hash;
+        }
+
+        (log, leaf_hashes, did)
+    }
+
+    /// Helper: build two identical logs with `n` events each.
+    fn build_matching_logs(n: u64) -> (EventLog, EventLog, String) {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut log_a = EventLog::new("ctx-checkpoint-test".to_owned());
+        let mut log_b = EventLog::new("ctx-checkpoint-test".to_owned());
+        let mut prev_hash = GENESIS_PREV_HASH;
+
+        for i in 0..n {
+            let event = sign_event(
+                EventType::MessageSent,
+                &did,
+                1_000_000 + i,
+                i,
+                format!("message {i}").into_bytes(),
+                prev_hash,
+                &signing_key,
+            );
+            tree::append(&mut log_a, &event).unwrap();
+            tree::append(&mut log_b, &event).unwrap();
+            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            prev_hash = leaf_hash;
+        }
+
+        (log_a, log_b, did)
+    }
+
+    // -------------------------------------------------------------------
+    // generate_checkpoint creates valid signed checkpoint
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn generate_creates_valid_signed_checkpoint() {
+        let (log, _, did) = build_log(10);
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let checkpoint = generate_checkpoint(&log, &did, 5, &custody, &key)
+            .await
+            .unwrap();
+
+        assert_eq!(checkpoint.context_id, "ctx-checkpoint-test");
+        assert_eq!(checkpoint.sender_did, did);
+        assert_eq!(checkpoint.event_count, 10);
+        assert_eq!(checkpoint.merkle_root, tree::root(&log));
+        assert_eq!(checkpoint.epoch, Some(5));
+        assert!(!checkpoint.signature.is_empty());
+        assert_eq!(checkpoint.signature.len(), 64);
+
+        // Verify the signature manually.
+        let pubkey = custody.public_key(&key).await.unwrap();
+        let pubkey_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
+
+        let canonical_hash = compute_checkpoint_canonical_hash(
+            &checkpoint.context_id,
+            &checkpoint.sender_did,
+            checkpoint.event_count,
+            &checkpoint.merkle_root,
+            checkpoint.epoch,
+            checkpoint.timestamp,
+        );
+
+        let sig_bytes: [u8; 64] = checkpoint.signature.as_slice().try_into().unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        verifying_key.verify(&canonical_hash, &signature).unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // generate_checkpoint on empty log
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn generate_checkpoint_on_empty_log() {
+        let log = EventLog::new("ctx-empty".to_owned());
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let did = "did:key:test".to_owned();
+
+        let checkpoint = generate_checkpoint(&log, &did, 0, &custody, &key)
+            .await
+            .unwrap();
+
+        assert_eq!(checkpoint.event_count, 0);
+        assert_eq!(checkpoint.merkle_root, [0u8; 32]);
+    }
+
+    // -------------------------------------------------------------------
+    // compare_checkpoint returns Consistent for matching roots
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compare_returns_consistent_for_matching_roots() {
+        let (log_a, log_b, did) = build_matching_logs(10);
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        // Generate a checkpoint from log_a.
+        let checkpoint = generate_checkpoint(&log_a, &did, 5, &custody, &key)
+            .await
+            .unwrap();
+
+        // Compare against log_b (which is identical).
+        let result = compare_checkpoint(&log_b, &checkpoint);
+        assert_eq!(result, CheckpointComparison::Consistent);
+    }
+
+    // -------------------------------------------------------------------
+    // compare_checkpoint returns Divergent for mismatched roots at same count
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compare_returns_divergent_for_mismatched_roots_same_count() {
+        let (verifying_key_a, signing_key_a) = test_keypair();
+        let did_a = did_from_pubkey(&verifying_key_a);
+
+        let (verifying_key_b, signing_key_b) = test_keypair();
+        let did_b = did_from_pubkey(&verifying_key_b);
+
+        // Build two logs with the same event count but different content
+        // (different signers produce different leaf hashes).
+        let mut log_a = EventLog::new("ctx-checkpoint-test".to_owned());
+        let mut log_b = EventLog::new("ctx-checkpoint-test".to_owned());
+
+        let mut prev_hash_a = GENESIS_PREV_HASH;
+        let mut prev_hash_b = GENESIS_PREV_HASH;
+
+        for i in 0..5u64 {
+            let event_a = sign_event(
+                EventType::MessageSent,
+                &did_a,
+                1_000_000 + i,
+                i,
+                format!("msg-a-{i}").into_bytes(),
+                prev_hash_a,
+                &signing_key_a,
+            );
+            tree::append(&mut log_a, &event_a).unwrap();
+            let leaf_hash_a: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event_a).unwrap()).into();
+            prev_hash_a = leaf_hash_a;
+
+            let event_b = sign_event(
+                EventType::MessageSent,
+                &did_b,
+                1_000_000 + i,
+                i,
+                format!("msg-b-{i}").into_bytes(),
+                prev_hash_b,
+                &signing_key_b,
+            );
+            tree::append(&mut log_b, &event_b).unwrap();
+            let leaf_hash_b: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event_b).unwrap()).into();
+            prev_hash_b = leaf_hash_b;
+        }
+
+        // Both logs have 5 events but different roots.
+        assert_eq!(tree::event_count(&log_a), tree::event_count(&log_b));
+        assert_ne!(tree::root(&log_a), tree::root(&log_b));
+
+        // Create a checkpoint from log_a and compare against log_b.
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let checkpoint = generate_checkpoint(&log_a, &did_a, 1, &custody, &key)
+            .await
+            .unwrap();
+
+        let result = compare_checkpoint(&log_b, &checkpoint);
+        assert_eq!(
+            result,
+            CheckpointComparison::Divergent {
+                first_divergent_event: None
+            }
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // compare_checkpoint returns Behind when local has fewer events
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compare_returns_behind_when_local_has_fewer() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+
+        // Build a log with 10 events for the remote checkpoint.
+        let mut log_full = EventLog::new("ctx-checkpoint-test".to_owned());
+        let mut log_partial = EventLog::new("ctx-checkpoint-test".to_owned());
+        let mut prev_hash = GENESIS_PREV_HASH;
+
+        for i in 0..10u64 {
+            let event = sign_event(
+                EventType::MessageSent,
+                &did,
+                1_000_000 + i,
+                i,
+                format!("message {i}").into_bytes(),
+                prev_hash,
+                &signing_key,
+            );
+            tree::append(&mut log_full, &event).unwrap();
+            if i < 7 {
+                tree::append(&mut log_partial, &event).unwrap();
+            }
+            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            prev_hash = leaf_hash;
+        }
+
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let checkpoint = generate_checkpoint(&log_full, &did, 1, &custody, &key)
+            .await
+            .unwrap();
+
+        let result = compare_checkpoint(&log_partial, &checkpoint);
+        assert_eq!(result, CheckpointComparison::Behind { missing_events: 3 });
+    }
+
+    // -------------------------------------------------------------------
+    // compare_checkpoint returns Ahead when local has more events
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compare_returns_ahead_when_local_has_more() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+
+        let mut log_full = EventLog::new("ctx-checkpoint-test".to_owned());
+        let mut log_partial = EventLog::new("ctx-checkpoint-test".to_owned());
+        let mut prev_hash = GENESIS_PREV_HASH;
+
+        for i in 0..10u64 {
+            let event = sign_event(
+                EventType::MessageSent,
+                &did,
+                1_000_000 + i,
+                i,
+                format!("message {i}").into_bytes(),
+                prev_hash,
+                &signing_key,
+            );
+            tree::append(&mut log_full, &event).unwrap();
+            if i < 4 {
+                tree::append(&mut log_partial, &event).unwrap();
+            }
+            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            prev_hash = leaf_hash;
+        }
+
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        // Checkpoint from the partial log (4 events).
+        let checkpoint = generate_checkpoint(&log_partial, &did, 1, &custody, &key)
+            .await
+            .unwrap();
+
+        // Compare: full log (10 events) vs. checkpoint (4 events).
+        let result = compare_checkpoint(&log_full, &checkpoint);
+        assert_eq!(result, CheckpointComparison::Ahead { extra_events: 6 });
+    }
+
+    // -------------------------------------------------------------------
+    // compare_checkpoint returns Consistent for empty logs
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compare_returns_consistent_for_empty_logs() {
+        let log_a = EventLog::new("ctx-empty".to_owned());
+        let log_b = EventLog::new("ctx-empty".to_owned());
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let did = "did:key:test".to_owned();
+
+        let checkpoint = generate_checkpoint(&log_a, &did, 0, &custody, &key)
+            .await
+            .unwrap();
+
+        let result = compare_checkpoint(&log_b, &checkpoint);
+        assert_eq!(result, CheckpointComparison::Consistent);
+    }
+
+    // -------------------------------------------------------------------
+    // CheckpointScheduler: checkpoint due after event threshold
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn scheduler_triggers_after_event_threshold() {
+        let mut scheduler = CheckpointScheduler::new(1_000_000);
+
+        // Not due before reaching the threshold.
+        for _ in 0..49 {
+            scheduler.record_event();
+            assert!(!scheduler.is_checkpoint_due(1_000_000));
+        }
+
+        // Due at the threshold.
+        scheduler.record_event();
+        assert!(scheduler.is_checkpoint_due(1_000_000));
+
+        // After reset, not due again.
+        scheduler.reset(1_000_000);
+        assert!(!scheduler.is_checkpoint_due(1_000_000));
+    }
+
+    // -------------------------------------------------------------------
+    // CheckpointScheduler: checkpoint due after time threshold
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn scheduler_triggers_after_time_threshold() {
+        let scheduler = CheckpointScheduler::new(1_000_000);
+
+        // Not due at 9 minutes.
+        assert!(!scheduler.is_checkpoint_due(1_000_000 + 539));
+
+        // Due at 10 minutes.
+        assert!(scheduler.is_checkpoint_due(1_000_000 + 600));
+
+        // Due at more than 10 minutes.
+        assert!(scheduler.is_checkpoint_due(1_000_000 + 700));
+    }
+
+    // -------------------------------------------------------------------
+    // CheckpointScheduler: reset clears state
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn scheduler_reset_clears_state() {
+        let mut scheduler = CheckpointScheduler::new(1_000_000);
+
+        // Record 49 events and advance time by 9 minutes.
+        for _ in 0..49 {
+            scheduler.record_event();
+        }
+        assert!(!scheduler.is_checkpoint_due(1_000_539));
+
+        // Reset at a new timestamp.
+        scheduler.reset(1_000_600);
+
+        // Should not be due (counters cleared).
+        assert!(!scheduler.is_checkpoint_due(1_000_600));
+
+        // Should be due after 10 more minutes from the new baseline.
+        assert!(scheduler.is_checkpoint_due(1_001_200));
+    }
+
+    // -------------------------------------------------------------------
+    // Checkpoint signature is deterministic for same inputs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_canonical_hash_is_deterministic() {
+        let hash1 = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
+        );
+
+        let hash2 = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
+        );
+
+        assert_eq!(hash1, hash2);
+    }
+
+    // -------------------------------------------------------------------
+    // Checkpoint canonical hash changes with different inputs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_canonical_hash_changes_with_different_inputs() {
+        let base = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
+        );
+
+        // Different context_id.
+        let different_ctx = compute_checkpoint_canonical_hash(
+            "ctx-2",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
+        );
+        assert_ne!(base, different_ctx);
+
+        // Different sender_did.
+        let different_did = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:xyz",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
+        );
+        assert_ne!(base, different_did);
+
+        // Different event_count.
+        let different_count = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:abc",
+            11,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
+        );
+        assert_ne!(base, different_count);
+
+        // Different merkle_root.
+        let different_root = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xBB; 32],
+            Some(5),
+            1_000_000,
+        );
+        assert_ne!(base, different_root);
+
+        // Different epoch.
+        let different_epoch = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(6),
+            1_000_000,
+        );
+        assert_ne!(base, different_epoch);
+
+        // None epoch vs Some epoch.
+        let no_epoch = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            None,
+            1_000_000,
+        );
+        assert_ne!(base, no_epoch);
+
+        // Different timestamp.
+        let different_ts = compute_checkpoint_canonical_hash(
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            2_000_000,
+        );
+        assert_ne!(base, different_ts);
+    }
+
+    // -------------------------------------------------------------------
+    // Divergent Merkle roots indicate equivocation
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn divergent_roots_indicate_equivocation() {
+        // Two participants with different views of a 5-event log.
+        let (vk_a, sk_a) = test_keypair();
+        let did_a = did_from_pubkey(&vk_a);
+        let (vk_b, sk_b) = test_keypair();
+        let did_b = did_from_pubkey(&vk_b);
+
+        let mut log_a = EventLog::new("ctx-equivocation".to_owned());
+        let mut log_b = EventLog::new("ctx-equivocation".to_owned());
+
+        let mut prev_a = GENESIS_PREV_HASH;
+        let mut prev_b = GENESIS_PREV_HASH;
+
+        for i in 0..5u64 {
+            let event_a = sign_event(
+                EventType::MessageSent,
+                &did_a,
+                1_000_000 + i,
+                i,
+                format!("alice-{i}").into_bytes(),
+                prev_a,
+                &sk_a,
+            );
+            tree::append(&mut log_a, &event_a).unwrap();
+            let h_a: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event_a).unwrap()).into();
+            prev_a = h_a;
+
+            let event_b = sign_event(
+                EventType::MessageSent,
+                &did_b,
+                1_000_000 + i,
+                i,
+                format!("bob-{i}").into_bytes(),
+                prev_b,
+                &sk_b,
+            );
+            tree::append(&mut log_b, &event_b).unwrap();
+            let h_b: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event_b).unwrap()).into();
+            prev_b = h_b;
+        }
+
+        // Same event count, different roots.
+        assert_eq!(tree::event_count(&log_a), tree::event_count(&log_b));
+        assert_ne!(tree::root(&log_a), tree::root(&log_b));
+
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let checkpoint_a = generate_checkpoint(&log_a, &did_a, 1, &custody, &key)
+            .await
+            .unwrap();
+
+        // Bob compares Alice's checkpoint against his log.
+        let result = compare_checkpoint(&log_b, &checkpoint_a);
+        match result {
+            CheckpointComparison::Divergent { .. } => {
+                // This is the expected equivocation detection.
+            }
+            other => panic!("expected Divergent (equivocation), got {other:?}"),
+        }
+    }
+}
