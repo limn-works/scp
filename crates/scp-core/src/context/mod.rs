@@ -33,6 +33,7 @@ pub mod params;
 pub mod roles;
 pub mod state_machine;
 pub mod templates;
+pub mod ttl;
 
 use std::sync::Arc;
 
@@ -68,6 +69,9 @@ pub use membership::{
     ContextEvent, DEFAULT_BUFFER_CAPACITY, KeyPackage, MAX_BUFFER_CAPACITY, MIN_BUFFER_CAPACITY,
     MemberInfo, MembershipState, ReceiveBuffer,
 };
+
+// Re-export TTL management types (SCP-021).
+pub use ttl::{CloseResult, TtlExtension, TtlTimer};
 
 // ---------------------------------------------------------------------------
 // ContextState

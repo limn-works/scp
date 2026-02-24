@@ -17,6 +17,7 @@ use super::builder::{
 };
 use super::membership::{ContextEvent, DID, KeyPackage, MembershipState, ReceiveBuffer};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
+use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use super::{ContextError, ContextHandle, ContextParams, ContextState};
 
 // ---------------------------------------------------------------------------
@@ -25,7 +26,7 @@ use super::{ContextError, ContextHandle, ContextParams, ContextState};
 
 /// Internal state tracked by the manager for each context.
 struct PerContextState {
-    /// The context handle.
+    /// The context handle (retained to keep the Arc alive).
     #[allow(dead_code)]
     handle: ContextHandle,
     /// Member tracking.
@@ -34,6 +35,11 @@ struct PerContextState {
     role_state: ContextRoleState,
     /// Receive event buffer.
     receive_buffer: ReceiveBuffer,
+    /// TTL timer management (SCP-021).
+    ttl_timer: TtlTimer,
+    /// Active TTL extension proposal, if any (SCP-021).
+    #[allow(dead_code)]
+    ttl_extension: Option<TtlExtension>,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,9 +189,16 @@ impl ContextManager {
             membership,
             role_state,
             receive_buffer: ReceiveBuffer::new(),
+            ttl_timer: TtlTimer::new(),
+            ttl_extension: None,
         };
 
-        lock_contexts_creation(&self.contexts)?.insert(context_id, per_context);
+        lock_contexts_creation(&self.contexts)?.insert(context_id.clone(), per_context);
+
+        // Spawn TTL timer if TTL is configured (SCP-021).
+        if let Some(ttl_duration) = params.ttl {
+            self.spawn_ttl_timer(&context_id, ttl_duration, handle.clone());
+        }
 
         Ok(handle)
     }
@@ -502,6 +515,221 @@ impl ContextManager {
                     .map(|ctx| ctx.receive_buffer.drain())
             })
             .unwrap_or_default()
+    }
+
+    // -------------------------------------------------------------------
+    // Close / Finalize / TTL Expiry (SCP-021)
+    // -------------------------------------------------------------------
+
+    /// Initiates cooperative context closure.
+    ///
+    /// Verifies the initiator has the `ContextClose` capability, transitions
+    /// from `Active` to `Closing`, and appends a `ContextClosing` event.
+    /// Cancels any active TTL timer for this context.
+    ///
+    /// See ADR-008 acceptance criterion 5.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotActive`] if the context is not
+    /// `Active`. Returns [`ContextError::PermissionDenied`] if the
+    /// initiator lacks the `ContextClose` capability.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn close_context(
+        &self,
+        handle: &ContextHandle,
+        initiator_did: &DID,
+    ) -> Result<CloseResult, ContextError> {
+        let context_id = handle.context_id().to_owned();
+
+        // Extract role_state for permission check (under lock).
+        let role_state = {
+            let contexts = lock_contexts(&self.contexts)?;
+            let ctx = contexts
+                .get(&context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            ctx.role_state.clone()
+        };
+
+        // Delegate to ttl::close_context for the actual logic.
+        let result =
+            ttl::close_context(handle, initiator_did, &role_state, self.event_log.as_ref()).await?;
+
+        // Cancel TTL timer and emit close notification to receive buffer.
+        {
+            let mut contexts = lock_contexts(&self.contexts)?;
+            if let Some(ctx) = contexts.get_mut(&context_id) {
+                ctx.ttl_timer.cancel();
+                ctx.receive_buffer.push(ContextEvent::MemberLeft {
+                    member_did: format!("__close_notification:{initiator_did}"),
+                });
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Completes context closure.
+    ///
+    /// Destroys MLS group state and sender keys, issues relay deletion
+    /// requests for ephemeral/summary scopes, transitions from `Closing`
+    /// to `Closed`, and appends the final `ContextClosed` event.
+    ///
+    /// See ADR-008 acceptance criterion 6.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if the context is not in `Closing` state
+    /// or if destruction operations fail.
+    pub async fn finalize_close(&self, handle: &ContextHandle) -> Result<(), ContextError> {
+        ttl::finalize_close(
+            handle,
+            self.crypto.as_ref(),
+            self.transport.as_ref(),
+            self.event_log.as_ref(),
+        )
+        .await
+    }
+
+    /// Handles automatic TTL expiry.
+    ///
+    /// Transitions from `Active` to `Expired`, destroys keys per memory
+    /// scope, and appends `ContextExpired` to the event log.
+    ///
+    /// See ADR-008 acceptance criterion 7.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotActive`] if the context is not
+    /// `Active`.
+    pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
+        let context_id = handle.context_id().to_owned();
+
+        ttl::handle_ttl_expiry(handle, self.crypto.as_ref(), self.event_log.as_ref()).await?;
+
+        // Emit expiry notification to receive buffer.
+        {
+            let mut contexts = lock_contexts(&self.contexts)?;
+            if let Some(ctx) = contexts.get_mut(&context_id) {
+                ctx.receive_buffer.push(ContextEvent::MemberLeft {
+                    member_did: "__ttl_expiry_notification".to_owned(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Proposes a TTL extension. Records consent from the given member.
+    ///
+    /// If all members have consented (unanimous), returns `true` indicating
+    /// the extension was approved. The caller should then call
+    /// [`reset_ttl_timer`](Self::reset_ttl_timer) with the new duration.
+    ///
+    /// See ADR-008 acceptance criterion 9 / spec section 5.10.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::MembershipFailed`] if the context is not
+    /// registered. Returns [`ContextError::MemberNotFound`] if the member
+    /// is not in the context.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn propose_ttl_extension(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        proposed_duration: std::time::Duration,
+    ) -> Result<bool, ContextError> {
+        let mut contexts = lock_contexts(&self.contexts)?;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+        if !ctx.membership.contains(member_did) {
+            return Err(ContextError::MemberNotFound(member_did.clone()));
+        }
+
+        let member_count = ctx.membership.count();
+
+        // Initialize extension proposal if not already in progress.
+        let extension = ctx
+            .ttl_extension
+            .get_or_insert_with(|| TtlExtension::new(proposed_duration, member_count));
+
+        extension.add_consent(member_did.clone());
+
+        Ok(extension.is_unanimous())
+    }
+
+    /// Resets the TTL timer after a successful unanimous extension.
+    ///
+    /// Cancels the old timer and spawns a new one with the given duration.
+    /// Clears the extension proposal state.
+    pub fn reset_ttl_timer(
+        &self,
+        context_id: &str,
+        new_duration: std::time::Duration,
+        handle: ContextHandle,
+    ) {
+        {
+            let Ok(mut contexts) = lock_contexts(&self.contexts) else {
+                return;
+            };
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.ttl_timer.cancel();
+                ctx.ttl_extension = None;
+            }
+        }
+
+        self.spawn_ttl_timer(context_id, new_duration, handle);
+    }
+
+    // -------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------
+
+    /// Spawns a TTL timer for the given context.
+    ///
+    /// The timer fires at the given duration and transitions the context
+    /// to `Expired`. The timer task is stored in the per-context state
+    /// for cancellation.
+    #[allow(clippy::significant_drop_tightening)]
+    fn spawn_ttl_timer(
+        &self,
+        context_id: &str,
+        duration: std::time::Duration,
+        handle: ContextHandle,
+    ) {
+        let context_id_owned = context_id.to_owned();
+        let cancel = {
+            let Ok(mut contexts) = lock_contexts(&self.contexts) else {
+                return;
+            };
+            let Some(ctx) = contexts.get_mut(context_id) else {
+                return;
+            };
+            ctx.ttl_timer.cancel.clone()
+        };
+
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(duration) => {
+                    // Timer fired. Transition to Expired.
+                    let _ = handle.transition_to(&ContextState::Expired).await;
+                }
+                () = cancel.notified() => {
+                    // Timer was cancelled.
+                }
+            }
+        });
+
+        // Store the task handle.
+        let Ok(mut contexts) = lock_contexts(&self.contexts) else {
+            return;
+        };
+        if let Some(ctx) = contexts.get_mut(&context_id_owned) {
+            ctx.ttl_timer.task = Some(task);
+        }
     }
 }
 
