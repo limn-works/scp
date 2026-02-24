@@ -411,7 +411,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/encrypt.rs"
       ],
@@ -458,7 +458,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/ratchet.rs",
         "crates/scp-core/src/crypto/mls/epoch_grace.rs",
@@ -518,7 +518,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/mod.rs",
         "crates/scp-core/src/identity/dht.rs",
@@ -883,7 +883,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/sender_keys/mod.rs",
         "crates/scp-core/src/crypto/sender_keys/encrypt.rs"
@@ -5990,7 +5990,7 @@
       "gate": "gate-5a",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/adrs/phase-6.md"
       ],
