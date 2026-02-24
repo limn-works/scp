@@ -4,7 +4,7 @@
 **Phase goal:** Android platform, Kotlin SDK, scale hardening, security audit, advanced governance, offline strategy.
 **Timeline:** Weeks 21+
 
-**Note:** All Phase 6 ADRs are Pending. Phase 6 follows Phases 1-5 implementation and depends on real-world implementation experience for concrete decisions. Each ADR below documents the decision space, known constraints, and approach guidance — enough for the Loom to know what's NOT decided and what to reference instead.
+**Note:** Phase 6 follows Phases 1-5 implementation. ADR-029 (Offline/Sync) and ADR-030 (Event Log Pruning) are Decided. Remaining ADRs (ADR-027, ADR-028, ADR-031) are Pending and depend on real-world implementation experience for concrete decisions. Each Pending ADR below documents the decision space, known constraints, and approach guidance — enough for the Loom to know what's NOT decided and what to reference instead.
 
 **Dependencies between ADRs:**
 
@@ -590,45 +590,576 @@ QueueDrained {
 
 ## ADR-030: Event Log Pruning and Checkpointing
 
-**Status:** Pending
+**Status:** Decided
 
-### What This ADR Will Decide
+### Context
 
-How append-only Merkle event logs (ADR-011) manage unbounded growth. Checkpoint strategy, pruning rules, proof compaction, and availability requirements for historical events.
+Every SCP context maintains an append-only Merkle event log (ADR-011) that records all protocol events — membership changes, governance actions, tool invocations, messages, role assignments, block notifications, and consistency checkpoints. The log is the foundation for behavioral validation (§7.3.1), equivocation detection (§9.9.3), and the trust model's Layer 2 (verifiable behavioral records, §7.3.2). Its append-only structure is what makes claims about context history verifiable rather than trust-dependent.
 
-### Blockers
+The problem is that event logs grow without bound. A long-lived context with active participants accumulates millions of events. Each event is a leaf in the Merkle tree, with interior nodes stored for proof generation (ADR-011, key convention: `context/{context_id}/event/{seq:020d}` for events, `context/{context_id}/event_tree/{level}/{index}` for tree nodes — §17.3). On mobile devices with constrained storage, maintaining full history for every active context is unsustainable. A context with 1 million events at ~200 bytes per event plus Merkle tree overhead consumes hundreds of megabytes for a single context.
 
-- Phase 2 event log implementation must be running with real contexts.
-- Need empirical data: typical event log growth rates per context type, device storage constraints, proof verification frequency.
+The core tension is that pruning contradicts the append-only property that makes the log verifiable. Deleting old events means their content cannot be independently re-verified. The protocol must balance verifiability (full history provable) with storage reality (unbounded growth is not viable on resource-constrained clients). The solution is checkpointing: periodically capturing a signed snapshot of the full context state anchored to a specific Merkle root, then pruning events behind the checkpoint while retaining enough Merkle tree structure to prove that pruned events were once part of the log.
 
-### The Core Tension
+### Scope
 
-Event logs are verifiable because they're append-only. Pruning breaks append-only. The protocol must balance verifiability (full history provable) with storage (unbounded growth unsustainable on mobile devices).
+**What this ADR covers:**
 
-### Known Constraints
+- Pruning strategies: time-based, size-based, and event-type-based criteria for removing old events from local storage.
+- Checkpoint creation: full context state snapshots anchored to a Merkle root at a specific sequence number.
+- State reconstruction: loading a checkpoint and replaying post-checkpoint events to recover current state.
+- Merkle proof interaction: how pruning affects proof validity and how "pruned proofs" work.
+- Governance of pruning policies: how contexts configure and enforce pruning rules.
+- Storage key management: how pruning interacts with the `ProtocolStore` key convention (§17.3).
 
-- Protocol state footprint is deliberately minimal (§10.3): membership, roles, tokens, tool registrations, governance, content hashes — NOT content itself.
-- Event logs are per-context Merkle trees with SHA-256 hash chain (ADR-011).
-- Must support inclusion proofs and consistency verification.
-- Behavioral validation (§7.3.1) depends on verifiable event logs.
+**What this ADR does NOT cover:**
 
-### Design Space (Not Decisions)
+- Offline/sync strategy for reconnecting members (ADR-029).
+- Multi-admin governance models (ADR-031).
+- Content storage and retrieval (app-layer, §10.6 — event logs store protocol events and content hashes, not content itself).
+- Relay-side storage management (relays manage blob TTL independently per ADR-004).
 
-1. **Full log forever** — simplest, unbounded storage.
-2. **Periodic checkpoints** (Merkle root snapshots) + pruned older entries — compresses, complicates proof verification.
-3. **Distributed log shards** — scales, adds availability complexity.
-4. **Tiered storage:** hot (recent, on-device) + cold (old, relay-hosted, proof-fetchable).
+### Decision
 
-### References
+Implement a checkpoint-and-prune system in `scp-core/event_log/` that creates signed state snapshots at configurable intervals and allows pruning of events behind checkpoints according to per-context policy. Pruning removes event payloads and optionally Merkle tree leaf data from local storage, but retains the Merkle tree's interior nodes so that inclusion proofs for pruned events remain verifiable against the checkpoint's Merkle root. The pruning policy is a context parameter set at creation or modified via governance, with a protocol-enforced minimum retention period of 30 days.
 
-- ADR-011 — Event log design (append-only, Merkle tree, entry structure).
-- §10.3 — Protocol state footprint.
-- §7.3.1 — Verifiable event logs (behavioral validation depends on them).
-- §17.4 — ProtocolStore event log key convention (zero-padded sequences).
+#### 1. Checkpoint Structure
 
-### Optimal Approach
+A checkpoint captures the complete, deterministic context state at a specific event log sequence number. Checkpoints are published to the event log as a special `Checkpoint` event type so that all members observe and can verify them.
 
-Implement Phase 2 event logs. Monitor growth rates in test scenarios. Profile proof generation/verification cost. Then design checkpointing with concrete numbers.
+```rust
+pub struct Checkpoint {
+    /// The context this checkpoint belongs to.
+    pub context_id: ContextId,
+    /// The event log sequence number this checkpoint covers (inclusive).
+    /// All events from 0 through checkpoint_seq are summarized.
+    pub checkpoint_seq: u64,
+    /// The Merkle root of the event log at checkpoint_seq.
+    pub merkle_root: [u8; 32],
+    /// The total number of events in the log at checkpoint time.
+    pub event_count: u64,
+    /// The hash of the last event at checkpoint_seq (hash chain tip).
+    pub last_event_hash: [u8; 32],
+    /// Full context state snapshot — deterministically serialized.
+    pub state_snapshot: ContextStateSnapshot,
+    /// DID of the checkpoint creator.
+    pub creator_did: DID,
+    /// Unix timestamp of checkpoint creation.
+    pub created_at: u64,
+    /// Ed25519 signature over SHA-256(context_id || checkpoint_seq ||
+    /// merkle_root || event_count || last_event_hash ||
+    /// SHA-256(serialize(state_snapshot)) || created_at).
+    pub signature: Ed25519Signature,
+    /// Optional governance quorum signatures (for multi-admin contexts, ADR-031).
+    /// In single-admin contexts, this is empty and creator_did must be the admin.
+    pub cosignatures: Vec<CosignedCheckpoint>,
+}
+
+pub struct CosignedCheckpoint {
+    pub signer_did: DID,
+    pub signature: Ed25519Signature,
+}
+
+pub struct ContextStateSnapshot {
+    /// Current membership: DID -> role mapping.
+    pub membership: Vec<(DID, RoleName)>,
+    /// Current capability ceiling.
+    pub capability_ceiling: Vec<Capability>,
+    /// Ceiling policy (locked, governed, admin-only).
+    pub ceiling_policy: CeilingPolicy,
+    /// Governance model identifier and configuration.
+    pub governance: GovernanceConfig,
+    /// Memory scope.
+    pub memory_scope: MemoryScope,
+    /// TTL remaining (None if no TTL or if persistent).
+    pub ttl_remaining_secs: Option<u64>,
+    /// Registered tools.
+    pub tools: Vec<ToolRegistration>,
+    /// Active sender key epochs per member.
+    pub sender_key_epochs: Vec<(DID, u64)>,
+    /// Current MLS epoch (None for Broadcast contexts).
+    pub mls_epoch: Option<u64>,
+    /// Active block relationships: (blocker, blocked).
+    pub blocks: Vec<(DID, DID)>,
+    /// Context mode (Encrypted or Broadcast).
+    pub context_mode: ContextMode,
+    /// Parent context IDs (empty for root contexts).
+    pub parent_context_ids: Vec<ContextId>,
+    /// Active UCAN revocations.
+    pub ucan_revocations: Vec<String>,
+}
+```
+
+**Checkpoint creation rules:**
+
+- In single-admin contexts (Phase 2 governance), only the admin can create checkpoints. The checkpoint is signed by the admin's Active Signing Key.
+- In multi-admin contexts (ADR-031), checkpoints require signatures from a governance quorum (e.g., M-of-N admins). The `cosignatures` field carries additional signer attestations.
+- Members receiving a checkpoint verify the signature(s) against known admin DID(s), then verify that the `merkle_root` matches their local Merkle root at `checkpoint_seq`. If it matches, the checkpoint is trusted. If it diverges, the member raises an equivocation alert (same mechanism as §9.9.3 consistency checkpoint divergence).
+- The `state_snapshot` is deterministically serialized (sorted keys, canonical MessagePack encoding) so that any member can independently compute `SHA-256(serialize(state_snapshot))` and verify the signature covers the correct state.
+
+#### 2. Pruning Strategies
+
+Pruning removes event data from local storage to reclaim space. Three pruning strategies are supported, and they compose: a context's pruning policy can combine multiple strategies with OR semantics (prune when any condition is met).
+
+**2a. Time-based pruning.** Prune events older than a configured duration. Events with `timestamp` older than `now - retention_duration` are eligible for pruning, provided they are behind a valid checkpoint.
+
+```rust
+pub struct TimeBasedPolicy {
+    /// Minimum age before an event becomes prunable.
+    /// Protocol minimum: 30 days (2_592_000 seconds). Contexts may set higher.
+    pub retention_secs: u64,
+}
+```
+
+**2b. Size-based pruning.** Prune when the event log exceeds a configured size. The oldest events behind a valid checkpoint are pruned first until the log is within bounds.
+
+```rust
+pub struct SizeBasedPolicy {
+    /// Maximum number of events to retain locally. When exceeded,
+    /// oldest events behind a checkpoint are pruned.
+    pub max_event_count: u64,
+    /// Maximum total storage bytes for event log data (events + tree nodes).
+    /// When exceeded, oldest events behind a checkpoint are pruned.
+    pub max_storage_bytes: u64,
+}
+```
+
+**2c. Event-type-based retention tiers.** Different event types have different retention priorities. Governance and membership events are retained longer than message events because they define the context's structural evolution and are essential for state reconstruction verification.
+
+```rust
+pub struct EventTypeRetention {
+    /// Governance and structural events: ContextCreated, MemberJoined, MemberLeft,
+    /// RoleAssigned, GovernanceAction, ContextClosing, ContextClosed, ContextExpired,
+    /// MemberBlocked, Checkpoint.
+    /// These are retained for the full retention period (or indefinitely if no
+    /// time-based policy).
+    pub structural_retention_multiplier: f64,  // Default: 3.0x the base retention
+
+    /// Operational events: MessageSent, ToolInvoked, ToolVerified,
+    /// ConsistencyCheckpoint, KeyEpochAdvance, AbsenceProofRequested.
+    /// These are retained for the base retention period.
+    pub operational_retention_multiplier: f64,  // Default: 1.0x
+}
+```
+
+Event-type retention interacts with time-based pruning: the effective retention for a structural event is `retention_secs * structural_retention_multiplier`. A context with a 30-day base retention and a 3.0x structural multiplier retains governance events for 90 days while message events are prunable after 30 days.
+
+**Pruning invariants (enforced mechanically):**
+
+1. Events are never pruned unless they are behind a valid, locally-verified checkpoint. No checkpoint = no pruning.
+2. The protocol-enforced minimum retention period is 30 days. A context cannot configure a retention shorter than 30 days. This ensures behavioral validation (§7.3.1) has sufficient history for meaningful evaluation.
+3. Pruning never removes checkpoint events themselves. Checkpoints are retained indefinitely (they are small and serve as trust anchors).
+4. Pruning is always local. A member's decision to prune does not affect other members' logs. Members who need full history can retain it regardless of the context's pruning policy.
+5. The hash chain is preserved: even when event payloads are pruned, the `prev_hash` chain continuity is maintained through retained leaf hashes.
+
+#### 3. Checkpoint Scheduling
+
+Checkpoints are created at configurable intervals, balancing proof compaction benefit against checkpoint creation cost.
+
+```rust
+pub struct CheckpointPolicy {
+    /// Create a checkpoint every N events. Default: 10_000.
+    pub event_interval: u64,
+    /// Create a checkpoint every N seconds. Default: 86_400 (24 hours).
+    pub time_interval_secs: u64,
+    /// Minimum events since last checkpoint before a new one is created.
+    /// Prevents checkpoint spam in low-activity contexts. Default: 100.
+    pub min_events_since_last: u64,
+}
+```
+
+Checkpoint creation is triggered by the context admin's SDK when either the event interval or time interval is reached, provided the minimum event threshold since the last checkpoint is met. For low-activity contexts (fewer than 100 events per day), checkpoints are created at the time interval even if the event threshold is not met — the time interval serves as an upper bound on checkpoint staleness.
+
+When a checkpoint is created, it is appended to the event log as a `Checkpoint` event type (extending the `EventType` enum from ADR-011). This ensures all members receive and can verify the checkpoint through normal event log synchronization.
+
+#### 4. Merkle Proof Interaction
+
+Pruning event payloads does not invalidate inclusion proofs for pruned events, provided the Merkle tree's interior nodes are retained. This is the key insight that makes pruning compatible with verifiability.
+
+**4a. Proof layers after pruning:**
+
+The Merkle tree (ADR-011) has three layers of data:
+
+1. **Event payloads** — the serialized `Event` structs. These are what pruning removes.
+2. **Leaf hashes** — `SHA-256(serialize(event))` for each event. These are 32 bytes each and are retained after pruning.
+3. **Interior nodes** — hash pairs at each tree level. These are retained after pruning.
+
+After pruning, the leaf hashes and interior nodes remain. An inclusion proof for a pruned event still works: the verifier provides the event's leaf hash (which the prover retains), and the proof path through interior nodes to the root is unchanged.
+
+**What is lost after pruning:** The ability to independently recompute the leaf hash from the event payload. A verifier who never saw the original event cannot verify that a claimed leaf hash corresponds to a specific event. They can only verify that *some* event with that leaf hash was included in the log at that position.
+
+**4b. Pruned proofs:**
+
+A "pruned proof" proves that an event was included in the log at a specific position, verified against a checkpoint's Merkle root rather than the current root.
+
+```rust
+pub struct PrunedInclusionProof {
+    /// The leaf hash of the pruned event.
+    pub leaf_hash: [u8; 32],
+    /// The leaf index in the log.
+    pub leaf_index: u64,
+    /// Standard Merkle inclusion proof path (sibling hashes + directions).
+    pub path: Vec<ProofStep>,
+    /// The checkpoint Merkle root this proof verifies against.
+    pub checkpoint_root: [u8; 32],
+    /// The checkpoint sequence number.
+    pub checkpoint_seq: u64,
+}
+```
+
+Verification: recompute the root from `leaf_hash` and `path`. If the computed root equals `checkpoint_root`, and the checkpoint itself is trusted (signature verified), then the event was in the log at `leaf_index` as of `checkpoint_seq`.
+
+**4c. Full proof chains:**
+
+For events that span a checkpoint boundary (some events before the checkpoint, some after), a full proof chain combines a pruned proof (against the checkpoint root) with a standard inclusion proof (against the current root) and the checkpoint event's own inclusion proof linking the two roots.
+
+```rust
+pub struct FullProofChain {
+    /// Proof of the event against the checkpoint's Merkle root.
+    pub pruned_proof: PrunedInclusionProof,
+    /// Proof that the checkpoint event itself is in the current log.
+    pub checkpoint_inclusion: InclusionProof,
+    /// The checkpoint (contains the Merkle root used by pruned_proof).
+    pub checkpoint: Checkpoint,
+}
+```
+
+Verification steps:
+1. Verify `checkpoint.signature` against the checkpoint creator's DID.
+2. Verify `checkpoint_inclusion` — the checkpoint event is in the current log.
+3. Verify `pruned_proof.checkpoint_root == checkpoint.merkle_root`.
+4. Verify `pruned_proof` — the target event was in the log at `checkpoint_seq`.
+
+This three-step chain provides the same assurance as a direct inclusion proof: the event was part of the log's history, the checkpoint is authentic, and the checkpoint is itself part of the current log.
+
+**4d. Interior node retention strategy:**
+
+After pruning, interior nodes from the Merkle tree are compacted. For a pruned region of the tree (all leaves behind a checkpoint), only the nodes on proof paths that connect to the checkpoint root need to be retained. In practice, the simplest strategy is to retain all interior nodes — at 32 bytes per node and O(n) total nodes for n leaves, the overhead is modest compared to event payloads. For a log with 1 million events, interior nodes consume approximately 64 MB (2n nodes * 32 bytes). If this proves excessive on mobile, a future optimization can prune interior nodes whose subtrees are entirely behind two consecutive checkpoints, retaining only the subtree roots.
+
+Storage key convention for checkpoint-related data (extending §17.3):
+
+```
+context/{context_id}/checkpoint/{seq:020d}           -- checkpoint data
+context/{context_id}/checkpoint_meta/latest           -- latest checkpoint sequence
+context/{context_id}/pruning_policy                   -- current pruning policy
+context/{context_id}/prune_cursor                     -- last pruned sequence number
+```
+
+#### 5. State Reconstruction from Checkpoints
+
+When a member joins a context with a long history, or when a member's local state is corrupted, they can reconstruct the current context state from the most recent checkpoint plus post-checkpoint events rather than replaying the entire log from genesis.
+
+**Reconstruction protocol:**
+
+1. **Obtain the latest checkpoint.** Query the context's event log (via relay QUERY or peer request) for the most recent `Checkpoint` event. Verify its signature against the admin's DID.
+2. **Verify checkpoint consistency.** Compute or request the current Merkle root from an online member (via consistency checkpoint exchange, ADR-011 criterion 8). Verify that the checkpoint event is included in the current log via standard inclusion proof.
+3. **Load state snapshot.** Deserialize the checkpoint's `ContextStateSnapshot`. This provides complete context state as of the checkpoint: membership, roles, governance, tools, ceilings, blocks, and sender key epochs.
+4. **Replay post-checkpoint events.** Request events from `checkpoint_seq + 1` through the current event count. Verify each event against the Merkle tree (hash chain integrity, inclusion proof). Apply each event's state mutation to the snapshot.
+5. **Verify final state.** After replay, the reconstructed state should be consistent with the current Merkle root and the latest consistency checkpoint from online members.
+
+**Reconstruction is not the same as sync.** ADR-029 covers reconnection and sync for members who were part of the context and went offline. State reconstruction is for members who either (a) are joining a context with a long history, (b) have lost local state, or (c) are recovering from storage corruption. The checkpoint provides a known-good starting point; the replay provides the delta.
+
+```rust
+pub struct StateReconstructor {
+    store: Arc<ProtocolStore>,
+}
+
+impl StateReconstructor {
+    /// Reconstruct context state from a checkpoint and post-checkpoint events.
+    pub async fn reconstruct(
+        &self,
+        checkpoint: &Checkpoint,
+        post_checkpoint_events: &[Event],
+        current_merkle_root: &[u8; 32],
+    ) -> Result<ReconstructedState, ReconstructionError>;
+}
+
+pub struct ReconstructedState {
+    pub context_state: ContextStateSnapshot,
+    pub event_count: u64,
+    pub merkle_root: [u8; 32],
+    pub events_replayed: u64,
+}
+
+pub enum ReconstructionError {
+    /// Checkpoint signature verification failed.
+    InvalidCheckpoint(String),
+    /// Hash chain broken during event replay.
+    BrokenHashChain { expected: [u8; 32], got: [u8; 32], at_seq: u64 },
+    /// Final state does not match expected Merkle root.
+    StateMismatch { expected_root: [u8; 32], computed_root: [u8; 32] },
+    /// Missing events in the replay sequence.
+    MissingEvents { from_seq: u64, to_seq: u64 },
+}
+```
+
+#### 6. Governance of Pruning Policies
+
+The pruning policy is a context parameter, set at creation or modified through the context's governance model. It is included in the context's publicly visible metadata (§5.7) so prospective members can evaluate the context's data retention posture before joining.
+
+```rust
+pub struct PruningPolicy {
+    /// Time-based pruning. None = no time-based pruning.
+    pub time_based: Option<TimeBasedPolicy>,
+    /// Size-based pruning. None = no size-based pruning.
+    pub size_based: Option<SizeBasedPolicy>,
+    /// Event-type retention multipliers.
+    pub event_type_retention: EventTypeRetention,
+    /// Checkpoint creation schedule.
+    pub checkpoint_schedule: CheckpointPolicy,
+    /// Whether members are allowed to request full log history from peers.
+    /// Default: true. If false, peers SHOULD NOT serve events behind their
+    /// most recent checkpoint to other members.
+    pub allow_full_history_requests: bool,
+}
+```
+
+**Governance rules:**
+
+- **Setting at creation.** The context creator includes `PruningPolicy` in `ContextParameters`. If omitted, the default policy applies: no time-based pruning, no size-based pruning, default checkpoint schedule (every 10,000 events or 24 hours), structural events retained 3x longer than operational events, full history requests allowed.
+- **Modifying via governance.** The pruning policy can be modified through the context's governance model (admin decision in single-admin, governance vote in multi-admin). Changes are recorded in the event log as a `GovernanceAction` event.
+- **Protocol minimum.** The protocol enforces a 30-day minimum for `time_based.retention_secs`. Governance cannot set a shorter retention. This floor ensures behavioral validation (§7.3.1) and equivocation detection (§9.9.3) have meaningful history to work with.
+- **Structural event floor.** Governance and membership events (structural events) cannot have an effective retention shorter than 90 days (`structural_retention_multiplier` is clamped to produce at least 90 days of structural event retention). This ensures that context governance history — who joined, who left, what roles changed, what governance actions occurred — is preserved long enough for accountability.
+- **Member autonomy.** A member's SDK can retain the full unprocessed event log locally regardless of the context's pruning policy. The pruning policy governs what the protocol considers the minimum retention obligation and what peers are expected to serve. A member who wants full history retains it; a member on a constrained device prunes according to policy.
+
+**Default pruning policy:**
+
+```rust
+impl Default for PruningPolicy {
+    fn default() -> Self {
+        Self {
+            time_based: None,         // No time-based pruning by default
+            size_based: None,          // No size-based pruning by default
+            event_type_retention: EventTypeRetention {
+                structural_retention_multiplier: 3.0,
+                operational_retention_multiplier: 1.0,
+            },
+            checkpoint_schedule: CheckpointPolicy {
+                event_interval: 10_000,
+                time_interval_secs: 86_400,
+                min_events_since_last: 100,
+            },
+            allow_full_history_requests: true,
+        }
+    }
+}
+```
+
+**Context templates (§5.12) with pruning presets:**
+
+- `ephemeral`: 30-day retention, 50,000 max events, checkpoints every 5,000 events.
+- `conversation`: 90-day retention, 100,000 max events, checkpoints every 10,000 events.
+- `persistent` / `full`: No time-based or size-based pruning (default policy). Full history retained.
+- `high_volume`: 30-day retention, 500,000 max events, checkpoints every 10,000 events, structural multiplier 5.0x.
+
+#### 7. Pruning Execution
+
+Pruning is a local operation performed by the SDK. It is never triggered by relays or remote peers. The SDK runs a background pruning task that evaluates the pruning policy periodically.
+
+```rust
+pub struct PruningExecutor {
+    store: Arc<ProtocolStore>,
+}
+
+impl PruningExecutor {
+    /// Evaluate the pruning policy for a context and prune eligible events.
+    /// Returns a report of what was pruned.
+    pub async fn prune(
+        &self,
+        context_id: &ContextId,
+        policy: &PruningPolicy,
+        now: u64,
+    ) -> Result<PruneReport, PruneError>;
+}
+
+pub struct PruneReport {
+    pub context_id: ContextId,
+    /// Number of event payloads removed.
+    pub events_pruned: u64,
+    /// Bytes reclaimed from storage.
+    pub bytes_reclaimed: u64,
+    /// The sequence number of the checkpoint used as the pruning boundary.
+    pub pruned_up_to_checkpoint: u64,
+    /// The sequence number of the oldest retained event payload.
+    pub oldest_retained_seq: u64,
+}
+
+pub enum PruneError {
+    /// No valid checkpoint exists — cannot prune.
+    NoCheckpoint,
+    /// All events are within the minimum retention period.
+    NothingToPrune,
+    /// Storage operation failed.
+    StorageError(String),
+}
+```
+
+**Pruning algorithm:**
+
+1. Load the latest verified checkpoint for the context.
+2. Determine the eligible pruning boundary: `min(checkpoint_seq, oldest_event_meeting_retention_criteria)`. Events beyond the checkpoint cannot be pruned (no checkpoint to anchor proofs). Events within the retention window cannot be pruned.
+3. For each event from the oldest to the pruning boundary:
+   a. Check event-type retention: if the event is structural and within the structural retention window, skip.
+   b. Delete the event payload from `ProtocolStore` (key: `context/{context_id}/event/{seq:020d}`).
+   c. Retain the leaf hash in a compact index (key: `context/{context_id}/pruned_leaf/{seq:020d}`, value: 32-byte hash). This enables pruned proofs.
+4. Update the prune cursor: `context/{context_id}/prune_cursor` = highest pruned sequence number.
+5. Optionally compact interior tree nodes (Phase 6 optimization — retain all by default).
+
+**Pruning frequency:** The background task runs every 6 hours. On mobile platforms, it defers to when the device is charging and on Wi-Fi (if the platform adapter exposes this information). Pruning is not time-critical — a few hours of delay does not affect correctness.
+
+### Rationale
+
+**Why checkpoint-based pruning instead of rolling windows:**
+
+A rolling window (keep last N events, discard older) breaks Merkle proof continuity. There is no anchor point to verify that pruned events were once part of the log. Checkpoints provide this anchor: the checkpoint's signed Merkle root is the verifiable claim that "all events up to sequence S produced this root." Pruned proofs work because the Merkle tree structure (leaf hashes + interior nodes) is retained even when payloads are removed.
+
+**Why 30-day minimum retention:**
+
+Behavioral validation (§7.3.1) computes records from event log history. A 30-day minimum ensures at least one month of behavioral data is available for trust evaluation. Shorter windows would make behavioral records unreliable — a participant could misbehave, wait for pruning, and have no verifiable behavioral record of the misbehavior. The 30-day floor is a practical balance between storage and accountability. Contexts that need longer accountability windows (governance, financial) set longer retention.
+
+**Why event-type tiers:**
+
+Governance and membership events are small (a role assignment is ~200 bytes) and structurally critical (they define who can do what in the context). Message events are more numerous and less structurally important after verification. Retaining structural events 3x longer than operational events costs minimal storage (structural events are typically <5% of total events by count) while preserving the governance audit trail. This is the same principle as database archival: metadata about the data outlives the data itself.
+
+**Why checkpoints are published to the event log:**
+
+Publishing checkpoints as event log entries makes them discoverable through the same mechanisms as any other event: relay subscription, peer sync, and event range queries. It also means checkpoints are included in the Merkle tree, so their authenticity is verifiable by the same proof machinery. A checkpoint event's inclusion in the log proves it was created when claimed and observed by all members.
+
+**Why pruning is local-only:**
+
+SCP's trust model treats relays as untrusted dumb pipes (§9.9.1). Relays should not influence what clients retain. Similarly, other members should not be able to force a client to prune — that would be a censorship vector (force prune evidence of misbehavior). Pruning is always the local member's decision, constrained by the protocol's minimum retention floor. The pruning policy is a recommendation that the SDK follows by default, not an enforcement mechanism.
+
+**Why members can retain full history:**
+
+The "member autonomy" principle ensures that pruning is a storage optimization, not a privacy guarantee. A context cannot promise that its event log will disappear after 30 days — any member who was present could have retained the full log. This is by design: SCP prioritizes accountability and verifiability over retroactive deletion. If a context needs content destruction guarantees, it uses ephemeral memory scope (§5.11) which destroys encryption keys, not event log hashes.
+
+### Implementation
+
+- **Language:** Rust
+- **Async runtime:** tokio (background pruning task, checkpoint creation)
+- **Crate:** `scp-core`
+- **Module:** `scp-core/event_log/` (extends existing event log module from ADR-011)
+- **Persistence:** Via `ProtocolStore` (§17.4). Key conventions:
+  - `context/{context_id}/checkpoint/{seq:020d}` — serialized `Checkpoint` structs
+  - `context/{context_id}/checkpoint_meta/latest` — latest checkpoint sequence number
+  - `context/{context_id}/pruning_policy` — serialized `PruningPolicy`
+  - `context/{context_id}/prune_cursor` — last pruned sequence number
+  - `context/{context_id}/pruned_leaf/{seq:020d}` — retained leaf hashes for pruned events
+
+### Dependencies
+
+- **ADR-011 (Event Log):** The checkpoint-and-prune system extends the Merkle event log. Checkpoints are a new `EventType`. Pruned proofs use the existing `InclusionProof` structure verified against a checkpoint root instead of the current root.
+- **ADR-008 (Context Lifecycle):** Pruning policy is a context parameter. Context creation includes optional `PruningPolicy` in `ContextParameters`. Context closure triggers final checkpoint creation before key destruction (for ephemeral/summary memory scopes).
+- **ADR-009 (Roles):** Checkpoint creation requires the admin role (or governance quorum in multi-admin contexts).
+- **ADR-029 (Offline/Sync):** State reconstruction from checkpoints provides the fast-start path for members who missed many events during extended offline periods. The `StateReconstructor` complements the `ReconnectionCoordinator` — reconnecting members can load the latest checkpoint instead of replaying the full log.
+- **ProtocolStore (§17.4):** Storage and retrieval of checkpoints, pruning policy, prune cursor, and retained leaf hashes. Range queries via `list_keys` with zero-padded sequence numbers.
+
+### Acceptance Criteria
+
+1. **`Checkpoint` struct and event type (extends ADR-011 `EventType` enum):**
+
+```rust
+// Addition to EventType in scp-core/event_log/
+Checkpoint {
+    checkpoint_seq: u64,
+    merkle_root: [u8; 32],
+    state_snapshot_hash: [u8; 32],  // SHA-256 of serialized ContextStateSnapshot
+},
+```
+
+2. **`create_checkpoint(event_log, context_state, signing_key) -> Result<Checkpoint, CheckpointError>`**
+
+   - Captures the current Merkle root, event count, and last event hash from the event log.
+   - Serializes the full `ContextStateSnapshot` deterministically.
+   - Signs the checkpoint with the provided signing key (admin's Active Signing Key).
+   - Appends the checkpoint as a `Checkpoint` event to the event log.
+   - Persists the checkpoint to `ProtocolStore` at `context/{id}/checkpoint/{seq:020d}`.
+   - Updates `context/{id}/checkpoint_meta/latest`.
+   - Returns the signed checkpoint.
+
+3. **`verify_checkpoint(checkpoint, admin_public_key, event_log) -> Result<bool, CheckpointError>`**
+
+   - Verifies the checkpoint signature against the admin's public key.
+   - Verifies the `merkle_root` matches the event log's root at `checkpoint_seq`.
+   - Verifies `state_snapshot_hash` matches `SHA-256(serialize(checkpoint.state_snapshot))`.
+   - Returns true if all verifications pass.
+
+4. **`PruningPolicy` struct and validation:**
+
+   - `validate_policy(policy) -> Result<(), PolicyError>`: Rejects policies with `time_based.retention_secs < 2_592_000` (30 days). Rejects policies where the effective structural retention is less than 90 days. Clamps `structural_retention_multiplier` to produce at least 90 days.
+
+5. **`PruningExecutor::prune(context_id, policy, now) -> Result<PruneReport, PruneError>`**
+
+   - Loads the latest checkpoint. Returns `PruneError::NoCheckpoint` if none exists.
+   - Computes the pruning boundary from the intersection of checkpoint coverage and retention policy.
+   - Iterates events from oldest to boundary, respecting event-type retention tiers.
+   - Deletes event payloads from `ProtocolStore`.
+   - Retains leaf hashes at `context/{id}/pruned_leaf/{seq:020d}`.
+   - Updates `prune_cursor`.
+   - Returns a `PruneReport` with statistics.
+
+6. **`prove_pruned_inclusion(event_log, leaf_hash, leaf_index, checkpoint) -> Result<PrunedInclusionProof, EventLogError>`**
+
+   - Generates a Merkle inclusion proof for a pruned event using the retained leaf hash and interior nodes.
+   - The proof verifies against the checkpoint's `merkle_root`.
+
+7. **`build_full_proof_chain(pruned_proof, checkpoint, event_log) -> Result<FullProofChain, EventLogError>`**
+
+   - Combines a pruned inclusion proof with the checkpoint's own inclusion proof in the current log.
+   - Returns a `FullProofChain` that can be verified by any third party with access to the current Merkle root.
+
+8. **`StateReconstructor::reconstruct(checkpoint, events, current_root) -> Result<ReconstructedState, ReconstructionError>`**
+
+   - Verifies the checkpoint signature.
+   - Loads the `ContextStateSnapshot` from the checkpoint.
+   - Replays each post-checkpoint event, verifying hash chain continuity.
+   - Applies each event's state mutation to the snapshot.
+   - Verifies the final Merkle root matches `current_root`.
+   - Returns the reconstructed state.
+
+9. **Background checkpoint and pruning tasks:**
+
+   - `CheckpointScheduler`: monitors event count and time since last checkpoint. Triggers `create_checkpoint` when thresholds are met. Runs as a tokio background task.
+   - `PruningTask`: runs every 6 hours. Evaluates the pruning policy for each active context and calls `PruningExecutor::prune`. Defers on mobile when not charging (if platform adapter reports power state).
+
+10. **Integration test:**
+
+```
+1. Alice creates an identity and a context with a pruning policy:
+   time-based 30-day retention, checkpoint every 100 events.
+2. Alice and Bob exchange 250 messages (250 events in the log).
+3. Verify: checkpoint was created automatically at event 100 and event 200.
+4. Verify: both checkpoints are in the event log as Checkpoint events.
+5. Verify: checkpoint state_snapshot matches actual context state at those points.
+6. Simulate time advance of 31 days.
+7. Run pruning. Verify: events 0-199 (behind the checkpoint at 200, older
+   than 30 days) are pruned. Events 200-249 are retained.
+8. Verify: event payloads for 0-199 are gone from ProtocolStore.
+9. Verify: leaf hashes for 0-199 are retained in pruned_leaf/ keys.
+10. Generate a pruned inclusion proof for event 50 against checkpoint at 200.
+    Verify it succeeds.
+11. Build a full proof chain for event 50. Verify it validates against
+    the current Merkle root.
+12. Carol joins the context. Carol reconstructs state from the latest
+    checkpoint (200) + events 200-249. Verify Carol's reconstructed state
+    matches Alice and Bob's current state.
+13. Verify: governance events (MemberJoined for Bob) with structural
+    retention multiplier 3.0x would be retained for 90 days even as
+    message events are pruned at 30 days.
+```
+
+### Scope
+
+**Files (~5-7):**
+
+| File | Purpose |
+|------|---------|
+| `checkpoint.rs` | `Checkpoint`, `ContextStateSnapshot`, `CosignedCheckpoint`, `create_checkpoint`, `verify_checkpoint`, `CheckpointScheduler` |
+| `pruning.rs` | `PruningPolicy`, `TimeBasedPolicy`, `SizeBasedPolicy`, `EventTypeRetention`, `PruningExecutor`, `PruneReport`, policy validation |
+| `pruned_proof.rs` | `PrunedInclusionProof`, `FullProofChain`, `prove_pruned_inclusion`, `build_full_proof_chain` |
+| `reconstruct.rs` | `StateReconstructor`, `ReconstructedState`, `ReconstructionError`, state replay logic |
+| `policy.rs` | `CheckpointPolicy`, default policies, template presets, policy governance integration |
+
+**Estimated functions:** ~20-25 public functions, ~15-20 internal helpers.
 
 ---
 
