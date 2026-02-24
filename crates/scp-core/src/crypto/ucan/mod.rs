@@ -40,6 +40,8 @@
 //! See ADR-016 in `.docs/adrs/phase-3.md` for the full specification.
 
 pub mod capability;
+pub mod mint;
+pub mod validate;
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +77,28 @@ pub enum UcanError {
     /// Ed25519 signature verification failed.
     #[error("signature verification failed")]
     SignatureInvalid,
+
+    /// The root issuer DID does not match the context creator DID.
+    #[error("invalid issuer: expected {expected}, got {actual}")]
+    InvalidIssuer {
+        /// The expected context creator DID.
+        expected: String,
+        /// The actual issuer DID found in the root token.
+        actual: String,
+    },
+
+    /// The token's audience DID does not match the presenting agent's DID.
+    #[error("audience mismatch: expected {expected}, got {actual}")]
+    AudienceMismatch {
+        /// The expected presenting agent DID.
+        expected: String,
+        /// The actual audience DID in the token.
+        actual: String,
+    },
+
+    /// The token expiry exceeds the maximum allowed (now + 24 hours).
+    #[error("expiry too far in the future: {0}s exceeds 24h maximum")]
+    ExpiryTooFar(u64),
 
     /// The token has expired (`exp <= now`).
     #[error("token expired")]
@@ -522,6 +546,33 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "capability outside ceiling: messages:admin"
+        );
+    }
+
+    #[test]
+    fn ucan_error_display_new_variants() {
+        let err = UcanError::InvalidIssuer {
+            expected: "did:dht:creator".to_owned(),
+            actual: "did:dht:imposter".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid issuer: expected did:dht:creator, got did:dht:imposter"
+        );
+
+        let err = UcanError::AudienceMismatch {
+            expected: "did:dht:member".to_owned(),
+            actual: "did:dht:other".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "audience mismatch: expected did:dht:member, got did:dht:other"
+        );
+
+        let err = UcanError::ExpiryTooFar(100_000);
+        assert_eq!(
+            err.to_string(),
+            "expiry too far in the future: 100000s exceeds 24h maximum"
         );
     }
 }
