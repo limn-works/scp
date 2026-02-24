@@ -30,6 +30,8 @@
 
 pub mod error;
 pub mod protocol;
+pub mod server;
+pub mod storage;
 
 // Re-export primary types for convenience.
 pub use error::{NativeProtocolError, code};
