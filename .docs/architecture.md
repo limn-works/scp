@@ -302,6 +302,12 @@ scp/
 │   │   ├── presets.rs         # Canned scenarios (two_party_basic, suppression_scenario, etc.)
 │   │   └── conformance/       # Trait conformance macros (transport, storage, key_custody, etc.)
 │   │
+│   ├── scp-node/              # Application deployment node (§18.6)
+│   │   ├── lib.rs             # ApplicationNode, ApplicationNodeBuilder
+│   │   ├── http.rs            # axum Router: .well-known/scp + relay WebSocket upgrade
+│   │   ├── tls.rs             # ACME TLS provisioning (Let's Encrypt)
+│   │   └── well_known.rs      # .well-known/scp generation from node state
+│   │
 │   ├── scp-ffi/               # Foreign function interface layer
 │   │   ├── uniffi/            # UniFFI definitions → Swift, Kotlin
 │   │   └── pyo3/              # PyO3 definitions → Python
@@ -599,6 +605,12 @@ State:
               ▼
      platform implementations
      (apple / android / web / testing)
+
+   scp-node (§18.6 — application deployment)
+        │
+        ├──► scp-core
+        ├──► scp-transport
+        └──► scp-platform
 
    scp-testing (dev-dependency, §16)
         │

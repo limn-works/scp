@@ -860,11 +860,12 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 
 ### 5.14.11 Discovery
 
-Broadcast contexts are discoverable through three mechanisms:
+Broadcast contexts are discoverable through four mechanisms:
 
 1. **DID document service endpoint.** Authors MAY publish an `SCPBroadcastContext` service entry in their DID document with the context ID and relay URLs.
 2. **Discovery contexts.** Authors register broadcast contexts via `agent_register` in discovery contexts (§6.2.2B), with metadata indicating the context mode.
-3. **Out-of-band.** URI format: `scp://broadcast/<context_id_hex>?relay=<url>`.
+3. **`.well-known/scp`.** Operators MAY list broadcast contexts in their `.well-known/scp` document (§18.3). Only broadcast context IDs may be listed — encrypted context IDs MUST NOT appear (§9.10 metadata privacy).
+4. **Out-of-band URI.** The universal context URI format (§18.4) is used for sharing context references: `scp://context/<context_id_hex>?relay=<url>&mode=broadcast`. The legacy format `scp://broadcast/<context_id_hex>?relay=<url>` is accepted as an alias and normalized to the universal format.
 
 ### 5.14.12 Security Model Delta
 
