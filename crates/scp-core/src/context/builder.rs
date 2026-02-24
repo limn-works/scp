@@ -127,6 +127,64 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextCreationError`] if destruction fails.
     fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    // -- Membership operations (SCP-020) -----------------------------------
+
+    /// Validates a joiner's key package.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidKeyPackage`] if the key package is invalid.
+    fn validate_key_package(&self, owner_did: &str) -> Result<(), ContextError>;
+
+    /// Adds a member to the MLS group (ADR-001 `add_member()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
+    fn add_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError>;
+
+    /// Removes a member from the MLS group (ADR-001 `remove_member()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
+    fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError>;
+
+    /// Distributes sender key bundle to a new member via ADR-007.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if distribution fails.
+    fn distribute_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<(), ContextError>;
+
+    /// Removes a member's sender key from all members' stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if removal fails.
+    fn remove_member_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<(), ContextError>;
+
+    /// Encrypts a payload with sender key (ADR-007), wraps in inner envelope
+    /// (ADR-002), encrypts with MLS (ADR-001), wraps in outer envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if any encryption step fails.
+    fn encrypt_message(
+        &self,
+        context_id: &[u8; 32],
+        sender_did: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ContextError>;
 }
 
 /// Provides transport operations needed during context creation.
@@ -156,6 +214,19 @@ pub trait ContextTransportProvider: Send + Sync {
     /// Returns [`ContextCreationError`] if deletion fails. Callers may
     /// ignore this error during rollback (best-effort).
     fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    // -- Messaging operations (SCP-020) ------------------------------------
+
+    /// Sends an encrypted message via transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if sending fails.
+    fn send_message(
+        &self,
+        context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+    ) -> Result<(), ContextError>;
 }
 
 /// Provides event log operations needed during context creation.
@@ -174,11 +245,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if the append fails.
-    fn append_event(
-        &self,
-        context_id: &[u8; 32],
-        event: &str,
-    ) -> Result<(), ContextCreationError>;
+    fn append_event(&self, context_id: &[u8; 32], event: &str) -> Result<(), ContextCreationError>;
 
     /// Destroys the event log for the given context (rollback).
     ///
@@ -187,6 +254,21 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Returns [`ContextCreationError`] if destruction fails. Callers may
     /// ignore this error during rollback (best-effort).
     fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    // -- Membership/messaging event logging (SCP-020) ----------------------
+
+    /// Appends a named event to the context's event log.
+    ///
+    /// This variant returns [`ContextError`] for use in membership and
+    /// messaging operations (as opposed to creation-time operations).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the append fails.
+    fn append_context_event(&self, context_id: &[u8; 32], event: &str) -> Result<(), ContextError> {
+        self.append_event(context_id, event)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,9 +423,8 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // If a template is specified, validate all params match the template
     // definition exactly.
     if params.template_id.is_some() {
-        validate_against_template(params).map_err(|e| {
-            ContextCreationError::TemplateValidationFailed(e.to_string())
-        })?;
+        validate_against_template(params)
+            .map_err(|e| ContextCreationError::TemplateValidationFailed(e.to_string()))?;
     }
 
     Ok(())
@@ -506,8 +587,8 @@ pub async fn create_context(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
 
@@ -579,11 +660,53 @@ mod tests {
         }
 
         fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            self.sender_keys_destroyed
-                .lock()
-                .unwrap()
-                .push(*context_id);
+            self.sender_keys_destroyed.lock().unwrap().push(*context_id);
             Ok(())
+        }
+
+        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+            Ok(())
+        }
+
+        fn add_member(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+
+        fn remove_member(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+
+        fn distribute_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+
+        fn remove_member_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+
+        fn encrypt_message(
+            &self,
+            _context_id: &[u8; 32],
+            _sender_did: &str,
+            payload: &[u8],
+        ) -> Result<Vec<u8>, ContextError> {
+            Ok(payload.to_vec())
         }
     }
 
@@ -624,6 +747,14 @@ mod tests {
 
         fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.deleted.lock().unwrap().push(*context_id);
+            Ok(())
+        }
+
+        fn send_message(
+            &self,
+            _context_id: &[u8; 32],
+            _encrypted_payload: &[u8],
+        ) -> Result<(), ContextError> {
             Ok(())
         }
     }
@@ -683,8 +814,7 @@ mod tests {
 
         let params = ContextParams::default(); // Encrypted mode by default
 
-        let result =
-            create_context("ctx-1".into(), params, &crypto, &transport, &event_log).await;
+        let result = create_context("ctx-1".into(), params, &crypto, &transport, &event_log).await;
 
         assert!(result.is_ok());
         let handle = result.unwrap();
@@ -722,8 +852,7 @@ mod tests {
             ..ContextParams::default()
         };
 
-        let result =
-            create_context("ctx-bc".into(), params, &crypto, &transport, &event_log).await;
+        let result = create_context("ctx-bc".into(), params, &crypto, &transport, &event_log).await;
 
         assert!(result.is_ok());
         let handle = result.unwrap();
@@ -778,9 +907,7 @@ mod tests {
     #[tokio::test]
     async fn create_context_fails_when_identity_invalid() {
         let crypto = MockCryptoProvider::default();
-        crypto
-            .fail_validate_identity
-            .store(true, Ordering::Relaxed);
+        crypto.fail_validate_identity.store(true, Ordering::Relaxed);
         let transport = MockTransportProvider::connected();
         let event_log = MockEventLogProvider::default();
 
@@ -880,8 +1007,14 @@ mod tests {
             ..ContextParams::default()
         };
 
-        let result =
-            create_context("ctx-fail-bc".into(), params, &crypto, &transport, &event_log).await;
+        let result = create_context(
+            "ctx-fail-bc".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
 
         assert!(result.is_err());
 
@@ -1308,9 +1441,14 @@ mod tests {
         let params = ContextParams::default();
         assert!(params.template_id.is_none());
 
-        let result =
-            create_context("ctx-no-template".into(), params, &crypto, &transport, &event_log)
-                .await;
+        let result = create_context(
+            "ctx-no-template".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
 
         assert!(result.is_ok());
     }

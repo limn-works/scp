@@ -90,6 +90,38 @@ pub enum Capability {
     Custom(String),
 }
 
+impl Capability {
+    /// Converts a [`params::Capability`](super::params::Capability) string
+    /// name to a [`roles::Capability`] enum variant.
+    ///
+    /// Recognized names: `"messages:read"`, `"messages:write"`,
+    /// `"tool:invoke:*"`, `"tool:register"`, `"member:invite"`,
+    /// `"member:remove"`, `"role:assign"`, `"governance:propose"`,
+    /// `"governance:vote"`, `"context:close"`, `"context:child:create"`.
+    /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
+    /// Anything else maps to `Custom(name)`.
+    #[must_use]
+    pub fn from_param_capability(param: &super::params::Capability) -> Self {
+        match param.name() {
+            "messages:read" => Self::MessagesRead,
+            "messages:write" => Self::MessagesWrite,
+            "tool:invoke:*" => Self::ToolInvokeAll,
+            "tool:register" => Self::ToolRegister,
+            "member:invite" => Self::MemberInvite,
+            "member:remove" => Self::MemberRemove,
+            "role:assign" => Self::RoleAssign,
+            "governance:propose" => Self::GovernancePropose,
+            "governance:vote" => Self::GovernanceVote,
+            "context:close" => Self::ContextClose,
+            "context:child:create" => Self::ChildContextCreate,
+            other => other.strip_prefix("tool:invoke:").map_or_else(
+                || Self::Custom(other.to_owned()),
+                |tool_id| Self::ToolInvoke(tool_id.to_owned()),
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -408,9 +440,7 @@ pub struct UcanAttestation {
 pub enum RoleError {
     /// A role definition includes a capability that is not in the context's
     /// capability ceiling.
-    #[error(
-        "role \"{role}\" includes capability {capability} which is outside the ceiling"
-    )]
+    #[error("role \"{role}\" includes capability {capability} which is outside the ceiling")]
     CapabilityOutsideCeiling {
         /// The role that contains the offending capability.
         role: String,
@@ -533,12 +563,7 @@ impl ContextRoleState {
             .cloned()
             .unwrap_or_else(|| builtin_admin(&ceiling));
 
-        let tokens = mint_role_tokens(
-            &context_id,
-            &creator_did,
-            &creator_did,
-            &admin_role,
-        );
+        let tokens = mint_role_tokens(&context_id, &creator_did, &creator_did, &admin_role);
 
         let mut assignments = HashMap::new();
         let assignment = RoleAssignment {
@@ -618,12 +643,7 @@ pub fn assign_role(
         .clone();
 
     // 4. Mint UCAN tokens for each capability in the role.
-    let tokens = mint_role_tokens(
-        &state.context_id,
-        &state.creator_did,
-        member_did,
-        &role_def,
-    );
+    let tokens = mint_role_tokens(&state.context_id, &state.creator_did, member_did, &role_def);
 
     // 5. Update state: replace any previous assignment.
     let assignment = RoleAssignment {
@@ -631,9 +651,7 @@ pub fn assign_role(
         role_name: role_name.to_owned(),
         tokens: tokens.clone(),
     };
-    state
-        .assignments
-        .insert(member_did.to_owned(), assignment);
+    state.assignments.insert(member_did.to_owned(), assignment);
     state
         .member_capabilities
         .insert(member_did.to_owned(), role_def.capabilities);
@@ -835,10 +853,7 @@ mod tests {
             format!("{}", Capability::GovernancePropose),
             "governance:propose"
         );
-        assert_eq!(
-            format!("{}", Capability::GovernanceVote),
-            "governance:vote"
-        );
+        assert_eq!(format!("{}", Capability::GovernanceVote), "governance:vote");
         assert_eq!(format!("{}", Capability::ContextClose), "context:close");
         assert_eq!(
             format!("{}", Capability::ChildContextCreate),
@@ -872,10 +887,7 @@ mod tests {
 
     #[test]
     fn ceiling_new_creates_from_iterator() {
-        let ceiling = CapabilityCeiling::new([
-            Capability::MessagesRead,
-            Capability::MessagesWrite,
-        ]);
+        let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
         assert_eq!(ceiling.len(), 2);
         assert!(!ceiling.is_empty());
     }
@@ -903,8 +915,7 @@ mod tests {
 
     #[test]
     fn ceiling_tool_invoke_all_implies_specific_tool() {
-        let ceiling =
-            CapabilityCeiling::new([Capability::ToolInvokeAll, Capability::MessagesRead]);
+        let ceiling = CapabilityCeiling::new([Capability::ToolInvokeAll, Capability::MessagesRead]);
         assert!(ceiling.contains(&Capability::ToolInvoke("any-tool".to_owned())));
         assert!(ceiling.contains(&Capability::ToolInvoke("another-tool".to_owned())));
     }
@@ -1064,10 +1075,7 @@ mod tests {
     #[test]
     fn builtin_member_respects_ceiling() {
         // If ToolInvokeAll is not in the ceiling, member should not have it.
-        let ceiling = CapabilityCeiling::new([
-            Capability::MessagesRead,
-            Capability::MessagesWrite,
-        ]);
+        let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
         let member = builtin_member(&ceiling);
         assert!(!member.capabilities.contains(&Capability::ToolInvokeAll));
         assert_eq!(member.capabilities.len(), 2);
@@ -1121,8 +1129,8 @@ mod tests {
     #[test]
     fn context_role_state_new_creates_with_builtins() {
         let ceiling = test_ceiling();
-        let state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling.clone(), vec![])
-            .unwrap();
+        let state =
+            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling.clone(), vec![]).unwrap();
 
         // Creator is a member.
         assert!(state.members.contains("did:dht:creator"));
@@ -1175,8 +1183,8 @@ mod tests {
     #[test]
     fn context_role_state_creator_has_all_ceiling_capabilities() {
         let ceiling = test_ceiling();
-        let state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling.clone(), vec![])
-            .unwrap();
+        let state =
+            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling.clone(), vec![]).unwrap();
 
         for cap in &ceiling.capabilities {
             assert!(
@@ -1201,8 +1209,7 @@ mod tests {
     #[test]
     fn assign_role_succeeds_for_authorized_assigner() {
         let ceiling = test_ceiling();
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
 
         // Add a member to the context.
         state.members.insert("did:dht:alice".to_owned());
@@ -1223,8 +1230,7 @@ mod tests {
     #[test]
     fn assign_role_fails_for_unauthorized_assigner() {
         let ceiling = test_ceiling();
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
 
         // Add members.
         state.members.insert("did:dht:alice".to_owned());
@@ -1245,15 +1251,9 @@ mod tests {
     #[test]
     fn assign_role_fails_for_nonexistent_member() {
         let ceiling = test_ceiling();
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
 
-        let result = assign_role(
-            &mut state,
-            "did:dht:nobody",
-            "member",
-            "did:dht:creator",
-        );
+        let result = assign_role(&mut state, "did:dht:nobody", "member", "did:dht:creator");
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1264,8 +1264,7 @@ mod tests {
     #[test]
     fn assign_role_fails_for_nonexistent_role() {
         let ceiling = test_ceiling();
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
 
@@ -1285,8 +1284,7 @@ mod tests {
     #[test]
     fn assign_role_replaces_previous_assignment() {
         let ceiling = test_ceiling();
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
 
@@ -1306,8 +1304,7 @@ mod tests {
     #[test]
     fn assign_role_mints_correct_token_format() {
         let ceiling = test_ceiling();
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
 
@@ -1334,8 +1331,7 @@ mod tests {
 
         state.members.insert("did:dht:alice".to_owned());
 
-        let tokens =
-            assign_role(&mut state, "did:dht:alice", "admin", "did:dht:creator").unwrap();
+        let tokens = assign_role(&mut state, "did:dht:alice", "admin", "did:dht:creator").unwrap();
 
         // Admin gets all ceiling capabilities.
         assert_eq!(tokens.len(), ceiling.len());
@@ -1380,10 +1376,8 @@ mod tests {
     #[test]
     fn validate_role_definition_succeeds_for_valid_subset() {
         let ceiling = test_ceiling();
-        let role = RoleDefinition::new_unchecked(
-            "custom",
-            HashSet::from([Capability::MessagesRead]),
-        );
+        let role =
+            RoleDefinition::new_unchecked("custom", HashSet::from([Capability::MessagesRead]));
         assert!(validate_role_definition(&role, &ceiling).is_ok());
     }
 
@@ -1540,8 +1534,7 @@ mod tests {
     #[test]
     fn multiple_role_assignments_tracked_independently() {
         let ceiling = test_ceiling();
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
         state.members.insert("did:dht:bob".to_owned());

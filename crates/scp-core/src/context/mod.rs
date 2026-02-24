@@ -28,6 +28,7 @@
 
 pub mod builder;
 pub mod manager;
+pub mod membership;
 pub mod params;
 pub mod roles;
 pub mod state_machine;
@@ -57,11 +58,16 @@ pub use roles::{
 
 // Re-export builder and manager types for convenience.
 pub use builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-    ContextTransportProvider, CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle,
-    create_context,
+    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle, create_context,
 };
 pub use manager::ContextManager;
+
+// Re-export membership types.
+pub use membership::{
+    ContextEvent, DEFAULT_BUFFER_CAPACITY, KeyPackage, MAX_BUFFER_CAPACITY, MIN_BUFFER_CAPACITY,
+    MemberInfo, MembershipState, ReceiveBuffer,
+};
 
 // ---------------------------------------------------------------------------
 // ContextState
@@ -157,6 +163,34 @@ pub enum ContextError {
     /// the template definition. See [`templates::validate_against_template`].
     #[error(transparent)]
     TemplateMismatch(#[from] templates::TemplateError),
+
+    /// A membership operation failed (join, leave).
+    #[error("membership operation failed: {0}")]
+    MembershipFailed(String),
+
+    /// A crypto operation failed during a membership or messaging operation.
+    #[error("crypto operation failed: {0}")]
+    CryptoFailed(String),
+
+    /// A transport operation failed during messaging.
+    #[error("transport operation failed: {0}")]
+    TransportFailed(String),
+
+    /// An event log operation failed.
+    #[error("event log operation failed: {0}")]
+    EventLogFailed(String),
+
+    /// The sender does not have the required UCAN capability.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
+    /// The specified member was not found in the context.
+    #[error("member not found: {0}")]
+    MemberNotFound(String),
+
+    /// A key package validation failed.
+    #[error("invalid key package: {0}")]
+    InvalidKeyPackage(String),
 }
 
 // ---------------------------------------------------------------------------
