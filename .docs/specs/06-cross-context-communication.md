@@ -36,6 +36,7 @@ Properties:
 - Rate-limited: both contexts can enforce rate limits on interface calls.
 - **Chain depth limit.** Cross-context tool calls carry a `chain_depth` counter, incremented on each hop. A tool call at maximum depth (protocol default: 3) cannot trigger further cross-context tool calls. This bounds amplification and makes transitive provenance degradation mechanically enforced (§9.2.1).
 - **Schema constraints.** Tool schemas must satisfy a structural specificity floor at registration time — no unbounded string-only interfaces, minimum two distinct fields in input or output. This prevents degenerate broad-schema tools that function as arbitrary message channels (§9.2.1).
+- **Tool-level costs.** Individual tools may declare per-invocation costs in their registration metadata (§5.4). These are additive with context-level costs and carry their own payee DID. Cross-context tool calls inherit the target tool's cost structure. See §19.3 for economic policy and §19.2.2 for the payment integration sequence.
 
 ### 6.2.1 Stateful Tool Sessions
 

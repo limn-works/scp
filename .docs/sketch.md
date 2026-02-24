@@ -1739,3 +1739,157 @@ SCP.Security.verifyDestruction(
   contextMatches: Bool
 }
 ```
+
+---
+
+## 17. Economy
+
+### Cost Estimation (§19.4, §19.11)
+
+Evaluate a context's pricing formula against current observable metrics.
+
+```
+SCP.Economy.estimateCost(
+  context: ContextID,
+  action: PaidActionType           // .message | .toolInvoke | .join | .period | .byteStored
+) → CostEstimate {
+  amount: Amount,
+  currency: CurrencyCode,
+  formulaInputs: {                 // observable metrics used in computation (all integer — §19.1.1)
+    contextMessageRate: Int?,      // messages in current window
+    memberCount: Int?,
+    senderVelocity: Int?,          // sender's messages in sliding window
+    storageUsage: Int?,            // bytes
+    timeOfDay: Int?                // UTC hour (0-23)
+  },
+  breakdown: {
+    baseCost: Amount,
+    variableComponents: [(PricingVariable, Amount)],  // each variable's contribution
+    cap: Amount?,
+    floor: Amount?
+  }
+}
+```
+
+### Payment History (§19.6, §19.11)
+
+Retrieve payment receipts from a context's event log.
+
+```
+SCP.Economy.paymentHistory(
+  context: ContextID,
+  filter: PaymentFilter? {
+    payer: DID?,
+    payee: DID?,
+    actionType: PaidActionType?,
+    since: DateTime?,
+    limit: Int?                    // default: 50
+  }
+) → [PaymentReceipt {
+  receiptId: [u8; 32],
+  payer: DID,
+  payee: DID,
+  amount: Amount,
+  currency: CurrencyCode,
+  actionType: PaidActionType,
+  contextId: ContextID?,
+  adapterId: String,
+  adapterProof: Data,             // x402: tx hash, Lightning: preimage, SPL: tx sig
+  timestamp: DateTime,
+  signature: Ed25519Signature     // signed by payer
+}]
+```
+
+### Grant Spending UCAN (§19.5, §19.11)
+
+Mint a spending capability UCAN for an agent.
+
+```
+SCP.Identity.grantSpending(
+  agent: DID,
+  context: ContextID?,              // None = wildcard "scp:spending:*", Some = "scp:spending:{contextId}"
+  capability: SpendingCapability {
+    maxPerAction: Amount,          // max single-action spend
+    maxTotal: Amount,              // max total spend within timeWindow
+    currency: CurrencyCode,        // ISO 4217 or protocol-defined
+    timeWindow: Duration,          // rolling window for maxTotal
+    allowedAdapters: [String]      // empty = any configured adapter
+  },
+  expiry: DateTime                 // MUST NOT exceed 24 hours (§9.5)
+) → UcanToken {
+  encoded: String,                 // JWT-encoded UCAN
+  resource: "scp:spending:{contextId}" | "scp:spending:*",
+  capability: SpendingCapability,
+  chain: [DID]                     // delegation chain (human → agent)
+}
+```
+
+Spending UCANs are AND-composed with action UCANs. Agent needs both `messagesWrite` + spending UCAN to send paid messages. Attenuation: sub-delegation must narrow (agent granted $100/day can delegate $10/day to sub-agent).
+
+### Configure Payment Adapter (§19.2.4, §19.11)
+
+Register a payment adapter with the identity's SDK instance.
+
+```
+SCP.Identity.configureAdapter(
+  adapter: PaymentAdapter {
+    adapterId: String,             // "x402" | "lightning" | "spl" | "stripe" | custom
+    capabilities: AdapterCapabilities {
+      supportedCurrencies: [CurrencyCode],
+      supportsStreaming: Bool,
+      supportsBatchAuth: Bool,
+      supportsSingleStep: Bool,
+      minAmount: Amount?,
+      maxAmount: Amount?,
+      typicalSettlementMs: Int,
+      requiresFacilitator: Bool
+    }
+  }
+) → ()
+```
+
+Adapter credentials are identity-private state (§3.7) — encrypted, stored alongside identity keys. Never exposed to contexts or relays.
+
+### Context Creation with Economic Policy (§19.3, §19.11)
+
+Extended context creation with optional economic policy.
+
+```
+SCP.Context.create(
+  template: TemplateID?,
+  params: ContextParams {
+    // ... existing params (ceiling, governance, mode, ttl, memoryScope) ...
+    economicPolicy: EconomicPolicy? {
+      locked: Bool,                // true = immutable, false = governed (default)
+      costSchedule: CostSchedule {
+        currency: CurrencyCode,
+        perMessage: Amount?,
+        perToolInvoke: Amount?,    // default for tools without own cost
+        perJoin: Amount?,          // one-time membership cost
+        perPeriod: SubscriptionCost?,
+        perByteStored: Amount?
+      },
+      paymentAdapters: [PaymentAdapterRef],
+      pricingFormula: PricingFormula?,
+      payee: DID
+    }
+  }
+) → Context
+```
+
+Auto-accept (§5.12.2) NEVER applies to contexts with economic policy requiring payment.
+
+### Context Inspection with Economic Policy (§19.9, §19.11)
+
+Extended context inspection surfaces economic metadata.
+
+```
+SCP.Context.inspect(
+  context: ContextID
+) → ContextMetadata {
+  // ... existing metadata (ceiling, governance, roles, members, mode, ttl) ...
+  economicPolicy: EconomicPolicy?,  // pricing, adapters, payee — visible before opt-in
+  estimatedCostPerMessage: Amount?,  // convenience: pre-computed from current formula
+  estimatedCostPerToolInvoke: Amount?
+}
+```

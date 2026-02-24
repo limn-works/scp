@@ -61,6 +61,7 @@ Every protocol action is zero-trust. An agent presents a UCAN capability token w
 - Agent's role includes the required permission
 - Token hasn't been revoked
 - Token hasn't expired
+- For paid actions: spending UCAN is present and covers the cost (§19.5). Action UCAN + spending UCAN are AND-composed — both required
 
 No action proceeds on reputation or identity alone. A trusted DID with an expired token is denied. An unknown DID with a valid token is permitted. This layer is mandatory and non-negotiable.
 
@@ -178,6 +179,8 @@ These rules are:
 
 Consequence mechanisms transform "do I trust this agent to behave?" into "are the consequences of misbehaving sufficient to make it irrational?" The latter is a validation question, not a trust question.
 
+**Economic consequences** compose with behavioral consequences. Contexts with economic policy (§19.3) add a cost tier: escalating pricing via `SenderVelocity` (§19.7) makes high-velocity behavior increasingly expensive before behavioral consequences trigger. Economic and behavioral tiers operate independently — an agent might exhaust its spending UCAN before behavioral suspension, or vice versa.
+
 ## 7.4 Layer 3: Attestation Authenticity
 
 Attestations are signed claims by identities about something. The protocol verifies their authenticity — that the claim was really made by the stated issuer — but not their truth.
@@ -286,6 +289,9 @@ DataProvenance {
   memoryScope:       MemoryScope             // what memory scope the source context had
   chainDepth:        uint                    // number of context boundaries crossed (0 = originated here, 1 = one hop, etc.)
   chainPath:         [contextID]?            // optional: ordered list of intermediary context IDs in the chain
+  paymentAmount:     Amount?                 // optional: cost of producing this data (§19.6)
+  paymentAdapter:    String?                 // optional: adapter used for payment
+  paymentReceiptId:  [u8; 32]?              // optional: receipt ID for verification
 }
 ```
 

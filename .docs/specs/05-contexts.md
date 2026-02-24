@@ -44,6 +44,8 @@ Every context also declares a **ceiling policy** at creation — whether the cei
 
 The ceiling policy is visible in context metadata (§5.7) before opt-in. A prospective member sees both the current ceiling and the policy governing changes.
 
+**Economic policy is orthogonal to capability ceiling.** Ceiling governs what CAN happen; economic policy (§19.3) governs what it COSTS. Economic policy is not a ceiling category — it does not restrict or expand what actions are available, only what they cost.
+
 ## 5.4 Tools
 
 Contexts provide tools: stateless functions that agents invoke. Tools have no identity, no agency, no ability to initiate. They take input and return output. They are scoped to their context and cannot span contexts.
@@ -56,6 +58,7 @@ Tool registrations include:
 - **Implementation hash.** Content-addressable reference to the tool's implementation. Any change to the implementation produces a new hash.
 - **Test vectors.** Known input-output pairs that define correct behavior. Any agent can call the tool with test inputs and verify outputs match. This enables continuous integrity verification (§7.3.3).
 - **Operator DID.** The identity accountable for the tool. Tool misbehavior traces to this DID.
+- **Cost metadata (optional).** Per-invocation cost declared by the tool, additive with context-level costs (§19.3). Fields: `cost: Option<Amount>`, `cost_currency: Option<CurrencyCode>`, `cost_payee: Option<DID>`. A tool calling an external API can pass through its cost. Tool costs carry their own payee DID, which may differ from the context payee. Tools without cost metadata are free.
 
 Tool mutations (implementation hash change, schema modification, test vector update) are recorded in the context's verifiable event log (§7.3.1). Silent tool modification is not possible — any change is visible to all context members.
 
@@ -98,6 +101,7 @@ The following are visible before opting in to any context:
 - Promotion policy (`no_promotion` or `promotable`), if context has a TTL (§5.10)
 - Memory scope (§5.11)
 - Context mode (`Encrypted` or `Broadcast`, §5.14)
+- Economic policy, if set (§19.3) — pricing, accepted adapters, payee
 - Active tool interface count (inbound and outbound, §6.2, §9.2.1)
 - For child contexts (§5.13): parent context IDs, parent metadata summaries, parent governance configuration, and the prospective member's eligibility basis (§5.13.6)
 
@@ -239,6 +243,38 @@ Template: "scp:template/gated-broadcast"
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
+
+Template: "scp:template/tool-interface"
+  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  roles:         [admin (creator), member (joiner)]
+  governance:    single-admin
+  memory_scope:  full
+  ttl:           optional
+  tools:         creator-defined at creation
+
+Template: "scp:template/paid-service"
+  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  ceiling_policy: immutable
+  roles:         [admin (creator), member (joiner)]
+  governance:    single-admin
+  memory_scope:  full (receipts are provenance)
+  economic_policy: required — per_tool_invoke must be set at creation
+  extends:       scp:template/tool-interface
+  ttl:           optional
+
+Template: "scp:template/paid-broadcast"
+  mode:          Broadcast
+  ceiling:       [messagesRead, messagesWrite]
+  ceiling_policy: immutable
+  roles:
+    owner:       all capabilities in ceiling + memberInvite, roleAssign, contextClose
+    author:      messagesWrite, messagesRead
+    subscriber:  messagesRead (requires admin-issued UCAN, granted after payment verification)
+  governance:    single-admin
+  memory_scope:  full
+  economic_policy: required — per_period must be set at creation
+  extends:       scp:template/gated-broadcast
+  ttl:           optional
 ```
 
 The ONLY difference between `public-broadcast` and `gated-broadcast` is whether the subscriber role's `messagesRead` is auto-granted (DID-authenticated, following the discovery context reader-tier pattern §6.2.2B) or requires an explicit admin-issued UCAN (like encrypted context membership). The open/gated distinction is expressed through the template's role definitions, not through a new enum type.
@@ -276,6 +312,8 @@ Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID I share
 - Auto-accept policies are enforced in the SDK, not the protocol. The protocol sees a normal context join. The policy just determines whether the SDK prompts the human or acts autonomously.
 
 **No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `toolInvokeAll`, `toolInvokeSpecific`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
+
+**No auto-accept for paid contexts.** This is a hard rule, not a default. Any context with an `EconomicPolicy` requiring payment (non-empty `CostSchedule`) requires explicit confirmation regardless of auto-accept policies. Agents never silently incur costs. See §19.3.
 
 ### 5.12.3 SDK Convenience Surface
 
@@ -787,7 +825,7 @@ The distinction between open and gated broadcast is expressed through the existi
 - Open: author checks block list only. Not blocked → respond with key.
 - Gated: author checks (1) valid `messagesRead` UCAN, (2) block list. Both pass → respond with key.
 
-Gated contexts enable: paid subscriptions (admin grants `messagesRead` after payment verification), invite-only communities (admin grants `messagesRead` to approved members), and tiered access (scoped UCANs for different content levels).
+Gated contexts enable: paid subscriptions (admin grants `messagesRead` after payment verification — see §19.10 `paid-broadcast` template), invite-only communities (admin grants `messagesRead` to approved members), and tiered access (scoped UCANs for different content levels).
 
 ### 5.14.5 BroadcastEnvelope
 
