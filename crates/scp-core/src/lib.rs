@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod context;
 pub mod crypto;
 pub mod envelope;
 pub mod identity;
