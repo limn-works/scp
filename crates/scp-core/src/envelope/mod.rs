@@ -28,7 +28,7 @@ pub mod pseudonym;
 
 // Re-export primary types and functions at the envelope module level.
 pub use inner::{InnerEnvelope, Provenance, create_inner_envelope, verify_inner_signature};
-pub use outer::{OuterEnvelope, create_outer_envelope};
+pub use outer::{OuterEnvelope, create_outer_envelope, open_envelope, seal_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 pub use pseudonym::derive_pseudonym;
 
@@ -82,4 +82,23 @@ pub enum EnvelopeError {
     /// The `recipient_hint` field is not a valid 32-byte identifier.
     #[error("invalid recipient_hint: {0}")]
     InvalidRecipientHint(String),
+
+    /// MLS encryption failed during envelope sealing.
+    #[error("MLS encryption failed: {0}")]
+    MlsEncryptionFailed(String),
+
+    /// MLS decryption failed during envelope opening.
+    #[error("MLS decryption failed: {0}")]
+    MlsDecryptionFailed(String),
+
+    /// Content integrity verification failed: `payload_hash` does not match
+    /// `SHA-256(stripped_payload)`.
+    #[error("content integrity failed: payload_hash mismatch")]
+    ContentIntegrityFailed,
+
+    /// The inner envelope signature is valid in form but does not match the
+    /// sender's public key — the message has been tampered with or was not
+    /// sent by the claimed sender.
+    #[error("inner signature mismatch: message rejected")]
+    InnerSignatureMismatch,
 }
