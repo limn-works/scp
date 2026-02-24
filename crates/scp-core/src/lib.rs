@@ -20,7 +20,10 @@
 pub mod context;
 pub mod crypto;
 pub mod envelope;
+pub mod event_log;
 pub mod identity;
+pub mod uri;
+pub mod well_known;
 
 // Re-export the MLS module's primary types at the crate level for convenience.
 pub use crypto::mls;
