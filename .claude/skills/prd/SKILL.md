@@ -73,6 +73,7 @@ Analyze the input documents and generate a complete PRD. The output is a single 
       "acceptanceCriteria": ["Concrete, testable assertion 1", "Concrete, testable assertion 2"],
       "actionItems": ["Specific implementation step 1", "Specific implementation step 2"],
       "blockedBy": [],
+      "tools": [],
       "sources": [
         "specs/auth-design.md",
         { "file": "specs/api-spec.md", "section": "## Login Endpoint" }
@@ -87,10 +88,11 @@ Analyze the input documents and generate a complete PRD. The output is a single 
 }
 ```
 
-**Required fields** on every story: `id`, `title`, `gate`, `priority`, `severity`, `status`, `files`, `description`, `acceptanceCriteria`, `actionItems`, `blockedBy`, `sources`, `details`.
+**Required fields** on every story: `id`, `title`, `gate`, `priority`, `severity`, `status`, `files`, `description`, `acceptanceCriteria`, `actionItems`, `blockedBy`, `tools`, `sources`, `details`.
 
 - `severity`: `"critical"` | `"major"` | `"minor"` — used for prioritization within a gate
 - `actionItems`: concrete implementation steps (what to do), complementing `acceptanceCriteria` (what to verify)
+- `tools`: array of abstract capability categories this story requires. Values: `"browser"` (web UI interaction, screenshots, DOM verification), `"mobile"` (iOS/Android simulator interaction, native gestures), `"design"` (design file reference, token extraction, visual fidelity). Defaults to `[]`.
 - `sources`: array of backlinks to the source documents this story was derived from. Each entry is either:
   - A string file path: `"specs/auth-design.md"` (the whole file is relevant)
   - An object with a section pointer: `{ "file": "specs/api-spec.md", "section": "## Login Endpoint" }`
@@ -119,6 +121,7 @@ Analyze the input documents and generate a complete PRD. The output is a single 
     - **`details`**: source subsections that don't map to a top-level key get copied as `{ "sectionName": "section content" }` entries. Use the source's section heading as the key.
     - When in doubt about where source content belongs, put it in `details` under a descriptive key rather than dropping it. Preserve lists exactly by converting them to arrays.
 11. **Source backlinks** — every story derived from a source document must include at least one entry in `sources`. This creates a traceable chain from spec to implementation. If a story spans multiple source files or sections, include all of them.
+12. **Tool detection** — auto-detect `tools` from acceptance criteria: browser/web UI/screenshots/DOM/CSS/responsive → `["browser"]`. Mobile app/simulator/emulator/native gestures → `["mobile"]`. Figma/design fidelity/design tokens/pixel-matching → `["design"]`. Multiple may apply. If none apply → `[]`.
 
 #### Source preservation examples
 

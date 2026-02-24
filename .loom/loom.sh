@@ -710,6 +710,49 @@ if [ "$USE_WORKTREE" = "yes" ]; then
   fi
 fi
 
+# ─── MCP Capability Detection ────────────────────────────────
+CAPABILITY_MAP=(
+  # browser
+  "playwright:browser"
+  "chrome:browser"
+  "puppeteer:browser"
+  "browserbase:browser"
+  # mobile
+  "mobile:mobile"
+  "mobile-mcp:mobile"
+  "appium:mobile"
+  # design
+  "figma:design"
+)
+
+detect_mcp_capabilities() {
+  local mcp_file="$PROJECT_DIR/.mcp.json"
+  local caps=""
+  if [ -f "$mcp_file" ]; then
+    local servers
+    servers=$(jq -r '.mcpServers // {} | keys[]' "$mcp_file" 2>/dev/null)
+    LOOM_MCP_SERVERS=$(echo "$servers" | paste -sd, -)
+    for server in $servers; do
+      for mapping in "${CAPABILITY_MAP[@]}"; do
+        if [ "$server" = "${mapping%%:*}" ]; then
+          local cap="${mapping#*:}"
+          [[ ",$caps," != *",$cap,"* ]] && caps="${caps:+$caps,}$cap"
+        fi
+      done
+      # Unknown servers: expose by name as a capability
+      local matched=false
+      for mapping in "${CAPABILITY_MAP[@]}"; do
+        [ "$server" = "${mapping%%:*}" ] && matched=true && break
+      done
+      $matched || caps="${caps:+$caps,}$server"
+    done
+  fi
+  export LOOM_MCP_SERVERS="${LOOM_MCP_SERVERS:-}"
+  export LOOM_CAPABILITIES="${caps:-}"
+}
+
+detect_mcp_capabilities
+
 # ─── Tmux Launch ─────────────────────────────────────────────────
 if $USE_TMUX; then
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -809,6 +852,9 @@ if [ -n "$DIRECTIVE_FILE" ]; then
 fi
 if [ "$USE_WORKTREE" = "yes" ]; then
   echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
+fi
+if [ -n "$LOOM_CAPABILITIES" ]; then
+  echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
 fi
 echo ""
 echo -e "  ${CYAN}Graceful stop${NC}    touch $LOOM_DIR/.stop"

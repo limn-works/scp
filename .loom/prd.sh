@@ -170,17 +170,19 @@ Generate a COMPLETE, VALID JSON object for .loom/prd.json. Output ONLY the JSON 
       \"acceptanceCriteria\": [\"Concrete, testable assertion\"],
       \"actionItems\": [\"Specific implementation step\"],
       \"blockedBy\": [],
+      \"tools\": [],
       \"details\": {}
     }
   ]
 }
 
 ### Required fields on every story
-id, title, gate, priority, severity, status, files, description, acceptanceCriteria, actionItems, blockedBy, details
+id, title, gate, priority, severity, status, files, description, acceptanceCriteria, actionItems, blockedBy, tools, details
 
 - severity: \"critical\" (blocking/security), \"major\" (significant), \"minor\" (cleanup/polish)
 - actionItems: concrete implementation steps (what to do)
 - acceptanceCriteria: concrete verification steps (what to check)
+- tools: array of abstract capability categories this story requires. Values: \"browser\" (web UI interaction, screenshots, DOM verification), \"mobile\" (iOS/Android simulator interaction, native gestures), \"design\" (design file reference, token extraction, visual fidelity). Defaults to [].
 - details: object for arbitrary project-specific metadata (always present, use {} when empty). Common keys: protocolSection, designUrl, apiEndpoints, migrationSteps, currentBehavior, targetBehavior, etc.
 
 ### Rules
@@ -193,11 +195,12 @@ id, title, gate, priority, severity, status, files, description, acceptanceCrite
 6. ACCEPTANCE CRITERIA — concrete, testable. Not 'it works' but 'POST /api/x returns 200 with JWT'.
 7. NO OVER-DECOMPOSITION — keep coupled work together. A model + its migration + its route = one story.
 8. CRITICAL PATH FIRST — lowest story numbers on the critical path.
-9. DESCRIPTION — enough context for autonomous implementation. Include spec references."
+9. DESCRIPTION — enough context for autonomous implementation. Include spec references.
+10. TOOLS — auto-detect from acceptance criteria: browser/web UI/screenshots/DOM/CSS/responsive → [\"browser\"]. Mobile app/simulator/emulator/native gestures → [\"mobile\"]. Figma/design fidelity/design tokens/pixel-matching → [\"design\"]. Multiple may apply. If none apply → []."
 
 if [ -n "$MAX_STORIES" ]; then
   PROMPT+="
-10. MAXIMUM $MAX_STORIES STORIES. Prioritize the most important work. Note omitted scope in the project description."
+11. MAXIMUM $MAX_STORIES STORIES. Prioritize the most important work. Note omitted scope in the project description."
 fi
 
 if $APPEND; then

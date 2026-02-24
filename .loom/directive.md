@@ -33,6 +33,15 @@ Read `.loom/status.md`. Note any failing tests or uncommitted changes from a pre
 
 Use subagents (Task tool) to parallelize independent pieces of work where possible. Assign one distinct unit of work per subagent. Always **search the codebase before assuming something is missing** — don't reimplement what already exists.
 
+### Visual verification
+
+If the `LOOM_CAPABILITIES` environment variable is non-empty (e.g. `browser`, `mobile`, `design`), MCP tools are available for visual verification. When the directive involves UI, visual, or interaction work:
+
+- **Write test files** for visual/interaction requirements using the project's test framework as durable verification.
+- **Use MCP tools ad-hoc** during implementation to screenshot, inspect, and debug visual changes before committing.
+
+This is never gating — proceed with or without MCP tools. They are a bonus for higher-fidelity verification.
+
 ---
 
 ## Step 3: Post-Execution
@@ -55,7 +64,16 @@ When committing, follow these rules:
 - **Do not bundle unrelated changes.** A feature and its tests can share a commit, but two separate features must not.
 - **Stage specific files by name.** Never use `git add -A` or `git add .`.
 
-### 3c — Store Learnings in Memory
+### 3c — Update Documentation
+
+Check if the work done this iteration warrants documentation updates:
+
+- **Root `.docs/` and `CLAUDE.md`** — update if you changed project-wide patterns, APIs, architecture, or conventions that future agents or developers need to know about.
+- **Feature-scoped `.docs/` and `CLAUDE.md`** — if you worked in a feature directory (e.g. `src/auth/`, `lib/transport/`), create or update a `.docs/` directory and/or `CLAUDE.md` there with usage notes, constraints, and gotchas specific to that feature.
+
+Keep docs concise and practical. Skip if the work was trivial.
+
+### 3d — Store Learnings in Memory
 
 Use Vestige to store any operational learnings from this iteration:
 
@@ -65,7 +83,7 @@ Use Vestige to store any operational learnings from this iteration:
 
 Only store things that would be **useful to a future iteration with no memory of this one**. Don't store routine progress — that's what status.md is for.
 
-### 3d — Emit Result Signal
+### 3e — Emit Result Signal
 
 Before writing status.md, output a result signal on its own line so the loop controller can parse it:
 
@@ -74,7 +92,7 @@ Before writing status.md, output a result signal on its own line so the loop con
 - `LOOM_RESULT:FAILED` — nothing completed successfully this iteration
 - `LOOM_RESULT:DONE` — directive is fully complete and no work remains; the loop should stop
 
-### 3e — Update Status (LAST STEP — triggers loop restart)
+### 3f — Update Status (LAST STEP — triggers loop restart)
 
 **This must be the final file you write.** Writing to `status.md` signals the loop controller that the iteration is complete. You will be terminated immediately after this write. Ensure all commits and memory storage are done before this step.
 
