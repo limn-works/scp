@@ -102,15 +102,17 @@ if [ -n "$LATEST_SUBAGENT_LOG" ] && [ -s "$LATEST_SUBAGENT_LOG" ]; then
   echo -e "${DIM}─────────────────────────────────────────${NC}"
   jq -s '
     ([.[] | select(.event == "dispatch")] | length) as $dispatched |
-    ([.[] | select(.event == "complete")] | length) as $completed |
+    ([.[] | select(.event == "dispatch") | .index]) as $di |
+    ([.[] | select(.event == "block_stop") | .index]) as $si |
+    ($di | map(select(. as $i | $si | index($i))) | length) as $completed |
     "  Dispatched: \($dispatched)  Completed: \($completed)  Orphaned: \($dispatched - $completed)"
   ' "$LATEST_SUBAGENT_LOG" 2>/dev/null | tr -d '"' || true
-  # Per-subagent timeline
+  # Per-subagent timeline (dispatch + matched completions)
   jq -r '
     if .event == "dispatch" then
-      "  \(.ts)  \u001b[0;33mDISPATCH\u001b[0m  \(.tool_use_id)"
-    elif .event == "complete" then
-      "  \(.ts)  \u001b[0;32mCOMPLETE\u001b[0m  \(.tool_use_id)"
+      "  \(.ts)  \u001b[0;33mDISPATCH\u001b[0m  idx:\(.index)  \(.tool_use_id)"
+    elif .event == "block_stop" then
+      "  \(.ts)  \u001b[0;32mCOMPLETE\u001b[0m  idx:\(.index)"
     else empty end
   ' "$LATEST_SUBAGENT_LOG" 2>/dev/null || true
 fi

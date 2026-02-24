@@ -133,9 +133,18 @@ Use Vestige to store any operational learnings from this iteration:
 
 Only store things that would be **useful to a future iteration with no memory of this one**. Don't store routine progress — that's what status.md is for.
 
-### 4f — Emit Result Signal
+### 4f — Emit Result Signal (MANDATORY)
 
-Before writing status.md, output a result signal on its own line so the loop controller can parse it:
+**You MUST print one of these exact lines as visible output before writing status.md.** The loop controller parses your stdout for this signal. If you skip it, the iteration is recorded as UNKNOWN.
+
+Print one of these lines verbatim — no markdown, no formatting, no wrapping, just the raw text on its own line:
+
+```
+LOOM_RESULT:SUCCESS
+LOOM_RESULT:PARTIAL
+LOOM_RESULT:FAILED
+LOOM_RESULT:DONE
+```
 
 - `LOOM_RESULT:SUCCESS` — all stories/tasks completed, tests green, code committed
 - `LOOM_RESULT:PARTIAL` — some work done but not everything (e.g. some stories completed, others failed)

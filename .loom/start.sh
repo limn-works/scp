@@ -1077,13 +1077,12 @@ DRYEOF
           index: .event.index
         }
       elif (
-        .event.type? == "content_block_start" and
-        .event.content_block.type? == "tool_result"
+        .event.type? == "content_block_stop"
       ) then
         {
           ts: now | strftime("%Y-%m-%d %H:%M:%S"),
-          event: "complete",
-          tool_use_id: .event.content_block.tool_use_id
+          event: "block_stop",
+          index: .event.index
         }
       else empty
       end
@@ -1096,22 +1095,48 @@ DRYEOF
   ITER_END=$(date +%s)
   ITER_DURATION=$((ITER_END - ITER_START))
 
-  # ─── Count subagent dispatches + detect orphans ──
+  # ─── Count subagent dispatches + completions ──
+  # Dispatches are content_block_start with name=="Task". Completions
+  # are content_block_stop events matched by index to a dispatch.
   SUBAGENT_COUNT=0
-  SUBAGENT_ORPHANED=0
+  SUBAGENT_COMPLETED=0
   if [ -f "$SUBAGENT_LOG" ] && [ -s "$SUBAGENT_LOG" ]; then
-    SUBAGENT_COUNT=$(jq -s '[.[] | select(.event == "dispatch")] | length' "$SUBAGENT_LOG" 2>/dev/null || echo 0)
-    SUBAGENT_ORPHANED=$(jq -s '
-      ([.[] | select(.event == "dispatch") | .tool_use_id]) -
-      ([.[] | select(.event == "complete") | .tool_use_id]) | length
-    ' "$SUBAGENT_LOG" 2>/dev/null || echo 0)
-    if [ "$SUBAGENT_ORPHANED" -gt 0 ]; then
-      log "${YELLOW}$SUBAGENT_ORPHANED of $SUBAGENT_COUNT subagents did not complete${NC}"
+    eval "$(jq -s '
+      ([.[] | select(.event == "dispatch")] | length) as $d |
+      ([.[] | select(.event == "dispatch") | .index]) as $di |
+      ([.[] | select(.event == "block_stop") | .index]) as $si |
+      ($di | map(select(. as $i | $si | index($i))) | length) as $c |
+      "SUBAGENT_COUNT=\($d) SUBAGENT_COMPLETED=\($c)"
+    ' "$SUBAGENT_LOG" 2>/dev/null || echo "SUBAGENT_COUNT=0 SUBAGENT_COMPLETED=0")"
+    SUBAGENT_ORPHANED=$((SUBAGENT_COUNT - SUBAGENT_COMPLETED))
+    if [ "$SUBAGENT_COUNT" -gt 0 ]; then
+      if [ "$SUBAGENT_ORPHANED" -gt 0 ]; then
+        log "${YELLOW}Subagents: $SUBAGENT_COMPLETED/$SUBAGENT_COUNT completed ($SUBAGENT_ORPHANED did not finish)${NC}"
+      else
+        log "${GREEN}Subagents: $SUBAGENT_COUNT/$SUBAGENT_COUNT completed${NC}"
+      fi
     fi
   fi
 
   # ─── Parse result signal from iteration output ──
   RESULT_SIGNAL=$(parse_result_signal "$ITER_LOG")
+
+  # Fallback: if agent didn't emit a signal but clearly succeeded,
+  # infer from status.md content (which it writes as the final step).
+  if [ "$RESULT_SIGNAL" = "UNKNOWN" ] && [ "$CLAUDE_EXIT" -eq 0 ]; then
+    if [ -f "$LOOM_DIR/status.md" ] && [ "$LOOM_DIR/status.md" -nt "$LOOM_DIR/.iteration_marker" ]; then
+      if grep -qiE 'LOOM_RESULT:DONE|no (actionable |remaining )?stories remain' "$LOOM_DIR/status.md" 2>/dev/null; then
+        RESULT_SIGNAL="DONE"
+      elif grep -qiE 'LOOM_RESULT:SUCCESS|all.*complete|all.*done' "$LOOM_DIR/status.md" 2>/dev/null; then
+        RESULT_SIGNAL="SUCCESS"
+      elif grep -qiE 'LOOM_RESULT:PARTIAL|partial|some.*failed' "$LOOM_DIR/status.md" 2>/dev/null; then
+        RESULT_SIGNAL="PARTIAL"
+      else
+        RESULT_SIGNAL="SUCCESS"
+      fi
+      log "${DIM}(inferred signal from status.md: $RESULT_SIGNAL)${NC}"
+    fi
+  fi
 
   # ─── Determine iteration status ──
   ITER_STATUS="unknown"
