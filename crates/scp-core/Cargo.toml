@@ -1,0 +1,24 @@
+[package]
+name = "scp-core"
+version = "0.1.0"
+description = "Core protocol implementation for SCP (Shareable Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+openmls = { workspace = true }
+openmls_traits = { workspace = true }
+openmls_basic_credential = { workspace = true }
+openmls_rust_crypto = { workspace = true }
+openmls_memory_storage = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+rmp-serde = { workspace = true }
+scp-platform = { path = "../scp-platform" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
