@@ -46,16 +46,19 @@ TIMEOUT=$(grep -c '| timeout |' "$MASTER_LOG" 2>/dev/null || true)
 HALTED=$(grep -c '| HALTED |' "$MASTER_LOG" 2>/dev/null || true)
 FAILURES=$((TOTAL - SUCCESS - TIMEOUT - HALTED))
 [ "$FAILURES" -lt 0 ] && FAILURES=0
+TOTAL_SUBAGENTS=$(grep -oE 'subagents:[0-9]+' "$MASTER_LOG" 2>/dev/null | \
+  awk -F: '{s+=$2} END {print s+0}' || echo 0)
 
 echo -e "  Total iterations: ${BOLD}$TOTAL${NC}"
 echo -e "  Succeeded:        ${GREEN}$SUCCESS${NC}"
 echo -e "  Failed:           ${RED}$FAILURES${NC}"
 echo -e "  Timed out:        ${YELLOW}$TIMEOUT${NC}"
+echo -e "  Total subagents:  ${CYAN}$TOTAL_SUBAGENTS${NC}"
 
 # Signal breakdown
-SIG_SUCCESS=$(grep -c '| SUCCESS$' "$MASTER_LOG" 2>/dev/null || true)
-SIG_PARTIAL=$(grep -c '| PARTIAL$' "$MASTER_LOG" 2>/dev/null || true)
-SIG_FAILED=$(grep -c '| FAILED$' "$MASTER_LOG" 2>/dev/null || true)
+SIG_SUCCESS=$(grep -cE '\| SUCCESS( \||$)' "$MASTER_LOG" 2>/dev/null || true)
+SIG_PARTIAL=$(grep -cE '\| PARTIAL( \||$)' "$MASTER_LOG" 2>/dev/null || true)
+SIG_FAILED=$(grep -cE '\| FAILED( \||$)' "$MASTER_LOG" 2>/dev/null || true)
 
 echo ""
 echo -e "${CYAN}${BOLD}Result Signals${NC}"
@@ -68,7 +71,7 @@ echo -e "  FAILED:   ${RED}$SIG_FAILED${NC}"
 echo ""
 echo -e "${CYAN}${BOLD}Recent Iterations${NC}"
 echo -e "${DIM}─────────────────────────────────────────${NC}"
-tail -5 "$MASTER_LOG" | while IFS='|' read -r ts iter label status duration reason; do
+tail -5 "$MASTER_LOG" | while IFS='|' read -r ts iter label status duration reason subagents; do
   # Trim whitespace
   ts=$(echo "$ts" | xargs)
   iter=$(echo "$iter" | xargs)
@@ -76,6 +79,7 @@ tail -5 "$MASTER_LOG" | while IFS='|' read -r ts iter label status duration reas
   status=$(echo "$status" | xargs)
   duration=$(echo "$duration" | xargs)
   reason=$(echo "$reason" | xargs)
+  subagents=$(echo "$subagents" | xargs)
 
   # Color by status
   case "$status" in
@@ -85,7 +89,9 @@ tail -5 "$MASTER_LOG" | while IFS='|' read -r ts iter label status duration reas
     *)       sc="${RED}" ;;
   esac
 
-  echo -e "  ${DIM}$ts${NC}  $iter  ${sc}$status${NC}  ${duration}  $reason"
+  local_line="  ${DIM}$ts${NC}  $iter  ${sc}$status${NC}  ${duration}  $reason"
+  [ -n "$subagents" ] && local_line="$local_line  ${CYAN}$subagents${NC}"
+  echo -e "$local_line"
 done
 
 # ─── Current status.md ──────────────────────────────────────────

@@ -22,7 +22,7 @@ else
 fi
 DRY_RUN=false
 DIRECTIVE_FILE=""
-TIMEOUT=3600
+TIMEOUT=10800
 MAX_FAILURES=3
 CONSECUTIVE_FAILURES=0
 
@@ -153,7 +153,7 @@ Usage: loom.sh [OPTIONS]
 Options:
   -m, --max-iterations N   Maximum loop iterations (default: 500)
   -d, --dry-run            Analyze one iteration without executing changes
-  --timeout SECONDS        Per-iteration timeout (default: 3600)
+  --timeout SECONDS        Per-iteration timeout (default: 10800)
   --max-failures N         Consecutive failures before halt (default: 3)
   -h, --help               Show this help
 
@@ -602,13 +602,15 @@ separator() {
 
 master_log() {
   # Append a structured line to master.log
-  # Format: timestamp | #iteration | label | status | duration | reason
-  local iteration="$1" label="$2" status="$3" duration="$4" reason="$5"
+  # Format: timestamp | #iteration | label | status | duration | reason [| subagents:N]
+  local iteration="$1" label="$2" status="$3" duration="$4" reason="$5" subagents="${6:-}"
   local ts
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
   local log_dir="$LOOM_DIR/logs"
   mkdir -p "$log_dir"
-  echo "$ts | #$iteration | $label | $status | ${duration}s | $reason" >> "$log_dir/master.log"
+  local line="$ts | #$iteration | $label | $status | ${duration}s | $reason"
+  [ -n "$subagents" ] && line="$line | subagents:$subagents"
+  echo "$line" >> "$log_dir/master.log"
 }
 
 # ─── Timeout Detection ──────────────────────────────────────────
@@ -931,7 +933,7 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
   # ─── Circuit breaker: consecutive failures ──
   if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_FAILURES" ]; then
     log "${RED}${BOLD}Circuit breaker tripped:${NC} $CONSECUTIVE_FAILURES consecutive failures. Halting."
-    master_log "$ITERATION" "$MODE_LABEL" "HALTED" "0" "Circuit breaker: $CONSECUTIVE_FAILURES consecutive failures"
+    master_log "$ITERATION" "$MODE_LABEL" "HALTED" "0" "Circuit breaker: $CONSECUTIVE_FAILURES consecutive failures" "0"
     break
   fi
 
@@ -1020,38 +1022,54 @@ DRYEOF
 
   cd "$PROJECT_DIR"
 
+  export LOOM_TIMEOUT="$TIMEOUT"
+
   # ─── Per-iteration log file ──
   ITER_LABEL="${MODE_LABEL}"
   ITER_LOG="$LOOM_DIR/logs/$(date '+%Y%m%d-%H%M%S')-${ITER_LABEL}.log"
   ITER_START=$(date +%s)
 
   # ─── Execute Claude with streaming output ──
-  set +e
+  CLAUDE_PREFIX=""
   if [ -n "$TIMEOUT_CMD" ] && [ "$TIMEOUT" -gt 0 ]; then
-    $TIMEOUT_CMD --foreground "$TIMEOUT" claude -p \
-      --dangerously-skip-permissions \
-      --verbose \
-      --output-format stream-json \
-      --include-partial-messages \
-      "$PROMPT" 2>>"$LOG_FILE" | \
-      jq --unbuffered -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text' 2>/dev/null | \
-      tee >(strip_ansi | tee -a "$LOG_FILE" > "$ITER_LOG")
-    CLAUDE_EXIT=${PIPESTATUS[0]}
-  else
-    claude -p \
-      --dangerously-skip-permissions \
-      --verbose \
-      --output-format stream-json \
-      --include-partial-messages \
-      "$PROMPT" 2>>"$LOG_FILE" | \
-      jq --unbuffered -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text' 2>/dev/null | \
-      tee >(strip_ansi | tee -a "$LOG_FILE" > "$ITER_LOG")
-    CLAUDE_EXIT=${PIPESTATUS[0]}
+    CLAUDE_PREFIX="$TIMEOUT_CMD --foreground $TIMEOUT"
   fi
+
+  SUBAGENT_LOG="$LOOM_DIR/logs/$(date '+%Y%m%d-%H%M%S')-${ITER_LABEL}-subagents.jsonl"
+
+  set +e
+  $CLAUDE_PREFIX claude -p \
+    --dangerously-skip-permissions \
+    --verbose \
+    --output-format stream-json \
+    --include-partial-messages \
+    "$PROMPT" 2>>"$LOG_FILE" | \
+    tee >(jq --unbuffered -c '
+      select(.type == "stream_event") |
+      select(
+        .event.type? == "content_block_start" and
+        .event.content_block.type? == "tool_use" and
+        .event.content_block.name? == "Task"
+      ) |
+      {
+        ts: now | strftime("%Y-%m-%d %H:%M:%S"),
+        tool_use_id: .event.content_block.id,
+        tool_name: .event.content_block.name
+      }
+    ' >> "$SUBAGENT_LOG" 2>/dev/null) | \
+    jq --unbuffered -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text' 2>/dev/null | \
+    tee >(strip_ansi | tee -a "$LOG_FILE" > "$ITER_LOG")
+  CLAUDE_EXIT=${PIPESTATUS[0]}
   set -e
 
   ITER_END=$(date +%s)
   ITER_DURATION=$((ITER_END - ITER_START))
+
+  # ─── Count subagent dispatches ──
+  SUBAGENT_COUNT=0
+  if [ -f "$SUBAGENT_LOG" ]; then
+    SUBAGENT_COUNT=$(wc -l < "$SUBAGENT_LOG" | tr -d ' ')
+  fi
 
   # ─── Parse result signal from iteration output ──
   RESULT_SIGNAL=$(parse_result_signal "$ITER_LOG")
@@ -1074,7 +1092,7 @@ DRYEOF
     log "${YELLOW}Iteration $ITERATION finished (exit $CLAUDE_EXIT, signal: $RESULT_SIGNAL)${NC}"
   fi
 
-  master_log "$ITERATION" "$ITER_LABEL" "$ITER_STATUS" "$ITER_DURATION" "$ITER_REASON"
+  master_log "$ITERATION" "$ITER_LABEL" "$ITER_STATUS" "$ITER_DURATION" "$ITER_REASON" "$SUBAGENT_COUNT"
 
   # ─── Done: no remaining work ──
   if [ "$RESULT_SIGNAL" = "DONE" ]; then
@@ -1104,5 +1122,5 @@ done
 
 if ! $DRY_RUN && [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
   log "${YELLOW}${BOLD}Loom completed $MAX_ITERATIONS iterations. Halting.${NC}"
-  master_log "$ITERATION" "$MODE_LABEL" "MAX_ITER" "0" "Reached max iterations"
+  master_log "$ITERATION" "$MODE_LABEL" "MAX_ITER" "0" "Reached max iterations" "0"
 fi
