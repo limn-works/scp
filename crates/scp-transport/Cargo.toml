@@ -1,0 +1,20 @@
+[package]
+name = "scp-transport"
+version = "0.1.0"
+description = "Transport abstraction layer for SCP (Shareable Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+scp-core = { path = "../scp-core" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = "0.3"
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+futures = "0.3"
+
+[lints]
+workspace = true
