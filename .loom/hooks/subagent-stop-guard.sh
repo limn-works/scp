@@ -12,6 +12,11 @@
 
 INPUT=$(cat)
 
+# Safety valve: if a stop hook already blocked this cycle, let it
+# through to prevent infinite loops.
+STOP_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false')
+[ "$STOP_ACTIVE" = "true" ] && exit 0
+
 MESSAGE=$(echo "$INPUT" | jq -r '.last_assistant_message // empty')
 
 # If the subagent produced no output at all, block so the

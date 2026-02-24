@@ -192,10 +192,17 @@ done
 
 # ─── Piped stdin ─────────────────────────────────────────────────
 if [ ! -t 0 ]; then
-  PIPED="$(timeout 1 cat 2>/dev/null || true)"
+  # detect_timeout_cmd runs later, so resolve timeout binary inline here
+  _tc=""; command -v gtimeout &>/dev/null && _tc=gtimeout || command -v timeout &>/dev/null && _tc=timeout
+  if [ -n "$_tc" ]; then
+    PIPED="$("$_tc" 1 cat 2>/dev/null || true)"
+  else
+    PIPED="$(cat 2>/dev/null || true)"
+  fi
   if [ -n "$PIPED" ]; then
     SOURCES_PIPED="$PIPED"
   fi
+  unset _tc
 fi
 
 # ─── Build Directive Content ─────────────────────────────────────
@@ -683,7 +690,7 @@ cleanup() {
   if [ "${ITERATION:-0}" -gt 0 ]; then
     create_pr 2>/dev/null || true
   fi
-  rm -f "$LOOM_DIR/.directive" "$LOOM_DIR/.piped_directive" "$LOOM_DIR/.iteration_marker" "$LOOM_DIR/.stop" "$LOOM_DIR/.pid"
+  rm -f "$LOOM_DIR/.directive" "$LOOM_DIR/.piped_directive" "$LOOM_DIR/.iteration_marker" "$LOOM_DIR/.stop" "$LOOM_DIR/.pid" "$LOOM_DIR/.iter_state" "$LOOM_DIR/.header-pane.sh"
   cleanup_worktree
 }
 trap cleanup EXIT
@@ -818,8 +825,8 @@ if $USE_TMUX; then
   rm -f "$PID_FILE"
 
   # Compute header height to match content exactly
-  # Base: 1 (title) + 1 (PID/Mode) + 1 (Dir) + 1 (Stop) = 4
-  HEADER_HEIGHT=4
+  # Base: 1 (title) + 1 (PID/Mode) + 1 (Dir) + 1 (Stop) + 1 (Iter/timer) = 5
+  HEADER_HEIGHT=5
   [ -n "$DIRECTIVE_FILE" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
   # Tree line only shown when different from Dir
   [ "$USE_WORKTREE" = "yes" ] && [ "$WORKTREE_DIR" != "$PROJECT_DIR" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
@@ -841,14 +848,35 @@ if $USE_TMUX; then
     echo -en "  ${DIM}Stop${NC}  ${CYAN}touch $LOOM_DIR/.stop${NC}"
   } > "$LOOM_DIR/.header"
 
+  # Generate header pane script (reads .header + .iter_state, computes elapsed timer)
+  cat > "$LOOM_DIR/.header-pane.sh" <<'HEADEREOF'
+#!/bin/sh
+LOOM_DIR="$1"
+while true; do
+  printf '\033[H\033[J'
+  cat "$LOOM_DIR/.header" 2>/dev/null || printf '  Starting…\n'
+  if [ -f "$LOOM_DIR/.iter_state" ]; then
+    read -r iter start < "$LOOM_DIR/.iter_state"
+    now=$(date +%s)
+    elapsed=$((now - start))
+    mins=$((elapsed / 60))
+    secs=$((elapsed % 60))
+    printf '  \033[2mIter\033[0m  \033[1m#%s\033[0m  \033[2m|\033[0m  \033[2m%dm %02ds\033[0m\n' "$iter" "$mins" "$secs"
+  else
+    printf '  \033[2mIter\033[0m  \033[2mwaiting…\033[0m\n'
+  fi
+  sleep 1
+done
+HEADEREOF
+
   # Main pane: the loom loop (LOOM_TMUX_CHILD tells the child to
   # write its banner to .header instead of stdout)
   tmux new-session -d -s "$TMUX_SESSION" -x "$TERM_COLS" -y "$TERM_LINES" \
     "LOOM_TMUX_CHILD=1 exec $0 $FORWARD_FLAGS"
 
-  # Top: fixed header pane (always visible, sized to content)
+  # Top: fixed header pane (always visible, sized to content, 1s refresh for timer)
   tmux split-window -v -b -t "$TMUX_SESSION:0.0" -l "$HEADER_HEIGHT" \
-    "sh -c 'while true; do printf \"\\033[H\\033[J\"; cat \"$LOOM_DIR/.header\" 2>/dev/null || printf \"  Starting…\\n\"; sleep 2; done'"
+    "exec sh \"$LOOM_DIR/.header-pane.sh\" \"$LOOM_DIR\""
 
   # Bottom-left: live status.md (compact, 10 lines)
   tmux split-window -v -t "$TMUX_SESSION:0.1" -l 10 \
@@ -1042,6 +1070,7 @@ DRYEOF
   ITER_LABEL="${MODE_LABEL}"
   ITER_LOG="$LOOM_DIR/logs/$(date '+%Y%m%d-%H%M%S')-${ITER_LABEL}.log"
   ITER_START=$(date +%s)
+  echo "$ITERATION $ITER_START" > "$LOOM_DIR/.iter_state"
 
   # ─── Execute Claude with streaming output ──
   CLAUDE_PREFIX=""

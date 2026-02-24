@@ -182,7 +182,7 @@ id, title, gate, priority, severity, status, files, description, acceptanceCrite
 - severity: \"critical\" (blocking/security), \"major\" (significant), \"minor\" (cleanup/polish)
 - actionItems: concrete implementation steps (what to do)
 - acceptanceCriteria: concrete verification steps (what to check)
-- tools: array of abstract capability categories this story requires. Values: \"browser\" (web UI interaction, screenshots, DOM verification), \"mobile\" (iOS/Android simulator interaction, native gestures), \"design\" (design file reference, token extraction, visual fidelity). Defaults to [].
+- tools: array of abstract capability categories this story requires. Values: \"browser\" (web UI interaction, screenshots, DOM verification), \"mobile\" (iOS/Android simulator interaction, gesture), \"design\" (design file reference, token extraction, visual fidelity). Defaults to [].
 - details: object for arbitrary project-specific metadata (always present, use {} when empty). Common keys: protocolSection, designUrl, apiEndpoints, migrationSteps, currentBehavior, targetBehavior, etc.
 
 ### Rules
@@ -196,7 +196,7 @@ id, title, gate, priority, severity, status, files, description, acceptanceCrite
 7. NO OVER-DECOMPOSITION — keep coupled work together. A model + its migration + its route = one story.
 8. CRITICAL PATH FIRST — lowest story numbers on the critical path.
 9. DESCRIPTION — enough context for autonomous implementation. Include spec references.
-10. TOOLS — auto-detect from acceptance criteria: browser/web UI/screenshots/DOM/CSS/responsive → [\"browser\"]. Mobile app/simulator/emulator/native gestures → [\"mobile\"]. Figma/design fidelity/design tokens/pixel-matching → [\"design\"]. Multiple may apply. If none apply → []."
+10. TOOLS — auto-detect from acceptance criteria: browser/web UI/screenshots/DOM/CSS/responsive → [\"browser\"]. Mobile app/simulator/emulator/gesture/tap/swipe/pinch/press/hold/drag/iOS/Android/app screen/push notification → [\"mobile\"]. Figma/design fidelity/design tokens/pixel-matching → [\"design\"]. Multiple may apply. If none apply → []."
 
 if [ -n "$MAX_STORIES" ]; then
   PROMPT+="
