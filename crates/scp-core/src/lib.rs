@@ -19,9 +19,11 @@
 
 pub mod context;
 pub mod crypto;
+pub mod discovery;
 pub mod envelope;
 pub mod event_log;
 pub mod identity;
+pub mod trust;
 pub mod uri;
 pub mod well_known;
 

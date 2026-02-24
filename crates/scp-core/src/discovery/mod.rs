@@ -1,0 +1,302 @@
+//! Tool-interface discovery for SCP.
+//!
+//! Implements two-tier discovery per ADR-020 (`.docs/adrs/phase-4.md`):
+//!
+//! 1. **DID document capabilities** -- Direct lookup via `did:dht`. Any agent
+//!    can publish capabilities in their DID document's `SCPCapabilities` service
+//!    entry. Zero setup, zero registration, zero dependency on discovery contexts.
+//!
+//! 2. **Discovery contexts** -- Searchable registries operated as standard SCP
+//!    contexts with open join policies and standardized tool schemas.
+//!
+//! # Modules
+//!
+//! - [`did_capabilities`] -- DID document capability resolution via `did:dht`.
+//!
+//! # Types
+//!
+//! - [`CapabilityEntry`] -- Capabilities extracted from a DID document.
+//! - [`DiscoveryQuery`] -- Search query for discovery contexts.
+//! - [`DiscoveryResult`] -- Merged search results with provenance.
+//! - [`DiscoveryResultEntry`] -- A single result entry with relevance scoring.
+//! - [`RegistrationEntry`] -- A registered agent entry in a discovery context.
+//! - [`DiscoveryBootstrap`] -- Default discovery context configuration.
+//! - [`DataProvenance`] -- Placeholder provenance metadata (replaced by SCP-070).
+//! - [`DiscoveryError`] -- Error type for discovery operations.
+
+pub mod did_capabilities;
+
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+pub use did_capabilities::{CapabilityEntry, resolve_capabilities};
+
+// ---------------------------------------------------------------------------
+// Type aliases (match event_log/mod.rs pattern)
+// ---------------------------------------------------------------------------
+
+/// A DID string (e.g., `"did:dht:z6Mk..."`).
+pub type DID = String;
+
+/// A context identifier string.
+pub type ContextId = String;
+
+// ---------------------------------------------------------------------------
+// DataProvenance (placeholder -- replaced by SCP-070 provenance module)
+// ---------------------------------------------------------------------------
+
+/// Placeholder provenance metadata attached to discovery results.
+///
+/// This is a minimal struct that will be replaced by the full `DataProvenance`
+/// type from the provenance module (SCP-070). It records the source DID, an
+/// optional source context, and a timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataProvenance {
+    /// The DID of the data source.
+    pub source_did: DID,
+    /// The context from which the data originated, if applicable.
+    pub source_context: Option<ContextId>,
+    /// Unix timestamp (seconds) when the provenance was recorded.
+    pub timestamp: u64,
+}
+
+// ---------------------------------------------------------------------------
+// DiscoveryQuery
+// ---------------------------------------------------------------------------
+
+/// A search query for discovery contexts.
+///
+/// Used to query discovery contexts for agents matching specific capabilities,
+/// keywords, or history requirements. All fields are optional filters -- an
+/// empty query matches all entries.
+///
+/// See ADR-020 acceptance criterion 1.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryQuery {
+    /// Filter by capability strings. Only agents advertising all listed
+    /// capabilities are returned.
+    pub capability_filter: Option<Vec<String>>,
+    /// Free-text keyword filter for metadata search.
+    pub keywords: Option<Vec<String>>,
+    /// Minimum participation history duration. Only agents with at least
+    /// this much history in discovery contexts are returned.
+    pub min_history: Option<Duration>,
+}
+
+// ---------------------------------------------------------------------------
+// DiscoveryResult / DiscoveryResultEntry
+// ---------------------------------------------------------------------------
+
+/// Merged search results from one or more discovery sources.
+///
+/// Contains deduplicated entries ranked by relevance, with provenance per
+/// entry and the list of discovery context sources that were queried.
+///
+/// See ADR-020 acceptance criterion 1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiscoveryResult {
+    /// The discovery result entries, ranked by relevance score (descending).
+    pub entries: Vec<DiscoveryResultEntry>,
+    /// The discovery context IDs that were queried to produce these results.
+    pub sources: Vec<ContextId>,
+}
+
+/// A single entry in a discovery result set.
+///
+/// Contains the agent's DID, advertised capabilities, optional behavioral
+/// summary, provenance metadata, and a relevance score.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiscoveryResultEntry {
+    /// The agent's DID.
+    pub did: DID,
+    /// The agent's advertised capabilities.
+    pub capabilities: Vec<String>,
+    /// Optional behavioral summary (agent-computed from event logs).
+    pub behavioral_summary: Option<serde_json::Value>,
+    /// Provenance metadata for this entry.
+    pub provenance: DataProvenance,
+    /// Relevance score (0.0 to 1.0). Higher is more relevant.
+    pub relevance_score: f64,
+}
+
+// ---------------------------------------------------------------------------
+// RegistrationEntry
+// ---------------------------------------------------------------------------
+
+/// A registered agent entry in a discovery context.
+///
+/// Created when an agent registers via the `agent_register` tool schema.
+/// The entry is recorded in the discovery context's event log as an MLS
+/// application message.
+///
+/// See ADR-020 acceptance criterion 1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistrationEntry {
+    /// The registered agent's DID.
+    pub did: DID,
+    /// The agent's advertised capabilities.
+    pub capabilities: Vec<String>,
+    /// Arbitrary metadata provided at registration time.
+    pub metadata: serde_json::Value,
+    /// Unique identifier for this registration entry.
+    pub entry_id: String,
+    /// Unix timestamp (seconds) when the registration was recorded.
+    pub registered_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// DiscoveryBootstrap
+// ---------------------------------------------------------------------------
+
+/// Default discovery context configuration for SDK bootstrap.
+///
+/// Analogous to DNS root servers: the SDK ships with configurable default
+/// discovery context IDs that are queried on first identity creation (opt-out).
+/// If defaults are unreachable, direct DID resolution still works.
+///
+/// See ADR-020 acceptance criterion 8.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryBootstrap {
+    /// Default discovery context IDs to query on bootstrap.
+    pub default_context_ids: Vec<ContextId>,
+}
+
+// ---------------------------------------------------------------------------
+// DiscoveryError
+// ---------------------------------------------------------------------------
+
+/// Errors produced by discovery operations.
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryError {
+    /// DID resolution via did:dht failed.
+    #[error("DID resolution failed: {0}")]
+    DidResolutionFailed(String),
+
+    /// The resolved DID document has no `SCPCapabilities` service entry.
+    #[error("no SCPCapabilities service entry in DID document for: {0}")]
+    NoCapabilitiesService(String),
+
+    /// The `SCPCapabilities` service entry contains invalid capability data.
+    #[error("invalid capabilities in DID document: {0}")]
+    InvalidCapabilities(String),
+
+    /// A cache operation failed.
+    #[error("cache error: {0}")]
+    CacheError(String),
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_query_default_has_no_filters() {
+        let query = DiscoveryQuery::default();
+        assert!(query.capability_filter.is_none());
+        assert!(query.keywords.is_none());
+        assert!(query.min_history.is_none());
+    }
+
+    #[test]
+    fn discovery_query_with_filters() {
+        let query = DiscoveryQuery {
+            capability_filter: Some(vec!["code_review".to_owned()]),
+            keywords: Some(vec!["rust".to_owned()]),
+            min_history: Some(Duration::from_secs(86400)),
+        };
+        assert_eq!(query.capability_filter.as_ref().unwrap().len(), 1);
+        assert_eq!(query.keywords.as_ref().unwrap()[0], "rust");
+        assert_eq!(query.min_history.unwrap(), Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn discovery_result_entry_serialization_roundtrip() {
+        let entry = DiscoveryResultEntry {
+            did: "did:dht:zTestDid".to_owned(),
+            capabilities: vec!["code_review".to_owned(), "testing".to_owned()],
+            behavioral_summary: Some(serde_json::json!({"participation": 42})),
+            provenance: DataProvenance {
+                source_did: "did:dht:zSourceDid".to_owned(),
+                source_context: Some("ctx-001".to_owned()),
+                timestamp: 1_700_000_000,
+            },
+            relevance_score: 0.85,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: DiscoveryResultEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(entry, deserialized);
+    }
+
+    #[test]
+    fn registration_entry_serialization_roundtrip() {
+        let entry = RegistrationEntry {
+            did: "did:dht:zAgent123".to_owned(),
+            capabilities: vec!["translation".to_owned()],
+            metadata: serde_json::json!({"language": "es"}),
+            entry_id: "reg-001".to_owned(),
+            registered_at: 1_700_000_000,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: RegistrationEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(entry, deserialized);
+    }
+
+    #[test]
+    fn discovery_bootstrap_default_has_no_contexts() {
+        let bootstrap = DiscoveryBootstrap::default();
+        assert!(bootstrap.default_context_ids.is_empty());
+    }
+
+    #[test]
+    fn discovery_bootstrap_with_contexts() {
+        let bootstrap = DiscoveryBootstrap {
+            default_context_ids: vec!["ctx-discovery-1".to_owned(), "ctx-discovery-2".to_owned()],
+        };
+        assert_eq!(bootstrap.default_context_ids.len(), 2);
+    }
+
+    #[test]
+    fn data_provenance_serialization_roundtrip() {
+        let provenance = DataProvenance {
+            source_did: "did:dht:zProvSource".to_owned(),
+            source_context: None,
+            timestamp: 1_700_000_000,
+        };
+
+        let json = serde_json::to_string(&provenance).unwrap();
+        let deserialized: DataProvenance = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(provenance, deserialized);
+    }
+
+    #[test]
+    fn discovery_error_display_messages() {
+        let err = DiscoveryError::DidResolutionFailed("timeout".to_owned());
+        assert!(err.to_string().contains("timeout"));
+
+        let err = DiscoveryError::NoCapabilitiesService("did:dht:z123".to_owned());
+        assert!(err.to_string().contains("SCPCapabilities"));
+
+        let err = DiscoveryError::InvalidCapabilities("malformed JSON".to_owned());
+        assert!(err.to_string().contains("malformed JSON"));
+
+        let err = DiscoveryError::CacheError("disk full".to_owned());
+        assert!(err.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn discovery_result_empty() {
+        let result = DiscoveryResult {
+            entries: Vec::new(),
+            sources: vec!["ctx-discovery-1".to_owned()],
+        };
+        assert!(result.entries.is_empty());
+        assert_eq!(result.sources.len(), 1);
+    }
+}
