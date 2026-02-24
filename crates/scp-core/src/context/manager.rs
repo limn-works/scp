@@ -142,6 +142,10 @@ mod tests {
     }
 
     impl ContextCryptoProvider for MockCrypto {
+        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
         fn create_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             if self.fail_create_mls.load(Ordering::Relaxed) {
                 return Err(ContextCreationError::CryptoFailed(

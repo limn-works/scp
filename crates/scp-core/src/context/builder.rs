@@ -11,6 +11,7 @@
 //! traits ([`ContextCryptoProvider`], [`ContextTransportProvider`],
 //! [`ContextEventLogProvider`]) so the builder is fully testable with mocks.
 
+use super::templates::validate_against_template;
 use super::{ContextError, ContextHandle, ContextMode, ContextParams, ContextState};
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,11 @@ pub enum ContextCreationError {
     /// Returned during Phase 1 validation.
     #[error("transport is not connected")]
     TransportNotConnected,
+
+    /// The creator's identity is invalid or the signing key is not accessible.
+    /// Returned during Phase 1 validation before any side effects.
+    #[error("identity validation failed: {0}")]
+    IdentityValidationFailed(String),
 
     /// An MLS group creation, sender key generation, broadcast key
     /// initialisation, or other crypto operation failed.
@@ -67,6 +73,18 @@ pub enum ContextCreationError {
 /// corresponding destruction (rollback). All methods take a `context_id` to
 /// scope the created state.
 pub trait ContextCryptoProvider: Send + Sync {
+    /// Validates that the creator's identity is valid and the signing key is
+    /// accessible.
+    ///
+    /// Called during Phase 1 (validation) before any side effects. This is a
+    /// read-only check that does not create or modify any state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::IdentityValidationFailed`] if the
+    /// identity is invalid or the signing key cannot be accessed.
+    fn validate_creator_identity(&self) -> Result<(), ContextCreationError>;
+
     /// Creates an MLS group for the given context.
     ///
     /// Called only when `mode == Encrypted`. The provider stores the group
@@ -172,31 +190,97 @@ pub trait ContextEventLogProvider: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Opaque resource handles -- represent ownership for rollback tracking
+// ---------------------------------------------------------------------------
+
+/// Opaque handle representing ownership of a created MLS group.
+///
+/// Exists solely to carry type-level evidence that an MLS group was created
+/// and needs rollback. The actual MLS group state lives inside the
+/// [`ContextCryptoProvider`]; this handle tracks that the provider holds
+/// state on behalf of this creation flow.
+#[derive(Debug)]
+pub struct MlsGroupHandle {
+    _private: (),
+}
+
+impl MlsGroupHandle {
+    /// Creates a new handle (builder-internal only).
+    const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Opaque handle representing ownership of a created sender key (or broadcast key).
+///
+/// Like [`MlsGroupHandle`], the actual key material lives inside the
+/// [`ContextCryptoProvider`]; this handle tracks that the provider holds
+/// sender key state for this context.
+#[derive(Debug)]
+pub struct SenderKeyHandle {
+    _private: (),
+}
+
+impl SenderKeyHandle {
+    /// Creates a new handle (builder-internal only).
+    const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Opaque handle representing ownership of a created event log.
+///
+/// The actual event log state lives inside the [`ContextEventLogProvider`];
+/// this handle tracks that the provider holds event log state for this context.
+#[derive(Debug)]
+pub struct EventLogHandle {
+    _private: (),
+}
+
+impl EventLogHandle {
+    /// Creates a new handle (builder-internal only).
+    const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CreationReceipt -- tracks completed steps for ordered rollback
 // ---------------------------------------------------------------------------
 
-/// Bitfield tracking which creation steps have completed so that rollback
-/// can reverse them in order.
+/// Tracks which creation steps have completed so that rollback can reverse
+/// them in order.
 ///
-/// Each flag corresponds to a creation step. On failure at any subsequent
+/// Each field corresponds to a creation step. On failure at any subsequent
 /// step, [`rollback`](CreationReceipt::rollback) destroys resources in
 /// reverse order.
 ///
 /// See ADR-008 section "Two-phase commit steps" for the step ordering.
 ///
-/// The four flags naturally map to the four creation steps that allocate
-/// recoverable resources; this is intentional and matches the ADR-008
-/// `CreationReceipt` specification.
+/// ## Design note: `Option<Handle>` vs `Option<T>` vs `bool`
+///
+/// The ADR-008 spec shows `Option<MlsGroup>`, `Option<SenderKey>`,
+/// `Option<EventLog>`. In this implementation, the actual resource state
+/// (MLS groups, sender keys, event logs) lives inside the provider traits
+/// ([`ContextCryptoProvider`], [`ContextEventLogProvider`]) which own and
+/// manage the state. The receipt holds opaque handle types
+/// ([`MlsGroupHandle`], [`SenderKeyHandle`], [`EventLogHandle`]) that
+/// carry type-level evidence of resource creation without duplicating
+/// provider-owned state. `published` remains a `bool` because transport
+/// publication has no recoverable local state -- rollback issues a
+/// best-effort DELETE to remote relays.
 #[derive(Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct CreationReceipt {
-    /// Whether an MLS group was created (Encrypted mode only).
-    pub mls_group: bool,
-    /// Whether a sender key (or broadcast key) was generated.
-    pub sender_key: bool,
-    /// Whether the event log was initialised.
-    pub event_log: bool,
-    /// Whether the context was published to transport.
+    /// Handle to the MLS group created during step 2 (Encrypted mode only).
+    /// `None` for Broadcast mode or if step 2 has not completed.
+    pub mls_group: Option<MlsGroupHandle>,
+    /// Handle to the sender key (Encrypted) or broadcast key (Broadcast)
+    /// created during step 2/3. `None` if the key step has not completed.
+    pub sender_key: Option<SenderKeyHandle>,
+    /// Handle to the event log initialised during step 4.
+    /// `None` if the event log step has not completed.
+    pub event_log: Option<EventLogHandle>,
+    /// Whether the context was published to transport (step 5).
     pub published: bool,
 }
 
@@ -219,13 +303,13 @@ impl CreationReceipt {
             // with destroyed keys.
             let _ = transport.delete_published(context_id);
         }
-        if self.event_log {
+        if self.event_log.is_some() {
             let _ = event_log.destroy_event_log(context_id);
         }
-        if self.sender_key {
+        if self.sender_key.is_some() {
             let _ = crypto.destroy_sender_key(context_id);
         }
-        if self.mls_group {
+        if self.mls_group.is_some() {
             let _ = crypto.destroy_mls_group(context_id);
         }
     }
@@ -237,9 +321,15 @@ impl CreationReceipt {
 
 /// Validates `ContextParams` for internal consistency.
 ///
-/// Checks that required fields are present and consistent. This is a pure
-/// function with no side effects.
-fn validate_params(params: &ContextParams) {
+/// Checks that required fields are present and consistent, including template
+/// validation when `template_id` is present. This is a pure function with no
+/// side effects.
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError::TemplateValidationFailed`] if a template
+/// is specified and the params do not match the template definition.
+fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // Governance model must be set (currently only SingleAdmin is supported).
     // ContextParams always has a governance field, so this is a placeholder
     // for future governance model validation.
@@ -248,20 +338,15 @@ fn validate_params(params: &ContextParams) {
     // policy is Governed, that is technically valid (no capabilities to
     // narrow). No structural constraint to enforce here.
 
-    // If a template is specified, validate against it.
+    // If a template is specified, validate all params match the template
+    // definition exactly.
     if params.template_id.is_some() {
-        validate_template(params);
+        validate_against_template(params).map_err(|e| {
+            ContextCreationError::TemplateValidationFailed(e.to_string())
+        })?;
     }
-}
 
-/// Stub for template validation until SCP-022 is wired in.
-///
-/// When `template_id` is `Some`, all `ContextParams` fields must match the
-/// template definition exactly. This stub is a no-op; SCP-022 will replace
-/// it with real validation that returns `ContextCreationError` on mismatch.
-#[allow(clippy::missing_const_for_fn)]
-fn validate_template(_params: &ContextParams) {
-    // Template validation will be wired in after SCP-022.
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -323,10 +408,13 @@ pub async fn create_context(
     // Phase 1 -- Validate (no side effects)
     // ------------------------------------------------------------------
 
-    // 1. Validate ContextParams.
-    validate_params(&params);
+    // 1. Validate ContextParams (including template validation).
+    validate_params(&params)?;
 
-    // 2. Validate transport connectivity.
+    // 2. Validate the creator's identity and signing key accessibility.
+    crypto.validate_creator_identity()?;
+
+    // 3. Validate transport connectivity.
     if !transport.is_connected() {
         return Err(ContextCreationError::TransportNotConnected);
     }
@@ -348,14 +436,14 @@ pub async fn create_context(
                 receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
                 return Err(e);
             }
-            receipt.mls_group = true;
+            receipt.mls_group = Some(MlsGroupHandle::new());
         }
         ContextMode::Broadcast => {
             if let Err(e) = crypto.init_broadcast_key(&id_bytes) {
                 receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
                 return Err(e);
             }
-            // No MLS group for Broadcast mode -- mls_group stays false.
+            // No MLS group for Broadcast mode -- mls_group stays None.
         }
     }
 
@@ -370,17 +458,25 @@ pub async fn create_context(
     // Mark sender_key for both modes: Encrypted has an explicit key,
     // Broadcast's key was initialised in step 2. Rollback destroys it
     // either way.
-    receipt.sender_key = true;
+    receipt.sender_key = Some(SenderKeyHandle::new());
 
     // Step 4: Initialise event log.
     if let Err(e) = event_log_provider.init_event_log(&id_bytes) {
         receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
         return Err(e);
     }
-    receipt.event_log = true;
+    receipt.event_log = Some(EventLogHandle::new());
 
     // Step 5: Publish to transport.
+    //
+    // If publish_context fails, the transport may have partially published
+    // (e.g., sent to 1 of 3 relays). Issue a best-effort DELETE for any
+    // partial blobs before rolling back all prior steps. Orphaned blobs on
+    // relays are encrypted with keys that will be destroyed during rollback,
+    // so they are unusable even if DELETE fails.
     if let Err(e) = transport.publish_context(&id_bytes, &params) {
+        // Best-effort cleanup of any partially published blobs.
+        let _ = transport.delete_published(&id_bytes);
         receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
         return Err(e);
     }
@@ -423,6 +519,7 @@ mod tests {
     /// specific steps.
     #[derive(Default)]
     struct MockCryptoProvider {
+        fail_validate_identity: AtomicBool,
         fail_create_mls: AtomicBool,
         fail_generate_sender_key: AtomicBool,
         fail_init_broadcast_key: AtomicBool,
@@ -434,6 +531,15 @@ mod tests {
     }
 
     impl ContextCryptoProvider for MockCryptoProvider {
+        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+            if self.fail_validate_identity.load(Ordering::Relaxed) {
+                return Err(ContextCreationError::IdentityValidationFailed(
+                    "mock identity validation failure".into(),
+                ));
+            }
+            Ok(())
+        }
+
         fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             if self.fail_create_mls.load(Ordering::Relaxed) {
                 return Err(ContextCreationError::CryptoFailed(
@@ -669,6 +775,37 @@ mod tests {
         assert!(transport.published.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn create_context_fails_when_identity_invalid() {
+        let crypto = MockCryptoProvider::default();
+        crypto
+            .fail_validate_identity
+            .store(true, Ordering::Relaxed);
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let result = create_context(
+            "ctx-bad-identity".into(),
+            ContextParams::default(),
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextCreationError::IdentityValidationFailed(_)
+        ));
+
+        // No side effects -- identity check is in Phase 1.
+        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
+        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
+        assert!(event_log.inited.lock().unwrap().is_empty());
+        assert!(transport.published.lock().unwrap().is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // Failure at each step with rollback verification
     // -----------------------------------------------------------------------
@@ -811,8 +948,10 @@ mod tests {
         assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
         assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);
         assert_eq!(event_log.destroyed.lock().unwrap().len(), 1);
-        // Publish itself failed, so nothing was published and nothing to delete.
+        // Publish failed, but partial publication rollback issues a
+        // best-effort DELETE to clean up any partially published blobs.
         assert!(transport.published.lock().unwrap().is_empty());
+        assert_eq!(transport.deleted.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -854,9 +993,9 @@ mod tests {
     fn creation_receipt_rollback_only_destroys_completed_steps() {
         // Simulate a receipt where only MLS group and sender key were created.
         let receipt = CreationReceipt {
-            mls_group: true,
-            sender_key: true,
-            event_log: false,
+            mls_group: Some(MlsGroupHandle::new()),
+            sender_key: Some(SenderKeyHandle::new()),
+            event_log: None,
             published: false,
         };
 
@@ -894,9 +1033,9 @@ mod tests {
     #[test]
     fn creation_receipt_full_rollback_destroys_everything() {
         let receipt = CreationReceipt {
-            mls_group: true,
-            sender_key: true,
-            event_log: true,
+            mls_group: Some(MlsGroupHandle::new()),
+            sender_key: Some(SenderKeyHandle::new()),
+            event_log: Some(EventLogHandle::new()),
             published: true,
         };
 
@@ -1015,5 +1154,164 @@ mod tests {
             result.unwrap_err(),
             ContextCreationError::EventLogFailed(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Template validation during creation (Phase 1)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_context_rejects_mismatched_template_params() {
+        use std::time::Duration;
+
+        use crate::context::params::{MemoryScope, TemplateId};
+        use crate::context::templates::template_params;
+
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        // Start from BilateralEphemeral template but change memory_scope to
+        // Full (template expects Ephemeral). This should fail Phase 1
+        // validation with no side effects.
+        let mut params = template_params(&TemplateId::BilateralEphemeral);
+        params.ttl = Some(Duration::from_secs(300));
+        params.memory_scope = MemoryScope::Full;
+
+        let result = create_context(
+            "ctx-template-mismatch".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextCreationError::TemplateValidationFailed(_)
+        ));
+
+        // No side effects -- nothing was created.
+        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
+        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
+        assert!(event_log.inited.lock().unwrap().is_empty());
+        assert!(transport.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_context_rejects_template_missing_required_ttl() {
+        use crate::context::params::TemplateId;
+        use crate::context::templates::template_params;
+
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        // BilateralEphemeral requires a TTL but template_params returns None.
+        let params = template_params(&TemplateId::BilateralEphemeral);
+        assert!(params.ttl.is_none());
+
+        let result = create_context(
+            "ctx-template-no-ttl".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextCreationError::TemplateValidationFailed(_)
+        ));
+
+        // No side effects.
+        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_context_accepts_valid_template_params() {
+        use std::time::Duration;
+
+        use crate::context::params::TemplateId;
+        use crate::context::templates::template_params;
+
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        // BilateralEphemeral with required TTL should succeed.
+        let mut params = template_params(&TemplateId::BilateralEphemeral);
+        params.ttl = Some(Duration::from_secs(3600));
+
+        let result = create_context(
+            "ctx-template-valid".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.context_id(), "ctx-template-valid");
+        assert_eq!(handle.state().await, ContextState::Active);
+    }
+
+    #[tokio::test]
+    async fn create_context_rejects_wrong_mode_for_template() {
+        use std::time::Duration;
+
+        use crate::context::params::TemplateId;
+        use crate::context::templates::template_params;
+
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        // BilateralEphemeral expects Encrypted mode; switch to Broadcast.
+        let mut params = template_params(&TemplateId::BilateralEphemeral);
+        params.ttl = Some(Duration::from_secs(300));
+        params.mode = ContextMode::Broadcast;
+
+        let result = create_context(
+            "ctx-wrong-mode".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextCreationError::TemplateValidationFailed(_)
+        ));
+
+        // No side effects.
+        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
+        assert!(crypto.broadcast_keys_created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_context_no_template_skips_template_validation() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        // Default params have no template_id -- no template validation runs.
+        let params = ContextParams::default();
+        assert!(params.template_id.is_none());
+
+        let result =
+            create_context("ctx-no-template".into(), params, &crypto, &transport, &event_log)
+                .await;
+
+        assert!(result.is_ok());
     }
 }
