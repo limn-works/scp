@@ -1223,7 +1223,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/tests/integration/phase1.rs",
         "crates/scp-testing/Cargo.toml"
@@ -1289,7 +1289,8 @@
       "details": {
         "testProves": "identity works, encryption works, the envelope format works, sender keys work, the relay is a dumb pipe, and the transport abstraction is functional",
         "relayBlindness": "The relay never saw: Alice's DID, Bob's DID, the context ID, the message content, or any metadata beyond the routing pseudonym and blob TTL"
-      }
+      },
+      "result": "Phase 1 integration test crate with 2 tests covering all 7 ADRs end-to-end"
     },
     {
       "id": "SCP-018",
@@ -1362,7 +1363,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/builder.rs",
         "crates/scp-core/context/manager.rs"
@@ -1405,7 +1406,8 @@
       "details": {
         "CreationReceipt struct": "```rust\nstruct CreationReceipt {\n    mls_group: Option<MlsGroup>,       // None for Broadcast mode\n    sender_key: Option<SenderKey>,      // Sender key (Encrypted) or broadcast key (Broadcast)\n    event_log: Option<EventLog>,\n    published: bool,\n}\n```",
         "Two-phase commit steps": "Phase 1 — Validate (no side effects):\n- Validates ContextParams: ceiling, roles, tools, TTL, memory scope, governance model.\n- If template_id is present, validates all params match the template definition exactly.\n- Validates the creator's identity is valid and the signing key is accessible.\n- Validates transport is connected and at least one relay is reachable.\n- If any validation fails, returns ContextError immediately. No state has been created.\n\nPhase 2 — Execute (with ordered rollback):\n1. Transition state to Creating.\n2. If mode == Encrypted: Create MLS group via ADR-001 create_group(). If mode == Broadcast: Initialize creator's broadcast key (epoch 0) — no MLS group. On failure: drop Creating state, return error.\n3. If mode == Encrypted: Generate creator's sender key via ADR-007 generate_sender_key(). If mode == Broadcast: Broadcast key already initialized in step 2. On failure: destroy MLS group, return error.\n4. Initialize empty event log (ADR-011). On failure: destroy sender key, destroy MLS group, return error.\n5. Publish context to transport. On failure: drop event log, destroy sender key, destroy MLS group, return error.\n6. Transition state to Active.\n7. Append ContextCreated event to event log.\n8. Return ContextHandle."
-      }
+      },
+      "result": "Two-phase commit with identity validation, opaque handle receipt types, and partial publication rollback"
     },
     {
       "id": "SCP-020",
@@ -1521,7 +1523,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/templates.rs"
       ],
@@ -1551,7 +1553,8 @@
       "details": {
         "Scope files": "| File | Purpose |\n|------|---------||\n| `templates.rs` | Well-known template definitions, template validation (params match template), template-based ContextParams construction |",
         "Nesting deferral": "Context nesting (§5.13) was originally in this story but is NOT Phase 2 scope. See SCP-134 for the nesting story."
-      }
+      },
+      "result": "All 6 templates spec-aligned, from_template constructor, roles/tools validation added"
     },
     {
       "id": "SCP-023",
