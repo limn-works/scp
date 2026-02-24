@@ -694,6 +694,20 @@ echo $$ > "$PID_FILE"
 if [ "$USE_WORKTREE" = "yes" ]; then
   setup_worktree
   PROJECT_DIR="$WORKTREE_DIR"
+  # Repoint all runtime state into the worktree so concurrent looms
+  # don't clobber each other. Source .loom/ keeps only checked-in files.
+  SOURCE_LOOM_DIR="$LOOM_DIR"
+  LOOM_DIR="$PROJECT_DIR/.loom"
+  LOG_FILE="$LOOM_DIR/loom.log"
+  rm -f "$SOURCE_LOOM_DIR/.pid"
+  PID_FILE="$LOOM_DIR/.pid"
+  echo $$ > "$PID_FILE"
+  # Relocate composed directive into the worktree so concurrent looms
+  # don't overwrite each other's directives.
+  if [ -n "$DIRECTIVE_FILE" ] && [ "$DIRECTIVE_FILE" = "$SOURCE_LOOM_DIR/.directive" ]; then
+    cp "$DIRECTIVE_FILE" "$LOOM_DIR/.directive"
+    DIRECTIVE_FILE="$LOOM_DIR/.directive"
+  fi
 fi
 
 # ─── Tmux Launch ─────────────────────────────────────────────────
@@ -728,14 +742,12 @@ if $USE_TMUX; then
     FORWARD_FLAGS="$FORWARD_FLAGS --prompt $(printf '%q' "$SOURCES_PROMPT")"
   fi
 
-  # Forward worktree and PR overrides
-  if [ "$USE_WORKTREE" = "yes" ] && [ -z "$RESUME_WORKTREE" ]; then
-    FORWARD_FLAGS="$FORWARD_FLAGS --worktree true"
+  # Forward worktree and PR overrides — always resume the already-created
+  # worktree so the tmux child doesn't create a second orphaned one.
+  if [ "$USE_WORKTREE" = "yes" ]; then
+    FORWARD_FLAGS="$FORWARD_FLAGS --resume $(printf '%q' "$WORKTREE_DIR")"
   fi
   [ "$CREATE_PR" = "no" ] && FORWARD_FLAGS="$FORWARD_FLAGS --pr false"
-  if [ -n "$RESUME_WORKTREE" ]; then
-    FORWARD_FLAGS="$FORWARD_FLAGS --resume $(printf '%q' "$RESUME_WORKTREE")"
-  fi
 
   # Clear PID file so re-executed instance doesn't hit the concurrency guard
   # (this process is still alive when the tmux instance starts)
@@ -765,6 +777,10 @@ if $USE_TMUX; then
   if [ -z "${CLAUDECODE:-}" ]; then
     exec tmux attach -t "$TMUX_SESSION"
   fi
+  # The tmux child owns all runtime state now — disable cleanup so the
+  # parent doesn't delete files (.directive, .piped_directive) before
+  # the async child reads them. The child handles its own cleanup.
+  trap - EXIT
   exit 0
 fi
 
@@ -795,11 +811,11 @@ if [ "$USE_WORKTREE" = "yes" ]; then
   echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
 fi
 echo ""
-echo -e "  ${CYAN}Graceful stop${NC}    touch .loom/.stop"
+echo -e "  ${CYAN}Graceful stop${NC}    touch $LOOM_DIR/.stop"
 echo -e "  ${CYAN}Kill${NC}             kill -TERM -$$"
-echo -e "  ${CYAN}Tail log${NC}         tail -f .loom/loom.log"
-echo -e "  ${CYAN}Status${NC}           cat .loom/status.md"
-echo -e "  ${CYAN}Master log${NC}       tail -f .loom/logs/master.log"
+echo -e "  ${CYAN}Tail log${NC}         tail -f $LOG_FILE"
+echo -e "  ${CYAN}Status${NC}           cat $LOOM_DIR/status.md"
+echo -e "  ${CYAN}Master log${NC}       tail -f $LOOM_DIR/logs/master.log"
 echo ""
 
 if $DRY_RUN; then
