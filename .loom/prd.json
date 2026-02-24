@@ -276,7 +276,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/src/testing/mod.rs",
         "crates/scp-platform/src/testing/key_custody.rs",
@@ -331,7 +331,8 @@
       "details": {
         "dependencies": "ed25519-dalek for key generation, rand for randomness (with seedable RNG for determinism), hmac + sha2 for pseudonym derivation, x25519-dalek for ECDH, uuid for push tokens",
         "testingHarness": "These in-memory adapters are consumed by the scp-testing crate (§16), which composes them into a full network simulation harness: SimulatedIdentity wraps a real Identity with InMemoryKeyCustody + InMemoryStorage + InMemoryTransport instances."
-      }
+      },
+      "result": "All 4 in-memory platform adapters implemented with 44 unit tests. Feature-gated behind testing flag."
     },
     {
       "id": "SCP-003",
@@ -339,7 +340,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/mod.rs",
         "crates/scp-core/src/crypto/mls/group.rs",
@@ -401,7 +402,8 @@
         "wrapperDesign": "Wrapper, not fork: SCP does not modify MLS behavior. The wrapper translates between SCP concepts (context, agent, epoch) and MLS concepts (group, member, epoch) per the mapping in spec section 9.7.1.",
         "fileLayout": "mod.rs (module root, re-exports), group.rs (ScpMlsGroup wrapper, create/add/remove/destroy), credential.rs (SCP credential type), storage.rs (StorageProvider bridge), error.rs (MLS-specific errors)",
         "estimatedFunctions": "~15-20 public functions, ~10-15 internal helpers across all MLS files"
-      }
+      },
+      "result": "MLS wrapper implemented: create_group, add_member, remove_member, destroy_group, join_group, generate_key_package. 13 unit tests. ScpCredential with MessagePack serialization."
     },
     {
       "id": "SCP-004",
@@ -5944,7 +5946,7 @@
       "gate": "gate-5a",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/adrs/phase-6.md"
       ],
@@ -5979,7 +5981,8 @@
       "details": {
         "adrCompletionStory": true,
         "note": "This story writes the ADR itself. Must resolve 'The Core Tension' between unbounded growth and verifiability."
-      }
+      },
+      "result": "ADR-030 written: 557 lines covering pruning strategies, checkpointing, Merkle proof interaction, state reconstruction, governance of pruning policies."
     },
     {
       "id": "SCP-109",
