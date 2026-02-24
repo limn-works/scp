@@ -4,6 +4,7 @@ members = [
     "crates/scp-platform",
     "crates/scp-core",
     "crates/scp-transport",
+    "crates/scp-testing",
 ]
 
 [workspace.package]

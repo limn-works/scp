@@ -1,0 +1,29 @@
+[package]
+name = "scp-testing"
+version = "0.1.0"
+description = "Integration tests for SCP (Shareable Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+
+[features]
+ci-tier2 = []
+ci-tier3 = []
+
+[dependencies]
+
+[dev-dependencies]
+scp-core = { path = "../scp-core" }
+scp-transport = { path = "../scp-transport" }
+scp-platform = { path = "../scp-platform", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+futures = "0.3"
+openmls = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+
+[[test]]
+name = "phase1"
+path = "tests/integration/phase1.rs"
+
+[lints]
+workspace = true

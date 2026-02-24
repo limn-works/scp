@@ -1984,6 +1984,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "scp-testing"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "openmls",
+ "rmp-serde",
+ "scp-core",
+ "scp-platform",
+ "scp-transport",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "scp-transport"
 version = "0.1.0"
 dependencies = [
