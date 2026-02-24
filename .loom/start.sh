@@ -374,6 +374,11 @@ fi
 
 # ─── Worktree Auto-Detection ────────────────────────────────────
 resolve_worktree() {
+  # Dry runs don't modify anything — skip worktree creation
+  if $DRY_RUN && [ -z "$RESUME_WORKTREE" ]; then
+    USE_WORKTREE="no"
+    return
+  fi
   if [ -z "$USE_WORKTREE" ]; then
     USE_WORKTREE="yes"
   fi
@@ -901,8 +906,8 @@ HEADEREOF
   echo -e "  Kill:    ${BOLD}tmux kill-session -t $TMUX_SESSION${NC}"
   echo -e "  Stop:    ${BOLD}touch .loom/.stop${NC} (finishes current iteration)"
 
-  # Auto-attach when running from a terminal (not inside Claude Code)
-  if [ -z "${CLAUDECODE:-}" ]; then
+  # Auto-attach when running from an interactive terminal
+  if [ -t 0 ]; then
     exec tmux attach -t "$TMUX_SESSION"
   fi
   # The tmux child owns all runtime state now — disable cleanup so the
