@@ -17,12 +17,20 @@
 //! - [`SenderKeyError`] — Error type for sender key operations.
 
 pub mod encrypt;
+pub mod key_protocol;
 
 use std::collections::HashMap;
 
 use rand::RngCore;
 
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
+pub use key_protocol::{
+    BlockNotification, RotateForBlockResult, SenderKeyEpochAdvance, SenderKeyRequest,
+    SenderKeyRequestResult, SenderKeyResponse, handle_sender_key_request,
+    open_sender_key_response, publish_sender_key_epoch_advance, request_sender_key,
+    rotate_sender_key_for_block, send_block_notification, verify_block_notification,
+    verify_epoch_advance, verify_sender_key_request,
+};
 
 // ---------------------------------------------------------------------------
 // SenderKey
@@ -36,6 +44,15 @@ pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub struct SenderKey([u8; 32]);
 
 impl SenderKey {
+    /// Creates a sender key from raw 32-byte key material.
+    ///
+    /// Used by [`key_protocol::open_sender_key_response`] to reconstruct a
+    /// sender key from HPKE-decrypted bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Returns a reference to the raw 32-byte key material.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -97,6 +114,30 @@ pub enum SenderKeyError {
         /// Minimum required length.
         minimum: usize,
     },
+
+    /// Ed25519 signing operation failed.
+    #[error("signing failed: {0}")]
+    SigningFailed(String),
+
+    /// Ed25519 signature verification failed due to malformed input.
+    #[error("verification failed: {0}")]
+    VerificationFailed(String),
+
+    /// JSON serialization failed.
+    #[error("serialization failed: {0}")]
+    SerializationFailed(String),
+
+    /// HPKE encryption (seal) failed.
+    #[error("HPKE encryption failed: {0}")]
+    HpkeEncryptionFailed(String),
+
+    /// HPKE decryption (open) failed.
+    #[error("HPKE decryption failed: {0}")]
+    HpkeDecryptionFailed(String),
+
+    /// A key custody operation failed.
+    #[error("key custody error: {0}")]
+    KeyCustodyError(String),
 }
 
 // ---------------------------------------------------------------------------
