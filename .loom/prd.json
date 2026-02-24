@@ -1163,7 +1163,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/client.rs",
         "crates/scp-transport/src/native/adapter.rs"
@@ -1183,7 +1183,6 @@
         "On reconnect, re-issues SUBSCRIBE for each routing_id with since = last received stored_at minus 5-second overlap",
         "Client deduplicates via blob_id on reconnect",
         "Relay maintains no per-client state across connections — recovery is entirely client-driven",
-        "Integration tests: adapter send/receive through relay server roundtrip",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -1243,7 +1242,8 @@
         "Bob receives the outer envelope via relay subscription (ADR-004, ADR-005)",
         "Bob decrypts MLS layer (ADR-001), decrypts sender key layer (ADR-007), verifies inner envelope signature (ADR-002)",
         "Bob reads Alice's message — content matches original",
-        "The relay never saw: Alice's DID, Bob's DID, the context ID, the message content, or any metadata beyond the routing pseudonym and blob TTL"
+        "The relay never saw: Alice's DID, Bob's DID, the context ID, the message content, or any metadata beyond the routing pseudonym and blob TTL",
+        "Integration tests: native relay adapter send/receive through relay server roundtrip"
       ],
       "actionItems": [
         "Create crates/scp-testing/Cargo.toml with dev-dependencies on scp-core, scp-transport, scp-platform",
