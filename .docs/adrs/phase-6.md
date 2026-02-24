@@ -4,7 +4,7 @@
 **Phase goal:** Android platform, Kotlin SDK, scale hardening, security audit, advanced governance, offline strategy.
 **Timeline:** Weeks 21+
 
-**Note:** Phase 6 follows Phases 1-5 implementation. ADR-029 (Offline/Sync) and ADR-030 (Event Log Pruning) are Decided. Remaining ADRs (ADR-027, ADR-028, ADR-031) are Pending and depend on real-world implementation experience for concrete decisions. Each Pending ADR below documents the decision space, known constraints, and approach guidance — enough for the Loom to know what's NOT decided and what to reference instead.
+**Note:** Phase 6 follows Phases 1-5 implementation. ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), and ADR-031 (Multi-Admin Governance) are Decided. Remaining ADRs (ADR-027, ADR-028) are Pending and depend on real-world implementation experience for concrete decisions. Each Pending ADR below documents the decision space, known constraints, and approach guidance — enough for the Loom to know what's NOT decided and what to reference instead.
 
 **Dependencies between ADRs:**
 
@@ -1165,52 +1165,685 @@ Checkpoint {
 
 ## ADR-031: Multi-Admin Governance Models
 
-**Status:** Pending
+**Status:** Decided
 
-### What This ADR Will Decide
+### Context
 
-Governance models beyond single-admin (Phase 2 baseline). Multi-sig (M-of-N), consensus (majority/supermajority), weighted voting. Proposal lifecycle, quorum rules, voting windows, deadlock recovery.
+Phase 2 governance (ADR-008) uses a single-admin model: one DID holds all governance authority, and governance actions are serialized through that admin. This works for bilateral contexts, small groups, and contexts where a clear authority is appropriate. It becomes a bottleneck and a single point of failure for larger, more collaborative contexts: if the admin goes offline, no governance changes can occur (ADR-029 section 5c explicitly acknowledges this); if the admin acts unilaterally in ways members disagree with, the only recourse is exit (§9.2.1); and if the admin's key is compromised, the entire context's governance is compromised.
 
-### Blockers
+Real-world collaborative contexts — working groups, DAOs, multi-party negotiations, open-source project spaces, community moderation teams — require shared governance. Different contexts have different governance needs: a 3-person team might want 2-of-3 approval for membership changes; a community might want majority vote; a high-stakes financial context might require unanimity for ceiling changes. The spec (§5.9) explicitly declares governance as a pluggable interface with multiple models, and the sketch defines the three-method contract (`propose`, `approve`, `reject`) that all models must implement. ADR-029 section 5c already references multi-admin governance and defines the conflict resolution semantics (Merkle log order is authoritative; simultaneous conflicting proposals trigger a `GovernanceConflict` state requiring manual resolution). ADR-030 defines checkpoint cosignatures from governance quorums. This ADR completes the governance system by defining the concrete models, the proposal lifecycle, quorum rules, voting windows, deadlock recovery, and the UCAN delegation model for multi-admin contexts.
 
-- Phase 2 single-admin governance (ADR-008) must be implemented and tested.
-- Phase 2 UCAN validation (ADR-016) must be running — governance actions are UCAN-authorized.
-- Need to understand how governance proposals interact with MLS epoch advances and context state.
+### Scope
 
-### Known Constraints
+**What this ADR covers:**
 
-- Governance is a pluggable interface (§5.9): protocol defines propose/approve/reject, implementations vary.
-- Context governance controls: role changes, membership, settings, ceiling expansion, interface decisions (§5.9).
-- Exit as veto: members can leave if governance makes unacceptable decisions (§9.2.1).
-- Governance actions are context events in the Merkle log — auditable and verifiable.
+- The `GovernanceEngine` trait: the pluggable interface all governance models implement.
+- The `GovernanceProposal` lifecycle: creation, voting, resolution, expiry, cancellation.
+- Four concrete governance models: single-admin (Phase 2 baseline, formalized), threshold (M-of-N), majority, and unanimity.
+- Governance model selection at context creation (immutable for lifetime).
+- Quorum rules, voting windows, and timeout handling per model.
+- Vote semantics: order-independent, withdrawal permitted, one vote per eligible voter.
+- Deadlock recovery: what happens when quorum is unreachable.
+- UCAN delegation in multi-admin contexts: who holds governance UCANs, how authority is distributed.
+- Interaction with MLS epochs: governance proposals are MLS application messages; approvals do not trigger epoch advances.
+- Interaction with ADR-029 (offline/sync): concurrent governance conflict resolution.
+- Interaction with ADR-030 (pruning): checkpoint cosignature requirements per governance model.
+- Event log event types for the governance proposal lifecycle.
 
-### Open Questions That Block This ADR
+**What this ADR does NOT cover:**
 
-- Proposal message format (structured event type in Merkle log).
-- Quorum rules per model type (majority? supermajority? unanimity for which actions?).
-- Voting window duration and timeout handling.
-- Multi-sig semantics: order-sensitive or order-independent? Withdrawal allowed?
-- Consensus deadlock recovery: what if N-of-M signers are unavailable?
-- Interaction with UCAN: who holds the governance UCAN? How is it delegated in multi-admin?
+- Weighted voting (deferred — requires a token or stake mechanism not present in SCP v1).
+- Delegated/representative governance (deferred — same complexity class as weighted voting).
+- Cross-context governance federation (out of scope — contexts are isolated).
+- Custom/pluggable governance implementations beyond the four built-in models (the trait is extensible, but only the four built-in models are specified here).
 
-### References
+### Decision
 
-- §5.9 — Context governance model (pluggable interface).
-- §9.2.1 — Security boundaries (exit as veto, single-admin as minimum).
-- ADR-008 — Context lifecycle state machine (single-admin governance).
-- ADR-009 — Role assignment and capability ceiling.
-- ADR-016 — UCAN validation.
+Implement a pluggable governance engine in `scp-core/governance/` that defines a `GovernanceEngine` trait with four built-in implementations: `SingleAdmin`, `Threshold`, `Majority`, and `Unanimity`. Every context declares its governance model at creation; the model is immutable for the context's lifetime. All governance models implement the same three-method interface (`propose`, `approve`, `reject`) from the sketch. Proposals are structured event log entries with typed payloads, configurable voting windows, and deterministic resolution. Vote collection is order-independent and withdrawal is permitted. Deadlock recovery uses an automatic fallback to preserve context liveness.
 
-### Expected Approach
+#### 1. Governance Engine Trait
 
-Define the governance interface contract (propose/approve/reject with typed proposals). Implement three concrete models:
+The governance engine is the pluggable interface that all governance models implement. The `ContextManager` delegates all governance decisions to the engine.
 
-1. **Multi-sig (M-of-N threshold):** Simplest semantics, most useful, least ambiguous. A proposal passes when M of N designated signers approve.
-2. **Majority vote (>50%):** Each member gets one vote. Proposal passes at majority. Suitable for peer groups.
-3. **Unanimity (all members):** Every member must approve. Suitable for high-stakes decisions (ceiling changes, context closure).
+```rust
+/// The pluggable governance interface. All governance models implement this trait.
+/// The trait is object-safe to enable dynamic dispatch via `Box<dyn GovernanceEngine>`.
+pub trait GovernanceEngine: Send + Sync {
+    /// Submit a new governance proposal. Returns the proposal ID.
+    /// The proposer must hold `GovernancePropose` capability (UCAN-validated).
+    fn propose(
+        &self,
+        proposer: &DID,
+        action: GovernanceAction,
+        context: &GovernanceContext,
+    ) -> Result<ProposalId, GovernanceError>;
 
-Each model implements the same governance interface. Start with multi-sig — simplest semantics, most useful for the common case of "2-of-3 admins."
+    /// Cast an approval vote on a pending proposal.
+    /// The voter must hold `GovernanceVote` capability (UCAN-validated).
+    fn approve(
+        &self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
 
-### Optimal Approach
+    /// Cast a rejection vote on a pending proposal.
+    /// The voter must hold `GovernanceVote` capability (UCAN-validated).
+    fn reject(
+        &self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
 
-Implement Phase 2 single-admin. Identify governance pain points from real context operation. Design multi-admin to solve observed problems, not hypothetical ones.
+    /// Withdraw a previously cast vote (approval or rejection).
+    /// Only the original voter can withdraw. Only valid while proposal is Pending.
+    fn withdraw_vote(
+        &self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
+
+    /// Check whether a proposal has reached resolution (quorum met, rejected,
+    /// or expired). Called after each vote and periodically by the SDK.
+    fn resolve(
+        &self,
+        proposal_id: &ProposalId,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
+
+    /// Return the governance model configuration for metadata publication.
+    fn model_config(&self) -> GovernanceModelConfig;
+
+    /// Return the set of DIDs eligible to vote on proposals in this model.
+    fn eligible_voters(&self, context: &GovernanceContext) -> Vec<DID>;
+}
+
+/// Read-only context snapshot provided to the governance engine.
+/// The engine never mutates context state directly — it returns decisions
+/// that the ContextManager executes.
+pub struct GovernanceContext {
+    pub context_id: ContextId,
+    pub members: Vec<(DID, RoleName)>,
+    pub admin_dids: Vec<DID>,
+    pub current_epoch: Option<u64>,
+    pub now: u64,
+}
+```
+
+#### 2. Governance Model Configuration
+
+The governance model is declared at context creation via `ContextParams.governance` and is immutable. Changing the governance model requires creating a new context. This prevents governance bait-and-switch — members join knowing exactly how decisions are made.
+
+```rust
+/// Governance model selection. Set at context creation, immutable thereafter.
+/// Included in context metadata (§5.7) — visible before opt-in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GovernanceModelConfig {
+    /// Single admin holds all governance authority. Phase 2 baseline.
+    /// The creator is the initial (and only) admin. Admin transfer is
+    /// a governance action that replaces the admin DID.
+    SingleAdmin {
+        admin_did: DID,
+    },
+
+    /// M-of-N threshold approval. A fixed set of designated signers;
+    /// a proposal passes when at least `threshold` of them approve.
+    Threshold {
+        /// The set of DIDs authorized to vote. These DIDs must hold
+        /// the `GovernanceVote` capability.
+        signers: Vec<DID>,
+        /// Minimum number of approvals required. Must satisfy:
+        /// 1 <= threshold <= signers.len().
+        threshold: u32,
+        /// Voting window in seconds. Proposals that do not reach
+        /// quorum within this window expire. Default: 86_400 (24 hours).
+        voting_window_secs: u64,
+    },
+
+    /// Majority vote among all context members holding `GovernanceVote`
+    /// capability. Proposal passes when approvals > 50% of eligible voters.
+    Majority {
+        /// Voting window in seconds. Default: 86_400 (24 hours).
+        voting_window_secs: u64,
+        /// Minimum participation threshold as a fraction (0.0 to 1.0).
+        /// The proposal is only valid if at least this fraction of eligible
+        /// voters cast a vote (approve or reject). Default: 0.5 (50%).
+        /// Prevents a proposal from passing with 2 approvals out of 100
+        /// eligible voters when 98 are absent.
+        min_participation: f64,
+    },
+
+    /// Unanimity among all context members holding `GovernanceVote`
+    /// capability. Every eligible voter must approve. A single rejection
+    /// defeats the proposal immediately.
+    Unanimity {
+        /// Voting window in seconds. Default: 172_800 (48 hours).
+        /// Longer default because unanimity requires every voter.
+        voting_window_secs: u64,
+    },
+}
+```
+
+**Validation at context creation:**
+
+- `Threshold`: `signers` must be non-empty, `threshold` must be in `[1, signers.len()]`, all signer DIDs must be among the context's initial members, `voting_window_secs` must be in `[300, 604_800]` (5 minutes to 7 days).
+- `Majority`: `min_participation` must be in `(0.0, 1.0]`, `voting_window_secs` must be in `[300, 604_800]`.
+- `Unanimity`: `voting_window_secs` must be in `[300, 604_800]`.
+
+#### 3. Governance Proposal Lifecycle
+
+Every governance action goes through the proposal lifecycle. In `SingleAdmin`, the propose step auto-resolves (the admin's proposal is simultaneously the approval). In multi-admin models, proposals are created, voted on, and resolved.
+
+```rust
+/// Unique identifier for a governance proposal.
+/// Format: SHA-256(context_id || proposer_did || action_hash || timestamp).
+pub type ProposalId = [u8; 32];
+
+/// A governance proposal. Created by `propose()`, stored in the event log
+/// and in `ProtocolStore` for active tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceProposal {
+    pub proposal_id: ProposalId,
+    pub context_id: ContextId,
+    pub proposer_did: DID,
+    pub action: GovernanceAction,
+    pub status: ProposalStatus,
+    pub created_at: u64,
+    pub voting_deadline: u64,
+    pub approvals: Vec<SignedVote>,
+    pub rejections: Vec<SignedVote>,
+    /// Epoch at which the proposal was created. Proposals are valid only
+    /// for the epoch in which they were created and subsequent epochs.
+    /// If the group resets (ADR-029 Tier 3), pending proposals are
+    /// invalidated because the epoch context has changed.
+    pub created_at_epoch: Option<u64>,
+}
+
+/// A signed vote on a proposal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedVote {
+    pub voter_did: DID,
+    pub vote: VoteType,
+    pub timestamp: u64,
+    pub signature: Ed25519Signature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VoteType {
+    Approve,
+    Reject,
+}
+
+/// The status of a governance proposal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProposalStatus {
+    /// Proposal is open for voting.
+    Pending,
+    /// Proposal reached quorum and was approved. The action will be executed.
+    Approved,
+    /// Proposal was rejected (explicit rejection or failed to reach quorum).
+    Rejected { reason: RejectionReason },
+    /// Proposal expired before reaching quorum.
+    Expired,
+    /// Proposal was cancelled by the proposer before resolution.
+    Cancelled,
+    /// Proposal was invalidated (e.g., epoch reset, proposer removed).
+    Invalidated { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RejectionReason {
+    /// More rejections than approvals (Majority model).
+    MajorityRejected,
+    /// Any single rejection (Unanimity model).
+    UnanimityBroken { rejector: DID },
+    /// Threshold of rejections reached making approval impossible
+    /// (Threshold model: rejections > signers - threshold).
+    ApprovalImpossible,
+    /// Insufficient participation within voting window (Majority model).
+    InsufficientParticipation,
+}
+
+/// Typed governance actions. Every governance change is one of these variants.
+/// The governance engine evaluates proposals containing these actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GovernanceAction {
+    /// Add a member to the context.
+    AddMember { did: DID, role: RoleName },
+    /// Remove a member from the context.
+    RemoveMember { did: DID, reason: Option<String> },
+    /// Change a member's role.
+    ChangeRole { did: DID, new_role: RoleName },
+    /// Register a new tool.
+    RegisterTool { registration: ToolRegistration },
+    /// Remove a tool.
+    RemoveTool { tool_id: ToolId },
+    /// Modify the capability ceiling (only if ceiling_policy is Governed).
+    ModifyCeiling { new_ceiling: Vec<Capability> },
+    /// Close the context.
+    CloseContext { reason: Option<String> },
+    /// Extend TTL (requires unanimous member consent per §5.10).
+    ExtendTtl { additional_secs: u64 },
+    /// Modify pruning policy (ADR-030).
+    ModifyPruningPolicy { new_policy: PruningPolicy },
+    /// Transfer single-admin authority (SingleAdmin model only).
+    TransferAdmin { new_admin: DID },
+    /// Add a new signer to the threshold set (Threshold model only).
+    AddSigner { did: DID },
+    /// Remove a signer from the threshold set (Threshold model only).
+    RemoveSigner { did: DID },
+    /// Modify the threshold value (Threshold model only).
+    ModifyThreshold { new_threshold: u32 },
+    /// Create a child context (§5.13).
+    CreateChildContext { params: Box<ContextParams> },
+    /// Establish a tool interface with another context (§6.2).
+    EstablishToolInterface { interface: ToolInterface },
+    /// Initiate governance-triggered member reset (ADR-029).
+    ResetMember { did: DID, reason: String },
+    /// Resolve a governance conflict (see section 7).
+    ResolveConflict { conflicting_proposal_id: ProposalId, resolution: ConflictResolution },
+}
+```
+
+#### 4. Proposal Resolution Rules Per Model
+
+**4a. SingleAdmin.** The admin's `propose()` call simultaneously creates and approves the proposal. The `approve()`/`reject()` methods are no-ops (return the current status). This preserves backward compatibility with Phase 2 behavior — single-admin governance is immediate and serialized.
+
+**4b. Threshold (M-of-N).** A proposal passes when `threshold` signers from the `signers` set have approved. Resolution is checked after every vote:
+
+- If `approvals.len() >= threshold`: status becomes `Approved`.
+- If `rejections.len() > signers.len() - threshold`: approval is mathematically impossible, status becomes `Rejected { reason: ApprovalImpossible }`.
+- If `now > voting_deadline` and neither condition met: status becomes `Expired`.
+
+Votes are order-independent — the Mth approval resolves the proposal regardless of when or in what order the M votes arrived. Only DIDs in the `signers` set can vote. A signer can withdraw their vote and re-vote (changing from approve to reject or vice versa) while the proposal is `Pending`.
+
+**4c. Majority.** A proposal passes when approvals exceed 50% of eligible voters (all members holding `GovernanceVote` capability). Resolution:
+
+- Let `eligible = eligible_voters.len()`, `participation = approvals.len() + rejections.len()`.
+- If `participation / eligible < min_participation` when `now > voting_deadline`: status becomes `Rejected { reason: InsufficientParticipation }`.
+- If `approvals.len() > eligible / 2`: status becomes `Approved` (early resolution — majority reached before deadline).
+- If `rejections.len() >= eligible / 2`: status becomes `Rejected { reason: MajorityRejected }` (early rejection — approval impossible).
+- If `now > voting_deadline` and `participation / eligible >= min_participation` and `approvals > rejections`: status becomes `Approved`.
+- If `now > voting_deadline` and `participation / eligible >= min_participation` and `approvals <= rejections`: status becomes `Rejected { reason: MajorityRejected }`.
+
+The eligible voter set is computed at proposal creation time and frozen for the proposal's lifetime. Members who join after proposal creation do not vote on it; members who leave have their votes removed.
+
+**4d. Unanimity.** Every eligible voter must approve. A single rejection defeats the proposal immediately:
+
+- If all eligible voters have approved: status becomes `Approved`.
+- If any eligible voter rejects: status becomes `Rejected { reason: UnanimityBroken { rejector } }`.
+- If `now > voting_deadline` and not all have voted: status becomes `Expired`.
+
+Unanimity is required by the spec (§5.10) for TTL extension and context promotion. The `ExtendTtl` and `PromoteContext` governance actions always require unanimity regardless of the context's governance model — this is a protocol-level override enforced by the `ContextManager`, not by the governance engine.
+
+#### 5. Voting Windows and Timeout Handling
+
+Every proposal has a `voting_deadline = created_at + voting_window_secs`. The voting window is configured per governance model at context creation and applies uniformly to all proposals in that context.
+
+**Timeout processing.** The SDK runs a background task (`GovernanceTimeoutTask`) that checks active proposals every 60 seconds. When a proposal's deadline passes without resolution, the task calls `resolve()` which transitions the proposal to `Expired` or `Rejected` (depending on model-specific rules). The timeout task also handles:
+
+- **Proposer departure.** If the proposer leaves the context while a proposal is `Pending`, the proposal is `Invalidated`. The proposer's departure does not retroactively invalidate an already-approved proposal.
+- **Voter departure.** If an eligible voter leaves the context, their vote is removed from the tally. This may change the resolution — if a Unanimity proposal had all approvals and one voter leaves, the proposal remains approved (the voter approved before leaving). If a voter leaves without having voted, the eligible voter set shrinks, which may make quorum easier to reach (Majority) or harder (Unanimity).
+- **Epoch reset.** If a member undergoes a group state reset (ADR-029 Tier 3), their votes on pending proposals are invalidated (the reset changes their epoch context). The proposal is not automatically invalidated — other votes remain valid.
+
+#### 6. UCAN Delegation in Multi-Admin Contexts
+
+In single-admin governance, the context creator holds the root UCAN authority and delegates all capabilities. In multi-admin governance, UCAN authority is distributed:
+
+**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator.
+
+**Governance capability distribution.** At context creation, the creator mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each DID that the governance model designates as a voter:
+
+- `Threshold`: each DID in `signers` receives `GovernancePropose` + `GovernanceVote`.
+- `Majority`: each member whose role includes `GovernanceVote` capability receives those tokens at role assignment.
+- `Unanimity`: same as Majority — all members with `GovernanceVote` in their role.
+
+**Governance action execution.** When a proposal is approved, the governance engine returns the decision to the `ContextManager`. The `ContextManager` executes the action using the creator's root authority — it mints new UCANs, revokes old ones, modifies membership, etc. The governance engine does not execute actions; it only decides whether they are approved. This separation ensures that UCAN chains remain valid (the root issuer signs all delegations) while governance authority is distributed (multiple DIDs vote on whether to authorize the action).
+
+**Signer set modification (Threshold model).** When a `Threshold` proposal to add or remove a signer is approved, the `ContextManager` mints or revokes `GovernanceVote` UCANs accordingly. Adding a signer requires the new DID to already be a context member. Removing a signer does not remove them from the context — it only removes governance authority. The `threshold` value is validated after modification: if removing a signer would make `threshold > signers.len()`, the removal is rejected.
+
+#### 7. Governance Conflict Resolution
+
+ADR-029 section 5c defines the conflict scenario: two admins both offline simultaneously propose conflicting governance actions. When both reconnect, both proposals are committed to the event log. The first proposal committed to the Merkle log wins; the second is rejected as conflicting.
+
+**Conflict detection.** The `GovernanceEngine` detects conflicts when two `Approved` proposals in the event log are incompatible:
+
+- Two `RemoveMember` proposals targeting each other's proposers (mutual removal).
+- Two `ChangeRole` proposals for the same DID with different target roles.
+- Two `ModifyCeiling` proposals with different ceiling sets.
+- A `RemoveMember` and a `ChangeRole` for the same DID.
+
+**Conflict resolution.** When a conflict is detected:
+
+1. The proposal with the lower event log sequence number (earlier in Merkle log) wins. This is deterministic — all members compute the same winner.
+2. The losing proposal's status becomes `Invalidated { reason: "Conflicting proposal {winner_id} committed first" }`.
+3. A `GovernanceConflict` event is appended to the event log recording both proposal IDs, the winner, and the resolution method.
+4. If the losing proposer still wants their action, they must re-propose with awareness of the winning proposal's effects.
+
+**Simultaneous commit (same sequence number).** If two conflicting proposals land at the exact same event log sequence (extremely rare — requires both to be appended in the same batch), the protocol enters a `GovernanceConflict` state:
+
+1. The context is frozen for new governance actions (no new proposals accepted). Message sending and tool invocation continue normally.
+2. A `GovernanceConflictDetected` event is emitted.
+3. Resolution requires an explicit `ResolveConflict` governance action from any DID with `GovernanceVote` capability. The resolution specifies which proposal wins.
+4. The `ResolveConflict` action itself follows the context's governance model (requires threshold/majority/unanimity). This prevents unilateral conflict resolution.
+5. If no resolution is reached within the voting window, both proposals are invalidated and the governance freeze is lifted. The context returns to its pre-proposal state.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConflictResolution {
+    /// Accept one proposal, invalidate the other.
+    AcceptProposal { winner_id: ProposalId },
+    /// Invalidate both proposals, return to pre-proposal state.
+    InvalidateBoth,
+}
+```
+
+#### 8. Interaction with MLS Epochs
+
+Governance proposals and votes are MLS application messages (in Encrypted contexts) or broadcast messages (in Broadcast contexts). They do not trigger MLS epoch advances — only membership changes (add/remove) and MLS Updates trigger Commits.
+
+However, governance actions that result in membership changes (approved `AddMember` or `RemoveMember` proposals) do trigger MLS operations, which advance the epoch. The sequence is:
+
+1. Proposal approved (governance decision).
+2. `ContextManager` executes the membership change (MLS `add_member()`/`remove_member()`).
+3. MLS Commit advances the epoch.
+4. `GovernanceActionExecuted` event appended to event log (records proposal ID, action, executor DID, resulting epoch).
+
+Pending proposals are NOT invalidated by epoch advances. A proposal created at epoch E is valid at epoch E+N — the proposal references a governance action, not an epoch-specific state. The only exception is group state reset (ADR-029 Tier 3), which invalidates pending proposals because the member's relationship to the group has fundamentally changed.
+
+#### 9. Interaction with Checkpointing (ADR-030)
+
+ADR-030 defines checkpoint cosignatures for multi-admin contexts. The requirement is:
+
+- In `SingleAdmin` contexts, only the admin signs checkpoints. `cosignatures` is empty.
+- In `Threshold` contexts, checkpoints require `threshold` signatures from the signer set. The checkpoint creator collects signatures by distributing the checkpoint hash to other signers, who verify and cosign.
+- In `Majority` contexts, checkpoints require signatures from >50% of eligible voters.
+- In `Unanimity` contexts, checkpoints require signatures from all eligible voters.
+
+Checkpoint cosignature collection follows the same voting-window pattern as governance proposals but with a shorter default window (1 hour). If cosignature quorum is not reached, the checkpoint is still valid with the creator's signature alone but is flagged as `PartiallyAttested` — members can decide how much weight to give it.
+
+#### 10. Deadlock Recovery
+
+Deadlock occurs when the governance model requires votes from DIDs that are permanently unavailable (key loss, extended offline beyond Tier 3, deliberate non-participation).
+
+**Detection.** A governance model is in deadlock when:
+
+- `Threshold`: fewer than `threshold` signers are active context members (signers who left or were removed are no longer eligible).
+- `Majority`: fewer than `ceil(eligible_voters * min_participation)` members are responsive (no vote cast within 3 consecutive voting windows).
+- `Unanimity`: any eligible voter has been offline beyond the Tier 3 threshold (7+ days) with no response to proposals.
+
+**Recovery protocol.** When deadlock is detected:
+
+1. Any member with `GovernancePropose` capability can propose a `ReconfigureGovernance` meta-action. This is a special governance action that modifies the governance model's parameters (e.g., reducing `threshold`, removing inactive signers) without changing the model type.
+2. The `ReconfigureGovernance` proposal follows a fallback quorum: the remaining active voters use majority-of-active as the quorum rule, regardless of the original governance model. This prevents a dead signer from permanently blocking all governance.
+3. The fallback is logged as a `GovernanceDeadlockRecovery` event in the event log with full justification (which signers are unavailable, how long, what the original quorum was).
+4. Members who disagree with the deadlock recovery can exercise exit-as-veto (§9.2.1) — leave the context.
+
+```rust
+/// Deadlock recovery meta-action. Uses fallback quorum rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconfigureGovernance {
+    /// What to change in the governance configuration.
+    pub changes: Vec<GovernanceReconfigAction>,
+    /// Justification — which voters are unavailable and evidence.
+    pub justification: DeadlockJustification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GovernanceReconfigAction {
+    /// Remove an inactive signer (Threshold model).
+    RemoveInactiveSigner { did: DID },
+    /// Reduce the threshold (Threshold model). New value must be
+    /// >= 1 and <= remaining active signers.
+    ReduceThreshold { new_threshold: u32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadlockJustification {
+    /// DIDs that are unavailable.
+    pub unavailable_dids: Vec<DID>,
+    /// Evidence of unavailability: consecutive missed voting windows.
+    pub missed_windows: Vec<(DID, u32)>,
+    /// Timestamp of deadlock detection.
+    pub detected_at: u64,
+}
+```
+
+**Deadlock recovery constraints:**
+
+- The governance model TYPE is never changed by deadlock recovery. A `Threshold` context remains `Threshold`. To change the model type, create a new context.
+- The fallback quorum (majority-of-active) requires at least 2 active voters. If only 1 voter remains, they effectively have single-admin authority — this is logged and visible to all members.
+- Deadlock recovery proposals have a 48-hour voting window (double the default) to give absent members time to respond before their authority is reduced.
+
+### Rationale
+
+**Why four models, not more:**
+
+The four models — SingleAdmin, Threshold, Majority, Unanimity — cover the practical governance space for SCP contexts. SingleAdmin is the Phase 2 baseline, needed for backward compatibility and simple contexts. Threshold is the most commonly requested multi-admin pattern ("2-of-3 admins") and has the simplest, most predictable semantics. Majority scales to larger groups where threshold enumeration is impractical. Unanimity satisfies the spec's requirement for TTL extension (§5.10) and ceiling changes in high-stakes contexts. Weighted voting and delegated governance were considered but deferred: they require a stake/token mechanism or a delegation graph that SCP v1 does not provide, and they add complexity without clear demand from the initial use cases.
+
+**Why governance model is immutable:**
+
+Changing the governance model after creation is a fundamental change to the opt-in contract. Members joined knowing "this context uses 2-of-3 threshold governance." Switching to majority vote changes the power dynamics retroactively. Making the model immutable prevents governance bait-and-switch — the same principle behind immutable capability ceilings (ADR-009). If a different governance model is needed, create a new context and migrate. The threshold value and signer set CAN be modified through governance (they are parameters within the model, not the model itself), but the model type cannot.
+
+**Why order-independent votes with withdrawal:**
+
+Order-independent votes are simpler to reason about: the Mth approval triggers resolution regardless of when it arrives. Order-sensitive votes (where the sequence of approvals matters) add complexity without benefit — the governance decision is the same regardless of whether Alice or Bob approved first. Vote withdrawal enables members to change their mind based on new information (e.g., discussion in the context about the proposal). Without withdrawal, a premature approval is irreversible, which discourages early voting.
+
+**Why Merkle log order for conflict resolution:**
+
+ADR-029 section 5c already establishes Merkle log order as the authoritative ordering for concurrent operations. Using the same mechanism for governance conflicts maintains consistency — no new conflict resolution primitive is needed. The determinism is critical: all members compute the same winner from the same log, so there is no disagreement about which proposal won.
+
+**Why the fallback quorum for deadlock recovery:**
+
+Without a deadlock recovery mechanism, a Threshold(3-of-5) context where 3 signers lose their keys is permanently frozen — no governance action can ever pass. The fallback quorum (majority of remaining active voters) is the least disruptive recovery: it preserves the model type, requires majority agreement among the remaining participants, and is fully logged. The alternative — no recovery, context must be abandoned — wastes the context's history, tool registrations, and ongoing work. The 48-hour voting window for recovery proposals gives absent members extra time to return, reducing false deadlock detection.
+
+**Why the context creator remains the UCAN root:**
+
+UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributing root authority across multiple DIDs would require multi-signature UCAN tokens, which the UCAN spec does not support. The creator-as-root pattern is already established in Phase 2 and works well: the creator's cryptographic role (root issuer) is decoupled from their governance role (which may be no more than any other signer in a Threshold model). The creator cannot unilaterally mint capabilities that bypass governance — all capability changes go through the governance engine.
+
+### Implementation
+
+- **Language:** Rust
+- **Async runtime:** tokio (voting window timers, deadlock detection background task)
+- **Crate:** `scp-core`
+- **Module:** `scp-core/governance/`
+- **Persistence:** Via `ProtocolStore` (§17.4). Key conventions:
+  - `context/{context_id}/governance/config` — serialized `GovernanceModelConfig`
+  - `context/{context_id}/governance/proposal/{proposal_id_hex}` — active proposals
+  - `context/{context_id}/governance/proposal_index/pending` — list of pending proposal IDs
+  - `context/{context_id}/governance/proposal_index/resolved` — list of resolved proposal IDs
+  - `context/{context_id}/governance/deadlock_state` — deadlock detection state
+
+### Dependencies
+
+- **ADR-008 (Context Lifecycle):** The `ContextManager` delegates governance decisions to the `GovernanceEngine`. Context creation includes `GovernanceModelConfig` in `ContextParams`. The governance model constrains which context operations require proposals (all multi-admin operations) vs. which are immediate (message sending, tool invocation — these are UCAN-authorized, not governance-gated).
+- **ADR-009 (Roles/UCAN):** `GovernancePropose` and `GovernanceVote` are capabilities in the `Capability` enum. Governance UCAN tokens are minted at role assignment and validated on every `propose()`, `approve()`, and `reject()` call. The capability ceiling bounds governance capabilities the same as any other capability.
+- **ADR-011 (Event Log):** Governance proposals, votes, resolutions, conflicts, and deadlock recoveries are event log entries. The Merkle log provides the authoritative ordering for conflict resolution.
+- **ADR-016 (UCAN Validation):** The full 11-step UCAN validation pipeline applies to governance operations. Governance UCANs follow the same delegation chain, nonce uniqueness, and revocation rules as all other UCANs.
+- **ADR-029 (Offline/Sync):** Concurrent governance conflict resolution (section 5c) is formalized by this ADR. Group state resets invalidate pending proposals. Reconnecting members catch up on governance state through event log sync.
+- **ADR-030 (Event Log Pruning):** Checkpoint cosignature requirements are defined per governance model. `GovernanceAction` events are structural events with 3x retention multiplier.
+
+### Acceptance Criteria
+
+1. **`GovernanceEngine` trait and `GovernanceModelConfig` enum:**
+
+```rust
+// GovernanceEngine trait with propose/approve/reject/withdraw_vote/resolve/model_config/eligible_voters.
+// GovernanceModelConfig with SingleAdmin, Threshold, Majority, Unanimity variants.
+// Validation: GovernanceModelConfig::validate() -> Result<(), GovernanceError>
+//   - Threshold: 1 <= threshold <= signers.len(), signers non-empty, window in [300, 604_800]
+//   - Majority: min_participation in (0.0, 1.0], window in [300, 604_800]
+//   - Unanimity: window in [300, 604_800]
+```
+
+2. **`GovernanceProposal` struct and `GovernanceAction` enum:**
+
+   - `GovernanceProposal` with `proposal_id`, `context_id`, `proposer_did`, `action`, `status`, `created_at`, `voting_deadline`, `approvals`, `rejections`, `created_at_epoch`.
+   - `GovernanceAction` with all variants listed in section 3.
+   - `ProposalStatus` with `Pending`, `Approved`, `Rejected`, `Expired`, `Cancelled`, `Invalidated`.
+   - Proposals are persisted to `ProtocolStore` on creation and on every status change.
+
+3. **`SingleAdminEngine` implementation:**
+
+   - `propose()` creates a proposal and immediately sets status to `Approved` if the proposer is the admin DID. Returns `GovernanceError::NotAdmin` if proposer is not the admin.
+   - `approve()`/`reject()` return current status (no-op).
+   - `eligible_voters()` returns `[admin_did]`.
+
+4. **`ThresholdEngine` implementation:**
+
+   - `propose()` creates a `Pending` proposal. The proposer's vote counts as the first approval.
+   - `approve()` adds a `SignedVote` if the voter is in `signers` and has not already voted. Calls `resolve()`.
+   - `reject()` adds a rejection vote. Calls `resolve()`.
+   - `resolve()` returns `Approved` if `approvals.len() >= threshold`, `Rejected` if `rejections.len() > signers.len() - threshold`, `Expired` if past deadline.
+   - `withdraw_vote()` removes the voter's vote. Returns error if proposal is not `Pending`.
+   - `eligible_voters()` returns the `signers` set.
+
+5. **`MajorityEngine` implementation:**
+
+   - `propose()` creates a `Pending` proposal. Freezes the eligible voter set at creation time.
+   - `approve()`/`reject()` add votes if voter is in the frozen eligible set.
+   - `resolve()` applies the resolution rules from section 4c: early approval if > 50%, early rejection if approval impossible, participation check at deadline.
+   - `eligible_voters()` returns all members with `GovernanceVote` capability at the time of the call.
+
+6. **`UnanimityEngine` implementation:**
+
+   - `propose()` creates a `Pending` proposal. Freezes the eligible voter set.
+   - `approve()` adds approval. If all eligible voters have approved, status becomes `Approved`.
+   - `reject()` immediately sets status to `Rejected { reason: UnanimityBroken { rejector } }`.
+   - `resolve()` returns `Expired` if past deadline and not all have voted.
+
+7. **Event types added to `EventType` enum (ADR-011):**
+
+```rust
+// Additions to EventType in scp-core/event_log/
+GovernanceProposalCreated {
+    proposal_id: ProposalId,
+    proposer_did: DID,
+    action: GovernanceAction,
+    voting_deadline: u64,
+},
+GovernanceVoteCast {
+    proposal_id: ProposalId,
+    voter_did: DID,
+    vote: VoteType,
+},
+GovernanceVoteWithdrawn {
+    proposal_id: ProposalId,
+    voter_did: DID,
+},
+GovernanceProposalResolved {
+    proposal_id: ProposalId,
+    status: ProposalStatus,
+    executor_did: Option<DID>,
+    resulting_epoch: Option<u64>,
+},
+GovernanceConflictDetected {
+    proposal_a: ProposalId,
+    proposal_b: ProposalId,
+},
+GovernanceConflictResolved {
+    winner_id: Option<ProposalId>,
+    resolution: ConflictResolution,
+},
+GovernanceDeadlockRecovery {
+    justification: DeadlockJustification,
+    changes: Vec<GovernanceReconfigAction>,
+},
+```
+
+8. **Governance timeout background task:**
+
+   - `GovernanceTimeoutTask` runs every 60 seconds per context with active proposals.
+   - Calls `resolve()` on each pending proposal to check for expiry.
+   - Detects voter departures and adjusts tallies.
+   - Detects deadlock conditions (consecutive missed voting windows per voter).
+
+9. **Protocol-level unanimity override for TTL extension:**
+
+   - When a `GovernanceAction::ExtendTtl` proposal is created in a non-Unanimity context, the `ContextManager` overrides the governance model's resolution rules and requires approval from ALL current members (not just governance voters). This enforces §5.10's requirement that TTL extension requires unanimous consent.
+
+10. **Integration test:**
+
+```
+1. Alice creates a context with Threshold(2-of-3, signers: [Alice, Bob, Carol]).
+2. Verify: Alice, Bob, Carol all receive GovernancePropose + GovernanceVote UCANs.
+3. Alice proposes AddMember { did: Dave, role: "member" }.
+   Event log records GovernanceProposalCreated.
+   Alice's proposal counts as first approval.
+4. Dave is NOT yet a member (proposal is Pending, 1-of-2 approvals).
+5. Bob approves. Proposal reaches threshold (2-of-3). Status -> Approved.
+   Event log records GovernanceVoteCast, GovernanceProposalResolved.
+   ContextManager executes: Dave is added via MLS add_member().
+6. Dave is now a member with role "member".
+
+--- Rejection test ---
+7. Alice proposes RemoveMember { did: Dave }.
+8. Bob rejects. Carol rejects. Rejections (2) > signers (3) - threshold (2) = 1.
+   Proposal status -> Rejected { reason: ApprovalImpossible }.
+   Dave remains a member.
+
+--- Vote withdrawal test ---
+9. Alice proposes ChangeRole { did: Dave, new_role: "observer" }.
+10. Bob approves (1-of-2 needed). Before Carol votes, Bob withdraws.
+    Approvals drop to 1 (Alice only). Proposal still Pending.
+11. Carol approves. Threshold met. Proposal Approved.
+
+--- Expiry test ---
+12. Alice proposes CloseContext. Voting window: 300 seconds.
+13. Simulate time advance past voting window. No quorum reached.
+    GovernanceTimeoutTask fires. Proposal status -> Expired.
+
+--- Conflict test ---
+14. Alice and Bob both go offline.
+15. Alice proposes ChangeRole { did: Dave, role: "admin" }.
+    Bob proposes RemoveMember { did: Dave }.
+16. Both reconnect. Both proposals committed to event log.
+    Alice's proposal has lower sequence number -> wins.
+    Bob's proposal -> Invalidated.
+    GovernanceConflictDetected event recorded.
+
+--- Unanimity test ---
+17. Create a separate context with Unanimity governance.
+18. Alice proposes AddMember { did: Eve }.
+19. Bob approves. Carol approves. Alice already approved (proposer).
+    All eligible voters approved. Status -> Approved.
+20. Alice proposes RemoveMember { did: Eve }.
+21. Bob rejects. Status -> Rejected { reason: UnanimityBroken { rejector: Bob } }.
+
+--- Majority test ---
+22. Create a context with Majority governance, min_participation: 0.5.
+    Members: Alice, Bob, Carol, Dave, Eve (5 eligible voters).
+23. Alice proposes RegisterTool { ... }.
+24. Alice, Bob, Carol approve (3/5 > 50%). Early resolution -> Approved.
+
+--- Deadlock recovery test ---
+25. Create a Threshold(3-of-4, signers: [Alice, Bob, Carol, Dave]) context.
+26. Carol and Dave leave the context.
+27. Alice proposes AddMember. Only Alice and Bob can vote.
+    threshold (3) > active signers (2). Deadlock detected.
+28. Alice proposes ReconfigureGovernance: remove Carol, remove Dave,
+    reduce threshold to 2.
+29. Fallback quorum: majority of active voters (2). Alice + Bob approve.
+    Governance reconfigured. GovernanceDeadlockRecovery event logged.
+30. Alice re-proposes AddMember. Now 2-of-2 threshold. Alice + Bob approve.
+    Proposal passes.
+```
+
+### Scope
+
+**Files (~6-8):**
+
+| File | Purpose |
+|------|---------|
+| `mod.rs` | Module root, `GovernanceEngine` trait, `GovernanceModelConfig`, `GovernanceAction`, `ProposalStatus`, `GovernanceProposal`, re-exports |
+| `single_admin.rs` | `SingleAdminEngine` — auto-approve on propose, admin transfer |
+| `threshold.rs` | `ThresholdEngine` — M-of-N vote collection, signer set management, threshold modification |
+| `majority.rs` | `MajorityEngine` — majority vote, participation threshold, frozen voter set |
+| `unanimity.rs` | `UnanimityEngine` — all-or-nothing voting, immediate rejection on any dissent |
+| `proposal.rs` | `GovernanceProposal` lifecycle, `SignedVote`, vote withdrawal, proposal persistence, conflict detection |
+| `deadlock.rs` | Deadlock detection, `ReconfigureGovernance`, fallback quorum, `DeadlockJustification` |
+| `timeout.rs` | `GovernanceTimeoutTask`, periodic proposal resolution, voter departure handling, epoch invalidation |
+
+**Estimated functions:** ~25-30 public functions, ~15-20 internal helpers.
