@@ -25,11 +25,17 @@
 //!
 //! See ADR-003 in `.docs/adrs/phase-1.md` for the full design.
 
+pub mod cache;
 pub mod dht;
+pub mod dht_client;
 pub mod document;
+pub mod republish;
 
+pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::DidDht;
+pub use dht_client::{DhtClient, InMemoryDhtClient};
 pub use document::DidDocument;
+pub use republish::RepublishManager;
 
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
@@ -64,9 +70,9 @@ pub struct ScpIdentity {
 
 /// Errors produced by identity operations.
 ///
-/// Covers key generation failures, encoding errors, and DID verification
-/// failures. Platform-level key custody errors are wrapped via the `Platform`
-/// variant.
+/// Covers key generation failures, encoding errors, DID verification
+/// failures, and DHT publish/resolve errors. Platform-level key custody
+/// errors are wrapped via the `Platform` variant.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     /// A platform key custody operation failed.
@@ -84,6 +90,31 @@ pub enum IdentityError {
     /// DID document serialization failed.
     #[error("document serialization error: {0}")]
     DocumentSerializationError(String),
+
+    /// Publishing a DID document to the DHT failed.
+    #[error("DHT publish failed: {0}")]
+    DhtPublishFailed(String),
+
+    /// Resolving a DID from the DHT failed.
+    #[error("DHT resolve failed: {0}")]
+    DhtResolveFailed(String),
+
+    /// BEP44 signature verification failed on a resolved DHT record.
+    #[error("BEP44 signature verification failed: {0}")]
+    Bep44SignatureInvalid(String),
+
+    /// Self-certification check failed: the public key in the resolved
+    /// document does not match the z-base-32 decoded DID suffix.
+    #[error("self-certification failed: {0}")]
+    SelfCertificationFailed(String),
+
+    /// The resolved DID document could not be deserialized.
+    #[error("DID document deserialization error: {0}")]
+    DocumentDeserializationError(String),
+
+    /// The DID was not found on the DHT.
+    #[error("DID not found on DHT: {0}")]
+    DhtNotFound(String),
 }
 
 /// Abstract trait for DID method implementations.

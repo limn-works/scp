@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod crypto;
+pub mod envelope;
 pub mod identity;
 
 // Re-export the MLS module's primary types at the crate level for convenience.
