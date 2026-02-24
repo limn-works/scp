@@ -34,6 +34,8 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod traits;
 
 // Re-export all public types for ergonomic access.

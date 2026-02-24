@@ -5,10 +5,31 @@ description = "Platform abstraction traits for SCP (Shareable Context Protocol)"
 edition.workspace = true
 repository.workspace = true
 
+[features]
+testing = [
+    "dep:ed25519-dalek",
+    "dep:x25519-dalek",
+    "dep:rand",
+    "dep:hmac",
+    "dep:sha2",
+    "dep:uuid",
+]
+
 [dependencies]
 serde = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
+
+# Testing-only dependencies, gated behind the `testing` feature flag.
+ed25519-dalek = { workspace = true, optional = true }
+x25519-dalek = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

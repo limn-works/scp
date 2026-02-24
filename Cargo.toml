@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/scp-platform",
+    "crates/scp-core",
 ]
 
 [workspace.package]
@@ -14,6 +15,16 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+openmls = { version = "0.8", features = ["libcrux-provider"] }
+openmls_traits = "0.5"
+openmls_basic_credential = "0.5"
+openmls_rust_crypto = "0.5"
+openmls_memory_storage = "0.5"
+rmp-serde = "1"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
