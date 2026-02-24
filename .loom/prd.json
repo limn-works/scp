@@ -572,7 +572,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/cache.rs"
@@ -631,7 +631,8 @@
         "republishStrategy": "DIDs published via did:dht require periodic republishing to remain resolvable — Mainline DHT records expire if not refreshed. Republish interval: every 2 hours. Failure handling: exponential backoff 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m. Each retry re-resolves DHT bootstrap nodes. After 6 consecutive failures, emit DhtPublishDegraded warning. Automatic lifecycle: starts on identity load, stops on unload/shutdown. Startup: immediate republish for all persisted active identities.",
         "cacheStrategy": "Resolution cache — TTL-based, 24h active / 7d inactive refresh, BEP44 sequence number comparison for staleness",
         "stalenessIndicator": "When resolve_did returns a cached result not refreshed within expected republish window (2 hours + 30 minute grace), result includes staleness indicator. Callers SHOULD treat stale results as valid but degraded. Critical operations (UCAN validation, MLS credential verification) SHOULD attempt fresh DHT resolution before rejecting stale result."
-      }
+      },
+      "result": "Implemented DID publish/resolve with BEP44 signing, DhtClient trait abstraction, InMemoryDhtClient for testing, DidCache with TTL-based staleness detection (24h active/7d inactive), RepublishManager with exponential backoff. 40 new tests."
     },
     {
       "id": "SCP-008",
@@ -702,7 +703,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/envelope/mod.rs",
         "crates/scp-core/src/envelope/inner.rs",
@@ -765,7 +766,8 @@
         "outerEnvelopeDesign": "Minimal: routing_id (per-context pseudonym via HMAC-SHA256), recipient_hint (recipient pseudonym for directed messages or broadcast marker), blob_ttl (relay storage duration), encrypted_blob (everything else, MLS-encrypted).",
         "paddingFormat": "payload bytes + padding bytes + 4-byte big-endian length of original payload at the end (so stripping reads the length suffix and truncates). Buckets: 256B, 1KB, 4KB, 16KB, 64KB, 256KB.",
         "pseudonymDerivation": "HMAC-SHA256(identity_key_material, context_id || \"scp-pseudonym\") then Ed25519_keygen(seed[0..32]). The HMAC computation happens inside the custody boundary (HSM or software). The resulting PseudonymKeypair is software-managed."
-      }
+      },
+      "result": "Implemented envelope types (InnerEnvelope, OuterEnvelope), bucket padding (256B-256KB), pseudonym derivation via KeyCustody, Ed25519 inner signature creation/verification, MessagePack serialization. 31 new tests including 3 proptests."
     },
     {
       "id": "SCP-010",
