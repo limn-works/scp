@@ -1498,7 +1498,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/ttl.rs",
         "crates/scp-core/context/manager.rs"
@@ -2004,7 +2004,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/event_log/proof.rs"
       ],
@@ -3004,7 +3004,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/crypto/ucan/mod.rs",
         "crates/scp-core/crypto/ucan/capability.rs"
@@ -3452,7 +3452,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/trust/mod.rs",
         "crates/scp-core/trust/behavioral.rs"
@@ -4072,7 +4072,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/discovery/mod.rs",
         "crates/scp-core/discovery/did_capabilities.rs"
