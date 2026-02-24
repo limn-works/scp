@@ -386,6 +386,8 @@ SCP.Context.receive(
 
 The stream primitive provides real-time delivery of all context activity. Transport-level details (reconnection, backoff, multi-relay fanout) are handled by the SDK. The stream respects the participant's role — events outside their capability ceiling are filtered.
 
+**Buffer semantics:** The receive stream buffers up to 1,000 events. When the buffer is full, the oldest unconsumed event is dropped and a `BufferOverflow` warning event is emitted on the stream. SDKs MAY expose buffer size as a configuration parameter (minimum: 100, maximum: 10,000, default: 1,000). The `BufferOverflow` event includes the count of dropped events since the last successful consumption, enabling consumers to detect and respond to backpressure.
+
 ---
 
 ## 3. Agents (within a context)
@@ -1501,7 +1503,7 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 - **~~UCAN capability schema.~~** ✅ **Resolved.** ADR-016 specifies concrete capability types, 11-step validation pipeline, delegation chains, nonce replay rejection, ceiling enforcement.
 - **~~Context lifecycle state machine.~~** ✅ **Resolved.** ADR-008 specifies states (Creating, Active, Closing, Closed, Expired), transitions, TTL management, governance enforcement.
 - **~~Context templates and lightweight creation.~~** ✅ **Resolved.** .docs/specs/ §5.12 specifies 6 well-known templates (4 encrypted + 2 broadcast), auto-accept policies, invitation bundling, computational profile, standing bilateral contexts. sdk-common.md specifies cross-language SDK surface.
-- **~~Context nesting.~~** ✅ **Resolved.** .docs/specs/ §5.13 specifies parent-child relationships (8 subsections): ceiling inheritance, membership eligibility, creation protocol, parent governance configuration, lifecycle coupling, metadata/legibility, interaction with other mechanisms, depth limits. Cryptographic binding via MLS `group_context` extensions. ADR phase-2 includes `nesting.rs` and `ChildContextCreate` capability.
+- **~~Context nesting.~~** ✅ **Resolved.** .docs/specs/ §5.13 specifies parent-child relationships (8 subsections): ceiling inheritance, membership eligibility, creation protocol, parent governance configuration, lifecycle coupling, metadata/legibility, interaction with other mechanisms, depth limits. Cryptographic binding via MLS `group_context` extensions. ADR-008 defines the `ChildContextCreate` capability. Nesting implementation (`nesting.rs`) is deferred to a later phase (see SCP-134 in the PRD).
 - **~~Cross-context provenance chain tracking.~~** ✅ **Resolved.** DataProvenance type includes `chainDepth` (boundary hop count) and `chainPath` (intermediary context IDs). Chain depth limit (default: 3) enforced at protocol level. .docs/specs/ §7.7.1.
 - **Minimum viable agent.** Likely a passthrough that takes human input, wraps it in SCP envelopes, signs, and sends. Reference implementation that's trivially embeddable.
 - **Capability declaration format.** The actual JSON schema for app manifests. Critical surface — this is the interface between "LLMs generate apps" and "SCP provides infrastructure." Must be LLM-parseable.

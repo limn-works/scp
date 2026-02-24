@@ -179,3 +179,47 @@ Every SDK ships with:
 2. **API reference** — Generated from source (rustdoc, pydoc, typedoc, DocC, KDoc, godoc, xmldoc, javadoc)
 3. **Type stubs / declarations** — For IDE autocompletion and static analysis (`.pyi`, `.d.ts`, etc.)
 4. **Examples directory** — Runnable examples covering: basic messaging, tool invocation, MCP integration, multi-agent coordination
+
+## Release Pipeline
+
+Binary artifact build, sign, and distribute workflow. Conformance gate (100% pass) is a prerequisite — no release without it.
+
+### Build matrix
+
+| Platform | Architectures | Artifact types |
+|----------|--------------|----------------|
+| Linux | x86_64, aarch64 | manylinux2014 wheels (Python), .so (native) |
+| macOS | universal2 (x86_64 + arm64) | wheels (Python), .dylib (native), .xcframework (Swift) |
+| Windows | x86_64 | wheels (Python), .dll (native) |
+
+### Distribution channels
+
+| Language | Package | Registry | Artifact |
+|----------|---------|----------|----------|
+| Rust | `scp-core`, `scp-transport`, `scp-platform` | crates.io | Source crate |
+| Python | `scp-sdk` | PyPI | maturin-built wheel (includes compiled Rust) |
+| TypeScript (browser) | `@scp/sdk` | npm | WASM bundle |
+| TypeScript (Node/Bun) | `@scp/sdk-node` | npm | napi-rs native addon |
+| Swift | `SCP` | Swift Package Manager | XCFramework binary target |
+| Kotlin | `com.limn:scp-sdk-kotlin` | Maven Central | AAR with bundled .so |
+| Go | `github.com/limn/scp-go` | Go modules | Source + pre-built .so |
+| C# | `Limn.Scp` | NuGet | Native runtime pack |
+| Java | `com.limn:scp-sdk-java` | Maven Central | JAR with bundled natives |
+
+### Version pinning
+
+All SDK packages pin to the exact `scp-core` version they were built against. The `scp-core` crate version is the source of truth (see §Versioning above). SDK packages encode the core version in their metadata (e.g., Python wheel metadata, npm `engines`, Swift Package.swift).
+
+### Signing
+
+All release artifacts are signed. Rust crates are verified by crates.io's built-in checksums. Platform packages use the platform's native signing mechanism (Apple codesigning for .xcframework, Authenticode for .dll, GPG for Maven artifacts). PyPI wheels use Trusted Publishers (GitHub Actions OIDC).
+
+### Release checklist
+
+1. All conformance tests pass (100%) across all target platforms
+2. Changelog updated with version bump and summary of changes
+3. Version tags created: `scp-core@{version}`, per-SDK tags (`scp-sdk-python@{version}`, etc.)
+4. CI builds artifacts for all platforms in the build matrix
+5. Artifacts signed per platform signing requirements
+6. Publish to registries (crates.io, PyPI, npm, SPM, Maven Central, NuGet, Go proxy)
+7. GitHub Release created with binary attachments and changelog

@@ -278,10 +278,11 @@ pub enum MemoryScope {
 | `manager.rs` | `ContextManager` struct — create, join, leave, close, send. Coordinates between MLS, envelope, transport, event log |
 | `params.rs` | `ContextParams`, `MemoryScope`, `GovernanceModel` (single-admin for Phase 2), `RoleDefinition`, `TemplateId` types |
 | `templates.rs` | Well-known template definitions, template validation (params match template), template-based `ContextParams` construction |
-| `nesting.rs` | Parent-child relationship management: ceiling intersection validation, eligibility enforcement, lifecycle coupling, `ParentGovernanceConfig`, MLS `group_context` extension construction (parent context IDs + governance config content hash) |
 | `ttl.rs` | TTL timer management — spawn, cancel, extend. tokio-based timer tasks |
 | `membership.rs` | Member tracking, role assignment per member, member list queries, member count |
 | `builder.rs` | `CreationReceipt`, two-phase commit logic, ordered rollback, precondition validation |
+
+> **Note:** Context nesting (spec §5.13) is **not Phase 2 scope**. The `nesting.rs` module — parent-child relationship management, ceiling intersection validation, eligibility enforcement, lifecycle coupling, `ParentGovernanceConfig`, MLS `group_context` extension construction — will be introduced when nesting is implemented in a later phase. See the context nesting story in the PRD for scope and dependencies.
 
 **Estimated functions:** ~20-25 public functions, ~15-20 internal helpers.
 
@@ -390,17 +391,24 @@ pub struct RoleDefinition {
 
 4. **`validate_ucan(context: &ContextHandle, token: &UcanToken, required_capability: &Capability) -> Result<(), UcanError>`**
 
-   > **Note:** This defines the base 8-check validation for Phase 2. ADR-016 (Phase 3) extends this to an 11-check pipeline that adds chain verification (step 3), attenuation checking (step 7), and structured nonce validation (step 9). The implementation SHOULD build the full 11-check version from ADR-016 directly — ADR-016 is a strict superset, not a replacement. The 8 checks below are listed for Phase 2 scoping; they map to ADR-016 steps 1-2, 4-6, 8-11.
+   Implement the **11-step UCAN validation pipeline** defined in ADR-016 (Phase 3) criterion 2. ADR-016 is the normative specification — implementations build the full 11-step pipeline from the start (it is a strict superset, not a future extension).
 
-   - Verifies UCAN signature chain: each delegation signature is valid.
-   - Verifies root issuer is the context creator.
-   - Verifies audience matches the presenting agent's DID.
-   - Verifies the token grants the required capability.
-   - Verifies the capability is within the context's ceiling.
-   - Verifies the nonce has not been seen before (replay prevention, spec section 9.5). Adds nonce to seen set.
-   - Verifies the token has not been revoked.
-   - Verifies the token has not expired.
-   - Returns `Ok(())` if all checks pass. Returns specific error variant on failure.
+   The 11 steps:
+   1. **Parse** — Decode JWT-format UCAN token; reject malformed tokens.
+   2. **Signature verification** — Verify Ed25519 signature over `base64url(header).base64url(payload)`.
+   3. **Chain verification** — For each proof CID in `prf`, resolve parent UCAN, verify its signature, verify parent's `aud` matches this token's `iss`. Recurse to root.
+   4. **Root issuer** — Verify root token's `iss` is the context creator's DID.
+   5. **Audience** — Verify token's `aud` matches the presenting agent's DID.
+   6. **Capability match** — Verify token's `att` includes the `required_capability`.
+   7. **Attenuation** — Verify each delegation narrows or preserves capabilities (never widens).
+   8. **Ceiling** — Verify `required_capability` is within the context's immutable capability ceiling.
+   9. **Nonce** — Validate format (`{unix_millis}-{hex16}`), validate freshness (±5 min), verify uniqueness, record in tracker.
+   10. **Revocation** — Verify token CID is not in the context's revocation list.
+   11. **Expiry** — Verify `exp > now` and `nbf <= now` (if present).
+
+   Returns `Ok(())` if all 11 checks pass. Returns a specific `UcanError` variant indicating which check failed.
+
+   **Phase 2 integration tests** exercise steps 1–2, 4–6, 8, 10–11 (the 8 steps that don't require delegation chain depth > 1). Phase 3 adds integration tests for steps 3, 7, 9.
 
 5. **`revoke_ucan(context: &ContextHandle, token_id: &str, revoker_did: &DID) -> Result<(), UcanError>`**
    - Verifies revoker has authority (must be the token issuer or the context creator).
@@ -916,7 +924,7 @@ pub struct TransportManager {
    - Subscribes to the routing_id on all relays in the context's relay set.
    - For broadcast contexts, `routing_id` is the public `SHA-256(context_id)` — any subscriber that knows the context_id can derive the routing_id and subscribe without prior membership negotiation.
    - Merges streams from all relays into a single deduplicated stream.
-   - Deduplication applies to `TransportEvent::Envelope` variants: envelopes with the same `blob_id` (SHA-256 of the blob) are delivered only once. The dedup cache is an LRU with a 10,000-entry capacity.
+   - Deduplication applies to `TransportEvent::Envelope` variants: envelopes with the same `blob_id` (SHA-256 of the blob) are delivered only once. The dedup cache uses LRU eviction with a 10,000-entry capacity **and** time-based expiry (1 hour default, configurable via `TransportConfig`). Entries older than the TTL are evicted even if the capacity has not been reached. This prevents stale entries from consuming memory in low-throughput scenarios and ensures that a slow relay delivering a blob after the LRU entry was evicted does not bypass deduplication.
    - Returns the merged, deduplicated stream.
 
 4. **`assign_relay_set(manager: &mut TransportManager, context_id: &ContextId) -> Vec<usize>`**

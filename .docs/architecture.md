@@ -613,7 +613,7 @@ Build order follows the dependency graph bottom-up: platform traits → transpor
 
 ### 2.4 Context Nesting
 
-Contexts can form parent-child relationships (spec §5.13, ADR-008 `nesting.rs`). A child context is a full context — its own MLS group, event log, governance, roles, tools, ceiling, and membership — structurally and cryptographically linked to one or more parents.
+Contexts can form parent-child relationships (spec §5.13, ADR-008). A child context is a full context — its own MLS group, event log, governance, roles, tools, ceiling, and membership — structurally and cryptographically linked to one or more parents.
 
 **Single-parent nesting** creates sub-spaces within a context: per-task rooms, per-topic channels, breakout sessions. The child narrows the parent's scope. **Multi-parent nesting** creates a governed bridge between contexts — a shared collaboration space where members from different parent contexts interact as peers. This is the symmetric complement to tool interfaces (§6.2): tool interfaces are asymmetric and per-call; multi-parent children are symmetric and persistent.
 

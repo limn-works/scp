@@ -53,6 +53,21 @@ All SCP SDK operations involving I/O (network, storage, crypto operations) are a
 | C# | `async Task<T>` | .NET task scheduler | `.GetAwaiter().GetResult()` (rare) |
 | Java | `CompletableFuture<T>` | ForkJoinPool / virtual threads | `.get()` / `.join()` |
 
+### Streaming return types
+
+`Context.receive()` (and equivalents) returns a language-appropriate async stream. See `.docs/scaffold/shared.md` §Streaming Types for the full mapping. Summary:
+
+| Language | `receive()` return type |
+|----------|------------------------|
+| Rust | `Pin<Box<dyn Stream<Item = Message> + Send>>` |
+| Python | `AsyncIterator[Message]` |
+| TypeScript | `AsyncIterable<Message>` |
+| Swift | `AsyncSequence` |
+| Kotlin | `Flow<Message>` |
+| Go | `<-chan Message` |
+| C# | `IAsyncEnumerable<Message>` |
+| Java | `Flow.Publisher<Message>` (Reactive Streams) |
+
 ## Resource Lifecycle
 
 SCP objects hold crypto state (MLS groups, key material, WebSocket connections) that must be properly released. Each language uses its idiomatic resource management pattern.
@@ -81,6 +96,23 @@ Destruction of key material is immediate and irreversible. This is by design —
 ### Cleanup error handling
 
 If any cleanup step fails (e.g., network unreachable when leaving a context), the resource MUST still complete local cleanup (key destruction, handle release). Errors during cleanup are logged but never propagated as exceptions — callers must not be penalized for disposing resources. The invariant: after dispose returns, all local state is released regardless of remote operation outcomes.
+
+## Concurrency Model
+
+All public handle types (`Identity`, `ContextHandle`/`Context`, `TransportManager`) are safe to share across threads and tasks. Individual operations are serialized internally — concurrent sends on the same context are safe and deliver in call order.
+
+| Language | Guarantee | Mechanism |
+|----------|-----------|-----------|
+| Rust | `Send + Sync` | Interior `Arc<Mutex<_>>` or `Arc<RwLock<_>>` on mutable state |
+| Python | Safe across `asyncio` tasks on the same event loop | GIL + interior locking in Rust core via PyO3 |
+| TypeScript | Single-threaded event loop; safe across concurrent promises | N/A (no true concurrency) |
+| Swift | `Sendable` | Actor isolation or `@unchecked Sendable` with interior locking |
+| Kotlin | Safe across coroutines | Interior `Mutex` in Rust core via UniFFI |
+| Go | Safe for concurrent use from multiple goroutines | Interior locking in Rust core via cgo |
+| C# | Thread-safe | Interior locking in Rust core via P/Invoke |
+| Java | Thread-safe | Interior locking in Rust core via JNA |
+
+**Invariant:** No SDK user should ever need an external lock to use SCP types safely. If a data race is possible without user-side synchronization, the SDK has a bug.
 
 ## Context Creation
 
@@ -172,6 +204,10 @@ sdk.set_auto_accept_policy(
 ```
 
 **Hard constraint (all SDKs, non-overridable):** Auto-accept policies NEVER apply to contexts whose ceiling includes any tool-related capability (`ToolInvokeAll`, `ToolInvokeSpecific`, `ToolRegister`). Tool-bearing contexts always require explicit confirmation. This is enforced in the SDK and cannot be disabled by configuration.
+
+### Auto-accept persistence
+
+Auto-accept policies are persisted via the SDK's `Storage` trait (same backend as protocol state). Key convention: `policy/{identity_did}/auto_accept`. Policies are device-local — cross-device sync is not supported (each device configures independently). Policies are never transmitted over the network. On SDK initialization, policies are loaded from storage and applied to the invitation evaluation pipeline.
 
 ### Invitation evaluation
 
@@ -279,3 +315,34 @@ The reorder buffer ensures reliable delivery without rejecting out-of-order mess
 | `messaging-reorder-gap-timeout-003` | 30-second gap timeout with suppression alert — missing messages are marked as gaps and buffered messages are delivered |
 | `messaging-reorder-buffer-bound-004` | 100-message buffer bound — when exceeded, buffer flushes in order with gap markers for missing sequence numbers |
 | `messaging-reorder-gap-alert-005` | Gap detection triggers an alert to the application, not message rejection |
+
+### Receive stream buffer tests
+
+The receive stream buffers events for the application layer. When the consumer falls behind, the buffer drops the oldest events and emits a warning rather than blocking the transport layer.
+
+| Test ID | Verifies |
+|---------|----------|
+| `receive-buffer-capacity-001` | Receive stream buffers up to 1,000 events (default) before dropping |
+| `receive-buffer-overflow-drop-002` | When buffer is full, oldest unconsumed event is dropped (not newest) |
+| `receive-buffer-overflow-warning-003` | `BufferOverflow` warning event is emitted when events are dropped, including dropped count |
+| `receive-buffer-configurable-004` | Buffer size is configurable within bounds (min 100, max 10,000) |
+
+## FFI Async Bridging Risks
+
+Cross-language async bridging introduces subtle failure modes. All SDK binding implementations must account for these risks.
+
+### 1. Tokio runtime must never block on Python GIL acquisition
+
+PyO3 async functions execute on tokio threads. If a tokio thread attempts to acquire the Python GIL (e.g., to call a Python callback) while the GIL-holding Python thread is blocked waiting for a tokio future, deadlock occurs. **Rule:** Rust-side tokio tasks must never call into Python synchronously. Use `Python::with_gil()` only from PyO3's async bridge path, which handles GIL acquisition safely via `pyo3-asyncio` / native async.
+
+### 2. UniFFI callbacks execute on Rust threads
+
+UniFFI-generated callback interfaces invoke the foreign callback on whatever Rust thread is running. Swift and Kotlin code must not assume callbacks arrive on the main thread or any specific dispatcher. **Rule:** UniFFI callbacks that touch UI or main-thread-only APIs must dispatch to the appropriate context (Swift: `MainActor.run {}`, Kotlin: `Dispatchers.Main`).
+
+### 3. cbindgen runtime initialization is not reentrant
+
+The shared tokio `Runtime` created at FFI initialization (`scp_init()`) must be called exactly once. A second call from Go/C#/Java will panic or return an error. **Rule:** Guard initialization with a `Once` / `OnceCell`. Document in all cbindgen-based SDK READMEs that `init()` is not reentrant.
+
+### 4. Shutdown ordering: language cleanup before Rust runtime drop
+
+If the Rust tokio runtime is dropped while language-side objects still hold FFI handles, those objects will attempt to call into a dead runtime. **Rule:** SDKs must ensure all SCP objects are disposed/closed before the FFI runtime is shut down. Implement a shutdown hook or reference counter that blocks runtime drop until all outstanding handles are released (with a configurable timeout, default 5 seconds).
