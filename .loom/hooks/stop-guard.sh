@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ─── Loom Stop Guard ────────────────────────────────────────────
 # Blocks the agent from exiting until status.md has been updated
-# this iteration. Only active inside a Loom loop (LOOM_ACTIVE=1).
+# this iteration. Also nudges about docs and memory.
+# Only active inside a Loom loop (LOOM_ACTIVE=1).
 # ─────────────────────────────────────────────────────────────────
 
 # No-op outside Loom
@@ -35,19 +36,17 @@ You must write a fresh status report before exiting:
   - Tests Added / Updated
   - Outcomes (story ID or directive summary, pass/fail for each)
 
-Also ensure all commits (if tests pass) and Vestige memory storage
+Ensure all commits (if tests pass), documentation updates, and memory storage
 are done before writing status.md — the write triggers an immediate kill.
-
-Documentation reminder: Before finishing, check whether this iteration's
-changes warrant .docs updates:
-  - Root .docs/ for project-wide knowledge (ADRs, specs, lessons, architecture)
-  - Localized .docs/ dirs (e.g. crates/scp-core/.docs/) for crate-specific
-    design notes, API decisions, and internal conventions
-Create localized .docs/ directories when a crate accumulates design context
-worth preserving close to the code.
 MSG
     exit 2
   fi
 fi
 
-exit 0
+# ─── Nudge: docs and memory ──────────────────────────────────────
+# Always nudge. Advisory (block + continue), not a hard gate.
+
+jq -n '{
+  decision: "block",
+  reason: "Before finishing, check if this iteration warrants updates to:\n\nDocumentation:\n  - Root .docs/ and CLAUDE.md for project-wide knowledge (ADRs, specs, lessons, architecture)\n  - Feature-scoped .docs/ and CLAUDE.md (e.g. src/auth/.docs/) for feature-specific design notes, API decisions, and internal conventions\n  Create feature-scoped .docs/ directories when a feature area has design context worth preserving close to the code.\n\nMemory:\n  - If you discovered patterns, gotchas, or architectural decisions worth preserving, store them using available memory storage or tools so future iterations can benefit."
+}'

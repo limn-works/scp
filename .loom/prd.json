@@ -1076,7 +1076,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/server.rs",
         "crates/scp-transport/src/native/storage.rs"
@@ -1137,7 +1137,8 @@
         "relayOperatorConfig": "Published out-of-band. Defaults: max_blob_size 262144, max_blob_ttl 604800, max_subscriptions_per_connection 100, max_query_limit 1000, rate_limit_publish 60/min, rate_limit_subscribe 20/min, idle_timeout 90s.",
         "contextMetadata": "Contexts publish parameters to publicly derivable routing ID: metadata_routing_id = SHA-256(context_id || \"scp-metadata\"). Any participant can SUBSCRIBE or QUERY to inspect context parameters before joining. Metadata blob is signed, unencrypted envelope containing ContextParameters struct (spec §5.3). Enables legibility-before-opt-in tenet.",
         "connectionRecovery": "Client-side: reconnect with exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap). Re-issue SUBSCRIBE with since = last received stored_at minus 5-second overlap. Deduplicate via blob_id. Relay maintains no per-client state across connections."
-      }
+      },
+      "result": "Implemented relay server (storage.rs + server.rs) with WebSocket handling, subscription registry, TTL expiry, backfill, PING/PONG. 30 tests."
     },
     {
       "id": "SCP-016",
@@ -1279,7 +1280,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/mod.rs",
         "crates/scp-core/context/state_machine.rs",
@@ -1335,7 +1336,8 @@
         "TemplateId enum": "```rust\npub enum TemplateId {\n    BilateralEphemeral,\n    BilateralPersistent,\n    Coordination,\n    GroupDiscussion,\n    PublicBroadcast,\n    GatedBroadcast,\n}\n```\nTemplates are protocol constants — not user-extensible. When present, all other ContextParams fields must match the template definition exactly.",
         "Implementation notes": "Language: Rust. Crate: scp-core. Module: scp-core/context/. Async runtime: tokio (TTL timers, MLS operations, transport). State persistence: Via ProtocolStore (§17.4), which wraps the scp-platform Storage trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.",
         "Concurrency model": "All public handle types (Identity, Context, TransportManager) are safe to share across threads/tasks. In Rust: Send + Sync. In Python: safe to use from any asyncio task on the same event loop. In Swift: Sendable. In Go: safe for concurrent use. In Kotlin: safe across coroutines. Individual operations are serialized internally — concurrent sends on the same context are safe and ordered. No SDK user should ever need an external lock to use SCP types safely."
-      }
+      },
+      "result": "Implemented context types: ContextState FSM, ContextHandle, ContextParams, all parameter enums. 52 tests."
     },
     {
       "id": "SCP-019",
