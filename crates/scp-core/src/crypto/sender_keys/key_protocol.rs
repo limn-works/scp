@@ -256,8 +256,8 @@ pub async fn request_sender_key(
         signature: signature.into_bytes(),
     };
 
-    let message =
-        serde_json::to_vec(&request).map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
+    let message = serde_json::to_vec(&request)
+        .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
 
     Ok(SenderKeyRequestResult {
         request_message: message,
@@ -330,16 +330,12 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
     }
 
     // Parse the requester's wrapping public key.
-    let wrapping_bytes: [u8; 32] = request
-        .wrapping_pubkey
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            SenderKeyError::VerificationFailed(format!(
-                "wrapping pubkey must be 32 bytes, got {}",
-                request.wrapping_pubkey.len()
-            ))
-        })?;
+    let wrapping_bytes: [u8; 32] = request.wrapping_pubkey.as_slice().try_into().map_err(|_| {
+        SenderKeyError::VerificationFailed(format!(
+            "wrapping pubkey must be 32 bytes, got {}",
+            request.wrapping_pubkey.len()
+        ))
+    })?;
 
     // HPKE seal: encrypt the sender key to the requester's wrapping key.
     let (sealed, ephemeral_pub) = hpke_seal(sender_key.as_bytes(), &wrapping_bytes)?;
@@ -351,8 +347,8 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         ephemeral_pubkey: ephemeral_pub.to_vec(),
     };
 
-    let message =
-        serde_json::to_vec(&response).map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
+    let message = serde_json::to_vec(&response)
+        .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
 
     Ok(Some(message))
 }
@@ -378,12 +374,16 @@ pub async fn open_sender_key_response(
     response: &SenderKeyResponse,
 ) -> Result<SenderKey, SenderKeyError> {
     let ephemeral_bytes: [u8; 32] =
-        response.ephemeral_pubkey.as_slice().try_into().map_err(|_| {
-            SenderKeyError::HpkeDecryptionFailed(format!(
-                "ephemeral pubkey must be 32 bytes, got {}",
-                response.ephemeral_pubkey.len()
-            ))
-        })?;
+        response
+            .ephemeral_pubkey
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                SenderKeyError::HpkeDecryptionFailed(format!(
+                    "ephemeral pubkey must be 32 bytes, got {}",
+                    response.ephemeral_pubkey.len()
+                ))
+            })?;
 
     // Compute shared secret inside custody boundary.
     let shared_secret = key_custody
@@ -693,7 +693,11 @@ fn verify_ed25519_signature(
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().saturating_mul(1000).saturating_add(u64::from(d.subsec_millis())))
+        .map(|d| {
+            d.as_secs()
+                .saturating_mul(1000)
+                .saturating_add(u64::from(d.subsec_millis()))
+        })
         .unwrap_or(0)
 }
 
@@ -727,15 +731,10 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let message = publish_sender_key_epoch_advance(
-            &custody,
-            &signing_key,
-            "ctx-1",
-            "did:dht:alice",
-            5,
-        )
-        .await
-        .unwrap();
+        let message =
+            publish_sender_key_epoch_advance(&custody, &signing_key, "ctx-1", "did:dht:alice", 5)
+                .await
+                .unwrap();
 
         let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
         assert_eq!(advance.sender_did, "did:dht:alice");
@@ -750,15 +749,10 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let message = publish_sender_key_epoch_advance(
-            &custody,
-            &signing_key,
-            "ctx-1",
-            "did:dht:alice",
-            5,
-        )
-        .await
-        .unwrap();
+        let message =
+            publish_sender_key_epoch_advance(&custody, &signing_key, "ctx-1", "did:dht:alice", 5)
+                .await
+                .unwrap();
 
         let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
 
@@ -773,15 +767,10 @@ mod tests {
         let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
 
-        let message = publish_sender_key_epoch_advance(
-            &custody,
-            &signing_key,
-            "ctx-1",
-            "did:dht:alice",
-            5,
-        )
-        .await
-        .unwrap();
+        let message =
+            publish_sender_key_epoch_advance(&custody, &signing_key, "ctx-1", "did:dht:alice", 5)
+                .await
+                .unwrap();
 
         let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
         let valid = verify_epoch_advance(&advance, "ctx-1", wrong_pubkey.as_bytes()).unwrap();
@@ -838,21 +827,20 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(response_bytes.is_some(), "non-blocked requester should get a response");
-        let response: SenderKeyResponse =
-            serde_json::from_slice(&response_bytes.unwrap()).unwrap();
+        assert!(
+            response_bytes.is_some(),
+            "non-blocked requester should get a response"
+        );
+        let response: SenderKeyResponse = serde_json::from_slice(&response_bytes.unwrap()).unwrap();
 
         assert_eq!(response.sender_did, "did:dht:alice");
         assert_eq!(response.epoch, 1);
 
         // Bob opens the response using his wrapping key.
-        let recovered_key = open_sender_key_response(
-            &bob_custody,
-            &request_result.wrapping_key_handle,
-            &response,
-        )
-        .await
-        .unwrap();
+        let recovered_key =
+            open_sender_key_response(&bob_custody, &request_result.wrapping_key_handle, &response)
+                .await
+                .unwrap();
 
         assert_eq!(
             recovered_key.as_bytes(),
@@ -866,18 +854,11 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let result = request_sender_key(
-            &custody,
-            &signing_key,
-            "did:dht:bob",
-            "did:dht:alice",
-            3,
-        )
-        .await
-        .unwrap();
+        let result = request_sender_key(&custody, &signing_key, "did:dht:bob", "did:dht:alice", 3)
+            .await
+            .unwrap();
 
-        let request: SenderKeyRequest =
-            serde_json::from_slice(&result.request_message).unwrap();
+        let request: SenderKeyRequest = serde_json::from_slice(&result.request_message).unwrap();
 
         let valid = verify_sender_key_request(&request, pubkey.as_bytes()).unwrap();
         assert!(valid, "request signature should be valid");
@@ -890,18 +871,11 @@ mod tests {
         let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
 
-        let result = request_sender_key(
-            &custody,
-            &signing_key,
-            "did:dht:bob",
-            "did:dht:alice",
-            3,
-        )
-        .await
-        .unwrap();
+        let result = request_sender_key(&custody, &signing_key, "did:dht:bob", "did:dht:alice", 3)
+            .await
+            .unwrap();
 
-        let request: SenderKeyRequest =
-            serde_json::from_slice(&result.request_message).unwrap();
+        let request: SenderKeyRequest = serde_json::from_slice(&result.request_message).unwrap();
 
         let valid = verify_sender_key_request(&request, wrong_pubkey.as_bytes()).unwrap();
         assert!(!valid, "wrong signer should invalidate request signature");
@@ -1027,8 +1001,7 @@ mod tests {
         assert_eq!(notification.blocked, "did:dht:dave");
         assert!(notification.timestamp > 0);
 
-        let valid =
-            verify_block_notification(&notification, "ctx-1", pubkey.as_bytes()).unwrap();
+        let valid = verify_block_notification(&notification, "ctx-1", pubkey.as_bytes()).unwrap();
         assert!(valid, "block notification signature should be valid");
     }
 
@@ -1260,7 +1233,10 @@ mod tests {
         let aes_key = hkdf_derive_key(shared.as_bytes()).unwrap();
         let result = aes128gcm_decrypt(&aes_key, &sealed);
 
-        assert!(result.is_err(), "wrong recipient should fail AEAD decryption");
+        assert!(
+            result.is_err(),
+            "wrong recipient should fail AEAD decryption"
+        );
     }
 
     #[test]

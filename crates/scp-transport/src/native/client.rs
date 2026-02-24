@@ -128,17 +128,13 @@ pub struct NativeRelayClient {
 
 /// Type alias for the WebSocket write half.
 type WsSink = futures::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 
 /// Type alias for the WebSocket read half.
 type WsSource = futures::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
 impl NativeRelayClient {
@@ -178,10 +174,9 @@ impl NativeRelayClient {
 
     /// Establishes (or re-establishes) the WebSocket connection.
     async fn establish_connection(&self) -> Result<(), TransportError> {
-        let (ws_stream, _response) =
-            tokio_tungstenite::connect_async(&self.url)
-                .await
-                .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
+        let (ws_stream, _response) = tokio_tungstenite::connect_async(&self.url)
+            .await
+            .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
         let (sink, source) = ws_stream.split();
 
@@ -194,9 +189,7 @@ impl NativeRelayClient {
             guard
                 .as_ref()
                 .map(tokio::sync::broadcast::Sender::subscribe)
-                .ok_or_else(|| {
-                    TransportError::ConnectionFailed("client shut down".to_string())
-                })?
+                .ok_or_else(|| TransportError::ConnectionFailed("client shut down".to_string()))?
         };
 
         let keepalive_shutdown_rx = {
@@ -204,9 +197,7 @@ impl NativeRelayClient {
             guard
                 .as_ref()
                 .map(tokio::sync::broadcast::Sender::subscribe)
-                .ok_or_else(|| {
-                    TransportError::ConnectionFailed("client shut down".to_string())
-                })?
+                .ok_or_else(|| TransportError::ConnectionFailed("client shut down".to_string()))?
         };
 
         // Spawn the reader task.
@@ -272,10 +263,7 @@ impl NativeRelayClient {
 
     /// Dispatches a relay message to the appropriate pending request or
     /// subscription channel.
-    async fn dispatch_relay_message(
-        inner: &Arc<RwLock<ClientInner>>,
-        msg: RelayMessage,
-    ) {
+    async fn dispatch_relay_message(inner: &Arc<RwLock<ClientInner>>, msg: RelayMessage) {
         match &msg {
             // OK and ERR responses are correlated by `ref_id`.
             RelayMessage::Ok { ref_id, .. } | RelayMessage::Err { ref_id, .. } => {
@@ -326,10 +314,7 @@ impl NativeRelayClient {
                 // Broadcast event to all subscriptions.
                 let state = inner.read().await;
                 for sub in state.subscriptions.values() {
-                    let _ = sub
-                        .tx
-                        .send(SubscriptionMessage::Relay(msg.clone()))
-                        .await;
+                    let _ = sub.tx.send(SubscriptionMessage::Relay(msg.clone())).await;
                 }
             }
 
@@ -502,10 +487,7 @@ impl NativeRelayClient {
     /// # Errors
     ///
     /// Returns [`TransportError::NotConnected`] if the client is not connected.
-    pub async fn unsubscribe(
-        &self,
-        routing_id: &[u8; 32],
-    ) -> Result<(), TransportError> {
+    pub async fn unsubscribe(&self, routing_id: &[u8; 32]) -> Result<(), TransportError> {
         let msg = ClientMessage::Unsubscribe {
             ref_id: None,
             routing_id: *routing_id,
@@ -540,7 +522,13 @@ impl NativeRelayClient {
         since: Option<u64>,
     ) -> Result<Vec<OuterEnvelope>, TransportError> {
         // Check if there's already an active subscription for this `routing_id`.
-        if self.inner.read().await.subscriptions.contains_key(routing_id) {
+        if self
+            .inner
+            .read()
+            .await
+            .subscriptions
+            .contains_key(routing_id)
+        {
             // When there's an active subscription, just send the QUERY.
             // Results will be delivered through the existing subscription.
             let msg = ClientMessage::Query {
@@ -676,8 +664,8 @@ impl NativeRelayClient {
                         .collect();
 
                     for (routing_id, last_stored_at) in subs_snapshot {
-                        let since = last_stored_at
-                            .map(|ts| ts.saturating_sub(RECONNECT_OVERLAP_SECS));
+                        let since =
+                            last_stored_at.map(|ts| ts.saturating_sub(RECONNECT_OVERLAP_SECS));
 
                         let msg = ClientMessage::Subscribe {
                             ref_id: None,
@@ -717,7 +705,13 @@ impl NativeRelayClient {
     /// Returns a snapshot of the current subscription routing IDs.
     #[allow(dead_code)]
     pub async fn active_subscriptions(&self) -> Vec<[u8; 32]> {
-        self.inner.read().await.subscriptions.keys().copied().collect()
+        self.inner
+            .read()
+            .await
+            .subscriptions
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Clears the deduplication set. Useful after a successful reconnect

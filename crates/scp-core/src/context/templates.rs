@@ -254,9 +254,9 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
     match template_id {
         TemplateId::BilateralEphemeral | TemplateId::Coordination => TtlPolicy::Required,
         TemplateId::BilateralPersistent => TtlPolicy::Forbidden,
-        TemplateId::GroupDiscussion
-        | TemplateId::PublicBroadcast
-        | TemplateId::GatedBroadcast => TtlPolicy::Optional,
+        TemplateId::GroupDiscussion | TemplateId::PublicBroadcast | TemplateId::GatedBroadcast => {
+            TtlPolicy::Optional
+        }
     }
 }
 
@@ -445,10 +445,12 @@ mod tests {
         assert_eq!(params.mode, ContextMode::Encrypted);
         assert_eq!(params.ceiling.len(), 2);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_MESSAGES_WRITE));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_MESSAGES_WRITE)
+        );
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -456,10 +458,7 @@ mod tests {
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Ephemeral);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
-        assert_eq!(
-            params.template_id,
-            Some(TemplateId::BilateralEphemeral)
-        );
+        assert_eq!(params.template_id, Some(TemplateId::BilateralEphemeral));
     }
 
     #[test]
@@ -468,10 +467,12 @@ mod tests {
         assert_eq!(params.mode, ContextMode::Encrypted);
         assert_eq!(params.ceiling.len(), 2);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_MESSAGES_WRITE));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_MESSAGES_WRITE)
+        );
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -479,10 +480,7 @@ mod tests {
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
-        assert_eq!(
-            params.template_id,
-            Some(TemplateId::BilateralPersistent)
-        );
+        assert_eq!(params.template_id, Some(TemplateId::BilateralPersistent));
     }
 
     #[test]
@@ -491,14 +489,18 @@ mod tests {
         assert_eq!(params.mode, ContextMode::Encrypted);
         assert_eq!(params.ceiling.len(), 3);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_MESSAGES_WRITE));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_TOOL_INVOKE_ALL));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_MESSAGES_WRITE)
+        );
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
+        );
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -515,14 +517,13 @@ mod tests {
         assert_eq!(params.mode, ContextMode::Encrypted);
         assert_eq!(params.ceiling.len(), 3);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_MESSAGES_WRITE));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_MEMBER_INVITE));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_MESSAGES_WRITE)
+        );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_INVITE));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
         assert!(params.roles.is_empty());
@@ -539,18 +540,19 @@ mod tests {
         assert_eq!(params.mode, ContextMode::Broadcast);
         assert_eq!(params.ceiling.len(), 4);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_MESSAGES_WRITE));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_TOOL_INVOKE_ALL));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_MESSAGES_WRITE)
+        );
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
+        );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -567,18 +569,19 @@ mod tests {
         assert_eq!(params.mode, ContextMode::Broadcast);
         assert_eq!(params.ceiling.len(), 4);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_MESSAGES_WRITE));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_TOOL_INVOKE_ALL));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_MESSAGES_WRITE)
+        );
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
+        );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -699,10 +702,7 @@ mod tests {
         params.ttl = Some(Duration::from_secs(300));
         params.mode = ContextMode::Broadcast;
         let err = validate_against_template(&params).unwrap_err();
-        assert!(matches!(
-            err,
-            TemplateError::Mismatch { field: "mode", .. }
-        ));
+        assert!(matches!(err, TemplateError::Mismatch { field: "mode", .. }));
     }
 
     #[test]
@@ -802,37 +802,22 @@ mod tests {
 
     #[test]
     fn capabilities_match_same_order() {
-        let a = vec![
-            Capability::new("a"),
-            Capability::new("b"),
-        ];
-        let b = vec![
-            Capability::new("a"),
-            Capability::new("b"),
-        ];
+        let a = vec![Capability::new("a"), Capability::new("b")];
+        let b = vec![Capability::new("a"), Capability::new("b")];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_order() {
-        let a = vec![
-            Capability::new("b"),
-            Capability::new("a"),
-        ];
-        let b = vec![
-            Capability::new("a"),
-            Capability::new("b"),
-        ];
+        let a = vec![Capability::new("b"), Capability::new("a")];
+        let b = vec![Capability::new("a"), Capability::new("b")];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_lengths() {
         let a = vec![Capability::new("a")];
-        let b = vec![
-            Capability::new("a"),
-            Capability::new("b"),
-        ];
+        let b = vec![Capability::new("a"), Capability::new("b")];
         assert!(!capabilities_match(&a, &b));
     }
 
@@ -988,7 +973,10 @@ mod tests {
         for variant in &variants {
             let from_method = ContextParams::from_template(*variant);
             let from_fn = template_params(variant);
-            assert_eq!(from_method, from_fn, "from_template mismatch for {variant:?}");
+            assert_eq!(
+                from_method, from_fn,
+                "from_template mismatch for {variant:?}"
+            );
         }
     }
 
@@ -1059,10 +1047,7 @@ mod tests {
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
             err,
-            TemplateError::Mismatch {
-                field: "roles",
-                ..
-            }
+            TemplateError::Mismatch { field: "roles", .. }
         ));
     }
 
@@ -1076,10 +1061,7 @@ mod tests {
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
             err,
-            TemplateError::Mismatch {
-                field: "tools",
-                ..
-            }
+            TemplateError::Mismatch { field: "tools", .. }
         ));
     }
 

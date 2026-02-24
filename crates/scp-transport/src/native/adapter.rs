@@ -93,16 +93,12 @@ impl TransportAdapter for NativeRelayAdapter {
         Box::pin(async move {
             let blob = blob_result.map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
-            let routing_id: [u8; 32] =
-                routing_id_vec
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| {
-                        TransportError::SendFailed(format!(
-                            "invalid routing_id length: expected 32, got {}",
-                            routing_id_vec.len()
-                        ))
-                    })?;
+            let routing_id: [u8; 32] = routing_id_vec.as_slice().try_into().map_err(|_| {
+                TransportError::SendFailed(format!(
+                    "invalid routing_id length: expected 32, got {}",
+                    routing_id_vec.len()
+                ))
+            })?;
 
             let recipient_hint: Option<[u8; 32]> = recipient_hint_vec
                 .as_ref()
@@ -130,12 +126,10 @@ impl TransportAdapter for NativeRelayAdapter {
                 RelayMessage::Ok {
                     blob_id: Some(id), ..
                 } => Ok(BlobId::new(id)),
-                RelayMessage::Ok {
-                    blob_id: None, ..
-                } => Ok(BlobId::from_sha256(&routing_id_vec)),
-                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(
-                    format!("relay error {code}: {msg}"),
-                )),
+                RelayMessage::Ok { blob_id: None, .. } => Ok(BlobId::from_sha256(&routing_id_vec)),
+                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
+                    "relay error {code}: {msg}"
+                ))),
                 _ => Err(TransportError::ProtocolError(
                     "unexpected response to PUBLISH".to_string(),
                 )),
@@ -157,10 +151,7 @@ impl TransportAdapter for NativeRelayAdapter {
     ) -> BoxFuture<'_, Result<SubscriptionStream, TransportError>> {
         let routing_id_bytes = *routing_id.as_bytes();
         Box::pin(async move {
-            let rx = self
-                .client
-                .subscribe(&routing_id_bytes, since)
-                .await?;
+            let rx = self.client.subscribe(&routing_id_bytes, since).await?;
 
             let stream = RelayMessageStream { rx };
             Ok(Box::pin(stream) as SubscriptionStream)
@@ -168,14 +159,9 @@ impl TransportAdapter for NativeRelayAdapter {
     }
 
     /// Unsubscribes from a routing ID via UNSUBSCRIBE.
-    fn unsubscribe(
-        &self,
-        routing_id: &RoutingId,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
+    fn unsubscribe(&self, routing_id: &RoutingId) -> BoxFuture<'_, Result<(), TransportError>> {
         let routing_id_bytes = *routing_id.as_bytes();
-        Box::pin(async move {
-            self.client.unsubscribe(&routing_id_bytes).await
-        })
+        Box::pin(async move { self.client.unsubscribe(&routing_id_bytes).await })
     }
 
     /// Queries stored envelopes for a routing ID via QUERY.
@@ -188,9 +174,7 @@ impl TransportAdapter for NativeRelayAdapter {
         since: Option<u64>,
     ) -> BoxFuture<'_, Result<Vec<OuterEnvelope>, TransportError>> {
         let routing_id_bytes = *routing_id.as_bytes();
-        Box::pin(async move {
-            self.client.query(&routing_id_bytes, since).await
-        })
+        Box::pin(async move { self.client.query(&routing_id_bytes, since).await })
     }
 
     /// Requests deletion of a blob via DELETE.
@@ -205,9 +189,9 @@ impl TransportAdapter for NativeRelayAdapter {
             let response = self.client.send_request(msg).await?;
 
             match response {
-                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(
-                    format!("relay error {code}: {msg}"),
-                )),
+                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
+                    "relay error {code}: {msg}"
+                ))),
                 // Best-effort: treat all non-error responses as success.
                 _ => Ok(()),
             }

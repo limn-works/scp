@@ -297,9 +297,7 @@ impl ClientMessage {
             | Self::Delete { ref_id, .. } => {
                 validate_ref_id(ref_id)?;
             }
-            Self::Query {
-                ref_id, limit, ..
-            } => {
+            Self::Query { ref_id, limit, .. } => {
                 validate_ref_id(ref_id)?;
                 if let Some(l) = limit
                     && (*l == 0 || *l > MAX_QUERY_LIMIT)
@@ -797,10 +795,11 @@ mod tests {
         // rmp-serde uses bin8 (0xC4, length=0x20).
         // Verify the 32-byte sequence exists contiguously in the output.
         let needle = [0xAA; 32];
-        let found = bytes
-            .windows(32)
-            .any(|window| window == needle);
-        assert!(found, "routing_id bytes should appear contiguously as binary");
+        let found = bytes.windows(32).any(|window| window == needle);
+        assert!(
+            found,
+            "routing_id bytes should appear contiguously as binary"
+        );
 
         // Also verify that the deserialized message matches.
         let restored = ClientMessage::from_bytes(&bytes).unwrap();
@@ -835,10 +834,7 @@ mod tests {
         let mut map = std::collections::BTreeMap::new();
         map.insert("op".to_string(), rmpv::Value::String("PONG".into()));
         map.insert("ts".to_string(), rmpv::Value::Integer(99.into()));
-        map.insert(
-            "extra".to_string(),
-            rmpv::Value::Boolean(true),
-        );
+        map.insert("extra".to_string(), rmpv::Value::Boolean(true));
 
         let bytes = rmp_serde::to_vec_named(&map).unwrap();
         let msg = RelayMessage::from_bytes(&bytes).unwrap();

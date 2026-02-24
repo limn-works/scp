@@ -35,9 +35,7 @@ use std::net::SocketAddr;
 use futures::StreamExt;
 
 use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::mls::group::{
-    add_member, create_group, generate_key_package, join_group,
-};
+use scp_core::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 use scp_core::crypto::sender_keys::{
     SenderKeyStore, decrypt_sender_layer, encrypt_sender_layer, generate_sender_key,
     handle_sender_key_request, open_sender_key_response, publish_sender_key_epoch_advance,
@@ -243,10 +241,9 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     .unwrap();
 
     // 8c. Derive pseudonym for routing (ADR-002).
-    let pseudonym =
-        derive_pseudonym(&alice_custody, &alice_id.identity_key, ctx_id.as_bytes())
-            .await
-            .unwrap();
+    let pseudonym = derive_pseudonym(&alice_custody, &alice_id.identity_key, ctx_id.as_bytes())
+        .await
+        .unwrap();
 
     let routing_bytes = pseudonym.public_key.as_bytes();
     let routing_arr: [u8; 32] = routing_bytes.try_into().unwrap();

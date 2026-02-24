@@ -35,8 +35,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::error::code;
 use super::protocol::{
-    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT,
-    MIN_BLOB_TTL, RelayMessage,
+    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT, MIN_BLOB_TTL,
+    RelayMessage,
 };
 use super::storage::{BlobStorage, StoredBlob};
 
@@ -259,8 +259,7 @@ async fn handle_connection<S: BlobStorage + 'static>(
     let (tx, mut rx) = mpsc::channel::<RelayMessage>(256);
 
     // Track this connection's subscriptions for cleanup.
-    let my_subscriptions: Arc<RwLock<HashSet<[u8; 32]>>> =
-        Arc::new(RwLock::new(HashSet::new()));
+    let my_subscriptions: Arc<RwLock<HashSet<[u8; 32]>>> = Arc::new(RwLock::new(HashSet::new()));
 
     // Spawn a task to forward relay messages from the channel to the WebSocket.
     let forward_handle = tokio::spawn(async move {
@@ -391,10 +390,7 @@ async fn handle_client_message<S: BlobStorage>(
             )
             .await;
         }
-        ClientMessage::Unsubscribe {
-            ref_id,
-            routing_id,
-        } => {
+        ClientMessage::Unsubscribe { ref_id, routing_id } => {
             handle_unsubscribe(
                 ref_id.clone(),
                 *routing_id,
@@ -817,9 +813,7 @@ mod tests {
     ) -> Option<RelayMessage> {
         let timeout = tokio::time::timeout(duration, stream.next()).await;
         match timeout {
-            Ok(Some(Ok(Message::Binary(data)))) => {
-                Some(RelayMessage::from_bytes(&data).unwrap())
-            }
+            Ok(Some(Ok(Message::Binary(data)))) => Some(RelayMessage::from_bytes(&data).unwrap()),
             _ => None,
         }
     }
@@ -1047,10 +1041,7 @@ mod tests {
 
         let event = recv_msg(&mut stream).await;
         match &event {
-            RelayMessage::Event {
-                event_type,
-                ref_id,
-            } => {
+            RelayMessage::Event { event_type, ref_id } => {
                 assert_eq!(event_type, "query_complete");
                 assert_eq!(ref_id, &Some("q-1".to_string()));
             }
