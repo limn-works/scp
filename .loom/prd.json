@@ -3381,7 +3381,6 @@
       ],
       "blockedBy": [
         "SCP-030",
-        "SCP-046",
         "SCP-023"
       ],
       "sources": [
@@ -3706,8 +3705,9 @@
         "Write unit tests for key destruction sequencing, relay tracking, and broadcast validation"
       ],
       "blockedBy": [
-        "SCP-001",
-        "SCP-018"
+        "SCP-003",
+        "SCP-018",
+        "SCP-012"
       ],
       "sources": [
         {
@@ -4066,7 +4066,7 @@
         "SCP-073",
         "SCP-026",
         "SCP-030",
-        "SCP-001"
+        "SCP-003"
       ],
       "sources": [
         {
@@ -4406,8 +4406,8 @@
         "Error mapping: Rust Result maps to typed TypeScript exceptions (ScpError hierarchy from scaffold)",
         "Streaming: AsyncIterable for message streams, disposal via Symbol.asyncDispose",
         "Build pipeline: tsup config for dual ESM/CJS output",
-        "Browser target uses WASM bridge (SCP-098)",
-        "Node/Bun target uses napi bridge (SCP-099)",
+        "Browser target uses WASM bridge (SCP-079)",
+        "Node/Bun target uses napi bridge (SCP-080)",
         "Package published as @scp/sdk on npm",
         "All conformance tests from scaffold/shared.md pass"
       ],
@@ -6789,7 +6789,7 @@
       "files": [
         "crates/scp-core/event_log/pruning.rs"
       ],
-      "description": "Implement pruning of event log entries older than a checkpoint, with proof compaction that preserves verifiability. After a checkpoint is created (SCP-154), older entries can be pruned to reclaim storage. Pruned entries must still be provable via the checkpoint's Merkle root. Critical for mobile devices where unbounded growth is unsustainable.",
+      "description": "Implement pruning of event log entries older than a checkpoint, with proof compaction that preserves verifiability. After a checkpoint is created (SCP-125), older entries can be pruned to reclaim storage. Pruned entries must still be provable via the checkpoint's Merkle root. Critical for mobile devices where unbounded growth is unsustainable.",
       "acceptanceCriteria": [
         "Events before a checkpoint can be pruned from local storage",
         "Pruned events remain provable via checkpoint Merkle root (compact proof)",
@@ -6997,7 +6997,7 @@
       ],
       "description": "Implement multi-sig (M-of-N threshold) governance model. Simplest semantics, most useful, least ambiguous. A proposal passes when M of N designated signers approve. Start with this \u2014 most useful for the common case of '2-of-3 admins.' Must define: quorum rules, voting window duration, timeout handling, order-sensitive or order-independent signatures, withdrawal allowed or not.",
       "acceptanceCriteria": [
-        "Multi-sig governance model implements GovernanceModel trait from SCP-158",
+        "Multi-sig governance model implements GovernanceModel trait from SCP-129",
         "M-of-N threshold configurable at context creation (e.g. 2-of-3)",
         "Proposal passes when M of N designated signers approve",
         "Voting window with configurable duration and timeout handling",
@@ -7056,7 +7056,7 @@
       ],
       "description": "Implement majority vote (>50%) governance model. Each member gets one vote. Proposal passes at majority. Suitable for peer groups. Must define voting window, quorum requirements, and how abstentions are handled.",
       "acceptanceCriteria": [
-        "Majority vote governance model implements GovernanceModel trait from SCP-158",
+        "Majority vote governance model implements GovernanceModel trait from SCP-129",
         "Each member gets exactly one vote",
         "Proposal passes when >50% of eligible members approve",
         "Voting window with configurable duration and timeout handling",
@@ -7113,7 +7113,7 @@
       ],
       "description": "Implement unanimity (all members) governance model. Every member must approve. Suitable for high-stakes decisions (ceiling changes, context closure). Must handle the case where members are unavailable or offline \u2014 consensus deadlock recovery when N-of-M signers are unavailable.",
       "acceptanceCriteria": [
-        "Unanimity governance model implements GovernanceModel trait from SCP-158",
+        "Unanimity governance model implements GovernanceModel trait from SCP-129",
         "Every member must approve for proposal to pass",
         "Single rejection vetoes the proposal",
         "Voting window with configurable duration and timeout handling",
