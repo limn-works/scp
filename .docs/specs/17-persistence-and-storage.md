@@ -94,6 +94,12 @@ context/{context_id}/tool_session/{session_id}
 context/{context_id}/role/{role_name}
 context/{context_id}/ucan_revocation/{token_id}
 
+context/{context_id}/economic_policy
+context/{context_id}/payment_receipt/{receipt_id}
+context/{context_id}/spending_ucan/{token_id}
+
+identity/{did}/adapter_credentials/{adapter_id}
+
 did_cache/{did}
 tofu/{did}
 key_package/{relay_url}/{index}
@@ -199,6 +205,21 @@ impl ProtocolStore {
     // --- UCAN revocations ---
     pub async fn store_revocation(&self, context_id: &ContextId, token_id: &str) -> Result<(), StoreError>;
     pub async fn is_revoked(&self, context_id: &ContextId, token_id: &str) -> Result<bool, StoreError>;
+
+    // --- Economic governance (§19) ---
+    pub async fn store_economic_policy(&self, context_id: &ContextId, policy: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_economic_policy(&self, context_id: &ContextId) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn store_payment_receipt(&self, context_id: &ContextId, receipt_id: &[u8; 32], receipt: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_payment_receipt(&self, context_id: &ContextId, receipt_id: &[u8; 32]) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn list_payment_receipts(&self, context_id: &ContextId) -> Result<Vec<[u8; 32]>, StoreError>;
+    pub async fn store_spending_ucan(&self, context_id: &ContextId, token_id: &str, ucan: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_spending_ucan(&self, context_id: &ContextId, token_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn list_spending_ucans(&self, context_id: &ContextId) -> Result<Vec<String>, StoreError>;
+
+    // --- Adapter credentials (identity-private, §19.2.5) ---
+    pub async fn store_adapter_credentials(&self, did: &DID, adapter_id: &str, credentials: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_adapter_credentials(&self, did: &DID, adapter_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn list_adapter_credentials(&self, did: &DID) -> Result<Vec<String>, StoreError>;
 }
 ```
 
@@ -215,6 +236,7 @@ scp-core/src/store/
     nonce.rs        # UCAN nonce tracking, pruning
     tools.rs        # Tool registration, sessions
     transport.rs    # Relay scores, key packages
+    economy.rs      # Economic policy, payment receipts, spending UCANs, adapter credentials
 ```
 
 ## 17.5 Serialization

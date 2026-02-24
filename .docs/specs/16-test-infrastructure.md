@@ -48,6 +48,7 @@ crates/
         attestation.rs       # attestation_conformance!()
         push.rs              # push_conformance!()
         blob_store.rs        # blob_store_conformance!()
+        payment.rs           # payment_adapter_conformance!()
 ```
 
 ### Dependencies
@@ -1354,6 +1355,78 @@ macro_rules! blob_store_conformance {
 }
 ```
 
+### 16.12.7 `payment_adapter_conformance!()`
+
+```rust
+/// scp-testing/src/conformance/payment.rs
+
+/// Generates a test module verifying the `PaymentAdapter` trait contract (§19.2).
+/// Tests the authorize-then-capture flow, void, verify, refund, and error conditions.
+///
+/// Usage:
+/// ```rust
+/// #[cfg(test)]
+/// payment_adapter_conformance!(|| TestAdapter::new());
+/// ```
+#[macro_export]
+macro_rules! payment_adapter_conformance {
+    ($constructor:expr) => {
+        #[cfg(test)]
+        mod payment_adapter_conformance {
+            use super::*;
+
+            #[tokio::test]
+            async fn authorize_capture_roundtrip() {
+                // Authorize an amount, capture, verify receipt is valid.
+                // Receipt amount matches authorized amount.
+            }
+
+            #[tokio::test]
+            async fn authorize_void_roundtrip() {
+                // Authorize an amount, void, verify funds released.
+                // Subsequent capture of voided auth fails.
+            }
+
+            #[tokio::test]
+            async fn double_capture_rejected() {
+                // Authorize, capture once (succeeds), capture again (fails).
+                // Idempotency: same auth cannot be captured twice.
+            }
+
+            #[tokio::test]
+            async fn insufficient_balance_handling() {
+                // Attempt to authorize more than available balance.
+                // Returns PaymentError with appropriate variant.
+            }
+
+            #[tokio::test]
+            async fn verify_roundtrip() {
+                // Authorize, capture, verify receipt.
+                // VerificationResult confirms receipt is valid.
+            }
+
+            #[tokio::test]
+            async fn currency_mismatch_rejected() {
+                // Authorize with a currency not in adapter capabilities.
+                // Returns PaymentError::UnsupportedCurrency.
+            }
+
+            #[tokio::test]
+            async fn concurrent_authorization_isolation() {
+                // Issue two authorizations concurrently for the same payer.
+                // Both succeed independently. Capturing one does not affect the other.
+            }
+
+            #[tokio::test]
+            async fn refund_against_captured_receipt() {
+                // Authorize, capture, refund (full amount).
+                // Verify refund confirmation. Partial refund if supported.
+            }
+        }
+    };
+}
+```
+
 ## 16.13 Acceptance Criteria for the Harness Itself
 
 Meta-tests that verify the simulation framework is correct before trusting it for protocol tests.
@@ -1510,6 +1583,7 @@ Every simulation component maps to a specific protocol mechanism or threat:
 | `attestation_conformance!()` | ADR-006 | DeviceAttestation contract |
 | `push_conformance!()` | ADR-006 | Push contract |
 | `blob_store_conformance!()` | §16.4.1, §17.7 | BlobStore contract (5 methods, TTL, concurrent access) |
+| `payment_adapter_conformance!()` | §19.2, §19.2.6 | PaymentAdapter contract (authorize/capture/void/verify/refund, error conditions) |
 | ProtocolStore integration tests | §17.4, §17.13 | Protocol-layer persistence correctness |
 | MlsStorageBridge tests | §17.9 | OpenMLS state persistence through ProtocolStore |
 | Assertion library meta-tests | §16.10, §16.13.9 | Assertion functions detect violations correctly |
@@ -1525,7 +1599,7 @@ The `scp-testing` harness tests are organized into three CI tiers with increasin
 **Target:** < 3 minutes.
 **Purpose:** Fast feedback. Must pass before review.
 
-Tier 1 runs standard quality gates (format, lint, build, deny, docs) plus unit tests and conformance macro suites. Conformance macros (`transport_conformance!()`, `storage_conformance!()`, `key_custody_conformance!()`, `attestation_conformance!()`, `push_conformance!()`, `blob_store_conformance!()`) expand into `#[cfg(test)]` modules that run as part of the normal `cargo nextest run --workspace` invocation. They exercise in-memory implementations only and complete in milliseconds.
+Tier 1 runs standard quality gates (format, lint, build, deny, docs) plus unit tests and conformance macro suites. Conformance macros (`transport_conformance!()`, `storage_conformance!()`, `key_custody_conformance!()`, `attestation_conformance!()`, `push_conformance!()`, `blob_store_conformance!()`, `payment_adapter_conformance!()`) expand into `#[cfg(test)]` modules that run as part of the normal `cargo nextest run --workspace` invocation. They exercise in-memory implementations only and complete in milliseconds.
 
 No §16.13 meta-tests run at this tier — they exercise the simulation harness itself, which is more expensive than unit-level conformance checks.
 

@@ -163,8 +163,14 @@ The `relay_config` object exposes operational parameters that agents need to eva
 | `max_blob_ttl` | integer | seconds | Maximum blob TTL the relay enforces. |
 | `rate_limit_publish` | integer | per minute | PUBLISH rate limit per connection. |
 | `rate_limit_subscribe` | integer | per connection | Maximum concurrent subscriptions per connection. |
+| `economic` | object | — | Relay economic configuration (§19.8). Optional. Absence = free relay. |
+| `economic.currency` | string | — | Currency code for all amounts in this economic config (e.g., `"USD"`). |
+| `economic.per_publish` | integer | smallest unit | Cost per PUBLISH operation as `Amount` in smallest currency unit (§19.1.1). |
+| `economic.per_byte_stored` | integer | smallest unit | Cost per byte stored as `Amount` in smallest currency unit (§19.1.1). |
+| `economic.payment_adapters` | array | — | Accepted payment adapter IDs (e.g., `["x402", "lightning"]`). |
+| `economic.payee` | string | — | Relay operator's DID for receiving payments. |
 
-All fields are optional. Absent fields indicate the relay uses protocol defaults or has no limit.
+All fields are optional. Absent fields indicate the relay uses protocol defaults or has no limit. Absent `economic` field indicates a free relay.
 
 ADR-004 specifies that relay configuration is available "out-of-band." `.well-known/scp` is the canonical location for this out-of-band configuration. Agents evaluating whether to use a relay can fetch `/.well-known/scp` and inspect `relay_config` before establishing a WebSocket connection.
 
@@ -239,7 +245,7 @@ When an identity needs to discover relays, the SDK follows this priority chain:
 2. **DID document resolution.** Resolve the identity's own DID document via Mainline DHT. Extract `SCPRelay` service entries. Self-certifying (§9.6.3).
 3. **`.well-known/scp` resolution.** If a bootstrap domain is configured, fetch `https://<domain>/.well-known/scp` and extract the relay URL. Verify against DID document (§18.3.2).
 4. **Peer relay discovery.** For identities that share contexts with known peers, resolve the peer's DID document and use overlapping relay sets. This enables relay discovery through the social graph.
-5. **Fallback relay list.** A hardcoded list of well-known community relays shipped with the SDK. Last resort. These relays are not privileged — they are default suggestions that can be overridden. The SDK SHOULD warn when falling back to default relays.
+5. **Fallback relay list.** A hardcoded list of well-known community relays shipped with the SDK. Last resort. These relays are not privileged — they are default suggestions that can be overridden. The SDK SHOULD warn when falling back to default relays. The fallback list MUST include at least one free relay (no `economic` field in `relay_config`) — this is a protocol invariant that prevents economic gatekeeping of basic protocol operation (§19.8, §19.14).
 
 Each priority level is tried in order. The first level that yields at least one reachable relay is used. The SDK MAY combine results from multiple levels (e.g., explicit + DID document) for suppression resistance.
 

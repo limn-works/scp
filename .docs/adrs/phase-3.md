@@ -9,19 +9,23 @@
 ```
 ADR-001..012 (Phase 1 + Phase 2)
          |
-         v
-    ADR-013 (PyO3 Bridge)
-      /        \
-     v          v
-ADR-014       ADR-016
-(Python SDK)  (UCAN Validation)
-     |
-     v
+    +----+----------+
+    |                |
+    v                v
+ADR-013 (PyO3    ADR-033 (Economic
+  Bridge)          Governance)
+  /        \         |
+ v          v        | depends on ADR-002,005,008,009,011
+ADR-014    ADR-016
+(Python    (UCAN
+  SDK)    Validation)
+  |
+  v
 ADR-015
 (MCP Adapter)
 ```
 
-Build order: ADR-013 (depends on all Phase 1 + Phase 2 Rust crates) --> ADR-014 + ADR-016 (parallel, both depend on ADR-013) --> ADR-015 (depends on ADR-013 + ADR-014)
+Build order: ADR-013 (depends on all Phase 1 + Phase 2 Rust crates) --> ADR-014 + ADR-016 (parallel, both depend on ADR-013) --> ADR-015 (depends on ADR-013 + ADR-014). ADR-033 depends on Phase 1 + Phase 2 ADRs (002, 005, 008, 009, 011) and can be built in parallel with ADR-013.
 
 ---
 
@@ -836,20 +840,22 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 ```
 Phase 1 (ADR-001..007)    Phase 2 (ADR-008..012)
-         \                      /
-          \                    /
-           v                  v
-        ADR-013 (PyO3 Bridge Layer)
-          /                    \
-         v                      v
-ADR-014 (Python SDK)        ADR-016 (UCAN Validation)
-         |
-         v
-ADR-015 (MCP Adapter)
+         \                      /          \
+          \                    /            \
+           v                  v              v
+    ADR-013 (PyO3 Bridge Layer)    ADR-033 (Economic Governance)
+      /        \
+     v          v
+ADR-014       ADR-016
+(Python SDK)  (UCAN Validation)
+     |
+     v
+ADR-015
+(MCP Adapter)
 ```
 
 Build order:
-1. ADR-013 — PyO3 bridge (requires all Phase 1 + Phase 2 Rust crates compiled)
+1. ADR-013 + ADR-033 — PyO3 bridge and economic governance (parallel, both depend on Phase 1 + Phase 2)
 2. ADR-014 + ADR-016 — Python SDK wrappers and UCAN validation (parallel, both depend on ADR-013)
 3. ADR-015 — MCP adapter (depends on ADR-013 + ADR-014)
 
@@ -943,3 +949,290 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
 ```
 
 This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP tools to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.
+
+---
+
+## ADR-033: Economic Governance
+
+**Status:** Decided
+
+### Context
+
+The agent economy needs protocol-level economic infrastructure. SaaS companies are seeing 50k+ agent requests/hour from OpenClaw-style agents. Machine payments are a rate limit that generates money — the modern realization of Dwork & Naor (1992), fixing Hashcash's botnet asymmetry problem ($0.001 costs $0.001 regardless of attacker resources).
+
+Prior art: Dwork & Naor (1992) computational spam prevention, Hashcash (1997) proof-of-work for email, x402 (2025) machine-to-machine payments on Base/Solana, L402 Lightning + Macaroons for API access, Stripe machine payments (2025), EIP-1559 algorithmic dynamic pricing.
+
+No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not DID-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP is the first to define spending-scoped UCAN capabilities.
+
+### Decision
+
+1. **Payment adapter trait** following the transport adapter pattern (ADR-005): `PaymentAdapter` with `authorize`, `capture`, `void`, `verify`, `refund` methods. `AdapterCapabilities` struct declares supported features. `payment_adapter_conformance!()` macro validates implementations. `TestAdapter` in-memory reference ships with SDK.
+
+2. **Spending UCAN** as new capability type: `SpendingCapability` with `max_per_action`, `max_total`, `currency`, `time_window`, `allowed_adapters`. AND-composed with action UCANs — both required for paid actions. Standard UCAN attenuation and revocation rules apply.
+
+3. **Formula-based dynamic pricing** (EIP-1559-inspired): `PricingFormula` with `base_cost`, `variables` (linear/step), `cap`, `floor`. Observable metrics: `ContextMessageRate`, `MemberCount`, `RelayQueueDepth`, `TimeOfDay`, `SenderVelocity`, `StorageUsage`. Both sides evaluate independently — deterministic, no oracle.
+
+4. **Mutable economic policy with optional lock**: `EconomicPolicy` governed by default (pricing changes are normal business), with optional immutability lock at creation. Lock is itself immutable.
+
+5. **Authorize-then-capture and invoice-then-preimage** as canonical flow patterns: two models that cover x402/Stripe (auth-capture) and Lightning/L402 (invoice-preimage). Both map onto the `PaymentAdapter` trait.
+
+6. **Three independent economic levels**: relay (transport), context (participation), tool (per-invocation). Each with its own payee, pricing, and adapter configuration. Free is default at all levels.
+
+7. **Phase 3 delivery**: All protocol components (trait, policy, UCAN type, receipts, formulas) compose Phase 1 + Phase 2 primitives. No new crypto. Community adapters (x402, Lightning, SPL, Stripe) are Phase 4+.
+
+8. **Integer-only arithmetic** for cross-party determinism: `Amount(u64)` in smallest currency unit (cents, satoshis), `Coefficient(i64)` as fixed-point with 6 decimal places. No IEEE 754 floats in economic calculations — both sides evaluate pricing formulas identically.
+
+### Rationale
+
+- **Adapter trait pattern (ADR-005 mirror):** The transport adapter pattern proved successful — thin async trait, conformance macro, reference implementation, community adapters. Economic governance mirrors this exactly. Adapter authors implement 5 methods; the protocol handles all integration logic. Trait evolution never touches adapter implementations.
+- **Spending UCAN over bespoke authorization:** UCANs already provide delegation, attenuation, and revocation (ADR-009, §7.2). Adding a new capability type (`SpendingCapability`) extends the existing system rather than creating a parallel one. AND-composition with action UCANs means spending authorization composes with every other capability type without special-casing.
+- **Formula-based over oracle-based pricing:** The protocol-requires-no-operator principle (§1) forbids external dependencies for core protocol operations. Formula-based pricing is deterministic, evaluable by both parties independently, and requires no external service. EIP-1559 proved this model at massive scale (Ethereum processes ~1M transactions/day with algorithmic pricing).
+- **Mutable economic policy vs. immutable ceiling:** Capability ceilings are security boundaries — changing what CAN happen has security implications. Economic policy governs what things COST — price changes are normal business operations. Different mutability defaults reflect this distinction. Optional immutability lock provides voluntary commitment for trust-sensitive contexts (public goods, permanent free tiers).
+- **Integer arithmetic over floating-point:** IEEE 754 is non-associative: `(a + b) + c != a + (b + c)` in general. When payer and receiver independently evaluate a pricing formula, f64 coefficients can produce different results. Integer arithmetic (Amount in smallest unit, Coefficient as fixed-point) is deterministic across all platforms, compilers, and optimization levels. Follows Stripe/Bitcoin/Solana conventions.
+
+### Implementation
+
+- **Language:** Rust
+- **Crates affected:**
+  - `scp-core/src/economy/` — new module: `PaymentAdapter` trait, `EconomicPolicy`, `CostSchedule`, `PricingFormula`, `SpendingCapability`, `PaymentReceipt`, `Amount`, `Coefficient`, `CurrencyCode`
+  - `scp-core/src/ucan/` — add `SpendingCapability` variant to capability types, AND-composition logic
+  - `scp-core/src/context/` — add `economic_policy: Option<EconomicPolicy>` to `ContextParams`, auto-accept guard for paid contexts
+  - `scp-core/src/event/` — add `PaymentReceived`, `EconomicPolicyChanged`, `SpendingUcanGranted`, `SpendingUcanRevoked` event types
+  - `scp-core/src/store/` — add `ProtocolStore` methods for economic data (economic_policy, payment_receipt, spending_ucan storage keys per §17.3)
+  - `scp-testing/src/conformance/payment.rs` — `payment_adapter_conformance!()` macro (§16.12.7)
+  - `scp-testing/src/` — `TestAdapter` in-memory reference payment adapter
+  - `scp-transport/native/` — extend `.well-known/scp` relay config parsing with economic fields
+
+- **Key types:**
+
+```rust
+// --- Core economic types (§19.1.1) ---
+
+pub struct Amount(pub u64);                     // smallest currency unit (cents, satoshis)
+pub struct CurrencyCode(pub [u8; 4]);           // ISO 4217 or protocol-defined
+pub struct Coefficient(pub i64);                // fixed-point: value = raw / 1_000_000
+pub type PaymentAdapterRef = String;            // adapter_id string
+
+pub enum PaidActionType {
+    MessageSend, ToolInvoke, ContextJoin, SubscriptionPeriod, ByteStored,
+}
+
+// --- Payment adapter (§19.2.1) ---
+
+#[async_trait]
+pub trait PaymentAdapter: Send + Sync {
+    fn adapter_id(&self) -> &str;
+    fn capabilities(&self) -> AdapterCapabilities;
+    async fn authorize(&self, payer: &DID, payee: &DID, amount: Amount,
+        currency: CurrencyCode, metadata: PaymentMetadata,
+    ) -> Result<PaymentAuthorization, PaymentError>;
+    async fn capture(&self, auth: &PaymentAuthorization) -> Result<PaymentReceipt, PaymentError>;
+    async fn void(&self, auth: &PaymentAuthorization) -> Result<(), PaymentError>;
+    async fn verify(&self, receipt: &PaymentReceipt) -> Result<VerificationResult, PaymentError>;
+    async fn refund(&self, receipt: &PaymentReceipt, amount: Option<Amount>,
+    ) -> Result<RefundConfirmation, PaymentError>;
+}
+
+pub struct AdapterCapabilities {
+    pub supported_currencies: Vec<CurrencyCode>,
+    pub supports_streaming: bool,
+    pub supports_batch_auth: bool,
+    pub supports_single_step: bool,
+    pub min_amount: Option<Amount>,
+    pub max_amount: Option<Amount>,
+    pub typical_settlement_ms: u64,
+    pub requires_facilitator: bool,
+}
+
+pub struct PaymentMetadata {
+    pub action_type: PaidActionType,
+    pub context_id: Option<ContextId>,
+    pub idempotency_key: [u8; 16],
+}
+
+pub struct PaymentAuthorization {
+    pub auth_id: [u8; 32],
+    pub payer: DID, pub payee: DID,
+    pub amount: Amount, pub currency: CurrencyCode,
+    pub adapter_id: String,
+    pub created_at: u64, pub expires_at: u64,
+    pub adapter_state: Vec<u8>,
+}
+
+pub enum PaymentError {
+    InsufficientBalance { available: Amount, requested: Amount },
+    UnsupportedCurrency(CurrencyCode),
+    AuthorizationExpired { auth_id: [u8; 32] },
+    AlreadyCaptured { auth_id: [u8; 32] },
+    AlreadyVoided { auth_id: [u8; 32] },
+    InvalidReceipt(String),
+    AdapterError(String),
+    NoCompatiblePaymentAdapter,
+}
+
+// --- Economic policy (§19.3) ---
+
+pub struct EconomicPolicy {
+    pub locked: bool,
+    pub cost_schedule: CostSchedule,
+    pub payment_adapters: Vec<PaymentAdapterRef>,
+    pub pricing_formula: Option<PricingFormula>,
+    pub payee: DID,
+}
+
+pub struct CostSchedule {
+    pub currency: CurrencyCode,
+    pub per_message: Option<Amount>,
+    pub per_tool_invoke: Option<Amount>,
+    pub per_join: Option<Amount>,
+    pub per_period: Option<SubscriptionCost>,
+    pub per_byte_stored: Option<Amount>,
+}
+
+pub struct SubscriptionCost {
+    pub amount: Amount, pub period: SubscriptionPeriod, pub currency: CurrencyCode,
+}
+pub enum SubscriptionPeriod { Daily, Weekly, Monthly, Custom { seconds: u64 } }
+
+// --- Dynamic pricing (§19.4) ---
+
+pub struct PricingFormula {
+    pub base_cost: Amount,
+    pub variables: Vec<PricingVariable>,
+    pub cap: Option<Amount>,
+    pub floor: Option<Amount>,
+}
+
+pub enum PricingVariable {
+    Linear { metric: PricingMetric, coefficient: Coefficient },
+    Step { metric: PricingMetric, thresholds: Vec<(u64, Amount)> },
+}
+
+pub enum PricingMetric {
+    ContextMessageRate, MemberCount, RelayQueueDepth,
+    TimeOfDay, SenderVelocity, StorageUsage,
+}
+
+pub struct CostInsufficient {
+    pub expected: Amount, pub provided: Amount,
+    pub currency: CurrencyCode,
+    pub metric_snapshot: Vec<(PricingMetric, u64)>,
+}
+
+// --- Spending UCAN (§19.5) ---
+
+pub struct SpendingCapability {
+    pub max_per_action: Amount,
+    pub max_total: Amount,
+    pub currency: CurrencyCode,
+    pub time_window: Duration,
+    pub allowed_adapters: Vec<String>,
+}
+
+// --- Payment receipt (§19.6) ---
+
+pub struct PaymentReceipt {
+    pub receipt_id: [u8; 32],
+    pub payer: DID, pub payee: DID,
+    pub amount: Amount, pub currency: CurrencyCode,
+    pub action_type: PaidActionType,
+    pub context_id: Option<ContextId>,
+    pub adapter_id: String,
+    pub adapter_proof: Vec<u8>,
+    pub timestamp: u64,
+    pub signature: Ed25519Signature,
+}
+
+pub struct VerificationResult {
+    pub valid: bool, pub adapter_id: String,
+    pub verified_amount: Amount, pub verified_currency: CurrencyCode,
+    pub verification_timestamp: u64,
+}
+
+pub struct RefundConfirmation {
+    pub refund_id: [u8; 32], pub original_receipt_id: [u8; 32],
+    pub refunded_amount: Amount, pub currency: CurrencyCode,
+    pub adapter_proof: Vec<u8>,
+}
+```
+
+### Scope
+
+**In scope (Phase 3):**
+- `PaymentAdapter` trait and `AdapterCapabilities`
+- `payment_adapter_conformance!()` macro
+- `TestAdapter` in-memory reference implementation
+- `SpendingCapability` UCAN type with AND-composition and attenuation
+- `EconomicPolicy`, `CostSchedule`, `PricingFormula` structures
+- `PaymentReceipt` as event log provenance record
+- Dynamic pricing formula evaluation with `Amount`/`Coefficient` integer arithmetic
+- Anti-spam cost escalation via `SenderVelocity`
+- Relay economic config extension to `.well-known/scp`
+- `paid-service` and `paid-broadcast` context templates
+- Auto-accept guard for paid contexts
+- Storage keys for economic data (§17.3)
+- Economic event types: `PaymentReceived`, `EconomicPolicyChanged`, `SpendingUcanGranted`, `SpendingUcanRevoked`
+
+**Out of scope (Phase 4+):**
+- Production payment adapter implementations (x402, Lightning, SPL, Stripe) — community/vendor maintained
+- Subscription lifecycle management (billing cycles, grace periods, dunning)
+- Cross-adapter settlement or reconciliation
+- Payment dispute resolution
+- Tax/compliance integration
+- Payment UI components
+
+### Consequences
+
+**Positive:**
+- Every paid action generates a `PaymentReceipt` in the context event log — full economic provenance.
+- Anti-spam becomes economic: `SenderVelocity` metric with step pricing makes bulk spam a P&L decision.
+- Relay operators can monetize transport without accessing content (dumb pipe model preserved).
+- UCAN spending delegation is a novel contribution — first standard to combine DID-based delegation chains with payment semantics.
+- Agents never silently incur costs — auto-accept never applies to paid contexts.
+
+**Negative (acknowledged trade-offs):**
+- Payment adapter adds a new trait surface for SDK implementers to understand, increasing onboarding complexity.
+- Integer-only arithmetic limits coefficient precision to 6 decimal places — sufficient for pricing but not for all financial calculations.
+- No protocol-level subscription lifecycle — subscription billing must be implemented by contexts/tools, potentially leading to inconsistent experiences.
+- `TestAdapter` is in-memory only — developers must find/implement production adapters separately (by design, but adds friction).
+- Pricing formula divergence between payer and receiver (due to metric observation timing) creates retry overhead, even with the `CostInsufficient` metric snapshot mechanism.
+
+**Protocol invariants established:**
+- Free relays MUST always exist in the bootstrap list — economic gatekeeping is a protocol violation.
+- Auto-accept never applies to paid contexts — agents never silently incur costs.
+- Free operation is default — no economic policy = free.
+- Payment data inside encrypted envelope — relays never see context-level payment metadata.
+
+### Alternatives Rejected
+
+- **Oracle-based pricing:** External dependency, new trust surface. Contradicts protocol-requires-no-operator principle.
+- **Protocol-native token:** Regulatory complexity, violates simplicity principle. Payment rails already exist.
+- **No economic layer:** Leaves spam unsolved, relay monetization ad-hoc, no standard for agent-to-service payments.
+- **Per-action HTTP round-trip for payment (x402 pure):** Too tightly coupled to HTTP transport. SCP is transport-independent, so the payment adapter abstracts over the rail.
+- **Prepaid balance as protocol concept:** Adapter concern (some adapters batch naturally), not protocol's business. Would add state management complexity for minimal benefit.
+- **f64 coefficients in pricing formulas:** IEEE 754 non-associativity means payer and receiver can compute different prices from the same formula. Integer arithmetic (Coefficient as fixed-point) eliminates this class of bug entirely.
+
+### Dependencies
+
+- ADR-002 (DID identity) — DIDs as payer/payee identifiers in all payment operations
+- ADR-005 (transport trait) — pattern for adapter trait design; relay economic config extends transport layer
+- ADR-008 (context lifecycle) — economic policy is a context setting governed through context governance
+- ADR-009 (roles/capabilities) — spending capability as new UCAN type, AND-composed with action UCANs
+- ADR-011 (event log) — payment receipts recorded as event log entries with Merkle inclusion proofs
+
+### Acceptance Criteria
+
+1. `PaymentAdapter` trait compiles with 5 async methods: `authorize`, `capture`, `void`, `verify`, `refund`.
+2. `AdapterCapabilities` struct includes all fields from §19.2.1: `supported_currencies`, `supports_streaming`, `supports_batch_auth`, `supports_single_step`, `min_amount`, `max_amount`, `typical_settlement_ms`, `requires_facilitator`.
+3. `payment_adapter_conformance!()` macro generates 8 test cases matching §19.2.6: authorize/capture roundtrip, authorize/void roundtrip, double-capture rejection, insufficient balance, verify roundtrip, currency mismatch, concurrent isolation, refund.
+4. `TestAdapter` passes `payment_adapter_conformance!()`.
+5. `SpendingCapability` is a valid UCAN capability type. AND-composition enforced: action requiring both `messagesWrite` and `SpendingCapability` fails if either is missing.
+6. UCAN attenuation: sub-delegated `SpendingCapability` must narrow (lower `max_per_action`, `max_total`) — widening is rejected.
+7. `EconomicPolicy` stored in `ContextParams`. Contexts without `EconomicPolicy` are free (no payment required for any action).
+8. `PricingFormula` evaluation uses `Amount(u64)` and `Coefficient(i64)` exclusively — no `f64` in any economic calculation path.
+9. `CostInsufficient` error includes receiver's `metric_snapshot` so payer can see why costs diverged.
+10. Auto-accept guard: `ContextInvitation` with `EconomicPolicy` requiring payment is never auto-accepted regardless of auto-accept policy configuration.
+11. `PaymentReceipt` events recorded in context event log with Merkle inclusion proofs.
+12. `.well-known/scp` relay config parsing accepts optional `economic` object with `per_publish`, `per_byte_stored`, `payment_adapters`, `payee` fields.
+13. `paid-service` and `paid-broadcast` context templates defined with required economic policy fields.
+14. Free relays exist in the default bootstrap relay list — at least one relay in the SDK's fallback list has no `economic` config.
