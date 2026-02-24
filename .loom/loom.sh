@@ -796,20 +796,38 @@ if $USE_TMUX; then
   # (this process is still alive when the tmux instance starts)
   rm -f "$PID_FILE"
 
-  # Main pane: the loom loop
-  tmux new-session -d -s "$TMUX_SESSION" \
-    "exec $0 $FORWARD_FLAGS"
+  # Compute header height to match content exactly
+  # Base: 3 (box) + 1 (PID/Mode) + 1 (Dir) + 1 (Stop) = 6
+  HEADER_HEIGHT=6
+  [ -n "$DIRECTIVE_FILE" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
+  [ "$USE_WORKTREE" = "yes" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
+  [ -n "${LOOM_CAPABILITIES:-}" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
 
-  # Bottom-left: live status.md
-  tmux split-window -v -t "$TMUX_SESSION" -p 28 \
+  # Use real terminal size so pane proportions are correct on attach
+  TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+  TERM_LINES=$(tput lines 2>/dev/null || echo 50)
+
+  # Main pane: the loom loop (LOOM_TMUX_CHILD tells the child to
+  # write its banner to .header instead of stdout)
+  tmux new-session -d -s "$TMUX_SESSION" -x "$TERM_COLS" -y "$TERM_LINES" \
+    "LOOM_TMUX_CHILD=1 exec $0 $FORWARD_FLAGS"
+
+  # Top: fixed header pane (always visible, sized to content)
+  tmux split-window -v -b -t "$TMUX_SESSION:0.0" -l "$HEADER_HEIGHT" \
+    "sh -c 'while true; do printf \"\\033[H\\033[J\"; cat \"$LOOM_DIR/.header\" 2>/dev/null || printf \"  Starting…\\n\"; sleep 2; done'"
+
+  # Bottom-left: live status.md (compact, 10 lines)
+  tmux split-window -v -t "$TMUX_SESSION:0.1" -l 10 \
     "exec watch -n 3 -t sh -c 'printf \"\\033[1;36m── status.md ──\\033[0m\\n\"; cat \"$LOOM_DIR/status.md\" 2>/dev/null || echo \"(empty)\"'"
 
   # Bottom-right: log tail
-  tmux split-window -h -t "$TMUX_SESSION" \
+  tmux split-window -h -t "$TMUX_SESSION:0.2" \
     "exec tail -f \"$LOOM_DIR/logs/master.log\" 2>/dev/null || tail -f \"$LOG_FILE\""
 
-  # Focus main pane
-  tmux select-pane -t "$TMUX_SESSION:0.0"
+  # Focus main pane and lock pane sizes on resize
+  tmux select-pane -t "$TMUX_SESSION:0.1"
+  tmux set-hook -t "$TMUX_SESSION" client-resized \
+    "resize-pane -t 0.0 -y $HEADER_HEIGHT ; resize-pane -t 0.2 -y 10 ; resize-pane -t 0.3 -y 10"
 
   echo -e "${GREEN}Loom launched in tmux session '${TMUX_SESSION}'${NC}"
   echo -e "  Attach:  ${BOLD}tmux attach -t $TMUX_SESSION${NC}"
@@ -839,30 +857,45 @@ MODE_LABEL=""
 MODE_LABEL="${MODE_LABEL:-prd}"
 
 # ─── Banner ──────────────────────────────────────────────────────
-echo -e "${CYAN}"
-echo "  ╔═══════════════════════════════════════════╗"
-echo "  ║             L O O M   L O O P             ║"
-echo "  ╚═══════════════════════════════════════════╝"
-echo -e "${NC}"
-echo -e "  ${DIM}PID${NC}   ${BOLD}$$${NC}"
-echo -e "  ${DIM}Mode${NC}  ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
-echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
-if [ -n "$DIRECTIVE_FILE" ]; then
-  echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
+if [ "${LOOM_TMUX_CHILD:-}" = "1" ]; then
+  # Compact banner for the fixed tmux header pane
+  {
+    echo -e "${CYAN}  ╔═══════════════════════════════════════════╗"
+    echo "  ║             L O O M   L O O P             ║"
+    echo -e "  ╚═══════════════════════════════════════════╝${NC}"
+    echo -e "  ${DIM}PID${NC} ${BOLD}$$${NC}  ${DIM}|${NC}  ${DIM}Mode${NC} ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
+    echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
+    [ -n "$DIRECTIVE_FILE" ] && echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
+    [ "${USE_WORKTREE:-}" = "yes" ] && echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
+    [ -n "${LOOM_CAPABILITIES:-}" ] && echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
+    echo -en "  ${DIM}Stop${NC}  ${CYAN}touch $LOOM_DIR/.stop${NC}"
+  } > "$LOOM_DIR/.header"
+else
+  echo -e "${CYAN}"
+  echo "  ╔═══════════════════════════════════════════╗"
+  echo "  ║             L O O M   L O O P             ║"
+  echo "  ╚═══════════════════════════════════════════╝"
+  echo -e "${NC}"
+  echo -e "  ${DIM}PID${NC}   ${BOLD}$$${NC}"
+  echo -e "  ${DIM}Mode${NC}  ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
+  echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
+  if [ -n "$DIRECTIVE_FILE" ]; then
+    echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
+  fi
+  if [ "$USE_WORKTREE" = "yes" ]; then
+    echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
+  fi
+  if [ -n "$LOOM_CAPABILITIES" ]; then
+    echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
+  fi
+  echo ""
+  echo -e "  ${CYAN}Graceful stop${NC}    touch $LOOM_DIR/.stop"
+  echo -e "  ${CYAN}Kill${NC}             kill -TERM -$$"
+  echo -e "  ${CYAN}Tail log${NC}         tail -f $LOG_FILE"
+  echo -e "  ${CYAN}Status${NC}           cat $LOOM_DIR/status.md"
+  echo -e "  ${CYAN}Master log${NC}       tail -f $LOOM_DIR/logs/master.log"
+  echo ""
 fi
-if [ "$USE_WORKTREE" = "yes" ]; then
-  echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
-fi
-if [ -n "$LOOM_CAPABILITIES" ]; then
-  echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
-fi
-echo ""
-echo -e "  ${CYAN}Graceful stop${NC}    touch $LOOM_DIR/.stop"
-echo -e "  ${CYAN}Kill${NC}             kill -TERM -$$"
-echo -e "  ${CYAN}Tail log${NC}         tail -f $LOG_FILE"
-echo -e "  ${CYAN}Status${NC}           cat $LOOM_DIR/status.md"
-echo -e "  ${CYAN}Master log${NC}       tail -f $LOOM_DIR/logs/master.log"
-echo ""
 
 if $DRY_RUN; then
   log "${YELLOW}${BOLD}DRY RUN${NC} — analysis only, no changes will be made"
