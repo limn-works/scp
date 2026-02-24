@@ -1,0 +1,440 @@
+# 18. Addressability and Deployment
+
+## 18.1 Philosophy
+
+SCP's protocol layer — identity (§3), contexts (§5), relays (§10.4), encryption (§9) — is fully specified. What remains is how things get **found** and how complete applications get **deployed**. Addressability is the bridge between "the protocol works" and "agents can use it without prior knowledge."
+
+The core protocol path avoids HTTP entirely:
+
+```
+DID (out-of-band exchange)
+  → DHT resolution (Mainline, self-certifying via BEP44)
+    → BEP44-signed relay list (in DID document SCPRelay entries)
+      → WebSocket connection (TLS 1.3, §9.13)
+        → MLS end-to-end encryption (§9.7)
+```
+
+Every step in this chain is self-certifying or cryptographically verified. No HTTP intermediary is required. Native clients (Swift, Kotlin, Python, Rust) never touch HTTP for protocol operations.
+
+`scp://` URIs are the direct-connection mechanism — a context ID plus relay URL, no HTTP intermediary. They are the canonical way to share a context reference out-of-band.
+
+`.well-known/scp` is an **optional web on-ramp** for the "I know a domain, nothing else" entry point. It is advisory only — HTTPS-dependent, not self-certifying. Clients MUST verify `.well-known/scp` data against DHT-resolved DID documents before trusting it (§18.3.2). Web clients (TypeScript/WASM in browser) use `.well-known/scp` to bridge from HTTP-land, then verify via DHT. This layering must be explicit: HTTP is the outermost, least-trusted discovery layer. The core protocol operates entirely without it.
+
+The agent workstation tier (§10.2) is the primary deployment target for addressability. A dedicated always-on machine running builder agents is the natural host for SCP infrastructure: relay, identity, contexts, and HTTP serving are marginal additional load on hardware that's already running 24/7. The `ApplicationNode` (§18.6) is the SDK type that makes this deployment trivial.
+
+## 18.2 DID Document Service Endpoints
+
+DID documents (§3.7) carry service endpoints that declare how to reach the identity's infrastructure. SCP defines specific service endpoint types for protocol operations.
+
+### 18.2.1 SCPRelay
+
+The `SCPRelay` service endpoint type declares transport-layer relay URLs where the identity's SCP traffic is routed. These are the endpoints that `TransportManager` (ADR-012) uses to route encrypted blobs to the identity.
+
+```json
+{
+  "id": "#scp-relay-1",
+  "type": "SCPRelay",
+  "serviceEndpoint": "wss://relay.example.com/scp/v1"
+}
+```
+
+Properties:
+
+- **URL format:** `wss://<host>/scp/v1` — the canonical SCP relay WebSocket endpoint (ADR-004). TLS 1.3 required (§9.13).
+- **Multiple entries allowed.** An identity MAY publish multiple `SCPRelay` entries for suppression resistance (§9.9.2, ADR-012). The recommended minimum is 3 relays.
+- **Self-certified via BEP44.** For did:dht identities, relay URLs in the DID document are signed as part of the BEP44 record (§9.6.3). Substituting a relay URL requires the identity's private key.
+- **Sequence number monotonicity.** Relay list updates follow the BEP44 sequence number rules (§9.6.3). Clients MUST reject DID documents with lower sequence numbers than previously observed.
+
+When a peer resolves an identity's DID document, the `SCPRelay` entries tell them where to route encrypted envelopes destined for that identity. This is the primary relay discovery mechanism — out-of-band DID exchange leads to DHT resolution leads to relay URLs.
+
+### 18.2.2 Existing Endpoint Types (Cross-Reference)
+
+SCP uses multiple DID document service endpoint types, each serving a distinct purpose:
+
+| Type | Purpose | Consumer | Spec Reference |
+|------|---------|----------|----------------|
+| `SCPRelay` | Transport-layer relay URLs for encrypted blob routing | `TransportManager` (ADR-012) | §18.2.1 |
+| `SCPCapabilities` | Application-layer capability endpoints (tool schemas, agent descriptions) | Discovery Engine (§6.2.2) | ADR-020 |
+| `IdentityPrivateState` | Relay URLs storing identity private state blobs | Identity Manager | §3.7 |
+| `PreRotationCommitment` | SHA-256 commitment hash for pre-rotation key | Identity Manager (§9.12) | ADR-003 |
+| `SCPBroadcastContext` | Broadcast context ID + relay URLs for author discovery | Discovery Engine | §5.14.11 |
+
+**SCPRelay vs SCPCapabilities.** These are distinct service types with different consumers and different purposes:
+
+- `SCPRelay` = **transport layer**. Where to send encrypted blobs. Consumed by `TransportManager`. Any SCP participant publishing to this identity routes through these URLs.
+- `SCPCapabilities` = **application layer**. What tools and capabilities an agent offers. Consumed by the Discovery Engine. Agents looking for specific capabilities query these endpoints.
+
+A relay operator's DID document contains `SCPRelay` entries (where to connect). An agent's DID document may contain both `SCPRelay` entries (how to reach the agent) and `SCPCapabilities` entries (what the agent can do).
+
+### 18.2.3 Multiple Relay Entries
+
+An identity SHOULD publish at least 3 `SCPRelay` entries for suppression resistance (§9.9.2). `TransportManager` reads all `SCPRelay` entries from a resolved DID document and routes to all of them. The relay set partitioning logic (ADR-012) operates on top of the published relay list.
+
+Relay entries are ordered by preference (first entry = preferred relay). Clients SHOULD respect ordering when selecting a subset. When adding or removing relays, the identity updates its DID document and publishes with an incremented BEP44 sequence number. Peers that re-resolve the DID document discover the updated relay list.
+
+## 18.3 .well-known/scp
+
+An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enables web-based discovery of SCP infrastructure associated with a domain. This is the web on-ramp — the entry point for users and agents who know a domain name but nothing else about the operator's SCP infrastructure.
+
+### 18.3.1 Document Format
+
+```json
+{
+  "version": 1,
+  "did": "did:dht:z6Mk...",
+  "relay": "wss://relay.example.com/scp/v1",
+  "contexts": [
+    {
+      "id": "a1b2c3d4e5f6...",
+      "name": "Example Community",
+      "mode": "broadcast",
+      "uri": "scp://context/a1b2c3d4e5f6...?relay=wss://relay.example.com/scp/v1&mode=broadcast&name=Example+Community"
+    }
+  ],
+  "relay_config": {
+    "max_blob_size": 262144,
+    "max_blob_ttl": 86400,
+    "rate_limit_publish": 100,
+    "rate_limit_subscribe": 50
+  }
+}
+```
+
+**Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `version` | integer | Yes | Protocol version. Currently `1`. |
+| `did` | string | Yes | The operator's DID (did:dht preferred). Enables partial verification via DHT resolution (§18.3.2). |
+| `relay` | string | Yes | Primary relay URL (`wss://` scheme, `/scp/v1` path). |
+| `contexts` | array | No | Publicly listed contexts. See constraints below. |
+| `relay_config` | object | No | Relay operator configuration subset (§18.3.3). |
+
+**Context entry fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | Yes | Context ID (hex-encoded). |
+| `name` | string | No | Human-readable name (advisory, unverified). |
+| `mode` | string | No | `"encrypted"` or `"broadcast"`. Defaults to `"encrypted"`. |
+| `uri` | string | No | Full `scp://` URI for the context (§18.4). |
+
+### 18.3.2 Security Properties
+
+`.well-known/scp` is **NOT self-certifying.** Its integrity depends on HTTPS (DNS + TLS + server integrity). An attacker who controls DNS or compromises the CA chain can serve a fraudulent `.well-known/scp` document. This is an inherent limitation of any HTTP-based discovery mechanism.
+
+**Verification chain:**
+
+1. Client reads `https://<domain>/.well-known/scp` → gets `did` + `relay` fields.
+2. Client resolves `did` via Mainline DHT (self-certifying, no HTTPS in this step).
+3. Client checks that the `relay` URL appears in the BEP44-signed DID document's `SCPRelay` service entries.
+4. **Match** → BEP44-grade assurance of relay URL. The `.well-known/scp` data is consistent with the self-certifying DID document.
+5. **Mismatch** → reject `.well-known/scp` data. The web document is inconsistent with the DHT-resolved identity.
+
+**Attack analysis:**
+
+- An attacker who controls DNS/CA can serve a fake `.well-known/scp` but **cannot forge the DHT-resolved DID document** without the identity's private key. The verification chain catches the discrepancy at step 5.
+- Worst case without verification: the client connects to the wrong relay. Since the relay is a dumb pipe that cannot read MLS-encrypted content (§9.9.1), the impact is limited to availability (messages go to the wrong relay) rather than confidentiality. The math enforces access, not infrastructure.
+- Clients MUST perform the verification chain before trusting `.well-known/scp` data for any protocol operation. Clients that skip verification (e.g., displaying a domain's broadcast context list in a web UI) MUST indicate that the data is unverified.
+
+**What `.well-known/scp` MUST NOT expose** (§9.10 metadata privacy constraints):
+
+- Encrypted context IDs (would leak context existence)
+- Membership rosters or member counts for encrypted contexts
+- Routing pseudonyms (§9.10.4)
+- Subscriber lists for broadcast contexts
+- Any data that is inside the encrypted envelope layer
+
+**What `.well-known/scp` MAY expose:**
+
+- Relay URLs (already public via DID document)
+- Operator DID (already public)
+- Protocol version
+- Relay operator configuration (§18.3.3)
+- Broadcast context IDs (public by design — §5.14.6, routing_id is SHA-256 of context_id)
+
+### 18.3.3 Relay Operator Configuration Subset
+
+The `relay_config` object exposes operational parameters that agents need to evaluate before connecting. These fields mirror the relay configuration table in ADR-004:
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `max_blob_size` | integer | bytes | Maximum blob size the relay accepts. |
+| `max_blob_ttl` | integer | seconds | Maximum blob TTL the relay enforces. |
+| `rate_limit_publish` | integer | per minute | PUBLISH rate limit per connection. |
+| `rate_limit_subscribe` | integer | per connection | Maximum concurrent subscriptions per connection. |
+
+All fields are optional. Absent fields indicate the relay uses protocol defaults or has no limit.
+
+ADR-004 specifies that relay configuration is available "out-of-band." `.well-known/scp` is the canonical location for this out-of-band configuration. Agents evaluating whether to use a relay can fetch `/.well-known/scp` and inspect `relay_config` before establishing a WebSocket connection.
+
+## 18.4 Context URIs
+
+SCP contexts are addressable via `scp://` URIs. Context URIs are **discovery-only** — they point to a context's metadata routing ID (§5.7.1) for inspection. They do not embed key material or grant membership. Joining a context is a separate protocol flow (MLS Welcome, §9.7).
+
+### 18.4.1 Universal URI Format
+
+```
+scp://context/<context_id_hex>?relay=<url>[&relay=<url2>][&mode=<mode>][&name=<name>]
+```
+
+**Components:**
+
+| Component | Required | Description |
+|-----------|----------|-------------|
+| `context/<context_id_hex>` | Yes | Hex-encoded context ID. |
+| `relay` | Yes (at least one) | Relay URL(s) where the context is reachable. Multiple `relay` parameters for multi-relay contexts. |
+| `mode` | No | `encrypted` or `broadcast`. Advisory — actual mode is verified from context metadata. |
+| `name` | No | Human-readable context name. Advisory, unverified against context metadata. Percent-encoded per RFC 3986. |
+
+**Parsing rules:**
+
+- Scheme MUST be `scp`.
+- Authority component is empty (double slash after scheme is part of the path).
+- Path MUST start with `context/`.
+- Context ID MUST be valid hexadecimal.
+- Relay URLs MUST use the `wss://` scheme.
+- Unknown query parameters MUST be ignored (forward compatibility).
+- Percent-encoding per RFC 3986 for all parameter values.
+
+**Examples:**
+
+```
+scp://context/a1b2c3d4e5f6?relay=wss://relay.example.com/scp/v1
+scp://context/a1b2c3d4e5f6?relay=wss://relay1.example.com/scp/v1&relay=wss://relay2.example.com/scp/v1&mode=broadcast&name=Tech+News
+```
+
+### 18.4.2 Encrypted Context URIs
+
+Encrypted context URIs follow the universal format. The `mode` parameter is omitted or set to `encrypted`. The URI enables a prospective member to fetch context metadata from the metadata routing ID (§5.7.1) and evaluate whether to request membership.
+
+```
+scp://context/<context_id_hex>?relay=wss://relay.example.com/scp/v1
+```
+
+The URI does **not** contain key material. Membership requires an MLS Welcome message from an existing member — the URI is sufficient for discovery and metadata inspection, not for joining.
+
+### 18.4.3 Broadcast Context URIs (Alias)
+
+The legacy format `scp://broadcast/<context_id_hex>?relay=<url>` (§5.14.11) is accepted as an alias for `scp://context/<context_id_hex>?relay=<url>&mode=broadcast`. Parsers MUST accept both forms and normalize to the universal format.
+
+### 18.4.4 Use Cases
+
+| Use case | URI enables |
+|----------|------------|
+| Out-of-band sharing | Share a context reference via any channel (chat, email, QR code). Recipient fetches metadata, evaluates, requests to join. |
+| Agent bootstrap | An agent receiving an `scp://` URI can resolve the context's metadata, evaluate governance and ceiling, and decide whether to participate — all without prior knowledge of the context. |
+| Deep linking | Applications can register `scp://` as a URI scheme. Clicking an `scp://` link opens the app and navigates to the context's metadata view. |
+| `.well-known/scp` integration | Broadcast contexts listed in `.well-known/scp` include their full `scp://` URI for direct access. |
+
+## 18.5 Relay Bootstrap
+
+How a new identity learns its first relay. This closes the relay discovery open question from §00.
+
+### 18.5.1 Bootstrap Priority Order
+
+When an identity needs to discover relays, the SDK follows this priority chain:
+
+1. **Explicit configuration.** Relay URLs provided directly in `TransportConfig` at SDK initialization. Highest trust — the operator or user explicitly chose these relays.
+2. **DID document resolution.** Resolve the identity's own DID document via Mainline DHT. Extract `SCPRelay` service entries. Self-certifying (§9.6.3).
+3. **`.well-known/scp` resolution.** If a bootstrap domain is configured, fetch `https://<domain>/.well-known/scp` and extract the relay URL. Verify against DID document (§18.3.2).
+4. **Peer relay discovery.** For identities that share contexts with known peers, resolve the peer's DID document and use overlapping relay sets. This enables relay discovery through the social graph.
+5. **Fallback relay list.** A hardcoded list of well-known community relays shipped with the SDK. Last resort. These relays are not privileged — they are default suggestions that can be overridden. The SDK SHOULD warn when falling back to default relays.
+
+Each priority level is tried in order. The first level that yields at least one reachable relay is used. The SDK MAY combine results from multiple levels (e.g., explicit + DID document) for suppression resistance.
+
+### 18.5.2 Agent Deployment Case
+
+An agent deploying via `ApplicationNode` (§18.6) follows a simplified bootstrap:
+
+1. `ApplicationNode::builder().domain("example.com").build()` starts the relay server on the local machine.
+2. The relay URL is `wss://example.com/scp/v1` (derived from the configured domain).
+3. The identity's DID document is published with this relay URL as an `SCPRelay` entry.
+4. `.well-known/scp` is generated and served at `https://example.com/.well-known/scp`.
+
+The agent's relay is self-hosted — no external relay discovery needed. Peers discover the agent's relay by resolving its DID document.
+
+### 18.5.3 Client Discovery Case
+
+A client that knows only a domain name (e.g., from a website or advertisement):
+
+1. Fetch `https://example.com/.well-known/scp` → get `did` + `relay`.
+2. Resolve `did` via DHT → get `SCPRelay` entries.
+3. Verify `relay` from step 1 appears in step 2 (§18.3.2).
+4. Connect to the relay via WebSocket.
+5. Subscribe to broadcast contexts listed in `.well-known/scp` or inspect encrypted context metadata via `scp://` URIs.
+
+## 18.6 Application Node
+
+`ApplicationNode` is a concrete SDK type in the `scp-node` crate that composes an SCP relay, an identity, and an HTTP server into a single deployable unit. It is the "one box" deployment pattern — relay + participant + HTTP server on one machine.
+
+`ApplicationNode` is NOT an HTTP framework. It exposes components (relay router, `.well-known` router, TLS configuration) that integrate with existing HTTP frameworks (axum, actix-web, etc.). Applications build their HTTP layer on top; `ApplicationNode` provides the SCP-specific pieces.
+
+### 18.6.1 Components
+
+An `ApplicationNode` composes:
+
+| Component | Description |
+|-----------|-------------|
+| **SCP Relay** | A relay server listening at `wss://<domain>/scp/v1` (ADR-004). Handles PUBLISH, SUBSCRIBE, QUERY, DELETE for all contexts hosted on this node. |
+| **Identity** | A DID identity (§3) with `SCPRelay` service entries pointing to this node's relay URL. Published to DHT on startup. |
+| **Storage** | `ProtocolStore` (§17.4) backed by `SqliteStorage` (§17.6). Stores identity state, context state, relay blobs, and TLS certificates. |
+| **HTTP Server** | Serves `.well-known/scp` (§18.3) and provides WebSocket upgrade at `/scp/v1`. Merges with application-provided routes. |
+| **TLS** | ACME-provisioned TLS certificates (§18.6.3). TLS 1.3 required (§9.13). |
+
+### 18.6.2 SDK Surface
+
+```rust
+// scp-node crate
+
+pub struct ApplicationNode { /* ... */ }
+
+impl ApplicationNode {
+    pub fn builder() -> ApplicationNodeBuilder;
+
+    /// The relay handle — for direct relay operations.
+    pub fn relay(&self) -> &RelayHandle;
+
+    /// The identity handle — for DID operations, context creation, messaging.
+    pub fn identity(&self) -> &IdentityHandle;
+
+    /// The storage handle — for direct ProtocolStore access.
+    pub fn storage(&self) -> &ProtocolStore;
+
+    /// Returns an axum Router serving GET /.well-known/scp.
+    /// Dynamically generated from node state (DID, relay URL, registered contexts).
+    pub fn well_known_router(&self) -> axum::Router;
+
+    /// Returns an axum Router handling WebSocket upgrade at /scp/v1.
+    pub fn relay_router(&self) -> axum::Router;
+
+    /// Binds HTTPS on the configured address, merging:
+    /// - Application-provided routes
+    /// - .well-known/scp route
+    /// - /scp/v1 WebSocket upgrade route
+    pub async fn serve(self, app_router: axum::Router) -> Result<(), NodeError>;
+}
+
+pub struct ApplicationNodeBuilder {
+    domain: Option<String>,
+    identity: Option<Identity>,
+    storage: Option<SqliteStorage>,
+    bind_addr: Option<SocketAddr>,
+    acme_email: Option<String>,
+}
+
+impl ApplicationNodeBuilder {
+    pub fn domain(mut self, domain: &str) -> Self;
+    pub fn identity(mut self, identity: Identity) -> Self;
+    pub fn generate_identity(mut self) -> Self;
+    pub fn storage(mut self, storage: SqliteStorage) -> Self;
+    pub fn bind_addr(mut self, addr: SocketAddr) -> Self;
+    pub fn acme_email(mut self, email: &str) -> Self;
+
+    /// Build the ApplicationNode:
+    /// 1. Initialize storage (create if needed)
+    /// 2. Load or generate identity
+    /// 3. Start relay server
+    /// 4. Publish DID document with SCPRelay entry
+    /// 5. Provision TLS certificate via ACME (if not cached)
+    pub async fn build(self) -> Result<ApplicationNode, NodeError>;
+}
+```
+
+### 18.6.3 TLS Provisioning
+
+`ApplicationNode` provisions TLS certificates automatically via ACME (Let's Encrypt):
+
+- **ACME HTTP-01 challenge.** The node serves the ACME challenge response at `http://<domain>/.well-known/acme-challenge/<token>`. This requires port 80 to be reachable.
+- **DNS-01 alternative.** For environments where port 80 is unavailable (home networks behind NAT, shared hosting), DNS-01 challenges are supported. The operator configures DNS TXT records manually or via DNS API.
+- **Certificate storage.** Certificates and private keys are stored in `SqliteStorage` (§17.6), encrypted at rest.
+- **Auto-renewal.** The node renews certificates 30 days before expiry. Renewal is background and non-disruptive.
+- **TLS 1.3 required.** Per §9.13, all relay connections use TLS 1.3. The node's TLS configuration enforces this minimum version.
+
+### 18.6.4 Properties and Invariants
+
+- `ApplicationNode` does not mandate a specific HTTP framework. The `well_known_router()` and `relay_router()` methods return axum `Router` instances that can be composed with any axum-compatible application.
+- The relay started by `ApplicationNode` is a standard SCP relay (ADR-004). It accepts connections from any SCP client, not just the local identity. Other identities can use this relay for their contexts.
+- DID publication happens once on `.build()` and on relay URL changes. The node does not continuously re-publish.
+- `.well-known/scp` is dynamically generated from node state. Registering a broadcast context on the node automatically makes it appear in `.well-known/scp` responses.
+- The node's identity is a full SCP identity. It can create contexts, join contexts, send messages — it is a protocol participant, not just infrastructure.
+
+## 18.7 Federation
+
+SCP does not have a federation protocol in the traditional sense (no homeserver-to-homeserver communication). Instead, federation emerges from three existing mechanisms:
+
+1. **Multi-relay publishing (ADR-012).** Messages are published to 3+ relays. Any relay in the set can deliver to any subscriber. This provides relay-level redundancy without relay-to-relay coordination.
+2. **DID-based relay discovery (§18.2).** Peers discover each other's relays by resolving DID documents. No central relay registry. Each identity declares its own relays.
+3. **Transport independence.** Different participants in the same context can connect to different relays (or even different transport types). The `TransportManager` handles multi-relay fanout and deduplication transparently.
+
+**Cross-operator messaging** works without explicit federation:
+
+```
+Alice (relay: relay-a.com)     Bob (relay: relay-b.com)
+         │                              │
+         ├── publishes to relay-a ──────┤ (Alice's relay set includes relay-a)
+         ├── publishes to relay-b ──────┤ (Alice also publishes to Bob's relay)
+         │                              │
+         │     Bob subscribes to ───────┤ (Bob subscribes on relay-b)
+         │     relay-b                  │
+```
+
+Alice resolves Bob's DID document, discovers Bob's `SCPRelay` entries, and includes Bob's relays in her publish set for contexts they share. Bob does the same for Alice. No relay-to-relay protocol needed — the clients handle cross-relay routing through `TransportManager`.
+
+## 18.8 Agent Deployment Flow
+
+End-to-end deployment of an SCP-enabled agent on a dedicated machine:
+
+```
+1. Agent provisions hardware (Mac Mini, VPS, etc.)
+
+2. Agent runs:
+   let node = ApplicationNode::builder()
+       .domain("agent.example.com")
+       .generate_identity()
+       .build()
+       .await?;
+
+   This:
+   a. Creates SqliteStorage at default path
+   b. Generates a new DID identity
+   c. Starts relay server at wss://agent.example.com/scp/v1
+   d. Publishes DID document with SCPRelay entry to DHT
+   e. Provisions TLS certificate via ACME
+   f. Serves .well-known/scp at https://agent.example.com/.well-known/scp
+
+3. Agent creates contexts:
+   let broadcast = node.identity().create_context(
+       template: "public-broadcast",
+   ).await?;
+
+   The broadcast context appears in .well-known/scp automatically.
+
+4. Other agents discover this agent:
+   a. Via domain: fetch .well-known/scp → get DID → resolve → connect
+   b. Via DID: resolve DID document → get SCPRelay entries → connect
+   c. Via URI: parse scp://context/... → connect to relay → inspect metadata
+
+5. Steady state:
+   node.serve(my_app_routes).await?;
+
+   The node runs indefinitely, handling relay traffic, context operations,
+   and application HTTP routes on the same HTTPS listener.
+```
+
+## 18.9 Phase Integration
+
+`ApplicationNode` and addressability features integrate into the existing build phases (architecture.md §4):
+
+| Component | Phase | Rationale |
+|-----------|-------|-----------|
+| `SCPRelay` DID service type | Phase 1 (patch) | Extends existing DidDocument from ADR-003. Required for relay discovery. |
+| Relay URL in DID publish flow | Phase 1 (patch) | Extends existing DID publish from ADR-003. Required for peers to discover relays. |
+| `ScpUri` type | Phase 2 | Context URI parsing is foundational for addressability. No external dependencies. |
+| `WellKnownScp` type | Phase 2 | Data type for `.well-known/scp` serialization. No external dependencies. |
+| `TransportConfig` + relay bootstrap | Phase 2 | Extends `TransportManager` (ADR-012). Requires DID relay publication. |
+| `scp-node` crate + `ApplicationNode` | Phase 2 | Requires relay server (ADR-004), identity (ADR-003), and transport (ADR-012). |
+| TLS provisioning (ACME) | Phase 2 | Required for `ApplicationNode` HTTPS. |
+| HTTP server (`.well-known` + relay upgrade) | Phase 2 | Required for web discovery and WebSocket relay. |
+
+The `scp-node` crate is added to the workspace as a new top-level crate at `crates/scp-node/`, depending on `scp-core`, `scp-transport`, and `scp-platform`.

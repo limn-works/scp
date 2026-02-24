@@ -1004,3 +1004,87 @@ The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with
 ```
 
 This test proves: context lifecycle works, roles enforce, tools invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack.
+
+---
+
+## ADR-032: Addressability and Deployment
+
+**Status:** Decided
+
+### Context
+
+SCP's protocol layer (identity, contexts, relays, encryption) is fully specified. What's missing is how things get found and how complete applications get deployed. Today:
+- No standard DID service endpoint type for "this is my SCP relay"
+- No HTTP-level discovery from a domain name (no `.well-known/scp`)
+- No universal context URI scheme (only `scp://broadcast/...` exists)
+- No SDK bootstrap story (how a client learns its first relay — open question in §00)
+- No deployment pattern for "relay + participant + HTTP server on one box"
+
+SCP-033 (TransportManager multi-relay) consumes relay lists from DID documents but nothing writes them there. The relay discovery open question in §00 explicitly states this gap.
+
+### Decision
+
+Implement a complete addressability and deployment layer as specified in §18:
+
+1. **`SCPRelay` DID service endpoint type** (§18.2.1) — transport-layer relay URLs in DID documents, distinct from `SCPCapabilities` (ADR-020, application-layer). Self-certified via BEP44.
+2. **`.well-known/scp`** (§18.3) — advisory HTTP on-ramp for web discovery. NOT self-certifying. Clients MUST verify against DHT-resolved DID documents. Exposes relay URLs, operator DID, relay config, and broadcast context IDs only.
+3. **Universal context URI** (§18.4) — `scp://context/<hex>?relay=<url>[&mode=...][&name=...]`. Discovery-only, no embedded key material. Legacy `scp://broadcast/...` accepted as alias.
+4. **Relay bootstrap priority chain** (§18.5) — explicit config → DID document → `.well-known/scp` → peer discovery → fallback list. Closes §00 open question.
+5. **`ApplicationNode`** (§18.6) — concrete SDK type in new `scp-node` crate. Composes relay server + identity + HTTP server + TLS (ACME). Not an HTTP framework — exposes axum Router instances for composition.
+
+### Rationale
+
+- **SCPRelay vs SCPCapabilities:** Different consumers, different purposes. TransportManager needs relay URLs (transport). Discovery Engine needs capability schemas (application). Conflating them forces both consumers to parse the same entry and filter. Separate types are cleaner.
+- **`.well-known/scp` is advisory, not trusted:** HTTPS-dependent discovery cannot provide the self-certifying guarantees of DID+DHT. Making the trust boundary explicit prevents false confidence. The verification chain (§18.3.2) gives BEP44-grade assurance when performed.
+- **Context URIs are discovery-only:** Embedding key material in URIs creates a shareable key — anyone with the URI could derive access. MLS membership is a separate, governed flow. URIs point to metadata for inspection, not access.
+- **`ApplicationNode` is composition, not framework:** Prescribing an HTTP framework locks out existing ecosystems. Exposing axum Routers lets applications compose SCP infrastructure into their existing server architecture.
+- **ACME HTTP-01 needs port 80:** This is the simplest path for most deployments. DNS-01 alternative covers environments without port 80 access (NAT, shared hosting).
+
+### Dependencies
+
+- **ADR-003 (DID):** SCPRelay extends the DID document with a new service entry type. Relay URL publication extends the DID publish flow.
+- **ADR-004 (Native Relay):** The relay server in ApplicationNode implements ADR-004. The `wss://<host>/scp/v1` URL format comes from ADR-004. Relay operator config fields in `.well-known/scp` mirror ADR-004's configuration table.
+- **ADR-012 (TransportManager):** TransportConfig and relay bootstrap resolution wire into TransportManager initialization. Multi-relay fanout (ADR-012) is the federation mechanism (§18.7).
+- **ADR-020 (SCPCapabilities):** SCPRelay is distinguished from SCPCapabilities as separate DID service types (§18.2.2).
+
+### Acceptance Criteria
+
+1. **`SCPRelay` service entry type** exists in `DidDocument`. `add_relay_service(url)` adds an entry. `relay_service_urls()` returns all relay URLs. Serde roundtrip preserves SCPRelay entries alongside existing service types (PreRotationCommitment, IdentityPrivateState).
+
+2. **DID publish flow** accepts optional `relay_urls: Vec<Url>`. When provided, relay URLs appear as SCPRelay service entries in the published DID document. BEP44 signature covers relay entries. Sequence number monotonicity (§9.6.3) applies to relay list updates.
+
+3. **`ScpUri` type** parses and serializes the universal context URI format: `scp://context/<hex>?relay=<url>[&relay=<url2>][&mode=...][&name=...]`. Legacy `scp://broadcast/<hex>?relay=<url>` accepted as alias. Invalid URIs return typed errors. Percent-encoding per RFC 3986. Parse/serialize roundtrip.
+
+4. **`WellKnownScp` type** serializes/deserializes the `.well-known/scp` JSON format. Fields: version, did, relay, optional contexts, optional relay_config. Validation rejects encrypted context IDs in contexts list. All optional fields behave correctly when absent.
+
+5. **`TransportConfig` struct** with relay_urls (explicit), bootstrap_domain (optional), dedup_cache_size, dedup_cache_ttl. `ResolveRelays` trait implements the bootstrap priority chain (§18.5.1). TransportManager accepts TransportConfig at initialization.
+
+6. **`scp-node` crate** with `ApplicationNode` builder: `.domain()`, `.identity()` / `.generate_identity()`, `.storage()`, `.build()`. Build wires relay server start, DID publication with SCPRelay entries, storage initialization. `node.relay()`, `node.identity()`, `node.storage()` accessors work.
+
+7. **TLS provisioning:** ACME HTTP-01 challenge handler. Certificate storage in SqliteStorage. Auto-renewal 30 days before expiry. TLS 1.3 enforced.
+
+8. **HTTP server:** `node.well_known_router()` returns axum Router serving `GET /.well-known/scp` with dynamically generated content. `node.relay_router()` returns axum Router handling WebSocket upgrade at `/scp/v1`. `node.serve(app_router)` merges routes and binds HTTPS.
+
+9. **Integration test:** ApplicationNode starts → DID published → `.well-known/scp` reachable → relay accepts connections. Client discovers relay via `.well-known/scp` → verifies against DID → connects → subscribes. `scp://` URI roundtrip through creation and parsing.
+
+### Scope
+
+**New crate:**
+
+| Crate | Files | Purpose |
+|-------|-------|---------|
+| `scp-node` | `lib.rs`, `http.rs`, `tls.rs`, `well_known.rs` | ApplicationNode builder, HTTP routing, TLS provisioning |
+
+**Modified files:**
+
+| File | Change |
+|------|--------|
+| `scp-core/src/identity/document.rs` | Add SCPRelay service entry type |
+| `scp-core/src/identity/dht.rs` | Wire relay URL publication into DID publish |
+| `scp-core/src/uri.rs` (new) | ScpUri type, parsing, serialization |
+| `scp-core/src/well_known.rs` (new) | WellKnownScp type, serialization |
+| `scp-transport/src/config.rs` (new) | TransportConfig, ResolveRelays trait |
+| `scp-transport/src/manager.rs` | Accept TransportConfig at init |
+| `Cargo.toml` | Add scp-node workspace member |
+
+**Estimated functions:** ~30-35 public functions, ~20-25 internal helpers across all files.

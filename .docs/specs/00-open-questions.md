@@ -57,5 +57,5 @@
 
 ## Uncovered Areas
 
-- **~~Transport layer specifics.~~** ✅ **Largely resolved.** ADR-005 specifies the `TransportAdapter` trait. ADR-004 specifies the SCP native relay protocol. Transport security in §9.13. Relay threat model in §9.9. Remaining: relay discovery protocol (how clients find relays).
+- **~~Transport layer specifics.~~** ✅ **Fully resolved.** ADR-005 specifies the `TransportAdapter` trait. ADR-004 specifies the SCP native relay protocol. Transport security in §9.13. Relay threat model in §9.9. ~~Remaining: relay discovery protocol (how clients find relays).~~ Relay discovery resolved in §18: `SCPRelay` DID document service endpoints (§18.2), `.well-known/scp` web on-ramp (§18.3), bootstrap priority chain (§18.5), and `TransportConfig` (ADR-032).
 - **Offline/local-first behavior.** Disconnection handling, sync, conflict resolution mechanics. (Informed by device-as-node §10.2, but mechanics unspecified.)

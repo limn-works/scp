@@ -119,6 +119,7 @@ Most identity private state operations are naturally commutative — "block X" a
 - **Relay obligations.** Same storage class and retention as context events. No differentiated commitment — relays treat all encrypted blobs uniformly. A relay that stores context events for a DID stores identity private state under the same terms.
 - **Key rotation.** On identity key rotation (§9.12), private state is re-encrypted to the new key. Single-owner case requires no group redistribution — the owner re-encrypts and republishes. For large private state, re-encryption is incremental: most recent events first, backfill in background.
 - **Discovery pointer.** Explicit. The DID document includes a service endpoint of type `IdentityPrivateState` listing relays that store private state. This cleanly disambiguates context event fetches from private state fetches without relay-side guessing.
+- **Relay service endpoints.** The DID document includes service endpoints of type `SCPRelay` listing the identity's transport-layer relay URLs — the endpoints where `TransportManager` routes encrypted blobs for this identity. Multiple entries are recommended for suppression resistance (§9.9.2). Self-certified via BEP44 signature (§9.6.3). See §18.2 for the full specification of DID document service endpoint types.
 
 ## 3.8 DID Resolution Security
 

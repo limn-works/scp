@@ -212,6 +212,23 @@
         "SCP-136",
         "SCP-139"
       ]
+    },
+    {
+      "id": "gate-addr",
+      "name": "Addressability and Deployment",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-140",
+        "SCP-141",
+        "SCP-142",
+        "SCP-143",
+        "SCP-144",
+        "SCP-145",
+        "SCP-146",
+        "SCP-147",
+        "SCP-148"
+      ]
     }
   ],
   "stories": [
@@ -2062,7 +2079,8 @@
       "blockedBy": [
         "SCP-011",
         "SCP-009",
-        "SCP-016"
+        "SCP-016",
+        "SCP-144"
       ],
       "sources": [
         {
@@ -7553,6 +7571,487 @@
       ],
       "details": {
         "Documentation deliverables": "1. README.md — Quick start in <30 lines.\n2. API reference — Generated from source (rustdoc, pydoc, typedoc, DocC, KDoc, godoc, xmldoc, javadoc).\n3. Type stubs — .pyi, .d.ts, etc.\n4. Examples directory — basic messaging, tool invocation, MCP integration, multi-agent coordination."
+      }
+    },
+    {
+      "id": "SCP-140",
+      "title": "PATCH — Add SCPRelay service entry type to DidDocument",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/document.rs"
+      ],
+      "description": "PATCH to SCP-006 (done). SCP-006 created DidDocument with only PreRotationCommitment service. §18.2 defines SCPRelay as a DID document service endpoint type for relay transport URLs — the endpoints where TransportManager (ADR-012) routes encrypted blobs to the identity. This story extends document.rs to support SCPRelay entries. This patch is considered more recent than SCP-006.\n\nThe SCPRelay service endpoint type declares transport-layer relay URLs. URL format: wss://<host>/scp/v1 (ADR-004). TLS 1.3 required (§9.13). Multiple entries allowed for suppression resistance (§9.9.2, ADR-012). Self-certified via BEP44 (§9.6.3). Sequence number monotonicity applies.\n\nSCPRelay is distinct from SCPCapabilities (ADR-020): SCPRelay = transport layer (where to send encrypted blobs, consumed by TransportManager), SCPCapabilities = application layer (what tools/capabilities an agent offers, consumed by Discovery Engine).",
+      "acceptanceCriteria": [
+        "SCPRelay variant exists in service entry types in DidDocument",
+        "add_relay_service(url: Url) method on DidDocument adds an SCPRelay service entry",
+        "relay_service_urls() -> Vec<Url> accessor returns all SCPRelay URLs",
+        "Serde roundtrip preserves SCPRelay entries alongside existing PreRotationCommitment and IdentityPrivateState service types",
+        "SCPRelay entries use wss:// scheme and /scp/v1 path format",
+        "SCPRelay is structurally distinct from SCPCapabilities — different enum variant, different type string in serialized form",
+        "Unit test: DidDocument with mixed service types (PreRotationCommitment + SCPRelay) serializes and deserializes correctly",
+        "Unit test: relay_service_urls returns only SCPRelay entries, not other service types",
+        "Unit test: add_relay_service with invalid URL (non-wss scheme) returns error",
+        "Multiple SCPRelay entries preserve insertion order (first entry = preferred relay per §18.2.3)"
+      ],
+      "actionItems": [
+        "Add SCPRelay variant to the service entry type enum in document.rs",
+        "Implement add_relay_service(url: Url) method on DidDocument — validates wss:// scheme, creates SCPRelay service entry with auto-generated ID",
+        "Implement relay_service_urls() -> Vec<Url> accessor that filters service entries by SCPRelay type",
+        "Update Serde Serialize/Deserialize implementations to handle SCPRelay entries with type string \"SCPRelay\"",
+        "Write unit tests for roundtrip serialization, URL filtering, and URL validation"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.2 DID Document Service Endpoints"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "## 3.7 Identity Private State"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-032: Addressability and Deployment"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.3 Multiple Relay Entries"
+        }
+      ],
+      "details": {
+        "patchContext": "SCP-006 (done) created DidDocument with only PreRotationCommitment service. This story extends it with SCPRelay. This is a patch to SCP-006's behavior and is considered more recent.",
+        "serviceEndpointFormat": "```json\n{\n  \"id\": \"#scp-relay-1\",\n  \"type\": \"SCPRelay\",\n  \"serviceEndpoint\": \"wss://relay.example.com/scp/v1\"\n}\n```",
+        "crossReferenceTable": "| Type | Purpose | Consumer |\n|------|---------|----------|\n| SCPRelay | Transport-layer relay URLs | TransportManager (ADR-012) |\n| SCPCapabilities | Application-layer capability endpoints | Discovery Engine (§6.2.2) |\n| IdentityPrivateState | Relay URLs storing identity private state | Identity Manager |\n| PreRotationCommitment | SHA-256 commitment for pre-rotation key | Identity Manager (§9.12) |\n| SCPBroadcastContext | Broadcast context ID + relay URLs | Discovery Engine |",
+        "multipleRelayEntries": "An identity SHOULD publish at least 3 SCPRelay entries for suppression resistance (§9.9.2). Relay entries are ordered by preference (first entry = preferred relay). Clients SHOULD respect ordering when selecting a subset. When adding or removing relays, the identity updates its DID document and publishes with an incremented BEP44 sequence number. Peers that re-resolve the DID document discover the updated relay list."
+      }
+    },
+    {
+      "id": "SCP-141",
+      "title": "PATCH — Wire relay URL publication into DID publish flow",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/dht.rs"
+      ],
+      "description": "PATCH to SCP-007 (done). SCP-007 publishes DID documents without relay URL entries. §18.2 and §18.5 require relay URLs in published DID documents so peers can discover relays via DID resolution. This story extends the publish flow to accept optional relay_urls and include them as SCPRelay service entries before BEP44 publication. This patch is considered more recent than SCP-007.\n\nRelay URLs are added as SCPRelay service entries before BEP44 publication. Self-certified via BEP44 signature (existing §9.6.3 property — no new crypto needed). Sequence number monotonicity (§9.6.3) applies to relay list updates.",
+      "acceptanceCriteria": [
+        "Identity creation flow accepts optional relay_urls: Vec<Url>",
+        "DID document update flow accepts optional relay_urls: Vec<Url>",
+        "When relay_urls provided, published DID documents include SCPRelay service entries for each URL",
+        "BEP44 signature covers the relay entries (no new crypto — existing §9.6.3 property)",
+        "Sequence number is incremented on relay list updates (§9.6.3 monotonicity)",
+        "DID resolution returns relay URLs from SCPRelay service entries",
+        "Unit test: publish with relay_urls -> resolve -> relay_service_urls returns the published URLs",
+        "Unit test: publish without relay_urls -> resolve -> relay_service_urls returns empty",
+        "Unit test: update relay_urls -> resolve -> returns new URLs, sequence number incremented"
+      ],
+      "actionItems": [
+        "Extend identity creation function signature to accept optional relay_urls: Vec<Url>",
+        "Before BEP44 publication, call add_relay_service for each URL in relay_urls",
+        "Extend DID document update function to accept relay_urls parameter",
+        "Verify BEP44 signature covers the complete DID document including SCPRelay entries",
+        "Write unit tests for publish/resolve roundtrip with and without relay URLs"
+      ],
+      "blockedBy": [
+        "SCP-140"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.2 DID Document Service Endpoints"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.5 Relay Bootstrap"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.6.3 Relay List Authentication"
+        }
+      ],
+      "details": {
+        "patchContext": "SCP-007 (done) publishes DID documents without relay URL entries. This story extends the publish flow. This is a patch to SCP-007's behavior and is considered more recent.",
+        "securityNote": "Self-certification comes from BEP44 — the entire DID document is signed by the identity's key. Adding SCPRelay entries to the document before signing means the relay URLs are covered by the same signature. No new cryptographic mechanism needed."
+      }
+    },
+    {
+      "id": "SCP-142",
+      "title": "Implement scp:// URI type, parsing, and serialization",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/uri.rs"
+      ],
+      "description": "Implement the universal SCP context URI type as specified in §18.4. The ScpUri type represents context references that can be shared out-of-band (chat, email, QR codes). URIs are discovery-only — they point to a context's metadata routing ID (§5.7.1) for inspection. They do not embed key material or grant membership.\n\nUniversal format: scp://context/<context_id_hex>?relay=<url>[&relay=<url2>][&mode=<mode>][&name=<name>]\n\nLegacy format scp://broadcast/<context_id_hex>?relay=<url> is accepted as alias and normalized to the universal format with mode=broadcast.\n\nname parameter is advisory and unverified against context metadata. Percent-encoding per RFC 3986 for all parameter values.",
+      "acceptanceCriteria": [
+        "ScpUri enum with Context { context_id, relays: Vec<Url>, mode: Option<ContextMode>, name: Option<String> } variant",
+        "Parse scp://context/<hex>?relay=<url> successfully",
+        "Parse scp://context/<hex>?relay=<url1>&relay=<url2> with multiple relays",
+        "Parse scp://context/<hex>?relay=<url>&mode=broadcast&name=Test+Name with all optional params",
+        "Parse legacy scp://broadcast/<hex>?relay=<url> as alias — normalized to Context variant with mode=broadcast",
+        "Relay URL parameters are validated to use the wss:// scheme — non-wss relay URLs produce a parse error",
+        "mode and name parameters are advisory — stored as-is without verification against context metadata",
+        "Serialize to canonical universal format (scp://context/...)",
+        "Percent-encoding per RFC 3986 for relay URLs and name parameter",
+        "Invalid URIs return typed errors: wrong scheme, missing context path, invalid hex, missing relay param",
+        "Parse/serialize roundtrip for all variants",
+        "Unknown query parameters are ignored (forward compatibility)",
+        "Unit test: roundtrip for encrypted context URI",
+        "Unit test: roundtrip for broadcast context URI",
+        "Unit test: legacy broadcast alias accepted and normalized",
+        "Unit test: invalid URIs produce specific error variants"
+      ],
+      "actionItems": [
+        "Create crates/scp-core/src/uri.rs",
+        "Define ScpUri enum with Context variant containing context_id (Vec<u8>), relays (Vec<Url>), mode (Option<ContextMode>), name (Option<String>)",
+        "Implement FromStr/TryFrom<&str> for parsing — handle both scp://context/ and scp://broadcast/ path prefixes",
+        "Implement Display for serialization — always serialize to canonical scp://context/ format",
+        "Implement percent-encoding/decoding for URL parameters per RFC 3986",
+        "Define ScpUriError enum with variants for each parse failure mode",
+        "Write comprehensive unit tests for parsing, serialization, roundtrip, legacy alias, and error cases"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.4 Context URIs"
+        }
+      ],
+      "details": {
+        "universalFormat": "scp://context/<context_id_hex>?relay=<url>[&relay=<url2>][&mode=<mode>][&name=<name>]",
+        "legacyAlias": "scp://broadcast/<context_id_hex>?relay=<url> is accepted and normalized to scp://context/<hex>?relay=<url>&mode=broadcast",
+        "designNote": "Context URIs are discovery-only — no embedded key= param. MLS membership is a separate flow. URIs point to metadata routing IDs for inspection.",
+        "useCases": "Out-of-band sharing: Share a context reference via any channel (chat, email, QR code). Recipient fetches metadata, evaluates, requests to join. | Agent bootstrap: An agent receiving an scp:// URI can resolve the context's metadata, evaluate governance and ceiling, and decide whether to participate — all without prior knowledge of the context. | Deep linking: Applications can register scp:// as a URI scheme. Clicking an scp:// link opens the app and navigates to the context's metadata view. | .well-known/scp integration: Broadcast contexts listed in .well-known/scp include their full scp:// URI for direct access."
+      }
+    },
+    {
+      "id": "SCP-143",
+      "title": "Implement .well-known/scp document type and serialization",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/well_known.rs"
+      ],
+      "description": "Implement the .well-known/scp document type as specified in §18.3. This is the data type for the HTTP-accessible JSON document at https://<domain>/.well-known/scp that enables web-based discovery of SCP infrastructure.\n\nWellKnownScp struct: version (integer, currently 1), did (String), relay (String), contexts (optional Vec<WellKnownContext>), relay_config (optional RelayConfig).\n\nRelayConfig struct: max_blob_size, max_blob_ttl, rate_limit_publish, rate_limit_subscribe (all optional integers, mirroring ADR-004 configuration table).\n\nWellKnownContext struct: id (hex String), name (optional String), mode (optional String), uri (optional String — full scp:// URI).\n\nContexts list MUST NOT include encrypted context IDs — validation rejects them. Only broadcast context IDs (public by design, §5.14.6) may appear.\n\n.well-known/scp is NOT self-certifying — integrity depends on HTTPS. The did field enables partial verification via DHT resolution (§18.3.2).",
+      "acceptanceCriteria": [
+        "WellKnownScp struct with fields: version (u32), did (String), relay (String), contexts (Option<Vec<WellKnownContext>>), relay_config (Option<RelayConfig>)",
+        "RelayConfig struct with fields: max_blob_size (Option<u64>), max_blob_ttl (Option<u64>), rate_limit_publish (Option<u32>), rate_limit_subscribe (Option<u32>)",
+        "WellKnownContext struct with fields: id (String), name (Option<String>), mode (Option<String>), uri (Option<String>)",
+        "Serde JSON serialization produces the format specified in §18.3.1",
+        "Serde JSON deserialization accepts the format specified in §18.3.1",
+        "All optional fields are correctly omitted from JSON when None (serde skip_serializing_if)",
+        "Serialize/deserialize roundtrip preserves all fields",
+        "Validation function rejects WellKnownScp where contexts contains entries with mode != broadcast (encrypted context IDs must not be exposed per §9.10)",
+        "Unit test: full document with all fields serializes to expected JSON",
+        "Unit test: minimal document (only required fields) serializes correctly",
+        "Unit test: deserialization handles missing optional fields",
+        "Unit test: validation rejects encrypted context IDs in contexts list"
+      ],
+      "actionItems": [
+        "Create crates/scp-core/src/well_known.rs",
+        "Define WellKnownScp, RelayConfig, and WellKnownContext structs with Serialize/Deserialize derives",
+        "Add #[serde(skip_serializing_if = \"Option::is_none\")] to all optional fields",
+        "Implement validate() method on WellKnownScp that checks contexts entries — reject any with mode absent or mode == encrypted",
+        "Write unit tests for serialization, deserialization, roundtrip, and validation"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.3 .well-known/scp"
+        }
+      ],
+      "details": {
+        "documentFormat": "```json\n{\n  \"version\": 1,\n  \"did\": \"did:dht:z6Mk...\",\n  \"relay\": \"wss://relay.example.com/scp/v1\",\n  \"contexts\": [\n    {\n      \"id\": \"a1b2c3d4e5f6...\",\n      \"name\": \"Example Community\",\n      \"mode\": \"broadcast\",\n      \"uri\": \"scp://context/a1b2c3d4e5f6...?relay=wss://relay.example.com/scp/v1&mode=broadcast&name=Example+Community\"\n    }\n  ],\n  \"relay_config\": {\n    \"max_blob_size\": 262144,\n    \"max_blob_ttl\": 86400,\n    \"rate_limit_publish\": 100,\n    \"rate_limit_subscribe\": 50\n  }\n}\n```",
+        "securityNote": ".well-known/scp is NOT self-certifying. Integrity depends on HTTPS (DNS + TLS + server integrity). The did field enables partial verification via DHT resolution (§18.3.2). Clients MUST verify against DHT-resolved DID documents before trusting for protocol operations.",
+        "privacyConstraints": "MUST NOT expose: encrypted context IDs, membership rosters, routing pseudonyms, subscriber lists. MAY expose: relay URLs, operator DID, protocol version, relay config, broadcast context IDs."
+      }
+    },
+    {
+      "id": "SCP-144",
+      "title": "Implement TransportConfig and relay bootstrap resolution",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/config.rs",
+        "crates/scp-transport/src/manager.rs"
+      ],
+      "description": "Implement TransportConfig and the relay bootstrap resolution chain as specified in §18.5 and ADR-032. TransportConfig is the configuration struct passed to TransportManager at initialization, providing explicit relay URLs, optional bootstrap domain, and dedup configuration.\n\nThe ResolveRelays trait implements the bootstrap priority chain: explicit config → DID document → .well-known/scp → peer relay discovery → fallback relay list. This closes the relay discovery open question from §00.\n\nThis story modifies crates/scp-transport/src/manager.rs to accept TransportConfig at initialization. Both this story and SCP-033 modify manager.rs — SCP-033 adds multi-relay routing on top of the TransportConfig foundation laid here.",
+      "acceptanceCriteria": [
+        "TransportConfig struct with fields: relay_urls (Vec<Url>), bootstrap_domain (Option<String>), dedup_cache_size (usize, default 10_000), dedup_cache_ttl (Duration, default 1 hour)",
+        "ResolveRelays trait with async method resolve() -> Result<Vec<Url>, TransportError>",
+        "DefaultRelayResolver implements ResolveRelays with the priority chain: (1) explicit relay_urls from TransportConfig, (2) DID document SCPRelay entries, (3) .well-known/scp relay URL from bootstrap_domain, (4) peer relay discovery from shared contexts, (5) hardcoded fallback relay list",
+        "Each priority level is tried in order — first level yielding at least one reachable relay is used",
+        "TransportManager::new accepts TransportConfig parameter",
+        "TransportManager uses resolved relays for its adapter pool",
+        "TransportConfig's dedup_cache_size and dedup_cache_ttl are wired into TransportManager's dedup cache configuration",
+        "Unit test: resolve with explicit relay_urls returns those URLs without trying other levels",
+        "Unit test: resolve with empty relay_urls falls through to DID document resolution",
+        "Unit test: resolve with bootstrap_domain fetches .well-known/scp and extracts relay URL",
+        "Unit test: TransportManager::new accepts TransportConfig and initializes correctly",
+        "SDK logs a warning when relay resolution falls through to the hardcoded fallback relay list (§18.5.1 SHOULD)"
+      ],
+      "actionItems": [
+        "Create crates/scp-transport/src/config.rs with TransportConfig struct",
+        "Define ResolveRelays trait with async resolve() method",
+        "Implement DefaultRelayResolver with the 5-level priority chain",
+        "Modify TransportManager::new in manager.rs to accept TransportConfig",
+        "Wire TransportConfig.dedup_cache_size and dedup_cache_ttl into dedup cache initialization",
+        "Write unit tests for each priority level and for TransportManager initialization"
+      ],
+      "blockedBy": [
+        "SCP-141",
+        "SCP-016"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.5 Relay Bootstrap"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-032: Addressability and Deployment"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-012: Multi-Transport Routing"
+        }
+      ],
+      "details": {
+        "bootstrapPriorityChain": "1. Explicit configuration (relay_urls in TransportConfig)\n2. DID document resolution (SCPRelay service entries)\n3. .well-known/scp resolution (from bootstrap_domain)\n4. Peer relay discovery (overlapping relay sets from shared contexts)\n5. Fallback relay list (hardcoded community relays)",
+        "fileConflictNote": "Both SCP-144 and SCP-033 modify crates/scp-transport/src/manager.rs. SCP-144 adds TransportConfig acceptance; SCP-033 completes multi-relay routing on top. Sequential execution required — SCP-033 is blocked by SCP-144.",
+        "implementationNotes": "Language: Rust. Async runtime: tokio. The ResolveRelays trait is async to support network operations (DHT resolution, HTTP fetch). The DefaultRelayResolver holds references to IdentityManager (for DID resolution) and an HTTP client (for .well-known/scp fetch)."
+      }
+    },
+    {
+      "id": "SCP-145",
+      "title": "Scaffold scp-node crate with ApplicationNode builder",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/Cargo.toml",
+        "crates/scp-node/src/lib.rs",
+        "Cargo.toml"
+      ],
+      "description": "Create the scp-node crate and implement the ApplicationNode builder as specified in §18.6 and ADR-032. ApplicationNode is a concrete SDK type that composes an SCP relay, an identity, and an HTTP server into a single deployable unit — the 'one box' deployment pattern.\n\nApplicationNode is NOT an HTTP framework — it exposes axum Router instances for composition with existing application code. The builder pattern wires: relay server start, DID publication with SCPRelay entries, storage initialization.\n\nComponents: SCP Relay (ADR-004 at wss://<domain>/scp/v1), Identity (§3 with SCPRelay service entries), Storage (ProtocolStore §17.4 backed by SqliteStorage §17.6), HTTP Server (.well-known/scp + WebSocket upgrade), TLS (ACME §18.6.3).",
+      "acceptanceCriteria": [
+        "New crate scp-node exists at crates/scp-node/ with Cargo.toml",
+        "scp-node is listed as workspace member in root Cargo.toml",
+        "scp-node depends on scp-core, scp-transport, scp-platform",
+        "ApplicationNode struct exists with relay(), identity(), storage() accessors",
+        "ApplicationNodeBuilder with .domain(), .identity(), .generate_identity(), .storage(), .bind_addr(), .acme_email() methods",
+        ".build() initializes storage, loads or generates identity, starts relay server, publishes DID document with SCPRelay entry",
+        "node.relay() returns relay handle for direct relay operations",
+        "node.identity() returns identity handle for DID operations",
+        "node.storage() returns ProtocolStore reference",
+        "ApplicationNode::builder().domain(\"example.com\").generate_identity().build() succeeds with relay listening and DID published",
+        "Unit test: builder requires domain to be set before build",
+        "Unit test: builder with generate_identity creates a new DID",
+        "Unit test: builder with explicit identity uses the provided identity",
+        "DID publication happens once on .build() — no continuous re-publishing (§18.6.4)",
+        "Relay started by ApplicationNode accepts connections from any SCP client, not just the local identity (§18.6.4)"
+      ],
+      "actionItems": [
+        "Create crates/scp-node/ directory with Cargo.toml",
+        "Add scp-node to workspace members in root Cargo.toml",
+        "Define ApplicationNode struct in lib.rs with RelayHandle, IdentityHandle, ProtocolStore fields",
+        "Define ApplicationNodeBuilder with optional fields: domain, identity, storage, bind_addr, acme_email",
+        "Implement builder methods (.domain(), .identity(), .generate_identity(), .storage(), etc.)",
+        "Implement .build() async method: validate required fields, init storage, load/generate identity, start relay, publish DID with SCPRelay entries",
+        "Implement accessor methods: relay(), identity(), storage()",
+        "Write unit tests for builder validation and initialization"
+      ],
+      "blockedBy": [
+        "SCP-015",
+        "SCP-141"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.6 Application Node"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-032: Addressability and Deployment"
+        }
+      ],
+      "details": {
+        "builderSDKSurface": "```rust\npub struct ApplicationNodeBuilder {\n    domain: Option<String>,\n    identity: Option<Identity>,\n    storage: Option<SqliteStorage>,\n    bind_addr: Option<SocketAddr>,\n    acme_email: Option<String>,\n}\n\nimpl ApplicationNodeBuilder {\n    pub fn domain(mut self, domain: &str) -> Self;\n    pub fn identity(mut self, identity: Identity) -> Self;\n    pub fn generate_identity(mut self) -> Self;\n    pub fn storage(mut self, storage: SqliteStorage) -> Self;\n    pub fn bind_addr(mut self, addr: SocketAddr) -> Self;\n    pub fn acme_email(mut self, email: &str) -> Self;\n    pub async fn build(self) -> Result<ApplicationNode, NodeError>;\n}\n```",
+        "buildSequence": "1. Initialize storage (create if needed)\n2. Load or generate identity\n3. Start relay server at wss://<domain>/scp/v1\n4. Publish DID document with SCPRelay entry pointing to relay URL\n5. Return ApplicationNode with handles to all components",
+        "invariants": "DID publication happens once on .build() and on relay URL changes. The node does not continuously re-publish. The relay is a standard SCP relay (ADR-004) accepting connections from any SCP client. The node's identity is a full SCP identity — it can create contexts, join contexts, send messages — it is a protocol participant, not just infrastructure."
+      }
+    },
+    {
+      "id": "SCP-146",
+      "title": "ApplicationNode TLS provisioning via ACME",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/tls.rs"
+      ],
+      "description": "Implement ACME-based TLS provisioning for ApplicationNode as specified in §18.6.3. TLS certificates are provisioned automatically via Let's Encrypt ACME HTTP-01 challenges. Certificates are stored in SqliteStorage, auto-renewed 30 days before expiry. TLS 1.3 required per §9.13.\n\nACME HTTP-01 requires port 80 reachability. DNS-01 alternative noted for environments without port 80 (home networks behind NAT, shared hosting).",
+      "acceptanceCriteria": [
+        "ACME HTTP-01 challenge handler serves challenge response at http://<domain>/.well-known/acme-challenge/<token>",
+        "Certificate and private key stored in SqliteStorage (§17.6), encrypted at rest",
+        "Certificates are loaded from storage on restart (no re-provisioning needed)",
+        "Auto-renewal triggers 30 days before certificate expiry",
+        "Renewal is background and non-disruptive (existing connections continue with old cert)",
+        "TLS 1.3 is the minimum version enforced in the TLS configuration",
+        "DNS-01 challenge type is noted as alternative in code comments / documentation",
+        "Unit test: TLS config enforces TLS 1.3 minimum version",
+        "Unit test: certificate storage roundtrip (store + load)",
+        "Integration test: ACME challenge/response flow (mocked ACME server)"
+      ],
+      "actionItems": [
+        "Create crates/scp-node/src/tls.rs",
+        "Implement AcmeProvider struct that handles ACME HTTP-01 challenge/response flow",
+        "Use an ACME client library (e.g., instant-acme or acme-lib) for Let's Encrypt integration",
+        "Implement certificate storage in SqliteStorage with encryption at rest",
+        "Implement certificate loading on ApplicationNode startup",
+        "Implement auto-renewal background task that checks expiry and renews at 30 days remaining",
+        "Configure TLS with minimum version 1.3 via rustls",
+        "Write unit and integration tests"
+      ],
+      "blockedBy": [
+        "SCP-145"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.6.3 TLS Provisioning"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.13 Transport Security Requirements"
+        }
+      ],
+      "details": {
+        "acmeNote": "ACME HTTP-01 needs port 80 reachable. DNS-01 alternative for environments without port 80 (NAT, shared hosting). The operator configures DNS TXT records manually or via DNS API.",
+        "rustlsConfig": "Use rustls with TLS 1.3 minimum version. No TLS 1.2 fallback for relay connections (§9.13 allows TLS 1.2 only as fallback when 1.3 unavailable — ApplicationNode controls its own TLS config and can enforce 1.3)."
+      }
+    },
+    {
+      "id": "SCP-147",
+      "title": "ApplicationNode HTTP server with .well-known/scp and relay upgrade",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/http.rs",
+        "crates/scp-node/src/well_known.rs"
+      ],
+      "description": "Implement the HTTP server components for ApplicationNode as specified in §18.6.2 and §18.3. ApplicationNode exposes axum Router instances that serve .well-known/scp and handle WebSocket upgrade at /scp/v1.\n\nnode.well_known_router() returns an axum Router serving GET /.well-known/scp with dynamically generated content from node state (DID, relay URL, registered broadcast contexts).\n\nnode.relay_router() returns an axum Router handling WebSocket upgrade at /scp/v1 and connecting to the node's relay server.\n\nnode.serve(app_router) binds HTTPS, merges application routes + .well-known route + relay route.",
+      "acceptanceCriteria": [
+        "node.well_known_router() returns axum Router serving GET /.well-known/scp",
+        ".well-known/scp response is dynamically generated from node state: reads node's DID, relay URL, registered broadcast contexts",
+        ".well-known/scp response matches WellKnownScp format (§18.3.1)",
+        ".well-known/scp response Content-Type is application/json",
+        "node.relay_router() returns axum Router handling WebSocket upgrade at /scp/v1",
+        "WebSocket upgrade at /scp/v1 connects to the node's relay server",
+        "node.serve(app_router) binds HTTPS on configured address",
+        "node.serve merges application routes + .well-known route + relay route — all accessible on same HTTPS listener",
+        "Custom application routes passed to serve() are accessible alongside SCP routes",
+        "Registering a broadcast context on the node causes it to appear in subsequent GET /.well-known/scp responses automatically (§18.6.4)",
+        "Unit test: GET /.well-known/scp returns valid WellKnownScp JSON",
+        "Unit test: WebSocket upgrade at /scp/v1 establishes connection",
+        "Unit test: custom app routes merge correctly with SCP routes"
+      ],
+      "actionItems": [
+        "Create crates/scp-node/src/http.rs for HTTP routing logic",
+        "Create crates/scp-node/src/well_known.rs for .well-known/scp generation from node state",
+        "Implement well_known_router() — axum GET handler that constructs WellKnownScp from node's DID, relay URL, and registered contexts",
+        "Implement relay_router() — axum WebSocket upgrade handler at /scp/v1 that bridges to relay server",
+        "Implement serve(app_router) — merge routers, bind TLS listener, run axum server",
+        "Write unit and integration tests"
+      ],
+      "blockedBy": [
+        "SCP-145",
+        "SCP-143"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.6.2 SDK Surface"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.3 .well-known/scp"
+        }
+      ],
+      "details": {
+        "routeMerging": "node.serve(app_router) merges three routers:\n1. app_router — application-provided routes\n2. well_known_router — GET /.well-known/scp\n3. relay_router — WebSocket upgrade at /scp/v1\n\nSCP routes take precedence for /.well-known/scp and /scp/v1 paths. All other paths route to app_router.",
+        "dynamicGeneration": ".well-known/scp is generated on each request from current node state. Registering a broadcast context on the node automatically makes it appear in future .well-known/scp responses."
+      }
+    },
+    {
+      "id": "SCP-148",
+      "title": "Addressability integration test",
+      "gate": "gate-addr",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/tests/integration.rs"
+      ],
+      "description": "End-to-end integration tests for the addressability and deployment layer as specified in §18.7, §18.8, and ADR-032.\n\nTest scenarios:\n1. ApplicationNode starts → DID published → .well-known/scp reachable → relay accepts connections\n2. Client discovers relay via .well-known/scp → connects → subscribes\n3. Client resolves operator DID → finds SCPRelay service entry → connects\n4. scp:// URI roundtrip through creation and parsing",
+      "acceptanceCriteria": [
+        "Test: ApplicationNode::builder().domain(test_domain).generate_identity().build() succeeds",
+        "Test: After build, DID is published and resolvable with SCPRelay service entries",
+        "Test: After build, GET /.well-known/scp returns valid JSON with correct DID and relay URL",
+        "Test: After build, WebSocket connection to /scp/v1 succeeds and relay accepts SUBSCRIBE",
+        "Test: Client fetches .well-known/scp → extracts relay URL → connects → subscribes to routing_id → receives published message",
+        "Test: Client resolves operator DID via DHT → extracts SCPRelay service entries → connects to relay URL",
+        "Test: ScpUri created for a context → serialized → parsed → all fields preserved",
+        "All 4 test scenarios pass end-to-end"
+      ],
+      "actionItems": [
+        "Create crates/scp-node/tests/integration.rs",
+        "Implement test 1: ApplicationNode full lifecycle (build → verify DID → verify .well-known → verify relay)",
+        "Implement test 2: Client discovery via .well-known/scp flow",
+        "Implement test 3: Client discovery via DID resolution flow",
+        "Implement test 4: ScpUri roundtrip test",
+        "Use scp-testing harness (§16) for in-memory relay and simulated DHT where needed"
+      ],
+      "blockedBy": [
+        "SCP-145",
+        "SCP-146",
+        "SCP-147",
+        "SCP-142"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.7 Federation"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.8 Agent Deployment Flow"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-032: Addressability and Deployment"
+        }
+      ],
+      "details": {
+        "testInfrastructure": "Use scp-testing harness (§16) for deterministic testing. InMemoryRelay for relay operations, SimulatedClock for time control. Mock ACME server for TLS provisioning tests. Mock DHT for DID resolution tests.",
+        "testScenarios": "1. Full ApplicationNode lifecycle: build → DID published → .well-known reachable → relay accepts connections\n2. Client discovery via .well-known/scp: fetch → connect → subscribe\n3. Client discovery via DID resolution: resolve DID → extract SCPRelay → connect\n4. scp:// URI roundtrip: create → serialize → parse → verify fields"
       }
     }
   ]
