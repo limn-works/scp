@@ -1437,7 +1437,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/membership.rs",
         "crates/scp-core/context/manager.rs"
@@ -1584,7 +1584,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/roles.rs"
       ],
@@ -1634,7 +1634,8 @@
         "RoleDefinition type": "```rust\npub struct RoleDefinition {\n    pub name: String,\n    pub capabilities: HashSet<Capability>,\n}\n```",
         "Built-in roles": "- `admin` — all capabilities in the ceiling.\n- `member` — MessagesRead, MessagesWrite, ToolInvokeAll.\n- `observer` — MessagesRead only.\n\nBroadcast-specific roles:\n- `author` — MessagesWrite, MessagesRead, ToolInvokeAll. Authors are bounded. Added via RoleAssigned event.\n- `subscriber` — MessagesRead only. In open broadcast contexts (public-broadcast template), MessagesRead is auto-granted on DID-authenticated registration, following the discovery context reader-tier pattern (§6.2.2B). In gated broadcast contexts (gated-broadcast template), MessagesRead requires an explicit admin-issued UCAN.",
         "UCAN token format": "Each token: iss = context creator DID, aud = member DID, att = [{ \"with\": \"scp:ctx:{context_id}/{capability}\", \"can\": \"invoke\" }], nnc = unique nonce."
-      }
+      },
+      "result": "Already implemented in prior iteration (SCP-018 remediation). 54 tests, all acceptance criteria met."
     },
     {
       "id": "SCP-024",
@@ -1950,7 +1951,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/event_log/mod.rs",
         "crates/scp-core/event_log/tree.rs"
@@ -7638,7 +7639,7 @@
       "gate": "gate-addr",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/document.rs"
       ],
@@ -7745,7 +7746,7 @@
       "gate": "gate-addr",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/uri.rs"
       ],
@@ -7797,7 +7798,7 @@
       "gate": "gate-addr",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/well_known.rs"
       ],
