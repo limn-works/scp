@@ -123,6 +123,10 @@ pub enum IdentityError {
     /// Key rotation failed.
     #[error("key rotation failed: {0}")]
     KeyRotationFailed(String),
+
+    /// An invalid relay URL was provided (must use wss:// scheme and /scp/v1 path).
+    #[error("invalid relay URL: {0}")]
+    InvalidRelayUrl(String),
 }
 
 /// Abstract trait for DID method implementations.
