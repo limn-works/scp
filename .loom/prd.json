@@ -1643,7 +1643,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/crypto/ucan/mod.rs",
         "crates/scp-core/crypto/ucan/mint.rs",
@@ -1684,7 +1684,8 @@
       "details": {
         "Validation pipeline note": "Implements the full 11-step validation pipeline from ADR-016 criterion 2. All 11 steps are built from the start (ADR-016 is normative, not a future extension). Phase 2 integration tests exercise steps 1–2, 4–6, 8, 10–11 (8 steps not requiring delegation chain depth > 1). Phase 3 adds integration tests for steps 3 (chain verification), 7 (attenuation), and 9 (structured nonce validation).",
         "Implementation notes": "Language: Rust. Library: rs-ucan crate (or ucan crate — evaluate for UCAN 0.10+ spec compliance). Crate: scp-core. Modules: scp-core/crypto/ucan/ (UCAN wrapper, validation, revocation). Nonce tracking: In-memory set of seen nonces per context, persisted to storage. Revocation: Revocation list per context, distributed as MLS application messages."
-      }
+      },
+      "result": "UCAN minting (mint.rs) and 11-step validation pipeline (validate.rs). 28 new tests. Ed25519 signing via KeyCustody trait."
     },
     {
       "id": "SCP-025",
@@ -2054,7 +2055,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/event_log/checkpoint.rs"
       ],
@@ -2093,7 +2094,8 @@
         "ConsistencyCheckpoint struct": "```rust\npub struct ConsistencyCheckpoint {\n    pub context_id: ContextId,\n    pub sender_did: DID,\n    pub event_count: u64,\n    pub merkle_root: [u8; 32],\n    pub epoch: Option<u64>,\n    pub timestamp: u64,\n    pub signature: Ed25519Signature,\n}\n```",
         "CheckpointComparison enum": "Returns: Consistent, Divergent { first_divergent_event: Option<u64> }, Behind { missing_events: u64 }, or Ahead { extra_events: u64 }.",
         "Scheduling": "Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3). Checkpoints are sent as regular MLS application messages. Divergent Merkle roots for the same event count indicate equivocation — trigger alert and divergence resolution."
-      }
+      },
+      "result": "ConsistencyCheckpoint struct, generate_checkpoint (async signing), compare_checkpoint, CheckpointScheduler (50 events/10min). 13 tests."
     },
     {
       "id": "SCP-033",
@@ -3929,7 +3931,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/provenance/mod.rs"
       ],
@@ -3968,7 +3970,8 @@
           "DiscoveryMethod": "pub enum DiscoveryMethod { SharedContext(ContextId), Registry(ContextId), None }",
           "ProvenanceQuality": "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] pub enum ProvenanceQuality { NoProvenance, EphemeralKnownParties, SummaryVerified, PersistentVerifiable }"
         }
-      }
+      },
+      "result": "DataProvenance, SourceType, DiscoveryMethod, ProvenanceQuality (ordered), ProvenanceError. Stub attach.rs/evaluate.rs. 18 tests."
     },
     {
       "id": "SCP-071",
@@ -4234,7 +4237,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/discovery/bootstrap.rs"
       ],
@@ -4265,7 +4268,8 @@
       "details": {
         "module": "scp-core/discovery/bootstrap.rs",
         "estimatedFunctions": "~3 public functions, ~2 internal helpers"
-      }
+      },
+      "result": "BootstrapConfig (defaults, auto-query, fallback), BootstrapResolver (dedup, fallback resolution). 17 tests."
     },
     {
       "id": "SCP-077",
@@ -4684,7 +4688,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/bridge/mod.rs"
       ],
@@ -4724,7 +4728,8 @@
           "ShadowIdentity": "shadow_id, platform_handle, bridge_id, attributed_role, provenance_status, created_at",
           "ShadowProvenanceStatus": "Shadow | Claimed"
         }
-      }
+      },
+      "result": "BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus. Stub submodules. 12 tests."
     },
     {
       "id": "SCP-085",
