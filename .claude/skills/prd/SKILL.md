@@ -41,6 +41,22 @@ If `$ARGUMENTS` is empty or `help`, show usage and exit.
 6. Do not omit anything from sources. Expansion is acceptable, but it must build on established patterns, knowledge, or specs, and expansion sources must also be added to story references. Do not expand without referencing expansion sources. Do not paraphrase, reduce, or omit any source content. Do not alter the source's meaning or reduce information density. Only reformat it.
 7. **Dispatch subagents per section.** To avoid hitting context limits (~150k tokens) or agent return windows (32k), dispatch one subagent per source section or unit of work that maps to a story. Each subagent receives only its section's `mdq` output and transforms it mechanically into a story JSON object. Subagents can gather more context if they decide they need to.
 
+1. **Index source structure.** For each `.md` source file, extract the heading tree without reading the full content:
+   ```bash
+   mdq '# *' -o json < file.md | jq -r '[.. | objects | select(has("depth")) | ("  " * (.depth - 1)) + "- " + .title] | .[]'
+   ```
+   If a path is a glob (contains `*`), expand it with Glob first. This gives you an indented TOC of sections without consuming context.
+2. **Extract sections on demand.** Use `mdq` to pull individual sections verbatim:
+   ```bash
+   mdq '# Section Name' < file.md
+   ```
+   `#` is the universal heading selector (matches any depth — h1 through h6). Always use single `#`. Selector values starting with numbers must be quoted (`# "2.1 Crate Structure"`) or use regex (`# /Crate Structure/`). Progressively extract the sections you need to completion. Do not read entire large files into context all at once. Do not skip any sections.
+3. If `append` is set and `.loom/prd.json` exists, read its structure and top-level story metadata with `jq` to understand current status (avoid duplicating work, continue ID numbering).
+4. Read any existing codebase files that help contextualize the spec (look for `src/`, `lib/`, `package.json`, `Cargo.toml`, etc. — keep it lightweight, just enough to understand the tech stack and existing structure).
+5. **Preserve source contents verbatim.** The source document is the specification; the PRD is a structured decomposition of it, not a rewrite. Copy relevant sections directly into story fields — do not paraphrase or summarize unless the original text is ambiguous.
+6. Do not omit anything from sources. Expansion is acceptable, but it must build on established patterns, knowledge, or specs, and expansion sources must also be added to story references. Do not expand without referencing expansion sources. Do not paraphrase, reduce, or omit any source content. Do not alter the source's meaning or reduce information density. Only reformat it.
+7. **Dispatch subagents per section.** To avoid hitting context limits (~150k tokens) or agent return windows (32k), dispatch one subagent per source section or unit of work that maps to a story. Each subagent receives only its section's `mdq` output and transforms it mechanically into a story JSON object. Subagents can gather more context if they decide they need to.
+
 ### Step 2: Decompose into PRD
 
 Analyze the input documents and generate a complete PRD. The output is a single JSON object written to `.loom/prd.json`.
@@ -90,6 +106,8 @@ Analyze the input documents and generate a complete PRD. The output is a single 
 
 **Required fields** on every story: `id`, `title`, `gate`, `priority`, `severity`, `status`, `files`, `description`, `acceptanceCriteria`, `actionItems`, `blockedBy`, `tools`, `sources`, `details`.
 
+**Those fields are required** on every story. Populate them like so:
+
 - `severity`: `"critical"` | `"major"` | `"minor"` — used for prioritization within a gate
 - `actionItems`: concrete implementation steps (what to do), complementing `acceptanceCriteria` (what to verify)
 - `tools`: array of abstract capability categories this story requires. Values: `"browser"` (web UI interaction, screenshots, DOM verification), `"mobile"` (iOS/Android simulator interaction, native gestures), `"design"` (design file reference, token extraction, visual fidelity). Defaults to `[]`.
@@ -122,6 +140,8 @@ Analyze the input documents and generate a complete PRD. The output is a single 
     - When in doubt about where source content belongs, put it in `details` under a descriptive key rather than dropping it. Preserve lists exactly by converting them to arrays.
 11. **Source backlinks** — every story derived from a source document must include at least one entry in `sources`. This creates a traceable chain from spec to implementation. If a story spans multiple source files or sections, include all of them.
 12. **Tool detection** — auto-detect `tools` from acceptance criteria: browser/web UI/screenshots/DOM/CSS/responsive → `["browser"]`. Mobile app/simulator/emulator/native gestures → `["mobile"]`. Figma/design fidelity/design tokens/pixel-matching → `["design"]`. Multiple may apply. If none apply → `[]`.
+
+Do not break any of the rules.
 
 #### Source preservation examples
 
