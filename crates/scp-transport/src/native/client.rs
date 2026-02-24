@@ -59,6 +59,20 @@ struct PendingRequest {
     tx: oneshot::Sender<RelayMessage>,
 }
 
+/// Internal message type for subscription channels.
+///
+/// Wraps [`RelayMessage`] and adds internal-only signals (e.g.,
+/// [`Reconnected`](SubscriptionMessage::Reconnected)) that do not exist in the
+/// wire protocol but are needed by the adapter's stream translation layer.
+#[derive(Debug, Clone)]
+pub enum SubscriptionMessage {
+    /// A relay message received from the wire.
+    Relay(RelayMessage),
+    /// The client reconnected to the relay. Subscribers should expect
+    /// possible duplicate envelopes from the overlap window.
+    Reconnected,
+}
+
 /// Subscription state tracked for reconnection recovery.
 #[derive(Debug, Clone)]
 struct SubscriptionState {
@@ -67,8 +81,8 @@ struct SubscriptionState {
     routing_id: [u8; 32],
     /// The last `stored_at` timestamp received for this subscription.
     last_stored_at: Option<u64>,
-    /// Channel for pushing relay messages to the subscription stream.
-    tx: mpsc::Sender<RelayMessage>,
+    /// Channel for pushing subscription messages to the stream.
+    tx: mpsc::Sender<SubscriptionMessage>,
 }
 
 /// Shared inner state of the WebSocket client.
@@ -293,7 +307,7 @@ impl NativeRelayClient {
                     if sub.last_stored_at.is_none_or(|prev| *stored_at > prev) {
                         sub.last_stored_at = Some(*stored_at);
                     }
-                    let _ = sub.tx.send(msg).await;
+                    let _ = sub.tx.send(SubscriptionMessage::Relay(msg)).await;
                 }
             }
 
@@ -312,7 +326,10 @@ impl NativeRelayClient {
                 // Broadcast event to all subscriptions.
                 let state = inner.read().await;
                 for sub in state.subscriptions.values() {
-                    let _ = sub.tx.send(msg.clone()).await;
+                    let _ = sub
+                        .tx
+                        .send(SubscriptionMessage::Relay(msg.clone()))
+                        .await;
                 }
             }
 
@@ -432,7 +449,7 @@ impl NativeRelayClient {
         &self,
         routing_id: &[u8; 32],
         since: Option<u64>,
-    ) -> Result<mpsc::Receiver<RelayMessage>, TransportError> {
+    ) -> Result<mpsc::Receiver<SubscriptionMessage>, TransportError> {
         let (tx, rx) = mpsc::channel(256);
 
         // Register subscription state before sending to avoid race conditions.
@@ -536,7 +553,7 @@ impl NativeRelayClient {
             return Ok(Vec::new());
         }
 
-        let (tx, mut rx) = mpsc::channel::<RelayMessage>(256);
+        let (tx, mut rx) = mpsc::channel::<SubscriptionMessage>(256);
 
         // Register a temporary subscription for receiving BLOB messages.
         self.inner.write().await.subscriptions.insert(
@@ -579,14 +596,16 @@ impl NativeRelayClient {
             tokio::select! {
                 msg_opt = rx.recv() => {
                     match msg_opt {
-                        Some(RelayMessage::Blob { blob, .. }) => {
+                        Some(SubscriptionMessage::Relay(
+                            RelayMessage::Blob { blob, .. },
+                        )) => {
                             if let Ok(env) = OuterEnvelope::from_bytes(&blob) {
                                 envelopes.push(env);
                             }
                         }
-                        Some(RelayMessage::Event { event_type, .. })
-                            if event_type == "query_complete" =>
-                        {
+                        Some(SubscriptionMessage::Relay(
+                            RelayMessage::Event { event_type, .. },
+                        )) if event_type == "query_complete" => {
                             break;
                         }
                         None => break,
@@ -670,6 +689,15 @@ impl NativeRelayClient {
                         // is still tracked and will be retried on next reconnect.
                         let _ = self.send_request(msg).await;
                     }
+
+                    // Notify all active subscriptions that a reconnection
+                    // occurred so the adapter can emit
+                    // `TransportEvent::Reconnected`.
+                    let state = self.inner.read().await;
+                    for sub in state.subscriptions.values() {
+                        let _ = sub.tx.send(SubscriptionMessage::Reconnected).await;
+                    }
+                    drop(state);
 
                     return Ok(());
                 }

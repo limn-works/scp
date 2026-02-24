@@ -25,7 +25,7 @@ use std::pin::Pin;
 use futures::Stream;
 use scp_core::envelope::OuterEnvelope;
 
-use super::client::NativeRelayClient;
+use super::client::{NativeRelayClient, SubscriptionMessage};
 use super::protocol::{ClientMessage, RelayMessage};
 use crate::error::TransportError;
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
@@ -215,10 +215,10 @@ impl TransportAdapter for NativeRelayAdapter {
     }
 }
 
-/// Stream adapter that converts [`RelayMessage`]s from a channel into
+/// Stream adapter that converts [`SubscriptionMessage`]s from a channel into
 /// [`TransportEvent`]s.
 struct RelayMessageStream {
-    rx: tokio::sync::mpsc::Receiver<RelayMessage>,
+    rx: tokio::sync::mpsc::Receiver<SubscriptionMessage>,
 }
 
 impl Stream for RelayMessageStream {
@@ -229,8 +229,8 @@ impl Stream for RelayMessageStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         match self.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(msg)) => {
-                relay_message_to_event(msg).map_or_else(
+            std::task::Poll::Ready(Some(sub_msg)) => {
+                subscription_message_to_event(sub_msg).map_or_else(
                     || {
                         // Skip messages that don't map to events (e.g., PONG).
                         cx.waker().wake_by_ref();
@@ -242,6 +242,18 @@ impl Stream for RelayMessageStream {
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
+    }
+}
+
+/// Converts a [`SubscriptionMessage`] into a [`TransportEvent`], if
+/// applicable.
+///
+/// Returns `None` for messages that don't map to transport events (e.g.,
+/// PONG, OK responses).
+fn subscription_message_to_event(msg: SubscriptionMessage) -> Option<TransportEvent> {
+    match msg {
+        SubscriptionMessage::Relay(relay_msg) => relay_message_to_event(relay_msg),
+        SubscriptionMessage::Reconnected => Some(TransportEvent::Reconnected),
     }
 }
 
@@ -395,5 +407,31 @@ mod tests {
 
         let event = relay_message_to_event(msg);
         assert!(matches!(event, Some(TransportEvent::Error(_))));
+    }
+
+    #[test]
+    fn subscription_reconnected_to_reconnected_event() {
+        let msg = SubscriptionMessage::Reconnected;
+        let event = subscription_message_to_event(msg);
+        assert!(matches!(event, Some(TransportEvent::Reconnected)));
+    }
+
+    #[test]
+    fn subscription_relay_delegates_to_relay_message_to_event() {
+        let relay_msg = RelayMessage::Event {
+            ref_id: None,
+            event_type: "backfill_complete".to_string(),
+        };
+        let msg = SubscriptionMessage::Relay(relay_msg);
+        let event = subscription_message_to_event(msg);
+        assert!(matches!(event, Some(TransportEvent::BackfillComplete)));
+    }
+
+    #[test]
+    fn subscription_relay_pong_returns_none() {
+        let relay_msg = RelayMessage::Pong { ts: 42 };
+        let msg = SubscriptionMessage::Relay(relay_msg);
+        let event = subscription_message_to_event(msg);
+        assert!(event.is_none());
     }
 }
