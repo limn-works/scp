@@ -84,8 +84,24 @@ fn messaging_ceiling() -> Vec<Capability> {
     ]
 }
 
-/// Returns the messaging + tools ceiling: messaging + `tool:invoke_all` +
+/// Returns the messaging + tool invoke ceiling: messaging + `tool:invoke_all`.
+///
+/// Used by the Coordination template (spec section 5.12.1). Tools are
+/// creator-defined at creation time, so only `tool:invoke_all` is in the
+/// ceiling — members can invoke tools but not dynamically register new ones.
+fn messaging_tool_invoke_ceiling() -> Vec<Capability> {
+    vec![
+        Capability::new(CAP_MESSAGES_READ),
+        Capability::new(CAP_MESSAGES_WRITE),
+        Capability::new(CAP_TOOL_INVOKE_ALL),
+    ]
+}
+
+/// Returns the messaging + full tools ceiling: messaging + `tool:invoke_all` +
 /// `tool:register`.
+///
+/// Used by broadcast templates (spec section 5.12.1) where authors can both
+/// invoke and register tools.
 fn messaging_tools_ceiling() -> Vec<Capability> {
     vec![
         Capability::new(CAP_MESSAGES_READ),
@@ -109,8 +125,8 @@ fn messaging_invite_ceiling() -> Vec<Capability> {
 /// The returned params have `ttl` set to `None`. For templates that require a
 /// TTL (`BilateralEphemeral`, `Coordination`), the caller must set the `ttl`
 /// field before passing to context creation. For templates where TTL is
-/// optional (`GroupDiscussion`), the caller may set it. For templates that
-/// forbid TTL (`BilateralPersistent`, `PublicBroadcast`, `GatedBroadcast`),
+/// optional (`GroupDiscussion`, `PublicBroadcast`, `GatedBroadcast`), the
+/// caller may set it. For templates that forbid TTL (`BilateralPersistent`),
 /// the `ttl` field must remain `None`.
 ///
 /// # Template definitions
@@ -119,10 +135,10 @@ fn messaging_invite_ceiling() -> Vec<Capability> {
 /// |----------|------|---------|----------------|-----------|--------|------------|-----|
 /// | `BilateralEphemeral` | Encrypted | messages | Immutable | NoPromotion | Ephemeral | SingleAdmin | Required |
 /// | `BilateralPersistent` | Encrypted | messages | Immutable | NoPromotion | Full | SingleAdmin | Forbidden |
-/// | `Coordination` | Encrypted | messages + tools | Immutable | NoPromotion | Summary | SingleAdmin | Required |
+/// | `Coordination` | Encrypted | messages + invoke | Immutable | NoPromotion | Summary | SingleAdmin | Required |
 /// | `GroupDiscussion` | Encrypted | messages + invite | Immutable | Promotable | Full | SingleAdmin | Optional |
-/// | `PublicBroadcast` | Broadcast | messages | Immutable | NoPromotion | Summary | SingleAdmin | Forbidden |
-/// | `GatedBroadcast` | Broadcast | messages | Immutable | NoPromotion | Summary | SingleAdmin | Forbidden |
+/// | `PublicBroadcast` | Broadcast | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional |
+/// | `GatedBroadcast` | Broadcast | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional |
 #[must_use]
 pub fn template_params(template_id: &TemplateId) -> ContextParams {
     match template_id {
@@ -152,7 +168,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tools_ceiling(),
+            ceiling: messaging_tool_invoke_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
@@ -176,25 +192,25 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
-            ceiling: messaging_ceiling(),
+            ceiling: messaging_tools_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
             tools: Vec::new(),
             ttl: None,
-            memory_scope: MemoryScope::Summary,
+            memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::PublicBroadcast),
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
-            ceiling: messaging_ceiling(),
+            ceiling: messaging_tools_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
             tools: Vec::new(),
             ttl: None,
-            memory_scope: MemoryScope::Summary,
+            memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::GatedBroadcast),
         },
@@ -237,10 +253,10 @@ enum TtlPolicy {
 const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
     match template_id {
         TemplateId::BilateralEphemeral | TemplateId::Coordination => TtlPolicy::Required,
-        TemplateId::BilateralPersistent
+        TemplateId::BilateralPersistent => TtlPolicy::Forbidden,
+        TemplateId::GroupDiscussion
         | TemplateId::PublicBroadcast
-        | TemplateId::GatedBroadcast => TtlPolicy::Forbidden,
-        TemplateId::GroupDiscussion => TtlPolicy::Optional,
+        | TemplateId::GatedBroadcast => TtlPolicy::Optional,
     }
 }
 
@@ -335,6 +351,26 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
             field: "governance",
             expected: format!("{:?}", expected.governance),
             actual: format!("{:?}", params.governance),
+        });
+    }
+
+    // Roles
+    if params.roles != expected.roles {
+        return Err(TemplateError::Mismatch {
+            template: *template_id,
+            field: "roles",
+            expected: format!("{:?}", expected.roles),
+            actual: format!("{:?}", params.roles),
+        });
+    }
+
+    // Tools
+    if params.tools != expected.tools {
+        return Err(TemplateError::Mismatch {
+            template: *template_id,
+            field: "tools",
+            expected: format!("{:?}", expected.tools),
+            actual: format!("{:?}", params.tools),
         });
     }
 
@@ -453,7 +489,7 @@ mod tests {
     fn coordination_params_have_correct_fields() {
         let params = template_params(&TemplateId::Coordination);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 3);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(params
             .ceiling
@@ -463,10 +499,6 @@ mod tests {
             .ceiling
             .iter()
             .any(|c| c.name() == CAP_TOOL_INVOKE_ALL));
-        assert!(params
-            .ceiling
-            .iter()
-            .any(|c| c.name() == CAP_TOOL_REGISTER));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -505,18 +537,26 @@ mod tests {
     fn public_broadcast_params_have_correct_fields() {
         let params = template_params(&TemplateId::PublicBroadcast);
         assert_eq!(params.mode, ContextMode::Broadcast);
-        assert_eq!(params.ceiling.len(), 2);
+        assert_eq!(params.ceiling.len(), 4);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(params
             .ceiling
             .iter()
             .any(|c| c.name() == CAP_MESSAGES_WRITE));
+        assert!(params
+            .ceiling
+            .iter()
+            .any(|c| c.name() == CAP_TOOL_INVOKE_ALL));
+        assert!(params
+            .ceiling
+            .iter()
+            .any(|c| c.name() == CAP_TOOL_REGISTER));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
         assert!(params.tools.is_empty());
         assert!(params.ttl.is_none());
-        assert_eq!(params.memory_scope, MemoryScope::Summary);
+        assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
     }
@@ -525,18 +565,26 @@ mod tests {
     fn gated_broadcast_params_have_correct_fields() {
         let params = template_params(&TemplateId::GatedBroadcast);
         assert_eq!(params.mode, ContextMode::Broadcast);
-        assert_eq!(params.ceiling.len(), 2);
+        assert_eq!(params.ceiling.len(), 4);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(params
             .ceiling
             .iter()
             .any(|c| c.name() == CAP_MESSAGES_WRITE));
+        assert!(params
+            .ceiling
+            .iter()
+            .any(|c| c.name() == CAP_TOOL_INVOKE_ALL));
+        assert!(params
+            .ceiling
+            .iter()
+            .any(|c| c.name() == CAP_TOOL_REGISTER));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
         assert!(params.tools.is_empty());
         assert!(params.ttl.is_none());
-        assert_eq!(params.memory_scope, MemoryScope::Summary);
+        assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::GatedBroadcast));
     }
@@ -628,19 +676,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_public_broadcast_with_ttl_returns_ttl_forbidden() {
+    fn validate_public_broadcast_with_ttl_passes() {
         let mut params = template_params(&TemplateId::PublicBroadcast);
         params.ttl = Some(Duration::from_secs(600));
-        let err = validate_against_template(&params).unwrap_err();
-        assert!(matches!(err, TemplateError::TtlForbidden { .. }));
+        assert!(validate_against_template(&params).is_ok());
     }
 
     #[test]
-    fn validate_gated_broadcast_with_ttl_returns_ttl_forbidden() {
+    fn validate_gated_broadcast_with_ttl_passes() {
         let mut params = template_params(&TemplateId::GatedBroadcast);
         params.ttl = Some(Duration::from_secs(600));
-        let err = validate_against_template(&params).unwrap_err();
-        assert!(matches!(err, TemplateError::TtlForbidden { .. }));
+        assert!(validate_against_template(&params).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -917,7 +963,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_coordination_params_with_bilateral_template_id() {
-        // Coordination has 4 ceiling caps but BilateralEphemeral expects 2.
+        // Coordination has 3 ceiling caps but BilateralEphemeral expects 2.
         let mut params = template_params(&TemplateId::Coordination);
         params.ttl = Some(Duration::from_secs(300));
         params.template_id = Some(TemplateId::BilateralEphemeral);
@@ -966,7 +1012,7 @@ mod tests {
     fn from_template_coordination_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::Coordination);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 3);
         assert_eq!(params.memory_scope, MemoryScope::Summary);
         assert_eq!(params.template_id, Some(TemplateId::Coordination));
     }
@@ -985,7 +1031,8 @@ mod tests {
     fn from_template_public_broadcast_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::PublicBroadcast);
         assert_eq!(params.mode, ContextMode::Broadcast);
-        assert_eq!(params.memory_scope, MemoryScope::Summary);
+        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
     }
 
@@ -993,8 +1040,47 @@ mod tests {
     fn from_template_gated_broadcast_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::GatedBroadcast);
         assert_eq!(params.mode, ContextMode::Broadcast);
-        assert_eq!(params.memory_scope, MemoryScope::Summary);
+        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::GatedBroadcast));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_against_template: roles and tools validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_unexpected_roles() {
+        let mut params = template_params(&TemplateId::BilateralEphemeral);
+        params.ttl = Some(Duration::from_secs(300));
+        params.roles = vec![super::super::params::RoleDefinition {
+            name: "smuggled".to_owned(),
+        }];
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(matches!(
+            err,
+            TemplateError::Mismatch {
+                field: "roles",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_unexpected_tools() {
+        let mut params = template_params(&TemplateId::BilateralEphemeral);
+        params.ttl = Some(Duration::from_secs(300));
+        params.tools = vec![super::super::params::ToolRegistration {
+            name: "rogue-tool".to_owned(),
+        }];
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(matches!(
+            err,
+            TemplateError::Mismatch {
+                field: "tools",
+                ..
+            }
+        ));
     }
 
     // -----------------------------------------------------------------------
