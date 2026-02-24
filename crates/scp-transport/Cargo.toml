@@ -11,10 +11,14 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 futures = "0.3"
 sha2 = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+rmp-serde = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
+rmpv = { version = "1", features = ["with-serde"] }
 
 [lints]
 workspace = true
