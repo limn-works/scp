@@ -640,7 +640,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/document.rs"
@@ -695,7 +695,8 @@
         "didRotationEvent": "```rust\npub struct DidRotationEvent {\n    pub old_did: String,\n    pub new_did: String,\n    pub migration_proof: MigrationProof,\n    pub pre_rotation_proof: Option<PreRotationProof>,\n    pub rotated_at: u64,\n}\n\npub struct MigrationProof {\n    /// Ed25519 signature of SHA-256(old_did || new_did || rotated_at)\n    /// signed by the old Identity Key.\n    pub signature: [u8; 64],\n    pub old_public_key: [u8; 32],\n}\n\npub struct PreRotationProof {\n    /// The commitment published in the old DID document.\n    pub commitment: [u8; 32],\n    /// The new Identity Key public bytes. SHA-256(this) must equal commitment.\n    pub revealed_key: [u8; 32],\n}\n```",
         "postRotationRequirements": "After rotation, the caller MUST issue MLS Update proposals in all active contexts (PCS, spec §9.7.3) and revoke/reissue UCAN tokens signed by the old active key.",
         "threeLayerSummary": "Layer 1 (rotate_active_key): common case, DID string unchanged. Layer 2 (migrate_identity): rare planned migration, DID string changes. Layer 3 (verify_migration): verification of migration proofs."
-      }
+      },
+      "result": "Three-layer key rotation: rotate_active_key, migrate_identity, verify_migration. 28 new tests. All passing."
     },
     {
       "id": "SCP-009",
@@ -775,7 +776,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/envelope/outer.rs"
       ],
@@ -816,7 +817,8 @@
       "details": {
         "sealPath": "seal_envelope: serialize inner envelope -> MLS encrypt -> wrap in outer envelope with routing_id, recipient_hint, blob_ttl",
         "openPath": "open_envelope: MLS decrypt -> deserialize inner envelope -> strip padding -> verify payload_hash == SHA256(stripped_payload) -> verify inner signature -> verify generation number -> return verified inner envelope"
-      }
+      },
+      "result": "seal_envelope and open_envelope with full integrity verification. 13 tests (12 + 1 proptest). All passing."
     },
     {
       "id": "SCP-011",
@@ -824,7 +826,7 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/lib.rs",
         "crates/scp-transport/src/traits.rs",
@@ -877,7 +879,8 @@
         "traitDefinition": "```rust\npub trait TransportAdapter: Send + Sync {\n    async fn send(&self, envelope: &OuterEnvelope) -> Result<BlobId, TransportError>;\n    async fn subscribe(\n        &self,\n        routing_id: &RoutingId,\n        since: Option<u64>,\n    ) -> Result<Pin<Box<dyn Stream<Item = TransportEvent> + Send>>, TransportError>;\n    async fn unsubscribe(&self, routing_id: &RoutingId) -> Result<(), TransportError>;\n    async fn query(\n        &self,\n        routing_id: &RoutingId,\n        since: Option<u64>,\n    ) -> Result<Vec<OuterEnvelope>, TransportError>;\n    async fn delete(&self, blob_id: &BlobId) -> Result<(), TransportError>;\n}\n```",
         "transportEventDefinition": "```rust\npub enum TransportEvent {\n    Envelope(OuterEnvelope),\n    Error(TransportError),\n    BackfillComplete,\n    Reconnected,\n    Terminated { reason: String },\n}\n```",
         "managerDesign": "Phase 1: single adapter (native relay). Multi-adapter routing is Phase 2+. send() routes through one or more adapters based on policy. subscribe() merges streams from multiple adapters into a single stream (deduplication by blob_id for Envelope variants; control events like BackfillComplete are passed through per-adapter)."
-      }
+      },
+      "result": "New scp-transport crate with TransportAdapter trait, BlobId/RoutingId types, TransportManager, MergedStream dedup. 22 tests. All passing."
     },
     {
       "id": "SCP-012",
