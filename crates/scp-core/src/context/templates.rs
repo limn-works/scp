@@ -7,6 +7,8 @@
 //! - [`template_params`] -- constructs default [`ContextParams`] for a given
 //!   template, with `ttl` set to `None` (the caller must supply it when
 //!   required).
+//! - [`ContextParams::from_template`] -- convenience method equivalent to
+//!   [`template_params`].
 //! - [`validate_against_template`] -- validates that a [`ContextParams`] matches
 //!   the template definition when `template_id` is present.
 //!
@@ -196,6 +198,23 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::GatedBroadcast),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ContextParams::from_template -- convenience constructor
+// ---------------------------------------------------------------------------
+
+impl ContextParams {
+    /// Constructs a [`ContextParams`] from a well-known template.
+    ///
+    /// This is a convenience method equivalent to [`template_params`]. The
+    /// returned params have `ttl` set to `None`. For templates that require a
+    /// TTL (`BilateralEphemeral`, `Coordination`), the caller must set the
+    /// `ttl` field before passing to context creation.
+    #[must_use]
+    pub fn from_template(template_id: TemplateId) -> Self {
+        template_params(&template_id)
     }
 }
 
@@ -904,5 +923,109 @@ mod tests {
         params.template_id = Some(TemplateId::BilateralEphemeral);
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(err, TemplateError::Mismatch { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // ContextParams::from_template -- convenience constructor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_template_matches_template_params_for_all_variants() {
+        let variants = [
+            TemplateId::BilateralEphemeral,
+            TemplateId::BilateralPersistent,
+            TemplateId::Coordination,
+            TemplateId::GroupDiscussion,
+            TemplateId::PublicBroadcast,
+            TemplateId::GatedBroadcast,
+        ];
+        for variant in &variants {
+            let from_method = ContextParams::from_template(*variant);
+            let from_fn = template_params(variant);
+            assert_eq!(from_method, from_fn, "from_template mismatch for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn from_template_bilateral_ephemeral_produces_valid_params() {
+        let params = ContextParams::from_template(TemplateId::BilateralEphemeral);
+        assert_eq!(params.mode, ContextMode::Encrypted);
+        assert_eq!(params.memory_scope, MemoryScope::Ephemeral);
+        assert_eq!(params.template_id, Some(TemplateId::BilateralEphemeral));
+    }
+
+    #[test]
+    fn from_template_bilateral_persistent_produces_valid_params() {
+        let params = ContextParams::from_template(TemplateId::BilateralPersistent);
+        assert_eq!(params.mode, ContextMode::Encrypted);
+        assert_eq!(params.memory_scope, MemoryScope::Full);
+        assert_eq!(params.template_id, Some(TemplateId::BilateralPersistent));
+    }
+
+    #[test]
+    fn from_template_coordination_produces_valid_params() {
+        let params = ContextParams::from_template(TemplateId::Coordination);
+        assert_eq!(params.mode, ContextMode::Encrypted);
+        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.memory_scope, MemoryScope::Summary);
+        assert_eq!(params.template_id, Some(TemplateId::Coordination));
+    }
+
+    #[test]
+    fn from_template_group_discussion_produces_valid_params() {
+        let params = ContextParams::from_template(TemplateId::GroupDiscussion);
+        assert_eq!(params.mode, ContextMode::Encrypted);
+        assert_eq!(params.ceiling.len(), 3);
+        assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
+        assert_eq!(params.memory_scope, MemoryScope::Full);
+        assert_eq!(params.template_id, Some(TemplateId::GroupDiscussion));
+    }
+
+    #[test]
+    fn from_template_public_broadcast_produces_valid_params() {
+        let params = ContextParams::from_template(TemplateId::PublicBroadcast);
+        assert_eq!(params.mode, ContextMode::Broadcast);
+        assert_eq!(params.memory_scope, MemoryScope::Summary);
+        assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
+    }
+
+    #[test]
+    fn from_template_gated_broadcast_produces_valid_params() {
+        let params = ContextParams::from_template(TemplateId::GatedBroadcast);
+        assert_eq!(params.mode, ContextMode::Broadcast);
+        assert_eq!(params.memory_scope, MemoryScope::Summary);
+        assert_eq!(params.template_id, Some(TemplateId::GatedBroadcast));
+    }
+
+    // -----------------------------------------------------------------------
+    // TemplateError converts to ContextError via From impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn template_error_converts_to_context_error() {
+        use super::super::ContextError;
+
+        let template_err = TemplateError::TtlRequired {
+            template: TemplateId::BilateralEphemeral,
+        };
+        let context_err: ContextError = template_err.into();
+        assert!(
+            matches!(context_err, ContextError::TemplateMismatch(_)),
+            "expected ContextError::TemplateMismatch, got {context_err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_against_template_error_converts_to_context_error() {
+        use super::super::ContextError;
+
+        // BilateralEphemeral requires TTL but template_params returns ttl=None.
+        let params = template_params(&TemplateId::BilateralEphemeral);
+        let result: Result<(), ContextError> =
+            validate_against_template(&params).map_err(ContextError::from);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("requires a TTL"));
     }
 }

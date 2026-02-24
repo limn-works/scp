@@ -26,8 +26,12 @@
 //! handles are serialized internally via `tokio::sync::RwLock`. See
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
+pub mod builder;
+pub mod manager;
 pub mod params;
+pub mod roles;
 pub mod state_machine;
+pub mod templates;
 
 use std::sync::Arc;
 
@@ -40,6 +44,23 @@ pub use params::{
     PromotionPolicy, RoleDefinition, TemplateId, ToolRegistration,
 };
 pub use state_machine::transition;
+
+// Re-export template types for convenience.
+pub use templates::{TemplateError, template_params, validate_against_template};
+
+// Re-export role system types from roles module (ADR-009).
+pub use roles::{
+    CapabilityCeiling, ContextRoleState, RoleAssignment, RoleError, UcanAttestation, UcanToken,
+    assign_role, builtin_admin, builtin_author, builtin_broadcast_roles, builtin_member,
+    builtin_observer, builtin_roles, builtin_subscriber, check_ceiling, validate_role_definition,
+};
+
+// Re-export builder and manager types for convenience.
+pub use builder::{
+    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
+    ContextTransportProvider, CreationReceipt, create_context,
+};
+pub use manager::ContextManager;
 
 // ---------------------------------------------------------------------------
 // ContextState
@@ -130,6 +151,11 @@ pub enum ContextError {
     /// The context is in a terminal state and cannot be used.
     #[error("context has expired")]
     ContextExpired,
+
+    /// Template validation failed: the [`ContextParams`] fields do not match
+    /// the template definition. See [`templates::validate_against_template`].
+    #[error(transparent)]
+    TemplateMismatch(#[from] templates::TemplateError),
 }
 
 // ---------------------------------------------------------------------------
