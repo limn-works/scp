@@ -59,6 +59,7 @@ pub enum SourceContextState {
 /// - `provenance` — The provenance record to evaluate. `None` means no
 ///   provenance is available, which always maps to `NoProvenance`.
 /// - `context_state` — The current operational state of the source context.
+#[must_use]
 pub fn evaluate_quality(
     provenance: Option<&DataProvenance>,
     context_state: &SourceContextState,
@@ -89,11 +90,11 @@ pub fn evaluate_quality(
             }
         }
         SourceContextState::ClosedEphemeral => {
-            if !prov.counterparties.is_empty() {
-                ProvenanceQuality::EphemeralKnownParties
-            } else {
+            if prov.counterparties.is_empty() {
                 // Ephemeral with no known counterparties — no provenance
                 ProvenanceQuality::NoProvenance
+            } else {
+                ProvenanceQuality::EphemeralKnownParties
             }
         }
         SourceContextState::Unknown => ProvenanceQuality::NoProvenance,
@@ -113,7 +114,7 @@ pub fn evaluate_quality(
 ///
 /// When `new_state` is [`SourceContextState::Unknown`], the source type is
 /// preserved as-is (no-op).
-pub fn update_source_type(provenance: &mut DataProvenance, new_state: &SourceContextState) {
+pub const fn update_source_type(provenance: &mut DataProvenance, new_state: &SourceContextState) {
     match new_state {
         SourceContextState::Active => provenance.source_type = SourceType::Persistent,
         SourceContextState::ClosedWithSummary { .. } => {
