@@ -21,3 +21,10 @@ Notes:
 - Strict sequence gap rejection vs multi-relay and offline delivery
 - Discovery context MLS scaling (MLS does not scale to open-join 10K+ contexts)
 - Cover traffic fingerprinting when disabled
+
+### Known Bug Patterns (Feb 2026 Review — PR #4, commit b66c457)
+- **Governance symmetry gaps:** Self-approval check in approve_registration not carried to reject_registration or revoke_bridge. Pattern: auth guards added to one path but not parallel paths.
+- **Dead ownership checks:** HashMap keyed by DID makes ownership check (entry.did != requester_did) tautological when requester_did is used as lookup key. Pattern: using same value for both lookup and authorization.
+- **Misleading event fields:** BridgeRegistrationEvent.governance_did forced to operator DID for Requested events (no governance actor exists). Pattern: non-optional fields that don't apply to all enum variants.
+- **Disjoint set invariant not enforced:** Writers/readers Vecs in DiscoveryContext can overlap — no cross-list dedup. Pattern: parallel collections that should be mutually exclusive but aren't validated.
+- **Test masking wrong error path:** agent_update_rejects_ownership_mismatch test passes with NotRegistered instead of OwnershipMismatch. Pattern: test asserts on a supertype error that masks the real code path.

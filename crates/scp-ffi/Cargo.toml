@@ -1,0 +1,24 @@
+[package]
+name = "scp-ffi"
+version = "0.1.0"
+description = "PyO3 FFI bridge for SCP — exposes scp-core to Python as the _scp_core extension module"
+edition.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_scp_core"
+crate-type = ["cdylib"]
+# Test harness disabled: PyO3 extension-module cdylib cannot link a test
+# binary without Python dev headers (libpython). Run tests via maturin/pytest.
+test = false
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "experimental-async"] }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pyo3 = { version = "0.23", features = ["auto-initialize"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

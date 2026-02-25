@@ -24,6 +24,7 @@ use scp_core::envelope::OuterEnvelope;
 
 use crate::config::TransportConfig;
 use crate::error::TransportError;
+use crate::scoring::{self, DeliveryOutcome, ReliabilityScore, SuppressionTracker};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
 
 /// Context identifier — a string alias matching the project-wide convention.
@@ -49,72 +50,6 @@ const MIN_RELAYS_PER_CONTEXT: usize = 3;
 /// succeed. If fewer than this many relays accept the envelope, the send
 /// returns an error (insufficient redundancy).
 const MIN_SUCCESSFUL_SENDS: usize = 2;
-
-/// Per-relay reliability score.
-///
-/// Tracks delivery success rates and latency for each relay, enabling the
-/// `TransportManager` to prefer more reliable relays when assigning relay
-/// sets to contexts.
-///
-/// See ADR-012 acceptance criterion 5 for the full scoring design.
-#[derive(Debug, Clone)]
-pub struct ReliabilityScore {
-    /// The relay URL this score tracks.
-    pub relay_url: String,
-    /// Delivery success rate (0.0 to 1.0).
-    pub delivery_success_rate: f64,
-    /// Average latency in milliseconds.
-    pub average_latency_ms: u64,
-    /// Deletion compliance rate (0.0 to 1.0).
-    pub deletion_compliance_rate: f64,
-    /// Epoch seconds when this score was last updated.
-    pub last_updated: u64,
-    /// Total number of send attempts.
-    pub total_sends: u64,
-    /// Total number of send failures.
-    pub total_failures: u64,
-}
-
-impl ReliabilityScore {
-    /// Creates a new `ReliabilityScore` for a relay with perfect initial scores.
-    #[must_use]
-    pub const fn new(relay_url: String) -> Self {
-        Self {
-            relay_url,
-            delivery_success_rate: 1.0,
-            deletion_compliance_rate: 1.0,
-            average_latency_ms: 0,
-            last_updated: 0,
-            total_sends: 0,
-            total_failures: 0,
-        }
-    }
-
-    /// Records a successful delivery for this relay.
-    #[allow(clippy::cast_precision_loss)]
-    pub fn record_success(&mut self) {
-        self.total_sends += 1;
-        self.delivery_success_rate =
-            (self.total_sends - self.total_failures) as f64 / self.total_sends as f64;
-    }
-
-    /// Records a failed delivery for this relay.
-    #[allow(clippy::cast_precision_loss)]
-    pub fn record_failure(&mut self) {
-        self.total_sends += 1;
-        self.total_failures += 1;
-        self.delivery_success_rate =
-            (self.total_sends - self.total_failures) as f64 / self.total_sends as f64;
-    }
-
-    /// Returns the composite score used for relay ranking.
-    ///
-    /// Higher is better. Combines delivery success rate as the primary factor.
-    #[must_use]
-    pub const fn composite_score(&self) -> f64 {
-        self.delivery_success_rate
-    }
-}
 
 /// Multi-adapter transport manager.
 ///
@@ -152,6 +87,8 @@ pub struct TransportManager {
     dedup_ttl: Duration,
     /// Round-robin counter for relay assignment spread.
     assignment_counter: usize,
+    /// Multi-relay suppression cross-check tracker (spec section 9.9.2).
+    suppression_tracker: SuppressionTracker,
 }
 
 /// Helper to create a `NonZeroUsize` for LRU capacity, falling back to 1.
@@ -174,6 +111,7 @@ impl TransportManager {
             dedup_cache: LruCache::new(nonzero_capacity(DEFAULT_DEDUP_CAPACITY)),
             dedup_ttl: DEFAULT_DEDUP_TTL,
             assignment_counter: 0,
+            suppression_tracker: SuppressionTracker::new(),
         }
     }
 
@@ -190,6 +128,7 @@ impl TransportManager {
             dedup_cache: LruCache::new(nonzero_capacity(DEFAULT_DEDUP_CAPACITY)),
             dedup_ttl: DEFAULT_DEDUP_TTL,
             assignment_counter: 0,
+            suppression_tracker: SuppressionTracker::new(),
         }
     }
 
@@ -205,6 +144,7 @@ impl TransportManager {
             dedup_cache: LruCache::new(nonzero_capacity(config.dedup_cache_size)),
             dedup_ttl: config.dedup_cache_ttl,
             assignment_counter: 0,
+            suppression_tracker: SuppressionTracker::new(),
         }
     }
 
@@ -301,16 +241,15 @@ impl TransportManager {
             }
         }
 
-        // Record delivery outcomes for reliability scoring.
+        // Record delivery outcomes for reliability scoring via EMA.
         for (idx, success) in outcomes {
             let key = idx.to_string();
-            if let Some(score) = self.reliability_scores.get_mut(&key) {
-                if success {
-                    score.record_success();
-                } else {
-                    score.record_failure();
-                }
-            }
+            let outcome = if success {
+                DeliveryOutcome::Success { latency_ms: 0 }
+            } else {
+                DeliveryOutcome::Failure
+            };
+            scoring::update_score(&mut self.reliability_scores, &key, outcome);
         }
 
         if successes.len() < MIN_SUCCESSFUL_SENDS {
@@ -576,6 +515,39 @@ impl TransportManager {
     #[must_use]
     pub fn get_reliability_score(&self, adapter_index: usize) -> Option<&ReliabilityScore> {
         self.reliability_scores.get(&adapter_index.to_string())
+    }
+
+    /// Updates the reliability score for a relay after an operation.
+    ///
+    /// Delegates to [`scoring::update_score`] which applies exponential
+    /// moving average (EMA) decay so that recent behavior weighs more than
+    /// historical.
+    ///
+    /// See ADR-012 acceptance criterion 5.
+    pub fn update_score(&mut self, relay_url: &str, outcome: DeliveryOutcome) {
+        scoring::update_score(&mut self.reliability_scores, relay_url, outcome);
+    }
+
+    /// Returns the current reliability score for a relay URL.
+    ///
+    /// Delegates to [`scoring::get_score`].
+    #[must_use]
+    pub fn get_score(&self, relay_url: &str) -> Option<&ReliabilityScore> {
+        scoring::get_score(&self.reliability_scores, relay_url)
+    }
+
+    /// Returns a mutable reference to the suppression tracker.
+    ///
+    /// Used by the subscription layer to record per-blob deliveries and
+    /// check for suppression across relays.
+    pub fn suppression_tracker_mut(&mut self) -> &mut SuppressionTracker {
+        &mut self.suppression_tracker
+    }
+
+    /// Returns a reference to the suppression tracker.
+    #[must_use]
+    pub fn suppression_tracker(&self) -> &SuppressionTracker {
+        &self.suppression_tracker
     }
 
     /// Counts how many existing context relay sets include the given adapter
@@ -1282,16 +1254,18 @@ mod tests {
             manager.add_adapter(Box::new(MockAdapter::succeeding()));
         }
 
-        // Degrade reliability for adapters 0 and 1.
-        if let Some(score) = manager.reliability_scores.get_mut("0") {
-            for _ in 0..10 {
-                score.record_failure();
-            }
-        }
-        if let Some(score) = manager.reliability_scores.get_mut("1") {
-            for _ in 0..10 {
-                score.record_failure();
-            }
+        // Degrade reliability for adapters 0 and 1 using the scoring API.
+        for _ in 0..10 {
+            scoring::update_score(
+                &mut manager.reliability_scores,
+                "0",
+                DeliveryOutcome::Failure,
+            );
+            scoring::update_score(
+                &mut manager.reliability_scores,
+                "1",
+                DeliveryOutcome::Failure,
+            );
         }
 
         let ctx = "ctx-reliable".to_string();
@@ -1341,9 +1315,12 @@ mod tests {
 
     #[test]
     fn reliability_score_record_success_updates_rate() {
-        let mut score = ReliabilityScore::new("relay-0".to_string());
-        score.record_success();
-        score.record_success();
+        let mut scores = HashMap::new();
+        let relay = "relay-0";
+        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
+        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
+        let score = scoring::get_score(&scores, relay).unwrap();
+        // EMA with alpha=0.3: two successes on a 1.0 base stays 1.0.
         assert!((score.delivery_success_rate - 1.0).abs() < f64::EPSILON);
         assert_eq!(score.total_sends, 2);
         assert_eq!(score.total_failures, 0);
@@ -1351,21 +1328,26 @@ mod tests {
 
     #[test]
     fn reliability_score_record_failure_updates_rate() {
-        let mut score = ReliabilityScore::new("relay-0".to_string());
-        score.record_success();
-        score.record_failure();
-        assert!((score.delivery_success_rate - 0.5).abs() < f64::EPSILON);
+        let mut scores = HashMap::new();
+        let relay = "relay-0";
+        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
+        scoring::update_score(&mut scores, relay, DeliveryOutcome::Failure);
+        let score = scoring::get_score(&scores, relay).unwrap();
+        // EMA: start 1.0 → success keeps 1.0 → failure: 0.3*0.0 + 0.7*1.0 = 0.7
+        assert!((score.delivery_success_rate - 0.7).abs() < 1e-10);
         assert_eq!(score.total_sends, 2);
         assert_eq!(score.total_failures, 1);
     }
 
     #[test]
     fn reliability_score_composite_equals_success_rate() {
-        let mut score = ReliabilityScore::new("relay-0".to_string());
-        score.record_success();
-        score.record_success();
-        score.record_failure();
-        let expected = 2.0 / 3.0;
-        assert!((score.composite_score() - expected).abs() < f64::EPSILON);
+        let mut scores = HashMap::new();
+        let relay = "relay-0";
+        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
+        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
+        scoring::update_score(&mut scores, relay, DeliveryOutcome::Failure);
+        let score = scoring::get_score(&scores, relay).unwrap();
+        // EMA: 1.0 → 1.0 → 0.3*0.0 + 0.7*1.0 = 0.7
+        assert!((score.composite_score() - 0.7).abs() < 1e-10);
     }
 }

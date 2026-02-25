@@ -32,6 +32,7 @@ pub mod config;
 pub mod error;
 pub mod manager;
 pub mod native;
+pub mod scoring;
 pub mod traits;
 
 // Re-export primary types at the crate level for convenience.

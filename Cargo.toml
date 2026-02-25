@@ -8,6 +8,7 @@ members = [
     "crates/scp-mcp",
     "crates/scp-media",
     "crates/scp-node",
+    "crates/scp-ffi",
 ]
 
 [workspace.package]
@@ -39,6 +40,8 @@ percent-encoding = "2"
 base64 = "0.22"
 tracing = "0.1"
 lru = "0.12"
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -27,6 +27,7 @@
 pub mod bootstrap;
 pub mod context;
 pub mod did_capabilities;
+pub mod search;
 
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ pub use context::{
     RegistrationEvent, MAX_WRITERS, TOOL_AGENT_DEREGISTER, TOOL_AGENT_REGISTER, TOOL_AGENT_SEARCH,
 };
 pub use did_capabilities::{CapabilityEntry, resolve_capabilities};
+pub use search::{ContactCache, ContextQuerier, unified_search};
 
 // ---------------------------------------------------------------------------
 // Type aliases (match event_log/mod.rs pattern)

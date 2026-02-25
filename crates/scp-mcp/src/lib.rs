@@ -20,6 +20,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod namespace;
 pub mod protocol;
 pub mod server;
+pub mod sse;
+pub mod stdio;

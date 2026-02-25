@@ -7,6 +7,10 @@ repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
+scp-core = { path = "../scp-core" }
+openmls_traits = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
