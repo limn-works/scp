@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
     self, ClientCapabilities, ClientInfo, ContentItem, InitializeParams, InitializeResult,
-    JsonRpcRequest, JsonRpcResponse, RequestId, ToolDefinition, ToolsCallParams,
-    ToolsCallResult, ToolsListResult, JSONRPC_VERSION,
+    JSONRPC_VERSION, JsonRpcRequest, JsonRpcResponse, RequestId, ToolDefinition, ToolsCallParams,
+    ToolsCallResult, ToolsListResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -261,7 +261,11 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
     }
 
     /// Sends a JSON-RPC request and returns the parsed response.
-    fn send(&self, method: &str, params: Option<serde_json::Value>) -> Result<JsonRpcResponse, McpClientError> {
+    fn send(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<JsonRpcResponse, McpClientError> {
         let request = JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_owned(),
             method: method.to_owned(),
@@ -283,12 +287,9 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
             });
         }
 
-        response
-            .result
-            .as_ref()
-            .ok_or_else(|| McpClientError::InvalidResponse(
-                "response contains neither result nor error".to_owned(),
-            ))
+        response.result.as_ref().ok_or_else(|| {
+            McpClientError::InvalidResponse("response contains neither result nor error".to_owned())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -412,12 +413,8 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
         let call_result: ToolsCallResult = serde_json::from_value(result_value.clone())
             .map_err(|e| McpClientError::InvalidResponse(e.to_string()))?;
 
-        let provenance = ExternalToolProvenance::new(
-            tool,
-            invoker_did,
-            context_id,
-            self.clock.now_millis(),
-        );
+        let provenance =
+            ExternalToolProvenance::new(tool, invoker_did, context_id, self.clock.now_millis());
 
         Ok(McpToolResult {
             content: call_result.content,
@@ -483,7 +480,10 @@ mod tests {
         }
 
         fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
-            self.sent_notifications.lock().unwrap().push(notification.clone());
+            self.sent_notifications
+                .lock()
+                .unwrap()
+                .push(notification.clone());
             Ok(())
         }
     }
@@ -567,12 +567,7 @@ mod tests {
 
     #[test]
     fn provenance_json_has_expected_fields() {
-        let p = ExternalToolProvenance::new(
-            "my_tool",
-            "did:dht:z6MkTest",
-            "ctx-xyz",
-            42,
-        );
+        let p = ExternalToolProvenance::new("my_tool", "did:dht:z6MkTest", "ctx-xyz", 42);
         let json = serde_json::to_value(&p).unwrap();
         assert_eq!(json["source"], "mcp:my_tool");
         assert_eq!(json["invoked_by"], "did:dht:z6MkTest");
@@ -594,9 +589,7 @@ mod tests {
 
     #[test]
     fn initialize_completes_handshake() {
-        let transport = MockTransport::new(vec![
-            init_success_response(RequestId::Number(1)),
-        ]);
+        let transport = MockTransport::new(vec![init_success_response(RequestId::Number(1))]);
         let mut client = McpClient::with_clock(transport, FixedClock(0));
 
         let result = client.initialize();
@@ -610,9 +603,7 @@ mod tests {
 
     #[test]
     fn initialize_sends_request_and_notification() {
-        let transport = MockTransport::new(vec![
-            init_success_response(RequestId::Number(1)),
-        ]);
+        let transport = MockTransport::new(vec![init_success_response(RequestId::Number(1))]);
         let mut client = McpClient::with_clock(transport, FixedClock(0));
         client.initialize().unwrap();
 
@@ -672,7 +663,10 @@ mod tests {
 
         let result = client.list_tools();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), McpClientError::NotInitialized));
+        assert!(matches!(
+            result.unwrap_err(),
+            McpClientError::NotInitialized
+        ));
     }
 
     #[test]
@@ -693,10 +687,7 @@ mod tests {
                 ],
                 next_cursor: None,
             };
-            JsonRpcResponse::success(
-                RequestId::Number(2),
-                serde_json::to_value(&result).unwrap(),
-            )
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
         };
 
         let client = initialized_client(vec![tools_response]);
@@ -715,10 +706,7 @@ mod tests {
                 tools: vec![],
                 next_cursor: None,
             };
-            JsonRpcResponse::success(
-                RequestId::Number(2),
-                serde_json::to_value(&result).unwrap(),
-            )
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
         };
 
         let client = initialized_client(vec![tools_response]);
@@ -737,10 +725,7 @@ mod tests {
                 tools: vec![],
                 next_cursor: None,
             };
-            JsonRpcResponse::success(
-                RequestId::Number(2),
-                serde_json::to_value(&result).unwrap(),
-            )
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
         };
 
         let client = initialized_client(vec![tools_response]);
@@ -764,7 +749,10 @@ mod tests {
             "did:dht:z6MkAlice",
         );
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), McpClientError::NotInitialized));
+        assert!(matches!(
+            result.unwrap_err(),
+            McpClientError::NotInitialized
+        ));
     }
 
     #[test]
@@ -776,10 +764,7 @@ mod tests {
                 }],
                 is_error: false,
             };
-            JsonRpcResponse::success(
-                RequestId::Number(2),
-                serde_json::to_value(&result).unwrap(),
-            )
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
         };
 
         let client = initialized_client(vec![call_response]);
@@ -816,10 +801,7 @@ mod tests {
                 }],
                 is_error: false,
             };
-            JsonRpcResponse::success(
-                RequestId::Number(2),
-                serde_json::to_value(&result).unwrap(),
-            )
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
         };
 
         let client = initialized_client(vec![call_response]);
@@ -851,10 +833,7 @@ mod tests {
                 }],
                 is_error: true,
             };
-            JsonRpcResponse::success(
-                RequestId::Number(2),
-                serde_json::to_value(&result).unwrap(),
-            )
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
         };
 
         let client = initialized_client(vec![call_response]);
@@ -912,12 +891,7 @@ mod tests {
                 text: "hello".to_owned(),
             }],
             is_error: false,
-            provenance: ExternalToolProvenance::new(
-                "test_tool",
-                "did:dht:z6MkSer",
-                "ctx-ser",
-                999,
-            ),
+            provenance: ExternalToolProvenance::new("test_tool", "did:dht:z6MkSer", "ctx-ser", 999),
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -936,12 +910,7 @@ mod tests {
         let result = McpToolResult {
             content: vec![],
             is_error: false,
-            provenance: ExternalToolProvenance::new(
-                "ext",
-                "did:dht:z6MkX",
-                "ctx-y",
-                123,
-            ),
+            provenance: ExternalToolProvenance::new("ext", "did:dht:z6MkX", "ctx-y", 123),
         };
 
         let json = serde_json::to_value(&result).unwrap();
@@ -1029,20 +998,14 @@ mod tests {
                 tools: vec![],
                 next_cursor: None,
             };
-            JsonRpcResponse::success(
-                RequestId::Number(2),
-                serde_json::to_value(&result).unwrap(),
-            )
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
         };
         let tools_response_2 = {
             let result = ToolsListResult {
                 tools: vec![],
                 next_cursor: None,
             };
-            JsonRpcResponse::success(
-                RequestId::Number(3),
-                serde_json::to_value(&result).unwrap(),
-            )
+            JsonRpcResponse::success(RequestId::Number(3), serde_json::to_value(&result).unwrap())
         };
 
         let client = initialized_client(vec![tools_response_1, tools_response_2]);

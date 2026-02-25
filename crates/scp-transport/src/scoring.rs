@@ -168,8 +168,8 @@ pub fn update_score(
                 EMA_ALPHA * 1.0 + (1.0 - EMA_ALPHA) * score.delivery_success_rate;
             // EMA for latency.
             #[allow(clippy::cast_precision_loss)]
-            let new_latency =
-                EMA_ALPHA * (latency_ms as f64) + (1.0 - EMA_ALPHA) * (score.average_latency_ms as f64);
+            let new_latency = EMA_ALPHA * (latency_ms as f64)
+                + (1.0 - EMA_ALPHA) * (score.average_latency_ms as f64);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             {
                 score.average_latency_ms = new_latency as u64;

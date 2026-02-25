@@ -198,7 +198,8 @@ impl ToolRegistry {
     /// Inserts a tool registration. Returns the previous registration if one
     /// existed for this tool ID.
     fn insert(&mut self, registration: ToolRegistration) -> Option<ToolRegistration> {
-        self.tools.insert(registration.tool_id.clone(), registration)
+        self.tools
+            .insert(registration.tool_id.clone(), registration)
     }
 }
 
@@ -458,9 +459,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::context::roles::{
-        Capability, CapabilityCeiling, ContextRoleState,
-    };
+    use crate::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 
     /// Creates a test capability ceiling with tool-related capabilities.
     fn test_ceiling() -> CapabilityCeiling {
@@ -480,21 +479,12 @@ mod tests {
 
     /// Creates a `ContextRoleState` with a creator that has admin (all) capabilities.
     fn test_role_state(creator_did: &str) -> ContextRoleState {
-        ContextRoleState::new(
-            "ctx-test",
-            creator_did,
-            test_ceiling(),
-            vec![],
-        )
-        .unwrap()
+        ContextRoleState::new("ctx-test", creator_did, test_ceiling(), vec![]).unwrap()
     }
 
     /// Creates a `ContextRoleState` with an additional member that has limited
     /// capabilities (no `ToolRegister`).
-    fn test_role_state_with_member(
-        creator_did: &str,
-        member_did: &str,
-    ) -> ContextRoleState {
+    fn test_role_state_with_member(creator_did: &str, member_did: &str) -> ContextRoleState {
         let mut state = test_role_state(creator_did);
         state.members.insert(member_did.to_owned());
         // Assign member role (no ToolRegister).
@@ -559,8 +549,12 @@ mod tests {
         let mut registry = ToolRegistry::new();
         let registration = valid_registration("tool-1");
 
-        let result =
-            register_tool(&mut registry, &role_state, registration, "did:dht:z6MkCreator");
+        let result = register_tool(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
+        );
         assert!(result.is_ok());
 
         let (tool_id, event) = result.unwrap();
@@ -615,10 +609,7 @@ mod tests {
 
     #[test]
     fn register_tool_rejects_registrant_without_tool_register_capability() {
-        let role_state = test_role_state_with_member(
-            "did:dht:z6MkCreator",
-            "did:dht:z6MkMember",
-        );
+        let role_state = test_role_state_with_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
         let mut registry = ToolRegistry::new();
         let registration = valid_registration("tool-1");
 
@@ -735,10 +726,7 @@ mod tests {
 
     #[test]
     fn update_tool_succeeds_by_operator() {
-        let role_state = test_role_state_with_member(
-            "did:dht:z6MkCreator",
-            "did:dht:z6MkOperator",
-        );
+        let role_state = test_role_state_with_member("did:dht:z6MkCreator", "did:dht:z6MkOperator");
         let mut registry = ToolRegistry::new();
 
         // Register with operator DID.
@@ -799,7 +787,12 @@ mod tests {
             "did:dht:z6MkCreator",
         );
         assert!(result.is_ok());
-        assert!(result.unwrap().changed_fields.contains(&"description".to_owned()));
+        assert!(
+            result
+                .unwrap()
+                .changed_fields
+                .contains(&"description".to_owned())
+        );
     }
 
     #[test]
@@ -836,10 +829,7 @@ mod tests {
 
     #[test]
     fn update_tool_rejects_non_operator_non_admin() {
-        let role_state = test_role_state_with_member(
-            "did:dht:z6MkCreator",
-            "did:dht:z6MkMember",
-        );
+        let role_state = test_role_state_with_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
         let mut registry = ToolRegistry::new();
 
         let registration = valid_registration("tool-1");
@@ -934,7 +924,10 @@ mod tests {
 
         // Executor that returns correct results for "add" but wrong for "mul".
         let executor = |input: &serde_json::Value| -> serde_json::Value {
-            let op = input.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+            let op = input
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if op == "add" {
                 serde_json::json!({"result": 3})
             } else {
@@ -981,9 +974,18 @@ mod tests {
 
         // Executor that returns correct results for all operations.
         let executor = |input: &serde_json::Value| -> serde_json::Value {
-            let op = input.get("operation").and_then(|v| v.as_str()).unwrap_or("");
-            let a = input.get("a").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            let b = input.get("b").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let op = input
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let a = input
+                .get("a")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let b = input
+                .get("b")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
             match op {
                 "add" => serde_json::json!({"result": a + b}),
                 "mul" => serde_json::json!({"result": a * b}),
@@ -1025,7 +1027,8 @@ mod tests {
         )
         .unwrap();
 
-        let (result, event) = verify_tool(&registry, "tool-1", |_| serde_json::json!(null)).unwrap();
+        let (result, event) =
+            verify_tool(&registry, "tool-1", |_| serde_json::json!(null)).unwrap();
 
         assert!(result.integrity_ok);
         assert!(result.vector_results.is_empty());

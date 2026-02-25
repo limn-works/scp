@@ -483,10 +483,7 @@ impl TransportManager {
         let counter = self.assignment_counter;
         candidates.sort_by(|a, b| {
             a.1.cmp(&b.1)
-                .then_with(|| {
-                    b.2.partial_cmp(&a.2)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
                 .then_with(|| {
                     // Round-robin offset for spread.
                     let a_off = (a.0 + adapter_count - counter % adapter_count) % adapter_count;
@@ -495,8 +492,11 @@ impl TransportManager {
                 })
         });
 
-        let assigned: Vec<usize> =
-            candidates.iter().take(set_size).map(|(idx, _, _)| *idx).collect();
+        let assigned: Vec<usize> = candidates
+            .iter()
+            .take(set_size)
+            .map(|(idx, _, _)| *idx)
+            .collect();
 
         self.assignment_counter += set_size;
         self.relay_assignments
@@ -713,10 +713,7 @@ mod tests {
     }
 
     impl TransportAdapter for MockAdapter {
-        fn send(
-            &self,
-            _envelope: &OuterEnvelope,
-        ) -> BoxFuture<'_, Result<BlobId, TransportError>> {
+        fn send(&self, _envelope: &OuterEnvelope) -> BoxFuture<'_, Result<BlobId, TransportError>> {
             let result = self.send_result.clone();
             Box::pin(async move { result })
         }
@@ -987,9 +984,7 @@ mod tests {
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
 
         let ctx = "ctx-1".to_string();
-        manager
-            .relay_assignments
-            .insert(ctx.clone(), vec![0, 1, 2]);
+        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await.unwrap();
@@ -1001,17 +996,15 @@ mod tests {
         let mut manager = TransportManager::builder();
         // One succeeds, two fail => only 1 success < MIN_SUCCESSFUL_SENDS (2).
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::failing(
-            TransportError::SendFailed("fail1".to_string()),
-        )));
-        manager.add_adapter(Box::new(MockAdapter::failing(
-            TransportError::SendFailed("fail2".to_string()),
-        )));
+        manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
+            "fail1".to_string(),
+        ))));
+        manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
+            "fail2".to_string(),
+        ))));
 
         let ctx = "ctx-fail".to_string();
-        manager
-            .relay_assignments
-            .insert(ctx.clone(), vec![0, 1, 2]);
+        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await;
@@ -1024,14 +1017,12 @@ mod tests {
         // Two succeed, one fails => 2 successes >= MIN_SUCCESSFUL_SENDS.
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::failing(
-            TransportError::SendFailed("fail".to_string()),
-        )));
+        manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
+            "fail".to_string(),
+        ))));
 
         let ctx = "ctx-partial".to_string();
-        manager
-            .relay_assignments
-            .insert(ctx.clone(), vec![0, 1, 2]);
+        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await.unwrap();
@@ -1042,15 +1033,13 @@ mod tests {
     async fn send_to_context_records_reliability_scores() {
         let mut manager = TransportManager::builder();
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::failing(
-            TransportError::SendFailed("fail".to_string()),
-        )));
+        manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
+            "fail".to_string(),
+        ))));
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
 
         let ctx = "ctx-score".to_string();
-        manager
-            .relay_assignments
-            .insert(ctx.clone(), vec![0, 1, 2]);
+        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let _ = manager.send_to_context(&envelope, &ctx).await;
@@ -1173,10 +1162,7 @@ mod tests {
         let result = manager
             .subscribe_context(&routing_id, &"unassigned".to_string(), None)
             .await;
-        assert!(matches!(
-            result,
-            Err(TransportError::SubscriptionFailed(_))
-        ));
+        assert!(matches!(result, Err(TransportError::SubscriptionFailed(_))));
     }
 
     // -----------------------------------------------------------------------
@@ -1317,8 +1303,16 @@ mod tests {
     fn reliability_score_record_success_updates_rate() {
         let mut scores = HashMap::new();
         let relay = "relay-0";
-        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
-        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
+        scoring::update_score(
+            &mut scores,
+            relay,
+            DeliveryOutcome::Success { latency_ms: 10 },
+        );
+        scoring::update_score(
+            &mut scores,
+            relay,
+            DeliveryOutcome::Success { latency_ms: 10 },
+        );
         let score = scoring::get_score(&scores, relay).unwrap();
         // EMA with alpha=0.3: two successes on a 1.0 base stays 1.0.
         assert!((score.delivery_success_rate - 1.0).abs() < f64::EPSILON);
@@ -1330,7 +1324,11 @@ mod tests {
     fn reliability_score_record_failure_updates_rate() {
         let mut scores = HashMap::new();
         let relay = "relay-0";
-        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
+        scoring::update_score(
+            &mut scores,
+            relay,
+            DeliveryOutcome::Success { latency_ms: 10 },
+        );
         scoring::update_score(&mut scores, relay, DeliveryOutcome::Failure);
         let score = scoring::get_score(&scores, relay).unwrap();
         // EMA: start 1.0 → success keeps 1.0 → failure: 0.3*0.0 + 0.7*1.0 = 0.7
@@ -1343,8 +1341,16 @@ mod tests {
     fn reliability_score_composite_equals_success_rate() {
         let mut scores = HashMap::new();
         let relay = "relay-0";
-        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
-        scoring::update_score(&mut scores, relay, DeliveryOutcome::Success { latency_ms: 10 });
+        scoring::update_score(
+            &mut scores,
+            relay,
+            DeliveryOutcome::Success { latency_ms: 10 },
+        );
+        scoring::update_score(
+            &mut scores,
+            relay,
+            DeliveryOutcome::Success { latency_ms: 10 },
+        );
         scoring::update_score(&mut scores, relay, DeliveryOutcome::Failure);
         let score = scoring::get_score(&scores, relay).unwrap();
         // EMA: 1.0 → 1.0 → 0.3*0.0 + 0.7*1.0 = 0.7

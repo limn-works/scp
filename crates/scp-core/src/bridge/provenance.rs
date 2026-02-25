@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{BridgeConnector, BridgeMode, ShadowIdentity, ShadowProvenanceStatus, DID};
+use super::{BridgeConnector, BridgeMode, DID, ShadowIdentity, ShadowProvenanceStatus};
 use crate::provenance::DataProvenance;
 
 // ---------------------------------------------------------------------------
@@ -324,9 +324,7 @@ mod tests {
         }
     }
 
-    fn make_bridge_provenance(
-        shadow_status: ShadowProvenanceStatus,
-    ) -> BridgeProvenance {
+    fn make_bridge_provenance(shadow_status: ShadowProvenanceStatus) -> BridgeProvenance {
         let base = make_base_provenance();
         let connector = make_connector("discord", BridgeMode::Relay);
         let shadow = make_shadow(shadow_status);
@@ -470,10 +468,22 @@ mod tests {
 
     #[test]
     fn trust_level_equality() {
-        assert_eq!(BridgeTrustLevel::ShadowBridged, BridgeTrustLevel::ShadowBridged);
-        assert_eq!(BridgeTrustLevel::ClaimedBridged, BridgeTrustLevel::ClaimedBridged);
-        assert_eq!(BridgeTrustLevel::NativeBridged, BridgeTrustLevel::NativeBridged);
-        assert_eq!(BridgeTrustLevel::NativeNative, BridgeTrustLevel::NativeNative);
+        assert_eq!(
+            BridgeTrustLevel::ShadowBridged,
+            BridgeTrustLevel::ShadowBridged
+        );
+        assert_eq!(
+            BridgeTrustLevel::ClaimedBridged,
+            BridgeTrustLevel::ClaimedBridged
+        );
+        assert_eq!(
+            BridgeTrustLevel::NativeBridged,
+            BridgeTrustLevel::NativeBridged
+        );
+        assert_eq!(
+            BridgeTrustLevel::NativeNative,
+            BridgeTrustLevel::NativeNative
+        );
     }
 
     // -------------------------------------------------------------------

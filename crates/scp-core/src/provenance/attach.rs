@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::context::MemoryScope;
 
-use super::{ContextId, DataProvenance, DiscoveryMethod, ProvenanceError, SourceType, DID};
+use super::{ContextId, DID, DataProvenance, DiscoveryMethod, ProvenanceError, SourceType};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -133,7 +133,10 @@ pub fn attach_provenance(
 ///
 /// Returns [`ProvenanceError::ChainDepthExceeded`] if the provenance's chain
 /// depth exceeds `max_depth`.
-pub const fn check_chain_depth(provenance: &DataProvenance, max_depth: u8) -> Result<(), ProvenanceError> {
+pub const fn check_chain_depth(
+    provenance: &DataProvenance,
+    max_depth: u8,
+) -> Result<(), ProvenanceError> {
     if provenance.chain_depth > max_depth {
         return Err(ProvenanceError::ChainDepthExceeded {
             depth: provenance.chain_depth,
@@ -272,7 +275,11 @@ mod tests {
     fn attach_provenance_populates_counterparties_from_membership() {
         let source = make_source(
             "ctx-src",
-            vec!["did:dht:z6MkAlice", "did:dht:z6MkBob", "did:dht:z6MkCharlie"],
+            vec![
+                "did:dht:z6MkAlice",
+                "did:dht:z6MkBob",
+                "did:dht:z6MkCharlie",
+            ],
         );
         let target = "ctx-target".to_string();
 
@@ -349,7 +356,8 @@ mod tests {
     fn attach_provenance_increments_depth_from_deeper_chain() {
         let source = make_source("ctx-hop-3", vec!["did:dht:z6MkCharlie"]);
         let target = "ctx-target".to_string();
-        let existing = make_provenance_with_chain("ctx-hop-2", 2, Some(vec!["ctx-hop-1", "ctx-hop-2"]));
+        let existing =
+            make_provenance_with_chain("ctx-hop-2", 2, Some(vec!["ctx-hop-1", "ctx-hop-2"]));
 
         let prov = attach_provenance(&source, &target, Some(&existing));
 
@@ -389,8 +397,7 @@ mod tests {
     fn attach_provenance_extends_existing_chain_path() {
         let source = make_source("ctx-hop-3", vec![]);
         let target = "ctx-target".to_string();
-        let existing =
-            make_provenance_with_chain("ctx-hop-2", 1, Some(vec!["ctx-hop-1"]));
+        let existing = make_provenance_with_chain("ctx-hop-2", 1, Some(vec!["ctx-hop-1"]));
 
         let prov = attach_provenance(&source, &target, Some(&existing));
 
@@ -435,7 +442,10 @@ mod tests {
 
         let prov = attach_provenance(&source, &target, None);
 
-        assert!(prov.chain_path.is_none(), "first hop should not have chain_path");
+        assert!(
+            prov.chain_path.is_none(),
+            "first hop should not have chain_path"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -500,8 +510,7 @@ mod tests {
 
     #[test]
     fn check_chain_depth_allows_depth_at_exact_limit() {
-        let prov =
-            make_provenance_with_chain("ctx-src", 3, Some(vec!["ctx-1", "ctx-2", "ctx-3"]));
+        let prov = make_provenance_with_chain("ctx-src", 3, Some(vec!["ctx-1", "ctx-2", "ctx-3"]));
 
         let result = check_chain_depth(&prov, DEFAULT_MAX_CHAIN_DEPTH);
 
@@ -675,7 +684,10 @@ mod tests {
         let prov_for_source = prov.clone();
         let prov_for_target = prov;
 
-        assert_eq!(prov_for_source.source_context, prov_for_target.source_context);
+        assert_eq!(
+            prov_for_source.source_context,
+            prov_for_target.source_context
+        );
         assert_eq!(prov_for_source.chain_depth, prov_for_target.chain_depth);
     }
 }

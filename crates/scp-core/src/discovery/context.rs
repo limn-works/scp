@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{DID, ContextId, RegistrationEntry};
+use super::{ContextId, DID, RegistrationEntry};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -429,7 +429,11 @@ impl DiscoveryContext {
                         .capabilities
                         .iter()
                         .any(|c| c.to_lowercase().contains(&kw_lower))
-                        || entry.metadata.to_string().to_lowercase().contains(&kw_lower)
+                        || entry
+                            .metadata
+                            .to_string()
+                            .to_lowercase()
+                            .contains(&kw_lower)
                 })
             });
         }
@@ -549,12 +553,11 @@ impl DiscoveryContext {
         }
 
         // Look up existing entry.
-        let entry = self
-            .registry
-            .get(requester_did)
-            .ok_or_else(|| DiscoveryContextError::NotRegistered {
+        let entry = self.registry.get(requester_did).ok_or_else(|| {
+            DiscoveryContextError::NotRegistered {
                 did: requester_did.to_owned(),
-            })?;
+            }
+        })?;
 
         // Verify ownership.
         if entry.did != requester_did {
@@ -616,12 +619,12 @@ impl DiscoveryContext {
         }
 
         // Look up existing entry.
-        let entry = self
-            .registry
-            .get(&params.did)
-            .ok_or_else(|| DiscoveryContextError::NotRegistered {
-                did: params.did.clone(),
-            })?;
+        let entry =
+            self.registry
+                .get(&params.did)
+                .ok_or_else(|| DiscoveryContextError::NotRegistered {
+                    did: params.did.clone(),
+                })?;
 
         // Verify ownership.
         if entry.did != requester_did {
@@ -657,10 +660,7 @@ impl DiscoveryContext {
     ///
     /// Returns [`DiscoveryContextError::StandardToolConflict`] if the name
     /// matches a standard tool name.
-    pub fn register_custom_tool(
-        &mut self,
-        name: String,
-    ) -> Result<(), DiscoveryContextError> {
+    pub fn register_custom_tool(&mut self, name: String) -> Result<(), DiscoveryContextError> {
         if is_standard_tool(&name) {
             return Err(DiscoveryContextError::StandardToolConflict { name });
         }
@@ -805,8 +805,14 @@ mod tests {
         let mut ctx = new_ctx();
         ctx.add_reader(READER_DID.to_owned()).unwrap();
 
-        assert_eq!(ctx.membership_tier(WRITER_DID), Some(MembershipTier::Writer));
-        assert_eq!(ctx.membership_tier(READER_DID), Some(MembershipTier::Reader));
+        assert_eq!(
+            ctx.membership_tier(WRITER_DID),
+            Some(MembershipTier::Writer)
+        );
+        assert_eq!(
+            ctx.membership_tier(READER_DID),
+            Some(MembershipTier::Reader)
+        );
         assert_eq!(ctx.membership_tier("did:dht:z6MkUnknown"), None);
     }
 
@@ -901,7 +907,9 @@ mod tests {
         let mut ctx = new_ctx();
         let params = register_params(AGENT_A_DID, &["code_review", "testing"]);
 
-        let result = ctx.agent_register(&params, WRITER_DID, 1_700_000_000).unwrap();
+        let result = ctx
+            .agent_register(&params, WRITER_DID, 1_700_000_000)
+            .unwrap();
         assert!(result.registered);
         assert!(!result.entry_id.is_empty());
 
@@ -916,11 +924,15 @@ mod tests {
     fn agent_register_records_event() {
         let mut ctx = new_ctx();
         let params = register_params(AGENT_A_DID, &["testing"]);
-        ctx.agent_register(&params, WRITER_DID, 1_700_000_000).unwrap();
+        ctx.agent_register(&params, WRITER_DID, 1_700_000_000)
+            .unwrap();
 
         assert_eq!(ctx.events().len(), 1);
         match &ctx.events()[0] {
-            RegistrationEvent::Registered { entry, processed_by } => {
+            RegistrationEvent::Registered {
+                entry,
+                processed_by,
+            } => {
                 assert_eq!(entry.did, AGENT_A_DID);
                 assert_eq!(processed_by, WRITER_DID);
             }
@@ -941,7 +953,8 @@ mod tests {
     fn agent_register_rejects_duplicate() {
         let mut ctx = new_ctx();
         let params = register_params(AGENT_A_DID, &["testing"]);
-        ctx.agent_register(&params, WRITER_DID, 1_700_000_000).unwrap();
+        ctx.agent_register(&params, WRITER_DID, 1_700_000_000)
+            .unwrap();
 
         let result = ctx.agent_register(&params, WRITER_DID, 1_700_000_001);
         assert!(matches!(
@@ -965,7 +978,8 @@ mod tests {
     fn registrant_does_not_become_writer() {
         let mut ctx = new_ctx();
         let params = register_params(AGENT_A_DID, &["testing"]);
-        ctx.agent_register(&params, WRITER_DID, 1_700_000_000).unwrap();
+        ctx.agent_register(&params, WRITER_DID, 1_700_000_000)
+            .unwrap();
 
         // Agent should NOT be a writer or reader.
         assert!(!ctx.is_writer(AGENT_A_DID));
@@ -980,8 +994,10 @@ mod tests {
         let params1 = register_params(AGENT_A_DID, &["code_review"]);
         let params2 = register_params(AGENT_A_DID, &["translation", "summarization"]);
 
-        ctx1.agent_register(&params1, WRITER_DID, 1_700_000_000).unwrap();
-        ctx2.agent_register(&params2, WRITER_DID, 1_700_000_000).unwrap();
+        ctx1.agent_register(&params1, WRITER_DID, 1_700_000_000)
+            .unwrap();
+        ctx2.agent_register(&params2, WRITER_DID, 1_700_000_000)
+            .unwrap();
 
         let entry1 = ctx1.get_entry(AGENT_A_DID).unwrap();
         let entry2 = ctx2.get_entry(AGENT_A_DID).unwrap();
@@ -995,8 +1011,12 @@ mod tests {
     #[test]
     fn agent_search_returns_all_when_no_filters() {
         let mut ctx = new_ctx();
-        ctx.agent_register(&register_params(AGENT_A_DID, &["code_review"]), WRITER_DID, 100)
-            .unwrap();
+        ctx.agent_register(
+            &register_params(AGENT_A_DID, &["code_review"]),
+            WRITER_DID,
+            100,
+        )
+        .unwrap();
         ctx.agent_register(&register_params(AGENT_B_DID, &["testing"]), WRITER_DID, 101)
             .unwrap();
 
@@ -1133,7 +1153,10 @@ mod tests {
 
         assert_eq!(ctx.events().len(), 2);
         match &ctx.events()[1] {
-            RegistrationEvent::Updated { entry, processed_by } => {
+            RegistrationEvent::Updated {
+                entry,
+                processed_by,
+            } => {
                 assert_eq!(entry.did, AGENT_A_DID);
                 assert_eq!(processed_by, WRITER_DID);
             }
@@ -1160,13 +1183,7 @@ mod tests {
     #[test]
     fn agent_update_rejects_non_registered() {
         let mut ctx = new_ctx();
-        let result = ctx.agent_update(
-            AGENT_A_DID,
-            vec![],
-            serde_json::json!({}),
-            WRITER_DID,
-            200,
-        );
+        let result = ctx.agent_update(AGENT_A_DID, vec![], serde_json::json!({}), WRITER_DID, 200);
         assert!(matches!(
             result,
             Err(DiscoveryContextError::NotRegistered { .. })
@@ -1180,13 +1197,7 @@ mod tests {
         ctx.agent_register(&params, WRITER_DID, 100).unwrap();
 
         // Agent B tries to update Agent A's entry.
-        let result = ctx.agent_update(
-            AGENT_B_DID,
-            vec![],
-            serde_json::json!({}),
-            WRITER_DID,
-            200,
-        );
+        let result = ctx.agent_update(AGENT_B_DID, vec![], serde_json::json!({}), WRITER_DID, 200);
         assert!(matches!(
             result,
             Err(DiscoveryContextError::NotRegistered { .. })
@@ -1248,11 +1259,7 @@ mod tests {
         let deregister_params = AgentDeregisterParams {
             did: AGENT_A_DID.to_owned(),
         };
-        let result = ctx.agent_deregister(
-            &deregister_params,
-            AGENT_A_DID,
-            "did:dht:z6MkNotWriter",
-        );
+        let result = ctx.agent_deregister(&deregister_params, AGENT_A_DID, "did:dht:z6MkNotWriter");
         assert!(matches!(result, Err(DiscoveryContextError::WriterRequired)));
     }
 
@@ -1291,7 +1298,8 @@ mod tests {
     #[test]
     fn register_custom_tool_succeeds() {
         let mut ctx = new_ctx();
-        ctx.register_custom_tool("reputation_score".to_owned()).unwrap();
+        ctx.register_custom_tool("reputation_score".to_owned())
+            .unwrap();
         assert_eq!(ctx.custom_tools().len(), 1);
         assert_eq!(ctx.custom_tools()[0], "reputation_score");
     }
@@ -1299,8 +1307,10 @@ mod tests {
     #[test]
     fn register_custom_tool_deduplicates() {
         let mut ctx = new_ctx();
-        ctx.register_custom_tool("reputation_score".to_owned()).unwrap();
-        ctx.register_custom_tool("reputation_score".to_owned()).unwrap();
+        ctx.register_custom_tool("reputation_score".to_owned())
+            .unwrap();
+        ctx.register_custom_tool("reputation_score".to_owned())
+            .unwrap();
         assert_eq!(ctx.custom_tools().len(), 1);
     }
 
@@ -1341,7 +1351,12 @@ mod tests {
         let schema = DiscoveryContext::agent_register_schema();
         assert!(schema.is_object());
         assert_eq!(schema["type"], "object");
-        assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("did")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("did"))
+        );
     }
 
     #[test]
@@ -1349,7 +1364,12 @@ mod tests {
         let schema = DiscoveryContext::agent_deregister_schema();
         assert!(schema.is_object());
         assert_eq!(schema["type"], "object");
-        assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("did")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("did"))
+        );
     }
 
     // -- Serialization roundtrips -----------------------------------------

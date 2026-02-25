@@ -392,13 +392,9 @@ mod tests {
                 )));
             }
 
-            self.responses
-                .get(context_id)
-                .cloned()
-                .ok_or_else(|| DiscoveryError::DidResolutionFailed(format!(
-                    "context {} not found",
-                    context_id
-                )))
+            self.responses.get(context_id).cloned().ok_or_else(|| {
+                DiscoveryError::DidResolutionFailed(format!("context {} not found", context_id))
+            })
         }
     }
 
@@ -672,11 +668,8 @@ mod tests {
 
     #[tokio::test]
     async fn unified_search_local_cache_only() {
-        let cache = TestContactCache::new(vec![make_entry(
-            "did:dht:zAlice",
-            &["code_review"],
-            None,
-        )]);
+        let cache =
+            TestContactCache::new(vec![make_entry("did:dht:zAlice", &["code_review"], None)]);
         let querier = TestContextQuerier::new();
 
         let query = DiscoveryQuery {
@@ -722,11 +715,8 @@ mod tests {
 
     #[tokio::test]
     async fn unified_search_merges_local_and_remote() {
-        let cache = TestContactCache::new(vec![make_entry(
-            "did:dht:zAlice",
-            &["code_review"],
-            None,
-        )]);
+        let cache =
+            TestContactCache::new(vec![make_entry("did:dht:zAlice", &["code_review"], None)]);
         let mut querier = TestContextQuerier::new();
 
         querier.add_response(
@@ -752,17 +742,17 @@ mod tests {
     #[tokio::test]
     async fn unified_search_deduplicates_across_sources() {
         // Same DID in local cache and remote context.
-        let cache = TestContactCache::new(vec![make_entry(
-            "did:dht:zAlice",
-            &["code_review"],
-            None,
-        )]);
+        let cache =
+            TestContactCache::new(vec![make_entry("did:dht:zAlice", &["code_review"], None)]);
         let mut querier = TestContextQuerier::new();
 
         querier.add_response(
             "ctx-discovery-1".to_owned(),
             AgentSearchResult {
-                entries: vec![make_reg_entry("did:dht:zAlice", &["code_review", "testing"])],
+                entries: vec![make_reg_entry(
+                    "did:dht:zAlice",
+                    &["code_review", "testing"],
+                )],
                 total_matches: 1,
             },
         );
@@ -914,11 +904,8 @@ mod tests {
 
     #[tokio::test]
     async fn unified_search_provenance_set_per_entry() {
-        let cache = TestContactCache::new(vec![make_entry(
-            "did:dht:zLocal",
-            &["code_review"],
-            None,
-        )]);
+        let cache =
+            TestContactCache::new(vec![make_entry("did:dht:zLocal", &["code_review"], None)]);
         let mut querier = TestContextQuerier::new();
 
         querier.add_response(
@@ -947,9 +934,6 @@ mod tests {
             .iter()
             .find(|e| e.did == "did:dht:zRemote")
             .unwrap();
-        assert_eq!(
-            remote.provenance.source_context.as_deref(),
-            Some("ctx-1")
-        );
+        assert_eq!(remote.provenance.source_context.as_deref(), Some("ctx-1"));
     }
 }

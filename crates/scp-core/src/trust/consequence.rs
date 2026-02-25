@@ -260,9 +260,8 @@ fn payload_target_is(data: &[u8], target_did: &str) -> bool {
 /// The payload is treated as a null-terminated or end-of-data UTF-8 string.
 fn payload_starts_with(data: &[u8], prefix: &str) -> bool {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    std::str::from_utf8(&data[..end]).is_ok_and(|payload_str| {
-        payload_str == prefix || payload_str.starts_with(prefix)
-    })
+    std::str::from_utf8(&data[..end])
+        .is_ok_and(|payload_str| payload_str == prefix || payload_str.starts_with(prefix))
 }
 
 // ---------------------------------------------------------------------------
@@ -304,9 +303,7 @@ mod tests {
     fn message_velocity_triggers_capability_suspension() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec![
-                "messages:write".to_owned(),
-            ]),
+            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
             threshold: 3,
             window: Duration::from_secs(60),
         }];
@@ -514,9 +511,7 @@ mod tests {
         let rules = vec![
             ConsequenceRule {
                 trigger: ConsequenceTrigger::MessageVelocity,
-                action: ConsequenceAction::CapabilitySuspension(vec![
-                    "messages:write".to_owned(),
-                ]),
+                action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
                 threshold: 2,
                 window: Duration::from_secs(60),
             },
@@ -803,9 +798,7 @@ mod tests {
         let rules = vec![
             ConsequenceRule {
                 trigger: ConsequenceTrigger::MessageVelocity,
-                action: ConsequenceAction::CapabilitySuspension(vec![
-                    "messages:write".to_owned(),
-                ]),
+                action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
                 threshold: 2,
                 // Short window: only events in [980, 1000]
                 window: Duration::from_secs(20),
@@ -868,9 +861,7 @@ mod tests {
     fn consequence_rule_serialization_roundtrip() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec![
-                "messages:write".to_owned(),
-            ]),
+            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
             threshold: 10,
             window: Duration::from_secs(300),
         };

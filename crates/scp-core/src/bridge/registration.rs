@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{BridgeConnector, BridgeMode, BridgeStatus, ContextId, ShadowIdentity, DID};
+use super::{BridgeConnector, BridgeMode, BridgeStatus, ContextId, DID, ShadowIdentity};
 
 // ---------------------------------------------------------------------------
 // BridgeRegistrationError
@@ -368,10 +368,7 @@ pub fn approve_registration(
     bridge_id: &str,
     governance_did: &DID,
     timestamp: u64,
-) -> Result<
-    (BridgeConnector, BridgeRegistrationEvent),
-    BridgeRegistrationError,
-> {
+) -> Result<(BridgeConnector, BridgeRegistrationEvent), BridgeRegistrationError> {
     // Find and remove the pending request.
     let pos = registry
         .pending_requests
@@ -580,9 +577,7 @@ pub fn list_bridges(registry: &BridgeRegistry) -> &[BridgeConnector] {
 ///
 /// - `registry` -- The bridge registry to query.
 #[must_use]
-pub fn list_active_bridges(
-    registry: &BridgeRegistry,
-) -> Vec<&BridgeConnector> {
+pub fn list_active_bridges(registry: &BridgeRegistry) -> Vec<&BridgeConnector> {
     registry
         .bridges
         .iter()
@@ -613,10 +608,7 @@ mod tests {
     const OPERATOR_DID: &str = "did:dht:z6MkOperator";
     const GOVERNANCE_DID: &str = "did:dht:z6MkGovernance";
 
-    fn make_request(
-        bridge_id: &str,
-        context_id: &str,
-    ) -> BridgeRegistrationRequest {
+    fn make_request(bridge_id: &str, context_id: &str) -> BridgeRegistrationRequest {
         BridgeRegistrationRequest {
             bridge_id: bridge_id.to_owned(),
             operator_did: OPERATOR_DID.to_owned(),
@@ -628,26 +620,19 @@ mod tests {
         }
     }
 
-    fn make_shadow(
-        bridge_id: &str,
-        shadow_id: &str,
-    ) -> ShadowIdentity {
+    fn make_shadow(bridge_id: &str, shadow_id: &str) -> ShadowIdentity {
         ShadowIdentity {
             shadow_id: shadow_id.to_owned(),
             platform_handle: "@user#1234".to_owned(),
             bridge_id: bridge_id.to_owned(),
             attributed_role: "observer".to_owned(),
-            provenance_status:
-                super::super::ShadowProvenanceStatus::Shadow,
+            provenance_status: super::super::ShadowProvenanceStatus::Shadow,
             created_at: 1_700_000_100,
         }
     }
 
     /// Registers and approves a bridge in one step.
-    fn register_and_approve(
-        registry: &mut BridgeRegistry,
-        bridge_id: &str,
-    ) -> BridgeConnector {
+    fn register_and_approve(registry: &mut BridgeRegistry, bridge_id: &str) -> BridgeConnector {
         let request = make_request(bridge_id, CTX_A);
         register_bridge(registry, request).unwrap();
         let (connector, _event) = approve_registration(
@@ -699,10 +684,7 @@ mod tests {
         let result = register_bridge(&mut registry, request);
         assert!(result.is_ok());
         assert_eq!(registry.pending_requests().len(), 1);
-        assert_eq!(
-            registry.pending_requests()[0].bridge_id,
-            "bridge-001"
-        );
+        assert_eq!(registry.pending_requests()[0].bridge_id, "bridge-001");
     }
 
     #[test]
@@ -710,10 +692,7 @@ mod tests {
         let mut registry = BridgeRegistry::new(CTX_A.to_owned());
         let request = make_request("bridge-001", CTX_A);
         let event = register_bridge(&mut registry, request).unwrap();
-        assert_eq!(
-            event.action,
-            BridgeRegistrationAction::Requested
-        );
+        assert_eq!(event.action, BridgeRegistrationAction::Requested);
         assert_eq!(event.bridge_id, "bridge-001");
         assert_eq!(event.operator_did, OPERATOR_DID);
         assert_eq!(event.context_id, CTX_A);
@@ -728,10 +707,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                BridgeRegistrationError::ContextMismatch { .. }
-            ),
+            matches!(err, BridgeRegistrationError::ContextMismatch { .. }),
             "expected ContextMismatch, got {err:?}"
         );
     }
@@ -745,9 +721,7 @@ mod tests {
         let result = register_bridge(&mut registry, request);
         assert!(matches!(
             result,
-            Err(BridgeRegistrationError::BridgeAlreadyRegistered {
-                ..
-            })
+            Err(BridgeRegistrationError::BridgeAlreadyRegistered { .. })
         ));
     }
 
@@ -761,9 +735,7 @@ mod tests {
         let result = register_bridge(&mut registry, request2);
         assert!(matches!(
             result,
-            Err(BridgeRegistrationError::BridgeAlreadyRegistered {
-                ..
-            })
+            Err(BridgeRegistrationError::BridgeAlreadyRegistered { .. })
         ));
     }
 
@@ -841,10 +813,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            event.action,
-            BridgeRegistrationAction::Approved
-        );
+        assert_eq!(event.action, BridgeRegistrationAction::Approved);
         assert_eq!(event.governance_did, GOVERNANCE_DID);
         // 2 events: Requested + Approved.
         assert_eq!(registry.events().len(), 2);
@@ -986,10 +955,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            registry.bridges()[0].status,
-            BridgeStatus::Revoked
-        );
+        assert_eq!(registry.bridges()[0].status, BridgeStatus::Revoked);
     }
 
     #[test]
@@ -1024,8 +990,7 @@ mod tests {
         let mut registry = BridgeRegistry::new(CTX_A.to_owned());
         register_and_approve(&mut registry, "bridge-001");
 
-        let mut shadows =
-            vec![make_shadow("bridge-001", "shadow-001")];
+        let mut shadows = vec![make_shadow("bridge-001", "shadow-001")];
         let original_status = shadows[0].provenance_status.clone();
 
         revoke_bridge(
@@ -1103,9 +1068,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(BridgeRegistrationError::BridgeAlreadyRevoked {
-                ..
-            })
+            Err(BridgeRegistrationError::BridgeAlreadyRevoked { .. })
         ));
     }
 
@@ -1177,10 +1140,8 @@ mod tests {
 
     #[test]
     fn separate_registries_for_separate_contexts() {
-        let mut registry_a =
-            BridgeRegistry::new(CTX_A.to_owned());
-        let mut registry_b =
-            BridgeRegistry::new(CTX_B.to_owned());
+        let mut registry_a = BridgeRegistry::new(CTX_A.to_owned());
+        let mut registry_b = BridgeRegistry::new(CTX_B.to_owned());
 
         register_and_approve(&mut registry_a, "bridge-discord-a");
 
@@ -1214,24 +1175,16 @@ mod tests {
         );
 
         // Each bridge scoped to its own context.
-        assert_eq!(
-            registry_a.bridges()[0].registration_context,
-            CTX_A
-        );
-        assert_eq!(
-            registry_b.bridges()[0].registration_context,
-            CTX_B
-        );
+        assert_eq!(registry_a.bridges()[0].registration_context, CTX_A);
+        assert_eq!(registry_b.bridges()[0].registration_context, CTX_B);
     }
 
     #[test]
     fn context_a_request_rejected_by_context_b_registry() {
-        let mut registry_b =
-            BridgeRegistry::new(CTX_B.to_owned());
+        let mut registry_b = BridgeRegistry::new(CTX_B.to_owned());
         let request_for_a = make_request("bridge-001", CTX_A);
 
-        let result =
-            register_bridge(&mut registry_b, request_for_a);
+        let result = register_bridge(&mut registry_b, request_for_a);
         assert!(matches!(
             result,
             Err(BridgeRegistrationError::ContextMismatch { .. })
@@ -1244,10 +1197,8 @@ mod tests {
 
     #[test]
     fn same_platform_two_contexts_separate_instances() {
-        let mut registry_a =
-            BridgeRegistry::new(CTX_A.to_owned());
-        let mut registry_b =
-            BridgeRegistry::new(CTX_B.to_owned());
+        let mut registry_a = BridgeRegistry::new(CTX_A.to_owned());
+        let mut registry_b = BridgeRegistry::new(CTX_B.to_owned());
 
         let req_a = BridgeRegistrationRequest {
             bridge_id: "bridge-discord-ctx-a".to_owned(),
@@ -1380,18 +1331,9 @@ mod tests {
 
         let events = registry.events();
         assert_eq!(events.len(), 3);
-        assert_eq!(
-            events[0].action,
-            BridgeRegistrationAction::Requested
-        );
-        assert_eq!(
-            events[1].action,
-            BridgeRegistrationAction::Approved
-        );
-        assert_eq!(
-            events[2].action,
-            BridgeRegistrationAction::Revoked
-        );
+        assert_eq!(events[0].action, BridgeRegistrationAction::Requested);
+        assert_eq!(events[1].action, BridgeRegistrationAction::Approved);
+        assert_eq!(events[2].action, BridgeRegistrationAction::Revoked);
     }
 
     #[test]
@@ -1412,10 +1354,7 @@ mod tests {
 
         let events = registry.events();
         assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].action,
-            BridgeRegistrationAction::Requested
-        );
+        assert_eq!(events[0].action, BridgeRegistrationAction::Requested);
         assert_eq!(
             events[1].action,
             BridgeRegistrationAction::Rejected {
@@ -1432,8 +1371,7 @@ mod tests {
     fn request_serialization_roundtrip() {
         let request = make_request("bridge-001", CTX_A);
         let json = serde_json::to_string(&request).unwrap();
-        let restored: BridgeRegistrationRequest =
-            serde_json::from_str(&json).unwrap();
+        let restored: BridgeRegistrationRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.bridge_id, request.bridge_id);
         assert_eq!(restored.operator_did, request.operator_did);
         assert_eq!(restored.platform, request.platform);
@@ -1454,8 +1392,7 @@ mod tests {
             timestamp: 1_700_000_001,
         };
         let json = serde_json::to_string(&event).unwrap();
-        let restored: BridgeRegistrationEvent =
-            serde_json::from_str(&json).unwrap();
+        let restored: BridgeRegistrationEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.action, event.action);
         assert_eq!(restored.bridge_id, event.bridge_id);
         assert_eq!(restored.operator_did, event.operator_did);
@@ -1474,8 +1411,7 @@ mod tests {
         ];
         for decision in &decisions {
             let json = serde_json::to_string(decision).unwrap();
-            let restored: RegistrationDecision =
-                serde_json::from_str(&json).unwrap();
+            let restored: RegistrationDecision = serde_json::from_str(&json).unwrap();
             assert_eq!(&restored, decision);
         }
     }
@@ -1492,8 +1428,7 @@ mod tests {
         ];
         for action in &actions {
             let json = serde_json::to_string(action).unwrap();
-            let restored: BridgeRegistrationAction =
-                serde_json::from_str(&json).unwrap();
+            let restored: BridgeRegistrationAction = serde_json::from_str(&json).unwrap();
             assert_eq!(&restored, action);
         }
     }
@@ -1511,10 +1446,9 @@ mod tests {
         assert!(format!("{err}").contains(CTX_A));
         assert!(format!("{err}").contains(CTX_B));
 
-        let err =
-            BridgeRegistrationError::BridgeAlreadyRegistered {
-                bridge_id: "b-1".to_owned(),
-            };
+        let err = BridgeRegistrationError::BridgeAlreadyRegistered {
+            bridge_id: "b-1".to_owned(),
+        };
         assert!(format!("{err}").contains("b-1"));
 
         let err = BridgeRegistrationError::BridgeNotFound {
@@ -1627,8 +1561,7 @@ mod tests {
         ];
 
         for (suffix, mode) in &modes {
-            let mut registry =
-                BridgeRegistry::new(CTX_A.to_owned());
+            let mut registry = BridgeRegistry::new(CTX_A.to_owned());
             let bridge_id = format!("bridge-{suffix}");
             let request = BridgeRegistrationRequest {
                 bridge_id: bridge_id.clone(),

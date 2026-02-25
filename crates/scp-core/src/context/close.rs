@@ -347,8 +347,8 @@ impl<'a> CloseOrchestrator<'a> {
             }
 
             MemoryScope::Summary => {
-                let window_duration = verification_window_secs
-                    .unwrap_or(DEFAULT_VERIFICATION_WINDOW_SECS);
+                let window_duration =
+                    verification_window_secs.unwrap_or(DEFAULT_VERIFICATION_WINDOW_SECS);
                 let window = SummaryVerificationWindow::new(
                     context_id.to_owned(),
                     now,
@@ -371,9 +371,7 @@ impl<'a> CloseOrchestrator<'a> {
 
             MemoryScope::Full => Ok(CloseAction::Preserved {
                 reason,
-                event: CloseEvent::FullCloseCompleted {
-                    completed_at: now,
-                },
+                event: CloseEvent::FullCloseCompleted { completed_at: now },
             }),
         }
     }

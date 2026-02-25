@@ -168,8 +168,7 @@ impl<C: Clock> NonceTracker<C> {
         }
 
         // Record the nonce.
-        self.seen
-            .insert(nonce.to_owned(), (now_secs, token_expiry));
+        self.seen.insert(nonce.to_owned(), (now_secs, token_expiry));
 
         // Auto-prune check.
         self.checks_since_prune += 1;
@@ -231,8 +230,9 @@ impl<C: Clock> NonceTracker<C> {
     ///
     /// Returns [`UcanError::MalformedToken`] if deserialization fails.
     pub fn from_bytes(data: &[u8], clock: C) -> Result<Self, UcanError> {
-        let state: OwnedSerializableState = serde_json::from_slice(data)
-            .map_err(|e| UcanError::MalformedToken(format!("nonce tracker deserialization: {e}")))?;
+        let state: OwnedSerializableState = serde_json::from_slice(data).map_err(|e| {
+            UcanError::MalformedToken(format!("nonce tracker deserialization: {e}"))
+        })?;
 
         let now = clock.now();
         let mut tracker = Self {
@@ -322,8 +322,7 @@ mod tests {
     #[test]
     fn check_rejects_nonce_non_numeric_timestamp() {
         let (mut tracker, _clock) = setup();
-        let result =
-            tracker.check_and_record("notanumber-aabbccdd11223344aabbccdd11223344", 0);
+        let result = tracker.check_and_record("notanumber-aabbccdd11223344aabbccdd11223344", 0);
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
     }
 
@@ -560,8 +559,7 @@ mod tests {
         tracker.check_and_record(&nonce, expiry).unwrap();
 
         let bytes = tracker.to_bytes().unwrap();
-        let restored =
-            NonceTracker::from_bytes(&bytes, Arc::clone(&clock)).unwrap();
+        let restored = NonceTracker::from_bytes(&bytes, Arc::clone(&clock)).unwrap();
 
         assert_eq!(restored.context_id(), "ctx-test");
         assert_eq!(restored.len(), 1);
@@ -579,8 +577,7 @@ mod tests {
         // Advance time past the retention window before restoring.
         clock.advance(PRUNE_MIN_RETENTION_SECS + 1);
 
-        let restored =
-            NonceTracker::from_bytes(&bytes, Arc::clone(&clock)).unwrap();
+        let restored = NonceTracker::from_bytes(&bytes, Arc::clone(&clock)).unwrap();
         assert_eq!(restored.len(), 0);
     }
 
