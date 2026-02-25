@@ -13,12 +13,15 @@
 //!   logs. Two agents may compute different records from different event log
 //!   views -- this is correct behavior, not a bug.
 //! - **Layer 3 (Attestation):** [`Attestation`] verification with common
-//!   envelope format. *(Placeholder -- SCP-062)*
+//!   envelope format. [`verify_attestation`] checks signatures, evidence,
+//!   expiry, and revocation. [`check_attestation_freshness`] evaluates renewal
+//!   intervals. [`check_threshold_attestation`] checks N-of-M requirements
+//!   with independence scoring.
 //! - **Layer 3 (Challenge-Response):** [`ChallengeRequest`] /
 //!   [`ChallengeResponse`] for capability verification. *(Placeholder --
 //!   SCP-063)*
 //! - **Layer 4 (Consequence):** [`ConsequenceRule`] declared at context creation
-//!   and protocol-enforced. *(Placeholder -- SCP-064)*
+//!   and protocol-enforced. See [`consequence`] module.
 //!
 //! [`TrustInput`] aggregates all layers for agent-level evaluation.
 //!
@@ -31,14 +34,21 @@
 //! - [`BehavioralRecord`] -- Verifiable facts computed from context event logs.
 //! - [`GovernanceActionSummary`] -- Summary of a governance action.
 //! - [`RoleTransition`] -- A role change event.
+//! - [`Attestation`] -- Common attestation envelope (ADR-017, section 7.4.1).
+//! - [`AttestationType`] -- Attestation type variants.
+//! - [`AttestationEvidence`] -- Evidence supporting an attestation.
+//! - [`RevocationStatus`] -- Revocation status of an attestation.
+//! - [`FreshnessStatus`] -- Result of freshness evaluation.
+//! - [`ThresholdRequirement`] -- N-of-M threshold requirement.
+//! - [`ThresholdResult`] -- Result of threshold attestation check.
 //! - [`AttestationReference`] -- Reference to an attestation in the event log.
 //!
 //! Placeholder types (to be fleshed out in future stories):
-//! - [`Attestation`], [`AttestationType`] -- SCP-062
 //! - [`ChallengeRequest`], [`ChallengeResponse`] -- SCP-063
-//! - [`ConsequenceRule`] -- SCP-064
 
+pub mod attestation;
 pub mod behavioral;
+pub mod consequence;
 
 use std::collections::HashMap;
 
@@ -47,7 +57,16 @@ use serde::{Deserialize, Serialize};
 use crate::event_log::DID;
 
 // Re-export all public types from submodules.
+pub use attestation::{
+    Attestation, AttestationEvidence, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
+    RevocationStatus, ThresholdRequirement, ThresholdResult, check_attestation_freshness,
+    check_threshold_attestation, verify_attestation,
+};
 pub use behavioral::{BehavioralRecord, compute_behavioral_record};
+pub use consequence::{
+    ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
+    TriggeredConsequence, evaluate_consequence_rules,
+};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -85,34 +104,53 @@ pub enum TrustError {
         /// Human-readable description of the issue.
         reason: String,
     },
+
+    /// The attestation's Ed25519 signature is invalid.
+    #[error("attestation {attestation_id}: signature invalid: {reason}")]
+    AttestationSignatureInvalid {
+        /// The attestation ID.
+        attestation_id: String,
+        /// Human-readable description of the failure.
+        reason: String,
+    },
+
+    /// The attestation has expired.
+    #[error("attestation {attestation_id}: expired at {expired_at}")]
+    AttestationExpired {
+        /// The attestation ID.
+        attestation_id: String,
+        /// Unix timestamp (seconds) when the attestation expired.
+        expired_at: u64,
+    },
+
+    /// The attestation has been revoked.
+    #[error("attestation {attestation_id}: revoked at {revoked_at}")]
+    AttestationRevoked {
+        /// The attestation ID.
+        attestation_id: String,
+        /// Unix timestamp (seconds) when the attestation was revoked.
+        revoked_at: u64,
+    },
+
+    /// The attestation evidence is missing or invalid.
+    #[error("attestation {attestation_id}: evidence invalid: {reason}")]
+    AttestationEvidenceInvalid {
+        /// The attestation ID.
+        attestation_id: String,
+        /// Human-readable description of the evidence issue.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder types for future submodules
+// AttestationType
 // ---------------------------------------------------------------------------
-
-/// Common attestation envelope (ADR-017, Spec section 7.4.1).
-///
-/// Placeholder -- will be fully implemented in SCP-062.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Attestation {
-    /// Unique attestation identifier.
-    pub id: String,
-    /// The type of attestation.
-    pub attestation_type: AttestationType,
-    /// DID of the attestation issuer.
-    pub issuer: DID,
-    /// DID of the attestation subject.
-    pub subject: DID,
-    /// Unix timestamp (seconds) when the attestation was issued.
-    pub issued_at: u64,
-    /// Optional expiry timestamp (seconds).
-    pub expires_at: Option<u64>,
-}
 
 /// Attestation type variants (ADR-017).
 ///
-/// Placeholder -- will be fully implemented in SCP-062.
+/// Each variant represents a category of attestation that can be issued,
+/// verified, and used in threshold checks. The type determines what evidence
+/// is expected and how the attestation contributes to trust evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AttestationType {
     /// Links an identity to an external identifier.
@@ -132,6 +170,10 @@ pub enum AttestationType {
     /// Witnesses behavioral facts.
     BehavioralWitness,
 }
+
+// ---------------------------------------------------------------------------
+// Placeholder types for future submodules
+// ---------------------------------------------------------------------------
 
 /// A challenge request for capability verification (ADR-017).
 ///
@@ -161,21 +203,7 @@ pub struct ChallengeResponse {
     pub completed_at: u64,
 }
 
-/// A declared consequence rule (ADR-017).
-///
-/// Consequences are part of the opt-in contract -- visible before joining,
-/// protocol-enforced, verifiable. No hidden penalties.
-///
-/// Placeholder -- will be fully implemented in SCP-064.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsequenceRule {
-    /// Human-readable description of what triggers this consequence.
-    pub trigger_description: String,
-    /// Human-readable description of the consequence action.
-    pub action_description: String,
-    /// Numeric threshold that triggers the consequence.
-    pub threshold: u64,
-}
+// ConsequenceRule is now defined in consequence.rs and re-exported above.
 
 // ---------------------------------------------------------------------------
 // Supporting types for BehavioralRecord
