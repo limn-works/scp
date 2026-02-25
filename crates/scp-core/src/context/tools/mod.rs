@@ -1,0 +1,221 @@
+//! Tool registration, schema validation, and verification for SCP contexts.
+//!
+//! Tools are stateless functions scoped to a context (spec section 5.4). They
+//! have MCP-compatible JSON Schema interfaces (spec section 8.5), making them
+//! interoperable with existing MCP tooling. Every tool registration includes
+//! schema, implementation hash, test vectors, and operator DID -- providing
+//! verifiable integrity (spec section 7.3.3).
+//!
+//! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
+//!
+//! # Modules
+//!
+//! - [`registry`] -- Tool registration storage, `register_tool`, `update_tool`,
+//!   `verify_tool`.
+//! - [`schema`] -- JSON Schema validation helpers and MCP compatibility.
+//!
+//! # Types
+//!
+//! - [`ToolId`] -- Unique identifier for a registered tool.
+//! - [`ToolError`] -- Error type for tool operations.
+//! - [`ToolRegistration`] -- Full tool registration with schema, hash, test
+//!   vectors, and operator DID. (Re-exported from [`registry`].)
+//! - [`ToolSchema`] -- MCP-compatible JSON Schema for input/output.
+//!   (Re-exported from [`registry`].)
+//! - [`TestVector`] -- Known input-output pair for tool verification.
+//!   (Re-exported from [`registry`].)
+//! - [`ToolRegistry`] -- In-memory tool storage per context.
+//!   (Re-exported from [`registry`].)
+
+pub mod registry;
+pub mod schema;
+
+use crate::context::roles;
+
+pub use registry::{
+    ToolEconomicMetadata, ToolRegistry, ToolRegistration, ToolSchema, ToolVerificationResult,
+    TestVector, VectorResult, register_tool, update_tool, verify_tool,
+};
+pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
+
+// ---------------------------------------------------------------------------
+// ToolId
+// ---------------------------------------------------------------------------
+
+/// Unique identifier for a registered tool within a context.
+///
+/// Matches the `ToolId` type alias in `context::roles`, re-defined here for
+/// module-local clarity. These are the same underlying type (`String`).
+pub type ToolId = String;
+
+/// A DID string (e.g., `"did:dht:z6Mk..."`).
+///
+/// Represented as a plain `String` for Phase 2.
+pub type DID = String;
+
+// ---------------------------------------------------------------------------
+// ToolError
+// ---------------------------------------------------------------------------
+
+/// Errors produced by tool registration, update, and verification operations.
+///
+/// See ADR-010 for error conditions.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolError {
+    /// The registrant does not have the `ToolRegister` capability.
+    #[error("registrant \"{did}\" does not have ToolRegister capability")]
+    RegistrantNotAuthorized {
+        /// The DID that attempted registration without authorization.
+        did: String,
+    },
+
+    /// The updater is not the tool's operator and does not have admin role.
+    #[error("updater \"{did}\" is not the tool operator and lacks admin role")]
+    UpdaterNotAuthorized {
+        /// The DID that attempted the update without authorization.
+        did: String,
+    },
+
+    /// The tool's input schema failed validation.
+    #[error("invalid input schema: {0}")]
+    InvalidInputSchema(#[source] SchemaValidationError),
+
+    /// The tool's output schema failed validation.
+    #[error("invalid output schema: {0}")]
+    InvalidOutputSchema(#[source] SchemaValidationError),
+
+    /// The implementation hash has an invalid length (must be 32 bytes).
+    #[error("implementation hash must be 32 bytes, got {length}")]
+    InvalidImplementationHash {
+        /// The actual length of the provided hash.
+        length: usize,
+    },
+
+    /// The operator DID is not resolvable (empty or malformed).
+    #[error("operator DID is not resolvable: \"{did}\"")]
+    UnresolvableDid {
+        /// The DID that failed resolution.
+        did: String,
+    },
+
+    /// The specified tool was not found in the registry.
+    #[error("tool not found: \"{tool_id}\"")]
+    ToolNotFound {
+        /// The tool ID that was not found.
+        tool_id: ToolId,
+    },
+
+    /// The tool ID in the new registration does not match the existing tool.
+    #[error("tool ID mismatch: expected \"{expected}\", got \"{actual}\"")]
+    ToolIdMismatch {
+        /// The expected tool ID.
+        expected: ToolId,
+        /// The actual tool ID provided.
+        actual: ToolId,
+    },
+
+    /// A tool with this ID is already registered.
+    #[error("tool already registered: \"{tool_id}\"")]
+    ToolAlreadyRegistered {
+        /// The duplicate tool ID.
+        tool_id: ToolId,
+    },
+
+    /// A test vector verification failed.
+    #[error("test vector verification failed: {message}")]
+    VerificationFailed {
+        /// Human-readable description of the failure.
+        message: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// ToolEvent (event log integration types)
+// ---------------------------------------------------------------------------
+
+/// Event payload for a `ToolRegistered` event in the context event log.
+///
+/// Captures the full registration metadata for auditability. Serialized into
+/// the opaque `EventPayload::data` field.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolRegisteredEvent {
+    /// The registered tool's ID.
+    pub tool_id: ToolId,
+    /// The tool name.
+    pub name: String,
+    /// The tool description.
+    pub description: String,
+    /// SHA-256 implementation hash.
+    pub implementation_hash: [u8; 32],
+    /// The operator DID responsible for the tool.
+    pub operator_did: DID,
+    /// The DID of the registrant who registered the tool.
+    pub registrant_did: DID,
+    /// Number of test vectors included.
+    pub test_vector_count: usize,
+}
+
+/// Event payload for a `ToolUpdated` event in the context event log.
+///
+/// Records old and new implementation hashes and all changed fields.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolUpdatedEvent {
+    /// The updated tool's ID.
+    pub tool_id: ToolId,
+    /// The old implementation hash before the update.
+    pub old_implementation_hash: [u8; 32],
+    /// The new implementation hash after the update.
+    pub new_implementation_hash: [u8; 32],
+    /// The DID that performed the update.
+    pub updater_did: DID,
+    /// Names of fields that changed in this update.
+    ///
+    /// Possible values: `"name"`, `"description"`, `"schema"`,
+    /// `"test_vectors"`, `"implementation_hash"`, `"operator_did"`.
+    pub changed_fields: Vec<String>,
+}
+
+/// Event payload for a `ToolVerified` event in the context event log.
+///
+/// Records the verification result for auditability.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolVerifiedEvent {
+    /// The verified tool's ID.
+    pub tool_id: ToolId,
+    /// Number of test vectors that passed.
+    pub passed: usize,
+    /// Number of test vectors that failed.
+    pub failed: usize,
+    /// Overall integrity assessment.
+    pub integrity_ok: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Capability check helper
+// ---------------------------------------------------------------------------
+
+/// Checks whether a member has the `ToolRegister` capability.
+///
+/// Delegates to the role system's capability check. This is the integration
+/// point between the tools module and the UCAN-based role system (ADR-009).
+#[must_use]
+pub fn has_tool_register_capability(
+    role_state: &roles::ContextRoleState,
+    did: &str,
+) -> bool {
+    role_state.member_has_capability(did, &roles::Capability::ToolRegister)
+}
+
+/// Checks whether a member has admin-level capabilities.
+///
+/// Used by `update_tool` to verify the updater is either the tool operator
+/// or an admin.
+#[must_use]
+pub fn has_admin_role(
+    role_state: &roles::ContextRoleState,
+    did: &str,
+) -> bool {
+    // Check for the RoleAssign capability as a proxy for admin status,
+    // since the admin role includes all capabilities in the ceiling.
+    role_state.member_has_capability(did, &roles::Capability::RoleAssign)
+}

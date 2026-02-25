@@ -33,6 +33,7 @@ pub mod params;
 pub mod roles;
 pub mod state_machine;
 pub mod templates;
+pub mod tools;
 pub mod ttl;
 
 use std::sync::Arc;
@@ -70,8 +71,12 @@ pub use membership::{
     MemberInfo, MembershipState, ReceiveBuffer,
 };
 
-// Re-export TTL management types (SCP-021).
+// Re-export TTL management types (SCP-021, SCP-066).
 pub use ttl::{CloseResult, TtlExtension, TtlTimer};
+pub use ttl::{
+    ExtensionConsentMode, TtlEnforcer, TtlError, TtlExtensionProposal, TtlPolicy,
+    TtlTimerHandle, check_ttl, consent_mode_for_member_count,
+};
 
 // ---------------------------------------------------------------------------
 // ContextState
