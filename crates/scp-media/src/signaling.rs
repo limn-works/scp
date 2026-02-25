@@ -15,6 +15,20 @@ use serde::{Deserialize, Serialize};
 /// across `scp-core` modules.
 pub type DID = String;
 
+/// Errors from signaling operations.
+#[derive(Debug, thiserror::Error)]
+pub enum SignalingError {
+    /// The sender DID in the signaling message does not match the envelope
+    /// sender DID. This indicates either a bug or a spoofing attempt.
+    #[error("sender mismatch: message claims sender {claimed} but envelope sender is {envelope}")]
+    SenderMismatch {
+        /// The sender DID claimed in the signaling message body.
+        claimed: String,
+        /// The sender DID from the authenticated SCP envelope.
+        envelope: String,
+    },
+}
+
 /// A WebRTC signaling message exchanged through SCP.
 ///
 /// These messages are encrypted and governed by the context. They enable
@@ -73,7 +87,11 @@ pub type SessionId = String;
 
 /// Creates an SDP offer signaling message.
 #[must_use]
-pub fn create_offer(session_id: &str, sdp: String, sender_did: DID) -> (SessionId, SignalingMessage) {
+pub fn create_offer(
+    session_id: &str,
+    sdp: String,
+    sender_did: DID,
+) -> (SessionId, SignalingMessage) {
     (
         session_id.to_owned(),
         SignalingMessage::Offer(SessionDescription { sdp, sender_did }),
@@ -82,7 +100,11 @@ pub fn create_offer(session_id: &str, sdp: String, sender_did: DID) -> (SessionI
 
 /// Creates an SDP answer signaling message.
 #[must_use]
-pub fn create_answer(session_id: &str, sdp: String, sender_did: DID) -> (SessionId, SignalingMessage) {
+pub fn create_answer(
+    session_id: &str,
+    sdp: String,
+    sender_did: DID,
+) -> (SessionId, SignalingMessage) {
     (
         session_id.to_owned(),
         SignalingMessage::Answer(SessionDescription { sdp, sender_did }),
@@ -125,6 +147,48 @@ pub fn serialize_signaling(msg: &SignalingMessage) -> Result<Vec<u8>, serde_json
 /// Returns an error if JSON deserialization fails.
 pub fn deserialize_signaling(bytes: &[u8]) -> Result<SignalingMessage, serde_json::Error> {
     serde_json::from_slice(bytes)
+}
+
+/// Verifies that the sender DID claimed in a signaling message matches the
+/// authenticated envelope sender.
+///
+/// Signaling messages contain a self-asserted `sender_did` field. This
+/// function checks that the claimed sender matches the DID from the
+/// authenticated SCP envelope (which is cryptographically verified via MLS
+/// group membership). Any mismatch indicates either a bug or a spoofing
+/// attempt and must be rejected.
+///
+/// `SessionEnd` messages carry no sender DID and always pass verification.
+///
+/// # Arguments
+///
+/// * `msg` - The deserialized signaling message to verify.
+/// * `envelope_sender_did` - The DID from the authenticated SCP envelope.
+///
+/// # Errors
+///
+/// Returns [`SignalingError::SenderMismatch`] if the claimed sender DID
+/// does not match the envelope sender.
+pub fn verify_sender_attribution(
+    msg: &SignalingMessage,
+    envelope_sender_did: &str,
+) -> Result<(), SignalingError> {
+    let claimed = match msg {
+        SignalingMessage::Offer(desc) => &desc.sender_did,
+        SignalingMessage::Answer(desc) => &desc.sender_did,
+        SignalingMessage::IceCandidate(c) => &c.sender_did,
+        // SessionEnd carries no sender DID -- nothing to verify.
+        SignalingMessage::SessionEnd => return Ok(()),
+    };
+
+    if claimed != envelope_sender_did {
+        return Err(SignalingError::SenderMismatch {
+            claimed: claimed.clone(),
+            envelope: envelope_sender_did.to_owned(),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -199,7 +263,11 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_offer_roundtrip() {
-        let (_, msg) = create_offer("s1", "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n".to_owned(), "did:dht:z1".to_owned());
+        let (_, msg) = create_offer(
+            "s1",
+            "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n".to_owned(),
+            "did:dht:z1".to_owned(),
+        );
         let bytes = serialize_signaling(&msg).unwrap();
         let restored = deserialize_signaling(&bytes).unwrap();
         match (&msg, &restored) {
@@ -213,7 +281,13 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_ice_roundtrip() {
-        let (_, msg) = create_ice_candidate("s2", "candidate:1".to_owned(), Some("video".to_owned()), Some(1), "did:dht:z2".to_owned());
+        let (_, msg) = create_ice_candidate(
+            "s2",
+            "candidate:1".to_owned(),
+            Some("video".to_owned()),
+            Some(1),
+            "did:dht:z2".to_owned(),
+        );
         let bytes = serialize_signaling(&msg).unwrap();
         let restored = deserialize_signaling(&bytes).unwrap();
         match (&msg, &restored) {
@@ -236,5 +310,83 @@ mod tests {
     fn deserialize_invalid_json_fails() {
         let result = deserialize_signaling(b"not json");
         assert!(result.is_err());
+    }
+
+    // -- verify_sender_attribution ------------------------------------------
+
+    #[test]
+    fn verify_sender_attribution_passes_for_matching_offer() {
+        let (_, msg) = create_offer("s1", "v=0\r\n".to_owned(), "did:dht:zAlice".to_owned());
+        let result = verify_sender_attribution(&msg, "did:dht:zAlice");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_sender_attribution_passes_for_matching_answer() {
+        let (_, msg) = create_answer("s1", "v=0\r\n".to_owned(), "did:dht:zBob".to_owned());
+        let result = verify_sender_attribution(&msg, "did:dht:zBob");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_sender_attribution_passes_for_matching_ice_candidate() {
+        let (_, msg) = create_ice_candidate(
+            "s1",
+            "candidate:1".to_owned(),
+            None,
+            None,
+            "did:dht:zAlice".to_owned(),
+        );
+        let result = verify_sender_attribution(&msg, "did:dht:zAlice");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_sender_attribution_passes_for_session_end() {
+        let msg = SignalingMessage::SessionEnd;
+        // SessionEnd has no sender_did -- should always pass.
+        let result = verify_sender_attribution(&msg, "did:dht:zAnyone");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_sender_attribution_fails_for_mismatched_offer() {
+        let (_, msg) = create_offer("s1", "v=0\r\n".to_owned(), "did:dht:zAlice".to_owned());
+        let result = verify_sender_attribution(&msg, "did:dht:zEve");
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did:dht:zAlice"),
+            "error should contain claimed DID"
+        );
+        assert!(
+            msg.contains("did:dht:zEve"),
+            "error should contain envelope DID"
+        );
+    }
+
+    #[test]
+    fn verify_sender_attribution_fails_for_mismatched_answer() {
+        let (_, msg) = create_answer("s1", "v=0\r\n".to_owned(), "did:dht:zBob".to_owned());
+        let result = verify_sender_attribution(&msg, "did:dht:zMallory");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_sender_attribution_fails_for_mismatched_ice_candidate() {
+        let (_, msg) = create_ice_candidate(
+            "s1",
+            "candidate:1".to_owned(),
+            None,
+            None,
+            "did:dht:zAlice".to_owned(),
+        );
+        let result = verify_sender_attribution(&msg, "did:dht:zEve");
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, SignalingError::SenderMismatch { .. }));
     }
 }

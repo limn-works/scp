@@ -230,7 +230,11 @@ struct ExplicitIdentity<D: DidMethod> {
 /// create a new DID with explicit implementations, or
 /// [`identity`](ApplicationNodeBuilder::identity) to use an existing one. If
 /// neither is called, `.build()` returns [`NodeError::MissingField`].
-pub struct ApplicationNodeBuilder<K: KeyCustody = NoOpCustody, D: DidMethod = NoOpDidMethod, S: Storage = NoOpStorage> {
+pub struct ApplicationNodeBuilder<
+    K: KeyCustody = NoOpCustody,
+    D: DidMethod = NoOpDidMethod,
+    S: Storage = NoOpStorage,
+> {
     domain: Option<String>,
     identity_source: Option<IdentitySource<K, D>>,
     storage: Option<Arc<S>>,
@@ -379,15 +383,11 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
     /// server fails to start.
     pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
         // 1. Validate required fields.
-        let domain = self
-            .domain
-            .ok_or(NodeError::MissingField("domain"))?;
+        let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
 
-        let identity_source = self
-            .identity_source
-            .ok_or(NodeError::MissingField(
-                "identity (call generate_identity_with() or identity())",
-            ))?;
+        let identity_source = self.identity_source.ok_or(NodeError::MissingField(
+            "identity (call generate_identity_with() or identity())",
+        ))?;
 
         // 2. Initialize storage.
         let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
@@ -458,8 +458,9 @@ impl KeyCustody for NoOpCustody {
     fn generate_keypair(
         &self,
         _key_type: scp_platform::KeyType,
-    ) -> impl std::future::Future<Output = Result<scp_platform::KeyHandle, scp_platform::PlatformError>>
-           + Send {
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::KeyHandle, scp_platform::PlatformError>,
+    > + Send {
         std::future::ready(Err(scp_platform::PlatformError::StorageError(
             "NoOpCustody: not configured".to_owned(),
         )))
@@ -468,8 +469,9 @@ impl KeyCustody for NoOpCustody {
     fn public_key(
         &self,
         _handle: &scp_platform::KeyHandle,
-    ) -> impl std::future::Future<Output = Result<scp_platform::PublicKey, scp_platform::PlatformError>>
-           + Send {
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::PublicKey, scp_platform::PlatformError>,
+    > + Send {
         std::future::ready(Err(scp_platform::PlatformError::StorageError(
             "NoOpCustody: not configured".to_owned(),
         )))
@@ -479,8 +481,9 @@ impl KeyCustody for NoOpCustody {
         &self,
         _handle: &scp_platform::KeyHandle,
         _data: &[u8],
-    ) -> impl std::future::Future<Output = Result<scp_platform::Signature, scp_platform::PlatformError>>
-           + Send {
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::Signature, scp_platform::PlatformError>,
+    > + Send {
         std::future::ready(Err(scp_platform::PlatformError::StorageError(
             "NoOpCustody: not configured".to_owned(),
         )))
@@ -534,8 +537,8 @@ impl DidMethod for NoOpDidMethod {
     fn create(
         &self,
         _key_custody: &impl KeyCustody,
-    ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>>
-           + Send {
+    ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
+    {
         std::future::ready(Err(IdentityError::DhtPublishFailed(
             "NoOpDidMethod: not configured".to_owned(),
         )))
@@ -568,8 +571,8 @@ impl DidMethod for NoOpDidMethod {
         &self,
         _identity: &ScpIdentity,
         _key_custody: &impl KeyCustody,
-    ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>>
-           + Send {
+    ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
+    {
         std::future::ready(Err(IdentityError::KeyRotationFailed(
             "NoOpDidMethod: not configured".to_owned(),
         )))
@@ -594,8 +597,8 @@ impl Storage for NoOpStorage {
     fn retrieve(
         &self,
         _key: &str,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, scp_platform::PlatformError>>
-           + Send {
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, scp_platform::PlatformError>> + Send
+    {
         std::future::ready(Ok(None))
     }
 
@@ -639,10 +642,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use scp_core::identity::DidCache;
     use scp_core::identity::cache::SystemClock;
     use scp_core::identity::dht::DidDht;
     use scp_core::identity::dht_client::InMemoryDhtClient;
-    use scp_core::identity::DidCache;
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
     /// The concrete `DidDht` type used in tests (with in-memory DHT and system clock).
@@ -657,8 +660,7 @@ mod tests {
     }
 
     /// Helper: creates a builder with domain and `generate_identity` configured.
-    fn test_builder() -> ApplicationNodeBuilder<InMemoryKeyCustody, TestDidDht, InMemoryStorage>
-    {
+    fn test_builder() -> ApplicationNodeBuilder<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
         ApplicationNodeBuilder::new()

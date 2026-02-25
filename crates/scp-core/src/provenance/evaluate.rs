@@ -381,8 +381,7 @@ mod tests {
 
     #[test]
     fn evaluate_quality_reflects_updated_source_type() {
-        let mut prov =
-            make_provenance(SourceType::Persistent, vec!["did:dht:z6MkAlice".into()]);
+        let mut prov = make_provenance(SourceType::Persistent, vec!["did:dht:z6MkAlice".into()]);
 
         // Initially active and persistent
         let q1 = evaluate_quality(Some(&prov), &SourceContextState::Active);

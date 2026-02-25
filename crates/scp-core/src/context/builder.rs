@@ -437,16 +437,10 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
 /// Generates a deterministic 32-byte context identifier from the context's
 /// string ID.
 ///
-/// Uses SHA-256 to produce a fixed-size identifier suitable for use as keys
-/// in provider stores.
+/// Uses the canonical SHA-256 context ID byte derivation.
+/// Delegates to [`super::context_id_bytes`].
 fn context_id_bytes(context_id: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(context_id.as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    bytes
+    super::context_id_bytes(context_id)
 }
 
 /// Executes the two-phase context creation flow.

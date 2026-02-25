@@ -180,13 +180,9 @@ pub struct KeyDestructionResult {
 
 /// Converts a `context_id` string to a 32-byte array (truncated/zero-padded).
 ///
-/// Mirrors the helper in `ttl.rs` and `manager.rs`.
+/// Delegates to the canonical [`super::context_id_bytes`] (SHA-256).
 fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
-    let bytes = context_id.as_bytes();
-    let mut result = [0u8; 32];
-    let len = bytes.len().min(32);
-    result[..len].copy_from_slice(&bytes[..len]);
-    result
+    super::context_id_bytes(context_id)
 }
 
 impl<'a> KeyDestructionOrchestrator<'a> {
@@ -329,10 +325,7 @@ impl RelayDeletionTracker {
     /// Increments the appropriate counter for the relay URL based on the
     /// response status.
     pub fn record_response(&mut self, relay_url: &str, response: DeletionResponseStatus) {
-        let entry = self
-            .relay_stats
-            .entry(relay_url.to_owned())
-            .or_default();
+        let entry = self.relay_stats.entry(relay_url.to_owned()).or_default();
 
         entry.total_requests += 1;
         match response {
@@ -859,7 +852,10 @@ mod tests {
         tracker.record_response("wss://relay.example.com", DeletionResponseStatus::Confirmed);
         tracker.record_response("wss://relay.example.com", DeletionResponseStatus::Partial);
         tracker.record_response("wss://relay.example.com", DeletionResponseStatus::Failed);
-        tracker.record_response("wss://relay.example.com", DeletionResponseStatus::NoResponse);
+        tracker.record_response(
+            "wss://relay.example.com",
+            DeletionResponseStatus::NoResponse,
+        );
 
         let stats = tracker.stats_for_relay("wss://relay.example.com").unwrap();
         assert_eq!(stats.total_requests, 4);
@@ -872,7 +868,11 @@ mod tests {
     #[test]
     fn relay_deletion_tracker_unknown_relay_returns_none() {
         let tracker = RelayDeletionTracker::new();
-        assert!(tracker.stats_for_relay("wss://unknown.example.com").is_none());
+        assert!(
+            tracker
+                .stats_for_relay("wss://unknown.example.com")
+                .is_none()
+        );
     }
 
     #[test]
@@ -980,8 +980,7 @@ mod tests {
 
     #[test]
     fn validate_broadcast_full_scope_succeeds() {
-        let result =
-            validate_memory_scope_for_broadcast(ContextMode::Broadcast, MemoryScope::Full);
+        let result = validate_memory_scope_for_broadcast(ContextMode::Broadcast, MemoryScope::Full);
         assert!(result.is_ok());
     }
 
@@ -1009,16 +1008,14 @@ mod tests {
 
     #[test]
     fn validate_encrypted_all_scopes_accepted() {
-        assert!(validate_memory_scope_for_broadcast(
-            ContextMode::Encrypted,
-            MemoryScope::Ephemeral
-        )
-        .is_ok());
-        assert!(validate_memory_scope_for_broadcast(
-            ContextMode::Encrypted,
-            MemoryScope::Summary
-        )
-        .is_ok());
+        assert!(
+            validate_memory_scope_for_broadcast(ContextMode::Encrypted, MemoryScope::Ephemeral)
+                .is_ok()
+        );
+        assert!(
+            validate_memory_scope_for_broadcast(ContextMode::Encrypted, MemoryScope::Summary)
+                .is_ok()
+        );
         assert!(
             validate_memory_scope_for_broadcast(ContextMode::Encrypted, MemoryScope::Full).is_ok()
         );

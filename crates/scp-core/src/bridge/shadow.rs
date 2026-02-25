@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{BridgeMode, ContextId, ShadowIdentity, ShadowProvenanceStatus, DID};
+use super::{BridgeMode, ContextId, DID, ShadowIdentity, ShadowProvenanceStatus};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -43,6 +43,17 @@ use super::{BridgeMode, ContextId, ShadowIdentity, ShadowProvenanceStatus, DID};
 /// Observer-equivalent: restricted capabilities, cannot exercise capabilities
 /// requiring verified identity (ADR-023 acceptance criterion 4).
 pub const DEFAULT_SHADOW_ROLE: &str = "observer";
+
+/// Default maximum number of shadow identities per bridge.
+///
+/// Prevents a single bridge from exhausting memory by creating an unbounded
+/// number of shadows.
+pub const DEFAULT_MAX_SHADOWS_PER_BRIDGE: usize = 10_000;
+
+/// Default maximum total number of shadow identities in a registry.
+///
+/// Prevents overall memory exhaustion across all bridges.
+pub const DEFAULT_MAX_TOTAL_SHADOWS: usize = 100_000;
 
 /// Capabilities that require a verified SCP identity and cannot be exercised
 /// by shadow identities.
@@ -96,9 +107,7 @@ pub enum ShadowError {
     },
 
     /// A shadow with the same platform handle already exists for this bridge.
-    #[error(
-        "duplicate platform handle {platform_handle} on bridge {bridge_id}"
-    )]
+    #[error("duplicate platform handle {platform_handle} on bridge {bridge_id}")]
     DuplicateHandle {
         /// The bridge ID.
         bridge_id: String,
@@ -123,6 +132,13 @@ pub enum ShadowError {
     #[error("invalid governance action for role upgrade: {reason}")]
     InvalidGovernanceAction {
         /// Human-readable reason.
+        reason: String,
+    },
+
+    /// The shadow registry has reached its capacity limit.
+    #[error("capacity exceeded: {reason}")]
+    CapacityExceeded {
+        /// Human-readable description of which limit was exceeded.
         reason: String,
     },
 }
@@ -226,6 +242,12 @@ pub struct ShadowRoleUpgradeEvent {
 /// Scoped to one context (context isolation tenet). All shadow operations
 /// are performed through this registry to maintain consistent state.
 ///
+/// Capacity limits prevent memory exhaustion from malicious bridges:
+/// - `max_shadows_per_bridge` limits how many shadows any single bridge can
+///   create (default: 10,000).
+/// - `max_total_shadows` limits the total number of shadows across all
+///   bridges (default: 100,000).
+///
 /// See ADR-023 acceptance criteria 3-4.
 #[derive(Debug)]
 pub struct ShadowRegistry {
@@ -240,18 +262,49 @@ pub struct ShadowRegistry {
 
     /// Event log of shadow role upgrade events.
     upgrade_events: Vec<ShadowRoleUpgradeEvent>,
+
+    /// Maximum number of shadow identities any single bridge can create.
+    max_shadows_per_bridge: usize,
+
+    /// Maximum total number of shadow identities across all bridges.
+    max_total_shadows: usize,
 }
 
 impl ShadowRegistry {
-    /// Creates a new empty shadow registry for the given context.
+    /// Creates a new empty shadow registry for the given context with default
+    /// capacity limits.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
     pub fn new(context_id: ContextId) -> Self {
         Self {
             context_id,
             shadows: Vec::new(),
             creation_events: Vec::new(),
             upgrade_events: Vec::new(),
+            max_shadows_per_bridge: DEFAULT_MAX_SHADOWS_PER_BRIDGE,
+            max_total_shadows: DEFAULT_MAX_TOTAL_SHADOWS,
+        }
+    }
+
+    /// Creates a new empty shadow registry with custom capacity limits.
+    ///
+    /// # Arguments
+    ///
+    /// - `context_id` -- The context this registry belongs to.
+    /// - `max_shadows_per_bridge` -- Maximum shadows per bridge.
+    /// - `max_total_shadows` -- Maximum total shadows across all bridges.
+    #[must_use]
+    pub fn with_limits(
+        context_id: ContextId,
+        max_shadows_per_bridge: usize,
+        max_total_shadows: usize,
+    ) -> Self {
+        Self {
+            context_id,
+            shadows: Vec::new(),
+            creation_events: Vec::new(),
+            upgrade_events: Vec::new(),
+            max_shadows_per_bridge,
+            max_total_shadows,
         }
     }
 
@@ -277,6 +330,18 @@ impl ShadowRegistry {
     #[must_use]
     pub fn upgrade_events(&self) -> &[ShadowRoleUpgradeEvent] {
         &self.upgrade_events
+    }
+
+    /// Returns the maximum number of shadows allowed per bridge.
+    #[must_use]
+    pub fn max_shadows_per_bridge(&self) -> usize {
+        self.max_shadows_per_bridge
+    }
+
+    /// Returns the maximum total number of shadows allowed.
+    #[must_use]
+    pub fn max_total_shadows(&self) -> usize {
+        self.max_total_shadows
     }
 }
 
@@ -308,6 +373,9 @@ impl ShadowRegistry {
 /// Returns [`ShadowError::DuplicateHandle`] if a shadow with the same
 /// platform handle already exists for this bridge.
 ///
+/// Returns [`ShadowError::CapacityExceeded`] if the per-bridge or total
+/// shadow limit would be exceeded.
+///
 /// See ADR-023 acceptance criterion 3.
 pub fn create_shadow(
     registry: &mut ShadowRegistry,
@@ -333,6 +401,31 @@ pub fn create_shadow(
         return Err(ShadowError::DuplicateHandle {
             bridge_id: bridge_id.to_owned(),
             platform_handle: platform_handle.to_owned(),
+        });
+    }
+
+    // Check total capacity limit.
+    if registry.shadows.len() >= registry.max_total_shadows {
+        return Err(ShadowError::CapacityExceeded {
+            reason: format!(
+                "total shadow limit ({}) reached",
+                registry.max_total_shadows
+            ),
+        });
+    }
+
+    // Check per-bridge capacity limit.
+    let bridge_shadow_count = registry
+        .shadows
+        .iter()
+        .filter(|s| s.bridge_id == bridge_id)
+        .count();
+    if bridge_shadow_count >= registry.max_shadows_per_bridge {
+        return Err(ShadowError::CapacityExceeded {
+            reason: format!(
+                "per-bridge shadow limit ({}) reached for bridge {bridge_id}",
+                registry.max_shadows_per_bridge
+            ),
         });
     }
 
@@ -371,6 +464,21 @@ pub fn create_shadow(
 /// privileged role by context governance. The governance action must include
 /// a valid DID and justification.
 ///
+/// # SAFETY: Callers must verify governance authorization
+///
+/// This function does **not** cryptographically verify the `GovernanceAction`.
+/// It checks only structural validity (context match, non-empty role). The
+/// caller is responsible for verifying that:
+///
+/// 1. The `governance_did` is authorized to perform governance actions in
+///    this context (e.g., via UCAN capability check).
+/// 2. The `GovernanceAction` is authentic (e.g., signature verification on
+///    the envelope that carried it).
+/// 3. The governance actor is not itself a shadow identity.
+///
+/// Failure to verify governance authorization before calling this function
+/// allows any participant to escalate shadow roles.
+///
 /// # Arguments
 ///
 /// - `registry` -- The shadow registry for this context.
@@ -388,7 +496,7 @@ pub fn create_shadow(
 ///
 /// See ADR-023 acceptance criterion 4: "Specific role upgradeable by context
 /// governance."
-pub fn upgrade_shadow_role(
+pub(crate) fn upgrade_shadow_role(
     registry: &mut ShadowRegistry,
     shadow_id: &str,
     new_role: &str,
@@ -453,10 +561,7 @@ pub fn upgrade_shadow_role(
 ///
 /// See ADR-023 acceptance criterion 3.
 #[must_use]
-pub fn list_shadows<'a>(
-    registry: &'a ShadowRegistry,
-    bridge_id: &str,
-) -> Vec<&'a ShadowIdentity> {
+pub fn list_shadows<'a>(registry: &'a ShadowRegistry, bridge_id: &str) -> Vec<&'a ShadowIdentity> {
     registry
         .shadows
         .iter()
@@ -766,6 +871,144 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Capacity limits
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_shadow_rejects_when_total_limit_reached() {
+        let mut registry = ShadowRegistry::with_limits(CTX.to_owned(), 100, 3);
+
+        // Create 3 shadows (at the total limit).
+        for i in 0..3 {
+            let shadow_id = format!("shadow-{i}");
+            let handle = format!("@user{i}");
+            let bridge_id = format!("bridge-{i}");
+            create_shadow(
+                &mut registry,
+                &shadow_id,
+                &bridge_id,
+                BridgeMode::Relay,
+                &handle,
+                1_700_000_100,
+            )
+            .unwrap();
+        }
+
+        // The 4th should fail.
+        let result = create_shadow(
+            &mut registry,
+            "shadow-overflow",
+            "bridge-new",
+            BridgeMode::Relay,
+            "@overflow",
+            1_700_000_200,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ShadowError::CapacityExceeded { .. }),
+            "expected CapacityExceeded, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("total shadow limit"),
+            "error message should mention total limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_shadow_rejects_when_per_bridge_limit_reached() {
+        let mut registry = ShadowRegistry::with_limits(CTX.to_owned(), 2, 100);
+
+        // Create 2 shadows on the same bridge (at the per-bridge limit).
+        for i in 0..2 {
+            let shadow_id = format!("shadow-{i}");
+            let handle = format!("@user{i}");
+            create_shadow(
+                &mut registry,
+                &shadow_id,
+                BRIDGE_ID,
+                BridgeMode::Relay,
+                &handle,
+                1_700_000_100,
+            )
+            .unwrap();
+        }
+
+        // The 3rd on the same bridge should fail.
+        let result = create_shadow(
+            &mut registry,
+            "shadow-overflow",
+            BRIDGE_ID,
+            BridgeMode::Relay,
+            "@overflow",
+            1_700_000_200,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ShadowError::CapacityExceeded { .. }),
+            "expected CapacityExceeded, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("per-bridge shadow limit"),
+            "error message should mention per-bridge limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn per_bridge_limit_does_not_affect_other_bridges() {
+        let mut registry = ShadowRegistry::with_limits(CTX.to_owned(), 2, 100);
+
+        // Fill bridge-001 to its limit.
+        for i in 0..2 {
+            let shadow_id = format!("shadow-a-{i}");
+            let handle = format!("@user-a-{i}");
+            create_shadow(
+                &mut registry,
+                &shadow_id,
+                "bridge-001",
+                BridgeMode::Relay,
+                &handle,
+                1_700_000_100,
+            )
+            .unwrap();
+        }
+
+        // bridge-002 should still be able to create shadows.
+        let result = create_shadow(
+            &mut registry,
+            "shadow-b-0",
+            "bridge-002",
+            BridgeMode::Relay,
+            "@user-b-0",
+            1_700_000_200,
+        );
+        assert!(
+            result.is_ok(),
+            "different bridge should not be affected by per-bridge limit"
+        );
+    }
+
+    #[test]
+    fn registry_with_limits_has_correct_values() {
+        let registry = ShadowRegistry::with_limits(CTX.to_owned(), 42, 999);
+        assert_eq!(registry.max_shadows_per_bridge(), 42);
+        assert_eq!(registry.max_total_shadows(), 999);
+    }
+
+    #[test]
+    fn default_registry_has_default_limits() {
+        let registry = ShadowRegistry::new(CTX.to_owned());
+        assert_eq!(
+            registry.max_shadows_per_bridge(),
+            DEFAULT_MAX_SHADOWS_PER_BRIDGE
+        );
+        assert_eq!(registry.max_total_shadows(), DEFAULT_MAX_TOTAL_SHADOWS);
+    }
+
+    // -------------------------------------------------------------------
     // upgrade_shadow_role
     // -------------------------------------------------------------------
 
@@ -776,8 +1019,7 @@ mod tests {
 
         let governance = make_governance(CTX);
         let event =
-            upgrade_shadow_role(&mut registry, "shadow-001", "contributor", &governance)
-                .unwrap();
+            upgrade_shadow_role(&mut registry, "shadow-001", "contributor", &governance).unwrap();
 
         assert_eq!(event.previous_role, "observer");
         assert_eq!(event.new_role, "contributor");
@@ -793,8 +1035,7 @@ mod tests {
 
         let governance = make_governance(CTX);
         let event =
-            upgrade_shadow_role(&mut registry, "shadow-001", "contributor", &governance)
-                .unwrap();
+            upgrade_shadow_role(&mut registry, "shadow-001", "contributor", &governance).unwrap();
 
         assert_eq!(event.shadow_id, "shadow-001");
         assert_eq!(event.governance_did, GOVERNANCE_DID);
@@ -808,8 +1049,7 @@ mod tests {
         let mut registry = make_registry();
         let governance = make_governance(CTX);
 
-        let result =
-            upgrade_shadow_role(&mut registry, "shadow-999", "contributor", &governance);
+        let result = upgrade_shadow_role(&mut registry, "shadow-999", "contributor", &governance);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -826,8 +1066,7 @@ mod tests {
 
         let governance = make_governance("ctx-other");
 
-        let result =
-            upgrade_shadow_role(&mut registry, "shadow-001", "contributor", &governance);
+        let result = upgrade_shadow_role(&mut registry, "shadow-001", "contributor", &governance);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1143,5 +1382,15 @@ mod tests {
             shadow_id: "shadow-999".to_owned(),
         };
         assert!(err.to_string().contains("shadow-999"));
+    }
+
+    #[test]
+    fn shadow_error_display_capacity_exceeded() {
+        let err = ShadowError::CapacityExceeded {
+            reason: "total shadow limit (100) reached".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("capacity exceeded"));
+        assert!(msg.contains("total shadow limit"));
     }
 }

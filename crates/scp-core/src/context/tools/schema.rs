@@ -60,11 +60,15 @@ const VALID_SCHEMA_TYPES: &[&str] = &[
 ///
 /// Returns [`SchemaValidationError`] if the value fails structural checks.
 pub fn validate_schema(schema: &Value) -> Result<(), SchemaValidationError> {
-    let obj = schema.as_object().ok_or_else(|| SchemaValidationError::NotAnObject {
-        kind: json_type_name(schema).to_owned(),
-    })?;
+    let obj = schema
+        .as_object()
+        .ok_or_else(|| SchemaValidationError::NotAnObject {
+            kind: json_type_name(schema).to_owned(),
+        })?;
 
-    let type_field = obj.get("type").ok_or(SchemaValidationError::MissingTypeField)?;
+    let type_field = obj
+        .get("type")
+        .ok_or(SchemaValidationError::MissingTypeField)?;
 
     let type_str =
         type_field
@@ -307,10 +311,7 @@ mod tests {
         let err = SchemaValidationError::NotAnObject {
             kind: "string".to_owned(),
         };
-        assert_eq!(
-            format!("{err}"),
-            "schema must be a JSON object, got string"
-        );
+        assert_eq!(format!("{err}"), "schema must be a JSON object, got string");
 
         let err = SchemaValidationError::MissingTypeField;
         assert_eq!(

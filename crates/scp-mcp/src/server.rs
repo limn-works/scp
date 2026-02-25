@@ -28,15 +28,14 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::namespace::{
-    BuiltinTool, BUILTIN_TOOLS, ContextId, context_tool_definition, parse_namespaced_tool,
+    BUILTIN_TOOLS, BuiltinTool, ContextId, context_tool_definition, parse_namespaced_tool,
 };
 use crate::protocol::{
-    self, ClientCapabilities, ContentItem, InitializeParams, InitializeResult,
-    JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    ResourceContent, ResourceDefinition, ResourcesListResult, ResourcesReadResult,
-    ResourcesSubscribeParams, RequestId, ServerCapabilities, ServerInfo,
-    ToolDefinition, ToolServerCapability, ToolsCallParams, ToolsCallResult,
-    ToolsListResult, ResourceServerCapability,
+    self, ClientCapabilities, ContentItem, InitializeParams, InitializeResult, JsonRpcError,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId, ResourceContent,
+    ResourceDefinition, ResourceServerCapability, ResourcesListResult, ResourcesReadResult,
+    ResourcesSubscribeParams, ServerCapabilities, ServerInfo, ToolDefinition, ToolServerCapability,
+    ToolsCallParams, ToolsCallResult, ToolsListResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -146,11 +145,7 @@ pub trait ContextProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns an error message if the agent lacks the required capability.
-    fn validate_capability(
-        &self,
-        context_id: &str,
-        tool_name: &str,
-    ) -> Result<(), String>;
+    fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String>;
 
     /// Invokes a tool and returns its output as a JSON value.
     ///
@@ -232,34 +227,35 @@ impl<P: ContextProvider> McpServer<P> {
     ///
     /// Routes to the appropriate handler based on the `method` field.
     /// Notifications (`initialized`) return `None` (no response expected).
-    pub fn handle_request(
-        &mut self,
-        request: &JsonRpcRequest,
-    ) -> Option<JsonRpcResponse> {
+    pub fn handle_request(&mut self, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+        // Pre-initialization guard: only `initialize` and `ping` are allowed
+        // before the server has completed the initialization handshake.
+        if !self.initialized
+            && request.method.as_str() != protocol::METHOD_INITIALIZE
+            && request.method.as_str() != protocol::METHOD_PING
+        {
+            return Some(JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError {
+                    code: protocol::INVALID_REQUEST,
+                    message: "server not initialized: send initialize first".to_owned(),
+                    data: None,
+                },
+            ));
+        }
+
         match request.method.as_str() {
-            protocol::METHOD_INITIALIZE => {
-                Some(self.handle_initialize(request))
-            }
+            protocol::METHOD_INITIALIZE => Some(self.handle_initialize(request)),
             protocol::METHOD_INITIALIZED => {
                 self.handle_initialized();
                 None // Notification -- no response.
             }
             protocol::METHOD_PING => Some(self.handle_ping(request)),
-            protocol::METHOD_TOOLS_LIST => {
-                Some(self.handle_tools_list(request))
-            }
-            protocol::METHOD_TOOLS_CALL => {
-                Some(self.handle_tools_call(request))
-            }
-            protocol::METHOD_RESOURCES_LIST => {
-                Some(self.handle_resources_list(request))
-            }
-            protocol::METHOD_RESOURCES_READ => {
-                Some(self.handle_resources_read(request))
-            }
-            protocol::METHOD_RESOURCES_SUBSCRIBE => {
-                Some(self.handle_resources_subscribe(request))
-            }
+            protocol::METHOD_TOOLS_LIST => Some(self.handle_tools_list(request)),
+            protocol::METHOD_TOOLS_CALL => Some(self.handle_tools_call(request)),
+            protocol::METHOD_RESOURCES_LIST => Some(self.handle_resources_list(request)),
+            protocol::METHOD_RESOURCES_READ => Some(self.handle_resources_read(request)),
+            protocol::METHOD_RESOURCES_SUBSCRIBE => Some(self.handle_resources_subscribe(request)),
             _ => Some(JsonRpcResponse::error(
                 request.id.clone(),
                 JsonRpcError {
@@ -313,7 +309,10 @@ impl<P: ContextProvider> McpServer<P> {
     /// Handles the `ping` request.
     #[allow(clippy::unused_self)]
     fn handle_ping(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
-        JsonRpcResponse::success(request.id.clone(), Value::Object(serde_json::Map::default()))
+        JsonRpcResponse::success(
+            request.id.clone(),
+            Value::Object(serde_json::Map::default()),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -433,7 +432,10 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         // Invoke the tool.
-        match self.provider.invoke_tool(&context_id, tool_name, params.arguments) {
+        match self
+            .provider
+            .invoke_tool(&context_id, tool_name, params.arguments)
+        {
             Ok(output) => {
                 // Validate output against schema if available.
                 if let Some(out_schema) = self.find_output_schema(&context_id, tool_name)
@@ -476,10 +478,7 @@ impl<P: ContextProvider> McpServer<P> {
                             meta.insert("provenance".to_owned(), prov_val);
                             obj.insert("_meta".to_owned(), Value::Object(meta));
                         }
-                        JsonRpcResponse::success(
-                            request.id.clone(),
-                            Value::Object(obj),
-                        )
+                        JsonRpcResponse::success(request.id.clone(), Value::Object(obj))
                     }
                     Ok(v) => JsonRpcResponse::success(request.id.clone(), v),
                     Err(e) => internal_error(request.id.clone(), &e.to_string()),
@@ -624,10 +623,7 @@ impl<P: ContextProvider> McpServer<P> {
 
     /// Handles `resources/subscribe` -- registers a subscription for resource
     /// updates.
-    fn handle_resources_subscribe(
-        &mut self,
-        request: &JsonRpcRequest,
-    ) -> JsonRpcResponse {
+    fn handle_resources_subscribe(&mut self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let params: ResourcesSubscribeParams = match parse_params(request.params.as_ref()) {
             Ok(p) => p,
             Err(resp) => return with_id(resp, request.id.clone()),
@@ -815,9 +811,9 @@ const fn json_type_name(value: &Value) -> &'static str {
 /// Expected format: `scp://context_id/resource_type` where `resource_type` is
 /// one of `events`, `members`, `tools`.
 fn parse_resource_uri(uri: &str) -> Result<(String, &str), String> {
-    let stripped = uri
-        .strip_prefix(RESOURCE_SCHEME)
-        .ok_or_else(|| format!("invalid resource URI: expected {RESOURCE_SCHEME} prefix, got {uri}"))?;
+    let stripped = uri.strip_prefix(RESOURCE_SCHEME).ok_or_else(|| {
+        format!("invalid resource URI: expected {RESOURCE_SCHEME} prefix, got {uri}")
+    })?;
 
     let slash_pos = stripped
         .find('/')
@@ -831,7 +827,9 @@ fn parse_resource_uri(uri: &str) -> Result<(String, &str), String> {
     }
 
     if resource_type.is_empty() {
-        return Err(format!("invalid resource URI: empty resource type in {uri}"));
+        return Err(format!(
+            "invalid resource URI: empty resource type in {uri}"
+        ));
     }
 
     Ok((context_id.to_owned(), resource_type))
@@ -855,8 +853,8 @@ mod tests {
     struct MockProvider {
         contexts: Vec<ContextId>,
         agent_did: String,
-        roles: Vec<(String, String)>, // (context_id, role)
-        tools: Vec<(String, ContextToolInfo)>, // (context_id, tool)
+        roles: Vec<(String, String)>,               // (context_id, role)
+        tools: Vec<(String, ContextToolInfo)>,      // (context_id, tool)
         denied_capabilities: Vec<(String, String)>, // (context_id, tool_name)
         invoke_result: Result<Value, String>,
         members: Vec<(String, MemberInfo)>,
@@ -920,19 +918,13 @@ mod tests {
                 .collect()
         }
 
-        fn validate_capability(
-            &self,
-            context_id: &str,
-            tool_name: &str,
-        ) -> Result<(), String> {
+        fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
             if self
                 .denied_capabilities
                 .iter()
                 .any(|(cid, tn)| cid == context_id && tn == tool_name)
             {
-                Err(format!(
-                    "capability denied: {tool_name} in {context_id}"
-                ))
+                Err(format!("capability denied: {tool_name} in {context_id}"))
             } else {
                 Ok(())
             }
@@ -985,6 +977,15 @@ mod tests {
         })
     }
 
+    /// Creates an `McpServer` that has already completed initialization.
+    fn initialized_server(provider: MockProvider) -> McpServer<MockProvider> {
+        let mut server = McpServer::new(provider);
+        let req = make_request(METHOD_INITIALIZE, Some(init_params()));
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_none());
+        server
+    }
+
     // -----------------------------------------------------------------------
     // MCP lifecycle tests
     // -----------------------------------------------------------------------
@@ -1000,17 +1001,43 @@ mod tests {
         assert_eq!(result["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
         assert_eq!(result["serverInfo"]["version"], SERVER_VERSION);
-        assert!(result["capabilities"]["tools"]["listChanged"].as_bool().unwrap());
-        assert!(result["capabilities"]["resources"]["subscribe"].as_bool().unwrap());
+        assert!(
+            result["capabilities"]["tools"]["listChanged"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            result["capabilities"]["resources"]["subscribe"]
+                .as_bool()
+                .unwrap()
+        );
         assert!(server.is_initialized());
     }
 
     #[test]
     fn initialized_notification_returns_none() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(protocol::METHOD_INITIALIZED, None);
         let resp = server.handle_request(&req);
         assert!(resp.is_none());
+    }
+
+    #[test]
+    fn pre_initialization_guard_rejects_tools_list() {
+        let mut server = McpServer::new(MockProvider::default());
+        let req = make_request(protocol::METHOD_TOOLS_LIST, None);
+        let resp = server.handle_request(&req).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, protocol::INVALID_REQUEST);
+        assert!(err.message.contains("not initialized"));
+    }
+
+    #[test]
+    fn pre_initialization_guard_allows_ping() {
+        let mut server = McpServer::new(MockProvider::default());
+        let req = make_request(METHOD_PING, None);
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_none());
     }
 
     #[test]
@@ -1024,7 +1051,7 @@ mod tests {
 
     #[test]
     fn unknown_method_returns_method_not_found() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request("unknown/method", None);
         let resp = server.handle_request(&req).unwrap();
         let err = resp.error.unwrap();
@@ -1037,14 +1064,18 @@ mod tests {
 
     #[test]
     fn tools_list_returns_builtin_tools_for_all_contexts() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(protocol::METHOD_TOOLS_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
         // 2 contexts x 3 built-in tools = 6 minimum.
-        assert!(tools.len() >= 6, "expected at least 6 tools, got {}", tools.len());
+        assert!(
+            tools.len() >= 6,
+            "expected at least 6 tools, got {}",
+            tools.len()
+        );
 
         // Check namespacing.
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1071,12 +1102,16 @@ mod tests {
             )],
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(protocol::METHOD_TOOLS_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert!(tools.iter().any(|t| t["name"].as_str().unwrap() == "ctx_a/guide_assistant"));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t["name"].as_str().unwrap() == "ctx_a/guide_assistant")
+        );
     }
 
     #[test]
@@ -1106,7 +1141,7 @@ mod tests {
             ],
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(protocol::METHOD_TOOLS_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
@@ -1133,24 +1168,26 @@ mod tests {
             )],
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(protocol::METHOD_TOOLS_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         // ctx_a has admin role -- admin_tool should be visible.
-        assert!(tools.iter().any(|t| t["name"].as_str().unwrap() == "ctx_a/admin_tool"));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t["name"].as_str().unwrap() == "ctx_a/admin_tool")
+        );
     }
 
     #[test]
     fn tools_list_filters_by_ucan_capability() {
         let provider = MockProvider {
-            denied_capabilities: vec![
-                ("ctx_a".to_owned(), "send_message".to_owned()),
-            ],
+            denied_capabilities: vec![("ctx_a".to_owned(), "send_message".to_owned())],
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(protocol::METHOD_TOOLS_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
@@ -1169,7 +1206,7 @@ mod tests {
 
     #[test]
     fn tools_call_invokes_and_returns_result_with_provenance() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_TOOLS_CALL,
             Some(serde_json::json!({
@@ -1194,7 +1231,7 @@ mod tests {
 
     #[test]
     fn tools_call_rejects_invalid_namespace() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_TOOLS_CALL,
             Some(serde_json::json!({
@@ -1210,12 +1247,10 @@ mod tests {
     #[test]
     fn tools_call_rejects_denied_capability() {
         let provider = MockProvider {
-            denied_capabilities: vec![
-                ("ctx_a".to_owned(), "send_message".to_owned()),
-            ],
+            denied_capabilities: vec![("ctx_a".to_owned(), "send_message".to_owned())],
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(
             protocol::METHOD_TOOLS_CALL,
             Some(serde_json::json!({
@@ -1230,7 +1265,7 @@ mod tests {
 
     #[test]
     fn tools_call_validates_input_schema() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         // send_message requires {"type": "object"} input; send a string.
         let req = make_request(
             protocol::METHOD_TOOLS_CALL,
@@ -1262,7 +1297,7 @@ mod tests {
             invoke_result: Ok(serde_json::json!("not an object")),
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(
             protocol::METHOD_TOOLS_CALL,
             Some(serde_json::json!({
@@ -1282,7 +1317,7 @@ mod tests {
             invoke_result: Err("tool crashed".to_owned()),
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(
             protocol::METHOD_TOOLS_CALL,
             Some(serde_json::json!({
@@ -1298,7 +1333,7 @@ mod tests {
 
     #[test]
     fn tools_call_result_is_not_error_flag() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_TOOLS_CALL,
             Some(serde_json::json!({
@@ -1317,7 +1352,7 @@ mod tests {
 
     #[test]
     fn resources_list_returns_three_resources_per_context() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(protocol::METHOD_RESOURCES_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
@@ -1326,7 +1361,10 @@ mod tests {
         // 2 contexts x 3 resources = 6.
         assert_eq!(resources.len(), 6);
 
-        let uris: Vec<&str> = resources.iter().map(|r| r["uri"].as_str().unwrap()).collect();
+        let uris: Vec<&str> = resources
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
         assert!(uris.contains(&"scp://ctx_a/events"));
         assert!(uris.contains(&"scp://ctx_a/members"));
         assert!(uris.contains(&"scp://ctx_a/tools"));
@@ -1337,7 +1375,7 @@ mod tests {
 
     #[test]
     fn resources_list_includes_mime_type() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(protocol::METHOD_RESOURCES_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
@@ -1354,7 +1392,7 @@ mod tests {
 
     #[test]
     fn resources_read_returns_members() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_RESOURCES_READ,
             Some(serde_json::json!({"uri": "scp://ctx_a/members"})),
@@ -1377,7 +1415,7 @@ mod tests {
             events: serde_json::json!([{"type": "message", "content": "hi"}]),
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(
             protocol::METHOD_RESOURCES_READ,
             Some(serde_json::json!({"uri": "scp://ctx_a/events"})),
@@ -1406,7 +1444,7 @@ mod tests {
             )],
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(
             protocol::METHOD_RESOURCES_READ,
             Some(serde_json::json!({"uri": "scp://ctx_a/tools"})),
@@ -1421,7 +1459,7 @@ mod tests {
 
     #[test]
     fn resources_read_rejects_invalid_uri() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_RESOURCES_READ,
             Some(serde_json::json!({"uri": "http://invalid/events"})),
@@ -1433,7 +1471,7 @@ mod tests {
 
     #[test]
     fn resources_read_rejects_unknown_context() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_RESOURCES_READ,
             Some(serde_json::json!({"uri": "scp://unknown_ctx/events"})),
@@ -1446,7 +1484,7 @@ mod tests {
 
     #[test]
     fn resources_read_rejects_unknown_resource_type() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_RESOURCES_READ,
             Some(serde_json::json!({"uri": "scp://ctx_a/unknown"})),
@@ -1462,7 +1500,7 @@ mod tests {
 
     #[test]
     fn resources_subscribe_succeeds() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_RESOURCES_SUBSCRIBE,
             Some(serde_json::json!({"uri": "scp://ctx_a/events"})),
@@ -1474,7 +1512,7 @@ mod tests {
 
     #[test]
     fn resources_subscribe_rejects_invalid_uri() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_RESOURCES_SUBSCRIBE,
             Some(serde_json::json!({"uri": "invalid"})),
@@ -1601,10 +1639,7 @@ mod tests {
         let list_req = make_request(protocol::METHOD_TOOLS_LIST, None);
         let list_resp = server.handle_request(&list_req).unwrap();
         assert!(list_resp.error.is_none());
-        let tools = list_resp.result.unwrap()["tools"]
-            .as_array()
-            .unwrap()
-            .len();
+        let tools = list_resp.result.unwrap()["tools"].as_array().unwrap().len();
         assert!(tools >= 6);
 
         // 4. Call a tool.
@@ -1647,7 +1682,7 @@ mod tests {
             contexts: Vec::new(),
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(protocol::METHOD_TOOLS_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
@@ -1661,7 +1696,7 @@ mod tests {
             contexts: Vec::new(),
             ..MockProvider::default()
         };
-        let mut server = McpServer::new(provider);
+        let mut server = initialized_server(provider);
         let req = make_request(protocol::METHOD_RESOURCES_LIST, None);
         let resp = server.handle_request(&req).unwrap();
         let result = resp.result.unwrap();
@@ -1671,7 +1706,7 @@ mod tests {
 
     #[test]
     fn tools_call_with_missing_params_returns_error() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         // tools/call with no params -- missing "name" field.
         let req = make_request(protocol::METHOD_TOOLS_CALL, None);
         let resp = server.handle_request(&req).unwrap();
@@ -1681,7 +1716,7 @@ mod tests {
 
     #[test]
     fn response_ids_match_request_ids() {
-        let mut server = McpServer::new(MockProvider::default());
+        let mut server = initialized_server(MockProvider::default());
         let mut req = make_request(METHOD_PING, None);
         req.id = RequestId::String("my-unique-id".to_owned());
         let resp = server.handle_request(&req).unwrap();

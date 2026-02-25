@@ -737,13 +737,10 @@ impl ContextManager {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Converts a `context_id` string to a 32-byte array (truncated/zero-padded).
+/// Uses the canonical SHA-256 context ID byte derivation.
+/// Delegates to [`super::context_id_bytes`] to match builder.rs.
 fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
-    let bytes = context_id.as_bytes();
-    let mut result = [0u8; 32];
-    let len = bytes.len().min(32);
-    result[..len].copy_from_slice(&bytes[..len]);
-    result
+    super::context_id_bytes(context_id)
 }
 
 // Compile-time assertion that `ContextManager` is `Send + Sync`.

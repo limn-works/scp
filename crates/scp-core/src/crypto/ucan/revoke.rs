@@ -154,11 +154,7 @@ pub trait RevocationAuthorizer {
     /// the token's issuer nor the context creator.
     /// Returns [`UcanError::RevocationFailed`] if the token CID cannot be
     /// resolved.
-    fn authorize_revocation(
-        &self,
-        token_cid: &str,
-        revoker_did: &str,
-    ) -> Result<(), UcanError>;
+    fn authorize_revocation(&self, token_cid: &str, revoker_did: &str) -> Result<(), UcanError>;
 }
 
 /// Abstraction for distributing revocations via MLS application messages.
@@ -172,11 +168,7 @@ pub trait RevocationDistributor {
     /// # Errors
     ///
     /// Returns [`UcanError::RevocationFailed`] if distribution fails.
-    fn distribute_revocation(
-        &self,
-        context_id: &str,
-        token_cid: &str,
-    ) -> Result<(), UcanError>;
+    fn distribute_revocation(&self, context_id: &str, token_cid: &str) -> Result<(), UcanError>;
 }
 
 /// Abstraction for appending events to the context's event log.

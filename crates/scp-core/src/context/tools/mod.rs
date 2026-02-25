@@ -51,14 +51,16 @@ pub mod session;
 
 use crate::context::roles;
 
-pub use invoke::{InvocationError, has_tool_invoke_capability, invoke_tool, invoke_tool_with_cancellation};
+pub use invoke::{
+    InvocationError, has_tool_invoke_capability, invoke_tool, invoke_tool_with_cancellation,
+};
 pub use lifecycle::{
-    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, Provenance, ToolCancel, ToolErrorCode,
-    ToolExecutionError, ToolInvokedEvent, ToolRequest, ToolResponse, ToolStatus, sha256_json,
+    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, Provenance, ToolCancel, ToolErrorCode, ToolExecutionError,
+    ToolInvokedEvent, ToolRequest, ToolResponse, ToolStatus, sha256_json,
 };
 pub use registry::{
-    ToolEconomicMetadata, ToolRegistry, ToolRegistration, ToolSchema, ToolVerificationResult,
-    TestVector, VectorResult, register_tool, update_tool, verify_tool,
+    TestVector, ToolEconomicMetadata, ToolRegistration, ToolRegistry, ToolSchema,
+    ToolVerificationResult, VectorResult, register_tool, update_tool, verify_tool,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
 
@@ -204,7 +206,9 @@ pub enum ToolError {
     },
 
     /// The interface has not been approved by both sides.
-    #[error("tool interface not fully approved (source: {source_approved}, target: {target_approved})")]
+    #[error(
+        "tool interface not fully approved (source: {source_approved}, target: {target_approved})"
+    )]
     InterfaceNotApproved {
         /// Whether the source context approved.
         source_approved: bool,
@@ -317,10 +321,7 @@ pub struct ToolVerifiedEvent {
 /// Delegates to the role system's capability check. This is the integration
 /// point between the tools module and the UCAN-based role system (ADR-009).
 #[must_use]
-pub fn has_tool_register_capability(
-    role_state: &roles::ContextRoleState,
-    did: &str,
-) -> bool {
+pub fn has_tool_register_capability(role_state: &roles::ContextRoleState, did: &str) -> bool {
     role_state.member_has_capability(did, &roles::Capability::ToolRegister)
 }
 
@@ -329,10 +330,7 @@ pub fn has_tool_register_capability(
 /// Used by `update_tool` to verify the updater is either the tool operator
 /// or an admin.
 #[must_use]
-pub fn has_admin_role(
-    role_state: &roles::ContextRoleState,
-    did: &str,
-) -> bool {
+pub fn has_admin_role(role_state: &roles::ContextRoleState, did: &str) -> bool {
     // Check for the RoleAssign capability as a proxy for admin status,
     // since the admin role includes all capabilities in the ceiling.
     role_state.member_has_capability(did, &roles::Capability::RoleAssign)

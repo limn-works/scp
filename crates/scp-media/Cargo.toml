@@ -12,6 +12,7 @@ scp-core = { path = "../scp-core" }
 openmls_traits = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

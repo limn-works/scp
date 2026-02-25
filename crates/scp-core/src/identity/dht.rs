@@ -2219,14 +2219,8 @@ mod tests {
         let resolved = dht.resolve_did(&identity.did).await.unwrap();
         let resolved_relay_urls = resolved.document.relay_service_urls();
         assert_eq!(resolved_relay_urls.len(), 2);
-        assert_eq!(
-            resolved_relay_urls[0],
-            "wss://relay1.example.com/scp/v1"
-        );
-        assert_eq!(
-            resolved_relay_urls[1],
-            "wss://relay2.example.com/scp/v1"
-        );
+        assert_eq!(resolved_relay_urls[0], "wss://relay1.example.com/scp/v1");
+        assert_eq!(resolved_relay_urls[1], "wss://relay2.example.com/scp/v1");
     }
 
     #[tokio::test]
@@ -2260,11 +2254,7 @@ mod tests {
 
         // Initial publish with one relay URL.
         let initial_doc = dht
-            .publish_with_relay_urls(
-                &identity,
-                &document,
-                &["wss://relay1.example.com/scp/v1"],
-            )
+            .publish_with_relay_urls(&identity, &document, &["wss://relay1.example.com/scp/v1"])
             .await
             .unwrap();
 
@@ -2315,21 +2305,13 @@ mod tests {
 
         // Invalid scheme.
         let result = dht
-            .publish_with_relay_urls(
-                &identity,
-                &document,
-                &["http://relay.example.com/scp/v1"],
-            )
+            .publish_with_relay_urls(&identity, &document, &["http://relay.example.com/scp/v1"])
             .await;
         assert!(matches!(result, Err(IdentityError::InvalidRelayUrl(_))));
 
         // Invalid path.
         let result = dht
-            .publish_with_relay_urls(
-                &identity,
-                &document,
-                &["wss://relay.example.com/other"],
-            )
+            .publish_with_relay_urls(&identity, &document, &["wss://relay.example.com/other"])
             .await;
         assert!(matches!(result, Err(IdentityError::InvalidRelayUrl(_))));
     }
@@ -2346,11 +2328,7 @@ mod tests {
 
         // Publish with relay URLs.
         let published_doc = dht
-            .publish_with_relay_urls(
-                &identity,
-                &document,
-                &["wss://relay.example.com/scp/v1"],
-            )
+            .publish_with_relay_urls(&identity, &document, &["wss://relay.example.com/scp/v1"])
             .await
             .unwrap();
 
@@ -2386,11 +2364,7 @@ mod tests {
 
         // Publish with relay URLs.
         let published_doc = dht
-            .publish_with_relay_urls(
-                &identity,
-                &document,
-                &["wss://relay.example.com/scp/v1"],
-            )
+            .publish_with_relay_urls(&identity, &document, &["wss://relay.example.com/scp/v1"])
             .await
             .unwrap();
         assert_eq!(published_doc.relay_service_urls().len(), 1);

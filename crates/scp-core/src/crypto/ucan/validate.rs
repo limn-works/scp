@@ -425,12 +425,20 @@ where
     }
 
     // Step 6: Capability match — verify att includes required capability.
+    // SECURITY: fail-closed — any unparseable attestation URI rejects the entire token.
     let granted_caps: Vec<CapabilityUri> = token
         .payload
         .att
         .iter()
-        .filter_map(|att| att.with.parse::<CapabilityUri>().ok())
-        .collect();
+        .map(|att| {
+            att.with.parse::<CapabilityUri>().map_err(|_| {
+                UcanError::MalformedToken(format!(
+                    "unparseable capability URI in attestation: {}",
+                    att.with
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     check_capability_match(&granted_caps, required_capability)?;
 
     // Step 7: Attenuation — verify delegations narrow or preserve.
@@ -505,12 +513,20 @@ where
     }
 
     // Step 6: Capability match.
+    // SECURITY: fail-closed — any unparseable attestation URI rejects the entire token.
     let granted_caps: Vec<CapabilityUri> = token
         .payload
         .att
         .iter()
-        .filter_map(|att| att.with.parse::<CapabilityUri>().ok())
-        .collect();
+        .map(|att| {
+            att.with.parse::<CapabilityUri>().map_err(|_| {
+                UcanError::MalformedToken(format!(
+                    "unparseable capability URI in attestation: {}",
+                    att.with
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     check_capability_match(&granted_caps, required_capability)?;
 
     // Step 8: Ceiling.
@@ -659,12 +675,20 @@ fn verify_attenuation(
         let parent = proof_resolver.resolve_proof(proof_cid)?;
 
         // Parse parent capabilities.
+        // SECURITY: fail-closed — any unparseable parent attestation URI rejects the chain.
         let parent_caps: Vec<CapabilityUri> = parent
             .payload
             .att
             .iter()
-            .filter_map(|att| att.with.parse::<CapabilityUri>().ok())
-            .collect();
+            .map(|att| {
+                att.with.parse::<CapabilityUri>().map_err(|_| {
+                    UcanError::MalformedToken(format!(
+                        "unparseable capability URI in parent attestation: {}",
+                        att.with
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Verify every child capability is granted by a parent capability.
         for child_att in &token.payload.att {

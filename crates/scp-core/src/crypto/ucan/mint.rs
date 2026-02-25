@@ -137,14 +137,22 @@ pub async fn mint_ucan(
     let exp = now + params.lifetime_secs;
 
     // Build attestations from capabilities, scoped to the context.
+    // Validate capability format: must be "resource:action".
     let att: Vec<Attenuation> = params
         .capabilities
         .iter()
-        .map(|cap| Attenuation {
-            with: format!("scp:ctx:{}/{cap}", params.context_id),
-            can: cap.split(':').nth(1).unwrap_or("invoke").to_owned(),
+        .map(|cap| {
+            let (_resource, action) = cap.split_once(':').ok_or_else(|| {
+                UcanError::MalformedToken(format!(
+                    "capability must be in 'resource:action' format, got: {cap}"
+                ))
+            })?;
+            Ok(Attenuation {
+                with: format!("scp:ctx:{}/{cap}", params.context_id),
+                can: action.to_owned(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, UcanError>>()?;
 
     let header = UcanHeader::new();
     let payload = UcanPayload {
@@ -781,11 +789,7 @@ mod tests {
         let cid = compute_cid(&token);
 
         // "bafyrei" (7 chars) + 64 hex chars (SHA-256) = 71 chars total.
-        assert_eq!(
-            cid.len(),
-            7 + 64,
-            "CID must be 'bafyrei' + 64 hex chars"
-        );
+        assert_eq!(cid.len(), 7 + 64, "CID must be 'bafyrei' + 64 hex chars");
 
         // The hex portion must be valid hex.
         let hex_part = &cid[7..];
@@ -828,12 +832,14 @@ mod tests {
         let (alice_custody, alice_key, alice_did) = setup_custody().await;
         let (bob_custody, bob_key, bob_did) = setup_custody().await;
 
-        let caps = vec![
-            "messages:read".to_owned(),
-            "messages:write".to_owned(),
-        ];
+        let caps = vec!["messages:read".to_owned(), "messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -860,10 +866,7 @@ mod tests {
         assert_eq!(delegated.payload.iss, bob_did);
         assert_eq!(delegated.payload.aud, carol_did);
         assert_eq!(delegated.payload.att.len(), 1);
-        assert_eq!(
-            delegated.payload.att[0].with,
-            "scp:ctx:ctx-1/messages:read"
-        );
+        assert_eq!(delegated.payload.att[0].with, "scp:ctx:ctx-1/messages:read");
         assert_eq!(delegated.payload.att[0].can, "read");
 
         // Verify JWT has three segments.
@@ -884,7 +887,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -921,7 +929,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -972,7 +985,12 @@ mod tests {
             "tool_invoke:assistant".to_owned(),
         ];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1004,7 +1022,12 @@ mod tests {
             "tool_invoke:assistant".to_owned(),
         ];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1026,10 +1049,7 @@ mod tests {
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
         assert_eq!(delegated.payload.att.len(), 1);
-        assert_eq!(
-            delegated.payload.att[0].with,
-            "scp:ctx:ctx-1/messages:read"
-        );
+        assert_eq!(delegated.payload.att[0].with, "scp:ctx:ctx-1/messages:read");
     }
 
     #[tokio::test]
@@ -1039,7 +1059,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1072,7 +1097,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1111,14 +1141,16 @@ mod tests {
         let (bob_custody, bob_key, bob_did) = setup_custody().await;
         let (carol_custody, carol_key, carol_did) = setup_custody().await;
 
-        let caps = vec![
-            "messages:read".to_owned(),
-            "messages:write".to_owned(),
-        ];
+        let caps = vec!["messages:read".to_owned(), "messages:write".to_owned()];
 
         // Alice mints root token for Bob.
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
         let root_cid = compute_cid(&root_token);
@@ -1192,7 +1224,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1231,7 +1268,12 @@ mod tests {
         // Root token only grants messages:read.
         let caps = vec!["messages:read".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1267,7 +1309,12 @@ mod tests {
 
         let caps = vec!["messages:read".to_owned(), "messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1309,7 +1356,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1345,7 +1397,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1380,7 +1437,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 
@@ -1415,7 +1477,12 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
         let root_token = mint_root_token(
-            &alice_custody, &alice_key, &alice_did, &bob_did, "ctx-1", &caps,
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
         )
         .await;
 

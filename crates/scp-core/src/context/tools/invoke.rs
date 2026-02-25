@@ -42,7 +42,9 @@ pub enum InvocationError {
     },
 
     /// The invoker does not have the required capability.
-    #[error("invoker \"{did}\" does not have ToolInvoke(\"{tool_id}\") or ToolInvokeAll capability")]
+    #[error(
+        "invoker \"{did}\" does not have ToolInvoke(\"{tool_id}\") or ToolInvokeAll capability"
+    )]
     InvokerNotAuthorized {
         /// The DID that attempted invocation.
         did: String,
@@ -166,23 +168,19 @@ where
         })?;
 
     // 4. Validate input against the tool's input schema.
-    validate_value_against_schema(&input, &registration.schema.input_schema).map_err(|msg| {
-        InvocationError::InputValidationFailed { message: msg }
-    })?;
+    validate_value_against_schema(&input, &registration.schema.input_schema)
+        .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
     // 5. Execute the tool with timeout.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
 
-    let execution_result =
-        tokio::time::timeout(timeout_duration, executor(input.clone())).await;
+    let execution_result = tokio::time::timeout(timeout_duration, executor(input.clone())).await;
 
     let output = match execution_result {
         Ok(Ok(output)) => output,
         Ok(Err(exec_err)) => {
-            return Err(InvocationError::ExecutionFailed {
-                message: exec_err,
-            });
+            return Err(InvocationError::ExecutionFailed { message: exec_err });
         }
         Err(_elapsed) => {
             return Err(InvocationError::Timeout {
@@ -192,9 +190,8 @@ where
     };
 
     // 6. Validate output against the tool's output schema.
-    validate_value_against_schema(&output, &registration.schema.output_schema).map_err(
-        |msg| InvocationError::OutputValidationFailed { message: msg },
-    )?;
+    validate_value_against_schema(&output, &registration.schema.output_schema)
+        .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
 
     // 7. Build event payload.
     let execution_time_ms = elapsed_ms(start);
@@ -272,9 +269,8 @@ where
         })?;
 
     // 4. Validate input against the tool's input schema.
-    validate_value_against_schema(&input, &registration.schema.input_schema).map_err(|msg| {
-        InvocationError::InputValidationFailed { message: msg }
-    })?;
+    validate_value_against_schema(&input, &registration.schema.input_schema)
+        .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
     // 5. Execute with timeout and cancellation.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
@@ -300,9 +296,7 @@ where
             return Err(InvocationError::Cancelled);
         }
         Ok(Err(exec_err)) => {
-            return Err(InvocationError::ExecutionFailed {
-                message: exec_err,
-            });
+            return Err(InvocationError::ExecutionFailed { message: exec_err });
         }
         Err(_elapsed) => {
             return Err(InvocationError::Timeout {
@@ -312,9 +306,8 @@ where
     };
 
     // 6. Validate output against the tool's output schema.
-    validate_value_against_schema(&output, &registration.schema.output_schema).map_err(
-        |msg| InvocationError::OutputValidationFailed { message: msg },
-    )?;
+    validate_value_against_schema(&output, &registration.schema.output_schema)
+        .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
 
     // 7. Build event payload.
     let execution_time_ms = elapsed_ms(start);
@@ -362,11 +355,7 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
 /// This is the integration point between the invocation module and the
 /// UCAN-based role system (ADR-009).
 #[must_use]
-pub fn has_tool_invoke_capability(
-    role_state: &ContextRoleState,
-    did: &str,
-    tool_id: &str,
-) -> bool {
+pub fn has_tool_invoke_capability(role_state: &ContextRoleState, did: &str, tool_id: &str) -> bool {
     // Check for ToolInvokeAll first (broader permission).
     if role_state.member_has_capability(did, &Capability::ToolInvokeAll) {
         return true;
@@ -419,12 +408,10 @@ mod tests {
         let mut state = test_role_state(creator_did);
         state.members.insert(member_did.to_owned());
         // Assign only MessagesRead/Write, no tool invoke.
-        let member_caps: HashSet<Capability> = [
-            Capability::MessagesRead,
-            Capability::MessagesWrite,
-        ]
-        .into_iter()
-        .collect();
+        let member_caps: HashSet<Capability> =
+            [Capability::MessagesRead, Capability::MessagesWrite]
+                .into_iter()
+                .collect();
         state
             .member_capabilities
             .insert(member_did.to_owned(), member_caps);
@@ -468,10 +455,7 @@ mod tests {
     /// Creates an active context handle (transitions from Creating to Active).
     async fn active_context() -> ContextHandle {
         let handle = ContextHandle::new("ctx-invoke-test".to_owned(), ContextParams::default());
-        handle
-            .transition_to(&ContextState::Active)
-            .await
-            .unwrap();
+        handle.transition_to(&ContextState::Active).await.unwrap();
         handle
     }
 
@@ -564,8 +548,7 @@ mod tests {
     async fn invoke_tool_rejects_invoker_without_tool_invoke_capability() {
         let creator_did = "did:dht:z6MkCreator";
         let member_did = "did:dht:z6MkMember";
-        let role_state =
-            test_role_state_with_no_invoke_member(creator_did, member_did);
+        let role_state = test_role_state_with_no_invoke_member(creator_did, member_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
         let context = active_context().await;
 
@@ -854,14 +837,8 @@ mod tests {
         let registry = setup_registry_with_tool(&role_state, creator_did);
 
         let context = ContextHandle::new("ctx-closing".to_owned(), ContextParams::default());
-        context
-            .transition_to(&ContextState::Active)
-            .await
-            .unwrap();
-        context
-            .transition_to(&ContextState::Closing)
-            .await
-            .unwrap();
+        context.transition_to(&ContextState::Active).await.unwrap();
+        context.transition_to(&ContextState::Closing).await.unwrap();
 
         let result = invoke_tool(
             &context,
@@ -898,10 +875,8 @@ mod tests {
 
     #[test]
     fn has_tool_invoke_capability_returns_false_without_capability() {
-        let role_state = test_role_state_with_no_invoke_member(
-            "did:dht:z6MkCreator",
-            "did:dht:z6MkMember",
-        );
+        let role_state =
+            test_role_state_with_no_invoke_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
         assert!(!has_tool_invoke_capability(
             &role_state,
             "did:dht:z6MkMember",
@@ -911,10 +886,8 @@ mod tests {
 
     #[test]
     fn has_tool_invoke_capability_with_specific_tool() {
-        let mut role_state = test_role_state_with_no_invoke_member(
-            "did:dht:z6MkCreator",
-            "did:dht:z6MkMember",
-        );
+        let mut role_state =
+            test_role_state_with_no_invoke_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
         // Add specific ToolInvoke capability.
         role_state
             .member_capabilities

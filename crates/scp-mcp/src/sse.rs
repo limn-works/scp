@@ -24,19 +24,18 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
-use axum::Router;
 use tokio::sync::{Mutex, broadcast};
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::protocol::{
-    JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
-    PARSE_ERROR,
+    JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PARSE_ERROR, RequestId,
 };
 use crate::server::{ContextProvider, McpServer};
 
@@ -134,9 +133,7 @@ pub async fn run_sse<P: ContextProvider + 'static>(
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!("MCP SSE server listening on {}", config.bind_addr);
-    axum::serve(listener, router)
-        .await
-        .map_err(SseError::Io)?;
+    axum::serve(listener, router).await.map_err(SseError::Io)?;
 
     Ok(())
 }
@@ -153,9 +150,7 @@ async fn sse_handler<P: ContextProvider + 'static>(
     State(state): State<Arc<AppState<P>>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     // Send the POST endpoint URL as the first event.
-    let endpoint_event = Event::default()
-        .event("endpoint")
-        .data("/message");
+    let endpoint_event = Event::default().event("endpoint").data("/message");
 
     let rx = state.tx.subscribe();
     let message_stream = BroadcastStream::new(rx).filter_map(|result| match result {
@@ -337,11 +332,7 @@ mod tests {
         fn context_tools(&self, _context_id: &str) -> Vec<ContextToolInfo> {
             Vec::new()
         }
-        fn validate_capability(
-            &self,
-            _context_id: &str,
-            _tool_name: &str,
-        ) -> Result<(), String> {
+        fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
             Ok(())
         }
         fn invoke_tool(
@@ -485,6 +476,24 @@ mod tests {
             server: Mutex::new(server),
             tx,
         });
+
+        // Initialize the server first — the pre-init guard blocks everything
+        // except `initialize` and `ping`.
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_INITIALIZE,
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test" }
+            },
+            "id": 0
+        })
+        .to_string();
+        if let SseIncoming::Request(req) = parse_sse_incoming(&init_body).unwrap() {
+            let mut srv = state.server.lock().await;
+            srv.handle_request(&req);
+        }
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",

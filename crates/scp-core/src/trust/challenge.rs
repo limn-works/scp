@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use crate::event_log::{DID, Ed25519Signature};
 use crate::identity::cache::Clock;
 
-use super::attestation::DidPublicKeyResolver;
 use super::TrustError;
+use super::attestation::DidPublicKeyResolver;
 
 // ---------------------------------------------------------------------------
 // ChallengeType
@@ -259,9 +259,7 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
 /// Returns a deterministic string tag for a challenge type.
 fn challenge_type_tag(ct: &ChallengeType) -> String {
     match ct {
-        ChallengeType::PromptInjectionResistance => {
-            "PromptInjectionResistance".to_owned()
-        }
+        ChallengeType::PromptInjectionResistance => "PromptInjectionResistance".to_owned(),
         ChallengeType::SchemaValidation => "SchemaValidation".to_owned(),
         ChallengeType::RateLimitCompliance => "RateLimitCompliance".to_owned(),
         ChallengeType::Custom(s) => format!("Custom:{s}"),
@@ -402,37 +400,33 @@ pub fn verify_challenge_response(
         }
     })?;
 
-    let verifying_key =
-        ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array).map_err(|e| {
-            TrustError::ChallengeSignatureInvalid {
-                challenge_id: request.challenge_id.clone(),
-                reason: format!("invalid Ed25519 public key: {e}"),
-            }
-        })?;
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array).map_err(|e| {
+        TrustError::ChallengeSignatureInvalid {
+            challenge_id: request.challenge_id.clone(),
+            reason: format!("invalid Ed25519 public key: {e}"),
+        }
+    })?;
 
-    let sig_bytes: [u8; 64] =
-        response
-            .signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| TrustError::ChallengeSignatureInvalid {
-                challenge_id: request.challenge_id.clone(),
-                reason: format!(
-                    "signature must be 64 bytes, got {}",
-                    response.signature.len()
-                ),
-            })?;
+    let sig_bytes: [u8; 64] = response.signature.as_slice().try_into().map_err(|_| {
+        TrustError::ChallengeSignatureInvalid {
+            challenge_id: request.challenge_id.clone(),
+            reason: format!(
+                "signature must be 64 bytes, got {}",
+                response.signature.len()
+            ),
+        }
+    })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
     let canonical = canonical_challenge_response_bytes(response);
 
-    verifying_key
-        .verify(&canonical, &signature)
-        .map_err(|_| TrustError::ChallengeSignatureInvalid {
+    verifying_key.verify(&canonical, &signature).map_err(|_| {
+        TrustError::ChallengeSignatureInvalid {
             challenge_id: request.challenge_id.clone(),
             reason: "Ed25519 signature verification failed".to_owned(),
-        })?;
+        }
+    })?;
 
     // Verification succeeded -- this is challenge-verified, not self-attested.
     Ok(ChallengeVerification {
@@ -487,12 +481,13 @@ mod tests {
 
     impl DidPublicKeyResolver for TestResolver {
         fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
-            self.keys.get(did).cloned().ok_or_else(|| {
-                TrustError::ChallengeSignatureInvalid {
+            self.keys
+                .get(did)
+                .cloned()
+                .ok_or_else(|| TrustError::ChallengeSignatureInvalid {
                     challenge_id: String::new(),
                     reason: format!("DID not found: {did}"),
-                }
-            })
+                })
         }
     }
 
@@ -664,10 +659,7 @@ mod tests {
         assert_eq!(verification.challenge_id, request.challenge_id);
         assert_eq!(verification.challenger_did, "did:key:challenger");
         assert_eq!(verification.responder_did, "did:key:subject");
-        assert_eq!(
-            verification.challenge_type,
-            ChallengeType::SchemaValidation
-        );
+        assert_eq!(verification.challenge_type, ChallengeType::SchemaValidation);
         assert_eq!(
             verification.verification_method,
             VerificationMethod::ChallengeVerified {

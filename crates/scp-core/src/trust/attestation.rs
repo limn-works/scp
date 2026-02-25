@@ -270,30 +270,27 @@ pub fn verify_attestation(
         }
     })?;
 
-    let sig_bytes: [u8; 64] =
-        attestation
-            .signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| TrustError::AttestationSignatureInvalid {
-                attestation_id: attestation.id.clone(),
-                reason: format!(
-                    "signature must be 64 bytes, got {}",
-                    attestation.signature.len()
-                ),
-            })?;
+    let sig_bytes: [u8; 64] = attestation.signature.as_slice().try_into().map_err(|_| {
+        TrustError::AttestationSignatureInvalid {
+            attestation_id: attestation.id.clone(),
+            reason: format!(
+                "signature must be 64 bytes, got {}",
+                attestation.signature.len()
+            ),
+        }
+    })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
     // Sign over the canonical content: id + type + issuer + subject + claim + issued_at.
     let canonical = canonical_attestation_bytes(attestation);
 
-    verifying_key
-        .verify(&canonical, &signature)
-        .map_err(|_| TrustError::AttestationSignatureInvalid {
+    verifying_key.verify(&canonical, &signature).map_err(|_| {
+        TrustError::AttestationSignatureInvalid {
             attestation_id: attestation.id.clone(),
             reason: "Ed25519 signature verification failed".to_owned(),
-        })?;
+        }
+    })?;
 
     // 2. Validate evidence per attestation type.
     validate_evidence(attestation)?;
@@ -567,12 +564,13 @@ mod tests {
 
     impl DidPublicKeyResolver for TestResolver {
         fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
-            self.keys.get(did).cloned().ok_or_else(|| {
-                TrustError::AttestationSignatureInvalid {
+            self.keys
+                .get(did)
+                .cloned()
+                .ok_or_else(|| TrustError::AttestationSignatureInvalid {
                     attestation_id: String::new(),
                     reason: format!("DID not found: {did}"),
-                }
-            })
+                })
         }
     }
 
@@ -1005,10 +1003,7 @@ mod tests {
         }
     }
 
-    fn make_simple_attestation(
-        attestation_type: AttestationType,
-        issuer: &str,
-    ) -> Attestation {
+    fn make_simple_attestation(attestation_type: AttestationType, issuer: &str) -> Attestation {
         Attestation {
             id: format!("att-{issuer}"),
             attestation_type,
@@ -1146,8 +1141,7 @@ mod tests {
             independence_threshold: 0.5,
         };
 
-        let result =
-            check_threshold_attestation(&required_type, &attestors, &requirement);
+        let result = check_threshold_attestation(&required_type, &attestors, &requirement);
         assert!(
             !result.met,
             "threshold should NOT be met (wrong type): {result:?}"
@@ -1208,10 +1202,7 @@ mod tests {
         };
 
         let result = check_threshold_attestation(&att_type, &attestors, &requirement);
-        assert!(
-            result.met,
-            "0.7 independence >= 0.5 threshold: {result:?}"
-        );
+        assert!(result.met, "0.7 independence >= 0.5 threshold: {result:?}");
         // 3 shared contexts => 0.3 penalty. Independence = 0.7.
         assert!(
             (result.independence_score - 0.7).abs() < 0.001,
