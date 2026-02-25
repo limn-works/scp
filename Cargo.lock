@@ -1978,6 +1978,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
  "x25519-dalek 2.0.1",
  "z-base-32",
 ]

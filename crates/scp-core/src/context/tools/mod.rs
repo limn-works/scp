@@ -1,4 +1,5 @@
-//! Tool registration, schema validation, and verification for SCP contexts.
+//! Tool registration, schema validation, invocation lifecycle, and verification
+//! for SCP contexts.
 //!
 //! Tools are stateless functions scoped to a context (spec section 5.4). They
 //! have MCP-compatible JSON Schema interfaces (spec section 8.5), making them
@@ -13,6 +14,10 @@
 //! - [`registry`] -- Tool registration storage, `register_tool`, `update_tool`,
 //!   `verify_tool`.
 //! - [`schema`] -- JSON Schema validation helpers and MCP compatibility.
+//! - [`invoke`] -- Tool invocation with full execution lifecycle:
+//!   capability checking, schema validation, timeout, cancellation.
+//! - [`lifecycle`] -- Request/response types, status codes, error codes,
+//!   cancellation, and event log integration for tool invocations.
 //!
 //! # Types
 //!
@@ -26,12 +31,29 @@
 //!   (Re-exported from [`registry`].)
 //! - [`ToolRegistry`] -- In-memory tool storage per context.
 //!   (Re-exported from [`registry`].)
+//! - [`ToolRequest`] -- Tool invocation request. (Re-exported from
+//!   [`lifecycle`].)
+//! - [`ToolResponse`] -- Tool invocation response. (Re-exported from
+//!   [`lifecycle`].)
+//! - [`ToolStatus`] -- Invocation terminal status. (Re-exported from
+//!   [`lifecycle`].)
+//! - [`ToolExecutionError`] -- Structured execution error. (Re-exported from
+//!   [`lifecycle`].)
+//! - [`ToolErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
+//! - [`ToolCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
+pub mod invoke;
+pub mod lifecycle;
 pub mod registry;
 pub mod schema;
 
 use crate::context::roles;
 
+pub use invoke::{InvocationError, has_tool_invoke_capability, invoke_tool, invoke_tool_with_cancellation};
+pub use lifecycle::{
+    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, Provenance, ToolCancel, ToolErrorCode,
+    ToolExecutionError, ToolInvokedEvent, ToolRequest, ToolResponse, ToolStatus, sha256_json,
+};
 pub use registry::{
     ToolEconomicMetadata, ToolRegistry, ToolRegistration, ToolSchema, ToolVerificationResult,
     TestVector, VectorResult, register_tool, update_tool, verify_tool,
