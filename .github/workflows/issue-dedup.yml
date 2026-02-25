@@ -20,7 +20,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: "--model claude-sonnet-4-20250514 --max-turns 10"
-          allowed_tools: "Bash(gh *),Read,Glob,Grep"
+          settings: '{"permissions":{"allow":["Bash(gh *)","Read","Glob","Grep"]}}'
           prompt: |
             Check if issue #${{ github.event.issue.number }} is a duplicate.
 

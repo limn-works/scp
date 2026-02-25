@@ -355,8 +355,7 @@ mod tests {
         for tool in BUILTIN_TOOLS {
             assert!(
                 !tool.description().is_empty(),
-                "{:?} has empty description",
-                tool
+                "{tool:?} has empty description"
             );
         }
     }
@@ -365,11 +364,10 @@ mod tests {
     fn builtin_tool_schemas_are_objects() {
         for tool in BUILTIN_TOOLS {
             let schema = tool.input_schema();
-            assert!(schema.is_object(), "{:?} schema is not an object", tool);
+            assert!(schema.is_object(), "{tool:?} schema is not an object");
             assert_eq!(
                 schema["type"], "object",
-                "{:?} schema type is not 'object'",
-                tool
+                "{tool:?} schema type is not 'object'"
             );
         }
     }

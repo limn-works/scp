@@ -422,7 +422,7 @@ mod tests {
         state.add_member("did:key:bob".into(), "member".into(), vec![]);
 
         let mut dids: Vec<&str> = state.member_dids().collect();
-        dids.sort();
+        dids.sort_unstable();
         assert_eq!(dids, vec!["did:key:alice", "did:key:bob"]);
     }
 

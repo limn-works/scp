@@ -25,6 +25,7 @@
 //! - [`DiscoveryError`] -- Error type for discovery operations.
 
 pub mod bootstrap;
+pub mod context;
 pub mod did_capabilities;
 
 use std::time::Duration;
@@ -32,6 +33,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub use bootstrap::{BootstrapConfig, BootstrapResolver};
+pub use context::{
+    AgentDeregisterParams, AgentDeregisterResult, AgentRegisterParams, AgentRegisterResult,
+    AgentSearchParams, AgentSearchResult, DiscoveryContext, DiscoveryContextError, MembershipTier,
+    RegistrationEvent, MAX_WRITERS, TOOL_AGENT_DEREGISTER, TOOL_AGENT_REGISTER, TOOL_AGENT_SEARCH,
+};
 pub use did_capabilities::{CapabilityEntry, resolve_capabilities};
 
 // ---------------------------------------------------------------------------

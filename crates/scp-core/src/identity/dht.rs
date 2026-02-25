@@ -1940,7 +1940,7 @@ mod tests {
             event.rotated_at,
         );
         assert!(result.is_ok(), "verify_migration failed: {result:?}");
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
 
         // Also verify self-certification of the new DID.
         let new_pub = custody
@@ -2036,7 +2036,7 @@ mod tests {
             event.rotated_at,
         );
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[tokio::test]
@@ -2084,7 +2084,7 @@ mod tests {
         let did = "did:dht:zTestRotation";
         let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        let mut rotated_doc = doc.clone();
+        let mut rotated_doc = doc;
         rotated_doc.retire_active_key(&[4u8; 32], 1);
 
         // Should have 3 verification methods now.

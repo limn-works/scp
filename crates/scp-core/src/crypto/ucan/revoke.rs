@@ -826,7 +826,7 @@ mod tests {
                 a in arb_revocation_list("ctx-1"),
                 b in arb_revocation_list("ctx-1"),
             ) {
-                let mut first = a.clone();
+                let mut first = a;
                 first.merge(&b);
 
                 let mut second = first.clone();

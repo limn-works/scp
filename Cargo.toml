@@ -6,6 +6,8 @@ members = [
     "crates/scp-transport",
     "crates/scp-testing",
     "crates/scp-mcp",
+    "crates/scp-media",
+    "crates/scp-node",
 ]
 
 [workspace.package]
@@ -36,6 +38,7 @@ aes-gcm = "0.10"
 percent-encoding = "2"
 base64 = "0.22"
 tracing = "0.1"
+lru = "0.12"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

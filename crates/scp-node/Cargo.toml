@@ -1,28 +1,22 @@
 [package]
-name = "scp-transport"
+name = "scp-node"
 version = "0.1.0"
-description = "Transport abstraction layer for SCP (Shareable Context Protocol)"
+description = "Application node composing relay, identity, and HTTP server for SCP"
 edition.workspace = true
 repository.workspace = true
 
 [dependencies]
 scp-core = { path = "../scp-core" }
+scp-transport = { path = "../scp-transport" }
+scp-platform = { path = "../scp-platform" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = { version = "0.24", features = ["connect"] }
-futures = "0.3"
-sha2 = { workspace = true }
-serde = { workspace = true }
-serde_bytes = { workspace = true }
-rmp-serde = { workspace = true }
 tracing = { workspace = true }
-lru = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
-futures = "0.3"
-rmpv = { version = "1", features = ["with-serde"] }
+scp-platform = { path = "../scp-platform", features = ["testing"] }
 
 [lints]
 workspace = true

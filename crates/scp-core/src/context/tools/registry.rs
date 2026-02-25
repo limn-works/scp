@@ -478,7 +478,7 @@ mod tests {
         ])
     }
 
-    /// Creates a ContextRoleState with a creator that has admin (all) capabilities.
+    /// Creates a `ContextRoleState` with a creator that has admin (all) capabilities.
     fn test_role_state(creator_did: &str) -> ContextRoleState {
         ContextRoleState::new(
             "ctx-test",
@@ -489,8 +489,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Creates a ContextRoleState with an additional member that has limited
-    /// capabilities (no ToolRegister).
+    /// Creates a `ContextRoleState` with an additional member that has limited
+    /// capabilities (no `ToolRegister`).
     fn test_role_state_with_member(
         creator_did: &str,
         member_did: &str,
@@ -982,8 +982,8 @@ mod tests {
         // Executor that returns correct results for all operations.
         let executor = |input: &serde_json::Value| -> serde_json::Value {
             let op = input.get("operation").and_then(|v| v.as_str()).unwrap_or("");
-            let a = input.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
-            let b = input.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
+            let a = input.get("a").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let b = input.get("b").and_then(serde_json::Value::as_i64).unwrap_or(0);
             match op {
                 "add" => serde_json::json!({"result": a + b}),
                 "mul" => serde_json::json!({"result": a * b}),

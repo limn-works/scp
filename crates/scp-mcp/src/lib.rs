@@ -8,6 +8,9 @@
 //! - [`namespace`] -- Context namespace parsing (`context_id/tool_name`
 //!   splitting) and built-in tool definitions (`send_message`, `read_messages`,
 //!   `list_members`).
+//! - [`server`] -- MCP server: tool listing with capability filtering, tool
+//!   invocation routing, resource listing/reading/subscriptions, and MCP
+//!   lifecycle handling.
 //!
 //! Any MCP-compatible model (Claude, GPT, Gemini, open-source models) can
 //! participate in SCP contexts without knowing SCP exists -- it sees MCP tools
@@ -19,3 +22,4 @@
 
 pub mod namespace;
 pub mod protocol;
+pub mod server;

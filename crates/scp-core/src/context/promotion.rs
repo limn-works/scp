@@ -416,7 +416,7 @@ mod tests {
         let mut proposal = make_promotable_proposal(3);
         let result = record_consent(&mut proposal, "did:key:bob".to_owned(), true);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert_eq!(proposal.consent_count(), 2);
         assert!(proposal.has_consented("did:key:bob"));
     }
@@ -429,7 +429,7 @@ mod tests {
         // Second consent from the same member returns false (already recorded).
         let result = record_consent(&mut proposal, "did:key:bob".to_owned(), true);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
         assert_eq!(proposal.consent_count(), 2);
     }
 

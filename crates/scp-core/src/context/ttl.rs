@@ -790,14 +790,14 @@ mod tests {
 
     fn role_state_with_close_capability(context_id: &str, creator_did: &str) -> ContextRoleState {
         let ceiling = CapabilityCeiling::new(
-            [Capability::MessagesRead, Capability::MessagesWrite, Capability::ContextClose, Capability::RoleAssign].into_iter(),
+            [Capability::MessagesRead, Capability::MessagesWrite, Capability::ContextClose, Capability::RoleAssign],
         );
         ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
     }
 
     fn role_state_without_close_capability(context_id: &str, creator_did: &str) -> ContextRoleState {
         let ceiling = CapabilityCeiling::new(
-            [Capability::MessagesRead, Capability::MessagesWrite].into_iter(),
+            [Capability::MessagesRead, Capability::MessagesWrite],
         );
         ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
     }

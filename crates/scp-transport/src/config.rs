@@ -289,13 +289,11 @@ impl ResolveRelays for DefaultRelayResolver {
             }
 
             // Level 3: .well-known/scp from bootstrap_domain.
-            if let Some(domain) = &self.config.bootstrap_domain {
-                if let Some(fetcher) = &self.well_known_fetcher {
-                    if let Some(url) = fetcher(domain).await {
+            if let Some(domain) = &self.config.bootstrap_domain
+                && let Some(fetcher) = &self.well_known_fetcher
+                    && let Some(url) = fetcher(domain).await {
                         return Ok(vec![url]);
                     }
-                }
-            }
 
             // Level 4: Peer relay discovery from shared contexts.
             if let Some(provider) = &self.peer_provider {

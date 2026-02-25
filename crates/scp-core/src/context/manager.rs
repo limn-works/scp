@@ -1219,7 +1219,7 @@ mod tests {
     // Send message tests
     // -----------------------------------------------------------------------
 
-    /// Unit test: send_message rejects when context is not Active.
+    /// Unit test: `send_message` rejects when context is not Active.
     #[tokio::test]
     async fn send_message_rejects_when_context_not_active() {
         let (manager, handle) = setup_active_context().await;
@@ -1236,7 +1236,7 @@ mod tests {
         ));
     }
 
-    /// Unit test: send_message validates UCAN before sending.
+    /// Unit test: `send_message` validates UCAN before sending.
     #[tokio::test]
     async fn send_message_validates_ucan_before_sending() {
         let (manager, handle) = setup_active_context().await;

@@ -348,7 +348,7 @@ mod seal_open_tests {
     }
 
     /// Sets up Alice and Bob in a shared MLS group.
-    /// Returns (alice_group, bob_group).
+    /// Returns (`alice_group`, `bob_group`).
     fn setup_mls_groups() -> (ScpMlsGroup, ScpMlsGroup) {
         let alice_cred = test_credential("alice");
         let mut alice_group = create_group(&alice_cred).unwrap();

@@ -275,7 +275,7 @@ mod tests {
     use super::*;
     use crate::event_log::EventPayload;
 
-    /// Creates a test event with the given parameters. Signature and prev_hash
+    /// Creates a test event with the given parameters. Signature and `prev_hash`
     /// are set to dummy values since `evaluate_consequence_rules` does not
     /// verify signatures.
     fn make_event(

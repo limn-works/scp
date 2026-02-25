@@ -326,8 +326,8 @@ where
 
     // 2. Check rate limit.
     #[allow(clippy::cast_possible_truncation)]
-    if let Some(ref mut rate_limit) = interface.rate_limit {
-        if !rate_limit.check_and_increment() {
+    if let Some(ref mut rate_limit) = interface.rate_limit
+        && !rate_limit.check_and_increment() {
             // Window durations are always far below u64::MAX milliseconds.
             let window_ms = rate_limit.window.as_millis() as u64;
             return Err(ToolError::InterfaceRateLimited {
@@ -335,7 +335,6 @@ where
                 window_ms,
             });
         }
-    }
 
     // 3. Source context governance: invoker must have tool invoke capability.
     if !super::invoke::has_tool_invoke_capability(

@@ -1130,7 +1130,7 @@ mod tests {
     fn context_role_state_new_creates_with_builtins() {
         let ceiling = test_ceiling();
         let state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling.clone(), vec![]).unwrap();
+            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
 
         // Creator is a member.
         assert!(state.members.contains("did:dht:creator"));

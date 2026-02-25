@@ -8,13 +8,13 @@
 //!
 //! 1. **Parse** — Decode JWT-format UCAN token.
 //! 2. **Signature** — Verify Ed25519 signature.
-//! 3. **Chain** — Verify delegation chain integrity (Phase 3 tests).
+//! 3. **Chain** — Verify delegation chain integrity.
 //! 4. **Root issuer** — Verify root token's `iss` is the context creator.
 //! 5. **Audience** — Verify `aud` matches the presenting agent.
 //! 6. **Capability match** — Verify `att` includes required capability.
-//! 7. **Attenuation** — Verify delegations narrow or preserve (Phase 3 tests).
+//! 7. **Attenuation** — Verify delegations narrow or preserve.
 //! 8. **Ceiling** — Verify capability is within context ceiling.
-//! 9. **Nonce** — Validate format, freshness, uniqueness (Phase 3 tests).
+//! 9. **Nonce** — Validate format, freshness, uniqueness.
 //! 10. **Revocation** — Verify token CID not in revocation list.
 //! 11. **Expiry** — Verify `exp > now` and `nbf <= now`.
 //!
@@ -28,6 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::Verifier;
 
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
+use super::mint::compute_cid;
 use super::{UcanError, UcanHeader, UcanPayload, UcanToken};
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
@@ -35,6 +36,9 @@ const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
 const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
+
+/// Maximum delegation chain depth to prevent infinite loops.
+const MAX_CHAIN_DEPTH: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Trait abstractions for external state
@@ -83,8 +87,8 @@ pub trait RevocationChecker {
 
 /// Resolves a proof CID to a parent UCAN token.
 ///
-/// Used for delegation chain verification (step 3). For Phase 2, this can be
-/// a no-op (empty proof chains). Phase 3 adds full chain resolution.
+/// Used for delegation chain verification (step 3). Implementations look up
+/// previously-stored UCAN tokens by their content identifier (CID).
 pub trait ProofResolver {
     /// Resolves a proof CID to a parent UCAN token.
     ///
@@ -229,6 +233,40 @@ impl ProofResolver for NoOpProofResolver {
     }
 }
 
+/// In-memory [`ProofResolver`] backed by a `HashMap`.
+///
+/// Maps proof CIDs to their corresponding [`UcanToken`]s. Used for testing
+/// and for delegation chain verification.
+pub struct InMemoryProofResolver {
+    /// Map of proof CID to the resolved UCAN token.
+    pub proofs: std::collections::HashMap<String, UcanToken>,
+}
+
+impl InMemoryProofResolver {
+    /// Creates a new empty proof resolver.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            proofs: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for InMemoryProofResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProofResolver for InMemoryProofResolver {
+    fn resolve_proof(&self, cid: &str) -> Result<UcanToken, UcanError> {
+        self.proofs
+            .get(cid)
+            .cloned()
+            .ok_or_else(|| UcanError::DelegationChainBroken(format!("proof CID not found: {cid}")))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
@@ -332,14 +370,14 @@ fn now_secs() -> u64 {
 ///
 /// 1. Parse JWT-format UCAN token.
 /// 2. Verify Ed25519 signature over `base64url(header).base64url(payload)`.
-/// 3. Chain verification (delegation proofs).
+/// 3. Chain verification (delegation proofs) — recurse to root.
 /// 4. Verify root issuer is context creator DID.
 /// 5. Verify audience matches presenting agent DID.
 /// 6. Verify token's `att` includes required capability.
 /// 7. Attenuation verification (delegation narrows only).
 /// 8. Verify capability is within context ceiling.
 /// 9. Nonce validation (format, freshness, uniqueness).
-/// 10. Revocation check.
+/// 10. Revocation check (token CID not in revocation list).
 /// 11. Expiry verification (`exp > now`, `nbf <= now`, `exp <= now + 24h`).
 ///
 /// # Errors
@@ -366,20 +404,15 @@ where
     verify_signature(token, ctx.did_resolver)?;
 
     // Step 3: Chain verification (delegation proofs).
-    // For root tokens (empty prf), this is a no-op.
-    verify_delegation_chain(token, ctx.did_resolver, ctx.proof_resolver)?;
+    // Verifies signatures on all parent tokens, aud/iss linkage, and
+    // returns the root issuer DID.
+    let root_issuer = verify_delegation_chain(token, ctx.did_resolver, ctx.proof_resolver)?;
 
-    // Step 4: Root issuer — verify issuer is context creator.
-    // For root tokens (empty prf), the token's iss is the root issuer.
-    // For delegated tokens, Phase 3 will walk the chain to the root.
-    // Phase 2: only root tokens (empty prf) are expected, so iss is always
-    // the root issuer.
-    let root_issuer = &token.payload.iss;
-
+    // Step 4: Root issuer — verify root token's iss is context creator.
     if root_issuer != ctx.context_creator_did {
         return Err(UcanError::InvalidIssuer {
             expected: ctx.context_creator_did.to_owned(),
-            actual: root_issuer.to_owned(),
+            actual: root_issuer,
         });
     }
 
@@ -402,7 +435,6 @@ where
 
     // Step 7: Attenuation — verify delegations narrow or preserve.
     // For root tokens (empty prf), this is a no-op.
-    // Phase 3 adds full attenuation verification for delegation chains.
     if !token.payload.prf.is_empty() {
         verify_attenuation(token, ctx.proof_resolver)?;
     }
@@ -415,9 +447,9 @@ where
         .check_and_record(&token.payload.nnc, token.payload.exp)?;
 
     // Step 10: Revocation — verify token CID not revoked.
-    // Use the encoded token as the CID (content identifier).
-    if ctx.revocation_checker.is_revoked(&token.encoded) {
-        return Err(UcanError::TokenRevoked(token.encoded.clone()));
+    let token_cid = compute_cid(token);
+    if ctx.revocation_checker.is_revoked(&token_cid) {
+        return Err(UcanError::TokenRevoked(token_cid));
     }
 
     // Step 11: Expiry — verify exp > now and nbf <= now.
@@ -530,20 +562,53 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
 
 /// Step 3: Verify delegation chain integrity.
 ///
-/// For each proof CID in `prf`, resolves the parent UCAN and verifies that
-/// the parent's `aud` matches this token's `iss`. For root tokens (empty `prf`),
-/// this is a no-op.
+/// For each proof CID in `prf`, resolves the parent UCAN, verifies its
+/// signature, and verifies that the parent's `aud` matches this token's `iss`.
+/// Recurses up the chain until reaching a root token (empty `prf`).
 ///
-/// Phase 2 only tests root tokens. Phase 3 adds full chain resolution.
+/// Returns the root issuer DID (the `iss` of the root token at the top of the
+/// chain). For root tokens (empty `prf`), returns the token's own `iss`.
 ///
 /// # Errors
 ///
 /// Returns [`UcanError::DelegationChainBroken`] if any link is invalid.
+/// Returns [`UcanError::SignatureInvalid`] if any parent signature is invalid.
 fn verify_delegation_chain(
     token: &UcanToken,
-    _did_resolver: &impl DidResolver,
+    did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
-) -> Result<(), UcanError> {
+) -> Result<String, UcanError> {
+    if token.payload.prf.is_empty() {
+        return Ok(token.payload.iss.clone());
+    }
+
+    verify_chain_recursive(token, did_resolver, proof_resolver, 0)
+}
+
+/// Recursive helper for delegation chain verification.
+///
+/// Walks the proof chain from child to root, verifying signatures and
+/// `aud`/`iss` linkage at each step. Returns the root issuer DID.
+fn verify_chain_recursive(
+    token: &UcanToken,
+    did_resolver: &impl DidResolver,
+    proof_resolver: &impl ProofResolver,
+    depth: usize,
+) -> Result<String, UcanError> {
+    if depth > MAX_CHAIN_DEPTH {
+        return Err(UcanError::DelegationChainBroken(
+            "delegation chain exceeds maximum depth".to_owned(),
+        ));
+    }
+
+    // For root tokens (no proofs), the issuer is the root.
+    if token.payload.prf.is_empty() {
+        return Ok(token.payload.iss.clone());
+    }
+
+    // Track the root issuer found. All proof chains must converge to the same root.
+    let mut root_issuer: Option<String> = None;
+
     for proof_cid in &token.payload.prf {
         let parent = proof_resolver.resolve_proof(proof_cid)?;
 
@@ -554,14 +619,34 @@ fn verify_delegation_chain(
                 parent.payload.aud, token.payload.iss
             )));
         }
+
+        // Verify parent's signature.
+        verify_signature(&parent, did_resolver)?;
+
+        // Recurse to find the root.
+        let found_root = verify_chain_recursive(&parent, did_resolver, proof_resolver, depth + 1)?;
+
+        // All proof chains must converge to the same root issuer.
+        if let Some(ref existing_root) = root_issuer {
+            if *existing_root != found_root {
+                return Err(UcanError::DelegationChainBroken(format!(
+                    "divergent root issuers: '{existing_root}' and '{found_root}'"
+                )));
+            }
+        } else {
+            root_issuer = Some(found_root);
+        }
     }
-    Ok(())
+
+    root_issuer.ok_or_else(|| {
+        UcanError::DelegationChainBroken("empty proof chain with no root issuer".to_owned())
+    })
 }
 
 /// Step 7: Verify attenuation — each delegation narrows or preserves capabilities.
 ///
 /// A child token cannot grant capabilities that its parent does not have.
-/// For Phase 2 (root tokens only), this is a no-op.
+/// For root tokens (empty `prf`), this is a no-op.
 ///
 /// # Errors
 ///
@@ -636,7 +721,7 @@ fn verify_expiry(token: &UcanToken) -> Result<(), UcanError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::crypto::ucan::mint::{MintParams, mint_ucan};
+    use crate::crypto::ucan::mint::{MintParams, compute_cid, mint_ucan};
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
 
@@ -660,7 +745,8 @@ mod tests {
         (custody, handle, did, pk_bytes)
     }
 
-    /// Build a [`ValidationContext`] with in-memory implementations.
+    /// Build a [`ValidationContext`] with in-memory implementations and
+    /// [`NoOpProofResolver`].
     fn build_context<'a, S: BuildHasher>(
         did_resolver: &'a InMemoryDidResolver,
         nonce_tracker: &'a mut InMemoryNonceTracker,
@@ -681,6 +767,35 @@ mod tests {
             nonce_tracker,
             revocation_checker,
             proof_resolver: &NoOpProofResolver,
+            ceiling,
+            context_creator_did,
+            presenting_agent_did,
+        }
+    }
+
+    /// Build a [`ValidationContext`] with an [`InMemoryProofResolver`] for
+    /// delegation chain tests.
+    fn build_context_with_proofs<'a, S: BuildHasher>(
+        did_resolver: &'a InMemoryDidResolver,
+        nonce_tracker: &'a mut InMemoryNonceTracker,
+        revocation_checker: &'a InMemoryRevocationChecker,
+        proof_resolver: &'a InMemoryProofResolver,
+        ceiling: &'a HashSet<String, S>,
+        context_creator_did: &'a str,
+        presenting_agent_did: &'a str,
+    ) -> ValidationContext<
+        'a,
+        InMemoryDidResolver,
+        InMemoryNonceTracker,
+        InMemoryRevocationChecker,
+        InMemoryProofResolver,
+        S,
+    > {
+        ValidationContext {
+            did_resolver,
+            nonce_tracker,
+            revocation_checker,
+            proof_resolver,
             ceiling,
             context_creator_did,
             presenting_agent_did,
@@ -819,6 +934,231 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Step 3: Delegation chain verification
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_ucan_accepts_delegated_token() {
+        use crate::crypto::ucan::Attenuation;
+        use crate::crypto::ucan::mint::DelegateParams;
+
+        // Creator (root issuer)
+        let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+        // Delegator (receives from creator, delegates to agent)
+        let (custody_delegator, key_delegator, delegator_did, pk_delegator) =
+            setup_identity().await;
+        // Agent (final audience)
+        let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned(), "messages:read".to_owned()];
+
+        // Creator mints root token to delegator.
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &creator_did,
+                issuer_key: &key_creator,
+                audience_did: &delegator_did,
+                context_id: "ctx-chain",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_creator,
+        )
+        .await
+        .unwrap();
+
+        let root_cid = compute_cid(&root_token);
+
+        // Delegator delegates to agent (narrowing to just write).
+        let delegated_token = crate::crypto::ucan::mint::delegate_ucan(
+            &DelegateParams {
+                parent_token: &root_token,
+                delegator_did: &delegator_did,
+                delegator_key: &key_delegator,
+                delegatee_did: &agent_did,
+                attenuated_capabilities: &[Attenuation {
+                    with: "scp:ctx:ctx-chain/messages:write".to_owned(),
+                    can: "write".to_owned(),
+                }],
+                lifetime_secs: 1800,
+                facts: None,
+            },
+            &custody_delegator,
+        )
+        .await
+        .unwrap();
+
+        // Build resolver with both keys.
+        let resolver = InMemoryDidResolver {
+            keys: [
+                (creator_did.clone(), pk_creator),
+                (delegator_did.clone(), pk_delegator),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
+
+        let mut ctx = build_context_with_proofs(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &creator_did,
+            &agent_did,
+        );
+
+        let result = validate_ucan(&delegated_token, &required_cap, &mut ctx);
+        assert!(
+            result.is_ok(),
+            "delegated token must pass validation: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_rejects_broken_chain_aud_iss_mismatch() {
+        let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+        let (_custody_a, _key_a, did_a, _pk_a) = setup_identity().await;
+        let (custody_b, key_b, did_b, pk_b) = setup_identity().await;
+        let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned()];
+
+        // Root token: creator -> A.
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &creator_did,
+                issuer_key: &key_creator,
+                audience_did: &did_a,
+                context_id: "ctx-chain",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_creator,
+        )
+        .await
+        .unwrap();
+
+        let root_cid = compute_cid(&root_token);
+
+        // B tries to delegate from root_token, but root_token.aud = A, not B.
+        // Manually construct a bad token by minting with proofs.
+        let bad_delegated = mint_ucan(
+            &MintParams {
+                issuer_did: &did_b,
+                issuer_key: &key_b,
+                audience_did: &agent_did,
+                context_id: "ctx-chain",
+                capabilities: &caps,
+                lifetime_secs: 1800,
+                not_before: None,
+                proofs: vec![root_cid.clone()],
+                facts: None,
+            },
+            &custody_b,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [(creator_did.clone(), pk_creator), (did_b.clone(), pk_b)]
+                .into_iter()
+                .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
+
+        let mut ctx = build_context_with_proofs(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &creator_did,
+            &agent_did,
+        );
+
+        let result = validate_ucan(&bad_delegated, &required_cap, &mut ctx);
+        assert!(
+            matches!(result, Err(UcanError::DelegationChainBroken(_))),
+            "broken chain (aud/iss mismatch) must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_rejects_unresolvable_proof() {
+        let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        // Mint a token with a non-existent proof CID.
+        let token = mint_ucan(
+            &MintParams {
+                issuer_did: &issuer_did,
+                issuer_key: &key_handle,
+                audience_did: "did:dht:z6MkMember",
+                context_id: "ctx-test",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec!["bafyrei-nonexistent".to_owned()],
+                facts: None,
+            },
+            &custody,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver::new();
+
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
+
+        let mut ctx = build_context_with_proofs(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            matches!(result, Err(UcanError::DelegationChainBroken(_))),
+            "unresolvable proof CID must be rejected: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Step 4: Root issuer
     // -----------------------------------------------------------------------
 
@@ -864,6 +1204,95 @@ mod tests {
         assert!(
             matches!(result, Err(UcanError::InvalidIssuer { .. })),
             "wrong issuer must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_rejects_wrong_root_issuer_in_chain() {
+        use crate::crypto::ucan::Attenuation;
+        use crate::crypto::ucan::mint::DelegateParams;
+
+        // Non-creator mints the root. The context creator is different.
+        let (custody_non_creator, key_non_creator, non_creator_did, pk_non_creator) =
+            setup_identity().await;
+        let (custody_delegator, key_delegator, delegator_did, pk_delegator) =
+            setup_identity().await;
+        let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned()];
+
+        // Root token: non_creator -> delegator.
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &non_creator_did,
+                issuer_key: &key_non_creator,
+                audience_did: &delegator_did,
+                context_id: "ctx-chain",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_non_creator,
+        )
+        .await
+        .unwrap();
+
+        let root_cid = compute_cid(&root_token);
+
+        // Delegator -> agent.
+        let delegated_token = crate::crypto::ucan::mint::delegate_ucan(
+            &DelegateParams {
+                parent_token: &root_token,
+                delegator_did: &delegator_did,
+                delegator_key: &key_delegator,
+                delegatee_did: &agent_did,
+                attenuated_capabilities: &[Attenuation {
+                    with: "scp:ctx:ctx-chain/messages:write".to_owned(),
+                    can: "write".to_owned(),
+                }],
+                lifetime_secs: 1800,
+                facts: None,
+            },
+            &custody_delegator,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [
+                (non_creator_did.clone(), pk_non_creator),
+                (delegator_did.clone(), pk_delegator),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
+
+        // The context creator is "did:dht:z6MkRealCreator" -- not non_creator.
+        let mut ctx = build_context_with_proofs(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            "did:dht:z6MkRealCreator",
+            &agent_did,
+        );
+
+        let result = validate_ucan(&delegated_token, &required_cap, &mut ctx);
+        assert!(
+            matches!(result, Err(UcanError::InvalidIssuer { .. })),
+            "wrong root issuer in chain must be rejected: {result:?}"
         );
     }
 
@@ -965,6 +1394,143 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn validate_ucan_accepts_wildcard_capability_grant() {
+        let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+
+        // Mint with wildcard context_id "*" to produce scp:ctx:*/messages:write.
+        let caps = vec!["messages:write".to_owned()];
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "*",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Verify the attenuation uses wildcard context.
+        assert_eq!(token.payload.att[0].with, "scp:ctx:*/messages:write");
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+
+        // Request specific context capability -- wildcard should match.
+        let required_cap = CapabilityUri::new("ctx-specific", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            result.is_ok(),
+            "wildcard capability must match specific context: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 7: Attenuation verification
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_ucan_rejects_widened_capabilities_in_delegation() {
+        // Creator grants read-only. Delegator tries to delegate write.
+        let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+        let (custody_delegator, key_delegator, delegator_did, pk_delegator) =
+            setup_identity().await;
+        let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+        let caps = vec!["messages:read".to_owned()]; // Only read.
+
+        // Root token: creator -> delegator (read only).
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &creator_did,
+                issuer_key: &key_creator,
+                audience_did: &delegator_did,
+                context_id: "ctx-att",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_creator,
+        )
+        .await
+        .unwrap();
+
+        let root_cid = compute_cid(&root_token);
+
+        // Manually construct a delegated token that WIDENS to write.
+        // (delegate_ucan would reject this, so we mint directly with proofs.)
+        let bad_token = mint_ucan(
+            &MintParams {
+                issuer_did: &delegator_did,
+                issuer_key: &key_delegator,
+                audience_did: &agent_did,
+                context_id: "ctx-att",
+                capabilities: &["messages:write".to_owned()], // Widened!
+                lifetime_secs: 1800,
+                not_before: None,
+                proofs: vec![root_cid.clone()],
+                facts: None,
+            },
+            &custody_delegator,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [
+                (creator_did.clone(), pk_creator),
+                (delegator_did.clone(), pk_delegator),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-att", "messages", "write");
+
+        let mut ctx = build_context_with_proofs(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &creator_did,
+            &agent_did,
+        );
+
+        let result = validate_ucan(&bad_token, &required_cap, &mut ctx);
+        assert!(
+            matches!(result, Err(UcanError::AttenuationViolation(_))),
+            "widened delegation must be rejected: {result:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Step 8: Ceiling
     // -----------------------------------------------------------------------
@@ -1018,6 +1584,65 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Step 9: Nonce
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_ucan_rejects_nonce_replay() {
+        let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-nonce",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-nonce", "messages", "write");
+
+        // First validation should succeed.
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(result.is_ok(), "first validation must pass: {result:?}");
+
+        // Second validation with same token should fail (nonce replay).
+        let mut ctx2 = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+        let result2 = validate_ucan(&token, &required_cap, &mut ctx2);
+        assert!(
+            matches!(result2, Err(UcanError::NonceReused(_))),
+            "nonce replay must be rejected: {result2:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Step 10: Revocation
     // -----------------------------------------------------------------------
 
@@ -1045,9 +1670,9 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
-        // Add the token to the revocation list.
+        // Add the token's CID to the revocation list.
         let mut revocation_checker = InMemoryRevocationChecker::new();
-        revocation_checker.revoked.insert(token.encoded.clone());
+        revocation_checker.revoked.insert(compute_cid(&token));
 
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -1065,6 +1690,54 @@ mod tests {
         assert!(
             matches!(result, Err(UcanError::TokenRevoked(_))),
             "revoked token must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_revocation_uses_compute_cid() {
+        let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-cid",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token_cid = compute_cid(&token);
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+
+        // Revoke using compute_cid.
+        let mut revocation_checker = InMemoryRevocationChecker::new();
+        revocation_checker.revoked.insert(token_cid.clone());
+
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-cid", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            matches!(result, Err(UcanError::TokenRevoked(ref cid)) if cid == &token_cid),
+            "token revoked by compute_cid must be rejected: {result:?}"
         );
     }
 
@@ -1350,5 +2023,149 @@ mod tests {
             result.is_ok(),
             "stateless validation should pass: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Full pipeline: mint -> delegate -> parse -> validate
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn full_pipeline_mint_delegate_parse_validate() {
+        use crate::crypto::ucan::Attenuation;
+        use crate::crypto::ucan::mint::DelegateParams;
+
+        let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+        let (custody_delegator, key_delegator, delegator_did, pk_delegator) =
+            setup_identity().await;
+
+        let caps = vec![
+            "messages:write".to_owned(),
+            "messages:read".to_owned(),
+            "tool_invoke:assistant".to_owned(),
+        ];
+
+        // Creator mints root.
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &creator_did,
+                issuer_key: &key_creator,
+                audience_did: &delegator_did,
+                context_id: "ctx-full",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_creator,
+        )
+        .await
+        .unwrap();
+
+        let root_cid = compute_cid(&root_token);
+
+        // Delegator narrows to read + write.
+        let delegated = crate::crypto::ucan::mint::delegate_ucan(
+            &DelegateParams {
+                parent_token: &root_token,
+                delegator_did: &delegator_did,
+                delegator_key: &key_delegator,
+                delegatee_did: "did:dht:z6MkAgent",
+                attenuated_capabilities: &[
+                    Attenuation {
+                        with: "scp:ctx:ctx-full/messages:write".to_owned(),
+                        can: "write".to_owned(),
+                    },
+                    Attenuation {
+                        with: "scp:ctx:ctx-full/messages:read".to_owned(),
+                        can: "read".to_owned(),
+                    },
+                ],
+                lifetime_secs: 1800,
+                facts: None,
+            },
+            &custody_delegator,
+        )
+        .await
+        .unwrap();
+
+        // Parse from encoded form.
+        let parsed = parse_ucan(&delegated.encoded).unwrap();
+        assert_eq!(parsed.payload.iss, delegator_did);
+        assert_eq!(parsed.payload.aud, "did:dht:z6MkAgent");
+        assert_eq!(parsed.payload.att.len(), 2);
+
+        // Validate.
+        let resolver = InMemoryDidResolver {
+            keys: [
+                (creator_did.clone(), pk_creator),
+                (delegator_did.clone(), pk_delegator),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-full", "messages", "write");
+
+        let mut ctx = build_context_with_proofs(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &creator_did,
+            "did:dht:z6MkAgent",
+        );
+
+        let result = validate_ucan(&parsed, &required_cap, &mut ctx);
+        assert!(
+            result.is_ok(),
+            "full pipeline (mint -> delegate -> parse -> validate) must pass: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // InMemoryProofResolver tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn in_memory_proof_resolver_rejects_missing_cid() {
+        let resolver = InMemoryProofResolver::new();
+        let result = resolver.resolve_proof("bafyrei-missing");
+        assert!(matches!(result, Err(UcanError::DelegationChainBroken(_))));
+    }
+
+    #[test]
+    fn in_memory_proof_resolver_returns_stored_token() {
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: 1_700_000_000,
+                nbf: None,
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: "test.encoded.token".to_owned(),
+        };
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver
+            .proofs
+            .insert("bafyrei-test".to_owned(), token.clone());
+
+        let result = proof_resolver.resolve_proof("bafyrei-test").unwrap();
+        assert_eq!(result, token);
     }
 }

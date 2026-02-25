@@ -261,7 +261,7 @@ mod tests {
     use crate::event_log::EventPayload;
 
     /// Creates a test event with the given parameters. The signature and
-    /// prev_hash are set to dummy values since `compute_behavioral_record`
+    /// `prev_hash` are set to dummy values since `compute_behavioral_record`
     /// does not verify signatures.
     fn make_event(
         event_type: EventType,

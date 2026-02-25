@@ -576,7 +576,7 @@ mod tests {
         }
     }
 
-    /// Creates a test signing key and returns (signing_key, verifying_key_bytes).
+    /// Creates a test signing key and returns (`signing_key`, `verifying_key_bytes`).
     fn test_keypair() -> (SigningKey, Vec<u8>) {
         let mut rng = rand::rngs::OsRng;
         let signing_key = SigningKey::generate(&mut rng);
