@@ -29,7 +29,7 @@ SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure p
 - **Artifacts are the system of record.** All knowledge — decisions, patterns, constraints, product context — lives in-repo as discoverable artifacts. If an agent can't find it, it doesn't exist.
 - **Root-cause orientation.** Bugs come from poor decisions upstream. Treat them first as architecture flaws, second as local defects. Don't patch around bad foundations — fix or replace them.
 - **No shortcuts.** The best solution is the right one. No force unwraps, no placeholder implementations, no "good enough." Ship excellent, complete, production-ready code.
-- **Provenance is paramount.** Every line of code must trace back to a documented decision. Typically this will be: source(s) in ~/.docs/ > story in .loom/prd.json. But it may be more complex, involving comments in GitHub or feature-local .docs/ artifacts. No matter how long the chain, provenance must be maintained so that full context is retraceable for every line of code, and fresh agents with no memory can obtain it quickly and easily.
+- **Provenance is paramount.** Every line of code must trace back to a documented decision. Typically this will be: source(s) in ~/.docs/ > story in .docs/prds/. But it may be more complex, involving comments in GitHub or feature-local .docs/ artifacts. No matter how long the chain, provenance must be maintained so that full context is retraceable for every line of code, and fresh agents with no memory can obtain it quickly and easily.
 
 ## Rules
 
