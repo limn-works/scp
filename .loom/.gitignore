@@ -7,4 +7,5 @@ logs/
 .header
 .header-pane.sh
 .iter_state
+.plugin_root
 *.log

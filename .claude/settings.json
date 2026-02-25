@@ -1,83 +1,5 @@
 {
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Task",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/background-tasks.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/bash-guard.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "EnterPlanMode",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/block-interactive.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "AskUserQuestion",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/block-interactive.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "TaskOutput",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/block-task-output.sh"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/status-kill.sh"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/stop-guard.sh"
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/subagent-stop-guard.sh"
-          }
-        ]
-      }
-    ],
     "PreCompact": [
       {
         "hooks": [
@@ -95,16 +17,6 @@
           {
             "type": "command",
             "command": "echo 'IMPORTANT: Context was just compacted. Proactively save important conversation context to the vestige memory MCP — architectural decisions, design discussions, key insights, implementation details, and task progress — using session_checkpoint or smart_ingest. Be liberal; losing important context is worse than saving too much.'"
-          }
-        ]
-      }
-    ],
-    "SubagentStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".loom/hooks/subagent-recall.sh"
           }
         ]
       }
