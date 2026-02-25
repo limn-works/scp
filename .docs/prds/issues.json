@@ -1,0 +1,1809 @@
+{
+  "project": "scp",
+  "description": "Execution PRD for 58 open GitHub issues from PR #4 red team security review and PR #8 defensive architecture review. Triaged into 49 atomic stories across 4 gates.",
+  "gates": [
+    {
+      "id": "gate-sec-critical",
+      "name": "Critical Security Fixes",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-163",
+        "SCP-164",
+        "SCP-165",
+        "SCP-166",
+        "SCP-167",
+        "SCP-168",
+        "SCP-169",
+        "SCP-170",
+        "SCP-171",
+        "SCP-172"
+      ]
+    },
+    {
+      "id": "gate-sec-medium",
+      "name": "Medium-Severity Security Fixes",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-173",
+        "SCP-174",
+        "SCP-175",
+        "SCP-176",
+        "SCP-177",
+        "SCP-178",
+        "SCP-179",
+        "SCP-180",
+        "SCP-181",
+        "SCP-182",
+        "SCP-183"
+      ]
+    },
+    {
+      "id": "gate-correctness",
+      "name": "Correctness and Robustness",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-184",
+        "SCP-185",
+        "SCP-186",
+        "SCP-187",
+        "SCP-188",
+        "SCP-189",
+        "SCP-190"
+      ]
+    },
+    {
+      "id": "gate-harden",
+      "name": "Hardening, Cleanup, and Architecture",
+      "priority": "P2",
+      "status": "pending",
+      "stories": [
+        "SCP-191",
+        "SCP-192",
+        "SCP-193",
+        "SCP-194",
+        "SCP-195",
+        "SCP-196",
+        "SCP-197",
+        "SCP-198",
+        "SCP-199",
+        "SCP-200",
+        "SCP-201",
+        "SCP-202",
+        "SCP-203",
+        "SCP-204",
+        "SCP-205",
+        "SCP-206",
+        "SCP-207",
+        "SCP-208",
+        "SCP-209",
+        "SCP-210",
+        "SCP-211"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-163",
+      "title": "Wire sender key encryption into envelope seal/open pipeline",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/envelope/outer.rs",
+        "crates/scp-core/src/envelope/mod.rs",
+        "crates/scp-core/src/crypto/sender_keys/encrypt.rs",
+        "crates/scp-core/src/crypto/sender_keys/mod.rs"
+      ],
+      "description": "The envelope seal/open path goes directly from inner envelope to MLS encryption, skipping the sender key AES-256-GCM layer specified in ADR-002. The sender key module is fully implemented but not wired into the envelope pipeline. This means the per-sender forward secrecy layer is absent.",
+      "acceptanceCriteria": [
+        "seal_envelope() applies encrypt_sender_layer() to the serialized inner envelope bytes BEFORE passing them to MLS encrypt()",
+        "open_envelope() applies decrypt_sender_layer() to the MLS-decrypted bytes BEFORE deserializing the inner envelope",
+        "seal_envelope() accepts a SenderKey parameter for the sender's current sender key",
+        "open_envelope() accepts a SenderKey parameter for the sender's current sender key",
+        "Existing seal/open roundtrip tests pass with sender key layer integrated",
+        "New test confirms that ciphertext produced by seal_envelope cannot be opened without the correct sender key even if MLS decryption succeeds",
+        "New test confirms tampered sender-key ciphertext is rejected with SenderKeyError::AuthenticationFailed before inner envelope deserialization is attempted"
+      ],
+      "actionItems": [
+        "Add SenderKey import from crate::crypto::sender_keys to outer.rs",
+        "Modify seal_envelope() signature to accept sender_key: &SenderKey parameter",
+        "In seal_envelope(), after serializing inner envelope, insert sender key encryption step before MLS encrypt()",
+        "Pass the sender-key-encrypted bytes (not raw serialized bytes) to MLS encrypt()",
+        "Modify open_envelope() signature to accept sender_key: &SenderKey parameter",
+        "In open_envelope(), after MLS decrypt, insert sender key decryption step before deserializing inner envelope",
+        "Add EnvelopeError variants for sender key encryption/decryption failures",
+        "Update all existing seal/open tests to pass a SenderKey to both functions",
+        "Add test: seal with sender key A, attempt open with sender key B \u2014 must fail"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/35"
+      ],
+      "details": {
+        "currentPipeline": "seal: serialize(inner) -> MLS_encrypt -> outer | open: MLS_decrypt -> deserialize(inner) -> verify",
+        "correctPipeline": "seal: serialize(inner) -> sender_key_encrypt -> MLS_encrypt -> outer | open: MLS_decrypt -> sender_key_decrypt -> deserialize(inner) -> verify",
+        "adrReference": "ADR-002 specifies the sender-side AES-256-GCM key layer between serialization and MLS encryption. ADR-007 specifies the pull-based sender key distribution protocol."
+      }
+    },
+    {
+      "id": "SCP-164",
+      "title": "Fix finalize_close key destruction ordering",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/close.rs"
+      ],
+      "description": "`finalize_close` destroys cryptographic keys before verifying the state transition from `Closing` to `Closed` is valid. If the transition fails, key material is already irreversibly destroyed.",
+      "acceptanceCriteria": [
+        "finalize_close() validates the Closing -> Closed state transition BEFORE destroying any key material",
+        "If the state transition validation fails, no key material is destroyed and the original error is returned",
+        "If key destruction fails after a successful state transition, the error is returned and the context state reflects the failure",
+        "New test confirms that calling finalize_close() on a context not in Closing state returns an error AND does not destroy keys",
+        "New test confirms that calling finalize_close() on a Closing context succeeds and destroys keys in the correct order"
+      ],
+      "actionItems": [
+        "In finalize_close(), move the state transition validation to execute BEFORE the key destruction call",
+        "Add guard clause returning ContextError if current state is not Closing",
+        "Only after state transition is validated, proceed to key destruction",
+        "Add test: call finalize_close() on Active context \u2014 must return error, keys intact",
+        "Add test: call finalize_close() on Closing context \u2014 must succeed, keys destroyed"
+      ],
+      "blockedBy": [
+        "SCP-168"
+      ],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/57"
+      ],
+      "details": {
+        "currentOrdering": "1. Destroy keys 2. Validate state transition 3. Emit event",
+        "correctOrdering": "1. Validate state transition 2. Destroy keys 3. Emit event",
+        "irreversibility": "Key destruction is irreversible \u2014 once zeroized, encrypted content becomes permanently unreadable."
+      }
+    },
+    {
+      "id": "SCP-165",
+      "title": "Guard OpenMLS decrypt against panic DoS",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/encrypt.rs",
+        "crates/scp-core/src/crypto/mls/error.rs",
+        "crates/scp-core/src/envelope/outer.rs"
+      ],
+      "description": "OpenMLS panics on AEAD decryption failure for tampered ciphertexts (test uses #[should_panic]). A malicious relay can send crafted ciphertext that crashes the client process. Should wrap in catch_unwind() or handle the error path.",
+      "acceptanceCriteria": [
+        "decrypt() in mls/encrypt.rs wraps the OpenMLS process_message() call in std::panic::catch_unwind()",
+        "A panic from OpenMLS during decryption is converted to MlsError::DecryptionFailed",
+        "The existing #[should_panic] test is converted to a normal error-checking test",
+        "New test confirms crafted ciphertext with tampered AEAD tag returns MlsError::DecryptionFailed instead of panicking",
+        "After a caught panic, subsequent encrypt/decrypt operations on the same group still work correctly"
+      ],
+      "actionItems": [
+        "Wrap group.group.process_message() in std::panic::catch_unwind(AssertUnwindSafe(|| { ... }))",
+        "Map caught panics to MlsError::DecryptionFailed",
+        "Update open_envelope_rejects_tampered_encrypted_blob test: remove #[should_panic], assert Err",
+        "Add dedicated tampered ciphertext test in mls/encrypt.rs",
+        "Verify group consistency after caught panic"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/31"
+      ],
+      "details": {
+        "attackVector": "Malicious relay sends crafted ciphertext that crashes client process via panic, achieving denial of service."
+      }
+    },
+    {
+      "id": "SCP-166",
+      "title": "Add MCP authorization (context membership + UCAN on reads)",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-mcp/src/server.rs"
+      ],
+      "description": "(1) handle_tools_call validates UCAN capability but does not check active_context_ids() to verify the agent is a member of the target context. A crafted tool call with a known context ID could invoke tools cross-context. (2) handle_resources_read performs NO UCAN capability validation after initialization. It checks active_context_ids() (context existence) but any initialized client can read any context's members, events, and tools without authorization.",
+      "acceptanceCriteria": [
+        "handle_tools_call() checks caller DID membership in target context BEFORE executing the tool",
+        "handle_tools_call() returns JSON-RPC error if membership check fails",
+        "handle_resources_read() validates UCAN capability for the requested resource type before returning data",
+        "handle_resources_read() returns JSON-RPC error if UCAN validation fails",
+        "New test: tools/call with valid UCAN but caller not a member returns membership error",
+        "New test: resources/read without valid UCAN returns authorization error",
+        "New test: resources/read with valid UCAN and membership succeeds"
+      ],
+      "actionItems": [
+        "In handle_tools_call(), add membership check via active_context_ids() after parsing context_id",
+        "In handle_resources_read(), add UCAN capability validation matching resource type",
+        "Return JsonRpcResponse::error with code -32603 for authorization failures",
+        "Add unit tests using mock ContextProvider"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/30",
+        "https://github.com/limn-works/scp/issues/18"
+      ],
+      "details": {
+        "handleToolsCallGap": "Validates UCAN but never checks active_context_ids()",
+        "handleResourcesReadGap": "Zero authorization checks after MCP initialization",
+        "resourceTypes": "scp://context/{id}/members, scp://context/{id}/events, scp://context/{id}/tools",
+        "partiallyFixed": "Issue #18 pre-initialization bypass already fixed via commit 8f35edd in PR #8. handle_request now rejects all methods except initialize and ping before initialization. Only the missing UCAN authorization on resource reads remains unfixed.",
+        "existingChecks": "handle_resources_read already checks active_context_ids() for context existence \u2014 only UCAN capability validation is missing. Do not re-implement the existence check."
+      }
+    },
+    {
+      "id": "SCP-167",
+      "title": "Add authorization check to leave_context",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs",
+        "crates/scp-core/src/context/membership.rs"
+      ],
+      "description": "`ContextManager::leave_context()` checks `ContextState::Active` but never validates that the caller is the member being removed or has `MemberRemove` capability. An observer (lowest-privilege role) can remove the admin.",
+      "acceptanceCriteria": [
+        "leave_context() validates caller_did == member_did (self-removal) OR caller holds MemberRemove capability",
+        "leave_context() returns ContextError if neither condition is met",
+        "Observer role cannot remove admin via leave_context()",
+        "Admin with MemberRemove can remove any member",
+        "Member can always self-remove regardless of role",
+        "New test: observer calls leave_context with admin's DID \u2014 returns authorization error",
+        "New test: admin calls leave_context with observer's DID \u2014 succeeds",
+        "New test: member calls leave_context with own DID \u2014 succeeds"
+      ],
+      "actionItems": [
+        "Add caller_did parameter to leave_context()",
+        "Check if caller_did == member_did; if so, allow (self-removal)",
+        "If not self-removal, check MemberRemove capability via ContextRoleState",
+        "Return ContextError::Unauthorized if neither condition met",
+        "Add unit tests for all authorization scenarios"
+      ],
+      "blockedBy": [
+        "SCP-168"
+      ],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/28"
+      ],
+      "details": {
+        "attackScenario": "Observer calls leave_context with admin's DID. Admin removed. In bilateral context, this destroys the context."
+      }
+    },
+    {
+      "id": "SCP-168",
+      "title": "Replace ContextManager std::sync::Mutex with tokio + atomic state ops",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "(1) ContextManager uses std::sync::Mutex instead of tokio::sync::Mutex. Violates .docs/standards/rust.md line 29. Risks deadlocks when MutexGuard held across .await points. Panic poisons mutex, bricking entire manager. (2) All ContextManager operations check state then perform mutation in separate steps \u2014 TOCTOU race.",
+      "acceptanceCriteria": [
+        "ContextManager uses tokio::sync::Mutex for all internal state",
+        "No std::sync::Mutex remains in ContextManager",
+        "All state-check-then-mutate sequences are atomic within a single lock acquisition",
+        "create_context, join_context, leave_context, send_message, close_context all operate atomically",
+        "A panic in one operation does not poison the mutex",
+        "No MutexGuard is held across any .await point",
+        "All existing ContextManager tests pass"
+      ],
+      "actionItems": [
+        "Replace use std::sync::Mutex with tokio::sync::Mutex in manager.rs",
+        "Convert .lock().map_err(|_| ...) to .lock().await (tokio Mutex has no poisoning)",
+        "Restructure each method: acquire lock -> check state -> mutate -> release, all in one scope",
+        "Ensure no .await calls while holding MutexGuard",
+        "Remove PoisonError handling",
+        "Add concurrent operations test",
+        "Add panic-recovery test"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/27",
+        "https://github.com/limn-works/scp/issues/33"
+      ],
+      "details": {
+        "stdMutexRisks": "Deadlock across .await, poisoning on panic, violates standards",
+        "tocTouRace": "lock -> check Active -> unlock -> lock -> mutate: state can change between steps"
+      }
+    },
+    {
+      "id": "SCP-169",
+      "title": "Fix ContextManager TTL expiry key destruction and event logging",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs",
+        "crates/scp-core/src/context/ttl.rs"
+      ],
+      "description": "The manager's TTL timer implementation skips key destruction and event logging that the standalone TtlTimer::spawn performs. When the manager's timer fires on context expiry, crypto state is not destroyed and no ContextExpired event is logged.",
+      "acceptanceCriteria": [
+        "TTL timer fires key destruction via KeyDestructionOrchestrator",
+        "TTL timer logs ContextExpired event to the event log",
+        "Ephemeral contexts: key material zeroized and MLS group destroyed on TTL expiry",
+        "Summary contexts: verification window opened before key destruction",
+        "Full contexts: no key destruction, only expiry event logged",
+        "New test: ephemeral context with short TTL \u2014 verify keys destroyed after expiry",
+        "New test: verify ContextExpired event in event log after TTL expiry"
+      ],
+      "actionItems": [
+        "Add key destruction dispatch to TTL expiry handler",
+        "Add ContextExpired event emission to TTL expiry handler",
+        "Ephemeral: call destroy_group() and zeroize sender keys",
+        "Summary: open SummaryVerificationWindow before key destruction",
+        "Full: skip key destruction, only log event",
+        "Add integration tests with short TTL contexts"
+      ],
+      "blockedBy": [
+        "SCP-168"
+      ],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/34"
+      ],
+      "details": {
+        "securityImpact": "For ephemeral contexts, TTL expiry through the manager leaves keys intact \u2014 violating the ephemeral guarantee."
+      }
+    },
+    {
+      "id": "SCP-170",
+      "title": "Add relay server DoS protections",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/native/storage.rs"
+      ],
+      "description": "No rate limiting on any relay server operation. InMemoryBlobStorage has no capacity limit. Subscription limit is per-connection (100) but no connection limit per IP. deliver_to_subscribers uses try_send which silently drops on full channel. Cleanup path acquires write lock on SubscriptionRegistry, creating lock contention DoS vector.",
+      "acceptanceCriteria": [
+        "RelayConfig includes max_connections_per_ip (default: 10)",
+        "RelayConfig includes max_total_connections (default: 1000)",
+        "RelayConfig includes rate_limit_publishes_per_second (default: 100 per IP)",
+        "InMemoryBlobStorage enforces max_blobs capacity limit (default: 100_000)",
+        "Connections exceeding limits are rejected",
+        "Publish operations exceeding rate limits return error",
+        "deliver_to_subscribers logs warning when try_send fails",
+        "Cleanup path minimizes write lock duration",
+        "New tests for all limit enforcements"
+      ],
+      "actionItems": [
+        "Add rate limiting and connection limit fields to RelayConfig",
+        "Add per-IP connection counter to RelayServer",
+        "Implement token-bucket rate limiter for publish operations",
+        "Add max_blobs to InMemoryBlobStorage",
+        "Add tracing::warn!() for try_send failures",
+        "Refactor cleanup: read-lock scan, brief write-lock removal",
+        "Add tests for all limits"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/19"
+      ],
+      "details": {
+        "currentState": "Zero DoS protections. Unlimited connections, unlimited blob storage, no rate limiting."
+      }
+    },
+    {
+      "id": "SCP-171",
+      "title": "Bound epoch grace store and trigger MLS key destruction",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/epoch_grace.rs",
+        "crates/scp-core/src/crypto/mls/group.rs"
+      ],
+      "description": "(1) EpochGraceStore in crypto/mls/epoch_grace.rs has no maximum capacity. add_epoch adds to a HashMap with no size bound. expire_old_epochs must be called explicitly \u2014 it is not called from add_epoch. An attacker who can trigger frequent epoch advances can accumulate unbounded grace entries. (2) expire_old_epochs removes HashMap entries but does not trigger actual MLS key material deletion in OpenMLS. See also: #24 (BLACK-008) covers the unbounded growth aspect; #32 tracks the distinct key destruction gap.",
+      "acceptanceCriteria": [
+        "EpochGraceStore enforces maximum capacity (e.g., 100 epochs)",
+        "add_epoch() calls expire_old_epochs() before inserting",
+        "When an epoch is expired, corresponding MLS key material is destroyed",
+        "expire_old_epochs() returns list of expired epoch numbers",
+        "New test: exceed max_capacity, verify store never exceeds limit",
+        "New test: key material for expired epoch is deleted from MLS provider",
+        "Forward secrecy: after grace window closes, old epoch messages cannot be decrypted",
+        "Verify whether OpenMLS retains key material for epochs tracked by EpochGraceStore and document findings"
+      ],
+      "actionItems": [
+        "Add MAX_GRACE_EPOCHS constant (100) and max_capacity field",
+        "Modify add_epoch() to call expire_old_epochs() at start",
+        "After purge, if still at capacity, evict oldest epoch",
+        "Change expire_old_epochs() return type to Vec<u64>",
+        "Add key destruction callback for expired epochs",
+        "In caller site, call OpenMLS delete_epoch_key_material for each expired epoch",
+        "Add capacity and key destruction tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/24",
+        "https://github.com/limn-works/scp/issues/32"
+      ],
+      "details": {
+        "keyMaterialLeak": "expire_old_epochs only removes HashMap entries, not actual OpenMLS key material. Forward secrecy violated.",
+        "openmlsKeyRetention": "Nuance: The store tracks which epochs are in grace, but actual cryptographic key material is managed by OpenMLS internally. The attack's impact depends on whether OpenMLS retains key material for epochs listed in the grace store. Verify OpenMLS behavior before assuming key material persists.",
+        "attackVector": "An attacker who can trigger frequent epoch advances can accumulate unbounded grace entries, extending the forward secrecy window."
+      }
+    },
+    {
+      "id": "SCP-172",
+      "title": "Complete equivocation defenses (suppression tracker wiring)",
+      "gate": "gate-sec-critical",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/manager.rs",
+        "crates/scp-transport/src/scoring.rs",
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "(1) Selective message suppression unfixed \u2014 deliver_to_subscribers uses try_send \u2014 if the channel is full, the message is silently dropped. A relay that artificially fills a target's buffer causes selective drops. (2) Checkpoint delivery circularity (partially fixed) \u2014 ConsistencyCheckpoint is sent as regular MLS messages through the relay. A compromised relay can suppress checkpoints. Fix commit fbc2256 in PR #8 adds checkpoint signature verification but does not address the delivery channel circularity. (3) SuppressionTracker has the data structures for cross-relay comparison (per-blob, per-adapter delivery sets) but the integration in TransportManager.subscribe_context is not fully wired. record_delivery is not called from subscription delivery paths.",
+      "acceptanceCriteria": [
+        "TransportManager calls SuppressionTracker::record_delivery() for every envelope received from each adapter",
+        "TransportManager periodically calls check_suppressions() and emits warnings",
+        "Suppression warnings downgrade flagged relay's ReliabilityScore",
+        "deliver_to_subscribers tracks failed sends instead of silent drop",
+        "New test: two adapters receive same blob, no warning",
+        "New test: one adapter receives, other does not within window, warning emitted",
+        "New test: warning triggers reliability score downgrade",
+        "SuppressionTracker is bounded with LRU eviction"
+      ],
+      "actionItems": [
+        "In MergedSubscriptionStream::poll_next(), call record_delivery() after dedup",
+        "Add periodic check_suppressions() call in TransportManager",
+        "Emit TransportEvent::SuppressionDetected for warnings",
+        "Update relay scores on suppression detection",
+        "Track try_send failures in server.rs",
+        "Add SuppressionTracker capacity bounds (10,000 entries)",
+        "Add integration tests for full flow"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/21",
+        "https://github.com/limn-works/scp/issues/68"
+      ],
+      "details": {
+        "suppressionTrackerState": "SuppressionTracker in scoring.rs tracks per-blob, per-adapter delivery sets for cross-relay comparison (more capable than originally stated), but requires record_delivery() to be called by the client \u2014 wiring is incomplete.",
+        "partiallyFixed": "Issue #21 checkpoint signature verification already implemented via commit fbc2256 in PR #8. Only selective suppression and delivery channel circularity remain unfixed. Do not re-implement checkpoint signatures.",
+        "attackMechanism": "A relay that artificially fills a target's channel buffer causes selective message drops.",
+        "wiringLocation": "Integration point is TransportManager.subscribe_context \u2014 SuppressionTracker.record_delivery() must be called from subscription delivery paths."
+      }
+    },
+    {
+      "id": "SCP-173",
+      "title": "Harden UCAN validation (restrict stateless, fix clock)",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/ucan/validate.rs"
+      ],
+      "description": "(1) validate_ucan_stateless() at validate.rs:473 is pub and skips steps 3 (chain), 7 (attenuation), 9 (nonce), and 10 (revocation). Only used in tests but accessible to downstream. Should be pub(crate) or removed. (2) unwrap_or_default() returning Duration::ZERO on pre-epoch systems allows timestamp bypass.",
+      "acceptanceCriteria": [
+        "validate_ucan_stateless() is no longer reachable from outside scp-core (pub(crate) or removed)",
+        "SystemTime failure returns explicit error instead of defaulting to Duration::ZERO",
+        "Unit test: UCAN with nbf/exp at epoch 0 is rejected when clock returns error",
+        "All existing tests pass"
+      ],
+      "actionItems": [
+        "Change validate_ucan_stateless() from pub to pub(crate), or remove entirely",
+        "Replace unwrap_or_default() with Result-returning helper propagating ClockError",
+        "Add ClockError variant to UCAN validation error enum",
+        "Add unit tests for clock failure and visibility restriction"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/29",
+        "https://github.com/limn-works/scp/issues/20"
+      ],
+      "details": {
+        "statelessSkips": "Steps 3 (chain), 7 (attenuation), 9 (nonce), 10 (revocation)",
+        "clockFallback": "Duration::ZERO bypasses all nbf/exp checks"
+      }
+    },
+    {
+      "id": "SCP-174",
+      "title": "Add domain separation prefix to canonical hash",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/envelope/inner.rs"
+      ],
+      "description": "compute_canonical_hash() in inner.rs has no domain separator (e.g., \"SCP-INNER-ENVELOPE-V1:\"). Same Ed25519 key used for multiple purposes, enabling cross-protocol signature confusion. PR #8 added length prefixes for variable-length fields but NOT a domain separator.",
+      "acceptanceCriteria": [
+        "compute_canonical_hash() prepends a fixed domain separator before hashing",
+        "Domain separator is documented as a constant",
+        "Unit test: hash output changes when domain separator is altered",
+        "All existing tests pass after updating expected hash values"
+      ],
+      "actionItems": [
+        "Define DOMAIN_SEPARATOR constant in inner.rs",
+        "Prepend domain separator to hasher input before any field data",
+        "Update all test fixtures depending on hash output",
+        "Add unit tests for domain separator inclusion"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/36"
+      ],
+      "details": {
+        "crossProtocolRisk": "Ed25519 keys reused across signing contexts \u2014 envelope, UCAN, DID auth. Without domain separator, signature from one context could be valid in another."
+      }
+    },
+    {
+      "id": "SCP-175",
+      "title": "Switch Ed25519 to verify_strict()",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/dht.rs",
+        "crates/scp-core/src/envelope/inner.rs",
+        "crates/scp-core/src/crypto/ucan/validate.rs"
+      ],
+      "description": "Ed25519 verification uses verify() instead of verify_strict(). Without strict verification, signatures with non-canonical S values are accepted, enabling signature malleability attacks.",
+      "acceptanceCriteria": [
+        "All Ed25519 verify() calls replaced with verify_strict() in all three files",
+        "Unit test in each module: signature with non-canonical S value is rejected",
+        "No verify() calls remain for Ed25519 in signing/verification paths",
+        "All existing tests pass"
+      ],
+      "actionItems": [
+        "Replace .verify( with .verify_strict( in dht.rs, inner.rs, validate.rs",
+        "Add test per module: non-canonical S signature rejected",
+        "Grep codebase to confirm no non-strict calls remain"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/54"
+      ],
+      "details": {
+        "malleability": "For any valid (R, S), (R, L-S) is also valid. verify_strict() rejects non-canonical S values."
+      }
+    },
+    {
+      "id": "SCP-176",
+      "title": "Fix DID AtomicU64 to AcqRel ordering",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/dht.rs"
+      ],
+      "description": "DID document sequence number uses Ordering::Relaxed which provides no synchronization guarantees across threads. Should use AcqRel to ensure correct happens-before ordering.",
+      "acceptanceCriteria": [
+        "All AtomicU64 loads use Ordering::Acquire, stores use Release, RMW uses AcqRel",
+        "No Ordering::Relaxed on sequence number atomic",
+        "Concurrent test: N threads calling fetch_add produce unique monotonic values",
+        "All existing tests pass"
+      ],
+      "actionItems": [
+        "Replace Relaxed with Acquire on loads, Release on stores, AcqRel on fetch_add/compare_exchange",
+        "Add concurrent monotonicity test"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/42"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-177",
+      "title": "Resolve sender key internally in open_envelope",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/envelope/outer.rs"
+      ],
+      "description": "ADR-002 specifies that open_envelope should resolve the sender public key internally from the MLS group state. Current implementation requires caller to provide it, creating opportunity to supply wrong key.",
+      "acceptanceCriteria": [
+        "open_envelope no longer accepts sender public key from caller",
+        "open_envelope resolves sender key internally from MLS group state",
+        "Test: envelope from valid group member decrypted with internally resolved key",
+        "Test: sender_id not in group returns UnknownSender error",
+        "All existing tests pass after updating call sites"
+      ],
+      "actionItems": [
+        "Modify open_envelope to accept MLS group state instead of explicit key",
+        "Implement internal sender key resolution from outer envelope header",
+        "Return UnknownSender error if sender not in group",
+        "Update all call sites",
+        "Add tests for valid member and unknown sender scenarios"
+      ],
+      "blockedBy": [
+        "SCP-163"
+      ],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/45"
+      ],
+      "details": {
+        "adrRequirement": "ADR-002: envelope processing layer should be self-contained given MLS group state"
+      }
+    },
+    {
+      "id": "SCP-178",
+      "title": "Zeroize MLS crypto state in destroy_group",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/group.rs"
+      ],
+      "description": "destroy_group sets a boolean flag but does not actively zeroize the MLS group's cryptographic state in memory. Key material persists until garbage collected.",
+      "acceptanceCriteria": [
+        "destroy_group zeroizes all cryptographic key material before setting destroyed flag",
+        "zeroize crate used for all sensitive fields",
+        "After destroy_group, encrypt/decrypt returns GroupDestroyed error",
+        "All existing tests pass"
+      ],
+      "actionItems": [
+        "Add zeroize crate dependency if not present",
+        "Derive/implement Zeroize on key material structs",
+        "In destroy_group, call .zeroize() on all crypto state before setting flag",
+        "Add tests: encrypt/decrypt after destroy returns error"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/46"
+      ],
+      "details": {
+        "exposureWindow": "Without zeroization, key material persists until garbage collected (in Rust: until the owning struct is dropped/deallocated). Recoverable via core dump, cold boot, or swap."
+      }
+    },
+    {
+      "id": "SCP-179",
+      "title": "Add replay protection to sender key and block notification protocols",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
+      ],
+      "description": "(1) SenderKeyRequest messages have no nonce or timestamp. A captured request can be replayed to obtain sender keys. (2) Block notifications carry a timestamp but it is not validated for freshness. A delayed or replayed block notification is accepted regardless of age.",
+      "acceptanceCriteria": [
+        "SenderKeyRequest includes cryptographic nonce (16+ bytes) and timestamp",
+        "SenderKeyResponse echoes request nonce for binding",
+        "Duplicate nonces within 5-minute window rejected",
+        "Block notification timestamps validated for freshness (30s threshold)",
+        "Tests: replay of SenderKeyRequest rejected, stale block notification rejected, valid requests succeed"
+      ],
+      "actionItems": [
+        "Add nonce and timestamp fields to SenderKeyRequest",
+        "Add nonce echo to SenderKeyResponse",
+        "Implement bounded nonce cache",
+        "Add freshness validation to block notification handler",
+        "Add replay and freshness tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/50",
+        "https://github.com/limn-works/scp/issues/49"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-180",
+      "title": "Make UCAN revocation atomic with propagation bounding",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/ucan/revoke.rs"
+      ],
+      "description": "(1) revoke_ucan adds CID to local revocation list (step 2), then attempts distribution (step 3). If distribution fails, local mutation is not rolled back \u2014 split-brain. (2) Between local revocation and MLS distribution completing, revoked tokens remain valid on some members. No mechanism exists for the revoker to confirm propagation or for members to refuse operations during the window.",
+      "acceptanceCriteria": [
+        "revoke_ucan is transactional: failed distribution rolls back local revocation",
+        "RevocationPending intermediate state marks token during propagation",
+        "After successful distribution, state transitions to Revoked",
+        "Capability exercise against RevocationPending is denied (fail-closed)",
+        "Tests: failed distribution rolls back, successful distribution commits, RevocationPending denies capability"
+      ],
+      "actionItems": [
+        "Add RevocationPending state",
+        "Refactor: mark pending -> distribute -> commit on success / rollback on failure",
+        "Treat RevocationPending as revoked for capability checks",
+        "Add confirmation event for successful distribution",
+        "Add tests for all scenarios"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/66",
+        "https://github.com/limn-works/scp/issues/72"
+      ],
+      "details": {
+        "splitBrain": "If distribution fails, revoker thinks token revoked but no one else does. Persists until next successful distribution."
+      }
+    },
+    {
+      "id": "SCP-181",
+      "title": "Validate bridge shadow identity against context members",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/bridge/registration.rs",
+        "crates/scp-core/src/bridge/shadow.rs"
+      ],
+      "description": "BridgeRegistry stores shadow identity DID mappings but does not cross-check against existing context members. A bridge operator could map a shadow identity to a real member's DID, enabling message forgery.",
+      "acceptanceCriteria": [
+        "Shadow registration rejects mapping where shadow DID matches existing context member",
+        "Shadow registration rejects mapping where shadow DID matches another shadow in same context",
+        "Tests: collision with real member rejected, collision with other shadow rejected, valid registration succeeds"
+      ],
+      "actionItems": [
+        "Add context member lookup before inserting shadow mapping",
+        "Check proposed DID against member list and existing shadows",
+        "Return ShadowIdentityCollision error on collision",
+        "Add validation in shadow.rs as defense in depth",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/71"
+      ],
+      "details": {
+        "forgerScenario": "Bridge registers shadow DID matching real member Alice. Messages from shadow appear to come from Alice."
+      }
+    },
+    {
+      "id": "SCP-182",
+      "title": "Don't trust relay-provided stored_at timestamps",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/client.rs"
+      ],
+      "description": "Client trusts relay-provided stored_at timestamps for reconnection window calculations. A malicious relay can backdate or forward-date timestamps to cause message loss or replay old messages.",
+      "acceptanceCriteria": [
+        "Client uses local monotonic clock for reconnection window tracking",
+        "Relay stored_at treated as untrusted metadata only",
+        "Reconnection window uses locally recorded receive times",
+        "Tests: relay backdating doesn't cause skipped messages, relay forward-dating doesn't accept stale messages"
+      ],
+      "actionItems": [
+        "Add local monotonic timestamp recorded at message receipt",
+        "Refactor reconnection window to use local times",
+        "Add plausibility check for relay timestamps (warn on large deviation)",
+        "Add tests for backdating and forward-dating scenarios"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/62"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-183",
+      "title": "Replace thread_rng() with OsRng at 4 crypto call sites",
+      "gate": "gate-sec-medium",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/encrypt.rs",
+        "crates/scp-core/src/envelope/padding.rs",
+        "crates/scp-core/src/crypto/ucan/nonce.rs",
+        "crates/scp-core/src/crypto/mod.rs"
+      ],
+      "description": "Four call sites use thread_rng() (CSPRNG seeded from OsRng but with potential state duplication across forks) instead of OsRng directly for cryptographic operations.",
+      "acceptanceCriteria": [
+        "All four call sites use OsRng instead of thread_rng()",
+        "No thread_rng() in any crypto or envelope module",
+        "Codebase grep confirms zero thread_rng matches in crypto paths",
+        "All existing tests pass"
+      ],
+      "actionItems": [
+        "Replace thread_rng() with OsRng in all 4 files",
+        "Update imports: remove rand::thread_rng, add OsRng",
+        "Search workspace for remaining thread_rng() in security paths",
+        "Run tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/37"
+      ],
+      "details": {
+        "forkSafety": "thread_rng() state duplicated across fork(). OsRng reads from OS entropy source directly."
+      }
+    },
+    {
+      "id": "SCP-184",
+      "title": "Fix ReceiveBuffer overflow drop and count",
+      "gate": "gate-correctness",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/membership.rs"
+      ],
+      "description": "When buffer is full, ReceiveBuffer::push drops the caller's event AND reports dropped_count incorrectly (off-by-one). Events are silently lost with no diagnostic.",
+      "acceptanceCriteria": [
+        "When full, push() always retains the caller's event in the buffer",
+        "push() returns a BufferOverflow value when events are displaced, ensuring overflow is never silent",
+        "BufferOverflow dropped_count accurately reflects displaced events only",
+        "Pushing N events beyond capacity into size-C buffer results in exactly N events dropped",
+        "Consecutive overflows coalesce into single BufferOverflow with updated count",
+        "All existing ReceiveBuffer tests pass"
+      ],
+      "actionItems": [
+        "Rewrite push() overflow strategy: drop oldest, update overflow count, always append caller event",
+        "Fix dropped_count to exclude internal bookkeeping drops",
+        "Add regression tests for single overflow, multi-overflow, and coalescing"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/38"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-185",
+      "title": "Make TransportManager::send_to_context take &self",
+      "gate": "gate-correctness",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/manager.rs"
+      ],
+      "description": "TransportManager::send_to_context takes &mut self, preventing concurrent sends to different contexts. This is a throughput bottleneck for multi-context clients.",
+      "acceptanceCriteria": [
+        "send_to_context takes &self instead of &mut self",
+        "Concurrent sends to different contexts do not block each other",
+        "Internal mutable state uses interior mutability (RwLock/DashMap)",
+        "No deadlocks under concurrent sends",
+        "All existing tests pass"
+      ],
+      "actionItems": [
+        "Wrap mutable fields (relay assignments, scores, trackers, dedup cache) in interior mutability",
+        "Change signature from &mut self to &self",
+        "Update other methods that can also take &self",
+        "Add concurrency test: 10 tasks sending to different contexts via Arc"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/70"
+      ],
+      "details": {
+        "mutableFields": [
+          "context_relay_assignments",
+          "reliability_scores",
+          "suppression_trackers",
+          "dedup_cache"
+        ]
+      }
+    },
+    {
+      "id": "SCP-186",
+      "title": "Reorder DID publish after relay server start",
+      "gate": "gate-correctness",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "In ApplicationNodeBuilder::build(), the DID document (containing the relay URL) is published to the DHT before the relay server is started. Clients resolving the DID during this window get a relay URL that isn't serving yet. Acceptable for a reverse-proxy deployment model but a potential issue for direct hosting.",
+      "acceptanceCriteria": [
+        "Relay server is started BEFORE DID document is published to DHT",
+        "DID document still contains correct SCPRelay service URL",
+        "Relay confirmed listening before DID publication occurs",
+        "All existing ApplicationNode tests pass",
+        "Fix is scoped to direct-hosting deployments; reverse-proxy deployments are unaffected by the ordering"
+      ],
+      "actionItems": [
+        "Move relay server start block before DID document publication block in build()",
+        "Verify relay URL derivation still works after reorder",
+        "Update step comments in build()",
+        "Add test verifying relay accepts connections before DID is published"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/15"
+      ],
+      "details": {
+        "currentOrder": "validate -> storage -> identity -> publish DID -> start relay",
+        "correctOrder": "validate -> storage -> identity -> start relay -> publish DID",
+        "deploymentModelNote": "The relay binds to 127.0.0.1:0 (a different address), so the published URL and actual bind address are always different (the URL uses the domain, the socket uses localhost). This is correct for the deployment model (reverse proxy in front). The fix primarily matters for direct-hosting deployments."
+      }
+    },
+    {
+      "id": "SCP-187",
+      "title": "Consolidate DID type alias to shared newtype",
+      "gate": "gate-correctness",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/mod.rs",
+        "crates/scp-core/src/context/membership.rs",
+        "crates/scp-core/src/context/tools/mod.rs",
+        "crates/scp-core/src/event_log/mod.rs",
+        "crates/scp-core/src/discovery/mod.rs",
+        "crates/scp-core/src/bridge/mod.rs",
+        "crates/scp-core/src/provenance/mod.rs",
+        "crates/scp-media/src/signaling.rs",
+        "crates/scp-media/src/session.rs",
+        "crates/scp-core/src/envelope/mod.rs"
+      ],
+      "description": "DID is defined as `type DID = String` independently in multiple modules (event_log/mod.rs, envelope/, etc.) rather than being a single shared newtype. This is consistent within the codebase but creates proliferation risk as the protocol grows.",
+      "acceptanceCriteria": [
+        "Single DID newtype in scp-core::identity (not a type alias)",
+        "Newtype implements Deref<Target=str>, Display, From<String>, From<&str>, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize",
+        "All 8+ independent type aliases removed",
+        "All modules import from scp_core::identity::DID",
+        "cargo test --workspace passes"
+      ],
+      "actionItems": [
+        "Define pub struct DID(pub String) in identity/mod.rs with all necessary derives/impls",
+        "Remove type DID = String from all 8+ modules",
+        "Replace with import from scp_core::identity::DID",
+        "Fix compilation errors from String-to-DID transition"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/14"
+      ],
+      "details": {
+        "affectedModules": [
+          "context/membership.rs",
+          "context/tools/mod.rs",
+          "event_log/mod.rs",
+          "discovery/mod.rs",
+          "bridge/mod.rs",
+          "provenance/mod.rs",
+          "scp-media/signaling.rs",
+          "scp-media/session.rs",
+          "envelope/mod.rs"
+        ]
+      }
+    },
+    {
+      "id": "SCP-188",
+      "title": "Implement .well-known/scp DHT cross-verification",
+      "gate": "gate-correctness",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/well_known.rs",
+        "crates/scp-core/src/discovery/bootstrap.rs"
+      ],
+      "description": "WellKnownScp in well_known.rs is a plain data structure with validate() checking only that listed contexts are broadcast mode. There is NO verification method that cross-references against DHT-resolved DID documents, despite the spec comment saying \"Clients MUST verify .well-known/scp data against DHT-resolved DID documents before trusting it.\" A compromised or malicious server can serve arbitrary .well-known/scp data and clients will trust it on first use (TOFU).",
+      "acceptanceCriteria": [
+        "New async method verify_against_did() resolves DID via DHT and cross-references",
+        "Verifies relay URL matches at least one SCPRelay service entry in resolved DID document",
+        "Verifies context listings and operator DID in .well-known/scp payload against DID document \u2014 not just relay URL",
+        "New error variants: DidResolutionFailed, RelayMismatch",
+        "Tests: matching relay passes, mismatched relay fails, unresolvable DID fails",
+        "Verification occurs on every fetch, not just first use (no TOFU trust)",
+        "verify_against_did() is wired into bootstrap.rs and called when processing well-known data"
+      ],
+      "actionItems": [
+        "Add verify_against_did method accepting DidMethod trait",
+        "Resolve DID document, check relay URL against SCPRelay entries",
+        "Return specific errors for resolution failure and relay mismatch",
+        "Wire into bootstrap.rs when processing well-known data",
+        "Add unit tests with mock DidMethod"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/25"
+      ],
+      "details": {
+        "specReference": "Section 18.3.2: Clients MUST verify .well-known/scp data against DHT-resolved DID documents before trusting it"
+      }
+    },
+    {
+      "id": "SCP-189",
+      "title": "Implement full JSON schema validation",
+      "gate": "gate-correctness",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/tools/schema.rs",
+        "crates/scp-mcp/src/server.rs",
+        "crates/scp-core/Cargo.toml"
+      ],
+      "description": "validate_value_against_schema checks ONLY top-level type field. Does not validate properties, required, additionalProperties, array items, or any constraint. MCP server validate_input has identical type-only check. Attacker can pass any payload as long as top-level type matches.",
+      "acceptanceCriteria": [
+        "Uses jsonschema crate for full JSON Schema validation",
+        "When no input schema is defined for a tool, validation behavior is explicitly defined (reject or accept) \u2014 not silently Ok",
+        "Unknown JSON types are rejected instead of returning Ok via wildcard match",
+        "Properties, required, additionalProperties, items, numeric/string constraints all validated",
+        "MCP server delegates to shared validation instead of duplicating",
+        "Tests: missing required rejected, extra properties rejected, array items validated, numeric range enforced, pattern validated"
+      ],
+      "actionItems": [
+        "Add jsonschema dependency to scp-core/Cargo.toml",
+        "Rewrite validate_value_against_schema using jsonschema::validate()",
+        "Remove duplicated validate_input from MCP server, delegate to shared",
+        "Add comprehensive tests for all constraint types"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/23"
+      ],
+      "details": {
+        "missingConstraints": [
+          "properties",
+          "required",
+          "additionalProperties",
+          "items",
+          "minimum/maximum",
+          "minLength/maxLength",
+          "pattern",
+          "enum"
+        ]
+      }
+    },
+    {
+      "id": "SCP-190",
+      "title": "Add capacity limits to nonce tracker",
+      "gate": "gate-correctness",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/ucan/validate.rs",
+        "crates/scp-core/src/crypto/ucan/nonce.rs"
+      ],
+      "description": "InMemoryNonceTracker in validate.rs: Unbounded HashMap, no pruning, no capacity limit. Used in tests but is pub. Production NonceTracker<C> in nonce.rs: Has pruning every 1000 checks or 10 minutes, and is per-context scoped. However, it has no capacity limit, and pruning is O(n) via HashMap::retain. The 24-hour minimum retention at high nonce rates could consume significant memory. Cross-context isolation: InMemoryNonceTracker is NOT per-context while production NonceTracker<C> IS per-context \u2014 valid concern for test/Phase 2 usage.",
+      "acceptanceCriteria": [
+        "Production NonceTracker has configurable max_capacity (default: 100,000)",
+        "Exceeding max_capacity returns NonceTrackerFull error",
+        "InMemoryNonceTracker restricted to #[cfg(test)] or gains capacity limit",
+        "O(n) HashMap::retain pruning latency addressed: either replaced with an O(1)-amortized structure or benchmarked and documented as acceptable at max_capacity",
+        "Tests: capacity exceeded rejects, pruning allows acceptance again",
+        "InMemoryNonceTracker either restricted to #[cfg(test)] or made per-context scoped to match production NonceTracker"
+      ],
+      "actionItems": [
+        "Add max_capacity field to NonceTracker (default 100,000)",
+        "In check_and_record(), check capacity before insert; attempt prune if full",
+        "Return NonceTrackerFull error if still at capacity after prune",
+        "Restrict InMemoryNonceTracker visibility or add capacity",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/26"
+      ],
+      "details": {
+        "memoryCalculation": "100 nonces/sec * 86400s retention * ~100 bytes = ~864 MB per context",
+        "inMemoryTracker": "InMemoryNonceTracker in validate.rs: Unbounded HashMap, no pruning, no capacity limit. Used in tests but is pub.",
+        "productionTracker": "Production NonceTracker<C> in nonce.rs: Has pruning every 1000 checks or 10 minutes, and is per-context scoped. However, it has no capacity limit, and pruning is O(n) via HashMap::retain. The 24-hour minimum retention at high nonce rates could consume significant memory.",
+        "crossContextIsolation": "InMemoryNonceTracker is NOT per-context while production NonceTracker<C> IS per-context \u2014 valid concern for test/Phase 2 usage.",
+        "pruningComplexity": "HashMap::retain is O(n) \u2014 at 8.6M entries this creates noticeable latency spikes"
+      }
+    },
+    {
+      "id": "SCP-191",
+      "title": "Add UCAN circular delegation detection",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/ucan/validate.rs"
+      ],
+      "description": "Chain verification does not detect circular delegations (A\u2192B\u2192A). MAX_CHAIN_DEPTH=32 prevents infinite recursion but does not detect the cycle itself.",
+      "acceptanceCriteria": [
+        "validate_chain returns CircularDelegation error on cycle detection",
+        "MAX_CHAIN_DEPTH=32 guard still terminates long chains",
+        "Tests: A\u2192B\u2192C\u2192A cycle rejected, A\u2192B\u2192C passes, self-delegation A\u2192A rejected"
+      ],
+      "actionItems": [
+        "Collect issuer DIDs in HashSet during chain walk",
+        "Check each issuer against set before processing",
+        "Add CircularDelegation error variant",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/67"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-192",
+      "title": "Fix UCAN validation (nbf > exp check + CID format)",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/ucan/validate.rs",
+        "crates/scp-core/src/crypto/ucan/revoke.rs"
+      ],
+      "description": "(1) UCAN token validation does not check that nbf (not before) is less than exp (expiry). A token with nbf > exp is inherently invalid but is not rejected. (2) revoke_ucan uses the full base64url-encoded JWT as the revocation CID. The UCAN spec recommends using a content hash (CID) for space efficiency and to avoid storing the full token in the revocation list.",
+      "acceptanceCriteria": [
+        "validate_ucan rejects tokens where nbf > exp with a descriptive error",
+        "Unit test: UCAN with nbf > exp returns InvalidTimeRange error",
+        "Unit test: UCAN with nbf < exp passes time range validation",
+        "revoke_ucan computes revocation CID as content hash of the UCAN payload, not the full JWT string",
+        "Existing revocation lookups use the new CID format",
+        "Unit test: revoking a UCAN by content hash CID is found on subsequent validation",
+        "Unit test: revocation storage size is bounded per entry, not variable-length JWT"
+      ],
+      "actionItems": [
+        "Add nbf < exp check in validate_ucan",
+        "Replace JWT storage with SHA-256 hash in revoke_ucan",
+        "Update revocation lookup to use content hash",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/65",
+        "https://github.com/limn-works/scp/issues/64"
+      ],
+      "details": {
+        "nbfExpSource": "Issue #65: A token with nbf > exp is inherently invalid but is not rejected.",
+        "cidFormatSource": "Issue #64: The UCAN spec recommends using a content hash (CID) for space efficiency and to avoid storing the full token in the revocation list.",
+        "cidHashAlgorithm": "The specific hash algorithm for the content CID is not specified in the source issue. Choose based on UCAN spec recommendation (likely SHA-256 or multihash)."
+      }
+    },
+    {
+      "id": "SCP-193",
+      "title": "Verify blob_id matches SHA-256(blob) on receive",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/client.rs"
+      ],
+      "description": "On receiving a blob, client does not verify relay-provided blob_id matches SHA-256(blob). Malicious relay could return mismatched blob IDs breaking deduplication and integrity.",
+      "acceptanceCriteria": [
+        "Client computes SHA-256(blob) and compares against expected blob_id",
+        "Hash mismatch returns BlobIntegrityError",
+        "Tests: correct hash accepted, tampered content rejected, empty blob with correct hash accepted"
+      ],
+      "actionItems": [
+        "Compute SHA-256 of received blob in receive path",
+        "Compare against relay-provided blob_id",
+        "Return BlobIntegrityError on mismatch",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/60"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-194",
+      "title": "Implement Merkle non-membership proofs",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/event_log/tree.rs",
+        "crates/scp-core/src/event_log/proof.rs"
+      ],
+      "description": "Merkle tree module has verify_inclusion but no verify_absence. Third parties cannot verify that an event is NOT in the log.",
+      "acceptanceCriteria": [
+        "prove_absence method returns AbsenceProof",
+        "verify_absence validates non-membership proof against root",
+        "Tests: absence of missing leaf verified, absence fails for present leaf"
+      ],
+      "actionItems": [
+        "Implement sorted/sparse Merkle approach for non-membership",
+        "Add prove_absence to MerkleTree",
+        "Add AbsenceProof struct",
+        "Add verify_absence function",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/58"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-195",
+      "title": "Validate TTL extension consenters are active members",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/ttl.rs"
+      ],
+      "description": "TTL extension collects consent votes but does not verify consenting members are still active at tally time.",
+      "acceptanceCriteria": [
+        "Consent tallying verifies each voter is active member at tally time",
+        "Votes from removed members excluded",
+        "Vote cast by member who was active at vote time but removed before tally time is excluded from the count",
+        "Tests: active member counted, removed member excluded, threshold evaluated against active votes only"
+      ],
+      "actionItems": [
+        "Modify tallying to accept active member set",
+        "Filter votes to active members only",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/56"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-196",
+      "title": "Clean pending request map on relay timeout",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/client.rs"
+      ],
+      "description": "When a request times out, the entry in the pending requests map is not cleaned up. Leaks memory for every timed-out request.",
+      "acceptanceCriteria": [
+        "Timed-out request entry removed from pending map",
+        "Oneshot sender dropped on timeout",
+        "Tests: pending map empty after timeout, map doesn't grow under repeated timeouts, successful responses still work"
+      ],
+      "actionItems": [
+        "Remove request entry from pending map on timeout",
+        "Use tokio::select! to race response against timeout",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/55"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-197",
+      "title": "Optimize SenderKeyStore (Cow return + epoch overflow)",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/encrypt.rs",
+        "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
+      ],
+      "description": "(1) Each key lookup in SenderKeyStore performs a heap allocation. For high-throughput message decryption, this creates unnecessary allocation pressure. Consider Cow or reference return. (2) The epoch counter is u64 and incremented without overflow checking. While practically unlikely to reach u64::MAX, the absence of a check violates defensive coding practices.",
+      "acceptanceCriteria": [
+        "Key lookup returns Cow or reference instead of cloning",
+        "Epoch increment uses checked_add, returns EpochOverflow on overflow",
+        "Tests: lookup doesn't allocate for cached key, epoch at MAX returns error"
+      ],
+      "actionItems": [
+        "Change lookup return type to Cow/reference",
+        "Replace epoch increment with checked_add",
+        "Add EpochOverflow error variant",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/52",
+        "https://github.com/limn-works/scp/issues/51"
+      ],
+      "details": {
+        "allocationContext": "For high-throughput message decryption, each lookup's heap allocation creates unnecessary allocation pressure.",
+        "overflowContext": "While practically unlikely to reach u64::MAX, the absence of a check violates defensive coding practices.",
+        "methodNames": "SenderKeyStore::get() for allocation issue, rotate_sender_key_for_block for epoch overflow."
+      }
+    },
+    {
+      "id": "SCP-198",
+      "title": "Replace hand-rolled base58btc with bs58 crate",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/dht.rs",
+        "crates/scp-core/Cargo.toml"
+      ],
+      "description": "Hand-rolled base58btc encoder exists instead of using the bs58 crate. Maintenance risk and potential encoding bugs.",
+      "acceptanceCriteria": [
+        "All base58btc encoding/decoding uses bs58 crate",
+        "Hand-rolled implementation removed",
+        "Tests: round-trip works, known test vectors produce expected output"
+      ],
+      "actionItems": [
+        "Add bs58 to Cargo.toml",
+        "Replace encode/decode with bs58::encode/decode",
+        "Remove hand-rolled implementation",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/48"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-199",
+      "title": "Add DID format validation to ScpCredential::new",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/credential.rs"
+      ],
+      "description": "ScpCredential::new accepts any string as DID without validating did:dht:z... format.",
+      "acceptanceCriteria": [
+        "ScpCredential::new validates DID starts with 'did:dht:z'",
+        "Returns error for malformed DIDs",
+        "Tests: valid DID accepted, empty rejected, wrong method rejected, missing z-prefix rejected"
+      ],
+      "actionItems": [
+        "Add DID format validation in new()",
+        "Return CredentialError::InvalidDidFormat on failure",
+        "Add tests for all edge cases"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/47"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-200",
+      "title": "Implement DID migration background republish",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/republish.rs"
+      ],
+      "description": "After DID migration, the old DID document should be republished periodically with a redirect to the new DID. No background task implements this.",
+      "acceptanceCriteria": [
+        "A background task periodically republishes the old DID document with a redirect to the new DID",
+        "Republish interval is configurable with a sensible default",
+        "The task stops when explicitly cancelled",
+        "Unit test: republish task publishes the old DID document with redirect pointing to new DID",
+        "Unit test: republish task respects the configured interval",
+        "Unit test: republish task stops on cancellation"
+      ],
+      "actionItems": [
+        "Implement MigrationRepublisher struct",
+        "Spawn tokio task for periodic republish",
+        "Add cancel handle",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/44"
+      ],
+      "details": {
+        "implementationNote": "The source issue specifies only 'republished periodically with a redirect to the new DID.' Specific interval, redirect mechanism (alsoKnownAs), and TTL are implementation choices not specified in the source."
+      }
+    },
+    {
+      "id": "SCP-201",
+      "title": "Fix DID cache seq >= vs DHT seq > inconsistency",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/cache.rs",
+        "crates/scp-core/src/identity/dht_client.rs"
+      ],
+      "description": "Local cache accepts updates with seq >= current, while DHT client requires seq > current. Cache can overwrite with same sequence number.",
+      "acceptanceCriteria": [
+        "Cache and DHT client both use strictly-greater comparison (seq > current)",
+        "Cache rejects seq == current",
+        "Tests: seq > current accepted, seq == current rejected, seq < current rejected"
+      ],
+      "actionItems": [
+        "Change cache comparison from >= to >",
+        "Add tests for boundary conditions in both cache and DHT client"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/43"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-202",
+      "title": "Change MigrationProof.signature to [u8; 64]",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/document.rs"
+      ],
+      "description": "Migration proof signature is Vec<u8> instead of [u8; 64] per ADR spec. Allows malformed signatures to pass structural checks.",
+      "acceptanceCriteria": [
+        "MigrationProof.signature is [u8; 64]",
+        "Deserialization rejects non-64-byte signatures",
+        "Tests: 64 bytes accepted, 63 bytes rejected, 65 bytes rejected"
+      ],
+      "actionItems": [
+        "Change field type from Vec<u8> to [u8; 64]",
+        "Update serialization/deserialization",
+        "Update constructors and callers",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/41"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-203",
+      "title": "Replace sentinel DID strings with proper event variants",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/close.rs",
+        "crates/scp-core/src/context/manager.rs",
+        "crates/scp-core/src/event_log/mod.rs"
+      ],
+      "description": "Context close and expiry use sentinel DID strings (e.g., \"system\") instead of proper ContextEvent variants. Magic strings could collide with real DIDs.",
+      "acceptanceCriteria": [
+        "No sentinel DID strings used for close/expiry events",
+        "ContextEvent has SystemClose and Expired variants",
+        "All code paths use new variants",
+        "Tests: close/expiry events use proper variants"
+      ],
+      "actionItems": [
+        "Add SystemClose and Expired to ContextEvent enum",
+        "Replace sentinel strings with new variants",
+        "Remove sentinel constants",
+        "Update match expressions",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/40"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-204",
+      "title": "Unify params::Capability and roles::Capability types",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/params.rs",
+        "crates/scp-core/src/context/roles.rs"
+      ],
+      "description": "Two distinct types named Capability exist: a string-based one in params (Capability(String) with name() accessor) and an enum-based one in roles (with variants like Custom(String)). This creates confusion and potential for mismatched capability checks.",
+      "acceptanceCriteria": [
+        "Single Capability type used throughout scp-core",
+        "Unified type supports well-known variants + Custom(String)",
+        "All capability comparisons use same type",
+        "Tests: cross-module capability comparison works, custom capability roundtrips"
+      ],
+      "actionItems": [
+        "Define unified Capability enum in shared location",
+        "Remove Capability from both params.rs and roles.rs",
+        "Re-export for backward compatibility",
+        "Update all references",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/39"
+      ],
+      "details": {
+        "paramsType": "params::Capability is Capability(String) with name() accessor \u2014 a newtype wrapper around String.",
+        "rolesType": "roles::Capability is an enum with variants like Custom(String) \u2014 a discriminated union.",
+        "mismatchRisk": "The two types have the same name but different structures, creating potential for mismatched capability checks at module boundaries."
+      }
+    },
+    {
+      "id": "SCP-205",
+      "title": "Remove NoOp placeholder implementations",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/tools/mod.rs",
+        "crates/scp-core/src/context/mod.rs"
+      ],
+      "description": "Several modules contain NoOp/placeholder implementations adding code weight without functionality. These should be cleaned up or replaced with actual implementations.",
+      "acceptanceCriteria": [
+        "All NoOp/placeholder implementations removed",
+        "No dead code warnings",
+        "Traits either replaced with actual implementations, removed entirely, or left with todo!() and tracking comment if genuinely needed later",
+        "All existing tests pass"
+      ],
+      "actionItems": [
+        "Audit for NoOp types",
+        "Remove NoOp structs and impls",
+        "Refactor dependencies to use real implementations",
+        "Run cargo check and test"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/13"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-206",
+      "title": "Annotate acme_email dead code",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "The acme_email builder method on ApplicationNodeBuilder stores a value that is never consumed \u2014 TLS provisioning (ADR-032 AC 7) is not yet implemented. The field should carry #[allow(dead_code)] or a todo!() annotation to make the intent explicit. Note: The field IS part of SCP-145's acceptance criteria for the builder API surface. It is intentional dead code, not an oversight \u2014 but it should be annotated.",
+      "acceptanceCriteria": [
+        "acme_email field has #[allow(dead_code)] or a todo!() annotation to make the intent explicit",
+        "A code comment explains why the field exists and references ADR-032 AC 7 and SCP-145",
+        "No dead_code compiler warning for acme_email"
+      ],
+      "actionItems": [
+        "Add #[allow(dead_code)] to acme_email field",
+        "Add explanatory comment",
+        "Verify warning suppressed"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/11"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-207",
+      "title": "Make blob storage configurable in ApplicationNodeBuilder",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "ApplicationNodeBuilder hardcodes InMemoryBlobStorage with no way to inject alternative. All blobs lost on restart.",
+      "acceptanceCriteria": [
+        "Builder accepts configurable blob storage via builder method",
+        "Accepts any type implementing BlobStorage trait",
+        "InMemoryBlobStorage remains default",
+        "Tests: default uses InMemory, custom storage injected correctly"
+      ],
+      "actionItems": [
+        "Add blob_storage field to builder",
+        "Add builder method accepting impl BlobStorage",
+        "Default to InMemoryBlobStorage in build()",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/10"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-208",
+      "title": "Add relay graceful shutdown handle",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "Relay server has no graceful shutdown handle. Starting returns no mechanism to stop it.",
+      "acceptanceCriteria": [
+        "Start returns shutdown handle",
+        "Shutdown gracefully drains connections",
+        "Tests: start and shutdown without panic, stops accepting connections, in-flight requests complete"
+      ],
+      "actionItems": [
+        "Add CancellationToken to server accept loop",
+        "Return ShutdownHandle from start method",
+        "Expose handle from ApplicationNode",
+        "Add lifecycle tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/9"
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-209",
+      "title": "Implement type-state builder for ApplicationNode",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "ApplicationNodeBuilder uses runtime validation (build() returns Result) rather than a type-state pattern that would enforce required fields at compile time. This is a valid architectural observation \u2014 a type-state builder would make misconfiguration a compile error rather than a runtime error.",
+      "acceptanceCriteria": [
+        "Type-state pattern with phantom type parameters",
+        "build() only available when all required fields set",
+        "Missing required fields produce compile error",
+        "Optional fields don't affect type-state",
+        "Tests: complete builder compiles, incomplete doesn't"
+      ],
+      "actionItems": [
+        "Define marker types for states",
+        "Add PhantomData type parameter",
+        "Methods transition between states",
+        "build() only on Ready state",
+        "Add compile-pass and compile-fail tests"
+      ],
+      "blockedBy": [
+        "SCP-207",
+        "SCP-208"
+      ],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/12"
+      ],
+      "details": {
+        "currentBehavior": "build() returns Result \u2014 misconfiguration is a runtime error, not a compile error.",
+        "designRationale": "A type-state builder would make misconfiguration a compile error rather than a runtime error."
+      }
+    },
+    {
+      "id": "SCP-210",
+      "title": "Design Sybil-resistant blocking mechanism",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
+      ],
+      "description": "handle_sender_key_request in crypto/sender_keys/key_protocol.rs checks block_list.contains(&request.requester_did) \u2014 per-DID blocking only. A Sybil identity (new DID controlled by the same actor) not in the block list can request and receive the new sender key. The protocol tenet \"every agent traces to a human DID\" is not mechanically enforced. Classification: Architectural. Requires identity-level (not DID-level) blocking or external Sybil resistance.",
+      "acceptanceCriteria": [
+        "A design document or ADR describes the chosen Sybil-resistant blocking approach",
+        "The blocking mechanism supports identity-level blocking (not just per-DID), or external Sybil resistance",
+        "Implementation in key_protocol.rs uses the new blocking mechanism",
+        "Unit test: blocked identity cannot obtain sender keys even with a new DID",
+        "Unit test: non-blocked identity can obtain sender keys normally",
+        "The approach integrates with SCP's existing DID and UCAN infrastructure"
+      ],
+      "actionItems": [
+        "Research Sybil resistance compatible with DID identity",
+        "Write design note in .docs/",
+        "Refactor to identity-level blocking",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/22"
+      ],
+      "details": {
+        "classification": "Architectural. Requires identity-level (not DID-level) blocking or external Sybil resistance.",
+        "currentCode": "block_list.contains(&request.requester_did) \u2014 per-DID blocking only.",
+        "protocolTenet": "The protocol tenet 'every agent traces to a human DID' is not mechanically enforced.",
+        "sybilDefinition": "A Sybil identity is a new DID controlled by the same actor."
+      }
+    },
+    {
+      "id": "SCP-211",
+      "title": "Design pseudonym rotation for traffic analysis resistance",
+      "gate": "gate-harden",
+      "priority": "P2",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/envelope/pseudonym.rs",
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "Pseudonym derivation in envelope/pseudonym.rs is HMAC-SHA256(identity_key_material, context_id || \"scp-pseudonym\") \u2014 deterministic, never rotated. The relay sees routing_id and recipient_hint on every envelope. deliver_to_subscribers delivers blobs by routing_id with no delay/batching, making timing correlation trivial. Cross-relay fanout sends identical envelopes simultaneously. Classification: Architectural (P2/defense-in-depth). Requires pseudonym rotation or traffic analysis resistance mechanisms.",
+      "acceptanceCriteria": [
+        "A design document or ADR describes the chosen pseudonym rotation and traffic analysis resistance approach",
+        "Pseudonym derivation supports epoch-based or event-triggered rotation",
+        "Relay delivery path supports configurable delay/batching to resist timing analysis",
+        "The recipient_hint visibility to relays is addressed (rotation or obfuscation)",
+        "Unit test: pseudonyms change after rotation trigger",
+        "Unit test: old pseudonyms are still resolvable during a grace period",
+        "The design addresses cross-relay fanout correlation (identical envelopes sent simultaneously)"
+      ],
+      "actionItems": [
+        "Research rotation strategies",
+        "Write design note in .docs/",
+        "Design rotation mechanism",
+        "Design delivery batching/delay",
+        "Add tests"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        "https://github.com/limn-works/scp/issues/17"
+      ],
+      "details": {
+        "classification": "Architectural (P2/defense-in-depth). Requires design decision.",
+        "hmacConstruction": "HMAC-SHA256(identity_key_material, context_id || \"scp-pseudonym\") \u2014 deterministic, never rotated.",
+        "relayVisibility": "The relay sees routing_id and recipient_hint on every envelope.",
+        "timingCorrelation": "deliver_to_subscribers delivers blobs by routing_id with no delay/batching, making timing correlation trivial.",
+        "crossRelayCorrelation": "Cross-relay fanout sends identical envelopes simultaneously."
+      }
+    }
+  ]
+}
