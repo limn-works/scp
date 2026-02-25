@@ -28,12 +28,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod error;
 pub mod manager;
 pub mod native;
 pub mod traits;
 
 // Re-export primary types at the crate level for convenience.
+pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
 pub use error::TransportError;
 pub use manager::TransportManager;
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};

@@ -42,10 +42,12 @@
 //! - [`ToolErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`ToolCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
+pub mod interface;
 pub mod invoke;
 pub mod lifecycle;
 pub mod registry;
 pub mod schema;
+pub mod session;
 
 use crate::context::roles;
 
@@ -146,6 +148,100 @@ pub enum ToolError {
     /// A test vector verification failed.
     #[error("test vector verification failed: {message}")]
     VerificationFailed {
+        /// Human-readable description of the failure.
+        message: String,
+    },
+
+    /// The context is not in the Active state.
+    #[error("context is not active (current state: {current_state})")]
+    ContextNotActive {
+        /// The current state of the context.
+        current_state: String,
+    },
+
+    /// The invoker does not have the required capability.
+    #[error("invoker \"{did}\" not authorized for tool \"{tool_id}\"")]
+    InvokerNotAuthorized {
+        /// The DID that attempted invocation.
+        did: String,
+        /// The tool ID.
+        tool_id: String,
+    },
+
+    /// Input validation against the tool schema failed.
+    #[error("input validation failed: {message}")]
+    InputValidationFailed {
+        /// Human-readable description of the validation failure.
+        message: String,
+    },
+
+    /// Tool execution failed.
+    #[error("execution failed: {message}")]
+    ExecutionFailed {
+        /// Human-readable description of the execution failure.
+        message: String,
+    },
+
+    /// The specified session was not found.
+    #[error("session not found: {session_id}")]
+    SessionNotFound {
+        /// The session ID that was not found.
+        session_id: String,
+    },
+
+    /// The session has expired.
+    #[error("session expired: {session_id}")]
+    SessionExpired {
+        /// The expired session ID.
+        session_id: String,
+    },
+
+    /// Admin capability is required for cross-context tool interfaces.
+    #[error("admin capability required for tool interface: {did}")]
+    InterfaceAdminRequired {
+        /// The DID that attempted the operation.
+        did: String,
+    },
+
+    /// The interface has not been approved by both sides.
+    #[error("tool interface not fully approved (source: {source_approved}, target: {target_approved})")]
+    InterfaceNotApproved {
+        /// Whether the source context approved.
+        source_approved: bool,
+        /// Whether the target context approved.
+        target_approved: bool,
+    },
+
+    /// The invoker is not authorized for this cross-context interface.
+    #[error("invoker \"{did}\" not authorized for cross-context tool \"{tool_id}\"")]
+    InterfaceInvokerNotAuthorized {
+        /// The DID that attempted invocation.
+        did: String,
+        /// The tool ID.
+        tool_id: String,
+    },
+
+    /// Cross-context interface rate limit exceeded.
+    #[error("rate limit exceeded: {max_calls} calls per {window_ms}ms")]
+    InterfaceRateLimited {
+        /// Maximum calls allowed.
+        max_calls: u64,
+        /// Window duration in milliseconds.
+        window_ms: u64,
+    },
+
+    /// Context ID mismatch in cross-context interface.
+    #[error("context mismatch in tool interface: expected {expected}, got {actual}")]
+    InterfaceContextMismatch {
+        /// The expected context ID.
+        expected: String,
+        /// The actual context ID.
+        actual: String,
+    },
+
+    /// Cross-context interface execution failed.
+    #[error("cross-context execution failed: {message}")]
+    InterfaceExecutionFailed {
         /// Human-readable description of the failure.
         message: String,
     },

@@ -51,6 +51,7 @@
 //! - [`VerificationMethod`] -- Self-attested vs challenge-verified.
 //! - [`ChallengeSigner`] -- Trait for signing challenge requests.
 
+pub mod aggregate;
 pub mod attestation;
 pub mod behavioral;
 pub mod challenge;

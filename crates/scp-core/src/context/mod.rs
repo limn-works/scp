@@ -27,10 +27,12 @@
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
 pub mod builder;
+pub mod close;
 pub mod manager;
 pub mod membership;
 pub mod memory_scope;
 pub mod params;
+pub mod promotion;
 pub mod roles;
 pub mod state_machine;
 pub mod templates;

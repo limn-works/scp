@@ -41,6 +41,7 @@
 
 pub mod capability;
 pub mod mint;
+pub mod nonce;
 pub mod revoke;
 pub mod validate;
 
