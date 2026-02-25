@@ -87,7 +87,13 @@ pub fn process_commit(
     // Place the old epoch into the grace window. In-flight messages encrypted
     // under this epoch can still be decrypted until the grace window closes
     // (30 seconds or until all members send in the new epoch).
-    grace_store.add_epoch(old_epoch);
+    //
+    // add_epoch() enforces capacity bounds and returns any epochs that were
+    // expired or evicted. OpenMLS handles its own key material deletion
+    // internally (via delete_previous_epoch_keypairs during commit merges),
+    // so we do not need to explicitly delete key material here. The expired
+    // epochs list is available for logging/diagnostics if needed.
+    let _expired_epochs = grace_store.add_epoch(old_epoch);
 
     Ok(())
 }
@@ -328,5 +334,128 @@ mod tests {
         for i in 0u64..3 {
             assert!(grace_store.is_in_grace(initial_epoch + i));
         }
+    }
+
+    /// Forward secrecy: after epoch advance via commit, messages encrypted
+    /// under the old epoch cannot be decrypted by the receiver whose group
+    /// has advanced past that epoch.
+    ///
+    /// This verifies that `OpenMLS`'s `merge_staged_commit()` deletes
+    /// previous epoch key material (via `delete_previous_epoch_keypairs()`),
+    /// making old-epoch ciphertexts undecryptable.
+    ///
+    /// **Documented finding (SCP-171):** OpenMLS's `merge_staged_commit()`
+    /// and `merge_pending_commit()` automatically call
+    /// `delete_previous_epoch_keypairs()`, which removes the previous epoch's
+    /// encryption key pairs from the storage provider. Additionally, the
+    /// `MlsGroupCreateConfig` default `max_past_epochs` is 0, meaning no
+    /// past epoch message secrets are retained in the `MessageSecretsStore`.
+    /// Therefore, forward secrecy of cryptographic key material is enforced
+    /// by OpenMLS itself, not by the `EpochGraceStore`. The grace store's
+    /// role is to control whether the SCP layer *attempts* decryption for a
+    /// given epoch.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn forward_secrecy_old_epoch_ciphertext_undecryptable_after_advance() {
+        use crate::crypto::mls::encrypt::{encrypt, decrypt, serialize_ciphertext};
+
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let mut grace_store = EpochGraceStore::new();
+
+        // Alice encrypts a message at epoch 1.
+        let old_epoch = alice_group.epoch().unwrap();
+        let ciphertext_msg = encrypt(&mut alice_group, b"secret at old epoch").unwrap();
+        let ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
+
+        // Alice issues an update, advancing her group to epoch 2.
+        let commit = propose_update(&mut alice_group).unwrap();
+        let commit_bytes = serialize_commit(&commit).unwrap();
+
+        // Bob processes the commit, advancing to epoch 2.
+        // merge_staged_commit internally calls delete_previous_epoch_keypairs().
+        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+
+        assert_eq!(bob_group.epoch().unwrap(), old_epoch + 1);
+
+        // Bob tries to decrypt the old-epoch ciphertext. OpenMLS has already
+        // deleted the epoch 1 key material during the commit merge, so
+        // decryption should fail.
+        let result = decrypt(&mut bob_group, &ciphertext_bytes);
+        assert!(
+            result.is_err(),
+            "old-epoch ciphertext must be undecryptable after epoch advance \
+             (forward secrecy enforced by OpenMLS key deletion)"
+        );
+    }
+
+    /// Verify that OpenMLS deletes key material across multiple epoch
+    /// advances, not just the most recent one. After two epoch advances,
+    /// ciphertext from epoch N should be undecryptable at epoch N+2.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn forward_secrecy_survives_multiple_epoch_advances() {
+        use crate::crypto::mls::encrypt::{encrypt, decrypt, serialize_ciphertext};
+
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let mut grace_store = EpochGraceStore::new();
+
+        // Alice encrypts at epoch 1.
+        let ciphertext_msg = encrypt(&mut alice_group, b"epoch 1 secret").unwrap();
+        let ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
+
+        // Advance twice: epoch 1 -> 2 -> 3.
+        for _ in 0..2 {
+            let commit = propose_update(&mut alice_group).unwrap();
+            let commit_bytes = serialize_commit(&commit).unwrap();
+            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        }
+
+        assert_eq!(bob_group.epoch().unwrap(), 3);
+
+        // The epoch-1 ciphertext should be completely undecryptable.
+        let result = decrypt(&mut bob_group, &ciphertext_bytes);
+        assert!(
+            result.is_err(),
+            "ciphertext from epoch 1 must be undecryptable at epoch 3"
+        );
+    }
+
+    /// Verify that the epoch expiration callback fires during process_commit
+    /// when the grace store is at capacity and must evict old epochs.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn process_commit_triggers_callback_on_grace_store_eviction() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let evicted = Rc::new(RefCell::new(Vec::<u64>::new()));
+        let evicted_clone = Rc::clone(&evicted);
+
+        // Use a very small grace store that will evict quickly.
+        let mut grace_store = EpochGraceStore::with_max_capacity(2);
+        grace_store.set_on_epoch_expired(Box::new(move |epochs| {
+            evicted_clone.borrow_mut().extend_from_slice(epochs);
+        }));
+
+        // Advance 3 times to fill and then exceed the grace store capacity.
+        for _ in 0..3 {
+            let commit = propose_update(&mut alice_group).unwrap();
+            let commit_bytes = serialize_commit(&commit).unwrap();
+            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        }
+
+        // The grace store has capacity 2, so the first epoch should have been
+        // evicted when the third was added.
+        let evicted_epochs = evicted.borrow();
+        assert!(
+            !evicted_epochs.is_empty(),
+            "callback should have been invoked for evicted epoch"
+        );
+        assert_eq!(
+            grace_store.len(),
+            2,
+            "grace store should be at capacity, not over"
+        );
     }
 }
