@@ -13,7 +13,9 @@
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::protocol::{JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId};
+use crate::protocol::{
+    JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
+};
 use crate::server::{ContextProvider, McpServer};
 
 // ---------------------------------------------------------------------------
@@ -107,9 +109,7 @@ fn parse_incoming(line: &str) -> Result<Incoming, JsonRpcResponse> {
 /// # Errors
 ///
 /// Returns [`StdioError`] if an I/O error occurs on stdin or stdout.
-pub async fn run_stdio<P: ContextProvider>(
-    server: &mut McpServer<P>,
-) -> Result<(), StdioError> {
+pub async fn run_stdio<P: ContextProvider>(server: &mut McpServer<P>) -> Result<(), StdioError> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -269,11 +269,7 @@ mod tests {
         fn context_tools(&self, _context_id: &str) -> Vec<ContextToolInfo> {
             Vec::new()
         }
-        fn validate_capability(
-            &self,
-            _context_id: &str,
-            _tool_name: &str,
-        ) -> Result<(), String> {
+        fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
             Ok(())
         }
         fn invoke_tool(
@@ -325,7 +321,24 @@ mod tests {
 
     #[test]
     fn handle_initialized_notification_via_parse() {
+        // Initialize the server first — the pre-init guard blocks everything
+        // except `initialize` and `ping`.
         let mut server = McpServer::new(MockProvider::default());
+        let init_line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_INITIALIZE,
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client" }
+            },
+            "id": 0
+        })
+        .to_string();
+        if let Incoming::Request(req) = parse_incoming(&init_line).unwrap() {
+            server.handle_request(&req);
+        }
+
         let line = serde_json::json!({
             "jsonrpc": "2.0",
             "method": METHOD_INITIALIZED

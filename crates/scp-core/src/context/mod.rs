@@ -42,7 +42,31 @@ pub mod ttl;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
+
+/// Converts a `context_id` string to a deterministic 32-byte array using SHA-256.
+///
+/// This is the **canonical** context ID byte representation used across all
+/// context operations: builder, manager, TTL, memory scope, and any code that
+/// needs a `[u8; 32]` from a context ID string. Using SHA-256 ensures:
+/// - Fixed output size regardless of input length (no truncation/collision).
+/// - Uniform distribution (suitable as cryptographic key material identifiers).
+/// - No information leakage about input length (unlike zero-padding).
+///
+/// # CRITICAL: All modules MUST use this function.
+/// Using raw UTF-8 bytes (truncation/zero-padding) produces different values
+/// than SHA-256 for the same input, causing crypto operations to address the
+/// wrong MLS groups, sender keys, and event logs.
+#[must_use]
+pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(context_id.as_bytes());
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    bytes
+}
 
 // Re-export all parameter types for convenience.
 pub use params::{
@@ -84,8 +108,8 @@ pub use memory_scope::{
 // Re-export TTL management types (SCP-021, SCP-066).
 pub use ttl::{CloseResult, TtlExtension, TtlTimer};
 pub use ttl::{
-    ExtensionConsentMode, TtlEnforcer, TtlError, TtlExtensionProposal, TtlPolicy,
-    TtlTimerHandle, check_ttl, consent_mode_for_member_count,
+    ExtensionConsentMode, TtlEnforcer, TtlError, TtlExtensionProposal, TtlPolicy, TtlTimerHandle,
+    check_ttl, consent_mode_for_member_count,
 };
 
 // ---------------------------------------------------------------------------

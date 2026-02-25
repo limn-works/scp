@@ -56,13 +56,10 @@ use crate::identity::cache::Clock;
 // context_id_to_bytes helper (mirrors manager.rs)
 // ---------------------------------------------------------------------------
 
-/// Converts a `context_id` string to a 32-byte array (truncated/zero-padded).
+/// Uses the canonical SHA-256 context ID byte derivation.
+/// Delegates to [`super::context_id_bytes`] to match builder.rs.
 fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
-    let bytes = context_id.as_bytes();
-    let mut result = [0u8; 32];
-    let len = bytes.len().min(32);
-    result[..len].copy_from_slice(&bytes[..len]);
-    result
+    super::context_id_bytes(context_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -144,8 +141,8 @@ pub fn check_ttl(
     match ttl_policy {
         TtlPolicy::None => Ok(()),
         TtlPolicy::Finite(duration) => {
-            let deadline = extended_until
-                .unwrap_or_else(|| created_at.saturating_add(duration.as_secs()));
+            let deadline =
+                extended_until.unwrap_or_else(|| created_at.saturating_add(duration.as_secs()));
             if now >= deadline {
                 Err(TtlError::Expired)
             } else {
@@ -338,11 +335,9 @@ impl TtlExtensionProposal {
         let consent_mode = consent_mode_for_member_count(member_count);
         let required_count = match consent_mode {
             ExtensionConsentMode::AllMember => member_count,
-            ExtensionConsentMode::Governance => {
-                match governance {
-                    GovernanceModel::SingleAdmin => 1,
-                }
-            }
+            ExtensionConsentMode::Governance => match governance {
+                GovernanceModel::SingleAdmin => 1,
+            },
         };
         Self {
             proposer_did,
@@ -730,10 +725,18 @@ mod tests {
     }
 
     impl ContextCryptoProvider for MockCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> { Ok(()) }
-        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
+        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
         fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.mls_destroyed.lock().unwrap().push(*id);
             Ok(())
@@ -742,12 +745,45 @@ mod tests {
             self.sender_keys_destroyed.lock().unwrap().push(*id);
             Ok(())
         }
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> { Ok(()) }
-        fn add_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
-        fn remove_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
-        fn distribute_sender_key(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
-        fn remove_member_sender_key(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
-        fn encrypt_message(&self, _context_id: &[u8; 32], _sender_did: &str, payload: &[u8]) -> Result<Vec<u8>, ContextError> { Ok(payload.to_vec()) }
+        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn add_member(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn remove_member(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn distribute_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn remove_member_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn encrypt_message(
+            &self,
+            _context_id: &[u8; 32],
+            _sender_did: &str,
+            payload: &[u8],
+        ) -> Result<Vec<u8>, ContextError> {
+            Ok(payload.to_vec())
+        }
     }
 
     #[derive(Default)]
@@ -765,13 +801,27 @@ mod tests {
     }
 
     impl ContextTransportProvider for MockTransport {
-        fn is_connected(&self) -> bool { self.connected.load(Ordering::Relaxed) }
-        fn publish_context(&self, _id: &[u8; 32], _params: &ContextParams) -> Result<(), ContextCreationError> { Ok(()) }
+        fn is_connected(&self) -> bool {
+            self.connected.load(Ordering::Relaxed)
+        }
+        fn publish_context(
+            &self,
+            _id: &[u8; 32],
+            _params: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
         fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.deleted.lock().unwrap().push(*id);
             Ok(())
         }
-        fn send_message(&self, _context_id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> { Ok(()) }
+        fn send_message(
+            &self,
+            _context_id: &[u8; 32],
+            _encrypted_payload: &[u8],
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -780,30 +830,41 @@ mod tests {
     }
 
     impl ContextEventLogProvider for MockEventLog {
-        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
+        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
         fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
             self.events.lock().unwrap().push((*id, event.to_owned()));
             Ok(())
         }
-        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
+        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
     }
 
     fn role_state_with_close_capability(context_id: &str, creator_did: &str) -> ContextRoleState {
-        let ceiling = CapabilityCeiling::new(
-            [Capability::MessagesRead, Capability::MessagesWrite, Capability::ContextClose, Capability::RoleAssign],
-        );
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ContextClose,
+            Capability::RoleAssign,
+        ]);
         ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
     }
 
-    fn role_state_without_close_capability(context_id: &str, creator_did: &str) -> ContextRoleState {
-        let ceiling = CapabilityCeiling::new(
-            [Capability::MessagesRead, Capability::MessagesWrite],
-        );
+    fn role_state_without_close_capability(
+        context_id: &str,
+        creator_did: &str,
+    ) -> ContextRoleState {
+        let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
         ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
     }
 
     fn active_handle(context_id: &str, memory_scope: MemoryScope) -> ContextHandle {
-        let params = ContextParams { memory_scope, ..ContextParams::default() };
+        let params = ContextParams {
+            memory_scope,
+            ..ContextParams::default()
+        };
         ContextHandle::new(context_id.to_owned(), params)
     }
 
@@ -817,9 +878,13 @@ mod tests {
         make_active(&handle).await;
         let role_state = role_state_without_close_capability("ctx-close-1", "did:key:creator");
         let event_log = MockEventLog::default();
-        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
+        let result =
+            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ContextError::PermissionDenied(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
         assert_eq!(handle.state().await, ContextState::Active);
     }
 
@@ -829,7 +894,8 @@ mod tests {
         make_active(&handle).await;
         let role_state = role_state_with_close_capability("ctx-close-2", "did:key:creator");
         let event_log = MockEventLog::default();
-        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
+        let result =
+            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
         assert!(result.is_ok());
         let close_result = result.unwrap();
         assert!(!close_result.should_generate_summary);
@@ -843,7 +909,8 @@ mod tests {
         make_active(&handle).await;
         let role_state = role_state_with_close_capability("ctx-close-3", "did:key:creator");
         let event_log = MockEventLog::default();
-        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
+        let result =
+            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
         assert!(result.is_ok());
         assert!(result.unwrap().should_generate_summary);
     }
@@ -854,7 +921,8 @@ mod tests {
         make_active(&handle).await;
         let role_state = role_state_with_close_capability("ctx-close-4", "did:key:creator");
         let event_log = MockEventLog::default();
-        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
+        let result =
+            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
         assert!(result.is_ok());
         let cr = result.unwrap();
         assert!(!cr.should_generate_summary);
@@ -866,8 +934,12 @@ mod tests {
         let handle = active_handle("ctx-close-5", MemoryScope::Ephemeral);
         let role_state = role_state_with_close_capability("ctx-close-5", "did:key:creator");
         let event_log = MockEventLog::default();
-        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
-        assert!(matches!(result.unwrap_err(), ContextError::ContextNotActive));
+        let result =
+            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::ContextNotActive
+        ));
     }
 
     #[tokio::test]
@@ -878,7 +950,11 @@ mod tests {
         let crypto = MockCrypto::default();
         let transport = MockTransport::connected();
         let event_log = MockEventLog::default();
-        assert!(finalize_close(&handle, &crypto, &transport, &event_log).await.is_ok());
+        assert!(
+            finalize_close(&handle, &crypto, &transport, &event_log)
+                .await
+                .is_ok()
+        );
         assert_eq!(crypto.mls_destroyed.lock().unwrap().len(), 1);
         assert_eq!(handle.state().await, ContextState::Closed);
     }
@@ -890,7 +966,11 @@ mod tests {
         let crypto = MockCrypto::default();
         let transport = MockTransport::connected();
         let event_log = MockEventLog::default();
-        assert!(finalize_close(&handle, &crypto, &transport, &event_log).await.is_err());
+        assert!(
+            finalize_close(&handle, &crypto, &transport, &event_log)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -899,7 +979,11 @@ mod tests {
         make_active(&handle).await;
         let crypto = MockCrypto::default();
         let event_log = MockEventLog::default();
-        assert!(handle_ttl_expiry(&handle, &crypto, &event_log).await.is_ok());
+        assert!(
+            handle_ttl_expiry(&handle, &crypto, &event_log)
+                .await
+                .is_ok()
+        );
         assert_eq!(handle.state().await, ContextState::Expired);
     }
 
@@ -909,7 +993,11 @@ mod tests {
         make_active(&handle).await;
         let crypto = MockCrypto::default();
         let event_log = MockEventLog::default();
-        assert!(handle_ttl_expiry(&handle, &crypto, &event_log).await.is_ok());
+        assert!(
+            handle_ttl_expiry(&handle, &crypto, &event_log)
+                .await
+                .is_ok()
+        );
         assert!(crypto.mls_destroyed.lock().unwrap().is_empty());
     }
 
@@ -918,7 +1006,12 @@ mod tests {
         let handle = active_handle("ctx-ttl-3", MemoryScope::Ephemeral);
         let crypto = MockCrypto::default();
         let event_log = MockEventLog::default();
-        assert!(matches!(handle_ttl_expiry(&handle, &crypto, &event_log).await.unwrap_err(), ContextError::ContextNotActive));
+        assert!(matches!(
+            handle_ttl_expiry(&handle, &crypto, &event_log)
+                .await
+                .unwrap_err(),
+            ContextError::ContextNotActive
+        ));
     }
 
     #[tokio::test]
@@ -982,17 +1075,42 @@ mod tests {
 
     #[test]
     fn check_ttl_returns_ok_when_active() {
-        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), None, 2000).is_ok());
+        assert!(
+            check_ttl(
+                1000,
+                TtlPolicy::Finite(Duration::from_secs(3600)),
+                None,
+                2000
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn check_ttl_returns_expired_when_elapsed() {
-        assert!(matches!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), None, 5000).unwrap_err(), TtlError::Expired));
+        assert!(matches!(
+            check_ttl(
+                1000,
+                TtlPolicy::Finite(Duration::from_secs(3600)),
+                None,
+                5000
+            )
+            .unwrap_err(),
+            TtlError::Expired
+        ));
     }
 
     #[test]
     fn check_ttl_returns_expired_at_exact_deadline() {
-        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), None, 4600).is_err());
+        assert!(
+            check_ttl(
+                1000,
+                TtlPolicy::Finite(Duration::from_secs(3600)),
+                None,
+                4600
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1002,12 +1120,28 @@ mod tests {
 
     #[test]
     fn check_ttl_respects_extension() {
-        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), Some(10000), 5000).is_ok());
+        assert!(
+            check_ttl(
+                1000,
+                TtlPolicy::Finite(Duration::from_secs(3600)),
+                Some(10000),
+                5000
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn check_ttl_expired_extension() {
-        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), Some(8000), 9000).is_err());
+        assert!(
+            check_ttl(
+                1000,
+                TtlPolicy::Finite(Duration::from_secs(3600)),
+                Some(8000),
+                9000
+            )
+            .is_err()
+        );
     }
 
     // SCP-066 tests: TtlEnforcer
@@ -1062,7 +1196,10 @@ mod tests {
     fn ttl_enforcer_apply_extension_rejects_none_policy() {
         let clock = TestClock::new(1000);
         let mut enforcer = TtlEnforcer::new(0, TtlPolicy::None);
-        assert!(matches!(enforcer.apply_extension(5000, &clock).unwrap_err(), TtlError::NoTtlPolicy));
+        assert!(matches!(
+            enforcer.apply_extension(5000, &clock).unwrap_err(),
+            TtlError::NoTtlPolicy
+        ));
     }
 
     #[test]
@@ -1090,7 +1227,10 @@ mod tests {
     fn ttl_enforcer_accessors() {
         let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
         assert_eq!(enforcer.created_at(), 1000);
-        assert_eq!(enforcer.ttl_policy(), TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert_eq!(
+            enforcer.ttl_policy(),
+            TtlPolicy::Finite(Duration::from_secs(3600))
+        );
         assert_eq!(enforcer.extended_until(), None);
         assert!(!enforcer.is_expired());
     }
@@ -1099,19 +1239,30 @@ mod tests {
 
     #[test]
     fn consent_mode_bilateral_uses_all_member() {
-        assert_eq!(consent_mode_for_member_count(2), ExtensionConsentMode::AllMember);
+        assert_eq!(
+            consent_mode_for_member_count(2),
+            ExtensionConsentMode::AllMember
+        );
     }
 
     #[test]
     fn consent_mode_multi_party_uses_governance() {
-        assert_eq!(consent_mode_for_member_count(3), ExtensionConsentMode::Governance);
+        assert_eq!(
+            consent_mode_for_member_count(3),
+            ExtensionConsentMode::Governance
+        );
     }
 
     // SCP-066 tests: TtlExtensionProposal
 
     #[test]
     fn extension_proposal_bilateral_requires_all_members() {
-        let mut proposal = TtlExtensionProposal::new("did:key:alice".into(), Duration::from_secs(3600), 2, GovernanceModel::SingleAdmin);
+        let mut proposal = TtlExtensionProposal::new(
+            "did:key:alice".into(),
+            Duration::from_secs(3600),
+            2,
+            GovernanceModel::SingleAdmin,
+        );
         assert_eq!(proposal.consent_mode(), ExtensionConsentMode::AllMember);
         assert!(!proposal.is_approved());
         proposal.record_consent("did:key:alice".into());
@@ -1122,7 +1273,12 @@ mod tests {
 
     #[test]
     fn extension_proposal_multi_party_single_admin() {
-        let mut proposal = TtlExtensionProposal::new("did:key:admin".into(), Duration::from_secs(7200), 5, GovernanceModel::SingleAdmin);
+        let mut proposal = TtlExtensionProposal::new(
+            "did:key:admin".into(),
+            Duration::from_secs(7200),
+            5,
+            GovernanceModel::SingleAdmin,
+        );
         assert_eq!(proposal.consent_mode(), ExtensionConsentMode::Governance);
         proposal.record_consent("did:key:admin".into());
         assert!(proposal.is_approved());
@@ -1130,7 +1286,12 @@ mod tests {
 
     #[test]
     fn extension_proposal_computes_deadline() {
-        let proposal = TtlExtensionProposal::new("did:key:alice".into(), Duration::from_secs(3600), 2, GovernanceModel::SingleAdmin);
+        let proposal = TtlExtensionProposal::new(
+            "did:key:alice".into(),
+            Duration::from_secs(3600),
+            2,
+            GovernanceModel::SingleAdmin,
+        );
         assert_eq!(proposal.compute_new_deadline(5000), 8600);
     }
 
@@ -1152,12 +1313,15 @@ mod tests {
     }
     impl TtlTimerHandle for MockTimerHandle {
         fn cancel_timer(&self) {
-            self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-            self.active.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         fn reset_timer(&mut self, d: Duration) {
             *self.reset_dur.lock().unwrap() = Some(d);
-            self.active.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.active
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         fn is_timer_active(&self) -> bool {
             self.active.load(std::sync::atomic::Ordering::Relaxed)
@@ -1187,7 +1351,12 @@ mod tests {
         let clock = TestClock::new(3000);
         let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
         assert!(enforcer.check(&clock).is_ok());
-        let mut proposal = TtlExtensionProposal::new("did:key:alice".into(), Duration::from_secs(3600), 2, GovernanceModel::SingleAdmin);
+        let mut proposal = TtlExtensionProposal::new(
+            "did:key:alice".into(),
+            Duration::from_secs(3600),
+            2,
+            GovernanceModel::SingleAdmin,
+        );
         proposal.record_consent("did:key:alice".into());
         proposal.record_consent("did:key:bob".into());
         assert!(proposal.is_approved());
@@ -1203,10 +1372,17 @@ mod tests {
     fn full_extension_flow_multi_party() {
         let clock = TestClock::new(2000);
         let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
-        let mut proposal = TtlExtensionProposal::new("did:key:admin".into(), Duration::from_secs(7200), 5, GovernanceModel::SingleAdmin);
+        let mut proposal = TtlExtensionProposal::new(
+            "did:key:admin".into(),
+            Duration::from_secs(7200),
+            5,
+            GovernanceModel::SingleAdmin,
+        );
         proposal.record_consent("did:key:admin".into());
         assert!(proposal.is_approved());
-        enforcer.apply_extension(proposal.compute_new_deadline(clock.now()), &clock).unwrap();
+        enforcer
+            .apply_extension(proposal.compute_new_deadline(clock.now()), &clock)
+            .unwrap();
         clock.set(5000);
         assert!(enforcer.check(&clock).is_ok());
         clock.set(9200);
