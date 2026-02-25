@@ -18,8 +18,10 @@
 //!   intervals. [`check_threshold_attestation`] checks N-of-M requirements
 //!   with independence scoring.
 //! - **Layer 3 (Challenge-Response):** [`ChallengeRequest`] /
-//!   [`ChallengeResponse`] for capability verification. *(Placeholder --
-//!   SCP-063)*
+//!   [`ChallengeResponse`] for capability verification.
+//!   [`verify_challenge_response`] verifies response signatures and
+//!   distinguishes self-attested vs challenge-verified in metadata. See
+//!   [`challenge`] module.
 //! - **Layer 4 (Consequence):** [`ConsequenceRule`] declared at context creation
 //!   and protocol-enforced. See [`consequence`] module.
 //!
@@ -42,12 +44,16 @@
 //! - [`ThresholdRequirement`] -- N-of-M threshold requirement.
 //! - [`ThresholdResult`] -- Result of threshold attestation check.
 //! - [`AttestationReference`] -- Reference to an attestation in the event log.
-//!
-//! Placeholder types (to be fleshed out in future stories):
-//! - [`ChallengeRequest`], [`ChallengeResponse`] -- SCP-063
+//! - [`ChallengeRequest`] -- Challenge request for capability verification.
+//! - [`ChallengeResponse`] -- Response to a challenge request.
+//! - [`ChallengeVerification`] -- Result of verifying a challenge response.
+//! - [`ChallengeType`] -- Standard and custom challenge types.
+//! - [`VerificationMethod`] -- Self-attested vs challenge-verified.
+//! - [`ChallengeSigner`] -- Trait for signing challenge requests.
 
 pub mod attestation;
 pub mod behavioral;
+pub mod challenge;
 pub mod consequence;
 
 use std::collections::HashMap;
@@ -63,6 +69,10 @@ pub use attestation::{
     check_threshold_attestation, verify_attestation,
 };
 pub use behavioral::{BehavioralRecord, compute_behavioral_record};
+pub use challenge::{
+    ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
+    VerificationMethod, issue_challenge, verify_challenge_response,
+};
 pub use consequence::{
     ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
     TriggeredConsequence, evaluate_consequence_rules,
@@ -140,6 +150,54 @@ pub enum TrustError {
         /// Human-readable description of the evidence issue.
         reason: String,
     },
+
+    /// The challenge response's ID does not match the challenge request.
+    #[error("challenge ID mismatch: expected {expected}, got {got}")]
+    ChallengeIdMismatch {
+        /// The expected challenge ID (from the request).
+        expected: String,
+        /// The actual challenge ID (from the response).
+        got: String,
+    },
+
+    /// The challenge responder is not the challenged subject.
+    #[error("challenge responder mismatch: expected {expected}, got {got}")]
+    ChallengeResponderMismatch {
+        /// The expected responder DID (the `subject_did` from the request).
+        expected: String,
+        /// The actual responder DID (from the response).
+        got: String,
+    },
+
+    /// The challenge response was completed after the timeout window.
+    #[error(
+        "challenge {challenge_id}: timed out (timeout {timeout_secs}s, completed at \
+         {completed_at})"
+    )]
+    ChallengeTimeout {
+        /// The challenge ID.
+        challenge_id: String,
+        /// The timeout in seconds.
+        timeout_secs: u64,
+        /// The timestamp when the response was completed.
+        completed_at: u64,
+    },
+
+    /// The challenge response's Ed25519 signature is invalid.
+    #[error("challenge {challenge_id}: signature invalid: {reason}")]
+    ChallengeSignatureInvalid {
+        /// The challenge ID.
+        challenge_id: String,
+        /// Human-readable description of the failure.
+        reason: String,
+    },
+
+    /// Signing a challenge request failed.
+    #[error("challenge signing failed: {reason}")]
+    ChallengeSigningFailed {
+        /// Human-readable description of the failure.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -171,39 +229,9 @@ pub enum AttestationType {
     BehavioralWitness,
 }
 
-// ---------------------------------------------------------------------------
-// Placeholder types for future submodules
-// ---------------------------------------------------------------------------
-
-/// A challenge request for capability verification (ADR-017).
-///
-/// Placeholder -- will be fully implemented in SCP-063.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChallengeRequest {
-    /// Unique challenge identifier.
-    pub challenge_id: String,
-    /// DID of the challenger.
-    pub challenger_did: DID,
-    /// DID of the subject being challenged.
-    pub subject_did: DID,
-    /// Unix timestamp (seconds) when the challenge was created.
-    pub created_at: u64,
-}
-
-/// A challenge response (ADR-017).
-///
-/// Placeholder -- will be fully implemented in SCP-063.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChallengeResponse {
-    /// The challenge ID this responds to.
-    pub challenge_id: String,
-    /// DID of the responder.
-    pub responder_did: DID,
-    /// Unix timestamp (seconds) when the response was completed.
-    pub completed_at: u64,
-}
-
 // ConsequenceRule is now defined in consequence.rs and re-exported above.
+// ChallengeRequest and ChallengeResponse are now defined in challenge.rs and
+// re-exported above.
 
 // ---------------------------------------------------------------------------
 // Supporting types for BehavioralRecord
@@ -266,9 +294,10 @@ pub struct TrustInput {
     /// event log for the subject DID.
     pub behavioral_record: BehavioralRecord,
 
-    /// Challenge-response results (Layer 3). Each pair contains the original
-    /// request and the verified response.
-    pub challenge_results: Vec<(ChallengeRequest, ChallengeResponse)>,
+    /// Challenge-response results (Layer 3). Each entry is a verified
+    /// challenge-response pair with metadata distinguishing self-attested
+    /// vs challenge-verified capabilities.
+    pub challenge_results: Vec<ChallengeVerification>,
 
     /// Declared consequence rules (Layer 4). These are the rules declared at
     /// context creation that govern enforcement actions.
