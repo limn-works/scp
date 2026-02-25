@@ -181,12 +181,12 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// Returns the current sequence number.
     #[must_use]
     pub fn current_sequence(&self) -> u64 {
-        self.sequence.load(Ordering::Relaxed)
+        self.sequence.load(Ordering::Acquire)
     }
 
     /// Sets the sequence number (e.g., when loading from persistent storage).
     pub fn set_sequence(&self, seq: u64) {
-        self.sequence.store(seq, Ordering::Relaxed);
+        self.sequence.store(seq, Ordering::Release);
     }
 
     /// Constructs the BEP44 signable payload for a value and sequence number.
@@ -291,7 +291,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let value = doc_json.as_bytes();
 
         // Increment the sequence number.
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Construct the BEP44 signable payload and sign it.
         let signable = Self::bep44_signable(value, seq);
@@ -2408,6 +2408,64 @@ mod tests {
         assert_eq!(
             resolved.document.relay_service_urls()[0],
             "wss://relay.example.com/scp/v1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-176 — Concurrent sequence number monotonicity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_fetch_add_produces_unique_monotonic_values() {
+        use std::sync::atomic::AtomicU64;
+        use std::thread;
+
+        let num_threads = 8;
+        let increments_per_thread = 1_000;
+        let seq = Arc::new(AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let seq = Arc::clone(&seq);
+                thread::spawn(move || {
+                    let mut values = Vec::with_capacity(increments_per_thread);
+                    for _ in 0..increments_per_thread {
+                        let v = seq.fetch_add(1, Ordering::AcqRel);
+                        values.push(v);
+                    }
+                    values
+                })
+            })
+            .collect();
+
+        let mut all_values: Vec<u64> = Vec::with_capacity(num_threads * increments_per_thread);
+        for handle in handles {
+            let thread_values = handle.join().unwrap();
+            // Each thread's values must be strictly monotonically increasing.
+            for window in thread_values.windows(2) {
+                assert!(
+                    window[0] < window[1],
+                    "per-thread values not monotonic: {} >= {}",
+                    window[0],
+                    window[1]
+                );
+            }
+            all_values.extend(thread_values);
+        }
+
+        // All values across all threads must be unique.
+        all_values.sort_unstable();
+        all_values.dedup();
+        assert_eq!(
+            all_values.len(),
+            num_threads * increments_per_thread,
+            "duplicate sequence values detected across threads"
+        );
+
+        // Final counter value must equal total increments.
+        assert_eq!(
+            seq.load(Ordering::Acquire),
+            (num_threads * increments_per_thread) as u64
         );
     }
 }

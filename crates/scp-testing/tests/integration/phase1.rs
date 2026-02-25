@@ -37,9 +37,8 @@ use futures::StreamExt;
 use scp_core::crypto::mls::credential::ScpCredential;
 use scp_core::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 use scp_core::crypto::sender_keys::{
-    SenderKeyStore, decrypt_sender_layer, encrypt_sender_layer, generate_sender_key,
-    handle_sender_key_request, open_sender_key_response, publish_sender_key_epoch_advance,
-    request_sender_key, verify_epoch_advance,
+    SenderKeyStore, generate_sender_key, handle_sender_key_request, open_sender_key_response,
+    publish_sender_key_epoch_advance, request_sender_key, verify_epoch_advance,
 };
 use scp_core::envelope::inner::create_inner_envelope;
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
@@ -217,14 +216,11 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     bob_sk_store.set(ctx_id, &alice_id.did, received_sk);
 
     // ---------------------------------------------------------------
-    // Step 8: Alice encrypts message with sender key, wraps in envelopes (ADR-002, ADR-007)
+    // Step 8: Alice wraps message in envelopes with sender key + MLS (ADR-002, ADR-007)
     // ---------------------------------------------------------------
     let original_msg = b"Hello Bob, this is a secret message from Alice!";
 
-    // 8a. Encrypt with sender key (ADR-007).
-    let sk_encrypted = encrypt_sender_layer(&alice_sender_key, original_msg).unwrap();
-
-    // 8b. Create inner envelope with signature (ADR-002).
+    // 8a. Create inner envelope with signature (ADR-002).
     let inner_env = create_inner_envelope(
         ctx_id,
         &alice_id.did,
@@ -232,7 +228,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
         0, // generation
         1, // sequence
         1_700_000_000,
-        &sk_encrypted,
+        original_msg,
         None, // no provenance for this test
         &alice_custody,
         &alice_id.active_signing_key,
@@ -240,7 +236,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     .await
     .unwrap();
 
-    // 8c. Derive pseudonym for routing (ADR-002).
+    // 8b. Derive pseudonym for routing (ADR-002).
     let pseudonym = derive_pseudonym(&alice_custody, &alice_id.identity_key, ctx_id.as_bytes())
         .await
         .unwrap();
@@ -248,10 +244,12 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     let routing_bytes = pseudonym.public_key.as_bytes();
     let routing_arr: [u8; 32] = routing_bytes.try_into().unwrap();
 
-    // 8d. Seal: serialize inner, encrypt with MLS, wrap in outer envelope (ADR-001, ADR-002).
+    // 8c. Seal: serialize inner, encrypt with sender key, encrypt with MLS,
+    //     wrap in outer envelope (ADR-001, ADR-002, ADR-007).
     let outer_env = seal_envelope(
         &inner_env,
         &mut alice_group,
+        &alice_sender_key,
         &routing_arr,
         None, // broadcast
         3600, // 1 hour TTL
@@ -290,17 +288,16 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     //          verifies inner envelope signature (ADR-001, ADR-002, ADR-007)
     // ---------------------------------------------------------------
 
-    // 11a. Open outer envelope: MLS decrypt + inner signature verification.
-    let verified_inner = open_envelope(&received_outer, &mut bob_group, &alice_pubkey).unwrap();
-
-    // 11b. Strip padding to get the sender-key-encrypted payload.
-    let sk_encrypted_payload = strip_padding(&verified_inner.payload).unwrap();
-
-    // 11c. Decrypt sender key layer (ADR-007).
+    // 11a. Open outer envelope: MLS decrypt + sender key decrypt + inner
+    //      signature verification (ADR-001, ADR-002, ADR-007).
     let bob_alice_sk = bob_sk_store
         .get(ctx_id, &alice_id.did)
         .expect("Bob must have Alice's sender key");
-    let decrypted_msg = decrypt_sender_layer(bob_alice_sk, &sk_encrypted_payload).unwrap();
+    let verified_inner =
+        open_envelope(&received_outer, &mut bob_group, bob_alice_sk, &alice_pubkey).unwrap();
+
+    // 11b. Strip padding to recover original plaintext.
+    let decrypted_msg = strip_padding(&verified_inner.payload).unwrap();
 
     // ---------------------------------------------------------------
     // Step 12: Bob reads Alice's message — content matches original

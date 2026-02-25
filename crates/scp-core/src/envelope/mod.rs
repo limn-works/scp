@@ -101,4 +101,16 @@ pub enum EnvelopeError {
     /// sent by the claimed sender.
     #[error("inner signature mismatch: message rejected")]
     InnerSignatureMismatch,
+
+    /// Sender key AES-256-GCM encryption failed during envelope sealing.
+    #[error("sender key encryption failed: {0}")]
+    SenderKeyEncryptionFailed(String),
+
+    /// Sender key AES-256-GCM decryption failed during envelope opening.
+    ///
+    /// This indicates the ciphertext was tampered with, corrupted, or the
+    /// wrong sender key was used. Raised before inner envelope deserialization
+    /// is attempted.
+    #[error("sender key decryption failed: {0}")]
+    SenderKeyDecryptionFailed(String),
 }

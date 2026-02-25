@@ -23,6 +23,8 @@ use super::inner::{InnerEnvelope, verify_inner_signature};
 use super::padding::strip_padding;
 use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 use crate::crypto::mls::group::ScpMlsGroup;
+use crate::crypto::sender_keys::SenderKey;
+use crate::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 
 /// The outer envelope — the minimal wire format visible to relays.
 ///
@@ -118,8 +120,8 @@ impl OuterEnvelope {
 // High-level send / receive path
 // ---------------------------------------------------------------------------
 
-/// Seals an inner envelope for transmission: serializes, encrypts via MLS,
-/// and wraps in an outer envelope.
+/// Seals an inner envelope for transmission: serializes, encrypts with the
+/// sender key layer, encrypts via MLS, and wraps in an outer envelope.
 ///
 /// This is the primary **send-path** function. The caller is responsible for
 /// constructing the [`InnerEnvelope`] (via [`create_inner_envelope`]) and
@@ -128,16 +130,20 @@ impl OuterEnvelope {
 /// # Processing order
 ///
 /// 1. Serialize the inner envelope to `MessagePack`.
-/// 2. Encrypt the serialized bytes via MLS (`create_message` +
+/// 2. Encrypt the serialized bytes with the sender's AES-256-GCM key
+///    (per-sender forward secrecy layer — see ADR-007).
+/// 3. Encrypt the sender-key ciphertext via MLS (`create_message` +
 ///    TLS-serialize).
-/// 3. Wrap the ciphertext in an [`OuterEnvelope`] with the provided routing
-///    metadata.
+/// 4. Wrap the MLS ciphertext in an [`OuterEnvelope`] with the provided
+///    routing metadata.
 ///
 /// # Arguments
 ///
 /// * `inner` - The fully constructed inner envelope (already signed and
 ///   padded).
 /// * `group` - The MLS group to encrypt within. Must be active.
+/// * `sender_key` - The sender's current AES-256 sender key for this
+///   context.
 /// * `routing_id` - 32-byte per-context pseudonym for relay routing.
 /// * `recipient_hint` - Optional 32-byte recipient pseudonym for directed
 ///   messages, or `None` for broadcast.
@@ -147,18 +153,21 @@ impl OuterEnvelope {
 ///
 /// Returns [`EnvelopeError::SerializationFailed`] if inner envelope
 /// serialization fails.
+/// Returns [`EnvelopeError::SenderKeyEncryptionFailed`] if sender key
+/// AES-256-GCM encryption fails.
 /// Returns [`EnvelopeError::MlsEncryptionFailed`] if MLS encryption fails.
 /// Returns [`EnvelopeError::InvalidRoutingId`] if `routing_id` is not 32
 /// bytes.
 /// Returns [`EnvelopeError::InvalidRecipientHint`] if `recipient_hint` is
 /// present but not 32 bytes.
 ///
-/// See ADR-002 acceptance criterion 4.
+/// See ADR-002 acceptance criterion 4 and ADR-007.
 ///
 /// [`create_inner_envelope`]: super::inner::create_inner_envelope
 pub fn seal_envelope(
     inner: &InnerEnvelope,
     group: &mut ScpMlsGroup,
+    sender_key: &SenderKey,
     routing_id: &[u8],
     recipient_hint: Option<&[u8]>,
     blob_ttl: u32,
@@ -167,20 +176,24 @@ pub fn seal_envelope(
     let serialized = rmp_serde::to_vec_named(inner)
         .map_err(|e| EnvelopeError::SerializationFailed(e.to_string()))?;
 
-    // 2. Encrypt via MLS.
-    let mls_message = encrypt(group, &serialized)
+    // 2. Encrypt with sender key (AES-256-GCM).
+    let sender_encrypted = encrypt_sender_layer(sender_key, &serialized)
+        .map_err(|e| EnvelopeError::SenderKeyEncryptionFailed(e.to_string()))?;
+
+    // 3. Encrypt via MLS.
+    let mls_message = encrypt(group, &sender_encrypted)
         .map_err(|e| EnvelopeError::MlsEncryptionFailed(e.to_string()))?;
 
     let encrypted_blob = serialize_ciphertext(&mls_message)
         .map_err(|e| EnvelopeError::MlsEncryptionFailed(e.to_string()))?;
 
-    // 3. Wrap in outer envelope.
+    // 4. Wrap in outer envelope.
     create_outer_envelope(routing_id, recipient_hint, blob_ttl, encrypted_blob)
 }
 
-/// Opens a received outer envelope: decrypts via MLS, deserializes,
-/// strips padding, verifies content integrity, and verifies the inner
-/// signature.
+/// Opens a received outer envelope: decrypts via MLS, decrypts with the
+/// sender key, deserializes, strips padding, verifies content integrity,
+/// and verifies the inner signature.
 ///
 /// This is the primary **receive-path** function with full integrity
 /// verification. It rejects messages that fail any verification step.
@@ -189,19 +202,23 @@ pub fn seal_envelope(
 ///
 /// 1. Decrypt the `encrypted_blob` via MLS (membership tag verification and
 ///    generation-number replay prevention are enforced by the MLS layer).
-/// 2. Deserialize the plaintext bytes into an [`InnerEnvelope`].
-/// 3. Strip bucket padding from the payload to recover the original
+/// 2. Decrypt the MLS plaintext with the sender's AES-256-GCM key
+///    (per-sender forward secrecy layer — see ADR-007).
+/// 3. Deserialize the sender-key-decrypted bytes into an [`InnerEnvelope`].
+/// 4. Strip bucket padding from the payload to recover the original
 ///    plaintext.
-/// 4. Verify `payload_hash == SHA-256(stripped_payload)` — reject on content
+/// 5. Verify `payload_hash == SHA-256(stripped_payload)` — reject on content
 ///    integrity failure.
-/// 5. Verify the inner Ed25519 signature against the sender's public key —
+/// 6. Verify the inner Ed25519 signature against the sender's public key —
 ///    reject on signature mismatch.
-/// 6. Return the verified inner envelope.
+/// 7. Return the verified inner envelope.
 ///
 /// # Arguments
 ///
 /// * `outer` - The received outer envelope.
 /// * `group` - The MLS group to decrypt within. Must be active.
+/// * `sender_key` - The sender's current AES-256 sender key for this
+///   context.
 /// * `sender_public_key` - The sender's Ed25519 public key (32 bytes),
 ///   resolved from the `sender_did` in the inner envelope.
 ///
@@ -209,6 +226,8 @@ pub fn seal_envelope(
 ///
 /// Returns [`EnvelopeError::MlsDecryptionFailed`] if MLS decryption fails
 /// (including replay rejection via generation number).
+/// Returns [`EnvelopeError::SenderKeyDecryptionFailed`] if sender key
+/// AES-256-GCM decryption fails (wrong key, tampered, or corrupted).
 /// Returns [`EnvelopeError::DeserializationFailed`] if the decrypted bytes
 /// are not a valid inner envelope.
 /// Returns [`EnvelopeError::InvalidPadding`] if padding cannot be stripped.
@@ -219,36 +238,41 @@ pub fn seal_envelope(
 /// Returns [`EnvelopeError::InnerSignatureMismatch`] if the signature is
 /// well-formed but does not match.
 ///
-/// See ADR-002 acceptance criterion 5.
+/// See ADR-002 acceptance criterion 5 and ADR-007.
 pub fn open_envelope(
     outer: &OuterEnvelope,
     group: &mut ScpMlsGroup,
+    sender_key: &SenderKey,
     sender_public_key: &[u8],
 ) -> Result<InnerEnvelope, EnvelopeError> {
     // 1. MLS decrypt (membership tag + generation number verified by MLS).
-    let plaintext = decrypt(group, &outer.encrypted_blob)
+    let mls_plaintext = decrypt(group, &outer.encrypted_blob)
         .map_err(|e| EnvelopeError::MlsDecryptionFailed(e.to_string()))?;
 
-    // 2. Deserialize inner envelope.
+    // 2. Decrypt sender key layer (AES-256-GCM).
+    let plaintext = decrypt_sender_layer(sender_key, &mls_plaintext)
+        .map_err(|e| EnvelopeError::SenderKeyDecryptionFailed(e.to_string()))?;
+
+    // 3. Deserialize inner envelope.
     let inner: InnerEnvelope = rmp_serde::from_slice(&plaintext)
         .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
 
-    // 3. Strip padding to recover original payload.
+    // 4. Strip padding to recover original payload.
     let stripped_payload = strip_padding(&inner.payload)?;
 
-    // 4. Verify content integrity: payload_hash == SHA-256(stripped_payload).
+    // 5. Verify content integrity: payload_hash == SHA-256(stripped_payload).
     let computed_hash = Sha256::digest(&stripped_payload);
     if computed_hash.as_slice() != inner.payload_hash.as_slice() {
         return Err(EnvelopeError::ContentIntegrityFailed);
     }
 
-    // 5. Verify inner signature.
+    // 6. Verify inner signature.
     let valid = verify_inner_signature(&inner, sender_public_key)?;
     if !valid {
         return Err(EnvelopeError::InnerSignatureMismatch);
     }
 
-    // 6. Return the verified inner envelope.
+    // 7. Return the verified inner envelope.
     Ok(inner)
 }
 
@@ -340,6 +364,7 @@ mod seal_open_tests {
     use super::*;
     use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
+    use crate::crypto::sender_keys::generate_sender_key;
     use crate::envelope::inner::{Provenance, create_inner_envelope};
     use crate::envelope::padding::strip_padding;
 
@@ -398,9 +423,18 @@ mod seal_open_tests {
     async fn seal_envelope_produces_valid_outer_envelope() {
         let (mut alice_group, _bob_group) = setup_mls_groups();
         let (inner, _pubkey) = create_test_inner(b"hello world", None).await;
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
-        let outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
+        let outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
 
         assert_eq!(outer.routing_id, routing_id);
         assert!(outer.recipient_hint.is_none());
@@ -415,12 +449,14 @@ mod seal_open_tests {
     async fn seal_envelope_with_recipient_hint() {
         let (mut alice_group, _bob_group) = setup_mls_groups();
         let (inner, _pubkey) = create_test_inner(b"directed message", None).await;
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
         let recipient = [0xBB; 32];
 
         let outer = seal_envelope(
             &inner,
             &mut alice_group,
+            &sender_key,
             &routing_id,
             Some(&recipient),
             7200,
@@ -435,8 +471,16 @@ mod seal_open_tests {
     async fn seal_envelope_rejects_invalid_routing_id() {
         let (mut alice_group, _bob_group) = setup_mls_groups();
         let (inner, _pubkey) = create_test_inner(b"test", None).await;
+        let sender_key = generate_sender_key();
 
-        let result = seal_envelope(&inner, &mut alice_group, &[0xAA; 16], None, 3600);
+        let result = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &[0xAA; 16],
+            None,
+            3600,
+        );
         assert!(result.is_err(), "should reject 16-byte routing_id");
     }
 
@@ -449,13 +493,22 @@ mod seal_open_tests {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
         let original_payload = b"hello, sealed world!";
         let (inner, pubkey) = create_test_inner(original_payload, None).await;
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
         // Seal (Alice sends).
-        let outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
+        let outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
 
         // Open (Bob receives).
-        let recovered = open_envelope(&outer, &mut bob_group, &pubkey).unwrap();
+        let recovered = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey).unwrap();
 
         // Verify all inner envelope fields match.
         assert_eq!(recovered.context_id, inner.context_id);
@@ -482,10 +535,19 @@ mod seal_open_tests {
         };
         let (inner, pubkey) =
             create_test_inner(b"payload with provenance", Some(provenance.clone())).await;
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
-        let outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
-        let recovered = open_envelope(&outer, &mut bob_group, &pubkey).unwrap();
+        let outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
+        let recovered = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey).unwrap();
 
         assert_eq!(recovered.provenance, Some(provenance));
         assert_eq!(recovered.provenance_hash, inner.provenance_hash);
@@ -496,9 +558,18 @@ mod seal_open_tests {
     async fn open_envelope_rejects_tampered_encrypted_blob() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
         let (inner, pubkey) = create_test_inner(b"test", None).await;
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
-        let mut outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
+        let mut outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
 
         // Tamper with the encrypted blob.
         if let Some(byte) = outer.encrypted_blob.last_mut() {
@@ -507,7 +578,7 @@ mod seal_open_tests {
 
         // OpenMLS panics internally on AEAD decryption failure rather than
         // returning an error. This is a known upstream behavior.
-        let _result = open_envelope(&outer, &mut bob_group, &pubkey);
+        let _result = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey);
     }
 
     #[tokio::test]
@@ -537,10 +608,19 @@ mod seal_open_tests {
         // content integrity check runs first).
         inner.payload_hash = vec![0xFF; 32];
 
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
-        let outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
+        let outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, pubkey.as_bytes());
+        let result = open_envelope(&outer, &mut bob_group, &sender_key, pubkey.as_bytes());
         assert!(
             result.is_err(),
             "open_envelope must reject mismatched payload_hash"
@@ -555,12 +635,21 @@ mod seal_open_tests {
     }
 
     #[tokio::test]
-    async fn open_envelope_rejects_wrong_sender_key() {
+    async fn open_envelope_rejects_wrong_signing_key() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
         let (inner, _correct_pubkey) = create_test_inner(b"signed by alice", None).await;
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
-        let outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
+        let outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
 
         // Use a different key for verification.
         let other_custody = InMemoryKeyCustody::new();
@@ -570,7 +659,7 @@ mod seal_open_tests {
             .unwrap();
         let wrong_pubkey = other_custody.public_key(&other_key).await.unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, wrong_pubkey.as_bytes());
+        let result = open_envelope(&outer, &mut bob_group, &sender_key, wrong_pubkey.as_bytes());
         assert!(
             result.is_err(),
             "open_envelope must reject wrong sender public key"
@@ -587,16 +676,25 @@ mod seal_open_tests {
     async fn open_envelope_rejects_replayed_message() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
         let (inner, pubkey) = create_test_inner(b"replay me", None).await;
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
-        let outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
+        let outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
 
         // First open succeeds.
-        let _recovered = open_envelope(&outer, &mut bob_group, &pubkey).unwrap();
+        let _recovered = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey).unwrap();
 
         // Second open with same ciphertext should fail (MLS generation
         // number replay prevention).
-        let replay_result = open_envelope(&outer, &mut bob_group, &pubkey);
+        let replay_result = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey);
         assert!(
             replay_result.is_err(),
             "open_envelope must reject replayed ciphertext"
@@ -606,12 +704,13 @@ mod seal_open_tests {
     #[tokio::test]
     async fn open_envelope_rejects_garbage_encrypted_blob() {
         let (_alice_group, mut bob_group) = setup_mls_groups();
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
         let outer =
             create_outer_envelope(&routing_id, None, 3600, vec![0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, &[0u8; 32]);
+        let result = open_envelope(&outer, &mut bob_group, &sender_key, &[0u8; 32]);
         assert!(
             result.is_err(),
             "open_envelope must reject garbage encrypted_blob"
@@ -622,10 +721,19 @@ mod seal_open_tests {
     async fn seal_then_open_empty_payload_roundtrip() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
         let (inner, pubkey) = create_test_inner(b"", None).await;
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
-        let outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
-        let recovered = open_envelope(&outer, &mut bob_group, &pubkey).unwrap();
+        let outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
+        let recovered = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey).unwrap();
 
         let stripped = strip_padding(&recovered.payload).unwrap();
         assert!(stripped.is_empty(), "empty payload should roundtrip");
@@ -638,6 +746,7 @@ mod seal_open_tests {
     #[tokio::test]
     async fn seal_then_open_multiple_messages() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
+        let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
         let messages: &[&[u8]] = &[b"first", b"second", b"third"];
@@ -647,20 +756,126 @@ mod seal_open_tests {
         let mut pubkeys = Vec::new();
         for msg in messages {
             let (inner, pubkey) = create_test_inner(msg, None).await;
-            let outer = seal_envelope(&inner, &mut alice_group, &routing_id, None, 3600).unwrap();
+            let outer = seal_envelope(
+                &inner,
+                &mut alice_group,
+                &sender_key,
+                &routing_id,
+                None,
+                3600,
+            )
+            .unwrap();
             outers.push(outer);
             pubkeys.push(pubkey);
         }
 
         // Open all messages in order.
         for (i, (outer, pubkey)) in outers.iter().zip(pubkeys.iter()).enumerate() {
-            let recovered = open_envelope(outer, &mut bob_group, pubkey).unwrap();
+            let recovered = open_envelope(outer, &mut bob_group, &sender_key, pubkey).unwrap();
             let stripped = strip_padding(&recovered.payload).unwrap();
             assert_eq!(
                 stripped, messages[i],
                 "message {i} must roundtrip correctly"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // sender key layer tests
+    // -----------------------------------------------------------------------
+
+    /// Confirms that ciphertext produced by seal_envelope cannot be opened
+    /// without the correct sender key, even if MLS decryption succeeds.
+    /// Using the wrong sender key must yield SenderKeyDecryptionFailed.
+    #[tokio::test]
+    async fn open_envelope_rejects_wrong_sender_key() {
+        let (mut alice_group, mut bob_group) = setup_mls_groups();
+        let (inner, pubkey) = create_test_inner(b"sender key protected", None).await;
+        let correct_sender_key = generate_sender_key();
+        let wrong_sender_key = generate_sender_key();
+        let routing_id = [0xAA; 32];
+
+        // Seal with the correct sender key.
+        let outer = seal_envelope(
+            &inner,
+            &mut alice_group,
+            &correct_sender_key,
+            &routing_id,
+            None,
+            3600,
+        )
+        .unwrap();
+
+        // Open with a different sender key — MLS decryption succeeds, but
+        // sender key decryption must fail.
+        let result = open_envelope(&outer, &mut bob_group, &wrong_sender_key, &pubkey);
+        assert!(
+            result.is_err(),
+            "open_envelope must reject wrong sender key"
+        );
+
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("SenderKeyDecryptionFailed"),
+            "error should be SenderKeyDecryptionFailed, got: {err_msg}"
+        );
+    }
+
+    /// Confirms that tampered sender-key ciphertext is rejected with an
+    /// authentication failure before inner envelope deserialization is
+    /// attempted. We manually build the pipeline to inject tampering at
+    /// the sender-key-ciphertext layer (after sender key encrypt, before
+    /// MLS encrypt).
+    #[tokio::test]
+    async fn open_envelope_rejects_tampered_sender_key_ciphertext() {
+        use crate::crypto::mls::encrypt::{
+            encrypt as mls_encrypt, serialize_ciphertext as mls_serialize,
+        };
+        use crate::crypto::sender_keys::encrypt::encrypt_sender_layer;
+
+        let (mut alice_group, mut bob_group) = setup_mls_groups();
+        let (inner, pubkey) = create_test_inner(b"tamper target", None).await;
+        let sender_key = generate_sender_key();
+        let routing_id = [0xAA; 32];
+
+        // Step 1: Serialize inner envelope.
+        let serialized = rmp_serde::to_vec_named(&inner).unwrap();
+
+        // Step 2: Encrypt with sender key.
+        let mut sender_encrypted = encrypt_sender_layer(&sender_key, &serialized).unwrap();
+
+        // Step 3: Tamper with the sender-key ciphertext (flip a byte in
+        // the encrypted portion, after the 12-byte nonce).
+        let tamper_index = 12 + 1; // nonce is 12 bytes, tamper first encrypted byte
+        sender_encrypted[tamper_index] ^= 0xFF;
+
+        // Step 4: MLS-encrypt the tampered bytes (MLS doesn't know they're
+        // tampered — it just encrypts whatever it receives).
+        let mls_message = mls_encrypt(&mut alice_group, &sender_encrypted).unwrap();
+        let encrypted_blob = mls_serialize(&mls_message).unwrap();
+
+        // Step 5: Wrap in outer envelope.
+        let outer = create_outer_envelope(&routing_id, None, 3600, encrypted_blob).unwrap();
+
+        // Step 6: Try to open — MLS decryption succeeds, but sender key
+        // authentication tag verification must fail.
+        let result = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey);
+        assert!(
+            result.is_err(),
+            "open_envelope must reject tampered sender-key ciphertext"
+        );
+
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("SenderKeyDecryptionFailed"),
+            "error should be SenderKeyDecryptionFailed (auth tag failure), got: {err_msg}"
+        );
+
+        // Verify the error message traces back to AuthenticationFailed.
+        assert!(
+            err_msg.contains("authentication tag verification failed"),
+            "error should mention authentication tag failure, got: {err_msg}"
+        );
     }
 
     mod proptest_seal_open {
@@ -678,11 +893,13 @@ mod seal_open_tests {
                 rt.block_on(async {
                     let (mut alice_group, mut bob_group) = setup_mls_groups();
                     let (inner, pubkey) = create_test_inner(&payload, None).await;
+                    let sender_key = generate_sender_key();
                     let routing_id = [0xAA; 32];
 
                     let outer = seal_envelope(
                         &inner,
                         &mut alice_group,
+                        &sender_key,
                         &routing_id,
                         None,
                         3600,
@@ -691,6 +908,7 @@ mod seal_open_tests {
                     let recovered = open_envelope(
                         &outer,
                         &mut bob_group,
+                        &sender_key,
                         &pubkey,
                     ).unwrap();
 

@@ -233,6 +233,13 @@ pub fn verify_inner_signature(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Domain separator prepended to the canonical hash input to prevent
+/// cross-protocol signature confusion. Because the same Ed25519 key may be
+/// used for multiple signing purposes (envelope, UCAN, DID auth), a unique
+/// prefix ensures that a signature produced for one context can never be
+/// replayed as valid in another.
+const DOMAIN_SEPARATOR: &[u8] = b"SCP-INNER-ENVELOPE-V1:";
+
 /// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
 /// absent.
 fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, EnvelopeError> {
@@ -248,9 +255,14 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, E
 
 /// Computes the canonical hash over all critical envelope fields.
 ///
+/// A domain separator ([`DOMAIN_SEPARATOR`]) is prepended to prevent
+/// cross-protocol signature confusion when the same Ed25519 key is reused
+/// across different signing contexts.
+///
 /// ```text
-/// SHA-256(context_id || sender_did || epoch_BE || generation_BE
-///         || sequence_BE || timestamp_BE || payload_hash || provenance_hash)
+/// SHA-256(DOMAIN_SEPARATOR || context_id || sender_did || epoch_BE
+///         || generation_BE || sequence_BE || timestamp_BE
+///         || payload_hash || provenance_hash)
 /// ```
 #[allow(clippy::too_many_arguments)]
 fn compute_canonical_hash(
@@ -264,6 +276,7 @@ fn compute_canonical_hash(
     provenance_hash: &[u8],
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
+    hasher.update(DOMAIN_SEPARATOR);
     hasher.update(context_id.as_bytes());
     hasher.update(sender_did.as_bytes());
     hasher.update(epoch.to_be_bytes());
@@ -531,6 +544,62 @@ mod tests {
 
         let result = verify_inner_signature(&envelope, &[0u8; 16]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn domain_separator_changes_canonical_hash() {
+        let payload_hash = Sha256::digest(b"test").to_vec();
+        let provenance_hash = Sha256::digest([0x00]).to_vec();
+
+        // Hash with the real domain separator (via the production function).
+        let hash_with_domain = compute_canonical_hash(
+            "ctx-1",
+            "did:dht:alice",
+            1,
+            0,
+            1,
+            1_700_000_000,
+            &payload_hash,
+            &provenance_hash,
+        );
+
+        // Hash WITHOUT any domain separator (manual construction).
+        let hash_without_domain = {
+            let mut h = Sha256::new();
+            h.update(b"ctx-1");
+            h.update(b"did:dht:alice");
+            h.update(1u64.to_be_bytes());
+            h.update(0u64.to_be_bytes());
+            h.update(1u64.to_be_bytes());
+            h.update(1_700_000_000u64.to_be_bytes());
+            h.update(&payload_hash);
+            h.update(&provenance_hash);
+            h.finalize().to_vec()
+        };
+
+        // Hash with a DIFFERENT domain separator (manual construction).
+        let hash_alt_domain = {
+            let mut h = Sha256::new();
+            h.update(b"DIFFERENT-DOMAIN:");
+            h.update(b"ctx-1");
+            h.update(b"did:dht:alice");
+            h.update(1u64.to_be_bytes());
+            h.update(0u64.to_be_bytes());
+            h.update(1u64.to_be_bytes());
+            h.update(1_700_000_000u64.to_be_bytes());
+            h.update(&payload_hash);
+            h.update(&provenance_hash);
+            h.finalize().to_vec()
+        };
+
+        assert_ne!(
+            hash_with_domain, hash_without_domain,
+            "domain separator must change hash vs. no separator"
+        );
+        assert_ne!(
+            hash_with_domain, hash_alt_domain,
+            "different domain separator must produce different hash"
+        );
     }
 
     mod proptest_inner {

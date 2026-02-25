@@ -168,7 +168,9 @@ impl NonceTracker for InMemoryNonceTracker {
         // Freshness check: timestamp within now +/- 5 minutes.
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|e| {
+                UcanError::ClockError(format!("system clock before Unix epoch: {e}"))
+            })?
             .as_millis();
 
         if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
@@ -353,11 +355,18 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
 // ---------------------------------------------------------------------------
 
 /// Returns the current Unix timestamp in seconds.
-fn now_secs() -> u64 {
+///
+/// # Errors
+///
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix
+/// epoch. Defaulting to zero would silently bypass all `nbf`/`exp` checks.
+fn now_secs() -> Result<u64, UcanError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .map_err(|e| {
+            UcanError::ClockError(format!("system clock before Unix epoch: {e}"))
+        })
 }
 
 /// Validates a UCAN token using the 11-step pipeline from ADR-016.
@@ -478,7 +487,7 @@ where
 /// # Errors
 ///
 /// Returns a specific [`UcanError`] variant indicating which step failed.
-pub fn validate_ucan_stateless<D, S>(
+pub(crate) fn validate_ucan_stateless<D, S>(
     token: &UcanToken,
     required_capability: &CapabilityUri,
     did_resolver: &D,
@@ -722,7 +731,7 @@ fn verify_attenuation(
 /// Returns [`UcanError::ExpiryTooFar`] if `exp` exceeds now + 24 hours.
 /// Returns [`UcanError::TokenNotYetValid`] if `nbf > now`.
 fn verify_expiry(token: &UcanToken) -> Result<(), UcanError> {
-    let now = now_secs();
+    let now = now_secs()?;
 
     if token.payload.exp <= now {
         return Err(UcanError::TokenExpired);
@@ -1818,7 +1827,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_token_with_exp_beyond_24h() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -1866,7 +1875,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_not_yet_valid() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -1889,7 +1898,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_accepts_valid_token() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -1922,7 +1931,7 @@ mod tests {
             .as_millis();
 
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
-        let expiry = now_secs() + 3600;
+        let expiry = now_secs().unwrap() + 3600;
 
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         let result = tracker.check_and_record(&nonce, expiry);
@@ -1935,7 +1944,7 @@ mod tests {
     #[test]
     fn nonce_tracker_rejects_malformed_nonce() {
         let mut tracker = InMemoryNonceTracker::new();
-        let expiry = now_secs() + 3600;
+        let expiry = now_secs().unwrap() + 3600;
 
         // No separator.
         let result = tracker.check_and_record("nohyphen", expiry);
@@ -2191,5 +2200,92 @@ mod tests {
 
         let result = proof_resolver.resolve_proof("bafyrei-test").unwrap();
         assert_eq!(result, token);
+    }
+
+    // -----------------------------------------------------------------------
+    // Clock error / epoch-0 bypass prevention (SCP-173)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `now_secs()` returns `Ok` on a normal system (Result
+    /// signature works correctly after the `unwrap_or_default()` removal).
+    #[test]
+    fn now_secs_returns_ok_on_normal_system() {
+        let result = now_secs();
+        assert!(result.is_ok(), "now_secs() should succeed on a normal system");
+        assert!(result.unwrap() > 0, "current time should be after Unix epoch");
+    }
+
+    /// A UCAN with exp=0 and nbf=0 must be rejected. Before the clock-error
+    /// fix, `unwrap_or_default()` would produce `Duration::ZERO` if the system
+    /// clock returned an error, making `now == 0`. That would cause `exp <= now`
+    /// to be `0 <= 0` (expired) but more critically, `nbf <= now` would be
+    /// `0 <= 0` (valid). With exp=1 and nbf=0, the token would pass all checks.
+    ///
+    /// This test verifies that epoch-0 tokens are always rejected on a
+    /// correctly-running system (where now >> 0), and that `now_secs()` no
+    /// longer defaults to zero.
+    #[test]
+    fn verify_expiry_rejects_epoch_zero_token() {
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: 0,
+                nbf: Some(0),
+                nnc: "0000000000000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let result = verify_expiry(&token);
+        assert!(
+            matches!(result, Err(UcanError::TokenExpired)),
+            "epoch-0 token must be rejected as expired: {result:?}"
+        );
+    }
+
+    /// A UCAN with exp=1 and nbf=0 must still be rejected. Before the fix,
+    /// if `now_secs()` defaulted to 0 on clock error, `exp (1) > now (0)`
+    /// would pass, and `nbf (0) <= now (0)` would also pass — a full bypass.
+    /// With the fix, `now_secs()` returns `ClockError` on failure, and on
+    /// normal systems now >> 0 so exp=1 is expired.
+    #[test]
+    fn verify_expiry_rejects_near_epoch_token() {
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: 1,
+                nbf: Some(0),
+                nnc: "0000000000000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let result = verify_expiry(&token);
+        assert!(
+            matches!(result, Err(UcanError::TokenExpired)),
+            "near-epoch token (exp=1) must be rejected: {result:?}"
+        );
+    }
+
+    /// Verify that `ClockError` displays correctly.
+    #[test]
+    fn clock_error_display() {
+        let err = UcanError::ClockError("system clock before Unix epoch: test".to_owned());
+        assert_eq!(
+            err.to_string(),
+            "system clock error: system clock before Unix epoch: test"
+        );
     }
 }
