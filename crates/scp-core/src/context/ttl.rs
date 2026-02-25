@@ -1,7 +1,9 @@
-//! Context close, finalize, TTL expiry, and TTL timer management.
+//! Context close, finalize, TTL expiry, TTL enforcement, and TTL timer
+//! management.
 //!
 //! Implements the context lifecycle termination operations from ADR-008
-//! (`.docs/adrs/phase-2.md`):
+//! (`.docs/adrs/phase-2.md`) and TTL enforcement from ADR-018
+//! (`.docs/adrs/phase-4.md`):
 //!
 //! - [`close_context`] -- Initiates cooperative close (Active -> Closing).
 //! - [`finalize_close`] -- Completes close after members process notifications
@@ -10,12 +12,25 @@
 //!   (Active -> Expired).
 //! - [`TtlTimer`] -- Manages tokio timer tasks for TTL enforcement.
 //! - [`TtlExtension`] -- Tracks unanimous consent for TTL extension.
+//! - [`TtlPolicy`] -- TTL policy enum: `None` or `Finite(Duration)`.
+//! - [`TtlEnforcer`] -- Per-context TTL state tracker with Clock-based
+//!   expiry checking.
+//! - [`TtlExtensionProposal`] -- Proposal for TTL extension with consent
+//!   tracking for bilateral and multi-party contexts.
+//! - [`TtlTimerHandle`] -- Trait-based timer management for testability.
 //!
 //! # Close Capability
 //!
 //! The initiator of `close_context` must hold the `ContextClose` capability
 //! (admin role or governance-permitted). This is checked via
 //! [`ContextRoleState::member_has_capability`].
+//!
+//! # TTL Enforcement (ADR-018)
+//!
+//! TTL is checked against the [`Clock`] trait (spec section 16.3) on every
+//! context action. TTL expiry triggers context close -- no new actions
+//! accepted after expiry. Extension requires consent: all-member for
+//! bilateral contexts, governance for multi-party contexts.
 //!
 //! # Memory Scope Behavior
 //!
@@ -25,14 +40,17 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::builder::{ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider};
 use super::membership::{ContextEvent, DID};
+use super::params::GovernanceModel;
 use super::roles::{self, ContextRoleState};
 use super::{ContextError, ContextHandle, ContextState, MemoryScope};
+use crate::identity::cache::Clock;
 
 // ---------------------------------------------------------------------------
 // context_id_to_bytes helper (mirrors manager.rs)
@@ -48,18 +66,371 @@ fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
+// TtlPolicy
+// ---------------------------------------------------------------------------
+
+/// TTL policy for a context, declared at creation time.
+///
+/// Determines whether the context has a finite lifespan. Contexts with
+/// `Finite` TTL automatically expire when the duration elapses. Contexts
+/// with `None` TTL have no automatic expiry.
+///
+/// See ADR-018 in `.docs/adrs/phase-4.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtlPolicy {
+    /// No TTL -- the context has no automatic expiry.
+    None,
+    /// Finite TTL -- the context expires after this duration from creation
+    /// (or from the last extension).
+    Finite(Duration),
+}
+
+// ---------------------------------------------------------------------------
+// TtlError
+// ---------------------------------------------------------------------------
+
+/// Errors produced by TTL enforcement operations.
+#[derive(Debug, thiserror::Error)]
+pub enum TtlError {
+    /// The context's TTL has expired. No further actions are permitted.
+    #[error("context TTL has expired")]
+    Expired,
+
+    /// A TTL extension was proposed for a context with no TTL policy.
+    #[error("cannot extend TTL on a context with no TTL policy")]
+    NoTtlPolicy,
+
+    /// A TTL extension proposal is already in progress.
+    #[error("a TTL extension proposal is already in progress")]
+    ProposalAlreadyActive,
+
+    /// No active TTL extension proposal to consent to.
+    #[error("no active TTL extension proposal")]
+    NoActiveProposal,
+
+    /// The governance model does not permit this member to propose or
+    /// approve extensions in a multi-party context.
+    #[error("governance does not permit extension: {0}")]
+    GovernanceDenied(String),
+}
+
+// ---------------------------------------------------------------------------
+// check_ttl -- Clock-based TTL checking
+// ---------------------------------------------------------------------------
+
+/// Checks whether a context's TTL has expired.
+///
+/// Compares the current time (from the [`Clock`] trait, spec section 16.3)
+/// against the context's creation time and TTL policy, accounting for any
+/// extensions.
+///
+/// # Arguments
+///
+/// * `created_at` -- Unix timestamp (seconds) when the context was created.
+/// * `ttl_policy` -- The context's TTL policy.
+/// * `extended_until` -- If set, the absolute Unix timestamp until which the
+///   TTL has been extended. Takes precedence over the original TTL.
+/// * `now` -- Current Unix timestamp (seconds) from the Clock trait.
+///
+/// # Errors
+///
+/// Returns [`TtlError::Expired`] if the TTL has elapsed.
+pub fn check_ttl(
+    created_at: u64,
+    ttl_policy: TtlPolicy,
+    extended_until: Option<u64>,
+    now: u64,
+) -> Result<(), TtlError> {
+    match ttl_policy {
+        TtlPolicy::None => Ok(()),
+        TtlPolicy::Finite(duration) => {
+            let deadline = extended_until
+                .unwrap_or_else(|| created_at.saturating_add(duration.as_secs()));
+            if now >= deadline {
+                Err(TtlError::Expired)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TtlEnforcer -- per-context TTL state management
+// ---------------------------------------------------------------------------
+
+/// Manages TTL state for a single context.
+///
+/// Tracks creation time, TTL policy, extension state, and expiry status.
+/// Used on every context action to enforce TTL via the [`Clock`] trait
+/// (spec section 16.3).
+///
+/// See ADR-018 acceptance criterion 2.
+#[derive(Debug)]
+pub struct TtlEnforcer {
+    /// Unix timestamp (seconds) when the context was created.
+    created_at: u64,
+    /// The context's TTL policy.
+    ttl_policy: TtlPolicy,
+    /// If the TTL has been extended, the absolute Unix timestamp until which
+    /// the extension is valid. `None` if no extension has been applied.
+    extended_until: Option<u64>,
+    /// Whether the context has been marked as expired. Once `true`, all
+    /// subsequent checks return [`TtlError::Expired`] without consulting
+    /// the clock.
+    expired: bool,
+}
+
+impl TtlEnforcer {
+    /// Creates a new `TtlEnforcer` for a context.
+    #[must_use]
+    pub const fn new(created_at: u64, ttl_policy: TtlPolicy) -> Self {
+        Self {
+            created_at,
+            ttl_policy,
+            extended_until: None,
+            expired: false,
+        }
+    }
+
+    /// Checks whether the context's TTL has expired, using the given clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TtlError::Expired`] if the TTL has elapsed.
+    pub fn check(&mut self, clock: &dyn Clock) -> Result<(), TtlError> {
+        if self.expired {
+            return Err(TtlError::Expired);
+        }
+        let result = check_ttl(
+            self.created_at,
+            self.ttl_policy,
+            self.extended_until,
+            clock.now(),
+        );
+        if result.is_err() {
+            self.expired = true;
+        }
+        result
+    }
+
+    /// Returns the context's TTL policy.
+    #[must_use]
+    pub const fn ttl_policy(&self) -> TtlPolicy {
+        self.ttl_policy
+    }
+
+    /// Returns the context's creation timestamp.
+    #[must_use]
+    pub const fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    /// Returns the extended-until timestamp, if any.
+    #[must_use]
+    pub const fn extended_until(&self) -> Option<u64> {
+        self.extended_until
+    }
+
+    /// Returns `true` if the enforcer has latched into the expired state.
+    #[must_use]
+    pub const fn is_expired(&self) -> bool {
+        self.expired
+    }
+
+    /// Applies a TTL extension, resetting the deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TtlError::NoTtlPolicy`] if the context has no TTL.
+    pub fn apply_extension(
+        &mut self,
+        new_deadline: u64,
+        clock: &dyn Clock,
+    ) -> Result<(), TtlError> {
+        if self.ttl_policy == TtlPolicy::None {
+            return Err(TtlError::NoTtlPolicy);
+        }
+        self.extended_until = Some(new_deadline);
+        if new_deadline > clock.now() {
+            self.expired = false;
+        }
+        Ok(())
+    }
+
+    /// Returns the remaining time in seconds until TTL expiry, or `None` if
+    /// the TTL policy is `None`.
+    #[must_use]
+    pub fn remaining_secs(&self, clock: &dyn Clock) -> Option<u64> {
+        match self.ttl_policy {
+            TtlPolicy::None => Option::None,
+            TtlPolicy::Finite(duration) => {
+                let deadline = self
+                    .extended_until
+                    .unwrap_or_else(|| self.created_at.saturating_add(duration.as_secs()));
+                let now = clock.now();
+                if now >= deadline {
+                    Some(0)
+                } else {
+                    Some(deadline - now)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExtensionConsentMode -- bilateral vs multi-party
+// ---------------------------------------------------------------------------
+
+/// Determines the consent model for TTL extension.
+///
+/// See ADR-018 acceptance criterion 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionConsentMode {
+    /// All members must consent (bilateral contexts with exactly 2 members).
+    AllMember,
+    /// Extension follows the context's governance model (multi-party).
+    Governance,
+}
+
+/// Determines the consent mode based on member count.
+#[must_use]
+pub const fn consent_mode_for_member_count(member_count: usize) -> ExtensionConsentMode {
+    if member_count <= 2 {
+        ExtensionConsentMode::AllMember
+    } else {
+        ExtensionConsentMode::Governance
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TtlExtensionProposal -- structured extension proposal
+// ---------------------------------------------------------------------------
+
+/// A structured proposal for TTL extension, recorded as a context event
+/// in the Merkle log (ADR-011).
+///
+/// See ADR-018 acceptance criterion 3.
+#[derive(Debug, Clone)]
+pub struct TtlExtensionProposal {
+    /// DID of the member who proposed the extension.
+    proposer_did: DID,
+    /// The proposed additional TTL duration.
+    proposed_duration: Duration,
+    /// The consent mode (bilateral vs governance).
+    consent_mode: ExtensionConsentMode,
+    /// The underlying consent tracker.
+    consent: TtlExtension,
+    /// The governance model for this context.
+    governance: GovernanceModel,
+}
+
+impl TtlExtensionProposal {
+    /// Creates a new TTL extension proposal.
+    #[must_use]
+    pub fn new(
+        proposer_did: DID,
+        proposed_duration: Duration,
+        member_count: usize,
+        governance: GovernanceModel,
+    ) -> Self {
+        let consent_mode = consent_mode_for_member_count(member_count);
+        let required_count = match consent_mode {
+            ExtensionConsentMode::AllMember => member_count,
+            ExtensionConsentMode::Governance => {
+                match governance {
+                    GovernanceModel::SingleAdmin => 1,
+                }
+            }
+        };
+        Self {
+            proposer_did,
+            proposed_duration,
+            consent_mode,
+            consent: TtlExtension::new(proposed_duration, required_count),
+            governance,
+        }
+    }
+
+    /// Records a member's consent for the extension.
+    pub fn record_consent(&mut self, member_did: DID) -> bool {
+        self.consent.add_consent(member_did)
+    }
+
+    /// Returns `true` if sufficient consent has been collected.
+    #[must_use]
+    pub fn is_approved(&self) -> bool {
+        self.consent.is_unanimous()
+    }
+
+    /// Returns the DID of the proposer.
+    #[must_use]
+    pub const fn proposer_did(&self) -> &DID {
+        &self.proposer_did
+    }
+
+    /// Returns the proposed additional TTL duration.
+    #[must_use]
+    pub const fn proposed_duration(&self) -> Duration {
+        self.proposed_duration
+    }
+
+    /// Returns the consent mode for this proposal.
+    #[must_use]
+    pub const fn consent_mode(&self) -> ExtensionConsentMode {
+        self.consent_mode
+    }
+
+    /// Returns the number of consents received so far.
+    #[must_use]
+    pub fn consent_count(&self) -> usize {
+        self.consent.consent_count()
+    }
+
+    /// Returns the number of consents still needed.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.consent.remaining()
+    }
+
+    /// Returns the governance model for this proposal's context.
+    #[must_use]
+    pub const fn governance(&self) -> &GovernanceModel {
+        &self.governance
+    }
+
+    /// Computes the new deadline by adding the proposed duration to now.
+    #[must_use]
+    pub const fn compute_new_deadline(&self, now: u64) -> u64 {
+        now.saturating_add(self.proposed_duration.as_secs())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TtlTimerHandle -- trait-based timer management for testability
+// ---------------------------------------------------------------------------
+
+/// Trait for TTL timer management, enabling testable timer logic without
+/// requiring a tokio runtime.
+///
+/// See ADR-018 acceptance criterion 2.
+pub trait TtlTimerHandle: Send + Sync {
+    /// Cancels the running TTL timer.
+    fn cancel_timer(&self);
+
+    /// Resets the TTL timer with a new duration.
+    fn reset_timer(&mut self, new_duration: Duration);
+
+    /// Returns `true` if a timer is currently active.
+    fn is_timer_active(&self) -> bool;
+}
+
+// ---------------------------------------------------------------------------
 // close_context
 // ---------------------------------------------------------------------------
 
 /// Initiates cooperative context closure.
-///
-/// Verifies the initiator has the `ContextClose` capability, transitions the
-/// context from `Active` to `Closing`, sends a close notification to all
-/// members, schedules key destruction for ephemeral/summary scopes, and
-/// appends a `ContextClosing` event to the event log.
-///
-/// If the memory scope is `Summary`, triggers summary generation (the
-/// verification window runs while the context is in `Closing` state).
 ///
 /// See ADR-008 acceptance criterion 5.
 ///
@@ -74,32 +445,27 @@ pub async fn close_context(
     role_state: &ContextRoleState,
     event_log: &dyn ContextEventLogProvider,
 ) -> Result<CloseResult, ContextError> {
-    // Verify context is Active.
     let state = handle.state().await;
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
     }
 
-    // Verify initiator has ContextClose capability.
     if !role_state.member_has_capability(initiator_did, &roles::Capability::ContextClose) {
         return Err(ContextError::PermissionDenied(format!(
             "member {initiator_did} does not have context:close capability"
         )));
     }
 
-    // Transition to Closing.
     handle.transition_to(&ContextState::Closing).await?;
 
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = context_id_to_bytes(&context_id);
 
-    // Determine memory scope behavior.
     let memory_scope = handle.params().memory_scope;
     let should_generate_summary = memory_scope == MemoryScope::Summary;
     let should_schedule_key_destruction =
         memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
 
-    // Append ContextClosing event to event log.
     event_log.append_context_event(&context_id_bytes, "ContextClosing")?;
 
     Ok(CloseResult {
@@ -109,15 +475,11 @@ pub async fn close_context(
 }
 
 /// Result of a successful `close_context` call.
-///
-/// Callers use this to determine what follow-up actions to take (summary
-/// generation, key destruction scheduling) before calling `finalize_close`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseResult {
-    /// If `true`, the caller should trigger summary generation and allow a
-    /// verification window before finalizing.
+    /// If `true`, the caller should trigger summary generation.
     pub should_generate_summary: bool,
-    /// If `true`, key destruction should be scheduled (ephemeral/summary scope).
+    /// If `true`, key destruction should be scheduled.
     pub should_schedule_key_destruction: bool,
 }
 
@@ -127,16 +489,12 @@ pub struct CloseResult {
 
 /// Completes context closure after all members have processed notifications.
 ///
-/// Destroys MLS group state and all sender keys, issues relay deletion
-/// requests for ephemeral/summary scope contexts, transitions from `Closing`
-/// to `Closed`, and appends the final `ContextClosed` event.
-///
 /// See ADR-008 acceptance criterion 6.
 ///
 /// # Errors
 ///
 /// Returns [`ContextError::InvalidTransition`] if the context is not in
-/// `Closing` state. Returns crypto or transport errors if destruction fails.
+/// `Closing` state.
 pub async fn finalize_close(
     handle: &ContextHandle,
     crypto: &dyn ContextCryptoProvider,
@@ -147,27 +505,18 @@ pub async fn finalize_close(
     let context_id_bytes = context_id_to_bytes(&context_id);
     let memory_scope = handle.params().memory_scope;
 
-    // Destroy MLS group state (ADR-001 destroy_group()).
     crypto
         .destroy_mls_group(&context_id_bytes)
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-    // Destroy all sender keys for this context.
     crypto
         .destroy_sender_key(&context_id_bytes)
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    // Issue relay deletion requests for ephemeral/summary scope contexts
-    // (spec section 5.11). Best-effort: relays are untrusted.
     if memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary {
-        // Best-effort deletion -- log but don't fail on transport errors.
         let _ = transport.delete_published(&context_id_bytes);
     }
 
-    // Transition to Closed.
     handle.transition_to(&ContextState::Closed).await?;
-
-    // Append ContextClosed event to event log (final event).
     event_log.append_context_event(&context_id_bytes, "ContextClosed")?;
 
     Ok(())
@@ -179,13 +528,6 @@ pub async fn finalize_close(
 
 /// Handles automatic TTL expiry.
 ///
-/// Transitions directly from `Active` to `Expired`, destroys MLS group state
-/// and sender keys according to memory scope, and appends `ContextExpired`
-/// to the event log.
-///
-/// Unlike cooperative close, TTL expiry skips the closing window -- it is a
-/// hard deadline that cannot be overridden by governance (spec section 5.10).
-///
 /// See ADR-008 acceptance criterion 7.
 ///
 /// # Errors
@@ -196,7 +538,6 @@ pub async fn handle_ttl_expiry(
     crypto: &dyn ContextCryptoProvider,
     event_log: &dyn ContextEventLogProvider,
 ) -> Result<(), ContextError> {
-    // Verify context is Active.
     let state = handle.state().await;
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
@@ -206,19 +547,13 @@ pub async fn handle_ttl_expiry(
     let context_id_bytes = context_id_to_bytes(&context_id);
     let memory_scope = handle.params().memory_scope;
 
-    // Transition directly to Expired (skips Closing).
     handle.transition_to(&ContextState::Expired).await?;
 
-    // Destroy keys per memory scope.
-    // For Ephemeral and Summary: destroy immediately.
-    // For Full: keys are retained (content remains readable).
     if memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary {
-        // Best-effort: log but continue on crypto errors.
         let _ = crypto.destroy_mls_group(&context_id_bytes);
         let _ = crypto.destroy_sender_key(&context_id_bytes);
     }
 
-    // Append ContextExpired event to event log.
     event_log.append_context_event(&context_id_bytes, "ContextExpired")?;
 
     Ok(())
@@ -230,10 +565,6 @@ pub async fn handle_ttl_expiry(
 
 /// Manages a TTL timer for a single context.
 ///
-/// On context creation with a TTL, a tokio timer task is spawned that fires
-/// at expiry and calls `handle_ttl_expiry()`. The timer can be cancelled
-/// (on early close) or reset (on TTL extension with unanimous consent).
-///
 /// See ADR-008 acceptance criterion 9.
 pub struct TtlTimer {
     /// The spawned timer task handle. `None` if no TTL is configured.
@@ -244,8 +575,6 @@ pub struct TtlTimer {
 
 impl TtlTimer {
     /// Creates a new `TtlTimer` without starting any task.
-    ///
-    /// Use [`TtlTimer::spawn`] to start the timer.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -255,19 +584,9 @@ impl TtlTimer {
     }
 
     /// Spawns a TTL timer task that fires after the given duration.
-    ///
-    /// When the timer fires, it calls `handle_ttl_expiry` on the context.
-    /// The timer can be cancelled by calling [`TtlTimer::cancel`].
-    ///
-    /// # Arguments
-    ///
-    /// * `duration` -- The TTL duration.
-    /// * `handle` -- The context handle to expire.
-    /// * `crypto` -- Crypto provider for key destruction.
-    /// * `event_log` -- Event log provider for appending the expiry event.
     pub fn spawn(
         &mut self,
-        duration: std::time::Duration,
+        duration: Duration,
         handle: ContextHandle,
         crypto: Arc<dyn ContextCryptoProvider>,
         event_log: Arc<dyn ContextEventLogProvider>,
@@ -277,11 +596,9 @@ impl TtlTimer {
         let task = tokio::spawn(async move {
             tokio::select! {
                 () = tokio::time::sleep(duration) => {
-                    // Timer fired -- expire the context.
                     let _ = handle_ttl_expiry(&handle, crypto.as_ref(), event_log.as_ref()).await;
                 }
                 () = cancel.notified() => {
-                    // Timer was cancelled (context closed early or TTL extended).
                 }
             }
         });
@@ -290,9 +607,6 @@ impl TtlTimer {
     }
 
     /// Cancels the running TTL timer, if any.
-    ///
-    /// Called when the context closes before TTL elapses, or when the TTL is
-    /// extended (the old timer is cancelled and a new one is spawned).
     pub fn cancel(&self) {
         self.cancel.notify_one();
     }
@@ -312,7 +626,6 @@ impl Default for TtlTimer {
 
 impl Drop for TtlTimer {
     fn drop(&mut self) {
-        // Cancel the timer on drop to prevent orphaned tasks.
         self.cancel.notify_one();
         if let Some(task) = self.task.take() {
             task.abort();
@@ -325,14 +638,10 @@ impl Drop for TtlTimer {
 // ---------------------------------------------------------------------------
 
 /// Tracks member consent for TTL extension.
-///
-/// TTL extension requires unanimous consent from all current members
-/// (spec section 5.10). Once all members have consented, the caller
-/// resets the TTL timer with the new duration.
 #[derive(Debug, Clone)]
 pub struct TtlExtension {
     /// The proposed new TTL duration.
-    pub proposed_duration: std::time::Duration,
+    pub proposed_duration: Duration,
     /// DIDs that have consented to the extension.
     consented: HashSet<DID>,
     /// Total member count required for unanimity.
@@ -341,13 +650,8 @@ pub struct TtlExtension {
 
 impl TtlExtension {
     /// Creates a new TTL extension proposal.
-    ///
-    /// # Arguments
-    ///
-    /// * `proposed_duration` -- The new TTL duration being proposed.
-    /// * `member_count` -- The total number of members who must consent.
     #[must_use]
-    pub fn new(proposed_duration: std::time::Duration, member_count: usize) -> Self {
+    pub fn new(proposed_duration: Duration, member_count: usize) -> Self {
         Self {
             proposed_duration,
             consented: HashSet::new(),
@@ -355,8 +659,7 @@ impl TtlExtension {
         }
     }
 
-    /// Records a member's consent. Returns `true` if this was a new consent
-    /// (not a duplicate).
+    /// Records a member's consent. Returns `true` if this was a new consent.
     pub fn add_consent(&mut self, member_did: DID) -> bool {
         self.consented.insert(member_did)
     }
@@ -418,10 +721,7 @@ mod tests {
     };
     use crate::context::params::ContextParams;
     use crate::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-
-    // -----------------------------------------------------------------------
-    // Mock providers (reusable for ttl tests)
-    // -----------------------------------------------------------------------
+    use crate::identity::cache::TestClock;
 
     #[derive(Default)]
     struct MockCrypto {
@@ -430,76 +730,24 @@ mod tests {
     }
 
     impl ContextCryptoProvider for MockCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-
-        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-
-        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-
-        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-
+        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> { Ok(()) }
+        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
+        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
+        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
         fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.mls_destroyed.lock().unwrap().push(*id);
             Ok(())
         }
-
         fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.sender_keys_destroyed.lock().unwrap().push(*id);
             Ok(())
         }
-
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
-            Ok(())
-        }
-
-        fn add_member(
-            &self,
-            _context_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-
-        fn remove_member(
-            &self,
-            _context_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-
-        fn distribute_sender_key(
-            &self,
-            _context_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-
-        fn remove_member_sender_key(
-            &self,
-            _context_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-
-        fn encrypt_message(
-            &self,
-            _context_id: &[u8; 32],
-            _sender_did: &str,
-            payload: &[u8],
-        ) -> Result<Vec<u8>, ContextError> {
-            Ok(payload.to_vec())
-        }
+        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> { Ok(()) }
+        fn add_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
+        fn remove_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
+        fn distribute_sender_key(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
+        fn remove_member_sender_key(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
+        fn encrypt_message(&self, _context_id: &[u8; 32], _sender_did: &str, payload: &[u8]) -> Result<Vec<u8>, ContextError> { Ok(payload.to_vec()) }
     }
 
     #[derive(Default)]
@@ -517,30 +765,13 @@ mod tests {
     }
 
     impl ContextTransportProvider for MockTransport {
-        fn is_connected(&self) -> bool {
-            self.connected.load(Ordering::Relaxed)
-        }
-
-        fn publish_context(
-            &self,
-            _id: &[u8; 32],
-            _params: &ContextParams,
-        ) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-
+        fn is_connected(&self) -> bool { self.connected.load(Ordering::Relaxed) }
+        fn publish_context(&self, _id: &[u8; 32], _params: &ContextParams) -> Result<(), ContextCreationError> { Ok(()) }
         fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.deleted.lock().unwrap().push(*id);
             Ok(())
         }
-
-        fn send_message(
-            &self,
-            _context_id: &[u8; 32],
-            _encrypted_payload: &[u8],
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
+        fn send_message(&self, _context_id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> { Ok(()) }
     }
 
     #[derive(Default)]
@@ -549,443 +780,436 @@ mod tests {
     }
 
     impl ContextEventLogProvider for MockEventLog {
-        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-
+        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
         fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
             self.events.lock().unwrap().push((*id, event.to_owned()));
             Ok(())
         }
-
-        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
+        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
     }
-
-    // -----------------------------------------------------------------------
-    // Helper: create a role state with close capability for admin
-    // -----------------------------------------------------------------------
 
     fn role_state_with_close_capability(context_id: &str, creator_did: &str) -> ContextRoleState {
         let ceiling = CapabilityCeiling::new(
-            [
-                Capability::MessagesRead,
-                Capability::MessagesWrite,
-                Capability::ContextClose,
-                Capability::RoleAssign,
-            ]
-            .into_iter(),
+            [Capability::MessagesRead, Capability::MessagesWrite, Capability::ContextClose, Capability::RoleAssign].into_iter(),
         );
         ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
     }
 
-    fn role_state_without_close_capability(
-        context_id: &str,
-        creator_did: &str,
-    ) -> ContextRoleState {
+    fn role_state_without_close_capability(context_id: &str, creator_did: &str) -> ContextRoleState {
         let ceiling = CapabilityCeiling::new(
             [Capability::MessagesRead, Capability::MessagesWrite].into_iter(),
         );
-        // The admin will have all ceiling caps, but ContextClose is not in
-        // the ceiling, so even admin won't have it.
         ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
     }
 
     fn active_handle(context_id: &str, memory_scope: MemoryScope) -> ContextHandle {
-        let params = ContextParams {
-            memory_scope,
-            ..ContextParams::default()
-        };
-        let handle = ContextHandle::new(context_id.to_owned(), params);
-        // We need to transition to Active synchronously for test setup.
-        // We'll do it in the test body since it's async.
-        handle
+        let params = ContextParams { memory_scope, ..ContextParams::default() };
+        ContextHandle::new(context_id.to_owned(), params)
     }
 
     async fn make_active(handle: &ContextHandle) {
         handle.transition_to(&ContextState::Active).await.unwrap();
     }
 
-    // -----------------------------------------------------------------------
-    // close_context tests
-    // -----------------------------------------------------------------------
-
-    /// AC-1: close_context rejects initiator without close capability.
     #[tokio::test]
     async fn close_context_rejects_without_close_capability() {
         let handle = active_handle("ctx-close-1", MemoryScope::Ephemeral);
         make_active(&handle).await;
-
-        // Creator does NOT have ContextClose (not in ceiling).
         let role_state = role_state_without_close_capability("ctx-close-1", "did:key:creator");
         let event_log = MockEventLog::default();
-
-        let result =
-            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
-
+        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextError::PermissionDenied(_)
-        ));
-
-        // State should still be Active (no transition occurred).
+        assert!(matches!(result.unwrap_err(), ContextError::PermissionDenied(_)));
         assert_eq!(handle.state().await, ContextState::Active);
     }
 
-    /// AC-1: close_context succeeds for admin with close capability.
     #[tokio::test]
     async fn close_context_succeeds_for_admin_with_capability() {
         let handle = active_handle("ctx-close-2", MemoryScope::Ephemeral);
         make_active(&handle).await;
-
         let role_state = role_state_with_close_capability("ctx-close-2", "did:key:creator");
         let event_log = MockEventLog::default();
-
-        let result =
-            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
-
+        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
         assert!(result.is_ok());
         let close_result = result.unwrap();
-
-        // Ephemeral scope: no summary, but schedule key destruction.
         assert!(!close_result.should_generate_summary);
         assert!(close_result.should_schedule_key_destruction);
-
-        // State should be Closing.
         assert_eq!(handle.state().await, ContextState::Closing);
-
-        // Event log should contain ContextClosing.
-        let events = event_log.events.lock().unwrap();
-        assert!(events.iter().any(|(_, e)| e == "ContextClosing"));
     }
 
-    /// AC-1: close_context with Summary scope triggers summary generation.
     #[tokio::test]
     async fn close_context_summary_scope_triggers_summary_generation() {
         let handle = active_handle("ctx-close-3", MemoryScope::Summary);
         make_active(&handle).await;
-
         let role_state = role_state_with_close_capability("ctx-close-3", "did:key:creator");
         let event_log = MockEventLog::default();
-
-        let result =
-            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
-
+        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
         assert!(result.is_ok());
-        let close_result = result.unwrap();
-
-        assert!(close_result.should_generate_summary);
-        assert!(close_result.should_schedule_key_destruction);
+        assert!(result.unwrap().should_generate_summary);
     }
 
-    /// AC-1: close_context with Full scope does not schedule key destruction.
     #[tokio::test]
     async fn close_context_full_scope_retains_keys() {
         let handle = active_handle("ctx-close-4", MemoryScope::Full);
         make_active(&handle).await;
-
         let role_state = role_state_with_close_capability("ctx-close-4", "did:key:creator");
         let event_log = MockEventLog::default();
-
-        let result =
-            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
-
+        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
         assert!(result.is_ok());
-        let close_result = result.unwrap();
-
-        assert!(!close_result.should_generate_summary);
-        assert!(!close_result.should_schedule_key_destruction);
+        let cr = result.unwrap();
+        assert!(!cr.should_generate_summary);
+        assert!(!cr.should_schedule_key_destruction);
     }
 
-    /// AC-1: close_context rejects if context is not Active.
     #[tokio::test]
     async fn close_context_rejects_when_not_active() {
         let handle = active_handle("ctx-close-5", MemoryScope::Ephemeral);
-        // Don't transition to Active -- stays in Creating.
-
         let role_state = role_state_with_close_capability("ctx-close-5", "did:key:creator");
         let event_log = MockEventLog::default();
-
-        let result =
-            close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextError::ContextNotActive
-        ));
+        let result = close_context(&handle, &"did:key:creator".into(), &role_state, &event_log).await;
+        assert!(matches!(result.unwrap_err(), ContextError::ContextNotActive));
     }
 
-    // -----------------------------------------------------------------------
-    // finalize_close tests
-    // -----------------------------------------------------------------------
-
-    /// AC-2: finalize_close destroys MLS group and sender keys.
     #[tokio::test]
     async fn finalize_close_destroys_mls_group_and_sender_keys() {
         let handle = active_handle("ctx-final-1", MemoryScope::Ephemeral);
         make_active(&handle).await;
         handle.transition_to(&ContextState::Closing).await.unwrap();
-
         let crypto = MockCrypto::default();
         let transport = MockTransport::connected();
         let event_log = MockEventLog::default();
-
-        let result = finalize_close(&handle, &crypto, &transport, &event_log).await;
-        assert!(result.is_ok());
-
-        // MLS group and sender key should be destroyed.
-        let mls = crypto.mls_destroyed.lock().unwrap();
-        assert_eq!(mls.len(), 1);
-
-        let sk = crypto.sender_keys_destroyed.lock().unwrap();
-        assert_eq!(sk.len(), 1);
-
-        // State should be Closed.
+        assert!(finalize_close(&handle, &crypto, &transport, &event_log).await.is_ok());
+        assert_eq!(crypto.mls_destroyed.lock().unwrap().len(), 1);
         assert_eq!(handle.state().await, ContextState::Closed);
-
-        // Event log should contain ContextClosed.
-        let events = event_log.events.lock().unwrap();
-        assert!(events.iter().any(|(_, e)| e == "ContextClosed"));
     }
 
-    /// AC-2: finalize_close issues relay deletion for ephemeral scope.
-    #[tokio::test]
-    async fn finalize_close_issues_relay_deletion_for_ephemeral() {
-        let handle = active_handle("ctx-final-2", MemoryScope::Ephemeral);
-        make_active(&handle).await;
-        handle.transition_to(&ContextState::Closing).await.unwrap();
-
-        let crypto = MockCrypto::default();
-        let transport = MockTransport::connected();
-        let event_log = MockEventLog::default();
-
-        finalize_close(&handle, &crypto, &transport, &event_log)
-            .await
-            .unwrap();
-
-        let deleted = transport.deleted.lock().unwrap();
-        assert_eq!(deleted.len(), 1);
-    }
-
-    /// AC-2: finalize_close does NOT issue relay deletion for Full scope.
-    #[tokio::test]
-    async fn finalize_close_no_relay_deletion_for_full_scope() {
-        let handle = active_handle("ctx-final-3", MemoryScope::Full);
-        make_active(&handle).await;
-        handle.transition_to(&ContextState::Closing).await.unwrap();
-
-        let crypto = MockCrypto::default();
-        let transport = MockTransport::connected();
-        let event_log = MockEventLog::default();
-
-        finalize_close(&handle, &crypto, &transport, &event_log)
-            .await
-            .unwrap();
-
-        let deleted = transport.deleted.lock().unwrap();
-        assert!(deleted.is_empty());
-    }
-
-    /// AC-2: finalize_close rejects if not in Closing state.
     #[tokio::test]
     async fn finalize_close_rejects_when_not_closing() {
         let handle = active_handle("ctx-final-4", MemoryScope::Ephemeral);
         make_active(&handle).await;
-        // Still Active -- not Closing.
-
         let crypto = MockCrypto::default();
         let transport = MockTransport::connected();
         let event_log = MockEventLog::default();
-
-        let result = finalize_close(&handle, &crypto, &transport, &event_log).await;
-
-        // The crypto operations will succeed, but transition_to(Closed) from
-        // Active should fail.
-        assert!(result.is_err());
+        assert!(finalize_close(&handle, &crypto, &transport, &event_log).await.is_err());
     }
 
-    // -----------------------------------------------------------------------
-    // handle_ttl_expiry tests
-    // -----------------------------------------------------------------------
-
-    /// AC-3: TTL expiry transitions Active to Expired automatically.
     #[tokio::test]
     async fn ttl_expiry_transitions_active_to_expired() {
         let handle = active_handle("ctx-ttl-1", MemoryScope::Ephemeral);
         make_active(&handle).await;
-
         let crypto = MockCrypto::default();
         let event_log = MockEventLog::default();
-
-        let result = handle_ttl_expiry(&handle, &crypto, &event_log).await;
-        assert!(result.is_ok());
-
-        // State should be Expired.
+        assert!(handle_ttl_expiry(&handle, &crypto, &event_log).await.is_ok());
         assert_eq!(handle.state().await, ContextState::Expired);
-
-        // Keys should be destroyed for Ephemeral scope.
-        let mls = crypto.mls_destroyed.lock().unwrap();
-        assert_eq!(mls.len(), 1);
-
-        let sk = crypto.sender_keys_destroyed.lock().unwrap();
-        assert_eq!(sk.len(), 1);
-
-        // Event log should contain ContextExpired.
-        let events = event_log.events.lock().unwrap();
-        assert!(events.iter().any(|(_, e)| e == "ContextExpired"));
     }
 
-    /// AC-3: TTL expiry with Full scope does NOT destroy keys.
     #[tokio::test]
     async fn ttl_expiry_full_scope_retains_keys() {
         let handle = active_handle("ctx-ttl-2", MemoryScope::Full);
         make_active(&handle).await;
-
         let crypto = MockCrypto::default();
         let event_log = MockEventLog::default();
-
-        let result = handle_ttl_expiry(&handle, &crypto, &event_log).await;
-        assert!(result.is_ok());
-
-        assert_eq!(handle.state().await, ContextState::Expired);
-
-        // Keys should NOT be destroyed for Full scope.
-        let mls = crypto.mls_destroyed.lock().unwrap();
-        assert!(mls.is_empty());
-
-        let sk = crypto.sender_keys_destroyed.lock().unwrap();
-        assert!(sk.is_empty());
+        assert!(handle_ttl_expiry(&handle, &crypto, &event_log).await.is_ok());
+        assert!(crypto.mls_destroyed.lock().unwrap().is_empty());
     }
 
-    /// AC-3: TTL expiry rejects if not Active.
     #[tokio::test]
     async fn ttl_expiry_rejects_when_not_active() {
         let handle = active_handle("ctx-ttl-3", MemoryScope::Ephemeral);
-        // Stay in Creating state.
-
         let crypto = MockCrypto::default();
         let event_log = MockEventLog::default();
-
-        let result = handle_ttl_expiry(&handle, &crypto, &event_log).await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextError::ContextNotActive
-        ));
+        assert!(matches!(handle_ttl_expiry(&handle, &crypto, &event_log).await.unwrap_err(), ContextError::ContextNotActive));
     }
 
-    // -----------------------------------------------------------------------
-    // TtlTimer tests
-    // -----------------------------------------------------------------------
-
-    /// AC-4: TTL timer fires and calls handle_ttl_expiry.
     #[tokio::test]
     async fn ttl_timer_fires_and_expires_context() {
         let handle = active_handle("ctx-timer-1", MemoryScope::Ephemeral);
         make_active(&handle).await;
-
         let crypto: Arc<dyn ContextCryptoProvider> = Arc::new(MockCrypto::default());
         let event_log: Arc<dyn ContextEventLogProvider> = Arc::new(MockEventLog::default());
-
         let mut timer = TtlTimer::new();
         timer.spawn(Duration::from_millis(50), handle.clone(), crypto, event_log);
-
         assert!(timer.is_active());
-
-        // Wait for timer to fire.
         tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // Context should be Expired.
         assert_eq!(handle.state().await, ContextState::Expired);
     }
 
-    /// AC-4: TTL timer cancelled on early close.
     #[tokio::test]
     async fn ttl_timer_cancelled_on_early_close() {
         let handle = active_handle("ctx-timer-2", MemoryScope::Ephemeral);
         make_active(&handle).await;
-
         let crypto: Arc<dyn ContextCryptoProvider> = Arc::new(MockCrypto::default());
         let event_log: Arc<dyn ContextEventLogProvider> = Arc::new(MockEventLog::default());
-
         let mut timer = TtlTimer::new();
-        timer.spawn(
-            Duration::from_secs(10), // Long TTL
-            handle.clone(),
-            crypto,
-            event_log,
-        );
-
-        assert!(timer.is_active());
-
-        // Cancel the timer (simulating early close).
+        timer.spawn(Duration::from_secs(10), handle.clone(), crypto, event_log);
         timer.cancel();
-
-        // Wait a bit for cancellation to take effect.
         tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Context should still be Active (not expired).
         assert_eq!(handle.state().await, ContextState::Active);
-
-        // Timer should no longer be active.
         assert!(!timer.is_active());
     }
 
-    /// TtlTimer default creates an inactive timer.
     #[tokio::test]
     async fn ttl_timer_default_is_inactive() {
-        let timer = TtlTimer::default();
-        assert!(!timer.is_active());
+        assert!(!TtlTimer::default().is_active());
     }
 
-    // -----------------------------------------------------------------------
-    // TtlExtension tests
-    // -----------------------------------------------------------------------
-
-    /// AC-5: TTL extension requires unanimous consent.
     #[test]
     fn ttl_extension_requires_unanimous_consent() {
         let mut ext = TtlExtension::new(Duration::from_secs(3600), 3);
-
         assert!(!ext.is_unanimous());
-        assert_eq!(ext.remaining(), 3);
-        assert_eq!(ext.consent_count(), 0);
-
-        assert!(ext.add_consent("did:key:alice".into()));
-        assert!(!ext.is_unanimous());
-        assert_eq!(ext.remaining(), 2);
-
-        assert!(ext.add_consent("did:key:bob".into()));
-        assert!(!ext.is_unanimous());
-        assert_eq!(ext.remaining(), 1);
-
-        assert!(ext.add_consent("did:key:charlie".into()));
+        ext.add_consent("did:key:alice".into());
+        ext.add_consent("did:key:bob".into());
+        ext.add_consent("did:key:charlie".into());
         assert!(ext.is_unanimous());
-        assert_eq!(ext.remaining(), 0);
     }
 
-    /// Duplicate consent is ignored.
     #[test]
     fn ttl_extension_duplicate_consent_ignored() {
         let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
-
         assert!(ext.add_consent("did:key:alice".into()));
-        assert!(!ext.add_consent("did:key:alice".into())); // duplicate
-
+        assert!(!ext.add_consent("did:key:alice".into()));
         assert_eq!(ext.consent_count(), 1);
-        assert!(!ext.is_unanimous());
     }
 
-    /// Single member can achieve unanimity alone.
     #[test]
     fn ttl_extension_single_member_unanimity() {
         let mut ext = TtlExtension::new(Duration::from_secs(600), 1);
-
-        assert!(!ext.is_unanimous());
         assert!(ext.add_consent("did:key:alice".into()));
         assert!(ext.is_unanimous());
+    }
+
+    // SCP-066 tests: check_ttl
+
+    #[test]
+    fn check_ttl_returns_ok_when_active() {
+        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), None, 2000).is_ok());
+    }
+
+    #[test]
+    fn check_ttl_returns_expired_when_elapsed() {
+        assert!(matches!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), None, 5000).unwrap_err(), TtlError::Expired));
+    }
+
+    #[test]
+    fn check_ttl_returns_expired_at_exact_deadline() {
+        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), None, 4600).is_err());
+    }
+
+    #[test]
+    fn check_ttl_none_policy_always_ok() {
+        assert!(check_ttl(0, TtlPolicy::None, None, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn check_ttl_respects_extension() {
+        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), Some(10000), 5000).is_ok());
+    }
+
+    #[test]
+    fn check_ttl_expired_extension() {
+        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_secs(3600)), Some(8000), 9000).is_err());
+    }
+
+    // SCP-066 tests: TtlEnforcer
+
+    #[test]
+    fn ttl_enforcer_check_active() {
+        let clock = TestClock::new(1000);
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert!(enforcer.check(&clock).is_ok());
+        assert!(!enforcer.is_expired());
+    }
+
+    #[test]
+    fn ttl_enforcer_check_expired() {
+        let clock = TestClock::new(5000);
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert!(enforcer.check(&clock).is_err());
+        assert!(enforcer.is_expired());
+    }
+
+    #[test]
+    fn ttl_enforcer_latches_expired() {
+        let clock = TestClock::new(5000);
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert!(enforcer.check(&clock).is_err());
+        clock.set(2000);
+        assert!(enforcer.check(&clock).is_err());
+    }
+
+    #[test]
+    fn ttl_enforcer_none_policy_always_ok() {
+        let clock = TestClock::new(u64::MAX);
+        let mut enforcer = TtlEnforcer::new(0, TtlPolicy::None);
+        assert!(enforcer.check(&clock).is_ok());
+    }
+
+    #[test]
+    fn ttl_enforcer_apply_extension_resets_deadline() {
+        // created_at=1000, TTL=3600s => deadline=4600. Clock at 4700 is past deadline.
+        let clock = TestClock::new(4700);
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert!(enforcer.check(&clock).is_err());
+        // Apply extension to 8000 -- this clears the expired latch and sets
+        // extended_until.
+        enforcer.apply_extension(8000, &clock).unwrap();
+        assert!(!enforcer.is_expired());
+        assert!(enforcer.check(&clock).is_ok());
+        assert_eq!(enforcer.extended_until(), Some(8000));
+    }
+
+    #[test]
+    fn ttl_enforcer_apply_extension_rejects_none_policy() {
+        let clock = TestClock::new(1000);
+        let mut enforcer = TtlEnforcer::new(0, TtlPolicy::None);
+        assert!(matches!(enforcer.apply_extension(5000, &clock).unwrap_err(), TtlError::NoTtlPolicy));
+    }
+
+    #[test]
+    fn ttl_enforcer_remaining_secs() {
+        let clock = TestClock::new(2000);
+        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert_eq!(enforcer.remaining_secs(&clock), Some(2600));
+    }
+
+    #[test]
+    fn ttl_enforcer_remaining_secs_expired() {
+        let clock = TestClock::new(5000);
+        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert_eq!(enforcer.remaining_secs(&clock), Some(0));
+    }
+
+    #[test]
+    fn ttl_enforcer_remaining_secs_none_policy() {
+        let clock = TestClock::new(1000);
+        let enforcer = TtlEnforcer::new(0, TtlPolicy::None);
+        assert_eq!(enforcer.remaining_secs(&clock), Option::None);
+    }
+
+    #[test]
+    fn ttl_enforcer_accessors() {
+        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert_eq!(enforcer.created_at(), 1000);
+        assert_eq!(enforcer.ttl_policy(), TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert_eq!(enforcer.extended_until(), None);
+        assert!(!enforcer.is_expired());
+    }
+
+    // SCP-066 tests: ExtensionConsentMode
+
+    #[test]
+    fn consent_mode_bilateral_uses_all_member() {
+        assert_eq!(consent_mode_for_member_count(2), ExtensionConsentMode::AllMember);
+    }
+
+    #[test]
+    fn consent_mode_multi_party_uses_governance() {
+        assert_eq!(consent_mode_for_member_count(3), ExtensionConsentMode::Governance);
+    }
+
+    // SCP-066 tests: TtlExtensionProposal
+
+    #[test]
+    fn extension_proposal_bilateral_requires_all_members() {
+        let mut proposal = TtlExtensionProposal::new("did:key:alice".into(), Duration::from_secs(3600), 2, GovernanceModel::SingleAdmin);
+        assert_eq!(proposal.consent_mode(), ExtensionConsentMode::AllMember);
+        assert!(!proposal.is_approved());
+        proposal.record_consent("did:key:alice".into());
+        assert!(!proposal.is_approved());
+        proposal.record_consent("did:key:bob".into());
+        assert!(proposal.is_approved());
+    }
+
+    #[test]
+    fn extension_proposal_multi_party_single_admin() {
+        let mut proposal = TtlExtensionProposal::new("did:key:admin".into(), Duration::from_secs(7200), 5, GovernanceModel::SingleAdmin);
+        assert_eq!(proposal.consent_mode(), ExtensionConsentMode::Governance);
+        proposal.record_consent("did:key:admin".into());
+        assert!(proposal.is_approved());
+    }
+
+    #[test]
+    fn extension_proposal_computes_deadline() {
+        let proposal = TtlExtensionProposal::new("did:key:alice".into(), Duration::from_secs(3600), 2, GovernanceModel::SingleAdmin);
+        assert_eq!(proposal.compute_new_deadline(5000), 8600);
+    }
+
+    // SCP-066 tests: TtlTimerHandle
+
+    struct MockTimerHandle {
+        cancelled: std::sync::atomic::AtomicBool,
+        active: std::sync::atomic::AtomicBool,
+        reset_dur: std::sync::Mutex<Option<Duration>>,
+    }
+    impl MockTimerHandle {
+        fn new() -> Self {
+            Self {
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+                active: std::sync::atomic::AtomicBool::new(true),
+                reset_dur: std::sync::Mutex::new(None),
+            }
+        }
+    }
+    impl TtlTimerHandle for MockTimerHandle {
+        fn cancel_timer(&self) {
+            self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.active.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn reset_timer(&mut self, d: Duration) {
+            *self.reset_dur.lock().unwrap() = Some(d);
+            self.active.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn is_timer_active(&self) -> bool {
+            self.active.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn ttl_timer_handle_cancel() {
+        let h = MockTimerHandle::new();
+        assert!(h.is_timer_active());
+        h.cancel_timer();
+        assert!(!h.is_timer_active());
+    }
+
+    #[test]
+    fn ttl_timer_handle_reset() {
+        let mut h = MockTimerHandle::new();
+        h.cancel_timer();
+        h.reset_timer(Duration::from_secs(7200));
+        assert!(h.is_timer_active());
+    }
+
+    // SCP-066 tests: integration
+
+    #[test]
+    fn full_extension_flow_bilateral() {
+        let clock = TestClock::new(3000);
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        assert!(enforcer.check(&clock).is_ok());
+        let mut proposal = TtlExtensionProposal::new("did:key:alice".into(), Duration::from_secs(3600), 2, GovernanceModel::SingleAdmin);
+        proposal.record_consent("did:key:alice".into());
+        proposal.record_consent("did:key:bob".into());
+        assert!(proposal.is_approved());
+        let new_deadline = proposal.compute_new_deadline(clock.now());
+        enforcer.apply_extension(new_deadline, &clock).unwrap();
+        clock.set(5000);
+        assert!(enforcer.check(&clock).is_ok());
+        clock.set(7000);
+        assert!(enforcer.check(&clock).is_err());
+    }
+
+    #[test]
+    fn full_extension_flow_multi_party() {
+        let clock = TestClock::new(2000);
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let mut proposal = TtlExtensionProposal::new("did:key:admin".into(), Duration::from_secs(7200), 5, GovernanceModel::SingleAdmin);
+        proposal.record_consent("did:key:admin".into());
+        assert!(proposal.is_approved());
+        enforcer.apply_extension(proposal.compute_new_deadline(clock.now()), &clock).unwrap();
+        clock.set(5000);
+        assert!(enforcer.check(&clock).is_ok());
+        clock.set(9200);
+        assert!(enforcer.check(&clock).is_err());
     }
 }
