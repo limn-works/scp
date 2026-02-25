@@ -323,6 +323,17 @@ impl ContextHandle {
         self.inner.read().await.state.clone()
     }
 
+    /// Attempts a non-blocking read of the context state.
+    ///
+    /// Returns `None` if the read lock cannot be acquired immediately (e.g.,
+    /// a state transition is in progress). Used by [`ContextManager`] to
+    /// check state synchronously inside a `Mutex` lock scope, avoiding
+    /// TOCTOU races without holding the `MutexGuard` across `.await` points.
+    #[must_use]
+    pub fn try_read_state(&self) -> Option<ContextState> {
+        self.inner.try_read().ok().map(|g| g.state.clone())
+    }
+
     /// Attempts to transition the context to a new state.
     ///
     /// Validates the transition via [`state_machine::transition`] and applies
