@@ -119,6 +119,9 @@ struct BlobEntry {
 /// Secondary index mapping `routing_id` to a list of `blob_id`s.
 type RoutingIndex = Arc<RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>>;
 
+/// Default maximum number of blobs that can be stored.
+const DEFAULT_MAX_BLOBS: usize = 100_000;
+
 /// In-memory blob storage backed by a `HashMap`.
 ///
 /// Suitable for development and testing. Not persistent -- all data is lost
@@ -131,15 +134,24 @@ pub struct InMemoryBlobStorage {
     blobs: Arc<RwLock<HashMap<[u8; 32], BlobEntry>>>,
     /// Secondary index: `routing_id` -> set of `blob_id`s.
     routing_index: RoutingIndex,
+    /// Maximum number of blobs this storage will accept.
+    max_blobs: usize,
 }
 
 impl InMemoryBlobStorage {
-    /// Creates a new, empty in-memory blob storage.
+    /// Creates a new, empty in-memory blob storage with default capacity.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_BLOBS)
+    }
+
+    /// Creates a new, empty in-memory blob storage with the given capacity limit.
+    #[must_use]
+    pub fn with_capacity(max_blobs: usize) -> Self {
         Self {
             blobs: Arc::new(RwLock::new(HashMap::new())),
             routing_index: Arc::new(RwLock::new(HashMap::new())),
+            max_blobs,
         }
     }
 }
@@ -187,6 +199,10 @@ impl BlobStorage for InMemoryBlobStorage {
 
         {
             let mut blobs = self.blobs.write().await;
+            // Enforce capacity limit. Overwrites of existing blob_ids are allowed.
+            if blobs.len() >= self.max_blobs && !blobs.contains_key(&blob_id) {
+                return Err(StorageError::StorageFull);
+            }
             blobs.insert(blob_id, entry);
         }
 
@@ -274,23 +290,35 @@ impl BlobStorage for InMemoryBlobStorage {
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
         let now = now_secs();
-        let mut blobs = self.blobs.write().await;
-        let mut index = self.routing_index.write().await;
 
-        let expired_ids: Vec<([u8; 32], [u8; 32])> = blobs
-            .iter()
-            .filter(|(_, entry)| entry.expires_at <= now)
-            .map(|(blob_id, entry)| (*blob_id, entry.stored_blob.routing_id))
-            .collect();
+        // Phase 1: identify expired blob IDs under a read lock.
+        let expired_ids: Vec<([u8; 32], [u8; 32])> = {
+            let blobs = self.blobs.read().await;
+            blobs
+                .iter()
+                .filter(|(_, entry)| entry.expires_at <= now)
+                .map(|(blob_id, entry)| (*blob_id, entry.stored_blob.routing_id))
+                .collect()
+        };
+
+        if expired_ids.is_empty() {
+            return Ok(0);
+        }
 
         let count = expired_ids.len();
 
-        for (blob_id, routing_id) in &expired_ids {
-            blobs.remove(blob_id);
-            if let Some(ids) = index.get_mut(routing_id) {
-                ids.retain(|id| id != blob_id);
-                if ids.is_empty() {
-                    index.remove(routing_id);
+        // Phase 2: remove expired entries under a brief write lock.
+        {
+            let mut blobs = self.blobs.write().await;
+            let mut index = self.routing_index.write().await;
+
+            for (blob_id, routing_id) in &expired_ids {
+                blobs.remove(blob_id);
+                if let Some(ids) = index.get_mut(routing_id) {
+                    ids.retain(|id| id != blob_id);
+                    if ids.is_empty() {
+                        index.remove(routing_id);
+                    }
                 }
             }
         }
@@ -536,5 +564,83 @@ mod tests {
         // After deletion, query should return empty.
         let results = storage.query(&routing_id, None, 100).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_rejects_when_at_capacity() {
+        let storage = InMemoryBlobStorage::with_capacity(3);
+        let routing_id = [0xAA; 32];
+
+        // Fill to capacity.
+        for i in 0u8..3 {
+            let data = vec![i; 10];
+            let blob_id = make_blob_id(&data);
+            storage
+                .store(routing_id, blob_id, None, 3600, data)
+                .await
+                .unwrap();
+        }
+
+        // The 4th store should fail.
+        let data = vec![99u8; 10];
+        let blob_id = make_blob_id(&data);
+        let result = storage.store(routing_id, blob_id, None, 3600, data).await;
+        assert!(matches!(result, Err(StorageError::StorageFull)));
+    }
+
+    #[tokio::test]
+    async fn store_allows_overwrite_at_capacity() {
+        let storage = InMemoryBlobStorage::with_capacity(2);
+        let routing_id = [0xAA; 32];
+
+        let data1 = vec![1u8; 10];
+        let blob_id1 = make_blob_id(&data1);
+        storage
+            .store(routing_id, blob_id1, None, 3600, data1.clone())
+            .await
+            .unwrap();
+
+        let data2 = vec![2u8; 10];
+        let blob_id2 = make_blob_id(&data2);
+        storage
+            .store(routing_id, blob_id2, None, 3600, data2)
+            .await
+            .unwrap();
+
+        // At capacity (2/2). Overwriting an existing blob_id should succeed.
+        let updated_data = vec![1u8; 20];
+        let result = storage
+            .store(routing_id, blob_id1, None, 7200, updated_data)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn store_succeeds_after_delete_frees_capacity() {
+        let storage = InMemoryBlobStorage::with_capacity(2);
+        let routing_id = [0xAA; 32];
+
+        let data1 = vec![1u8; 10];
+        let blob_id1 = make_blob_id(&data1);
+        storage
+            .store(routing_id, blob_id1, None, 3600, data1)
+            .await
+            .unwrap();
+
+        let data2 = vec![2u8; 10];
+        let blob_id2 = make_blob_id(&data2);
+        storage
+            .store(routing_id, blob_id2, None, 3600, data2)
+            .await
+            .unwrap();
+
+        // Delete one blob to free capacity.
+        storage.delete(&blob_id1).await.unwrap();
+
+        // Now a new store should succeed.
+        let data3 = vec![3u8; 10];
+        let blob_id3 = make_blob_id(&data3);
+        let result = storage.store(routing_id, blob_id3, None, 3600, data3).await;
+        assert!(result.is_ok());
     }
 }
