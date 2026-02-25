@@ -40,7 +40,7 @@ pub struct MediaKeyMaterial {
     pub context_id: ContextId,
 }
 
-/// Errors from media key operations.
+/// Errors from media key and session lifecycle operations.
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
     /// The MLS group has been destroyed.
@@ -54,6 +54,35 @@ pub enum MediaError {
     /// The requested key length exceeds the maximum allowed by MLS.
     #[error("requested key length {0} exceeds maximum (65535)")]
     KeyLengthTooLong(usize),
+
+    /// A requested media capability is not present in the context ceiling.
+    #[error("capability `{0}` not found in context ceiling")]
+    CapabilityNotInCeiling(String),
+
+    /// The media session was not found.
+    #[error("session `{0}` not found")]
+    SessionNotFound(String),
+
+    /// The session is in an invalid state for the requested operation.
+    #[error("invalid session state: expected {expected}, got {actual}")]
+    InvalidSessionState {
+        /// The state(s) required for the operation.
+        expected: String,
+        /// The actual current state.
+        actual: String,
+    },
+
+    /// No capabilities were requested for session initiation.
+    #[error("at least one media capability is required")]
+    NoCapabilities,
+
+    /// No participants were provided for session initiation.
+    #[error("at least one participant is required")]
+    NoParticipants,
+
+    /// Serialization of session metadata failed.
+    #[error("session metadata serialization failed: {0}")]
+    MetadataSerializationFailed(String),
 }
 
 /// Encodes bytes as a lowercase hex string.

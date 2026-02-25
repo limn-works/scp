@@ -11,7 +11,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 19 event type variants.
+//! - [`EventType`] -- The 21 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //!
@@ -55,7 +55,7 @@ pub type Ed25519Signature = Vec<u8>;
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 19 event type variants for SCP context event logs.
+/// The 21 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the full enumeration.
@@ -99,6 +99,10 @@ pub enum EventType {
     MemberBlocked,
     /// Sender key epoch was advanced (ADR-007).
     KeyEpochAdvance,
+    /// A media session was started (ADR-024).
+    MediaSessionStarted,
+    /// A media session ended (ADR-024).
+    MediaSessionEnded,
 }
 
 // ---------------------------------------------------------------------------

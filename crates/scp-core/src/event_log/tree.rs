@@ -238,6 +238,8 @@ const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::AbsenceProofRequested => 16,
         EventType::MemberBlocked => 17,
         EventType::KeyEpochAdvance => 18,
+        EventType::MediaSessionStarted => 19,
+        EventType::MediaSessionEnded => 20,
     }
 }
 
@@ -718,7 +720,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // all 19 event types are valid
+    // all 21 event types are valid
     // -----------------------------------------------------------------------
 
     #[test]
@@ -747,6 +749,8 @@ mod tests {
             EventType::AbsenceProofRequested,
             EventType::MemberBlocked,
             EventType::KeyEpochAdvance,
+            EventType::MediaSessionStarted,
+            EventType::MediaSessionEnded,
         ];
 
         let mut prev_hash = GENESIS_PREV_HASH;
@@ -768,7 +772,7 @@ mod tests {
             prev_hash = leaf_hash;
         }
 
-        assert_eq!(event_count(&log), 19);
+        assert_eq!(event_count(&log), 21);
     }
 
     // -----------------------------------------------------------------------

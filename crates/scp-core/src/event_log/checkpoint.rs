@@ -373,6 +373,8 @@ mod tests {
             EventType::AbsenceProofRequested => 16,
             EventType::MemberBlocked => 17,
             EventType::KeyEpochAdvance => 18,
+            EventType::MediaSessionStarted => 19,
+            EventType::MediaSessionEnded => 20,
         }
     }
 
