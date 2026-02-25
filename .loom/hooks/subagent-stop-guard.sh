@@ -12,6 +12,11 @@
 
 INPUT=$(cat)
 
+# Safety valve: if a stop hook already blocked this cycle, let it
+# through to prevent infinite loops.
+STOP_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false')
+[ "$STOP_ACTIVE" = "true" ] && exit 0
+
 MESSAGE=$(echo "$INPUT" | jq -r '.last_assistant_message // empty')
 
 # If the subagent produced no output at all, block so the
@@ -24,4 +29,10 @@ if [ -z "$MESSAGE" ] || [ ${#MESSAGE} -lt 10 ]; then
   exit 0
 fi
 
-exit 0
+# ─── Nudge: docs and memory ──────────────────────────────────────
+# Always nudge. Advisory (block + continue), not a hard gate.
+
+jq -n '{
+  decision: "block",
+  reason: "Before finishing, check if your work warrants updates to:\n\nDocumentation:\n  - Root .docs/ and CLAUDE.md for project-wide knowledge (ADRs, specs, lessons, architecture)\n  - Feature-scoped .docs/ and CLAUDE.md (e.g. src/auth/.docs/) for feature-specific design notes, API decisions, and internal conventions\n  Create feature-scoped .docs/ directories when a feature area has design context worth preserving close to the code.\n\nMemory:\n  - If you discovered patterns, gotchas, or architectural decisions worth preserving, store them using available memory storage or tools so future iterations can benefit."
+}'

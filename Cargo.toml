@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scp-platform",
+    "crates/scp-core",
+    "crates/scp-transport",
+    "crates/scp-testing",
+    "crates/scp-mcp",
+    "crates/scp-media",
+    "crates/scp-node",
+    "crates/scp-ffi",
+]
+
+[workspace.package]
+edition = "2024"
+repository = "https://github.com/limn/scp"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+uuid = { version = "1", features = ["v4"] }
+openmls = { version = "0.8", features = ["libcrux-provider"] }
+openmls_traits = "0.5"
+openmls_basic_credential = "0.5"
+openmls_rust_crypto = "0.5"
+openmls_memory_storage = "0.5"
+rmp-serde = "1"
+serde_bytes = "0.11"
+serde_json = "1"
+z-base-32 = "0.1.3"
+aes-gcm = "0.10"
+percent-encoding = "2"
+base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
+tracing = "0.1"
+lru = "0.12"
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+multiple_crate_versions = "allow"
+cargo_common_metadata = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

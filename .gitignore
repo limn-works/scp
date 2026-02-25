@@ -1,5 +1,6 @@
 .DS_Store
 .fastembed_cache/
+target/
 
 # Loom autonomous loop
 .loom/logs/

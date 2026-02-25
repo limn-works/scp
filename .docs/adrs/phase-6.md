@@ -4,7 +4,7 @@
 **Phase goal:** Android platform, Kotlin SDK, scale hardening, security audit, advanced governance, offline strategy.
 **Timeline:** Weeks 21+
 
-**Note:** All Phase 6 ADRs are Pending. Phase 6 follows Phases 1-5 implementation and depends on real-world implementation experience for concrete decisions. Each ADR below documents the decision space, known constraints, and approach guidance — enough for the Loom to know what's NOT decided and what to reference instead.
+**Note:** Phase 6 follows Phases 1-5 implementation. ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), and ADR-031 (Multi-Admin Governance) are Decided. Remaining ADRs (ADR-027, ADR-028) are Pending and depend on real-world implementation experience for concrete decisions. Each Pending ADR below documents the decision space, known constraints, and approach guidance — enough for the Loom to know what's NOT decided and what to reference instead.
 
 **Dependencies between ADRs:**
 
@@ -119,152 +119,1731 @@ Write after ADR-026 (Swift SDK). Mirror Swift ergonomics decisions where applica
 
 ## ADR-029: Offline/Sync Strategy
 
-**Status:** Pending
+**Status:** Decided
 
-### Why This Is the Hardest Problem
+### Context
 
-Architecture.md §6 explicitly flags offline MLS re-sync as "the hardest unsolved problem." Members offline for extended periods accumulate pending MLS proposals. Group state reset trigger conditions, initiation protocol, and context lifecycle during reset are all unspecified.
+Architecture.md §6 explicitly flags offline MLS re-sync as "the hardest unsolved problem" with High likelihood and High impact. Members offline for extended periods accumulate pending MLS proposals and Commits. The group state advances without them — epochs increment, sender keys rotate, members join and leave, governance actions execute. When the offline member reconnects, they must reconcile their stale local state with the group's current state. The difficulty is that MLS requires sequential epoch processing (each Commit depends on the previous epoch's key schedule), forward secrecy means old epoch keys are destroyed after the grace window (ADR-001 criterion 6), and relays are untrusted infrastructure that may or may not retain the full message history.
 
-### What This ADR Will Decide
+SCP's design makes this simultaneously harder and easier than in traditional messaging systems. Harder: devices are full protocol participants (§10.2), not thin clients that can ask a server for the current state. There is no authoritative server — only relays holding encrypted blobs and peers holding decrypted state. Easier: the verifiable event log (ADR-011) provides a cryptographic mechanism for state reconciliation — two members can compare Merkle roots and prove exactly where their views diverge. The protocol's minimal state footprint (§10.3) means what needs syncing is small: membership, roles, tokens, tool registrations, governance, and event hashes — not content.
 
-How devices that have been offline (hours to days) rebuild full context state. Conflict resolution for concurrent offline operations. MLS re-sync protocol for long-offline members. Sync strategy for multi-device scenarios.
+This ADR defines the offline/sync strategy across three time horizons (hours, days, weeks), resolves conflict semantics for concurrent offline operations, specifies the MLS epoch catch-up protocol, and defines when and how group state resets occur.
 
-### Blockers
+### Scope
 
-- Phase 1-2 implementation must be complete — need real MLS group behavior data.
-- Phase 2 multi-relay delivery must be tested — offline resilience depends on relay behavior.
-- Need empirical data: typical offline duration distribution, MLS epoch accumulation rates, context state growth rates.
+**What this ADR covers:**
 
-### Known Constraints
+- Client-side message queue for outbound messages during disconnection.
+- Reconnection protocol: relay catch-up, MLS epoch reconciliation, event log sync.
+- Offline duration tiers and the strategy for each (hours, days, weeks).
+- MLS group state reset: trigger conditions, initiation protocol, member lifecycle during reset.
+- Conflict resolution for concurrent offline governance and membership changes.
+- Sender key re-acquisition after missed rotations.
+- Multi-device sync coordination for offline/online transitions.
 
-- Devices are full protocol participants (§10.2), not thin clients.
-- SCP does not require synchronized clocks (§9.8.3).
-- KeyPackages pre-published for offline member addition (§9.6).
-- SDK SHOULD issue MLS Update after reconnecting (§9.12).
-- 30-second gap timeout, 100-message buffer (§9.8.5 reorder buffer spec).
-- Relays provide availability but are untrusted.
+**What this ADR does NOT cover:**
 
-### Open Questions That Block This ADR
+- Content storage and retrieval (app-layer, §10.6).
+- Event log pruning and checkpointing (ADR-030).
+- Multi-admin governance conflict resolution beyond single-admin (ADR-031).
+- Real-time media session recovery (§10.9.1 — media sessions are ephemeral and do not survive disconnection).
 
-- Conflict resolution for concurrent offline governance changes (two admins both offline, both propose role changes).
-- Full state reconstruction semantics after extended offline (what's authoritative vs derivable).
-- Standing bilateral context lifetime vs offline duration (weeks-offline scenario).
-- MLS group state reset: trigger conditions, who initiates, what happens to in-flight messages.
+### Decision
 
-### References
+Implement a three-tier offline/sync strategy in `scp-core/sync/` that classifies offline durations and applies progressively stronger reconciliation mechanisms. The tiers are: **Tier 1 (Short offline, < 4 hours)** using relay buffering and sequential MLS catch-up; **Tier 2 (Extended offline, 4 hours to 7 days)** using state snapshot comparison and delta sync with selective epoch reconstruction; and **Tier 3 (Long offline, > 7 days)** using forced re-join via MLS group state reset. All tiers use the Merkle event log (ADR-011) as the authoritative state reconciliation mechanism and the relay's store-and-forward capability (ADR-004) as the primary message recovery path.
 
-- §10.2 — Device as node design.
-- §9.8.3 — Timestamp model (no synchronized clocks).
-- §9.8.5 — Message gap handling (30s timeout, 100-message buffer).
-- §9.6 — KeyPackage pre-publication for offline members.
-- §9.12 — Compromise recovery (MLS Update after reconnect).
-- `00-open-questions.md` — Offline/sync flagged as uncovered area.
+#### 1. Client-Side Outbound Queue
 
-### Expected Approach Directions (Not Decisions)
+When the SDK detects disconnection (all relay WebSocket connections lost), outbound messages are queued locally rather than dropped.
 
-- **Hours-scale offline:** Relay buffering + MLS catch-up (likely works with current design).
-- **Days-scale offline:** State snapshot + delta sync (needs design).
-- **Weeks-scale offline:** Forced re-join with state reset (needs design).
-- **Conflict resolution:** Last-writer-wins for metadata, Merkle tree for event ordering, governance deadlock = context fork.
+The outbound queue operates as follows:
 
-### Optimal Approach
+- Messages are serialized to their inner envelope form (signed, padded) and stored in `ProtocolStore` under `queue/{context_id}/{seq:020d}`. The inner envelope is fully constructed (including signature and padding) but NOT MLS-encrypted — MLS encryption requires the current epoch's key schedule, which may advance while offline. MLS encryption is applied at drain time using the then-current epoch.
+- The queue is bounded at 1,000 messages per context and 10,000 messages total across all contexts. When full, the oldest messages are dropped with a `QueueOverflow` event emitted to the application layer.
+- Queue entries include a `queued_at` timestamp. On reconnection, entries older than the context's `blob_ttl` (or 7 days if no TTL) are discarded — they would expire on relays before delivery anyway.
+- The queue drains automatically on reconnection, after MLS epoch catch-up completes. Messages are MLS-encrypted with the current epoch's key schedule and sent in queue order.
 
-Implement Phase 1-2, run stress tests with simulated offline scenarios (`NetworkSimulator` from §16.8 with partition topologies). Gather data on MLS epoch accumulation, state divergence patterns, and recovery complexity. Then design the sync protocol from empirical evidence.
+```rust
+pub struct QueuedMessage {
+    pub context_id: ContextId,
+    pub inner_envelope: Vec<u8>,  // Serialized, signed, padded inner envelope
+    pub queued_at: u64,           // Unix timestamp when queued
+    pub sequence: u64,            // Local queue sequence (for ordering)
+}
+
+pub struct OutboundQueue {
+    store: Arc<ProtocolStore>,
+    per_context_limit: usize,     // Default: 1_000
+    total_limit: usize,           // Default: 10_000
+}
+```
+
+#### 2. Reconnection Protocol
+
+On reconnection (at least one relay WebSocket connection re-established), the SDK executes the following ordered protocol:
+
+**Phase 1 — Relay catch-up.** For each active context, re-issue `SUBSCRIBE` with `since` = last received `stored_at` minus 5-second overlap (ADR-004 Connection Recovery). Process all backfilled blobs. Deduplicate by `blob_id` (ADR-012 dedup cache). This recovers all messages that relays retained during the offline period.
+
+**Phase 2 — MLS epoch reconciliation.** For each context, compare the local MLS epoch number against the epoch numbers in received messages. If the local epoch is behind, enter the epoch catch-up procedure (section 3 below). If epochs match, the context is current.
+
+**Phase 3 — Event log sync.** For each context, exchange consistency checkpoints (ADR-011 criterion 8) with online members. Compare Merkle roots. If roots match at the same event count, the logs are consistent. If they diverge, identify the first divergent event and resolve (section 5 below).
+
+**Phase 4 — Sender key re-acquisition.** For each context, check for `SenderKeyEpochAdvance` events received during catch-up. For any sender whose key epoch has advanced beyond the locally cached version, issue `SenderKeyRequest` (ADR-007 criterion 4c) to obtain the current key. Messages encrypted with missed sender key epochs are buffered until the key is obtained or a 60-second timeout expires. After timeout, those messages are marked as `UnrecoverableSenderKey` and the application layer is notified.
+
+**Phase 5 — MLS Update.** After catch-up is complete, the SDK issues an MLS Update proposal in each active context (§9.7.3: "SDK SHOULD issue an Update after re-establishing connectivity following an offline period"). This provides post-compromise security for the reconnecting member.
+
+**Phase 6 — Queue drain.** Drain the outbound queue for each context. Each queued inner envelope is MLS-encrypted with the current epoch's key schedule and sent. If a queued message references a context that no longer exists (closed or expired while offline), the message is discarded with a `ContextGone` notification to the application layer.
+
+#### 3. MLS Epoch Catch-Up (Tier 1 and Tier 2)
+
+MLS requires sequential epoch processing — each Commit depends on the previous epoch's key schedule. An offline member at epoch E who reconnects to find the group at epoch E+N must process all N intermediate Commits in order.
+
+**Commit recovery sources (tried in order):**
+
+1. **Relay backfill.** MLS Commits are sent as MLS `PublicMessage` (Commit messages are not application messages; they are protocol messages delivered via the transport layer). Relays store them like any other blob. If the relay's retention covers the offline period, all Commits are recoverable.
+2. **Peer request.** If relays have expired some Commits (blob_ttl elapsed), the reconnecting member broadcasts a `CommitRangeRequest { context_id, from_epoch, to_epoch }` as an MLS application message (using their current epoch keys — they can still encrypt at their stale epoch). Online members who have persisted the Commit messages respond with the missing Commits. This is a best-effort protocol — members are not required to retain raw Commit messages beyond the MLS grace window.
+3. **Welcome-based fast-forward.** If the epoch gap is too large (> 100 epochs or no member can provide the full Commit chain), the reconnecting member is treated as a new joiner. An online admin (or any member with `MemberInvite` capability) generates a fresh Welcome message for the reconnecting member's pre-published KeyPackage, effectively re-adding them to the group at the current epoch. The member's old leaf node is removed. This is the Tier 2 fallback — it preserves membership and context continuity but the member loses access to messages encrypted in epochs between their stale epoch and the current epoch (forward secrecy is maintained).
+
+**Epoch catch-up limits:**
+
+- The SDK processes at most 100 sequential Commits per catch-up attempt. If more than 100 Commits are pending, the SDK switches to Welcome-based fast-forward.
+- Each Commit is processed within a 5-second timeout. Commits that fail to process (corrupted, missing dependencies) are logged as `EpochCatchUpFailure` and the SDK falls through to the next recovery source.
+- The 100-Commit limit is a practical bound. In a context with 24-hour PCS Update intervals and 10 members, 100 Commits represents roughly 10 days of activity. Contexts with higher churn (frequent joins/leaves) may hit this limit sooner.
+
+```rust
+pub struct EpochCatchUpState {
+    pub context_id: ContextId,
+    pub local_epoch: u64,
+    pub target_epoch: u64,
+    pub commits_processed: u64,
+    pub status: CatchUpStatus,
+}
+
+pub enum CatchUpStatus {
+    /// Sequential Commit processing in progress.
+    Processing,
+    /// All epochs caught up successfully.
+    Complete,
+    /// Fell back to Welcome-based fast-forward.
+    FastForwarded { skipped_from: u64, skipped_to: u64 },
+    /// Catch-up failed — context may need group reset.
+    Failed { reason: String },
+}
+
+pub struct CommitRangeRequest {
+    pub context_id: ContextId,
+    pub from_epoch: u64,
+    pub to_epoch: u64,
+    pub requester_did: DID,
+    pub signature: Ed25519Signature,
+}
+
+pub struct CommitRangeResponse {
+    pub context_id: ContextId,
+    pub commits: Vec<Vec<u8>>,  // Serialized MLS Commit messages, in epoch order
+    pub responder_did: DID,
+    pub signature: Ed25519Signature,
+}
+```
+
+#### 4. MLS Group State Reset (Tier 3)
+
+When a member has been offline for more than 7 days, or when the epoch catch-up procedure fails (no recovery source can provide the Commit chain and no member can generate a Welcome), the member triggers a group state reset for their participation.
+
+**Group state reset is NOT a group-wide operation.** It affects only the offline member's participation. The group continues operating normally. The reset is equivalent to: the offline member leaves and immediately re-joins.
+
+**Trigger conditions (any one triggers reset):**
+
+1. Offline duration exceeds 7 days (measured from last successful relay interaction timestamp, persisted in `ProtocolStore`).
+2. Epoch catch-up fails: relay backfill, peer request, and Welcome-based fast-forward all failed.
+3. The context's governance model explicitly requests reset (future: ADR-031 governance action).
+
+**Reset protocol:**
+
+1. The reconnecting member publishes a `ResetRequest { context_id, member_did, last_known_epoch, reason, signature }` via the relay (not MLS-encrypted — the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key for authentication.
+2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
+3. The reconnecting member processes the Welcome, joining the group at the current epoch. They request sender keys for all current members via the pull-based protocol (ADR-007 criterion 4c).
+4. The reconnecting member's outbound queue is drained using the new epoch's key schedule.
+5. A `MemberReset` event (distinct from `MemberLeft` + `MemberJoined`) is appended to the event log, recording the reset reason, old epoch, new epoch, and the admin who processed it.
+
+**What the reset member loses:**
+
+- Access to messages encrypted in epochs between their last known epoch and the current epoch. Forward secrecy is preserved — old epoch keys were destroyed per ADR-001 criterion 6.
+- Any pending governance proposals they initiated while offline (proposals reference specific epochs).
+- Queue entries that reference the old epoch (re-queued messages are re-encrypted with the new epoch).
+
+**What the reset member retains:**
+
+- Their DID and identity.
+- Their role in the context (the admin re-assigns the same role during re-add).
+- Their event log history up to the last known epoch.
+- Context metadata (params, tools, ceiling) — this is public and queryable via the metadata routing ID (ADR-004).
+
+```rust
+pub struct ResetRequest {
+    pub context_id: ContextId,
+    pub member_did: DID,
+    pub last_known_epoch: u64,
+    pub reason: ResetReason,
+    pub timestamp: u64,
+    pub signature: Ed25519Signature,
+}
+
+pub enum ResetReason {
+    /// Offline duration exceeded the 7-day threshold.
+    ExtendedOffline { offline_duration_secs: u64 },
+    /// Epoch catch-up failed after exhausting all recovery sources.
+    CatchUpFailed { attempted_sources: Vec<String> },
+    /// Governance-initiated reset.
+    GovernanceAction { proposal_id: String },
+}
+```
+
+#### 5. Conflict Resolution
+
+Concurrent offline operations create conflicts when two or more members make incompatible changes while unable to observe each other's actions. SCP resolves conflicts using three principles: (a) the Merkle event log order is authoritative (§9.14), (b) MLS epoch boundaries are synchronization points (§9.8.3), and (c) governance actions are serialized through the admin role (Phase 2 single-admin model).
+
+**Conflict categories and resolution:**
+
+**5a. Concurrent messages (no conflict).** Messages from different senders in the same epoch are ordered by `(epoch, sender_generation_number, timestamp)` per §9.8.3. Messages queued while offline receive fresh sequence numbers at drain time. No conflict — messages are independent.
+
+**5b. Concurrent membership changes.** MLS serializes membership changes through Commits. Only one Commit can advance the epoch. If two members propose Add/Remove simultaneously, the first Commit to be processed wins; the second proposal becomes invalid (it references a stale epoch) and must be re-proposed. The reconnecting member detects this during epoch catch-up and re-issues any stale proposals.
+
+**5c. Concurrent governance changes.** In Phase 2 (single-admin), governance changes are serialized through the admin. If the admin is offline, no governance changes can occur — this is by design. If a non-admin proposes a governance action while the admin is offline, the proposal is queued in the event log and processed when the admin reconnects. There is no conflict because governance is single-threaded.
+
+For future multi-admin governance (ADR-031): if two admins both offline propose conflicting role changes, the conflict is resolved by Merkle log order — the first proposal to be committed to the log wins. The second admin's proposal is rejected as conflicting and must be re-proposed with awareness of the first. If both proposals are committed simultaneously (same event log sequence), the protocol treats this as a log fork — equivocation detection (§9.9.3) fires and the context enters a `GovernanceConflict` state requiring manual resolution by an admin with sufficient capability. This is the "governance deadlock = context fork" outcome from the stub — but formalized: the context is not forked automatically. Instead, it is frozen (no new governance actions) until an admin resolves the conflict.
+
+**5d. Concurrent sender key rotations.** If a sender rotates their key while a peer is offline, the peer requests the new key on reconnection (Phase 4 of the reconnection protocol). If the sender rotated multiple times, only the current key is needed — intermediate keys are irrelevant (messages encrypted with intermediate keys during the offline period are recovered via relay backfill before the sender key was rotated, or are unrecoverable if the relay expired them).
+
+**5e. Context closure or expiry during offline.** If a context was closed or expired while the member was offline, the reconnecting member discovers this during relay catch-up (the `ContextClosing`, `ContextClosed`, or `ContextExpired` events are in the backfill). The member processes the closure locally, destroys key material per the context's memory scope, and discards any queued messages for that context.
+
+#### 6. Event Log Reconciliation
+
+The Merkle event log (ADR-011) is the authoritative state record. After relay catch-up and epoch reconciliation, the SDK verifies event log consistency:
+
+1. **Exchange checkpoints.** The reconnecting member generates a `ConsistencyCheckpoint` (ADR-011 criterion 8) from their local log state and sends it to the context. Online members compare and respond with their own checkpoints.
+2. **Compare Merkle roots.** If roots match at the same event count, the logs are consistent — no further action.
+3. **Behind.** If the reconnecting member's event count is less than the group's (the expected case after offline), the member requests the missing events via `CommitRangeRequest`-style event range requests. Events are verified by recomputing the Merkle path from each event to the known root.
+4. **Divergent.** If Merkle roots differ at the same event count, equivocation has occurred (a relay showed different histories to different members, per §9.9.3). The reconnecting member raises a `EquivocationDetected` alert. Resolution follows the relay consistency protocol: identify the divergent relay, flag it in reliability scoring (ADR-012), and prefer the event chain signed by more members.
+
+```rust
+pub struct EventSyncRequest {
+    pub context_id: ContextId,
+    pub local_event_count: u64,
+    pub local_merkle_root: [u8; 32],
+    pub requester_did: DID,
+    pub signature: Ed25519Signature,
+}
+
+pub struct EventSyncResponse {
+    pub context_id: ContextId,
+    pub remote_event_count: u64,
+    pub remote_merkle_root: [u8; 32],
+    pub events: Option<Vec<Event>>,  // Missing events if requester is behind
+    pub responder_did: DID,
+    pub signature: Ed25519Signature,
+}
+```
+
+#### 7. Multi-Device Coordination
+
+Multi-device sync during offline/online transitions follows the principle from §10.8: "the protocol delivers the same encrypted envelopes to all devices; the client decides how to present them."
+
+Each device independently runs the reconnection protocol. There is no device-to-device coordination at the protocol level. However, the SDK provides hooks for client-layer coordination:
+
+- **Reconnection deduplication.** If multiple devices reconnect simultaneously and all issue MLS Updates, the resulting epoch churn is harmless but wasteful. The SDK emits a `ReconnectionStarted { device_id, context_id }` event to the identity's private state log (§3.7, encrypted, synced across devices). Devices observing another device's reconnection event within a 30-second window defer their own MLS Update to avoid redundant epoch advances.
+- **Queue deduplication.** Each queued message includes a content-addressable hash (`payload_hash` from ADR-002). If multiple devices queued the same message (e.g., user typed a message on phone, then opened laptop), the first device to drain delivers the message; the second device recognizes the duplicate `payload_hash` in the event log and discards the queued copy.
+
+### Rationale
+
+**Why three tiers instead of one unified strategy:**
+
+The core tension is between simplicity and correctness. A single strategy that handles all offline durations either (a) is too conservative (always resets, losing message history even for short disconnections) or (b) is too optimistic (always tries sequential catch-up, hanging indefinitely when hundreds of epochs have passed). The three-tier approach matches the strategy to the problem scale:
+
+- Tier 1 (< 4 hours) handles the common case — mobile devices sleeping, brief network outages, moving between WiFi and cellular. This is 95%+ of offline events. Relay buffering covers it with zero special handling beyond the existing connection recovery protocol (ADR-004).
+- Tier 2 (4 hours to 7 days) handles the uncommon but important case — devices left offline overnight, travel without connectivity, hardware issues. Welcome-based fast-forward provides a clean recovery at the cost of losing access to messages encrypted in the skipped epoch range. This is an acceptable trade-off: the messages exist in the relay (if not expired) but cannot be decrypted due to forward secrecy. The member is informed of the gap.
+- Tier 3 (> 7 days) handles the rare but catastrophic case — extended disconnection where relays have expired all buffered messages and no peer can reconstruct the Commit chain. Group state reset is the only option. This is the "hardest problem" case, and the answer is: treat it as a re-join, preserving identity and role but accepting the gap.
+
+**Why 100-epoch catch-up limit:**
+
+Sequential Commit processing is O(N) in the number of missed epochs. Each Commit requires tree ratcheting (MLS tree-based key management). At 100 Commits, this is several seconds of processing on mobile hardware. Beyond 100, the user experience degrades unacceptably, and the probability of encountering a corrupted or missing Commit in the chain increases. The Welcome-based fast-forward is O(1) — processing a single Welcome message regardless of how many epochs were missed.
+
+**Why group reset is per-member, not group-wide:**
+
+A group-wide reset would destroy all members' current key material and force everyone to re-establish. This is catastrophic for a group where only one member went offline. Per-member reset (leave + re-join) affects only the offline member's key state while the rest of the group continues uninterrupted.
+
+**Why queued messages are not MLS-encrypted until drain:**
+
+The MLS epoch may advance while the member is offline. Encrypting at queue time would bind the message to a stale epoch, making it undecryptable by members who have advanced. By deferring MLS encryption to drain time, queued messages are encrypted with the current (post-catch-up) epoch, ensuring all current members can decrypt them.
+
+**Conflict resolution — why Merkle log order is authoritative:**
+
+The alternative approaches (vector clocks, CRDTs, consensus protocols) all add complexity that SCP's architecture does not need. SCP's event log already provides a total order via the hash chain. The single-admin governance model (Phase 2) eliminates most governance conflicts by construction. The remaining conflicts (concurrent membership proposals) are resolved by MLS's natural serialization through Commits. Merkle log order is the tie-breaker because it is already the system of record — no new mechanism is needed.
+
+### Implementation
+
+- **Language:** Rust
+- **Async runtime:** tokio (reconnection timers, concurrent relay catch-up, queue drain)
+- **Crate:** `scp-core`
+- **Module:** `scp-core/sync/`
+- **Persistence:** Via `ProtocolStore` (§17.4) for queue state, last-seen timestamps, and catch-up progress. Key conventions:
+  - `queue/{context_id}/{seq:020d}` — queued outbound messages
+  - `sync/{context_id}/last_relay_contact` — last successful relay interaction timestamp
+  - `sync/{context_id}/catch_up_state` — in-progress catch-up state (survives process restart)
+
+### Dependencies
+
+- **ADR-001 (MLS):** MLS epoch processing, Commit handling, Welcome message processing, Update proposal generation. The epoch catch-up and group reset protocols are built directly on MLS group operations.
+- **ADR-004 (Native Relay):** Relay `SUBSCRIBE` with `since` parameter for backfill. Relay blob TTL determines the maximum Tier 1 offline duration. Connection recovery with exponential backoff (1s to 30s cap).
+- **ADR-007 (Sender Keys):** Sender key re-acquisition via pull-based protocol after missed `SenderKeyEpochAdvance` events.
+- **ADR-008 (Context Lifecycle):** Context state machine determines valid operations during catch-up. Context closure/expiry events discovered during reconnection trigger local cleanup.
+- **ADR-011 (Event Log):** Merkle tree consistency checkpoints for state reconciliation. Inclusion proofs for verifying recovered events. Event log as authoritative ordering for conflict resolution.
+- **ADR-012 (Multi-Transport):** Multi-relay subscription recovery. Relay reliability scoring — degraded relays that failed to retain messages during offline period are penalized.
+- **ProtocolStore (§17.4):** Queue persistence, sync state persistence, event log range queries for catch-up.
+
+### Acceptance Criteria
+
+1. **`OutboundQueue` struct and operations:**
+
+```rust
+pub struct OutboundQueue {
+    store: Arc<ProtocolStore>,
+    per_context_limit: usize,
+    total_limit: usize,
+}
+
+impl OutboundQueue {
+    pub fn new(store: Arc<ProtocolStore>) -> Self;
+    pub async fn enqueue(&self, msg: QueuedMessage) -> Result<(), QueueError>;
+    pub async fn drain(&self, context_id: &ContextId, mls_group: &mut MlsGroup) -> Result<Vec<OuterEnvelope>, QueueError>;
+    pub async fn discard_expired(&self, context_id: &ContextId, max_age_secs: u64) -> Result<u64, QueueError>;
+    pub async fn discard_context(&self, context_id: &ContextId) -> Result<u64, QueueError>;
+    pub async fn queue_depth(&self, context_id: &ContextId) -> Result<u64, QueueError>;
+    pub async fn total_depth(&self) -> Result<u64, QueueError>;
+}
+```
+
+   - `enqueue` stores a `QueuedMessage` in `ProtocolStore`. Returns `QueueError::ContextFull` or `QueueError::TotalFull` if limits are reached (oldest messages dropped).
+   - `drain` MLS-encrypts each queued message with the current epoch and returns sealed outer envelopes ready for transport. Drains in queue order. Removes drained entries from storage.
+   - `discard_expired` removes entries older than `max_age_secs`. Returns count discarded.
+   - `discard_context` removes all entries for a context (used on context closure/expiry). Returns count discarded.
+
+2. **`ReconnectionCoordinator` struct:**
+
+```rust
+pub struct ReconnectionCoordinator {
+    context_manager: Arc<ContextManager>,
+    transport_manager: Arc<TransportManager>,
+    queue: Arc<OutboundQueue>,
+    store: Arc<ProtocolStore>,
+}
+
+impl ReconnectionCoordinator {
+    pub async fn on_reconnect(&self) -> ReconnectionReport;
+}
+
+pub struct ReconnectionReport {
+    pub contexts_synced: Vec<ContextSyncResult>,
+    pub messages_drained: u64,
+    pub messages_discarded: u64,
+    pub total_duration_ms: u64,
+}
+
+pub struct ContextSyncResult {
+    pub context_id: ContextId,
+    pub tier: OfflineTier,
+    pub epochs_caught_up: u64,
+    pub events_recovered: u64,
+    pub messages_unrecoverable: u64,
+    pub outcome: SyncOutcome,
+}
+
+pub enum OfflineTier {
+    Short,     // < 4 hours
+    Extended,  // 4 hours to 7 days
+    Long,      // > 7 days
+}
+
+pub enum SyncOutcome {
+    FullyCaughtUp,
+    FastForwarded { skipped_epochs: u64 },
+    Reset,
+    ContextGone,  // Context was closed/expired while offline
+    Failed { reason: String },
+}
+```
+
+   - `on_reconnect` executes the six-phase reconnection protocol for all active contexts. Returns a report detailing per-context sync results.
+   - Each context is synced concurrently (tokio tasks), with a 120-second overall timeout. Contexts that timeout are marked as `Failed`.
+
+3. **`epoch_catch_up(context_id, local_epoch, target_epoch) -> Result<CatchUpStatus, SyncError>`**
+
+   - Implements the three-source epoch catch-up: relay backfill, peer request, Welcome-based fast-forward.
+   - Processes at most 100 sequential Commits with 5-second per-Commit timeout.
+   - Falls back to Welcome-based fast-forward if sequential processing fails or the gap exceeds 100 epochs.
+   - Returns `CatchUpStatus` indicating the outcome.
+
+4. **`request_group_reset(context_id, reason) -> Result<(), SyncError>`**
+
+   - Publishes a `ResetRequest` to the relay.
+   - Waits for a Welcome message (60-second timeout).
+   - On receipt, processes the Welcome, re-acquires sender keys, drains the queue.
+   - Appends `MemberReset` event to the local event log.
+
+5. **`sync_event_log(context_id) -> Result<EventSyncResult, SyncError>`**
+
+   - Exchanges `ConsistencyCheckpoint` with online members.
+   - Requests missing events if behind.
+   - Verifies each recovered event against the Merkle tree.
+   - Raises `EquivocationDetected` if Merkle roots diverge at the same event count.
+
+6. **Offline tier classification:**
+
+```rust
+pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTier {
+    let duration_secs = now.saturating_sub(last_relay_contact);
+    match duration_secs {
+        0..=14_400 => OfflineTier::Short,          // < 4 hours
+        14_401..=604_800 => OfflineTier::Extended,  // 4 hours to 7 days
+        _ => OfflineTier::Long,                     // > 7 days
+    }
+}
+```
+
+7. **Event types added to `EventType` enum (ADR-011):**
+
+```rust
+// Additions to EventType in scp-core/event_log/
+MemberReset {
+    member_did: DID,
+    old_epoch: u64,
+    new_epoch: u64,
+    reason: ResetReason,
+    processed_by: DID,
+},
+QueueDrained {
+    member_did: DID,
+    message_count: u64,
+    discarded_count: u64,
+},
+```
+
+8. **Integration test (exercises all tiers):**
+
+```
+1. Alice and Bob create identities and a context (ADR-008).
+2. Alice and Bob exchange messages (verify baseline).
+
+--- Tier 1 test ---
+3. Bob goes offline (transport disconnected).
+4. Alice sends 5 messages while Bob is offline.
+5. Bob reconnects. Relay backfill delivers all 5 messages.
+   Bob processes MLS catch-up (if any epoch advanced). Bob's event log syncs.
+
+--- Tier 2 test ---
+6. Bob goes offline again. Simulate 50 epoch advances (members joining/leaving/updating).
+7. Bob reconnects. Sequential catch-up processes all 50 Commits.
+   Bob's event log catches up. Bob drains any queued messages.
+
+8. Bob goes offline again. Simulate 150 epoch advances (exceeds 100-Commit limit).
+9. Bob reconnects. Sequential catch-up processes first 100, then falls back to
+   Welcome-based fast-forward. Bob re-joins at current epoch.
+   Bob's event log records the fast-forward gap.
+
+--- Tier 3 test ---
+10. Bob goes offline. Simulate relay expiry of all buffered messages (TTL elapsed)
+    AND epoch gap > 100 AND no peer can provide Commits.
+11. Bob reconnects. Tier classification = Long. Bob issues ResetRequest.
+    Alice (admin) processes reset: removes Bob, re-adds Bob with fresh Welcome.
+    Bob joins at current epoch, re-acquires sender keys, drains queue.
+    Event log records MemberReset.
+
+--- Conflict resolution test ---
+12. Bob and Alice both go offline simultaneously.
+13. Both queue governance-irrelevant messages.
+14. Both reconnect. Both drain queues. Messages interleave by timestamp.
+    No conflict — messages from different senders are independent.
+
+--- Context closure while offline ---
+15. Bob goes offline. Alice closes the context.
+16. Bob reconnects. Relay backfill contains ContextClosing + ContextClosed events.
+    Bob processes closure, discards queued messages for that context, destroys keys.
+```
+
+### Scope
+
+**Files (~5-7):**
+
+| File | Purpose |
+|------|---------|
+| `mod.rs` | Module root, `OfflineTier`, tier classification, re-exports |
+| `queue.rs` | `OutboundQueue`, `QueuedMessage`, queue persistence, drain logic |
+| `reconnect.rs` | `ReconnectionCoordinator`, six-phase reconnection protocol, `ReconnectionReport` |
+| `epoch_catch_up.rs` | `EpochCatchUpState`, three-source catch-up, `CommitRangeRequest`/`Response`, Welcome-based fast-forward |
+| `reset.rs` | `ResetRequest`, `ResetReason`, group state reset protocol, `MemberReset` event |
+| `event_sync.rs` | `EventSyncRequest`/`Response`, Merkle root comparison, event range recovery, equivocation detection |
+| `conflict.rs` | Conflict classification, resolution strategies, governance conflict handling |
+
+**Estimated functions:** ~20-25 public functions, ~15-20 internal helpers.
 
 ---
 
 ## ADR-030: Event Log Pruning and Checkpointing
 
-**Status:** Pending
+**Status:** Decided
 
-### What This ADR Will Decide
+### Context
 
-How append-only Merkle event logs (ADR-011) manage unbounded growth. Checkpoint strategy, pruning rules, proof compaction, and availability requirements for historical events.
+Every SCP context maintains an append-only Merkle event log (ADR-011) that records all protocol events — membership changes, governance actions, tool invocations, messages, role assignments, block notifications, and consistency checkpoints. The log is the foundation for behavioral validation (§7.3.1), equivocation detection (§9.9.3), and the trust model's Layer 2 (verifiable behavioral records, §7.3.2). Its append-only structure is what makes claims about context history verifiable rather than trust-dependent.
 
-### Blockers
+The problem is that event logs grow without bound. A long-lived context with active participants accumulates millions of events. Each event is a leaf in the Merkle tree, with interior nodes stored for proof generation (ADR-011, key convention: `context/{context_id}/event/{seq:020d}` for events, `context/{context_id}/event_tree/{level}/{index}` for tree nodes — §17.3). On mobile devices with constrained storage, maintaining full history for every active context is unsustainable. A context with 1 million events at ~200 bytes per event plus Merkle tree overhead consumes hundreds of megabytes for a single context.
 
-- Phase 2 event log implementation must be running with real contexts.
-- Need empirical data: typical event log growth rates per context type, device storage constraints, proof verification frequency.
+The core tension is that pruning contradicts the append-only property that makes the log verifiable. Deleting old events means their content cannot be independently re-verified. The protocol must balance verifiability (full history provable) with storage reality (unbounded growth is not viable on resource-constrained clients). The solution is checkpointing: periodically capturing a signed snapshot of the full context state anchored to a specific Merkle root, then pruning events behind the checkpoint while retaining enough Merkle tree structure to prove that pruned events were once part of the log.
 
-### The Core Tension
+### Scope
 
-Event logs are verifiable because they're append-only. Pruning breaks append-only. The protocol must balance verifiability (full history provable) with storage (unbounded growth unsustainable on mobile devices).
+**What this ADR covers:**
 
-### Known Constraints
+- Pruning strategies: time-based, size-based, and event-type-based criteria for removing old events from local storage.
+- Checkpoint creation: full context state snapshots anchored to a Merkle root at a specific sequence number.
+- State reconstruction: loading a checkpoint and replaying post-checkpoint events to recover current state.
+- Merkle proof interaction: how pruning affects proof validity and how "pruned proofs" work.
+- Governance of pruning policies: how contexts configure and enforce pruning rules.
+- Storage key management: how pruning interacts with the `ProtocolStore` key convention (§17.3).
 
-- Protocol state footprint is deliberately minimal (§10.3): membership, roles, tokens, tool registrations, governance, content hashes — NOT content itself.
-- Event logs are per-context Merkle trees with SHA-256 hash chain (ADR-011).
-- Must support inclusion proofs and consistency verification.
-- Behavioral validation (§7.3.1) depends on verifiable event logs.
+**What this ADR does NOT cover:**
 
-### Design Space (Not Decisions)
+- Offline/sync strategy for reconnecting members (ADR-029).
+- Multi-admin governance models (ADR-031).
+- Content storage and retrieval (app-layer, §10.6 — event logs store protocol events and content hashes, not content itself).
+- Relay-side storage management (relays manage blob TTL independently per ADR-004).
 
-1. **Full log forever** — simplest, unbounded storage.
-2. **Periodic checkpoints** (Merkle root snapshots) + pruned older entries — compresses, complicates proof verification.
-3. **Distributed log shards** — scales, adds availability complexity.
-4. **Tiered storage:** hot (recent, on-device) + cold (old, relay-hosted, proof-fetchable).
+### Decision
 
-### References
+Implement a checkpoint-and-prune system in `scp-core/event_log/` that creates signed state snapshots at configurable intervals and allows pruning of events behind checkpoints according to per-context policy. Pruning removes event payloads and optionally Merkle tree leaf data from local storage, but retains the Merkle tree's interior nodes so that inclusion proofs for pruned events remain verifiable against the checkpoint's Merkle root. The pruning policy is a context parameter set at creation or modified via governance, with a protocol-enforced minimum retention period of 30 days.
 
-- ADR-011 — Event log design (append-only, Merkle tree, entry structure).
-- §10.3 — Protocol state footprint.
-- §7.3.1 — Verifiable event logs (behavioral validation depends on them).
-- §17.4 — ProtocolStore event log key convention (zero-padded sequences).
+#### 1. Checkpoint Structure
 
-### Optimal Approach
+A checkpoint captures the complete, deterministic context state at a specific event log sequence number. Checkpoints are published to the event log as a special `Checkpoint` event type so that all members observe and can verify them.
 
-Implement Phase 2 event logs. Monitor growth rates in test scenarios. Profile proof generation/verification cost. Then design checkpointing with concrete numbers.
+```rust
+pub struct Checkpoint {
+    /// The context this checkpoint belongs to.
+    pub context_id: ContextId,
+    /// The event log sequence number this checkpoint covers (inclusive).
+    /// All events from 0 through checkpoint_seq are summarized.
+    pub checkpoint_seq: u64,
+    /// The Merkle root of the event log at checkpoint_seq.
+    pub merkle_root: [u8; 32],
+    /// The total number of events in the log at checkpoint time.
+    pub event_count: u64,
+    /// The hash of the last event at checkpoint_seq (hash chain tip).
+    pub last_event_hash: [u8; 32],
+    /// Full context state snapshot — deterministically serialized.
+    pub state_snapshot: ContextStateSnapshot,
+    /// DID of the checkpoint creator.
+    pub creator_did: DID,
+    /// Unix timestamp of checkpoint creation.
+    pub created_at: u64,
+    /// Ed25519 signature over SHA-256(context_id || checkpoint_seq ||
+    /// merkle_root || event_count || last_event_hash ||
+    /// SHA-256(serialize(state_snapshot)) || created_at).
+    pub signature: Ed25519Signature,
+    /// Optional governance quorum signatures (for multi-admin contexts, ADR-031).
+    /// In single-admin contexts, this is empty and creator_did must be the admin.
+    pub cosignatures: Vec<CosignedCheckpoint>,
+}
+
+pub struct CosignedCheckpoint {
+    pub signer_did: DID,
+    pub signature: Ed25519Signature,
+}
+
+pub struct ContextStateSnapshot {
+    /// Current membership: DID -> role mapping.
+    pub membership: Vec<(DID, RoleName)>,
+    /// Current capability ceiling.
+    pub capability_ceiling: Vec<Capability>,
+    /// Ceiling policy (locked, governed, admin-only).
+    pub ceiling_policy: CeilingPolicy,
+    /// Governance model identifier and configuration.
+    pub governance: GovernanceConfig,
+    /// Memory scope.
+    pub memory_scope: MemoryScope,
+    /// TTL remaining (None if no TTL or if persistent).
+    pub ttl_remaining_secs: Option<u64>,
+    /// Registered tools.
+    pub tools: Vec<ToolRegistration>,
+    /// Active sender key epochs per member.
+    pub sender_key_epochs: Vec<(DID, u64)>,
+    /// Current MLS epoch (None for Broadcast contexts).
+    pub mls_epoch: Option<u64>,
+    /// Active block relationships: (blocker, blocked).
+    pub blocks: Vec<(DID, DID)>,
+    /// Context mode (Encrypted or Broadcast).
+    pub context_mode: ContextMode,
+    /// Parent context IDs (empty for root contexts).
+    pub parent_context_ids: Vec<ContextId>,
+    /// Active UCAN revocations.
+    pub ucan_revocations: Vec<String>,
+}
+```
+
+**Checkpoint creation rules:**
+
+- In single-admin contexts (Phase 2 governance), only the admin can create checkpoints. The checkpoint is signed by the admin's Active Signing Key.
+- In multi-admin contexts (ADR-031), checkpoints require signatures from a governance quorum (e.g., M-of-N admins). The `cosignatures` field carries additional signer attestations.
+- Members receiving a checkpoint verify the signature(s) against known admin DID(s), then verify that the `merkle_root` matches their local Merkle root at `checkpoint_seq`. If it matches, the checkpoint is trusted. If it diverges, the member raises an equivocation alert (same mechanism as §9.9.3 consistency checkpoint divergence).
+- The `state_snapshot` is deterministically serialized (sorted keys, canonical MessagePack encoding) so that any member can independently compute `SHA-256(serialize(state_snapshot))` and verify the signature covers the correct state.
+
+#### 2. Pruning Strategies
+
+Pruning removes event data from local storage to reclaim space. Three pruning strategies are supported, and they compose: a context's pruning policy can combine multiple strategies with OR semantics (prune when any condition is met).
+
+**2a. Time-based pruning.** Prune events older than a configured duration. Events with `timestamp` older than `now - retention_duration` are eligible for pruning, provided they are behind a valid checkpoint.
+
+```rust
+pub struct TimeBasedPolicy {
+    /// Minimum age before an event becomes prunable.
+    /// Protocol minimum: 30 days (2_592_000 seconds). Contexts may set higher.
+    pub retention_secs: u64,
+}
+```
+
+**2b. Size-based pruning.** Prune when the event log exceeds a configured size. The oldest events behind a valid checkpoint are pruned first until the log is within bounds.
+
+```rust
+pub struct SizeBasedPolicy {
+    /// Maximum number of events to retain locally. When exceeded,
+    /// oldest events behind a checkpoint are pruned.
+    pub max_event_count: u64,
+    /// Maximum total storage bytes for event log data (events + tree nodes).
+    /// When exceeded, oldest events behind a checkpoint are pruned.
+    pub max_storage_bytes: u64,
+}
+```
+
+**2c. Event-type-based retention tiers.** Different event types have different retention priorities. Governance and membership events are retained longer than message events because they define the context's structural evolution and are essential for state reconstruction verification.
+
+```rust
+pub struct EventTypeRetention {
+    /// Governance and structural events: ContextCreated, MemberJoined, MemberLeft,
+    /// RoleAssigned, GovernanceAction, ContextClosing, ContextClosed, ContextExpired,
+    /// MemberBlocked, Checkpoint.
+    /// These are retained for the full retention period (or indefinitely if no
+    /// time-based policy).
+    pub structural_retention_multiplier: f64,  // Default: 3.0x the base retention
+
+    /// Operational events: MessageSent, ToolInvoked, ToolVerified,
+    /// ConsistencyCheckpoint, KeyEpochAdvance, AbsenceProofRequested.
+    /// These are retained for the base retention period.
+    pub operational_retention_multiplier: f64,  // Default: 1.0x
+}
+```
+
+Event-type retention interacts with time-based pruning: the effective retention for a structural event is `retention_secs * structural_retention_multiplier`. A context with a 30-day base retention and a 3.0x structural multiplier retains governance events for 90 days while message events are prunable after 30 days.
+
+**Pruning invariants (enforced mechanically):**
+
+1. Events are never pruned unless they are behind a valid, locally-verified checkpoint. No checkpoint = no pruning.
+2. The protocol-enforced minimum retention period is 30 days. A context cannot configure a retention shorter than 30 days. This ensures behavioral validation (§7.3.1) has sufficient history for meaningful evaluation.
+3. Pruning never removes checkpoint events themselves. Checkpoints are retained indefinitely (they are small and serve as trust anchors).
+4. Pruning is always local. A member's decision to prune does not affect other members' logs. Members who need full history can retain it regardless of the context's pruning policy.
+5. The hash chain is preserved: even when event payloads are pruned, the `prev_hash` chain continuity is maintained through retained leaf hashes.
+
+#### 3. Checkpoint Scheduling
+
+Checkpoints are created at configurable intervals, balancing proof compaction benefit against checkpoint creation cost.
+
+```rust
+pub struct CheckpointPolicy {
+    /// Create a checkpoint every N events. Default: 10_000.
+    pub event_interval: u64,
+    /// Create a checkpoint every N seconds. Default: 86_400 (24 hours).
+    pub time_interval_secs: u64,
+    /// Minimum events since last checkpoint before a new one is created.
+    /// Prevents checkpoint spam in low-activity contexts. Default: 100.
+    pub min_events_since_last: u64,
+}
+```
+
+Checkpoint creation is triggered by the context admin's SDK when either the event interval or time interval is reached, provided the minimum event threshold since the last checkpoint is met. For low-activity contexts (fewer than 100 events per day), checkpoints are created at the time interval even if the event threshold is not met — the time interval serves as an upper bound on checkpoint staleness.
+
+When a checkpoint is created, it is appended to the event log as a `Checkpoint` event type (extending the `EventType` enum from ADR-011). This ensures all members receive and can verify the checkpoint through normal event log synchronization.
+
+#### 4. Merkle Proof Interaction
+
+Pruning event payloads does not invalidate inclusion proofs for pruned events, provided the Merkle tree's interior nodes are retained. This is the key insight that makes pruning compatible with verifiability.
+
+**4a. Proof layers after pruning:**
+
+The Merkle tree (ADR-011) has three layers of data:
+
+1. **Event payloads** — the serialized `Event` structs. These are what pruning removes.
+2. **Leaf hashes** — `SHA-256(serialize(event))` for each event. These are 32 bytes each and are retained after pruning.
+3. **Interior nodes** — hash pairs at each tree level. These are retained after pruning.
+
+After pruning, the leaf hashes and interior nodes remain. An inclusion proof for a pruned event still works: the verifier provides the event's leaf hash (which the prover retains), and the proof path through interior nodes to the root is unchanged.
+
+**What is lost after pruning:** The ability to independently recompute the leaf hash from the event payload. A verifier who never saw the original event cannot verify that a claimed leaf hash corresponds to a specific event. They can only verify that *some* event with that leaf hash was included in the log at that position.
+
+**4b. Pruned proofs:**
+
+A "pruned proof" proves that an event was included in the log at a specific position, verified against a checkpoint's Merkle root rather than the current root.
+
+```rust
+pub struct PrunedInclusionProof {
+    /// The leaf hash of the pruned event.
+    pub leaf_hash: [u8; 32],
+    /// The leaf index in the log.
+    pub leaf_index: u64,
+    /// Standard Merkle inclusion proof path (sibling hashes + directions).
+    pub path: Vec<ProofStep>,
+    /// The checkpoint Merkle root this proof verifies against.
+    pub checkpoint_root: [u8; 32],
+    /// The checkpoint sequence number.
+    pub checkpoint_seq: u64,
+}
+```
+
+Verification: recompute the root from `leaf_hash` and `path`. If the computed root equals `checkpoint_root`, and the checkpoint itself is trusted (signature verified), then the event was in the log at `leaf_index` as of `checkpoint_seq`.
+
+**4c. Full proof chains:**
+
+For events that span a checkpoint boundary (some events before the checkpoint, some after), a full proof chain combines a pruned proof (against the checkpoint root) with a standard inclusion proof (against the current root) and the checkpoint event's own inclusion proof linking the two roots.
+
+```rust
+pub struct FullProofChain {
+    /// Proof of the event against the checkpoint's Merkle root.
+    pub pruned_proof: PrunedInclusionProof,
+    /// Proof that the checkpoint event itself is in the current log.
+    pub checkpoint_inclusion: InclusionProof,
+    /// The checkpoint (contains the Merkle root used by pruned_proof).
+    pub checkpoint: Checkpoint,
+}
+```
+
+Verification steps:
+1. Verify `checkpoint.signature` against the checkpoint creator's DID.
+2. Verify `checkpoint_inclusion` — the checkpoint event is in the current log.
+3. Verify `pruned_proof.checkpoint_root == checkpoint.merkle_root`.
+4. Verify `pruned_proof` — the target event was in the log at `checkpoint_seq`.
+
+This three-step chain provides the same assurance as a direct inclusion proof: the event was part of the log's history, the checkpoint is authentic, and the checkpoint is itself part of the current log.
+
+**4d. Interior node retention strategy:**
+
+After pruning, interior nodes from the Merkle tree are compacted. For a pruned region of the tree (all leaves behind a checkpoint), only the nodes on proof paths that connect to the checkpoint root need to be retained. In practice, the simplest strategy is to retain all interior nodes — at 32 bytes per node and O(n) total nodes for n leaves, the overhead is modest compared to event payloads. For a log with 1 million events, interior nodes consume approximately 64 MB (2n nodes * 32 bytes). If this proves excessive on mobile, a future optimization can prune interior nodes whose subtrees are entirely behind two consecutive checkpoints, retaining only the subtree roots.
+
+Storage key convention for checkpoint-related data (extending §17.3):
+
+```
+context/{context_id}/checkpoint/{seq:020d}           -- checkpoint data
+context/{context_id}/checkpoint_meta/latest           -- latest checkpoint sequence
+context/{context_id}/pruning_policy                   -- current pruning policy
+context/{context_id}/prune_cursor                     -- last pruned sequence number
+```
+
+#### 5. State Reconstruction from Checkpoints
+
+When a member joins a context with a long history, or when a member's local state is corrupted, they can reconstruct the current context state from the most recent checkpoint plus post-checkpoint events rather than replaying the entire log from genesis.
+
+**Reconstruction protocol:**
+
+1. **Obtain the latest checkpoint.** Query the context's event log (via relay QUERY or peer request) for the most recent `Checkpoint` event. Verify its signature against the admin's DID.
+2. **Verify checkpoint consistency.** Compute or request the current Merkle root from an online member (via consistency checkpoint exchange, ADR-011 criterion 8). Verify that the checkpoint event is included in the current log via standard inclusion proof.
+3. **Load state snapshot.** Deserialize the checkpoint's `ContextStateSnapshot`. This provides complete context state as of the checkpoint: membership, roles, governance, tools, ceilings, blocks, and sender key epochs.
+4. **Replay post-checkpoint events.** Request events from `checkpoint_seq + 1` through the current event count. Verify each event against the Merkle tree (hash chain integrity, inclusion proof). Apply each event's state mutation to the snapshot.
+5. **Verify final state.** After replay, the reconstructed state should be consistent with the current Merkle root and the latest consistency checkpoint from online members.
+
+**Reconstruction is not the same as sync.** ADR-029 covers reconnection and sync for members who were part of the context and went offline. State reconstruction is for members who either (a) are joining a context with a long history, (b) have lost local state, or (c) are recovering from storage corruption. The checkpoint provides a known-good starting point; the replay provides the delta.
+
+```rust
+pub struct StateReconstructor {
+    store: Arc<ProtocolStore>,
+}
+
+impl StateReconstructor {
+    /// Reconstruct context state from a checkpoint and post-checkpoint events.
+    pub async fn reconstruct(
+        &self,
+        checkpoint: &Checkpoint,
+        post_checkpoint_events: &[Event],
+        current_merkle_root: &[u8; 32],
+    ) -> Result<ReconstructedState, ReconstructionError>;
+}
+
+pub struct ReconstructedState {
+    pub context_state: ContextStateSnapshot,
+    pub event_count: u64,
+    pub merkle_root: [u8; 32],
+    pub events_replayed: u64,
+}
+
+pub enum ReconstructionError {
+    /// Checkpoint signature verification failed.
+    InvalidCheckpoint(String),
+    /// Hash chain broken during event replay.
+    BrokenHashChain { expected: [u8; 32], got: [u8; 32], at_seq: u64 },
+    /// Final state does not match expected Merkle root.
+    StateMismatch { expected_root: [u8; 32], computed_root: [u8; 32] },
+    /// Missing events in the replay sequence.
+    MissingEvents { from_seq: u64, to_seq: u64 },
+}
+```
+
+#### 6. Governance of Pruning Policies
+
+The pruning policy is a context parameter, set at creation or modified through the context's governance model. It is included in the context's publicly visible metadata (§5.7) so prospective members can evaluate the context's data retention posture before joining.
+
+```rust
+pub struct PruningPolicy {
+    /// Time-based pruning. None = no time-based pruning.
+    pub time_based: Option<TimeBasedPolicy>,
+    /// Size-based pruning. None = no size-based pruning.
+    pub size_based: Option<SizeBasedPolicy>,
+    /// Event-type retention multipliers.
+    pub event_type_retention: EventTypeRetention,
+    /// Checkpoint creation schedule.
+    pub checkpoint_schedule: CheckpointPolicy,
+    /// Whether members are allowed to request full log history from peers.
+    /// Default: true. If false, peers SHOULD NOT serve events behind their
+    /// most recent checkpoint to other members.
+    pub allow_full_history_requests: bool,
+}
+```
+
+**Governance rules:**
+
+- **Setting at creation.** The context creator includes `PruningPolicy` in `ContextParameters`. If omitted, the default policy applies: no time-based pruning, no size-based pruning, default checkpoint schedule (every 10,000 events or 24 hours), structural events retained 3x longer than operational events, full history requests allowed.
+- **Modifying via governance.** The pruning policy can be modified through the context's governance model (admin decision in single-admin, governance vote in multi-admin). Changes are recorded in the event log as a `GovernanceAction` event.
+- **Protocol minimum.** The protocol enforces a 30-day minimum for `time_based.retention_secs`. Governance cannot set a shorter retention. This floor ensures behavioral validation (§7.3.1) and equivocation detection (§9.9.3) have meaningful history to work with.
+- **Structural event floor.** Governance and membership events (structural events) cannot have an effective retention shorter than 90 days (`structural_retention_multiplier` is clamped to produce at least 90 days of structural event retention). This ensures that context governance history — who joined, who left, what roles changed, what governance actions occurred — is preserved long enough for accountability.
+- **Member autonomy.** A member's SDK can retain the full unprocessed event log locally regardless of the context's pruning policy. The pruning policy governs what the protocol considers the minimum retention obligation and what peers are expected to serve. A member who wants full history retains it; a member on a constrained device prunes according to policy.
+
+**Default pruning policy:**
+
+```rust
+impl Default for PruningPolicy {
+    fn default() -> Self {
+        Self {
+            time_based: None,         // No time-based pruning by default
+            size_based: None,          // No size-based pruning by default
+            event_type_retention: EventTypeRetention {
+                structural_retention_multiplier: 3.0,
+                operational_retention_multiplier: 1.0,
+            },
+            checkpoint_schedule: CheckpointPolicy {
+                event_interval: 10_000,
+                time_interval_secs: 86_400,
+                min_events_since_last: 100,
+            },
+            allow_full_history_requests: true,
+        }
+    }
+}
+```
+
+**Context templates (§5.12) with pruning presets:**
+
+- `ephemeral`: 30-day retention, 50,000 max events, checkpoints every 5,000 events.
+- `conversation`: 90-day retention, 100,000 max events, checkpoints every 10,000 events.
+- `persistent` / `full`: No time-based or size-based pruning (default policy). Full history retained.
+- `high_volume`: 30-day retention, 500,000 max events, checkpoints every 10,000 events, structural multiplier 5.0x.
+
+#### 7. Pruning Execution
+
+Pruning is a local operation performed by the SDK. It is never triggered by relays or remote peers. The SDK runs a background pruning task that evaluates the pruning policy periodically.
+
+```rust
+pub struct PruningExecutor {
+    store: Arc<ProtocolStore>,
+}
+
+impl PruningExecutor {
+    /// Evaluate the pruning policy for a context and prune eligible events.
+    /// Returns a report of what was pruned.
+    pub async fn prune(
+        &self,
+        context_id: &ContextId,
+        policy: &PruningPolicy,
+        now: u64,
+    ) -> Result<PruneReport, PruneError>;
+}
+
+pub struct PruneReport {
+    pub context_id: ContextId,
+    /// Number of event payloads removed.
+    pub events_pruned: u64,
+    /// Bytes reclaimed from storage.
+    pub bytes_reclaimed: u64,
+    /// The sequence number of the checkpoint used as the pruning boundary.
+    pub pruned_up_to_checkpoint: u64,
+    /// The sequence number of the oldest retained event payload.
+    pub oldest_retained_seq: u64,
+}
+
+pub enum PruneError {
+    /// No valid checkpoint exists — cannot prune.
+    NoCheckpoint,
+    /// All events are within the minimum retention period.
+    NothingToPrune,
+    /// Storage operation failed.
+    StorageError(String),
+}
+```
+
+**Pruning algorithm:**
+
+1. Load the latest verified checkpoint for the context.
+2. Determine the eligible pruning boundary: `min(checkpoint_seq, oldest_event_meeting_retention_criteria)`. Events beyond the checkpoint cannot be pruned (no checkpoint to anchor proofs). Events within the retention window cannot be pruned.
+3. For each event from the oldest to the pruning boundary:
+   a. Check event-type retention: if the event is structural and within the structural retention window, skip.
+   b. Delete the event payload from `ProtocolStore` (key: `context/{context_id}/event/{seq:020d}`).
+   c. Retain the leaf hash in a compact index (key: `context/{context_id}/pruned_leaf/{seq:020d}`, value: 32-byte hash). This enables pruned proofs.
+4. Update the prune cursor: `context/{context_id}/prune_cursor` = highest pruned sequence number.
+5. Optionally compact interior tree nodes (Phase 6 optimization — retain all by default).
+
+**Pruning frequency:** The background task runs every 6 hours. On mobile platforms, it defers to when the device is charging and on Wi-Fi (if the platform adapter exposes this information). Pruning is not time-critical — a few hours of delay does not affect correctness.
+
+### Rationale
+
+**Why checkpoint-based pruning instead of rolling windows:**
+
+A rolling window (keep last N events, discard older) breaks Merkle proof continuity. There is no anchor point to verify that pruned events were once part of the log. Checkpoints provide this anchor: the checkpoint's signed Merkle root is the verifiable claim that "all events up to sequence S produced this root." Pruned proofs work because the Merkle tree structure (leaf hashes + interior nodes) is retained even when payloads are removed.
+
+**Why 30-day minimum retention:**
+
+Behavioral validation (§7.3.1) computes records from event log history. A 30-day minimum ensures at least one month of behavioral data is available for trust evaluation. Shorter windows would make behavioral records unreliable — a participant could misbehave, wait for pruning, and have no verifiable behavioral record of the misbehavior. The 30-day floor is a practical balance between storage and accountability. Contexts that need longer accountability windows (governance, financial) set longer retention.
+
+**Why event-type tiers:**
+
+Governance and membership events are small (a role assignment is ~200 bytes) and structurally critical (they define who can do what in the context). Message events are more numerous and less structurally important after verification. Retaining structural events 3x longer than operational events costs minimal storage (structural events are typically <5% of total events by count) while preserving the governance audit trail. This is the same principle as database archival: metadata about the data outlives the data itself.
+
+**Why checkpoints are published to the event log:**
+
+Publishing checkpoints as event log entries makes them discoverable through the same mechanisms as any other event: relay subscription, peer sync, and event range queries. It also means checkpoints are included in the Merkle tree, so their authenticity is verifiable by the same proof machinery. A checkpoint event's inclusion in the log proves it was created when claimed and observed by all members.
+
+**Why pruning is local-only:**
+
+SCP's trust model treats relays as untrusted dumb pipes (§9.9.1). Relays should not influence what clients retain. Similarly, other members should not be able to force a client to prune — that would be a censorship vector (force prune evidence of misbehavior). Pruning is always the local member's decision, constrained by the protocol's minimum retention floor. The pruning policy is a recommendation that the SDK follows by default, not an enforcement mechanism.
+
+**Why members can retain full history:**
+
+The "member autonomy" principle ensures that pruning is a storage optimization, not a privacy guarantee. A context cannot promise that its event log will disappear after 30 days — any member who was present could have retained the full log. This is by design: SCP prioritizes accountability and verifiability over retroactive deletion. If a context needs content destruction guarantees, it uses ephemeral memory scope (§5.11) which destroys encryption keys, not event log hashes.
+
+### Implementation
+
+- **Language:** Rust
+- **Async runtime:** tokio (background pruning task, checkpoint creation)
+- **Crate:** `scp-core`
+- **Module:** `scp-core/event_log/` (extends existing event log module from ADR-011)
+- **Persistence:** Via `ProtocolStore` (§17.4). Key conventions:
+  - `context/{context_id}/checkpoint/{seq:020d}` — serialized `Checkpoint` structs
+  - `context/{context_id}/checkpoint_meta/latest` — latest checkpoint sequence number
+  - `context/{context_id}/pruning_policy` — serialized `PruningPolicy`
+  - `context/{context_id}/prune_cursor` — last pruned sequence number
+  - `context/{context_id}/pruned_leaf/{seq:020d}` — retained leaf hashes for pruned events
+
+### Dependencies
+
+- **ADR-011 (Event Log):** The checkpoint-and-prune system extends the Merkle event log. Checkpoints are a new `EventType`. Pruned proofs use the existing `InclusionProof` structure verified against a checkpoint root instead of the current root.
+- **ADR-008 (Context Lifecycle):** Pruning policy is a context parameter. Context creation includes optional `PruningPolicy` in `ContextParameters`. Context closure triggers final checkpoint creation before key destruction (for ephemeral/summary memory scopes).
+- **ADR-009 (Roles):** Checkpoint creation requires the admin role (or governance quorum in multi-admin contexts).
+- **ADR-029 (Offline/Sync):** State reconstruction from checkpoints provides the fast-start path for members who missed many events during extended offline periods. The `StateReconstructor` complements the `ReconnectionCoordinator` — reconnecting members can load the latest checkpoint instead of replaying the full log.
+- **ProtocolStore (§17.4):** Storage and retrieval of checkpoints, pruning policy, prune cursor, and retained leaf hashes. Range queries via `list_keys` with zero-padded sequence numbers.
+
+### Acceptance Criteria
+
+1. **`Checkpoint` struct and event type (extends ADR-011 `EventType` enum):**
+
+```rust
+// Addition to EventType in scp-core/event_log/
+Checkpoint {
+    checkpoint_seq: u64,
+    merkle_root: [u8; 32],
+    state_snapshot_hash: [u8; 32],  // SHA-256 of serialized ContextStateSnapshot
+},
+```
+
+2. **`create_checkpoint(event_log, context_state, signing_key) -> Result<Checkpoint, CheckpointError>`**
+
+   - Captures the current Merkle root, event count, and last event hash from the event log.
+   - Serializes the full `ContextStateSnapshot` deterministically.
+   - Signs the checkpoint with the provided signing key (admin's Active Signing Key).
+   - Appends the checkpoint as a `Checkpoint` event to the event log.
+   - Persists the checkpoint to `ProtocolStore` at `context/{id}/checkpoint/{seq:020d}`.
+   - Updates `context/{id}/checkpoint_meta/latest`.
+   - Returns the signed checkpoint.
+
+3. **`verify_checkpoint(checkpoint, admin_public_key, event_log) -> Result<bool, CheckpointError>`**
+
+   - Verifies the checkpoint signature against the admin's public key.
+   - Verifies the `merkle_root` matches the event log's root at `checkpoint_seq`.
+   - Verifies `state_snapshot_hash` matches `SHA-256(serialize(checkpoint.state_snapshot))`.
+   - Returns true if all verifications pass.
+
+4. **`PruningPolicy` struct and validation:**
+
+   - `validate_policy(policy) -> Result<(), PolicyError>`: Rejects policies with `time_based.retention_secs < 2_592_000` (30 days). Rejects policies where the effective structural retention is less than 90 days. Clamps `structural_retention_multiplier` to produce at least 90 days.
+
+5. **`PruningExecutor::prune(context_id, policy, now) -> Result<PruneReport, PruneError>`**
+
+   - Loads the latest checkpoint. Returns `PruneError::NoCheckpoint` if none exists.
+   - Computes the pruning boundary from the intersection of checkpoint coverage and retention policy.
+   - Iterates events from oldest to boundary, respecting event-type retention tiers.
+   - Deletes event payloads from `ProtocolStore`.
+   - Retains leaf hashes at `context/{id}/pruned_leaf/{seq:020d}`.
+   - Updates `prune_cursor`.
+   - Returns a `PruneReport` with statistics.
+
+6. **`prove_pruned_inclusion(event_log, leaf_hash, leaf_index, checkpoint) -> Result<PrunedInclusionProof, EventLogError>`**
+
+   - Generates a Merkle inclusion proof for a pruned event using the retained leaf hash and interior nodes.
+   - The proof verifies against the checkpoint's `merkle_root`.
+
+7. **`build_full_proof_chain(pruned_proof, checkpoint, event_log) -> Result<FullProofChain, EventLogError>`**
+
+   - Combines a pruned inclusion proof with the checkpoint's own inclusion proof in the current log.
+   - Returns a `FullProofChain` that can be verified by any third party with access to the current Merkle root.
+
+8. **`StateReconstructor::reconstruct(checkpoint, events, current_root) -> Result<ReconstructedState, ReconstructionError>`**
+
+   - Verifies the checkpoint signature.
+   - Loads the `ContextStateSnapshot` from the checkpoint.
+   - Replays each post-checkpoint event, verifying hash chain continuity.
+   - Applies each event's state mutation to the snapshot.
+   - Verifies the final Merkle root matches `current_root`.
+   - Returns the reconstructed state.
+
+9. **Background checkpoint and pruning tasks:**
+
+   - `CheckpointScheduler`: monitors event count and time since last checkpoint. Triggers `create_checkpoint` when thresholds are met. Runs as a tokio background task.
+   - `PruningTask`: runs every 6 hours. Evaluates the pruning policy for each active context and calls `PruningExecutor::prune`. Defers on mobile when not charging (if platform adapter reports power state).
+
+10. **Integration test:**
+
+```
+1. Alice creates an identity and a context with a pruning policy:
+   time-based 30-day retention, checkpoint every 100 events.
+2. Alice and Bob exchange 250 messages (250 events in the log).
+3. Verify: checkpoint was created automatically at event 100 and event 200.
+4. Verify: both checkpoints are in the event log as Checkpoint events.
+5. Verify: checkpoint state_snapshot matches actual context state at those points.
+6. Simulate time advance of 31 days.
+7. Run pruning. Verify: events 0-199 (behind the checkpoint at 200, older
+   than 30 days) are pruned. Events 200-249 are retained.
+8. Verify: event payloads for 0-199 are gone from ProtocolStore.
+9. Verify: leaf hashes for 0-199 are retained in pruned_leaf/ keys.
+10. Generate a pruned inclusion proof for event 50 against checkpoint at 200.
+    Verify it succeeds.
+11. Build a full proof chain for event 50. Verify it validates against
+    the current Merkle root.
+12. Carol joins the context. Carol reconstructs state from the latest
+    checkpoint (200) + events 200-249. Verify Carol's reconstructed state
+    matches Alice and Bob's current state.
+13. Verify: governance events (MemberJoined for Bob) with structural
+    retention multiplier 3.0x would be retained for 90 days even as
+    message events are pruned at 30 days.
+```
+
+### Scope
+
+**Files (~5-7):**
+
+| File | Purpose |
+|------|---------|
+| `checkpoint.rs` | `Checkpoint`, `ContextStateSnapshot`, `CosignedCheckpoint`, `create_checkpoint`, `verify_checkpoint`, `CheckpointScheduler` |
+| `pruning.rs` | `PruningPolicy`, `TimeBasedPolicy`, `SizeBasedPolicy`, `EventTypeRetention`, `PruningExecutor`, `PruneReport`, policy validation |
+| `pruned_proof.rs` | `PrunedInclusionProof`, `FullProofChain`, `prove_pruned_inclusion`, `build_full_proof_chain` |
+| `reconstruct.rs` | `StateReconstructor`, `ReconstructedState`, `ReconstructionError`, state replay logic |
+| `policy.rs` | `CheckpointPolicy`, default policies, template presets, policy governance integration |
+
+**Estimated functions:** ~20-25 public functions, ~15-20 internal helpers.
 
 ---
 
 ## ADR-031: Multi-Admin Governance Models
 
-**Status:** Pending
+**Status:** Decided
 
-### What This ADR Will Decide
+### Context
 
-Governance models beyond single-admin (Phase 2 baseline). Multi-sig (M-of-N), consensus (majority/supermajority), weighted voting. Proposal lifecycle, quorum rules, voting windows, deadlock recovery.
+Phase 2 governance (ADR-008) uses a single-admin model: one DID holds all governance authority, and governance actions are serialized through that admin. This works for bilateral contexts, small groups, and contexts where a clear authority is appropriate. It becomes a bottleneck and a single point of failure for larger, more collaborative contexts: if the admin goes offline, no governance changes can occur (ADR-029 section 5c explicitly acknowledges this); if the admin acts unilaterally in ways members disagree with, the only recourse is exit (§9.2.1); and if the admin's key is compromised, the entire context's governance is compromised.
 
-### Blockers
+Real-world collaborative contexts — working groups, DAOs, multi-party negotiations, open-source project spaces, community moderation teams — require shared governance. Different contexts have different governance needs: a 3-person team might want 2-of-3 approval for membership changes; a community might want majority vote; a high-stakes financial context might require unanimity for ceiling changes. The spec (§5.9) explicitly declares governance as a pluggable interface with multiple models, and the sketch defines the three-method contract (`propose`, `approve`, `reject`) that all models must implement. ADR-029 section 5c already references multi-admin governance and defines the conflict resolution semantics (Merkle log order is authoritative; simultaneous conflicting proposals trigger a `GovernanceConflict` state requiring manual resolution). ADR-030 defines checkpoint cosignatures from governance quorums. This ADR completes the governance system by defining the concrete models, the proposal lifecycle, quorum rules, voting windows, deadlock recovery, and the UCAN delegation model for multi-admin contexts.
 
-- Phase 2 single-admin governance (ADR-008) must be implemented and tested.
-- Phase 2 UCAN validation (ADR-016) must be running — governance actions are UCAN-authorized.
-- Need to understand how governance proposals interact with MLS epoch advances and context state.
+### Scope
 
-### Known Constraints
+**What this ADR covers:**
 
-- Governance is a pluggable interface (§5.9): protocol defines propose/approve/reject, implementations vary.
-- Context governance controls: role changes, membership, settings, ceiling expansion, interface decisions (§5.9).
-- Exit as veto: members can leave if governance makes unacceptable decisions (§9.2.1).
-- Governance actions are context events in the Merkle log — auditable and verifiable.
+- The `GovernanceEngine` trait: the pluggable interface all governance models implement.
+- The `GovernanceProposal` lifecycle: creation, voting, resolution, expiry, cancellation.
+- Four concrete governance models: single-admin (Phase 2 baseline, formalized), threshold (M-of-N), majority, and unanimity.
+- Governance model selection at context creation (immutable for lifetime).
+- Quorum rules, voting windows, and timeout handling per model.
+- Vote semantics: order-independent, withdrawal permitted, one vote per eligible voter.
+- Deadlock recovery: what happens when quorum is unreachable.
+- UCAN delegation in multi-admin contexts: who holds governance UCANs, how authority is distributed.
+- Interaction with MLS epochs: governance proposals are MLS application messages; approvals do not trigger epoch advances.
+- Interaction with ADR-029 (offline/sync): concurrent governance conflict resolution.
+- Interaction with ADR-030 (pruning): checkpoint cosignature requirements per governance model.
+- Event log event types for the governance proposal lifecycle.
 
-### Open Questions That Block This ADR
+**What this ADR does NOT cover:**
 
-- Proposal message format (structured event type in Merkle log).
-- Quorum rules per model type (majority? supermajority? unanimity for which actions?).
-- Voting window duration and timeout handling.
-- Multi-sig semantics: order-sensitive or order-independent? Withdrawal allowed?
-- Consensus deadlock recovery: what if N-of-M signers are unavailable?
-- Interaction with UCAN: who holds the governance UCAN? How is it delegated in multi-admin?
+- Weighted voting (deferred — requires a token or stake mechanism not present in SCP v1).
+- Delegated/representative governance (deferred — same complexity class as weighted voting).
+- Cross-context governance federation (out of scope — contexts are isolated).
+- Custom/pluggable governance implementations beyond the four built-in models (the trait is extensible, but only the four built-in models are specified here).
 
-### References
+### Decision
 
-- §5.9 — Context governance model (pluggable interface).
-- §9.2.1 — Security boundaries (exit as veto, single-admin as minimum).
-- ADR-008 — Context lifecycle state machine (single-admin governance).
-- ADR-009 — Role assignment and capability ceiling.
-- ADR-016 — UCAN validation.
+Implement a pluggable governance engine in `scp-core/governance/` that defines a `GovernanceEngine` trait with four built-in implementations: `SingleAdmin`, `Threshold`, `Majority`, and `Unanimity`. Every context declares its governance model at creation; the model is immutable for the context's lifetime. All governance models implement the same three-method interface (`propose`, `approve`, `reject`) from the sketch. Proposals are structured event log entries with typed payloads, configurable voting windows, and deterministic resolution. Vote collection is order-independent and withdrawal is permitted. Deadlock recovery uses an automatic fallback to preserve context liveness.
 
-### Expected Approach
+#### 1. Governance Engine Trait
 
-Define the governance interface contract (propose/approve/reject with typed proposals). Implement three concrete models:
+The governance engine is the pluggable interface that all governance models implement. The `ContextManager` delegates all governance decisions to the engine.
 
-1. **Multi-sig (M-of-N threshold):** Simplest semantics, most useful, least ambiguous. A proposal passes when M of N designated signers approve.
-2. **Majority vote (>50%):** Each member gets one vote. Proposal passes at majority. Suitable for peer groups.
-3. **Unanimity (all members):** Every member must approve. Suitable for high-stakes decisions (ceiling changes, context closure).
+```rust
+/// The pluggable governance interface. All governance models implement this trait.
+/// The trait is object-safe to enable dynamic dispatch via `Box<dyn GovernanceEngine>`.
+pub trait GovernanceEngine: Send + Sync {
+    /// Submit a new governance proposal. Returns the proposal ID.
+    /// The proposer must hold `GovernancePropose` capability (UCAN-validated).
+    fn propose(
+        &self,
+        proposer: &DID,
+        action: GovernanceAction,
+        context: &GovernanceContext,
+    ) -> Result<ProposalId, GovernanceError>;
 
-Each model implements the same governance interface. Start with multi-sig — simplest semantics, most useful for the common case of "2-of-3 admins."
+    /// Cast an approval vote on a pending proposal.
+    /// The voter must hold `GovernanceVote` capability (UCAN-validated).
+    fn approve(
+        &self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
 
-### Optimal Approach
+    /// Cast a rejection vote on a pending proposal.
+    /// The voter must hold `GovernanceVote` capability (UCAN-validated).
+    fn reject(
+        &self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
 
-Implement Phase 2 single-admin. Identify governance pain points from real context operation. Design multi-admin to solve observed problems, not hypothetical ones.
+    /// Withdraw a previously cast vote (approval or rejection).
+    /// Only the original voter can withdraw. Only valid while proposal is Pending.
+    fn withdraw_vote(
+        &self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
+
+    /// Check whether a proposal has reached resolution (quorum met, rejected,
+    /// or expired). Called after each vote and periodically by the SDK.
+    fn resolve(
+        &self,
+        proposal_id: &ProposalId,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
+
+    /// Return the governance model configuration for metadata publication.
+    fn model_config(&self) -> GovernanceModelConfig;
+
+    /// Return the set of DIDs eligible to vote on proposals in this model.
+    fn eligible_voters(&self, context: &GovernanceContext) -> Vec<DID>;
+}
+
+/// Read-only context snapshot provided to the governance engine.
+/// The engine never mutates context state directly — it returns decisions
+/// that the ContextManager executes.
+pub struct GovernanceContext {
+    pub context_id: ContextId,
+    pub members: Vec<(DID, RoleName)>,
+    pub admin_dids: Vec<DID>,
+    pub current_epoch: Option<u64>,
+    pub now: u64,
+}
+```
+
+#### 2. Governance Model Configuration
+
+The governance model is declared at context creation via `ContextParams.governance` and is immutable. Changing the governance model requires creating a new context. This prevents governance bait-and-switch — members join knowing exactly how decisions are made.
+
+```rust
+/// Governance model selection. Set at context creation, immutable thereafter.
+/// Included in context metadata (§5.7) — visible before opt-in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GovernanceModelConfig {
+    /// Single admin holds all governance authority. Phase 2 baseline.
+    /// The creator is the initial (and only) admin. Admin transfer is
+    /// a governance action that replaces the admin DID.
+    SingleAdmin {
+        admin_did: DID,
+    },
+
+    /// M-of-N threshold approval. A fixed set of designated signers;
+    /// a proposal passes when at least `threshold` of them approve.
+    Threshold {
+        /// The set of DIDs authorized to vote. These DIDs must hold
+        /// the `GovernanceVote` capability.
+        signers: Vec<DID>,
+        /// Minimum number of approvals required. Must satisfy:
+        /// 1 <= threshold <= signers.len().
+        threshold: u32,
+        /// Voting window in seconds. Proposals that do not reach
+        /// quorum within this window expire. Default: 86_400 (24 hours).
+        voting_window_secs: u64,
+    },
+
+    /// Majority vote among all context members holding `GovernanceVote`
+    /// capability. Proposal passes when approvals > 50% of eligible voters.
+    Majority {
+        /// Voting window in seconds. Default: 86_400 (24 hours).
+        voting_window_secs: u64,
+        /// Minimum participation threshold as a fraction (0.0 to 1.0).
+        /// The proposal is only valid if at least this fraction of eligible
+        /// voters cast a vote (approve or reject). Default: 0.5 (50%).
+        /// Prevents a proposal from passing with 2 approvals out of 100
+        /// eligible voters when 98 are absent.
+        min_participation: f64,
+    },
+
+    /// Unanimity among all context members holding `GovernanceVote`
+    /// capability. Every eligible voter must approve. A single rejection
+    /// defeats the proposal immediately.
+    Unanimity {
+        /// Voting window in seconds. Default: 172_800 (48 hours).
+        /// Longer default because unanimity requires every voter.
+        voting_window_secs: u64,
+    },
+}
+```
+
+**Validation at context creation:**
+
+- `Threshold`: `signers` must be non-empty, `threshold` must be in `[1, signers.len()]`, all signer DIDs must be among the context's initial members, `voting_window_secs` must be in `[300, 604_800]` (5 minutes to 7 days).
+- `Majority`: `min_participation` must be in `(0.0, 1.0]`, `voting_window_secs` must be in `[300, 604_800]`.
+- `Unanimity`: `voting_window_secs` must be in `[300, 604_800]`.
+
+#### 3. Governance Proposal Lifecycle
+
+Every governance action goes through the proposal lifecycle. In `SingleAdmin`, the propose step auto-resolves (the admin's proposal is simultaneously the approval). In multi-admin models, proposals are created, voted on, and resolved.
+
+```rust
+/// Unique identifier for a governance proposal.
+/// Format: SHA-256(context_id || proposer_did || action_hash || timestamp).
+pub type ProposalId = [u8; 32];
+
+/// A governance proposal. Created by `propose()`, stored in the event log
+/// and in `ProtocolStore` for active tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceProposal {
+    pub proposal_id: ProposalId,
+    pub context_id: ContextId,
+    pub proposer_did: DID,
+    pub action: GovernanceAction,
+    pub status: ProposalStatus,
+    pub created_at: u64,
+    pub voting_deadline: u64,
+    pub approvals: Vec<SignedVote>,
+    pub rejections: Vec<SignedVote>,
+    /// Epoch at which the proposal was created. Proposals are valid only
+    /// for the epoch in which they were created and subsequent epochs.
+    /// If the group resets (ADR-029 Tier 3), pending proposals are
+    /// invalidated because the epoch context has changed.
+    pub created_at_epoch: Option<u64>,
+}
+
+/// A signed vote on a proposal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedVote {
+    pub voter_did: DID,
+    pub vote: VoteType,
+    pub timestamp: u64,
+    pub signature: Ed25519Signature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VoteType {
+    Approve,
+    Reject,
+}
+
+/// The status of a governance proposal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProposalStatus {
+    /// Proposal is open for voting.
+    Pending,
+    /// Proposal reached quorum and was approved. The action will be executed.
+    Approved,
+    /// Proposal was rejected (explicit rejection or failed to reach quorum).
+    Rejected { reason: RejectionReason },
+    /// Proposal expired before reaching quorum.
+    Expired,
+    /// Proposal was cancelled by the proposer before resolution.
+    Cancelled,
+    /// Proposal was invalidated (e.g., epoch reset, proposer removed).
+    Invalidated { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RejectionReason {
+    /// More rejections than approvals (Majority model).
+    MajorityRejected,
+    /// Any single rejection (Unanimity model).
+    UnanimityBroken { rejector: DID },
+    /// Threshold of rejections reached making approval impossible
+    /// (Threshold model: rejections > signers - threshold).
+    ApprovalImpossible,
+    /// Insufficient participation within voting window (Majority model).
+    InsufficientParticipation,
+}
+
+/// Typed governance actions. Every governance change is one of these variants.
+/// The governance engine evaluates proposals containing these actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GovernanceAction {
+    /// Add a member to the context.
+    AddMember { did: DID, role: RoleName },
+    /// Remove a member from the context.
+    RemoveMember { did: DID, reason: Option<String> },
+    /// Change a member's role.
+    ChangeRole { did: DID, new_role: RoleName },
+    /// Register a new tool.
+    RegisterTool { registration: ToolRegistration },
+    /// Remove a tool.
+    RemoveTool { tool_id: ToolId },
+    /// Modify the capability ceiling (only if ceiling_policy is Governed).
+    ModifyCeiling { new_ceiling: Vec<Capability> },
+    /// Close the context.
+    CloseContext { reason: Option<String> },
+    /// Extend TTL (requires unanimous member consent per §5.10).
+    ExtendTtl { additional_secs: u64 },
+    /// Modify pruning policy (ADR-030).
+    ModifyPruningPolicy { new_policy: PruningPolicy },
+    /// Transfer single-admin authority (SingleAdmin model only).
+    TransferAdmin { new_admin: DID },
+    /// Add a new signer to the threshold set (Threshold model only).
+    AddSigner { did: DID },
+    /// Remove a signer from the threshold set (Threshold model only).
+    RemoveSigner { did: DID },
+    /// Modify the threshold value (Threshold model only).
+    ModifyThreshold { new_threshold: u32 },
+    /// Create a child context (§5.13).
+    CreateChildContext { params: Box<ContextParams> },
+    /// Establish a tool interface with another context (§6.2).
+    EstablishToolInterface { interface: ToolInterface },
+    /// Initiate governance-triggered member reset (ADR-029).
+    ResetMember { did: DID, reason: String },
+    /// Resolve a governance conflict (see section 7).
+    ResolveConflict { conflicting_proposal_id: ProposalId, resolution: ConflictResolution },
+}
+```
+
+#### 4. Proposal Resolution Rules Per Model
+
+**4a. SingleAdmin.** The admin's `propose()` call simultaneously creates and approves the proposal. The `approve()`/`reject()` methods are no-ops (return the current status). This preserves backward compatibility with Phase 2 behavior — single-admin governance is immediate and serialized.
+
+**4b. Threshold (M-of-N).** A proposal passes when `threshold` signers from the `signers` set have approved. Resolution is checked after every vote:
+
+- If `approvals.len() >= threshold`: status becomes `Approved`.
+- If `rejections.len() > signers.len() - threshold`: approval is mathematically impossible, status becomes `Rejected { reason: ApprovalImpossible }`.
+- If `now > voting_deadline` and neither condition met: status becomes `Expired`.
+
+Votes are order-independent — the Mth approval resolves the proposal regardless of when or in what order the M votes arrived. Only DIDs in the `signers` set can vote. A signer can withdraw their vote and re-vote (changing from approve to reject or vice versa) while the proposal is `Pending`.
+
+**4c. Majority.** A proposal passes when approvals exceed 50% of eligible voters (all members holding `GovernanceVote` capability). Resolution:
+
+- Let `eligible = eligible_voters.len()`, `participation = approvals.len() + rejections.len()`.
+- If `participation / eligible < min_participation` when `now > voting_deadline`: status becomes `Rejected { reason: InsufficientParticipation }`.
+- If `approvals.len() > eligible / 2`: status becomes `Approved` (early resolution — majority reached before deadline).
+- If `rejections.len() >= eligible / 2`: status becomes `Rejected { reason: MajorityRejected }` (early rejection — approval impossible).
+- If `now > voting_deadline` and `participation / eligible >= min_participation` and `approvals > rejections`: status becomes `Approved`.
+- If `now > voting_deadline` and `participation / eligible >= min_participation` and `approvals <= rejections`: status becomes `Rejected { reason: MajorityRejected }`.
+
+The eligible voter set is computed at proposal creation time and frozen for the proposal's lifetime. Members who join after proposal creation do not vote on it; members who leave have their votes removed.
+
+**4d. Unanimity.** Every eligible voter must approve. A single rejection defeats the proposal immediately:
+
+- If all eligible voters have approved: status becomes `Approved`.
+- If any eligible voter rejects: status becomes `Rejected { reason: UnanimityBroken { rejector } }`.
+- If `now > voting_deadline` and not all have voted: status becomes `Expired`.
+
+Unanimity is required by the spec (§5.10) for TTL extension and context promotion. The `ExtendTtl` and `PromoteContext` governance actions always require unanimity regardless of the context's governance model — this is a protocol-level override enforced by the `ContextManager`, not by the governance engine.
+
+#### 5. Voting Windows and Timeout Handling
+
+Every proposal has a `voting_deadline = created_at + voting_window_secs`. The voting window is configured per governance model at context creation and applies uniformly to all proposals in that context.
+
+**Timeout processing.** The SDK runs a background task (`GovernanceTimeoutTask`) that checks active proposals every 60 seconds. When a proposal's deadline passes without resolution, the task calls `resolve()` which transitions the proposal to `Expired` or `Rejected` (depending on model-specific rules). The timeout task also handles:
+
+- **Proposer departure.** If the proposer leaves the context while a proposal is `Pending`, the proposal is `Invalidated`. The proposer's departure does not retroactively invalidate an already-approved proposal.
+- **Voter departure.** If an eligible voter leaves the context, their vote is removed from the tally. This may change the resolution — if a Unanimity proposal had all approvals and one voter leaves, the proposal remains approved (the voter approved before leaving). If a voter leaves without having voted, the eligible voter set shrinks, which may make quorum easier to reach (Majority) or harder (Unanimity).
+- **Epoch reset.** If a member undergoes a group state reset (ADR-029 Tier 3), their votes on pending proposals are invalidated (the reset changes their epoch context). The proposal is not automatically invalidated — other votes remain valid.
+
+#### 6. UCAN Delegation in Multi-Admin Contexts
+
+In single-admin governance, the context creator holds the root UCAN authority and delegates all capabilities. In multi-admin governance, UCAN authority is distributed:
+
+**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator.
+
+**Governance capability distribution.** At context creation, the creator mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each DID that the governance model designates as a voter:
+
+- `Threshold`: each DID in `signers` receives `GovernancePropose` + `GovernanceVote`.
+- `Majority`: each member whose role includes `GovernanceVote` capability receives those tokens at role assignment.
+- `Unanimity`: same as Majority — all members with `GovernanceVote` in their role.
+
+**Governance action execution.** When a proposal is approved, the governance engine returns the decision to the `ContextManager`. The `ContextManager` executes the action using the creator's root authority — it mints new UCANs, revokes old ones, modifies membership, etc. The governance engine does not execute actions; it only decides whether they are approved. This separation ensures that UCAN chains remain valid (the root issuer signs all delegations) while governance authority is distributed (multiple DIDs vote on whether to authorize the action).
+
+**Signer set modification (Threshold model).** When a `Threshold` proposal to add or remove a signer is approved, the `ContextManager` mints or revokes `GovernanceVote` UCANs accordingly. Adding a signer requires the new DID to already be a context member. Removing a signer does not remove them from the context — it only removes governance authority. The `threshold` value is validated after modification: if removing a signer would make `threshold > signers.len()`, the removal is rejected.
+
+#### 7. Governance Conflict Resolution
+
+ADR-029 section 5c defines the conflict scenario: two admins both offline simultaneously propose conflicting governance actions. When both reconnect, both proposals are committed to the event log. The first proposal committed to the Merkle log wins; the second is rejected as conflicting.
+
+**Conflict detection.** The `GovernanceEngine` detects conflicts when two `Approved` proposals in the event log are incompatible:
+
+- Two `RemoveMember` proposals targeting each other's proposers (mutual removal).
+- Two `ChangeRole` proposals for the same DID with different target roles.
+- Two `ModifyCeiling` proposals with different ceiling sets.
+- A `RemoveMember` and a `ChangeRole` for the same DID.
+
+**Conflict resolution.** When a conflict is detected:
+
+1. The proposal with the lower event log sequence number (earlier in Merkle log) wins. This is deterministic — all members compute the same winner.
+2. The losing proposal's status becomes `Invalidated { reason: "Conflicting proposal {winner_id} committed first" }`.
+3. A `GovernanceConflict` event is appended to the event log recording both proposal IDs, the winner, and the resolution method.
+4. If the losing proposer still wants their action, they must re-propose with awareness of the winning proposal's effects.
+
+**Simultaneous commit (same sequence number).** If two conflicting proposals land at the exact same event log sequence (extremely rare — requires both to be appended in the same batch), the protocol enters a `GovernanceConflict` state:
+
+1. The context is frozen for new governance actions (no new proposals accepted). Message sending and tool invocation continue normally.
+2. A `GovernanceConflictDetected` event is emitted.
+3. Resolution requires an explicit `ResolveConflict` governance action from any DID with `GovernanceVote` capability. The resolution specifies which proposal wins.
+4. The `ResolveConflict` action itself follows the context's governance model (requires threshold/majority/unanimity). This prevents unilateral conflict resolution.
+5. If no resolution is reached within the voting window, both proposals are invalidated and the governance freeze is lifted. The context returns to its pre-proposal state.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConflictResolution {
+    /// Accept one proposal, invalidate the other.
+    AcceptProposal { winner_id: ProposalId },
+    /// Invalidate both proposals, return to pre-proposal state.
+    InvalidateBoth,
+}
+```
+
+#### 8. Interaction with MLS Epochs
+
+Governance proposals and votes are MLS application messages (in Encrypted contexts) or broadcast messages (in Broadcast contexts). They do not trigger MLS epoch advances — only membership changes (add/remove) and MLS Updates trigger Commits.
+
+However, governance actions that result in membership changes (approved `AddMember` or `RemoveMember` proposals) do trigger MLS operations, which advance the epoch. The sequence is:
+
+1. Proposal approved (governance decision).
+2. `ContextManager` executes the membership change (MLS `add_member()`/`remove_member()`).
+3. MLS Commit advances the epoch.
+4. `GovernanceActionExecuted` event appended to event log (records proposal ID, action, executor DID, resulting epoch).
+
+Pending proposals are NOT invalidated by epoch advances. A proposal created at epoch E is valid at epoch E+N — the proposal references a governance action, not an epoch-specific state. The only exception is group state reset (ADR-029 Tier 3), which invalidates pending proposals because the member's relationship to the group has fundamentally changed.
+
+#### 9. Interaction with Checkpointing (ADR-030)
+
+ADR-030 defines checkpoint cosignatures for multi-admin contexts. The requirement is:
+
+- In `SingleAdmin` contexts, only the admin signs checkpoints. `cosignatures` is empty.
+- In `Threshold` contexts, checkpoints require `threshold` signatures from the signer set. The checkpoint creator collects signatures by distributing the checkpoint hash to other signers, who verify and cosign.
+- In `Majority` contexts, checkpoints require signatures from >50% of eligible voters.
+- In `Unanimity` contexts, checkpoints require signatures from all eligible voters.
+
+Checkpoint cosignature collection follows the same voting-window pattern as governance proposals but with a shorter default window (1 hour). If cosignature quorum is not reached, the checkpoint is still valid with the creator's signature alone but is flagged as `PartiallyAttested` — members can decide how much weight to give it.
+
+#### 10. Deadlock Recovery
+
+Deadlock occurs when the governance model requires votes from DIDs that are permanently unavailable (key loss, extended offline beyond Tier 3, deliberate non-participation).
+
+**Detection.** A governance model is in deadlock when:
+
+- `Threshold`: fewer than `threshold` signers are active context members (signers who left or were removed are no longer eligible).
+- `Majority`: fewer than `ceil(eligible_voters * min_participation)` members are responsive (no vote cast within 3 consecutive voting windows).
+- `Unanimity`: any eligible voter has been offline beyond the Tier 3 threshold (7+ days) with no response to proposals.
+
+**Recovery protocol.** When deadlock is detected:
+
+1. Any member with `GovernancePropose` capability can propose a `ReconfigureGovernance` meta-action. This is a special governance action that modifies the governance model's parameters (e.g., reducing `threshold`, removing inactive signers) without changing the model type.
+2. The `ReconfigureGovernance` proposal follows a fallback quorum: the remaining active voters use majority-of-active as the quorum rule, regardless of the original governance model. This prevents a dead signer from permanently blocking all governance.
+3. The fallback is logged as a `GovernanceDeadlockRecovery` event in the event log with full justification (which signers are unavailable, how long, what the original quorum was).
+4. Members who disagree with the deadlock recovery can exercise exit-as-veto (§9.2.1) — leave the context.
+
+```rust
+/// Deadlock recovery meta-action. Uses fallback quorum rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconfigureGovernance {
+    /// What to change in the governance configuration.
+    pub changes: Vec<GovernanceReconfigAction>,
+    /// Justification — which voters are unavailable and evidence.
+    pub justification: DeadlockJustification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GovernanceReconfigAction {
+    /// Remove an inactive signer (Threshold model).
+    RemoveInactiveSigner { did: DID },
+    /// Reduce the threshold (Threshold model). New value must be
+    /// >= 1 and <= remaining active signers.
+    ReduceThreshold { new_threshold: u32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadlockJustification {
+    /// DIDs that are unavailable.
+    pub unavailable_dids: Vec<DID>,
+    /// Evidence of unavailability: consecutive missed voting windows.
+    pub missed_windows: Vec<(DID, u32)>,
+    /// Timestamp of deadlock detection.
+    pub detected_at: u64,
+}
+```
+
+**Deadlock recovery constraints:**
+
+- The governance model TYPE is never changed by deadlock recovery. A `Threshold` context remains `Threshold`. To change the model type, create a new context.
+- The fallback quorum (majority-of-active) requires at least 2 active voters. If only 1 voter remains, they effectively have single-admin authority — this is logged and visible to all members.
+- Deadlock recovery proposals have a 48-hour voting window (double the default) to give absent members time to respond before their authority is reduced.
+
+### Rationale
+
+**Why four models, not more:**
+
+The four models — SingleAdmin, Threshold, Majority, Unanimity — cover the practical governance space for SCP contexts. SingleAdmin is the Phase 2 baseline, needed for backward compatibility and simple contexts. Threshold is the most commonly requested multi-admin pattern ("2-of-3 admins") and has the simplest, most predictable semantics. Majority scales to larger groups where threshold enumeration is impractical. Unanimity satisfies the spec's requirement for TTL extension (§5.10) and ceiling changes in high-stakes contexts. Weighted voting and delegated governance were considered but deferred: they require a stake/token mechanism or a delegation graph that SCP v1 does not provide, and they add complexity without clear demand from the initial use cases.
+
+**Why governance model is immutable:**
+
+Changing the governance model after creation is a fundamental change to the opt-in contract. Members joined knowing "this context uses 2-of-3 threshold governance." Switching to majority vote changes the power dynamics retroactively. Making the model immutable prevents governance bait-and-switch — the same principle behind immutable capability ceilings (ADR-009). If a different governance model is needed, create a new context and migrate. The threshold value and signer set CAN be modified through governance (they are parameters within the model, not the model itself), but the model type cannot.
+
+**Why order-independent votes with withdrawal:**
+
+Order-independent votes are simpler to reason about: the Mth approval triggers resolution regardless of when it arrives. Order-sensitive votes (where the sequence of approvals matters) add complexity without benefit — the governance decision is the same regardless of whether Alice or Bob approved first. Vote withdrawal enables members to change their mind based on new information (e.g., discussion in the context about the proposal). Without withdrawal, a premature approval is irreversible, which discourages early voting.
+
+**Why Merkle log order for conflict resolution:**
+
+ADR-029 section 5c already establishes Merkle log order as the authoritative ordering for concurrent operations. Using the same mechanism for governance conflicts maintains consistency — no new conflict resolution primitive is needed. The determinism is critical: all members compute the same winner from the same log, so there is no disagreement about which proposal won.
+
+**Why the fallback quorum for deadlock recovery:**
+
+Without a deadlock recovery mechanism, a Threshold(3-of-5) context where 3 signers lose their keys is permanently frozen — no governance action can ever pass. The fallback quorum (majority of remaining active voters) is the least disruptive recovery: it preserves the model type, requires majority agreement among the remaining participants, and is fully logged. The alternative — no recovery, context must be abandoned — wastes the context's history, tool registrations, and ongoing work. The 48-hour voting window for recovery proposals gives absent members extra time to return, reducing false deadlock detection.
+
+**Why the context creator remains the UCAN root:**
+
+UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributing root authority across multiple DIDs would require multi-signature UCAN tokens, which the UCAN spec does not support. The creator-as-root pattern is already established in Phase 2 and works well: the creator's cryptographic role (root issuer) is decoupled from their governance role (which may be no more than any other signer in a Threshold model). The creator cannot unilaterally mint capabilities that bypass governance — all capability changes go through the governance engine.
+
+### Implementation
+
+- **Language:** Rust
+- **Async runtime:** tokio (voting window timers, deadlock detection background task)
+- **Crate:** `scp-core`
+- **Module:** `scp-core/governance/`
+- **Persistence:** Via `ProtocolStore` (§17.4). Key conventions:
+  - `context/{context_id}/governance/config` — serialized `GovernanceModelConfig`
+  - `context/{context_id}/governance/proposal/{proposal_id_hex}` — active proposals
+  - `context/{context_id}/governance/proposal_index/pending` — list of pending proposal IDs
+  - `context/{context_id}/governance/proposal_index/resolved` — list of resolved proposal IDs
+  - `context/{context_id}/governance/deadlock_state` — deadlock detection state
+
+### Dependencies
+
+- **ADR-008 (Context Lifecycle):** The `ContextManager` delegates governance decisions to the `GovernanceEngine`. Context creation includes `GovernanceModelConfig` in `ContextParams`. The governance model constrains which context operations require proposals (all multi-admin operations) vs. which are immediate (message sending, tool invocation — these are UCAN-authorized, not governance-gated).
+- **ADR-009 (Roles/UCAN):** `GovernancePropose` and `GovernanceVote` are capabilities in the `Capability` enum. Governance UCAN tokens are minted at role assignment and validated on every `propose()`, `approve()`, and `reject()` call. The capability ceiling bounds governance capabilities the same as any other capability.
+- **ADR-011 (Event Log):** Governance proposals, votes, resolutions, conflicts, and deadlock recoveries are event log entries. The Merkle log provides the authoritative ordering for conflict resolution.
+- **ADR-016 (UCAN Validation):** The full 11-step UCAN validation pipeline applies to governance operations. Governance UCANs follow the same delegation chain, nonce uniqueness, and revocation rules as all other UCANs.
+- **ADR-029 (Offline/Sync):** Concurrent governance conflict resolution (section 5c) is formalized by this ADR. Group state resets invalidate pending proposals. Reconnecting members catch up on governance state through event log sync.
+- **ADR-030 (Event Log Pruning):** Checkpoint cosignature requirements are defined per governance model. `GovernanceAction` events are structural events with 3x retention multiplier.
+
+### Acceptance Criteria
+
+1. **`GovernanceEngine` trait and `GovernanceModelConfig` enum:**
+
+```rust
+// GovernanceEngine trait with propose/approve/reject/withdraw_vote/resolve/model_config/eligible_voters.
+// GovernanceModelConfig with SingleAdmin, Threshold, Majority, Unanimity variants.
+// Validation: GovernanceModelConfig::validate() -> Result<(), GovernanceError>
+//   - Threshold: 1 <= threshold <= signers.len(), signers non-empty, window in [300, 604_800]
+//   - Majority: min_participation in (0.0, 1.0], window in [300, 604_800]
+//   - Unanimity: window in [300, 604_800]
+```
+
+2. **`GovernanceProposal` struct and `GovernanceAction` enum:**
+
+   - `GovernanceProposal` with `proposal_id`, `context_id`, `proposer_did`, `action`, `status`, `created_at`, `voting_deadline`, `approvals`, `rejections`, `created_at_epoch`.
+   - `GovernanceAction` with all variants listed in section 3.
+   - `ProposalStatus` with `Pending`, `Approved`, `Rejected`, `Expired`, `Cancelled`, `Invalidated`.
+   - Proposals are persisted to `ProtocolStore` on creation and on every status change.
+
+3. **`SingleAdminEngine` implementation:**
+
+   - `propose()` creates a proposal and immediately sets status to `Approved` if the proposer is the admin DID. Returns `GovernanceError::NotAdmin` if proposer is not the admin.
+   - `approve()`/`reject()` return current status (no-op).
+   - `eligible_voters()` returns `[admin_did]`.
+
+4. **`ThresholdEngine` implementation:**
+
+   - `propose()` creates a `Pending` proposal. The proposer's vote counts as the first approval.
+   - `approve()` adds a `SignedVote` if the voter is in `signers` and has not already voted. Calls `resolve()`.
+   - `reject()` adds a rejection vote. Calls `resolve()`.
+   - `resolve()` returns `Approved` if `approvals.len() >= threshold`, `Rejected` if `rejections.len() > signers.len() - threshold`, `Expired` if past deadline.
+   - `withdraw_vote()` removes the voter's vote. Returns error if proposal is not `Pending`.
+   - `eligible_voters()` returns the `signers` set.
+
+5. **`MajorityEngine` implementation:**
+
+   - `propose()` creates a `Pending` proposal. Freezes the eligible voter set at creation time.
+   - `approve()`/`reject()` add votes if voter is in the frozen eligible set.
+   - `resolve()` applies the resolution rules from section 4c: early approval if > 50%, early rejection if approval impossible, participation check at deadline.
+   - `eligible_voters()` returns all members with `GovernanceVote` capability at the time of the call.
+
+6. **`UnanimityEngine` implementation:**
+
+   - `propose()` creates a `Pending` proposal. Freezes the eligible voter set.
+   - `approve()` adds approval. If all eligible voters have approved, status becomes `Approved`.
+   - `reject()` immediately sets status to `Rejected { reason: UnanimityBroken { rejector } }`.
+   - `resolve()` returns `Expired` if past deadline and not all have voted.
+
+7. **Event types added to `EventType` enum (ADR-011):**
+
+```rust
+// Additions to EventType in scp-core/event_log/
+GovernanceProposalCreated {
+    proposal_id: ProposalId,
+    proposer_did: DID,
+    action: GovernanceAction,
+    voting_deadline: u64,
+},
+GovernanceVoteCast {
+    proposal_id: ProposalId,
+    voter_did: DID,
+    vote: VoteType,
+},
+GovernanceVoteWithdrawn {
+    proposal_id: ProposalId,
+    voter_did: DID,
+},
+GovernanceProposalResolved {
+    proposal_id: ProposalId,
+    status: ProposalStatus,
+    executor_did: Option<DID>,
+    resulting_epoch: Option<u64>,
+},
+GovernanceConflictDetected {
+    proposal_a: ProposalId,
+    proposal_b: ProposalId,
+},
+GovernanceConflictResolved {
+    winner_id: Option<ProposalId>,
+    resolution: ConflictResolution,
+},
+GovernanceDeadlockRecovery {
+    justification: DeadlockJustification,
+    changes: Vec<GovernanceReconfigAction>,
+},
+```
+
+8. **Governance timeout background task:**
+
+   - `GovernanceTimeoutTask` runs every 60 seconds per context with active proposals.
+   - Calls `resolve()` on each pending proposal to check for expiry.
+   - Detects voter departures and adjusts tallies.
+   - Detects deadlock conditions (consecutive missed voting windows per voter).
+
+9. **Protocol-level unanimity override for TTL extension:**
+
+   - When a `GovernanceAction::ExtendTtl` proposal is created in a non-Unanimity context, the `ContextManager` overrides the governance model's resolution rules and requires approval from ALL current members (not just governance voters). This enforces §5.10's requirement that TTL extension requires unanimous consent.
+
+10. **Integration test:**
+
+```
+1. Alice creates a context with Threshold(2-of-3, signers: [Alice, Bob, Carol]).
+2. Verify: Alice, Bob, Carol all receive GovernancePropose + GovernanceVote UCANs.
+3. Alice proposes AddMember { did: Dave, role: "member" }.
+   Event log records GovernanceProposalCreated.
+   Alice's proposal counts as first approval.
+4. Dave is NOT yet a member (proposal is Pending, 1-of-2 approvals).
+5. Bob approves. Proposal reaches threshold (2-of-3). Status -> Approved.
+   Event log records GovernanceVoteCast, GovernanceProposalResolved.
+   ContextManager executes: Dave is added via MLS add_member().
+6. Dave is now a member with role "member".
+
+--- Rejection test ---
+7. Alice proposes RemoveMember { did: Dave }.
+8. Bob rejects. Carol rejects. Rejections (2) > signers (3) - threshold (2) = 1.
+   Proposal status -> Rejected { reason: ApprovalImpossible }.
+   Dave remains a member.
+
+--- Vote withdrawal test ---
+9. Alice proposes ChangeRole { did: Dave, new_role: "observer" }.
+10. Bob approves (1-of-2 needed). Before Carol votes, Bob withdraws.
+    Approvals drop to 1 (Alice only). Proposal still Pending.
+11. Carol approves. Threshold met. Proposal Approved.
+
+--- Expiry test ---
+12. Alice proposes CloseContext. Voting window: 300 seconds.
+13. Simulate time advance past voting window. No quorum reached.
+    GovernanceTimeoutTask fires. Proposal status -> Expired.
+
+--- Conflict test ---
+14. Alice and Bob both go offline.
+15. Alice proposes ChangeRole { did: Dave, role: "admin" }.
+    Bob proposes RemoveMember { did: Dave }.
+16. Both reconnect. Both proposals committed to event log.
+    Alice's proposal has lower sequence number -> wins.
+    Bob's proposal -> Invalidated.
+    GovernanceConflictDetected event recorded.
+
+--- Unanimity test ---
+17. Create a separate context with Unanimity governance.
+18. Alice proposes AddMember { did: Eve }.
+19. Bob approves. Carol approves. Alice already approved (proposer).
+    All eligible voters approved. Status -> Approved.
+20. Alice proposes RemoveMember { did: Eve }.
+21. Bob rejects. Status -> Rejected { reason: UnanimityBroken { rejector: Bob } }.
+
+--- Majority test ---
+22. Create a context with Majority governance, min_participation: 0.5.
+    Members: Alice, Bob, Carol, Dave, Eve (5 eligible voters).
+23. Alice proposes RegisterTool { ... }.
+24. Alice, Bob, Carol approve (3/5 > 50%). Early resolution -> Approved.
+
+--- Deadlock recovery test ---
+25. Create a Threshold(3-of-4, signers: [Alice, Bob, Carol, Dave]) context.
+26. Carol and Dave leave the context.
+27. Alice proposes AddMember. Only Alice and Bob can vote.
+    threshold (3) > active signers (2). Deadlock detected.
+28. Alice proposes ReconfigureGovernance: remove Carol, remove Dave,
+    reduce threshold to 2.
+29. Fallback quorum: majority of active voters (2). Alice + Bob approve.
+    Governance reconfigured. GovernanceDeadlockRecovery event logged.
+30. Alice re-proposes AddMember. Now 2-of-2 threshold. Alice + Bob approve.
+    Proposal passes.
+```
+
+### Scope
+
+**Files (~6-8):**
+
+| File | Purpose |
+|------|---------|
+| `mod.rs` | Module root, `GovernanceEngine` trait, `GovernanceModelConfig`, `GovernanceAction`, `ProposalStatus`, `GovernanceProposal`, re-exports |
+| `single_admin.rs` | `SingleAdminEngine` — auto-approve on propose, admin transfer |
+| `threshold.rs` | `ThresholdEngine` — M-of-N vote collection, signer set management, threshold modification |
+| `majority.rs` | `MajorityEngine` — majority vote, participation threshold, frozen voter set |
+| `unanimity.rs` | `UnanimityEngine` — all-or-nothing voting, immediate rejection on any dissent |
+| `proposal.rs` | `GovernanceProposal` lifecycle, `SignedVote`, vote withdrawal, proposal persistence, conflict detection |
+| `deadlock.rs` | Deadlock detection, `ReconfigureGovernance`, fallback quorum, `DeadlockJustification` |
+| `timeout.rs` | `GovernanceTimeoutTask`, periodic proposal resolution, voter departure handling, epoch invalidation |
+
+**Estimated functions:** ~25-30 public functions, ~15-20 internal helpers.

@@ -4,7 +4,7 @@
 
 Software is shifting from something we labor to craft into something manufactured on demand. We are early in this transition, but the trajectory is clear: production-ready apps built entirely by agents in hours or days — work that would have taken teams weeks or months, at a fraction of the cost. These apps are being commissioned by non-technical people operating agentic flows like OpenClaw, not by engineers writing code. Everything points to a world in the near future where software is on-demand, disposable, and highly personal. Agents will soon be building an overwhelming majority of the world's software. Without a guarantee that these ephemeral clients can exchange durable state, and without a strong, agent-optimized protocol for doing so, the result is fragmented apps saved only by monolithic solutions from established enterprises like Apple, Google, and Meta. SCP is the open, functional answer — not just an ethical alternative to platform lock-in, but the functionally preferable one: no opinions, easy adoption, collective contribution, and unlimited integration.
 
-SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure protocol that provides the social layer for software built by and for AI agents: cryptographically verifiable identity (DID), governed interaction spaces (contexts), trustworthy communication channels (MLS encryption), capability-based authorization (UCAN), and transparent provenance. App generation is becoming trivial — agents increasingly build ephemeral, personalized software on demand. What remains hard is the connective tissue between these clients and the humans and agents using them: identity, trust, relationships, and accountability. SCP is that connective tissue. The core is implemented in Rust with language bindings via PyO3 (Python), UniFFI (Swift, Kotlin), and wasm-bindgen (TypeScript). Client SDKs handle identity management, context participation, encryption, and transport — everything a client needs to join and interact within contexts. Server SDKs handle relay operation, message routing, and storage — everything needed to run SCP infrastructure. Both are optional and independent: a client can connect to any conforming relay, and relay operators need no knowledge of client implementations. All interaction happens within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. Transport is fully abstracted behind an adapter trait with an SCP native relay as the canonical reference and 17 additional adapters (Nostr, Matrix, libp2p, Hyperswarm, WebSocket, etc.). The build follows phased delivery defined in `.docs/architecture.md` §4, with Architecture Decision Records in `.docs/adrs/`.
+SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure protocol that provides the social layer for software built by and for AI agents: cryptographically verifiable identity (DID), governed interaction spaces (contexts), trustworthy communication channels (MLS encryption), capability-based authorization (UCAN), and transparent provenance. App generation is becoming trivial — agents increasingly build ephemeral, personalized software on demand. What remains hard is the connective tissue between these clients and the humans and agents using them: identity, trust, relationships, and accountability. SCP is that connective tissue. The core is implemented in Rust with language bindings via PyO3 (Python), UniFFI (Swift, Kotlin), and wasm-bindgen (TypeScript). Client SDKs handle identity management, context participation, encryption, and transport — everything a client needs to join and interact within contexts. Server SDKs handle relay operation, message routing, and storage — everything needed to run SCP infrastructure. Both are optional and independent: a client can connect to any conforming relay, and relay operators need no knowledge of client implementations. All interaction happens within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. Transport is fully abstracted behind an adapter trait with an SCP native relay as the canonical reference and 17 additional adapters (Nostr, Matrix, libp2p, Hyperswarm, WebSocket, etc.). The build follows phased delivery defined in `.docs/adrs/`.
 
 ### Protocol tenets
 
@@ -29,12 +29,14 @@ SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure p
 - **Artifacts are the system of record.** All knowledge — decisions, patterns, constraints, product context — lives in-repo as discoverable artifacts. If an agent can't find it, it doesn't exist.
 - **Root-cause orientation.** Bugs come from poor decisions upstream. Treat them first as architecture flaws, second as local defects. Don't patch around bad foundations — fix or replace them.
 - **No shortcuts.** The best solution is the right one. No force unwraps, no placeholder implementations, no "good enough." Ship excellent, complete, production-ready code.
+- **Provenance is paramount.** Every line of code must trace back to a documented decision. Typically this will be: source(s) in ~/.docs/ > story in .loom/prd.json. But it may be more complex, involving comments in GitHub or feature-local .docs/ artifacts. No matter how long the chain, provenance must be maintained so that full context is retraceable for every line of code, and fresh agents with no memory can obtain it quickly and easily.
 
 ## Rules
 
 **Operating model:**
-- Humans steer. Agents execute. No human written code
+- Humans steer. Agents execute. No human written code; only human driven specs.
 - Context is scarce — give agents a map, not a manual. Monolithic artifacts rot
+- Provenance must always be maintained, and always be traced back. Everything along the provenance chain must be kept up to date. All sources along the chain should read and referenced before making changes or decisions.
 - Be autonomous: infer from context, code, artifacts. Escalate only for genuine judgment calls
 
 **Workflow:**
@@ -55,27 +57,6 @@ Use agents eagerly for focus, expertise, and parallelization — especially code
 ## Project Map
 
 ### Agentic harness & artifacts:
-
-**Loom loop rules for success:**
-- **Atomic stories.** One subagent, one iteration (~15-30 min). Coupled work (model + migration + route) stays together; unrelated work does not.
-- **Machine-verifiable acceptance criteria.** Not "it works" but "POST /api/x returns 200 with a JWT". If you can't write a test for it, Loom can't verify it.
-- **File isolation for parallelism.** Stories that touch the same files cannot run in the same batch. Set `blockedBy` for true data dependencies only.
-- **Green tests are a hard gate.** Never commit failing code. Failures go to status.md for the next iteration. 3 fix attempts max per iteration.
-- **Context is scarce.** Read prd.json in jq waves of 10. Use dedicated tools (Read, Grep, Glob) not shell. status.md is the only cross-iteration continuity — write it thoroughly.
-- **Search before building.** Always search the codebase before assuming something is missing.
-- **Scope is sacred.** Implement only the assigned story. Don't "fix" adjacent code or add unrequested features.
-
-.loom/               # Autonomous dev loop — dispatches parallel subagents from a PRD
-├── loom.sh          # Main loop script — starts/stops iterations, manages tmux panes
-├── prompt.md        # Autonomous iteration instructions (story selection, execution, commit)
-├── directive.md     # Single-task mode instructions (execute one directive, signal result)
-├── prd.json         # Structured stories with gates (P0/P1/P2), deps, acceptance criteria
-├── status.md        # Current iteration state (read at start, written at end of each cycle)
-├── prd.sh           # Standalone PRD generator (wraps claude -p)
-├── loom-status.sh   # Status display — parses logs and status.md for summary
-├── stop.sh          # Graceful stop signal
-├── specs/           # Reference specs and ticket tracking for Loom
-└── hooks/           # Guard rails: stop signals, interactive blocking, subagent limits
 
 .claude/             # Claude's project-wide operating instructions and tools
 ├── agents/          # 21 agent definitions — 8 core specialists + 13 reviewers (see agents/README.md)
@@ -126,3 +107,4 @@ Loom runs Claude Code in a continuous loop: read tasks from a PRD, dispatch para
 **Search before building.** Subagents must search the codebase before assuming something is missing. Reimplementing existing code is a common failure mode.
 
 **Scope is sacred.** Implement only the assigned story. Do not "fix" adjacent code, add unrequested features, or refactor code that seems inconsistent with other specs.
+<!-- loom:end -->

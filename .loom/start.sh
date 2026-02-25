@@ -22,7 +22,7 @@ else
 fi
 DRY_RUN=false
 DIRECTIVE_FILE=""
-TIMEOUT=3600
+TIMEOUT=10800
 MAX_FAILURES=3
 CONSECUTIVE_FAILURES=0
 
@@ -51,6 +51,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
+TERM_WIDTH=$(tput cols 2>/dev/null || echo 120)
 
 # ─── Helpers ─────────────────────────────────────────────────────
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
@@ -137,18 +138,23 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --resume)
-      [[ $# -ge 2 ]] || die "$1 requires a worktree path or branch name"
-      RESUME_WORKTREE="$2"
-      shift 2
+      if [[ $# -ge 2 ]] && [[ "$2" != --* ]]; then
+        RESUME_WORKTREE="$2"
+        shift 2
+      else
+        # Default to current directory
+        RESUME_WORKTREE="."
+        shift 1
+      fi
       ;;
     -h|--help)
       cat <<'HELPEOF'
-Usage: loom.sh [OPTIONS]
+Usage: start.sh [OPTIONS]
 
 Options:
   -m, --max-iterations N   Maximum loop iterations (default: 500)
   -d, --dry-run            Analyze one iteration without executing changes
-  --timeout SECONDS        Per-iteration timeout (default: 3600)
+  --timeout SECONDS        Per-iteration timeout (default: 10800)
   --max-failures N         Consecutive failures before halt (default: 3)
   -h, --help               Show this help
 
@@ -161,17 +167,17 @@ Sources (can be combined):
   --sentry URL_OR_QUERY   Fetch Sentry issue via MCP, fix the error
 
   Multiple sources can be combined:
-    loom.sh --linear PHN-42 --github 13 --prompt "Also fix lint"
+    start.sh --linear PHN-42 --github 13 --prompt "Also fix lint"
 
   Without a source flag, runs in PRD mode (reads prd.json).
   A directive can also be piped via stdin:
-    echo 'Fix all lint errors' | loom.sh
-    echo 'Only work on AC-001' | loom.sh --dry-run
+    echo 'Fix all lint errors' | start.sh
+    echo 'Only work on AC-001' | start.sh --dry-run
 
 Worktree:
   --worktree              Git worktree isolation (default: on)
   --pr                    Push + PR after loop (default: on)
-  --resume PATH_OR_BRANCH Reuse existing worktree
+  --resume [PATH_OR_BRANCH] Reuse existing worktree (default: current dir)
 
 Graceful stop:
   touch .loom/.stop      Stop after the current iteration finishes
@@ -186,10 +192,17 @@ done
 
 # ─── Piped stdin ─────────────────────────────────────────────────
 if [ ! -t 0 ]; then
-  PIPED="$(timeout 1 cat 2>/dev/null || true)"
+  # detect_timeout_cmd runs later, so resolve timeout binary inline here
+  _tc=""; command -v gtimeout &>/dev/null && _tc=gtimeout || command -v timeout &>/dev/null && _tc=timeout
+  if [ -n "$_tc" ]; then
+    PIPED="$("$_tc" 1 cat 2>/dev/null || true)"
+  else
+    PIPED="$(cat 2>/dev/null || true)"
+  fi
   if [ -n "$PIPED" ]; then
     SOURCES_PIPED="$PIPED"
   fi
+  unset _tc
 fi
 
 # ─── Build Directive Content ─────────────────────────────────────
@@ -361,6 +374,11 @@ fi
 
 # ─── Worktree Auto-Detection ────────────────────────────────────
 resolve_worktree() {
+  # Dry runs don't modify anything — skip worktree creation
+  if $DRY_RUN && [ -z "$RESUME_WORKTREE" ]; then
+    USE_WORKTREE="no"
+    return
+  fi
   if [ -z "$USE_WORKTREE" ]; then
     USE_WORKTREE="yes"
   fi
@@ -374,7 +392,7 @@ setup_worktree() {
   if [ -n "$RESUME_WORKTREE" ]; then
     # Resume existing worktree
     if [ -d "$RESUME_WORKTREE" ]; then
-      WORKTREE_DIR="$RESUME_WORKTREE"
+      WORKTREE_DIR="$(cd "$RESUME_WORKTREE" && pwd)"
     elif [ -d "$base_dir/$RESUME_WORKTREE" ]; then
       WORKTREE_DIR="$base_dir/$RESUME_WORKTREE"
     else
@@ -592,18 +610,20 @@ log() {
 }
 
 separator() {
-  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  printf "${DIM}──────────────────────────────────────────────────────${NC}\n"
 }
 
 master_log() {
   # Append a structured line to master.log
-  # Format: timestamp | #iteration | label | status | duration | reason
-  local iteration="$1" label="$2" status="$3" duration="$4" reason="$5"
+  # Format: timestamp | #iteration | label | status | duration | reason [| subagents:N]
+  local iteration="$1" label="$2" status="$3" duration="$4" reason="$5" subagents="${6:-}"
   local ts
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
   local log_dir="$LOOM_DIR/logs"
   mkdir -p "$log_dir"
-  echo "$ts | #$iteration | $label | $status | ${duration}s | $reason" >> "$log_dir/master.log"
+  local line="$ts | #$iteration | $label | $status | ${duration}s | $reason"
+  [ -n "$subagents" ] && line="$line | subagents:$subagents"
+  echo "$line" >> "$log_dir/master.log"
 }
 
 # ─── Timeout Detection ──────────────────────────────────────────
@@ -670,10 +690,12 @@ export LOOM_ACTIVE=1
 
 # ─── Cleanup ─────────────────────────────────────────────────────
 cleanup() {
-  # Attempt PR creation if the loop produced useful work.
-  # create_pr guards internally — safe to call unconditionally.
-  create_pr 2>/dev/null || true
-  rm -f "$LOOM_DIR/.directive" "$LOOM_DIR/.piped_directive" "$LOOM_DIR/.iteration_marker" "$LOOM_DIR/.stop" "$LOOM_DIR/.pid"
+  # Only attempt PR creation if the loop actually ran iterations.
+  # Prevents premature push on early exit (e.g. --resume with no work).
+  if [ "${ITERATION:-0}" -gt 0 ]; then
+    create_pr 2>/dev/null || true
+  fi
+  rm -f "$LOOM_DIR/.directive" "$LOOM_DIR/.piped_directive" "$LOOM_DIR/.iteration_marker" "$LOOM_DIR/.stop" "$LOOM_DIR/.pid" "$LOOM_DIR/.iter_state" "$LOOM_DIR/.header-pane.sh"
   cleanup_worktree
 }
 trap cleanup EXIT
@@ -694,7 +716,75 @@ echo $$ > "$PID_FILE"
 if [ "$USE_WORKTREE" = "yes" ]; then
   setup_worktree
   PROJECT_DIR="$WORKTREE_DIR"
+  # Repoint all runtime state into the worktree so concurrent looms
+  # don't clobber each other. Source .loom/ keeps only checked-in files.
+  SOURCE_LOOM_DIR="$LOOM_DIR"
+  LOOM_DIR="$PROJECT_DIR/.loom"
+  LOG_FILE="$LOOM_DIR/loom.log"
+  rm -f "$SOURCE_LOOM_DIR/.pid"
+  PID_FILE="$LOOM_DIR/.pid"
+  echo $$ > "$PID_FILE"
+  # Relocate composed directive into the worktree so concurrent looms
+  # don't overwrite each other's directives.
+  if [ -n "$DIRECTIVE_FILE" ] && [ "$DIRECTIVE_FILE" = "$SOURCE_LOOM_DIR/.directive" ]; then
+    cp "$DIRECTIVE_FILE" "$LOOM_DIR/.directive"
+    DIRECTIVE_FILE="$LOOM_DIR/.directive"
+  fi
 fi
+
+# ─── MCP Capability Detection ────────────────────────────────
+CAPABILITY_MAP=(
+  # browser
+  "playwright:browser"
+  "chrome:browser"
+  "puppeteer:browser"
+  "browserbase:browser"
+  # mobile
+  "mobile:mobile"
+  "mobile-mcp:mobile"
+  "appium:mobile"
+  # design
+  "figma:design"
+)
+
+detect_mcp_capabilities() {
+  local mcp_file="$PROJECT_DIR/.mcp.json"
+  local caps=""
+  if [ -f "$mcp_file" ]; then
+    local servers
+    servers=$(jq -r '.mcpServers // {} | keys[]' "$mcp_file" 2>/dev/null)
+    LOOM_MCP_SERVERS=$(echo "$servers" | paste -sd, -)
+    for server in $servers; do
+      for mapping in "${CAPABILITY_MAP[@]}"; do
+        if [ "$server" = "${mapping%%:*}" ]; then
+          local cap="${mapping#*:}"
+          [[ ",$caps," != *",$cap,"* ]] && caps="${caps:+$caps,}$cap"
+        fi
+      done
+      # Unknown servers: expose by name as a capability
+      local matched=false
+      for mapping in "${CAPABILITY_MAP[@]}"; do
+        [ "$server" = "${mapping%%:*}" ] && matched=true && break
+      done
+      $matched || caps="${caps:+$caps,}$server"
+    done
+  fi
+  export LOOM_MCP_SERVERS="${LOOM_MCP_SERVERS:-}"
+  export LOOM_CAPABILITIES="${caps:-}"
+}
+
+detect_mcp_capabilities
+
+# ─── Mode label for logging ───────────────────────────────────────
+MODE_LABEL=""
+[ -n "$SOURCES_LINEAR" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}linear"
+[ -n "$SOURCES_GITHUB" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}github"
+[ -n "$SOURCES_SLACK" ]  && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}slack"
+[ -n "$SOURCES_NOTION" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}notion"
+[ -n "$SOURCES_SENTRY" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}sentry"
+[ -n "$SOURCES_PROMPT" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}prompt"
+[ -n "$SOURCES_PIPED" ]  && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}prompt"
+MODE_LABEL="${MODE_LABEL:-prd}"
 
 # ─── Tmux Launch ─────────────────────────────────────────────────
 if $USE_TMUX; then
@@ -728,79 +818,141 @@ if $USE_TMUX; then
     FORWARD_FLAGS="$FORWARD_FLAGS --prompt $(printf '%q' "$SOURCES_PROMPT")"
   fi
 
-  # Forward worktree and PR overrides
-  if [ "$USE_WORKTREE" = "yes" ] && [ -z "$RESUME_WORKTREE" ]; then
-    FORWARD_FLAGS="$FORWARD_FLAGS --worktree true"
+  # Forward worktree and PR overrides — always resume the already-created
+  # worktree so the tmux child doesn't create a second orphaned one.
+  if [ "$USE_WORKTREE" = "yes" ]; then
+    FORWARD_FLAGS="$FORWARD_FLAGS --resume $(printf '%q' "$WORKTREE_DIR")"
   fi
   [ "$CREATE_PR" = "no" ] && FORWARD_FLAGS="$FORWARD_FLAGS --pr false"
-  if [ -n "$RESUME_WORKTREE" ]; then
-    FORWARD_FLAGS="$FORWARD_FLAGS --resume $(printf '%q' "$RESUME_WORKTREE")"
-  fi
 
   # Clear PID file so re-executed instance doesn't hit the concurrency guard
   # (this process is still alive when the tmux instance starts)
   rm -f "$PID_FILE"
 
-  # Main pane: the loom loop
-  tmux new-session -d -s "$TMUX_SESSION" \
-    "exec $0 $FORWARD_FLAGS"
+  # Compute header height to match content exactly
+  # Base: 1 (title) + 1 (PID/Mode) + 1 (Dir) + 1 (Stop) + 1 (Iter/timer) = 5
+  HEADER_HEIGHT=5
+  [ -n "$DIRECTIVE_FILE" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
+  # Tree line only shown when different from Dir
+  [ "$USE_WORKTREE" = "yes" ] && [ "$WORKTREE_DIR" != "$PROJECT_DIR" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
+  [ -n "${LOOM_CAPABILITIES:-}" ] && HEADER_HEIGHT=$((HEADER_HEIGHT + 1))
 
-  # Bottom-left: live status.md
-  tmux split-window -v -t "$TMUX_SESSION" -p 28 \
+  # Use real terminal size so pane proportions are correct on attach
+  TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+  TERM_LINES=$(tput lines 2>/dev/null || echo 50)
+
+  # Write .header before creating tmux so the header pane has content
+  # immediately. The child will overwrite with its own PID on start.
+  {
+    echo -e "  ${BOLD}${CYAN}Loom ∞${NC}"
+    echo -e "  ${DIM}PID${NC} ${BOLD}…${NC}  ${DIM}|${NC}  ${DIM}Mode${NC} ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
+    echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
+    [ -n "$DIRECTIVE_FILE" ] && echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
+    [ "${USE_WORKTREE:-}" = "yes" ] && [ "${WORKTREE_DIR:-}" != "$PROJECT_DIR" ] && echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
+    [ -n "${LOOM_CAPABILITIES:-}" ] && echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
+    echo -e "  ${DIM}Stop${NC}  ${CYAN}touch $LOOM_DIR/.stop${NC}"
+  } > "$LOOM_DIR/.header"
+
+  # Generate header pane script (reads .header + .iter_state, computes elapsed timer)
+  cat > "$LOOM_DIR/.header-pane.sh" <<'HEADEREOF'
+#!/bin/sh
+LOOM_DIR="$1"
+while true; do
+  printf '\033[H\033[J'
+  cat "$LOOM_DIR/.header" 2>/dev/null || printf '  Starting…\n'
+  if [ -f "$LOOM_DIR/.iter_state" ]; then
+    read -r iter start < "$LOOM_DIR/.iter_state"
+    now=$(date +%s)
+    elapsed=$((now - start))
+    mins=$((elapsed / 60))
+    secs=$((elapsed % 60))
+    printf '  \033[2mIter\033[0m  \033[1m#%s\033[0m  \033[2m|\033[0m  \033[2m%dm %02ds\033[0m\n' "$iter" "$mins" "$secs"
+  else
+    printf '  \033[2mIter\033[0m  \033[2mwaiting…\033[0m\n'
+  fi
+  sleep 1
+done
+HEADEREOF
+
+  # Main pane: the loom loop (LOOM_TMUX_CHILD tells the child to
+  # write its banner to .header instead of stdout)
+  tmux new-session -d -s "$TMUX_SESSION" -x "$TERM_COLS" -y "$TERM_LINES" \
+    "LOOM_TMUX_CHILD=1 exec $0 $FORWARD_FLAGS"
+
+  # Top: fixed header pane (always visible, sized to content, 1s refresh for timer)
+  tmux split-window -v -b -t "$TMUX_SESSION:0.0" -l "$HEADER_HEIGHT" \
+    "exec sh \"$LOOM_DIR/.header-pane.sh\" \"$LOOM_DIR\""
+
+  # Bottom-left: live status.md (compact, 10 lines)
+  tmux split-window -v -t "$TMUX_SESSION:0.1" -l 10 \
     "exec watch -n 3 -t sh -c 'printf \"\\033[1;36m── status.md ──\\033[0m\\n\"; cat \"$LOOM_DIR/status.md\" 2>/dev/null || echo \"(empty)\"'"
 
   # Bottom-right: log tail
-  tmux split-window -h -t "$TMUX_SESSION" \
+  tmux split-window -h -t "$TMUX_SESSION:0.2" \
     "exec tail -f \"$LOOM_DIR/logs/master.log\" 2>/dev/null || tail -f \"$LOG_FILE\""
 
-  # Focus main pane
-  tmux select-pane -t "$TMUX_SESSION:0.0"
+  # Pin pane sizes: header at top, bottom panes at 10 lines
+  tmux resize-pane -t "$TMUX_SESSION:0.0" -y "$HEADER_HEIGHT" 2>/dev/null || true
+  tmux resize-pane -t "$TMUX_SESSION:0.2" -y 10 2>/dev/null || true
+  tmux resize-pane -t "$TMUX_SESSION:0.3" -y 10 2>/dev/null || true
+  tmux select-pane -t "$TMUX_SESSION:0.1"
+  # Hook fires on terminal resize — re-pin header and bottom panes.
+  # run-shell wraps in sh so errors don't propagate to tmux.
+  tmux set-hook -t "$TMUX_SESSION" client-resized \
+    "run-shell 'tmux resize-pane -t 0.0 -y $HEADER_HEIGHT 2>/dev/null; tmux resize-pane -t 0.2 -y 10 2>/dev/null; tmux resize-pane -t 0.3 -y 10 2>/dev/null; true'"
 
   echo -e "${GREEN}Loom launched in tmux session '${TMUX_SESSION}'${NC}"
   echo -e "  Attach:  ${BOLD}tmux attach -t $TMUX_SESSION${NC}"
   echo -e "  Kill:    ${BOLD}tmux kill-session -t $TMUX_SESSION${NC}"
   echo -e "  Stop:    ${BOLD}touch .loom/.stop${NC} (finishes current iteration)"
 
-  # Auto-attach when running from a terminal (not inside Claude Code)
-  if [ -z "${CLAUDECODE:-}" ]; then
+  # Auto-attach when running from an interactive terminal
+  if [ -t 0 ]; then
     exec tmux attach -t "$TMUX_SESSION"
   fi
+  # The tmux child owns all runtime state now — disable cleanup so the
+  # parent doesn't delete files (.directive, .piped_directive) before
+  # the async child reads them. The child handles its own cleanup.
+  trap - EXIT
   exit 0
 fi
 
-# ─── Mode label for logging ───────────────────────────────────────
-MODE_LABEL=""
-[ -n "$SOURCES_LINEAR" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}linear"
-[ -n "$SOURCES_GITHUB" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}github"
-[ -n "$SOURCES_SLACK" ]  && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}slack"
-[ -n "$SOURCES_NOTION" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}notion"
-[ -n "$SOURCES_SENTRY" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}sentry"
-[ -n "$SOURCES_PROMPT" ] && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}prompt"
-[ -n "$SOURCES_PIPED" ]  && MODE_LABEL="${MODE_LABEL:+$MODE_LABEL+}prompt"
-MODE_LABEL="${MODE_LABEL:-prd}"
-
 # ─── Banner ──────────────────────────────────────────────────────
-echo -e "${CYAN}"
-echo "  ╔═══════════════════════════════════════════╗"
-echo "  ║             L O O M   L O O P             ║"
-echo "  ╚═══════════════════════════════════════════╝"
-echo -e "${NC}"
-echo -e "  ${DIM}PID${NC}   ${BOLD}$$${NC}"
-echo -e "  ${DIM}Mode${NC}  ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
-echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
-if [ -n "$DIRECTIVE_FILE" ]; then
-  echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
+if [ "${LOOM_TMUX_CHILD:-}" = "1" ]; then
+  # Compact banner for the fixed tmux header pane
+  {
+    echo -e "  ${BOLD}${CYAN}Loom ∞${NC}"
+    echo -e "  ${DIM}PID${NC} ${BOLD}$$${NC}  ${DIM}|${NC}  ${DIM}Mode${NC} ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
+    echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
+    [ -n "$DIRECTIVE_FILE" ] && echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
+    [ "${USE_WORKTREE:-}" = "yes" ] && [ "${WORKTREE_DIR:-}" != "$PROJECT_DIR" ] && echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
+    [ -n "${LOOM_CAPABILITIES:-}" ] && echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
+    echo -en "  ${DIM}Stop${NC}  ${CYAN}touch $LOOM_DIR/.stop${NC}"
+  } > "$LOOM_DIR/.header"
+else
+  echo ""
+  echo -e "  ${BOLD}${CYAN}Loom ∞${NC}"
+  echo ""
+  echo -e "  ${DIM}PID${NC}   ${BOLD}$$${NC}"
+  echo -e "  ${DIM}Mode${NC}  ${BOLD}$MODE_LABEL${NC}  ${DIM}|${NC}  ${DIM}Iter${NC} ${BOLD}$MAX_ITERATIONS${NC}  ${DIM}|${NC}  ${DIM}Timeout${NC} ${BOLD}${TIMEOUT}s${NC}"
+  echo -e "  ${DIM}Dir${NC}   $PROJECT_DIR"
+  if [ -n "$DIRECTIVE_FILE" ]; then
+    echo -e "  ${DIM}Src${NC}   $DIRECTIVE_FILE"
+  fi
+  if [ "$USE_WORKTREE" = "yes" ] && [ "${WORKTREE_DIR:-}" != "$PROJECT_DIR" ]; then
+    echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
+  fi
+  if [ -n "$LOOM_CAPABILITIES" ]; then
+    echo -e "  ${DIM}MCPs${NC}  ${GREEN}$LOOM_CAPABILITIES${NC}"
+  fi
+  echo ""
+  echo -e "  ${CYAN}Graceful stop${NC}    touch $LOOM_DIR/.stop"
+  echo -e "  ${CYAN}Kill${NC}             kill -TERM -$$"
+  echo -e "  ${CYAN}Tail log${NC}         tail -f $LOG_FILE"
+  echo -e "  ${CYAN}Status${NC}           cat $LOOM_DIR/status.md"
+  echo -e "  ${CYAN}Master log${NC}       tail -f $LOOM_DIR/logs/master.log"
+  echo ""
 fi
-if [ "$USE_WORKTREE" = "yes" ]; then
-  echo -e "  ${DIM}Tree${NC}  $WORKTREE_DIR"
-fi
-echo ""
-echo -e "  ${CYAN}Graceful stop${NC}    touch .loom/.stop"
-echo -e "  ${CYAN}Kill${NC}             kill -TERM -$$"
-echo -e "  ${CYAN}Tail log${NC}         tail -f .loom/loom.log"
-echo -e "  ${CYAN}Status${NC}           cat .loom/status.md"
-echo -e "  ${CYAN}Master log${NC}       tail -f .loom/logs/master.log"
-echo ""
 
 if $DRY_RUN; then
   log "${YELLOW}${BOLD}DRY RUN${NC} — analysis only, no changes will be made"
@@ -828,11 +980,11 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
   # ─── Circuit breaker: consecutive failures ──
   if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_FAILURES" ]; then
     log "${RED}${BOLD}Circuit breaker tripped:${NC} $CONSECUTIVE_FAILURES consecutive failures. Halting."
-    master_log "$ITERATION" "$MODE_LABEL" "HALTED" "0" "Circuit breaker: $CONSECUTIVE_FAILURES consecutive failures"
+    master_log "$ITERATION" "$MODE_LABEL" "HALTED" "0" "Circuit breaker: $CONSECUTIVE_FAILURES consecutive failures" "0"
     break
   fi
 
-  separator
+  echo ""
   log "${BOLD}Iteration $ITERATION${NC} (failures: $CONSECUTIVE_FAILURES/$MAX_FAILURES)"
   separator
 
@@ -917,41 +1069,108 @@ DRYEOF
 
   cd "$PROJECT_DIR"
 
+  export LOOM_TIMEOUT="$TIMEOUT"
+
   # ─── Per-iteration log file ──
   ITER_LABEL="${MODE_LABEL}"
   ITER_LOG="$LOOM_DIR/logs/$(date '+%Y%m%d-%H%M%S')-${ITER_LABEL}.log"
   ITER_START=$(date +%s)
+  echo "$ITERATION $ITER_START" > "$LOOM_DIR/.iter_state"
 
   # ─── Execute Claude with streaming output ──
-  set +e
+  CLAUDE_PREFIX=""
   if [ -n "$TIMEOUT_CMD" ] && [ "$TIMEOUT" -gt 0 ]; then
-    $TIMEOUT_CMD --foreground "$TIMEOUT" claude -p \
-      --dangerously-skip-permissions \
-      --verbose \
-      --output-format stream-json \
-      --include-partial-messages \
-      "$PROMPT" 2>>"$LOG_FILE" | \
-      jq --unbuffered -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text' 2>/dev/null | \
-      tee >(strip_ansi | tee -a "$LOG_FILE" > "$ITER_LOG")
-    CLAUDE_EXIT=${PIPESTATUS[0]}
-  else
-    claude -p \
-      --dangerously-skip-permissions \
-      --verbose \
-      --output-format stream-json \
-      --include-partial-messages \
-      "$PROMPT" 2>>"$LOG_FILE" | \
-      jq --unbuffered -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text' 2>/dev/null | \
-      tee >(strip_ansi | tee -a "$LOG_FILE" > "$ITER_LOG")
-    CLAUDE_EXIT=${PIPESTATUS[0]}
+    CLAUDE_PREFIX="$TIMEOUT_CMD --foreground $TIMEOUT"
   fi
+
+  SUBAGENT_LOG="$LOOM_DIR/logs/$(date '+%Y%m%d-%H%M%S')-${ITER_LABEL}-subagents.jsonl"
+
+  set +e
+  # Pipeline: claude | tee (sidecar) | jq (text extraction) | tee (log capture)
+  # PIPESTATUS[0] = claude (or timeout wrapper)
+  # PIPESTATUS[1] = tee (subagent sidecar fork)
+  # PIPESTATUS[2] = jq text_delta extraction
+  # PIPESTATUS[3] = tee (log capture)
+  $CLAUDE_PREFIX claude -p \
+    --dangerously-skip-permissions \
+    --verbose \
+    --output-format stream-json \
+    --include-partial-messages \
+    "$PROMPT" 2>>"$LOG_FILE" | \
+    tee >(jq --unbuffered -c '
+      select(.type == "stream_event") |
+      if (
+        .event.type? == "content_block_start" and
+        .event.content_block.type? == "tool_use" and
+        .event.content_block.name? == "Task"
+      ) then
+        {
+          ts: now | strftime("%Y-%m-%d %H:%M:%S"),
+          event: "dispatch",
+          tool_use_id: .event.content_block.id,
+          index: .event.index
+        }
+      elif (
+        .event.type? == "content_block_stop"
+      ) then
+        {
+          ts: now | strftime("%Y-%m-%d %H:%M:%S"),
+          event: "block_stop",
+          index: .event.index
+        }
+      else empty
+      end
+    ' >> "$SUBAGENT_LOG" 2>/dev/null || true) | \
+    jq --unbuffered -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text' 2>/dev/null | \
+    tee >(strip_ansi | tee -a "$LOG_FILE" > "$ITER_LOG")
+  CLAUDE_EXIT=${PIPESTATUS[0]}
   set -e
 
   ITER_END=$(date +%s)
   ITER_DURATION=$((ITER_END - ITER_START))
 
+  # ─── Count subagent dispatches + completions ──
+  # Dispatches are content_block_start with name=="Task". Completions
+  # are content_block_stop events matched by index to a dispatch.
+  SUBAGENT_COUNT=0
+  SUBAGENT_COMPLETED=0
+  if [ -f "$SUBAGENT_LOG" ] && [ -s "$SUBAGENT_LOG" ]; then
+    eval "$(jq -rs '
+      ([.[] | select(.event == "dispatch")] | length) as $d |
+      ([.[] | select(.event == "dispatch") | .index]) as $di |
+      ([.[] | select(.event == "block_stop") | .index]) as $si |
+      ($di | map(select(. as $i | $si | index($i))) | length) as $c |
+      "SUBAGENT_COUNT=\($d) SUBAGENT_COMPLETED=\($c)"
+    ' "$SUBAGENT_LOG" 2>/dev/null || echo "SUBAGENT_COUNT=0 SUBAGENT_COMPLETED=0")"
+    SUBAGENT_ORPHANED=$((SUBAGENT_COUNT - SUBAGENT_COMPLETED))
+    if [ "$SUBAGENT_COUNT" -gt 0 ]; then
+      if [ "$SUBAGENT_ORPHANED" -gt 0 ]; then
+        log "${YELLOW}Subagents: $SUBAGENT_COMPLETED/$SUBAGENT_COUNT completed ($SUBAGENT_ORPHANED did not finish)${NC}"
+      else
+        log "${GREEN}Subagents: $SUBAGENT_COUNT/$SUBAGENT_COUNT completed${NC}"
+      fi
+    fi
+  fi
+
   # ─── Parse result signal from iteration output ──
   RESULT_SIGNAL=$(parse_result_signal "$ITER_LOG")
+
+  # Fallback: if agent didn't emit a signal but clearly succeeded,
+  # infer from status.md content (which it writes as the final step).
+  if [ "$RESULT_SIGNAL" = "UNKNOWN" ] && [ "$CLAUDE_EXIT" -eq 0 ]; then
+    if [ -f "$LOOM_DIR/status.md" ] && [ "$LOOM_DIR/status.md" -nt "$LOOM_DIR/.iteration_marker" ]; then
+      if grep -qiE 'LOOM_RESULT:DONE|no (actionable |remaining )?stories remain' "$LOOM_DIR/status.md" 2>/dev/null; then
+        RESULT_SIGNAL="DONE"
+      elif grep -qiE 'LOOM_RESULT:SUCCESS|all.*complete|all.*done' "$LOOM_DIR/status.md" 2>/dev/null; then
+        RESULT_SIGNAL="SUCCESS"
+      elif grep -qiE 'LOOM_RESULT:PARTIAL|partial|some.*failed' "$LOOM_DIR/status.md" 2>/dev/null; then
+        RESULT_SIGNAL="PARTIAL"
+      else
+        RESULT_SIGNAL="SUCCESS"
+      fi
+      log "${DIM}(inferred signal from status.md: $RESULT_SIGNAL)${NC}"
+    fi
+  fi
 
   # ─── Determine iteration status ──
   ITER_STATUS="unknown"
@@ -971,12 +1190,11 @@ DRYEOF
     log "${YELLOW}Iteration $ITERATION finished (exit $CLAUDE_EXIT, signal: $RESULT_SIGNAL)${NC}"
   fi
 
-  master_log "$ITERATION" "$ITER_LABEL" "$ITER_STATUS" "$ITER_DURATION" "$ITER_REASON"
+  master_log "$ITERATION" "$ITER_LABEL" "$ITER_STATUS" "$ITER_DURATION" "$ITER_REASON" "$SUBAGENT_COUNT"
 
   # ─── Done: no remaining work ──
   if [ "$RESULT_SIGNAL" = "DONE" ]; then
     log "${GREEN}${BOLD}All work complete.${NC} Halting loop."
-    create_pr
     break
   fi
 
@@ -1002,6 +1220,5 @@ done
 
 if ! $DRY_RUN && [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
   log "${YELLOW}${BOLD}Loom completed $MAX_ITERATIONS iterations. Halting.${NC}"
-  master_log "$ITERATION" "$MODE_LABEL" "MAX_ITER" "0" "Reached max iterations"
-  create_pr
+  master_log "$ITERATION" "$MODE_LABEL" "MAX_ITER" "0" "Reached max iterations" "0"
 fi
