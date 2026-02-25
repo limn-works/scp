@@ -80,17 +80,16 @@ In addition to permanent context provided by artifacts, you have access to an MC
 <!-- loom:begin -->
 ## Loom — Autonomous Development Loop
 
-Loom runs Claude Code in a continuous loop: read tasks from a PRD, dispatch parallel subagents, run tests, commit green code, repeat.
+Loom is installed as a Claude Code plugin (`alecmarcus/loom`). It runs Claude Code in a continuous loop: read tasks from a PRD, dispatch parallel subagents, run tests, commit green code, repeat.
 
 ```
-.loom/               # Autonomous dev loop — dispatches parallel subagents from a PRD
+.loom/               # Per-project Loom state (plugin provides scripts, hooks, and skills)
 ├── prd.json         # Structured stories with gates (P0/P1/P2), deps, acceptance criteria
-├── prompt.md        # Autonomous iteration instructions (story selection, execution, commit)
-├── directive.md     # Single-task mode instructions (execute one directive, signal result)
 ├── status.md        # Current iteration state (read at start, written at end of each cycle)
-├── prd.sh           # Standalone PRD generator (wraps claude -p)
-└── hooks/           # Guard rails: stop signals, interactive blocking, subagent limits
+└── logs/            # Per-iteration logs
 ```
+
+**Skills:** `/loom:start`, `/loom:init`, `/loom:setup`, `/loom:prd`, `/loom:status`, `/loom:stop`, `/loom:kill`, `/loom:preview`
 
 ### Rules for success
 
