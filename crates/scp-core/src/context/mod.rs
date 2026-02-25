@@ -29,6 +29,7 @@
 pub mod builder;
 pub mod manager;
 pub mod membership;
+pub mod memory_scope;
 pub mod params;
 pub mod roles;
 pub mod state_machine;
@@ -69,6 +70,13 @@ pub use manager::ContextManager;
 pub use membership::{
     ContextEvent, DEFAULT_BUFFER_CAPACITY, KeyPackage, MAX_BUFFER_CAPACITY, MIN_BUFFER_CAPACITY,
     MemberInfo, MembershipState, ReceiveBuffer,
+};
+
+// Re-export memory scope and key destruction types (SCP-067).
+pub use memory_scope::{
+    DeletionResponseStatus, KeyDestructionAttestation, KeyDestructionLevel,
+    KeyDestructionOrchestrator, RelayDeletionRequest, RelayDeletionTracker,
+    validate_memory_scope_for_broadcast,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).
@@ -200,6 +208,14 @@ pub enum ContextError {
     /// A key package validation failed.
     #[error("invalid key package: {0}")]
     InvalidKeyPackage(String),
+
+    /// An invalid memory scope was requested for a broadcast context.
+    ///
+    /// Broadcast contexts only support `MemoryScope::Full` because they lack
+    /// MLS group management and cannot deliver the key destruction semantics
+    /// required by `Ephemeral` and `Summary` scopes.
+    #[error("broadcast contexts only support MemoryScope::Full")]
+    InvalidMemoryScopeForBroadcast,
 }
 
 // ---------------------------------------------------------------------------

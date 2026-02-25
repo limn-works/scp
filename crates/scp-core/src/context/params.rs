@@ -154,6 +154,16 @@ pub enum MemoryScope {
     Full,
 }
 
+impl std::fmt::Display for MemoryScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ephemeral => write!(f, "Ephemeral"),
+            Self::Summary => write!(f, "Summary"),
+            Self::Full => write!(f, "Full"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GovernanceModel
 // ---------------------------------------------------------------------------
