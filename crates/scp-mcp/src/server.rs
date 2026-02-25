@@ -381,9 +381,10 @@ impl<P: ContextProvider> McpServer<P> {
     // Tool invocation
     // -----------------------------------------------------------------------
 
-    /// Handles `tools/call` -- parses context namespace, validates capability,
-    /// validates input against schema, invokes the tool, validates output, and
-    /// attaches provenance.
+    /// Handles `tools/call` -- parses context namespace, validates membership
+    /// and capability, validates input against schema, invokes the tool,
+    /// validates output, and attaches provenance.
+    #[allow(clippy::too_many_lines)]
     fn handle_tools_call(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let params: ToolsCallParams = match parse_params(request.params.as_ref()) {
             Ok(p) => p,
@@ -404,6 +405,25 @@ impl<P: ContextProvider> McpServer<P> {
                 );
             }
         };
+
+        // Verify caller is a member of the target context.
+        if !self
+            .provider
+            .active_context_ids()
+            .iter()
+            .any(|id| id == &context_id)
+        {
+            return JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError {
+                    code: protocol::INTERNAL_ERROR,
+                    message: format!(
+                        "membership check failed: caller is not a member of context {context_id}"
+                    ),
+                    data: None,
+                },
+            );
+        }
 
         // Validate UCAN capability.
         if let Err(msg) = self.provider.validate_capability(&context_id, tool_name) {
@@ -571,6 +591,22 @@ impl<P: ContextProvider> McpServer<P> {
                 JsonRpcError {
                     code: protocol::RESOURCE_NOT_FOUND,
                     message: format!("context not found: {context_id}"),
+                    data: None,
+                },
+            );
+        }
+
+        // Validate UCAN capability for the requested resource type.
+        let capability_name = format!("resource:{resource_type}");
+        if let Err(msg) = self
+            .provider
+            .validate_capability(&context_id, &capability_name)
+        {
+            return JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError {
+                    code: protocol::CAPABILITY_DENIED,
+                    message: msg,
                     data: None,
                 },
             );
@@ -1332,6 +1368,24 @@ mod tests {
     }
 
     #[test]
+    fn tools_call_rejects_non_member_context() {
+        // Agent only belongs to ctx_a and ctx_b, not ctx_x.
+        let mut server = initialized_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_TOOLS_CALL,
+            Some(serde_json::json!({
+                "name": "ctx_x/send_message",
+                "arguments": {"content": "hello"}
+            })),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, protocol::INTERNAL_ERROR);
+        assert!(err.message.contains("membership check failed"));
+        assert!(err.message.contains("ctx_x"));
+    }
+
+    #[test]
     fn tools_call_result_is_not_error_flag() {
         let mut server = initialized_server(MockProvider::default());
         let req = make_request(
@@ -1492,6 +1546,39 @@ mod tests {
         let resp = server.handle_request(&req).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, protocol::RESOURCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn resources_read_rejects_denied_ucan_capability() {
+        // Deny the resource:members capability for ctx_a.
+        let provider = MockProvider {
+            denied_capabilities: vec![("ctx_a".to_owned(), "resource:members".to_owned())],
+            ..MockProvider::default()
+        };
+        let mut server = initialized_server(provider);
+        let req = make_request(
+            protocol::METHOD_RESOURCES_READ,
+            Some(serde_json::json!({"uri": "scp://ctx_a/members"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, protocol::CAPABILITY_DENIED);
+    }
+
+    #[test]
+    fn resources_read_succeeds_with_valid_ucan_and_membership() {
+        // Default provider has ctx_a as active and no denied capabilities.
+        let mut server = initialized_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_RESOURCES_READ,
+            Some(serde_json::json!({"uri": "scp://ctx_a/members"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        let contents = result["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["uri"], "scp://ctx_a/members");
     }
 
     // -----------------------------------------------------------------------
