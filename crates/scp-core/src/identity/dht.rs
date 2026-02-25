@@ -316,6 +316,58 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         Ok(())
     }
 
+    /// Publishes a DID document to the DHT with optional relay URLs.
+    ///
+    /// When `relay_urls` is non-empty, `SCPRelay` service entries are added to
+    /// the document before signing and publishing. The BEP44 signature covers
+    /// the complete document including relay entries (existing §9.6.3 property).
+    ///
+    /// This is used during identity creation when the caller knows their relay
+    /// URLs upfront (§18.5 bootstrap flow).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::InvalidRelayUrl`] if any URL fails validation.
+    /// Returns [`IdentityError::DhtPublishFailed`] if the DHT publish fails.
+    pub async fn publish_with_relay_urls(
+        &self,
+        identity: &ScpIdentity,
+        document: &DidDocument,
+        relay_urls: &[&str],
+    ) -> Result<DidDocument, IdentityError> {
+        let mut doc = document.clone();
+        doc.set_relay_services(relay_urls)?;
+        self.publish_document(identity, &doc).await?;
+        Ok(doc)
+    }
+
+    /// Updates the relay URL list for an already-published identity.
+    ///
+    /// Replaces all existing `SCPRelay` service entries in the document with the
+    /// provided URLs, then publishes the updated document with an incremented
+    /// BEP44 sequence number (§9.6.3 monotonicity). The BEP44 signature covers
+    /// the complete updated document.
+    ///
+    /// Callers SHOULD use this method instead of manually modifying the document
+    /// and calling `publish_document`, because this method ensures the relay
+    /// entries are validated and the sequence number is incremented atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::InvalidRelayUrl`] if any URL fails validation.
+    /// Returns [`IdentityError::DhtPublishFailed`] if the DHT publish fails.
+    pub async fn update_relay_urls(
+        &self,
+        identity: &ScpIdentity,
+        document: &DidDocument,
+        relay_urls: &[&str],
+    ) -> Result<DidDocument, IdentityError> {
+        let mut doc = document.clone();
+        doc.set_relay_services(relay_urls)?;
+        self.publish_document(identity, &doc).await?;
+        Ok(doc)
+    }
+
     /// Resolves a DID document from the DHT with cache and staleness detection.
     ///
     /// # Resolution Steps
@@ -2133,5 +2185,255 @@ mod tests {
         let hex_str = "zzzzzzzz00112233445566778899aabbccddeeff00112233445566778899aabb";
         let result = hex_decode(hex_str);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-141 tests — Relay URL publication in DID publish flow
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_with_relay_urls_includes_scp_relay_entries() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        let relay_urls = &[
+            "wss://relay1.example.com/scp/v1",
+            "wss://relay2.example.com/scp/v1",
+        ];
+
+        let published_doc = dht
+            .publish_with_relay_urls(&identity, &document, relay_urls)
+            .await
+            .unwrap();
+
+        // Published document should include SCPRelay entries.
+        let resolved_urls = published_doc.relay_service_urls();
+        assert_eq!(resolved_urls.len(), 2);
+        assert_eq!(resolved_urls[0], "wss://relay1.example.com/scp/v1");
+        assert_eq!(resolved_urls[1], "wss://relay2.example.com/scp/v1");
+
+        // Resolve from DHT and verify relay entries survive roundtrip.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        let resolved_relay_urls = resolved.document.relay_service_urls();
+        assert_eq!(resolved_relay_urls.len(), 2);
+        assert_eq!(
+            resolved_relay_urls[0],
+            "wss://relay1.example.com/scp/v1"
+        );
+        assert_eq!(
+            resolved_relay_urls[1],
+            "wss://relay2.example.com/scp/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_without_relay_urls_has_no_relay_entries() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Publish without relay URLs (empty slice).
+        let published_doc = dht
+            .publish_with_relay_urls(&identity, &document, &[])
+            .await
+            .unwrap();
+
+        // No SCPRelay entries.
+        assert!(published_doc.relay_service_urls().is_empty());
+
+        // Resolve from DHT and verify no relay entries.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert!(resolved.document.relay_service_urls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_relay_urls_returns_new_urls_and_increments_sequence() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Initial publish with one relay URL.
+        let initial_doc = dht
+            .publish_with_relay_urls(
+                &identity,
+                &document,
+                &["wss://relay1.example.com/scp/v1"],
+            )
+            .await
+            .unwrap();
+
+        let seq_after_initial = dht.current_sequence();
+        assert_eq!(initial_doc.relay_service_urls().len(), 1);
+
+        // Update to a different set of relay URLs.
+        let updated_doc = dht
+            .update_relay_urls(
+                &identity,
+                &initial_doc,
+                &[
+                    "wss://new-relay1.example.com/scp/v1",
+                    "wss://new-relay2.example.com/scp/v1",
+                    "wss://new-relay3.example.com/scp/v1",
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Sequence number must have incremented.
+        let seq_after_update = dht.current_sequence();
+        assert!(seq_after_update > seq_after_initial);
+
+        // Updated document should have the new relay URLs.
+        let updated_urls = updated_doc.relay_service_urls();
+        assert_eq!(updated_urls.len(), 3);
+        assert_eq!(updated_urls[0], "wss://new-relay1.example.com/scp/v1");
+        assert_eq!(updated_urls[1], "wss://new-relay2.example.com/scp/v1");
+        assert_eq!(updated_urls[2], "wss://new-relay3.example.com/scp/v1");
+
+        // Resolve from DHT and verify the updated relay URLs.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        let resolved_urls = resolved.document.relay_service_urls();
+        assert_eq!(resolved_urls.len(), 3);
+        assert_eq!(resolved_urls[0], "wss://new-relay1.example.com/scp/v1");
+        assert_eq!(resolved_urls[1], "wss://new-relay2.example.com/scp/v1");
+        assert_eq!(resolved_urls[2], "wss://new-relay3.example.com/scp/v1");
+    }
+
+    #[tokio::test]
+    async fn publish_with_relay_urls_rejects_invalid_url() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Invalid scheme.
+        let result = dht
+            .publish_with_relay_urls(
+                &identity,
+                &document,
+                &["http://relay.example.com/scp/v1"],
+            )
+            .await;
+        assert!(matches!(result, Err(IdentityError::InvalidRelayUrl(_))));
+
+        // Invalid path.
+        let result = dht
+            .publish_with_relay_urls(
+                &identity,
+                &document,
+                &["wss://relay.example.com/other"],
+            )
+            .await;
+        assert!(matches!(result, Err(IdentityError::InvalidRelayUrl(_))));
+    }
+
+    #[tokio::test]
+    async fn update_relay_urls_preserves_non_relay_services() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Verify the document starts with a PreRotationCommitment service.
+        assert!(document.pre_rotation_service().is_some());
+
+        // Publish with relay URLs.
+        let published_doc = dht
+            .publish_with_relay_urls(
+                &identity,
+                &document,
+                &["wss://relay.example.com/scp/v1"],
+            )
+            .await
+            .unwrap();
+
+        // PreRotationCommitment should still be present.
+        assert!(published_doc.pre_rotation_service().is_some());
+        assert_eq!(published_doc.relay_service_urls().len(), 1);
+
+        // Update relay URLs.
+        let updated_doc = dht
+            .update_relay_urls(
+                &identity,
+                &published_doc,
+                &["wss://new-relay.example.com/scp/v1"],
+            )
+            .await
+            .unwrap();
+
+        // PreRotationCommitment should still be present after update.
+        assert!(updated_doc.pre_rotation_service().is_some());
+        assert_eq!(updated_doc.relay_service_urls().len(), 1);
+        assert_eq!(
+            updated_doc.relay_service_urls()[0],
+            "wss://new-relay.example.com/scp/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_relay_urls_to_empty_removes_all_relay_entries() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Publish with relay URLs.
+        let published_doc = dht
+            .publish_with_relay_urls(
+                &identity,
+                &document,
+                &["wss://relay.example.com/scp/v1"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(published_doc.relay_service_urls().len(), 1);
+
+        // Update to empty relay list.
+        let updated_doc = dht
+            .update_relay_urls(&identity, &published_doc, &[])
+            .await
+            .unwrap();
+
+        assert!(updated_doc.relay_service_urls().is_empty());
+
+        // Resolve and verify.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert!(resolved.document.relay_service_urls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bep44_signature_covers_relay_entries() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        let relay_urls = &["wss://relay.example.com/scp/v1"];
+        dht.publish_with_relay_urls(&identity, &document, relay_urls)
+            .await
+            .unwrap();
+
+        // Clear cache and resolve from DHT. The resolve_did method verifies
+        // the BEP44 signature, which covers the complete document including
+        // relay entries. If the signature didn't cover relay entries, this
+        // would fail.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+
+        // The resolved document should have the relay entries, proving the
+        // BEP44 signature covered them.
+        assert_eq!(resolved.document.relay_service_urls().len(), 1);
+        assert_eq!(
+            resolved.document.relay_service_urls()[0],
+            "wss://relay.example.com/scp/v1"
+        );
     }
 }

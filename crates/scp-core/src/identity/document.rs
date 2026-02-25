@@ -263,6 +263,52 @@ impl DidDocument {
             .collect()
     }
 
+    /// Replaces all `SCPRelay` service entries with the given URLs.
+    ///
+    /// Removes any existing `SCPRelay` entries and adds new ones for each URL.
+    /// Non-relay services (e.g., `PreRotationCommitment`) are preserved. Each
+    /// URL is validated per §18.2.1 (`wss://` scheme, `/scp/v1` path).
+    ///
+    /// This is used during relay list updates (§18.5) to atomically replace the
+    /// relay set before republishing with an incremented BEP44 sequence number
+    /// (§9.6.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::InvalidRelayUrl`] if any URL fails validation.
+    /// On error, no entries are modified (all-or-nothing).
+    pub fn set_relay_services(&mut self, urls: &[&str]) -> Result<(), IdentityError> {
+        // Validate all URLs before modifying state (all-or-nothing).
+        for url in urls {
+            if !url.starts_with(SCP_RELAY_SCHEME) {
+                return Err(IdentityError::InvalidRelayUrl(format!(
+                    "URL must use wss:// scheme, got: {url}"
+                )));
+            }
+            if !url.ends_with(SCP_RELAY_PATH) {
+                return Err(IdentityError::InvalidRelayUrl(format!(
+                    "URL must end with /scp/v1 path, got: {url}"
+                )));
+            }
+        }
+
+        // Remove existing SCPRelay entries.
+        self.service
+            .retain(|s| s.service_type != SCP_RELAY_SERVICE_TYPE);
+
+        // Add new entries.
+        for (i, url) in urls.iter().enumerate() {
+            let service = Service {
+                id: format!("{}#scp-relay-{}", self.id, i + 1),
+                service_type: SCP_RELAY_SERVICE_TYPE.to_owned(),
+                service_endpoint: (*url).to_owned(),
+            };
+            self.service.push(service);
+        }
+
+        Ok(())
+    }
+
     /// Retires the current active signing key and installs a new one.
     ///
     /// This is used during Layer 1 key rotation (`rotate_active_key`).
@@ -669,5 +715,81 @@ mod tests {
         let json = doc.to_json().unwrap();
         assert!(json.contains("\"SCPRelay\""));
         assert!(json.contains("\"PreRotationCommitment\""));
+    }
+
+    // --- set_relay_services tests (SCP-141) ---
+
+    #[test]
+    fn set_relay_services_replaces_existing_relay_entries() {
+        let did = "did:dht:zSetRelay";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+
+        // Add initial relay entries via add_relay_service.
+        doc.add_relay_service("wss://old-relay.example.com/scp/v1")
+            .unwrap();
+        assert_eq!(doc.relay_service_urls().len(), 1);
+
+        // Replace with set_relay_services.
+        doc.set_relay_services(&[
+            "wss://new1.example.com/scp/v1",
+            "wss://new2.example.com/scp/v1",
+        ])
+        .unwrap();
+
+        let urls = doc.relay_service_urls();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "wss://new1.example.com/scp/v1");
+        assert_eq!(urls[1], "wss://new2.example.com/scp/v1");
+
+        // PreRotationCommitment should still be present.
+        assert!(doc.pre_rotation_service().is_some());
+    }
+
+    #[test]
+    fn set_relay_services_with_empty_removes_all() {
+        let did = "did:dht:zSetEmpty";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+        doc.add_relay_service("wss://relay.example.com/scp/v1")
+            .unwrap();
+        assert_eq!(doc.relay_service_urls().len(), 1);
+
+        doc.set_relay_services(&[]).unwrap();
+        assert!(doc.relay_service_urls().is_empty());
+
+        // Only PreRotationCommitment should remain.
+        assert_eq!(doc.service.len(), 1);
+        assert!(doc.pre_rotation_service().is_some());
+    }
+
+    #[test]
+    fn set_relay_services_validates_all_urls_before_modifying() {
+        let did = "did:dht:zSetValidation";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+        doc.add_relay_service("wss://existing.example.com/scp/v1")
+            .unwrap();
+
+        // One valid URL + one invalid URL. Should fail and not modify state.
+        let result = doc.set_relay_services(&[
+            "wss://valid.example.com/scp/v1",
+            "http://invalid.example.com/scp/v1",
+        ]);
+        assert!(result.is_err());
+
+        // Original relay entry should still be present (all-or-nothing).
+        let urls = doc.relay_service_urls();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "wss://existing.example.com/scp/v1");
     }
 }
