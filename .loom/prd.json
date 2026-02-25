@@ -1750,7 +1750,7 @@
       "gate": "gate-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/tools/mod.rs",
         "crates/scp-core/context/tools/registry.rs",
@@ -1796,7 +1796,8 @@
       "details": {
         "ToolRegistration struct": "```rust\npub struct ToolRegistration {\n    pub tool_id: ToolId,\n    pub name: String,\n    pub description: String,\n    pub schema: ToolSchema,\n    pub implementation_hash: [u8; 32],\n    pub test_vectors: Vec<TestVector>,\n    pub operator_did: DID,\n}\n\npub struct ToolSchema {\n    pub input_schema: serde_json::Value,\n    pub output_schema: serde_json::Value,\n}\n\npub struct TestVector {\n    pub input: serde_json::Value,\n    pub expected_output: serde_json::Value,\n    pub description: String,\n}\n```",
         "Implementation notes": "Language: Rust. Schema validation: jsonschema crate for JSON Schema validation. Hashing: SHA-256 via sha2 crate for implementation hashes. Crate: scp-core. Module: scp-core/context/tools/."
-      }
+      },
+      "result": "Tool registration types, schema validation, registry with 48 tests"
     },
     {
       "id": "SCP-027",
@@ -3111,7 +3112,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/crypto/ucan/nonce.rs"
       ],
@@ -3146,7 +3147,8 @@
         "nonce_tracker": "pub struct NonceTracker {\n    /// Map of nonce -> (first_seen_timestamp, token_expiry_timestamp).\n    seen: HashMap<String, (u64, u64)>,\n    context_id: ContextId,\n}\n\nimpl NonceTracker {\n    pub fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> { ... }\n    pub fn prune(&mut self) { ... }\n}",
         "nonce_format": "{unix_millis_timestamp}-{16_random_bytes_hex}",
         "replay_window": "A nonce is retained until `max(token_expiry + 5 minutes, first_seen + 24 hours)`."
-      }
+      },
+      "result": "NonceTracker with format validation, freshness, pruning, persistence, 26 tests"
     },
     {
       "id": "SCP-055",
@@ -3154,7 +3156,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/crypto/ucan/revoke.rs"
       ],
@@ -3190,7 +3192,8 @@
       ],
       "details": {
         "revocation_list": "pub struct RevocationList {\n    revoked: HashSet<String>,       // Set of revoked token CIDs\n    context_id: ContextId,\n}\n\nimpl RevocationList {\n    pub fn is_revoked(&self, token_cid: &str) -> bool { ... }\n    pub fn revoke(&mut self, token_cid: String) { ... }\n    pub fn merge(&mut self, remote: &RevocationList) { ... }  // Merge from MLS message\n}"
-      }
+      },
+      "result": "RevocationList with union-only merge, trait-based revoke_ucan, 27 tests"
     },
     {
       "id": "SCP-056",
@@ -3507,7 +3510,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/trust/attestation.rs"
       ],
@@ -3562,7 +3565,8 @@
           "AttestationType": "pub enum AttestationType { IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, BehavioralWitness }",
           "ThresholdRequirement": "pub struct ThresholdRequirement { pub required_count: u32, pub total_attestors: u32, pub independence_threshold: f64 }"
         }
-      }
+      },
+      "result": "Attestation verification with Ed25519, freshness, threshold independence, 21 tests"
     },
     {
       "id": "SCP-063",
@@ -3618,7 +3622,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/trust/consequence.rs"
       ],
@@ -3661,7 +3665,8 @@
           "ConsequenceTrigger": "pub enum ConsequenceTrigger { MessageVelocity, ToolRateExceeded, WarningCount, Custom(String) }",
           "ConsequenceAction": "pub enum ConsequenceAction { CapabilitySuspension(Vec<Capability>), AccessRevocation, RoleDemotion { to_role: String } }"
         }
-      }
+      },
+      "result": "Consequence rule evaluation with 4 trigger types, 3 action types, evidence collection, 21 tests"
     },
     {
       "id": "SCP-065",
@@ -3722,7 +3727,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/ttl.rs"
       ],
@@ -3767,7 +3772,8 @@
           "TtlPolicy": "pub enum TtlPolicy { None, Finite(Duration) }"
         },
         "asyncRuntime": "tokio timer tasks"
-      }
+      },
+      "result": "TTL enforcement, extension proposals with bilateral/governance consent, timer trait, 41 tests"
     },
     {
       "id": "SCP-067",
@@ -4030,7 +4036,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/provenance/evaluate.rs"
       ],
@@ -4067,7 +4073,8 @@
         "module": "scp-core/provenance/evaluate.rs",
         "estimatedFunctions": "~4 public functions, ~2 internal helpers",
         "qualityTiers": "NoProvenance < EphemeralKnownParties < SummaryVerified < PersistentVerifiable"
-      }
+      },
+      "result": "Provenance quality evaluation with 4 tiers, source type updates, 22 tests"
     },
     {
       "id": "SCP-073",
