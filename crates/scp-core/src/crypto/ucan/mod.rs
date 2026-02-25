@@ -41,6 +41,7 @@
 
 pub mod capability;
 pub mod mint;
+pub mod revoke;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,15 @@ pub enum UcanError {
     /// The token has been revoked.
     #[error("token revoked: {0}")]
     TokenRevoked(String),
+
+    /// The revoker is not authorized to revoke the token (must be the token's
+    /// issuer or the context creator).
+    #[error("revocation unauthorized: {0}")]
+    RevocationUnauthorized(String),
+
+    /// A revocation operation failed (MLS distribution or event log append).
+    #[error("revocation failed: {0}")]
+    RevocationFailed(String),
 
     /// Capability URI parsing failed.
     #[error("invalid capability URI: {0}")]
