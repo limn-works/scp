@@ -24,7 +24,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: "--model claude-opus-4-20250514 --max-turns 30"
-          allowed_tools: "Bash(gh *),Read,Glob,Grep"
+          settings: '{"permissions":{"allow":["Bash(gh *)","Read","Glob","Grep"]}}'
           prompt: |
             You are an artifact health auditor for the SCP project. Your job is to read
             all documentation artifacts under `.docs/` and check for staleness,
