@@ -24,6 +24,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use futures::{SinkExt, StreamExt};
 use scp_core::envelope::OuterEnvelope;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
@@ -48,11 +50,18 @@ const BACKOFF_STEPS: &[Duration] = &[
     Duration::from_secs(30),
 ];
 
-/// Overlap subtracted from `stored_at` for reconnect backfill (5 seconds).
+/// Overlap subtracted from local receive time for reconnect backfill (5 seconds).
 ///
 /// Used by [`NativeRelayClient::reconnect`] on connection loss.
 #[allow(dead_code)]
-const RECONNECT_OVERLAP_SECS: u64 = 5;
+const RECONNECT_OVERLAP: Duration = Duration::from_secs(5);
+
+/// Maximum acceptable deviation between relay-provided `stored_at` and local
+/// wall-clock time (60 seconds). Deviations beyond this threshold are logged as
+/// warnings because they may indicate a malicious relay backdating or
+/// forward-dating timestamps.
+#[allow(dead_code)]
+const RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS: u64 = 60;
 
 /// A pending request waiting for a relay response keyed by `ref_id`.
 struct PendingRequest {
@@ -79,8 +88,14 @@ struct SubscriptionState {
     /// The routing ID this subscription is for (used during reconnection).
     #[allow(dead_code)]
     routing_id: [u8; 32],
-    /// The last `stored_at` timestamp received for this subscription.
+    /// The last relay-provided `stored_at` timestamp (untrusted metadata, used
+    /// only for logging/diagnostics -- never for security decisions).
     last_stored_at: Option<u64>,
+    /// Local monotonic time when the most recent message was received for this
+    /// subscription. Used for reconnection window calculations instead of
+    /// relay-provided `stored_at` to prevent malicious relays from manipulating
+    /// the reconnect window.
+    last_local_receive: Option<Instant>,
     /// Channel for pushing subscription messages to the stream.
     tx: mpsc::Sender<SubscriptionMessage>,
 }
@@ -283,6 +298,7 @@ impl NativeRelayClient {
                 stored_at,
                 ..
             } => {
+                let receive_time = Instant::now();
                 let mut state = inner.write().await;
 
                 // Deduplication: skip if we've already seen this `blob_id`.
@@ -291,10 +307,35 @@ impl NativeRelayClient {
                 }
 
                 if let Some(sub) = state.subscriptions.get_mut(routing_id) {
-                    // Update the `last_stored_at` for reconnection recovery.
+                    // Record local monotonic receive time for reconnection
+                    // window calculations (immune to relay timestamp
+                    // manipulation).
+                    sub.last_local_receive = Some(receive_time);
+
+                    // Update relay-provided `stored_at` as untrusted metadata
+                    // (informational/logging only).
                     if sub.last_stored_at.is_none_or(|prev| *stored_at > prev) {
                         sub.last_stored_at = Some(*stored_at);
                     }
+
+                    // Plausibility check: warn if relay timestamp deviates
+                    // significantly from local wall-clock time.
+                    let local_now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let deviation = local_now.abs_diff(*stored_at);
+                    if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
+                        tracing::warn!(
+                            relay_stored_at = *stored_at,
+                            local_time = local_now,
+                            deviation_secs = deviation,
+                            "relay stored_at deviates from local time by more \
+                             than {RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS}s; \
+                             possible malicious relay"
+                        );
+                    }
+
                     let _ = sub.tx.send(SubscriptionMessage::Relay(msg)).await;
                 }
             }
@@ -443,6 +484,7 @@ impl NativeRelayClient {
             SubscriptionState {
                 routing_id: *routing_id,
                 last_stored_at: None,
+                last_local_receive: None,
                 tx,
             },
         );
@@ -549,6 +591,7 @@ impl NativeRelayClient {
             SubscriptionState {
                 routing_id: *routing_id,
                 last_stored_at: None,
+                last_local_receive: None,
                 tx,
             },
         );
@@ -660,12 +703,22 @@ impl NativeRelayClient {
                         .await
                         .subscriptions
                         .values()
-                        .map(|s| (s.routing_id, s.last_stored_at))
+                        .map(|s| (s.routing_id, s.last_local_receive))
                         .collect();
 
-                    for (routing_id, last_stored_at) in subs_snapshot {
-                        let since =
-                            last_stored_at.map(|ts| ts.saturating_sub(RECONNECT_OVERLAP_SECS));
+                    for (routing_id, last_local_receive) in subs_snapshot {
+                        // Use local receive time (immune to relay timestamp
+                        // manipulation) to compute the reconnect window.
+                        let since = last_local_receive.map(|instant| {
+                            let elapsed = instant.elapsed();
+                            let now_unix = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            now_unix
+                                .saturating_sub(elapsed.as_secs())
+                                .saturating_sub(RECONNECT_OVERLAP.as_secs())
+                        });
 
                         let msg = ClientMessage::Subscribe {
                             ref_id: None,
@@ -813,6 +866,6 @@ mod tests {
 
     #[test]
     fn reconnect_overlap_is_5_seconds() {
-        assert_eq!(RECONNECT_OVERLAP_SECS, 5);
+        assert_eq!(RECONNECT_OVERLAP.as_secs(), 5);
     }
 }
