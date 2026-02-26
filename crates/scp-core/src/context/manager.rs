@@ -354,10 +354,9 @@ impl ContextManager {
                 .role_state
                 .member_has_capability(caller_did, &Capability::MemberRemove)
             {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {caller_did} cannot remove {member_did}: \
-                     requires self-removal or member:remove capability"
-                )));
+                return Err(ContextError::PermissionDenied(
+                    "caller lacks permission to remove this member".into(),
+                ));
             }
             drop(contexts);
         }
