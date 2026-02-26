@@ -46,6 +46,14 @@ const PRUNE_CHECK_INTERVAL: u64 = 1000;
 /// Time between automatic pruning attempts: 10 minutes in seconds.
 const PRUNE_TIME_INTERVAL_SECS: u64 = 600;
 
+/// Default maximum number of nonces a tracker will hold before rejecting
+/// new entries. At ~100 bytes per entry, 100 000 entries consume roughly
+/// 10 MB — well within tolerance for a single context.
+///
+/// `HashMap::retain` pruning is O(n) but at 100 000 entries completes in
+/// single-digit microseconds on modern hardware, so it is acceptable here.
+const DEFAULT_MAX_CAPACITY: usize = 100_000;
+
 // ---------------------------------------------------------------------------
 // NonceTracker
 // ---------------------------------------------------------------------------
@@ -58,6 +66,13 @@ const PRUNE_TIME_INTERVAL_SECS: u64 = 600;
 ///
 /// Uses the [`Clock`] trait for time, enabling deterministic testing.
 ///
+/// # Capacity
+///
+/// The tracker enforces a configurable maximum capacity (default:
+/// [`DEFAULT_MAX_CAPACITY`] = 100 000). When at capacity, a prune pass runs
+/// before inserting; if no entries can be pruned, the tracker returns
+/// [`UcanError::NonceTrackerFull`].
+///
 /// # Pruning strategy
 ///
 /// An entry is eligible for removal when:
@@ -66,7 +81,12 @@ const PRUNE_TIME_INTERVAL_SECS: u64 = 600;
 /// ```
 ///
 /// Pruning runs automatically every 1000 calls to [`check_and_record`] or
-/// every 10 minutes, whichever comes first.
+/// every 10 minutes, whichever comes first. It also runs when the tracker
+/// reaches capacity.
+///
+/// `HashMap::retain` is O(n), but at the default capacity of 100 000 entries
+/// this completes in single-digit microseconds on modern hardware — well
+/// within acceptable latency bounds.
 ///
 /// See ADR-016 acceptance criterion 6.
 #[derive(Debug)]
@@ -81,15 +101,27 @@ pub struct NonceTracker<C: Clock> {
     checks_since_prune: u64,
     /// Timestamp (seconds) of the last prune operation.
     last_prune_time: u64,
+    /// Maximum number of nonces the tracker will hold.
+    max_capacity: usize,
 }
 
 impl<C: Clock> NonceTracker<C> {
-    /// Creates a new nonce tracker for the given context.
+    /// Creates a new nonce tracker for the given context with the default
+    /// capacity limit ([`DEFAULT_MAX_CAPACITY`]).
     ///
     /// The tracker starts empty with zero checks and the prune timer set to
     /// the current clock time.
     #[must_use]
     pub fn new(context_id: String, clock: C) -> Self {
+        Self::with_max_capacity(context_id, clock, DEFAULT_MAX_CAPACITY)
+    }
+
+    /// Creates a new nonce tracker with an explicit maximum capacity.
+    ///
+    /// Use this when the default 100 000 limit is not appropriate for the
+    /// deployment context.
+    #[must_use]
+    pub fn with_max_capacity(context_id: String, clock: C, max_capacity: usize) -> Self {
         let now = clock.now();
         Self {
             seen: HashMap::new(),
@@ -97,7 +129,14 @@ impl<C: Clock> NonceTracker<C> {
             clock,
             checks_since_prune: 0,
             last_prune_time: now,
+            max_capacity,
         }
+    }
+
+    /// Returns the maximum capacity of this tracker.
+    #[must_use]
+    pub fn max_capacity(&self) -> usize {
+        self.max_capacity
     }
 
     /// Returns the context ID this tracker is scoped to.
@@ -167,6 +206,14 @@ impl<C: Clock> NonceTracker<C> {
             return Err(UcanError::NonceReused(nonce.to_owned()));
         }
 
+        // 4. Capacity check: if at capacity, attempt a prune to free space.
+        if self.seen.len() >= self.max_capacity {
+            self.prune();
+            if self.seen.len() >= self.max_capacity {
+                return Err(UcanError::NonceTrackerFull(self.max_capacity));
+            }
+        }
+
         // Record the nonce.
         self.seen.insert(nonce.to_owned(), (now_secs, token_expiry));
 
@@ -220,7 +267,8 @@ impl<C: Clock> NonceTracker<C> {
             .map_err(|e| UcanError::MalformedToken(format!("nonce tracker serialization: {e}")))
     }
 
-    /// Restores tracker state from previously serialized bytes.
+    /// Restores tracker state from previously serialized bytes with the
+    /// default capacity limit.
     ///
     /// The `clock` argument provides the time source for the restored tracker.
     /// After restoration, a prune pass runs to discard any entries that expired
@@ -230,6 +278,20 @@ impl<C: Clock> NonceTracker<C> {
     ///
     /// Returns [`UcanError::MalformedToken`] if deserialization fails.
     pub fn from_bytes(data: &[u8], clock: C) -> Result<Self, UcanError> {
+        Self::from_bytes_with_capacity(data, clock, DEFAULT_MAX_CAPACITY)
+    }
+
+    /// Restores tracker state from previously serialized bytes with an
+    /// explicit capacity limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UcanError::MalformedToken`] if deserialization fails.
+    pub fn from_bytes_with_capacity(
+        data: &[u8],
+        clock: C,
+        max_capacity: usize,
+    ) -> Result<Self, UcanError> {
         let state: OwnedSerializableState = serde_json::from_slice(data).map_err(|e| {
             UcanError::MalformedToken(format!("nonce tracker deserialization: {e}"))
         })?;
@@ -241,6 +303,7 @@ impl<C: Clock> NonceTracker<C> {
             clock,
             checks_since_prune: 0,
             last_prune_time: now,
+            max_capacity,
         };
 
         // Prune stale entries that expired during downtime.
@@ -640,5 +703,123 @@ mod tests {
         let mut tracker = NonceTracker::new("ctx-epoch".to_owned(), clock);
         let nonce = make_nonce(0, "aabbccdd11223344aabbccdd11223344");
         assert!(tracker.check_and_record(&nonce, 3600).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // Capacity limits
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn with_max_capacity_sets_limit() {
+        let clock = Arc::new(TestClock::new(BASE_SECS));
+        let tracker = NonceTracker::with_max_capacity("ctx-cap".to_owned(), clock, 42);
+        assert_eq!(tracker.max_capacity(), 42);
+    }
+
+    #[test]
+    fn default_max_capacity_is_100_000() {
+        let (tracker, _clock) = setup();
+        assert_eq!(tracker.max_capacity(), 100_000);
+    }
+
+    #[test]
+    fn check_accepts_up_to_max_capacity() {
+        let clock = Arc::new(TestClock::new(BASE_SECS));
+        let mut tracker =
+            NonceTracker::with_max_capacity("ctx-cap".to_owned(), Arc::clone(&clock), 5);
+        let millis = u128::from(clock.now()) * 1000;
+        let expiry = clock.now() + 3600;
+
+        for i in 0..5 {
+            let hex = format!("{i:032x}");
+            let nonce = make_nonce(millis, &hex);
+            assert!(tracker.check_and_record(&nonce, expiry).is_ok());
+        }
+        assert_eq!(tracker.len(), 5);
+    }
+
+    #[test]
+    fn check_rejects_when_at_capacity_with_fresh_entries() {
+        let clock = Arc::new(TestClock::new(BASE_SECS));
+        let mut tracker =
+            NonceTracker::with_max_capacity("ctx-cap".to_owned(), Arc::clone(&clock), 3);
+        let millis = u128::from(clock.now()) * 1000;
+        let expiry = clock.now() + 3600;
+
+        // Fill to capacity.
+        for i in 0..3 {
+            let hex = format!("{i:032x}");
+            let nonce = make_nonce(millis, &hex);
+            assert!(tracker.check_and_record(&nonce, expiry).is_ok());
+        }
+
+        // One more should fail — all entries are fresh (within retention).
+        let nonce = make_nonce(millis, "ff00ff00ff00ff00ff00ff00ff00ff00");
+        let result = tracker.check_and_record(&nonce, expiry);
+        assert!(
+            matches!(result, Err(UcanError::NonceTrackerFull(3))),
+            "expected NonceTrackerFull(3), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_prunes_expired_entries_when_at_capacity() {
+        let clock = Arc::new(TestClock::new(BASE_SECS));
+        let mut tracker =
+            NonceTracker::with_max_capacity("ctx-cap".to_owned(), Arc::clone(&clock), 3);
+        let millis = u128::from(clock.now()) * 1000;
+
+        // Fill to capacity with short-lived entries.
+        for i in 0..3 {
+            let hex = format!("{i:032x}");
+            let nonce = make_nonce(millis, &hex);
+            let expiry = clock.now() + 1; // Very short expiry.
+            assert!(tracker.check_and_record(&nonce, expiry).is_ok());
+        }
+        assert_eq!(tracker.len(), 3);
+
+        // Advance time past all retention deadlines.
+        clock.advance(PRUNE_MIN_RETENTION_SECS + 1);
+
+        // Now a new nonce should succeed: the capacity check triggers prune,
+        // freeing all 3 expired entries.
+        let new_millis = u128::from(clock.now()) * 1000;
+        let nonce = make_nonce(new_millis, "ff00ff00ff00ff00ff00ff00ff00ff00");
+        let expiry = clock.now() + 3600;
+        assert!(tracker.check_and_record(&nonce, expiry).is_ok());
+        assert_eq!(tracker.len(), 1);
+    }
+
+    #[test]
+    fn check_partial_prune_frees_space_at_capacity() {
+        let clock = Arc::new(TestClock::new(BASE_SECS));
+        let mut tracker =
+            NonceTracker::with_max_capacity("ctx-cap".to_owned(), Arc::clone(&clock), 3);
+        let millis = u128::from(clock.now()) * 1000;
+
+        // Insert 2 entries with short expiry.
+        for i in 0..2 {
+            let hex = format!("{i:032x}");
+            let nonce = make_nonce(millis, &hex);
+            let expiry = clock.now() + 1;
+            assert!(tracker.check_and_record(&nonce, expiry).is_ok());
+        }
+
+        // Insert 1 entry with long expiry.
+        let nonce_long = make_nonce(millis, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3");
+        let long_expiry = clock.now() + PRUNE_MIN_RETENTION_SECS + 3600;
+        assert!(tracker.check_and_record(&nonce_long, long_expiry).is_ok());
+        assert_eq!(tracker.len(), 3);
+
+        // Advance past 24h retention for the short-lived entries.
+        clock.advance(PRUNE_MIN_RETENTION_SECS + 1);
+
+        // New nonce should succeed: prune removes the 2 expired entries.
+        let new_millis = u128::from(clock.now()) * 1000;
+        let nonce = make_nonce(new_millis, "ff00ff00ff00ff00ff00ff00ff00ff00");
+        let expiry = clock.now() + 3600;
+        assert!(tracker.check_and_record(&nonce, expiry).is_ok());
+        // 1 old long-lived + 1 new = 2
+        assert_eq!(tracker.len(), 2);
     }
 }

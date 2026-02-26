@@ -34,6 +34,7 @@ use super::{UcanError, UcanHeader, UcanPayload, UcanToken};
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+#[cfg(test)]
 const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
 
 /// Maximum delegation chain depth to prevent infinite loops.
@@ -124,12 +125,18 @@ impl DidResolver for InMemoryDidResolver {
 /// Validates nonce format (`{unix_millis}-{32_hex_chars}`), freshness
 /// (timestamp within +/- 5 minutes of now), and uniqueness.
 ///
+/// Restricted to test builds — production code should use
+/// [`nonce::NonceTracker`](super::nonce::NonceTracker) which provides
+/// per-context scoping, capacity limits, and automatic pruning.
+///
 /// See ADR-016 acceptance criterion 6.
-pub struct InMemoryNonceTracker {
+#[cfg(test)]
+pub(crate) struct InMemoryNonceTracker {
     /// Map of nonce -> (`first_seen_timestamp_secs`, `token_expiry_secs`).
     seen: std::collections::HashMap<String, (u64, u64)>,
 }
 
+#[cfg(test)]
 impl InMemoryNonceTracker {
     /// Creates a new empty nonce tracker.
     #[must_use]
@@ -140,12 +147,14 @@ impl InMemoryNonceTracker {
     }
 }
 
+#[cfg(test)]
 impl Default for InMemoryNonceTracker {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl NonceTracker for InMemoryNonceTracker {
     fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
         // Validate nonce format: {unix_millis}-{32_hex_chars}
@@ -167,9 +176,7 @@ impl NonceTracker for InMemoryNonceTracker {
         // Freshness check: timestamp within now +/- 5 minutes.
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| {
-                UcanError::ClockError(format!("system clock before Unix epoch: {e}"))
-            })?
+            .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))?
             .as_millis();
 
         if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
@@ -363,9 +370,7 @@ fn now_secs() -> Result<u64, UcanError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|e| {
-            UcanError::ClockError(format!("system clock before Unix epoch: {e}"))
-        })
+        .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))
 }
 
 /// Validates a UCAN token using the 11-step pipeline from ADR-016.
@@ -2210,8 +2215,14 @@ mod tests {
     #[test]
     fn now_secs_returns_ok_on_normal_system() {
         let result = now_secs();
-        assert!(result.is_ok(), "now_secs() should succeed on a normal system");
-        assert!(result.unwrap() > 0, "current time should be after Unix epoch");
+        assert!(
+            result.is_ok(),
+            "now_secs() should succeed on a normal system"
+        );
+        assert!(
+            result.unwrap() > 0,
+            "current time should be after Unix epoch"
+        );
     }
 
     /// A UCAN with exp=0 and nbf=0 must be rejected. Before the clock-error

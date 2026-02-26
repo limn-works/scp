@@ -126,6 +126,11 @@ pub enum UcanError {
     #[error("invalid nonce format: {0}")]
     NonceFormatInvalid(String),
 
+    /// The nonce tracker has reached its capacity limit and all entries are
+    /// still within their retention window.
+    #[error("nonce tracker full: capacity {0} reached with no expired entries to prune")]
+    NonceTrackerFull(usize),
+
     /// The requested capability is not within the context's ceiling.
     #[error("capability outside ceiling: {0}")]
     CapabilityOutsideCeiling(String),
@@ -591,6 +596,12 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "expiry too far in the future: 100000s exceeds 24h maximum"
+        );
+
+        let err = UcanError::NonceTrackerFull(100_000);
+        assert_eq!(
+            err.to_string(),
+            "nonce tracker full: capacity 100000 reached with no expired entries to prune"
         );
     }
 }
