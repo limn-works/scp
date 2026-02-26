@@ -9,6 +9,7 @@
 //! `.docs/adrs/phase-2.md` for the full context lifecycle specification.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
@@ -84,11 +85,19 @@ fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
 /// ```
 pub struct ContextManager {
     /// Provider for MLS group and sender key operations.
-    crypto: Box<dyn ContextCryptoProvider>,
+    ///
+    /// Stored as `Arc` (not `Box`) so the provider can be shared with
+    /// spawned TTL timer tasks that need crypto access for key destruction
+    /// on context expiry (SCP-169).
+    crypto: Arc<dyn ContextCryptoProvider>,
     /// Provider for relay connectivity and publication.
-    transport: Box<dyn ContextTransportProvider>,
+    transport: Arc<dyn ContextTransportProvider>,
     /// Provider for event log initialisation and append.
-    event_log: Box<dyn ContextEventLogProvider>,
+    ///
+    /// Stored as `Arc` (not `Box`) so the provider can be shared with
+    /// spawned TTL timer tasks that need event log access for logging
+    /// `ContextExpired` events on context expiry (SCP-169).
+    event_log: Arc<dyn ContextEventLogProvider>,
     /// Per-context state, keyed by `context_id` string.
     contexts: Mutex<HashMap<String, PerContextState>>,
 }
@@ -111,9 +120,9 @@ impl ContextManager {
         event_log: Box<dyn ContextEventLogProvider>,
     ) -> Self {
         Self {
-            crypto,
-            transport,
-            event_log,
+            crypto: Arc::from(crypto),
+            transport: Arc::from(transport),
+            event_log: Arc::from(event_log),
             contexts: Mutex::new(HashMap::new()),
         }
     }
@@ -708,9 +717,14 @@ impl ContextManager {
 
     /// Spawns a TTL timer for the given context.
     ///
-    /// The timer fires at the given duration and transitions the context
-    /// to `Expired`. The timer task is stored in the per-context state
-    /// for cancellation.
+    /// When the timer fires, it calls [`ttl::handle_ttl_expiry`] which:
+    /// - Transitions the context from `Active` to `Expired`.
+    /// - For `Ephemeral` and `Summary` memory scopes: destroys MLS group
+    ///   state and sender keys via the crypto provider.
+    /// - Logs a `ContextExpired` event to the event log.
+    ///
+    /// This matches the behavior of [`TtlTimer::spawn`] and ensures key
+    /// material is properly destroyed on TTL expiry (SCP-169).
     #[allow(clippy::significant_drop_tightening)]
     async fn spawn_ttl_timer(
         &self,
@@ -727,11 +741,22 @@ impl ContextManager {
             ctx.ttl_timer.cancel.clone()
         };
 
+        // Clone Arc-wrapped providers so the spawned task can perform
+        // key destruction and event logging on TTL expiry.
+        let crypto = Arc::clone(&self.crypto);
+        let event_log = Arc::clone(&self.event_log);
+
         let task = tokio::spawn(async move {
             tokio::select! {
                 () = tokio::time::sleep(duration) => {
-                    // Timer fired. Transition to Expired.
-                    let _ = handle.transition_to(&ContextState::Expired).await;
+                    // Timer fired. Delegate to handle_ttl_expiry which
+                    // transitions to Expired, destroys keys per memory
+                    // scope, and logs ContextExpired event (SCP-169).
+                    let _ = ttl::handle_ttl_expiry(
+                        &handle,
+                        crypto.as_ref(),
+                        event_log.as_ref(),
+                    ).await;
                 }
                 () = cancel.notified() => {
                     // Timer was cancelled.
