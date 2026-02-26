@@ -1958,7 +1958,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_nbf_greater_than_exp() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -1984,7 +1984,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_nbf_equal_to_exp() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let exp_time = now + 3600;
         let token = UcanToken {
             header: UcanHeader::new(),
@@ -2011,7 +2011,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_accepts_nbf_less_than_exp() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2365,9 +2365,10 @@ mod tests {
         };
 
         let result = verify_expiry(&token);
+        // nbf == exp triggers InvalidTimeRange before TokenExpired.
         assert!(
-            matches!(result, Err(UcanError::TokenExpired)),
-            "epoch-0 token must be rejected as expired: {result:?}"
+            matches!(result, Err(UcanError::InvalidTimeRange { nbf: 0, exp: 0 })),
+            "epoch-0 token with nbf==exp must be rejected as InvalidTimeRange: {result:?}"
         );
     }
 

@@ -1202,7 +1202,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/validate.rs",
         "crates/scp-core/src/crypto/ucan/revoke.rs"
@@ -1233,7 +1233,8 @@
         "nbfExpSource": "Issue #65: A token with nbf > exp is inherently invalid but is not rejected.",
         "cidFormatSource": "Issue #64: The UCAN spec recommends using a content hash (CID) for space efficiency and to avoid storing the full token in the revocation list.",
         "cidHashAlgorithm": "The specific hash algorithm for the content CID is not specified in the source issue. Choose based on UCAN spec recommendation (likely SHA-256 or multihash)."
-      }
+      },
+      "result": "Added nbf>=exp check in verify_expiry (InvalidTimeRange error), content-hash CID for revocation. 3 new tests. Merge conflict resolution with pending/confirm revocation flow."
     },
     {
       "id": "SCP-193",
@@ -1362,7 +1363,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/sender_keys/encrypt.rs",
         "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
@@ -1389,7 +1390,8 @@
         "allocationContext": "For high-throughput message decryption, each lookup's heap allocation creates unnecessary allocation pressure.",
         "overflowContext": "While practically unlikely to reach u64::MAX, the absence of a check violates defensive coding practices.",
         "methodNames": "SenderKeyStore::get() for allocation issue, rotate_sender_key_for_block for epoch overflow."
-      }
+      },
+      "result": "SenderKeyStore::get returns &SenderKey reference. rotate_sender_key_for_block uses checked_add with EpochOverflow error. 2 new tests."
     },
     {
       "id": "SCP-198",
@@ -1397,7 +1399,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/Cargo.toml"
@@ -1419,7 +1421,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/48"
       ],
-      "details": {}
+      "details": {},
+      "result": "Replaced hand-rolled base58btc with bs58 0.5 crate. Added workspace dep. Round-trip test added."
     },
     {
       "id": "SCP-199",
@@ -1490,7 +1493,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/cache.rs",
         "crates/scp-core/src/identity/dht_client.rs"
@@ -1510,7 +1513,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/43"
       ],
-      "details": {}
+      "details": {},
+      "result": "Changed DID cache seq comparison from >= to > (strictly-greater). 3 boundary tests added."
     },
     {
       "id": "SCP-202",
@@ -1518,7 +1522,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/document.rs"
       ],
@@ -1539,7 +1543,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/41"
       ],
-      "details": {}
+      "details": {},
+      "result": "Changed MigrationProof.signature from Vec<u8> to [u8; 64] with custom serde. Deserialization rejects wrong lengths. 3 tests."
     },
     {
       "id": "SCP-203",
@@ -1547,7 +1552,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/close.rs",
         "crates/scp-core/src/context/manager.rs",
@@ -1572,7 +1577,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/40"
       ],
-      "details": {}
+      "details": {},
+      "result": "Added SystemClose{initiator_did} and Expired variants to ContextEvent. Replaced sentinel DID strings. Updated event_type_tag. 4 tests."
     },
     {
       "id": "SCP-204",

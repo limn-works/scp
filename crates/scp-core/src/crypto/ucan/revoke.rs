@@ -364,20 +364,23 @@ pub fn revoke_ucan(
     // Step 1: Compute content-hash CID from payload.
     let token_cid = compute_revocation_cid(payload);
 
-    // Step 2: Mark as RevocationPending (fail-closed).
+    // Step 2: Verify authorization.
+    authorizer.authorize_revocation(&token_cid, revoker_did)?;
+
+    // Step 3: Mark as RevocationPending (fail-closed).
     revocation_list.mark_pending(token_cid.to_owned());
 
-    // Step 3: Distribute via MLS. On failure, roll back.
+    // Step 4: Distribute via MLS. On failure, roll back.
     let context_id = revocation_list.context_id().to_owned();
     if let Err(e) = distributor.distribute_revocation(&context_id, &token_cid) {
         revocation_list.rollback_revocation(&token_cid);
         return Err(e);
     }
 
-    // Step 4: Commit -- Pending to Revoked.
+    // Step 5: Commit -- Pending to Revoked.
     revocation_list.confirm_revocation(&token_cid);
 
-    // Step 5: Append TokenRevoked event.
+    // Step 6: Append TokenRevoked event.
     event_logger.log_token_revoked(&context_id, &token_cid, revoker_did)?;
 
     Ok(token_cid)
@@ -999,17 +1002,19 @@ mod tests {
         };
         let distributor = MockDistributor::new();
         let logger = MockEventLogger::new();
-        assert_eq!(list.state("bafyrei-token1"), RevocationState::Active);
+        let payload = test_payload();
+        let expected_cid = compute_revocation_cid(&payload);
+        assert_eq!(list.state(&expected_cid), RevocationState::Active);
         revoke_ucan(
             &mut list,
-            "bafyrei-token1",
+            &payload,
             "did:dht:z6MkIssuer",
             &authorizer,
             &distributor,
             &logger,
         )
         .unwrap();
-        assert_eq!(list.state("bafyrei-token1"), RevocationState::Revoked);
+        assert_eq!(list.state(&expected_cid), RevocationState::Revoked);
     }
 
     // -----------------------------------------------------------------------
