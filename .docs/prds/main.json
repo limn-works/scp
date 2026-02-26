@@ -2743,7 +2743,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/__init__.py",
         "bindings/python/scp_sdk/py.typed",
@@ -2781,7 +2781,8 @@
       ],
       "details": {
         "init_exports": "from scp_sdk.identity import Identity\nfrom scp_sdk.context import Context\nfrom scp_sdk.tools import ToolDefinition, TestVector\nfrom scp_sdk.trust import evaluate_trust\nfrom scp_sdk.errors import ScpError, IdentityError, ContextError, ...\n\n__version__ = \"0.1.0\""
-      }
+      },
+      "result": "Python SDK __init__.py with re-exports, py.typed marker, pyproject.toml with maturin backend created"
     },
     {
       "id": "SCP-047",
@@ -4824,7 +4825,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/bridge/shadow.rs"
       ],
@@ -4867,7 +4868,8 @@
           "ADR-011": "Shadow creation is a context event.",
           "ADR-009": "Role management uses context governance roles."
         }
-      }
+      },
+      "result": "Already implemented in prior iteration. ShadowRegistry with create_shadow, role management, collision guard, 62 shadow-specific tests."
     },
     {
       "id": "SCP-087",
@@ -7998,7 +8000,7 @@
       "gate": "gate-addr",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/tls.rs"
       ],
@@ -8041,7 +8043,8 @@
       "details": {
         "acmeNote": "ACME HTTP-01 needs port 80 reachable. DNS-01 alternative for environments without port 80 (NAT, shared hosting). The operator configures DNS TXT records manually or via DNS API.",
         "rustlsConfig": "Use rustls with TLS 1.3 minimum version. No TLS 1.2 fallback for relay connections (§9.13 allows TLS 1.2 only as fallback when 1.3 unavailable — ApplicationNode controls its own TLS config and can enforce 1.3)."
-      }
+      },
+      "result": "ACME TLS provisioning with HTTP-01 challenge, certificate storage, auto-renewal, TLS 1.3 enforcement. 16 tests."
     },
     {
       "id": "SCP-147",
@@ -8049,7 +8052,7 @@
       "gate": "gate-addr",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/http.rs",
         "crates/scp-node/src/well_known.rs"
@@ -8095,7 +8098,8 @@
       "details": {
         "routeMerging": "node.serve(app_router) merges three routers:\n1. app_router — application-provided routes\n2. well_known_router — GET /.well-known/scp\n3. relay_router — WebSocket upgrade at /scp/v1\n\nSCP routes take precedence for /.well-known/scp and /scp/v1 paths. All other paths route to app_router.",
         "dynamicGeneration": ".well-known/scp is generated on each request from current node state. Registering a broadcast context on the node automatically makes it appear in future .well-known/scp responses."
-      }
+      },
+      "result": "HTTP server with .well-known/scp and WebSocket relay upgrade at /scp/v1. Route merging with serve()."
     },
     {
       "id": "SCP-148",
@@ -8157,7 +8161,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/economy/types.rs",
         "crates/scp-core/src/economy/mod.rs",
@@ -8241,7 +8245,8 @@
         "Patches": "SCP-018",
         "Integer arithmetic rationale": "IEEE 754 floating-point arithmetic is non-associative — (a + b) + c != a + (b + c) in general. When payer and receiver independently evaluate a pricing formula, f64 coefficients can produce different results depending on evaluation order, platform, or compiler optimizations. Integer arithmetic is deterministic across all platforms. This follows the pattern established by Stripe (amounts in cents), Bitcoin (amounts in satoshis), and Solana (amounts in lamports).",
         "Fixed-point coefficient rationale": "Pricing formulas need fractional multipliers (e.g., 'cost increases by 0.5x per 100 messages/min'). Coefficient provides 6 decimal places of precision using integer arithmetic. Evaluation: (coefficient.0 * metric_value) / 1_000_000. Both sides compute the same result."
-      }
+      },
+      "result": "All economic types from §19.1.1, §19.3, §19.4 implemented. Integer-only arithmetic. ContextParams extended with economic_policy. 34 economy tests."
     },
     {
       "id": "SCP-150",
@@ -9508,7 +9513,7 @@
       "gate": "gate-addr",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/tls.rs"
       ],
@@ -9551,7 +9556,8 @@
       "details": {
         "acmeNote": "ACME HTTP-01 needs port 80 reachable. DNS-01 alternative for environments without port 80 (NAT, shared hosting). The operator configures DNS TXT records manually or via DNS API.",
         "rustlsConfig": "Use rustls with TLS 1.3 minimum version. No TLS 1.2 fallback for relay connections (§9.13 allows TLS 1.2 only as fallback when 1.3 unavailable — ApplicationNode controls its own TLS config and can enforce 1.3)."
-      }
+      },
+      "result": "ACME TLS provisioning with HTTP-01 challenge, certificate storage, auto-renewal, TLS 1.3 enforcement. 16 tests."
     },
     {
       "id": "SCP-147",
@@ -9559,7 +9565,7 @@
       "gate": "gate-addr",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/http.rs",
         "crates/scp-node/src/well_known.rs"
@@ -9605,7 +9611,8 @@
       "details": {
         "routeMerging": "node.serve(app_router) merges three routers:\n1. app_router — application-provided routes\n2. well_known_router — GET /.well-known/scp\n3. relay_router — WebSocket upgrade at /scp/v1\n\nSCP routes take precedence for /.well-known/scp and /scp/v1 paths. All other paths route to app_router.",
         "dynamicGeneration": ".well-known/scp is generated on each request from current node state. Registering a broadcast context on the node automatically makes it appear in future .well-known/scp responses."
-      }
+      },
+      "result": "HTTP server with .well-known/scp and WebSocket relay upgrade at /scp/v1. Route merging with serve()."
     },
     {
       "id": "SCP-148",
@@ -9667,7 +9674,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/economy/types.rs",
         "crates/scp-core/src/economy/mod.rs",
@@ -9751,7 +9758,8 @@
         "Patches": "SCP-018",
         "Integer arithmetic rationale": "IEEE 754 floating-point arithmetic is non-associative — (a + b) + c != a + (b + c) in general. When payer and receiver independently evaluate a pricing formula, f64 coefficients can produce different results depending on evaluation order, platform, or compiler optimizations. Integer arithmetic is deterministic across all platforms. This follows the pattern established by Stripe (amounts in cents), Bitcoin (amounts in satoshis), and Solana (amounts in lamports).",
         "Fixed-point coefficient rationale": "Pricing formulas need fractional multipliers (e.g., 'cost increases by 0.5x per 100 messages/min'). Coefficient provides 6 decimal places of precision using integer arithmetic. Evaluation: (coefficient.0 * metric_value) / 1_000_000. Both sides compute the same result."
-      }
+      },
+      "result": "All economic types from §19.1.1, §19.3, §19.4 implemented. Integer-only arithmetic. ContextParams extended with economic_policy. 34 economy tests."
     },
     {
       "id": "SCP-150",
