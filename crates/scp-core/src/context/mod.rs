@@ -28,6 +28,7 @@
 
 pub mod builder;
 pub mod close;
+pub mod governance;
 pub mod invitation;
 pub mod manager;
 pub mod membership;
@@ -131,6 +132,13 @@ pub use invitation::{
 
 // Re-export standing channel types (SCP-138).
 pub use standing::{StandingChannelError, StandingChannelManager};
+
+// Re-export governance types (SCP-129, ADR-031).
+pub use governance::{
+    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
+    GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
+    SignedVote, SingleAdminEngine, VoteType,
+};
 
 // Re-export TTL management types (SCP-021, SCP-066).
 pub use ttl::{CloseResult, TtlExtension, TtlTimer};
