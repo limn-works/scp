@@ -695,8 +695,9 @@ async fn handle_publish<S: BlobStorage>(
         }
     };
 
-    // Deliver to active subscribers.
-    deliver_to_subscribers(&stored, subscriptions).await;
+    // Deliver to active subscribers. The return value tracks failed sends
+    // (logged inside the function) for suppression detection.
+    let _failed_deliveries = deliver_to_subscribers(&stored, subscriptions).await;
 
     // Respond with OK + blob_id.
     let ok = RelayMessage::Ok {
@@ -707,12 +708,16 @@ async fn handle_publish<S: BlobStorage>(
 }
 
 /// Delivers a stored blob to matching subscribers.
+///
+/// Returns the number of delivery failures (subscribers whose channel was
+/// full or closed). A non-zero count indicates potential selective message
+/// suppression if a relay artificially fills a target's buffer.
 #[allow(clippy::significant_drop_tightening)]
-async fn deliver_to_subscribers(stored: &StoredBlob, subscriptions: &SubscriptionRegistry) {
+async fn deliver_to_subscribers(stored: &StoredBlob, subscriptions: &SubscriptionRegistry) -> u64 {
     let registry = subscriptions.read().await;
 
     let Some(entries) = registry.get(&stored.routing_id) else {
-        return;
+        return 0;
     };
 
     let blob_msg = RelayMessage::Blob {
@@ -724,16 +729,35 @@ async fn deliver_to_subscribers(stored: &StoredBlob, subscriptions: &Subscriptio
         blob: stored.blob.clone(),
     };
 
+    let mut failed = 0u64;
     for entry in entries {
-        // Send to subscriber; if the channel is full or closed, log and skip.
+        // Send to subscriber; if the channel is full or closed, track the failure.
         if let Err(e) = entry.tx.try_send(blob_msg.clone()) {
+            failed += 1;
             tracing::warn!(
                 connection_id = entry.connection_id,
+                blob_id = ?stored.blob_id,
                 error = %e,
-                "failed to deliver blob to subscriber (channel full or closed)"
+                failed_count = failed,
+                total_subscribers = entries.len(),
+                "failed to deliver blob to subscriber (channel full or closed) — \
+                 possible selective suppression vector"
             );
         }
     }
+
+    if failed > 0 {
+        tracing::warn!(
+            blob_id = ?stored.blob_id,
+            routing_id = ?stored.routing_id,
+            failed_deliveries = failed,
+            total_subscribers = entries.len(),
+            "blob delivery incomplete: {failed}/{} subscribers received the blob",
+            entries.len()
+        );
+    }
+
+    failed
 }
 
 /// Handles a SUBSCRIBE operation.

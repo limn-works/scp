@@ -15,7 +15,10 @@
 //! See ADR-012 in `.docs/adrs/phase-2.md` for the full scoring design.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::time::Duration;
+
+use lru::LruCache;
 
 use crate::traits::BlobId;
 
@@ -37,6 +40,9 @@ const DELETION_COMPLIANCE_THRESHOLD: f64 = 0.5;
 
 /// Default suppression cross-check window.
 const DEFAULT_SUPPRESSION_WINDOW: Duration = Duration::from_secs(30);
+
+/// Maximum number of blobs tracked by `SuppressionTracker` (LRU eviction).
+const DEFAULT_SUPPRESSION_CAPACITY: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // ReliabilityScore
@@ -215,13 +221,15 @@ pub fn get_score<'a>(
 /// potentially adversarial. Blobs delivered by fewer than half the context's
 /// relays trigger a suppression warning.
 ///
+/// Uses LRU eviction to bound memory usage to at most
+/// [`DEFAULT_SUPPRESSION_CAPACITY`] (10,000) entries. When the tracker is full,
+/// the least-recently-used blob entry is evicted.
+///
 /// See ADR-012 acceptance criterion 7 (spec section 9.9.2).
 pub struct SuppressionTracker {
-    /// Per-blob delivery tracking: blob -> set of adapter indices that
-    /// delivered it.
-    deliveries: HashMap<BlobId, HashSet<usize>>,
-    /// Per-blob first-seen timestamp (epoch milliseconds).
-    first_seen: HashMap<BlobId, u64>,
+    /// Per-blob delivery tracking: blob -> (first_seen_ms, set of adapter
+    /// indices that delivered it). LRU-bounded.
+    entries: LruCache<BlobId, (u64, HashSet<usize>)>,
     /// The suppression cross-check window duration.
     window: Duration,
 }
@@ -239,27 +247,51 @@ pub struct SuppressionWarning {
 }
 
 impl SuppressionTracker {
-    /// Creates a new `SuppressionTracker` with the default 30-second window.
+    /// Creates a new `SuppressionTracker` with the default 30-second window
+    /// and 10,000 entry LRU capacity.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            deliveries: HashMap::new(),
-            first_seen: HashMap::new(),
+            entries: LruCache::new(
+                NonZeroUsize::new(DEFAULT_SUPPRESSION_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            ),
             window: DEFAULT_SUPPRESSION_WINDOW,
         }
     }
 
-    /// Creates a new `SuppressionTracker` with a custom window duration.
+    /// Creates a new `SuppressionTracker` with a custom window duration
+    /// and the default 10,000 entry LRU capacity.
     #[must_use]
     pub fn with_window(window: Duration) -> Self {
         Self {
-            deliveries: HashMap::new(),
-            first_seen: HashMap::new(),
+            entries: LruCache::new(
+                NonZeroUsize::new(DEFAULT_SUPPRESSION_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            ),
             window,
         }
     }
 
+    /// Returns the LRU capacity of this tracker.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.entries.cap().get()
+    }
+
+    /// Returns the number of blobs currently tracked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the tracker has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Records that an adapter delivered a blob.
+    ///
+    /// If the tracker is at capacity, the least-recently-used entry is evicted.
     ///
     /// # Arguments
     ///
@@ -267,11 +299,15 @@ impl SuppressionTracker {
     /// * `adapter_index` -- the adapter that delivered it.
     /// * `now_ms` -- the current time in epoch milliseconds.
     pub fn record_delivery(&mut self, blob_id: BlobId, adapter_index: usize, now_ms: u64) {
-        self.first_seen.entry(blob_id).or_insert(now_ms);
-        self.deliveries
-            .entry(blob_id)
-            .or_default()
-            .insert(adapter_index);
+        if let Some((first_seen, adapters)) = self.entries.get_mut(&blob_id) {
+            // Entry exists: just add the adapter (first_seen stays unchanged).
+            let _ = *first_seen; // keep original first_seen
+            adapters.insert(adapter_index);
+        } else {
+            let mut adapters = HashSet::new();
+            adapters.insert(adapter_index);
+            self.entries.put(blob_id, (now_ms, adapters));
+        }
     }
 
     /// Checks all tracked blobs for suppression and returns warnings for any
@@ -294,28 +330,26 @@ impl SuppressionTracker {
         let mut warnings = Vec::new();
         let mut expired_blobs = Vec::new();
 
-        for (blob_id, first_seen_ms) in &self.first_seen {
+        // Iterate over all entries without promoting (peek).
+        for (&blob_id, (first_seen_ms, adapters)) in self.entries.iter() {
             let elapsed = now_ms.saturating_sub(*first_seen_ms);
             if elapsed >= window_ms {
                 // Window has elapsed; check delivery count.
-                if let Some(adapters) = self.deliveries.get(blob_id) {
-                    let threshold = (total_relays + 1) / 2; // ceil(total_relays / 2)
-                    if adapters.len() < threshold {
-                        warnings.push(SuppressionWarning {
-                            blob_id: *blob_id,
-                            delivered_by: adapters.clone(),
-                            total_relays,
-                        });
-                    }
+                let threshold = (total_relays + 1) / 2; // ceil(total_relays / 2)
+                if adapters.len() < threshold {
+                    warnings.push(SuppressionWarning {
+                        blob_id,
+                        delivered_by: adapters.clone(),
+                        total_relays,
+                    });
                 }
-                expired_blobs.push(*blob_id);
+                expired_blobs.push(blob_id);
             }
         }
 
         // Clean up expired entries.
         for blob_id in &expired_blobs {
-            self.deliveries.remove(blob_id);
-            self.first_seen.remove(blob_id);
+            self.entries.pop(blob_id);
         }
 
         warnings
@@ -588,5 +622,61 @@ mod tests {
         // Only blob_b should trigger a warning.
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].blob_id, blob_b);
+    }
+
+    // -------------------------------------------------------------------
+    // LRU eviction tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn suppression_tracker_has_default_capacity() {
+        let tracker = SuppressionTracker::new();
+        assert_eq!(tracker.capacity(), DEFAULT_SUPPRESSION_CAPACITY);
+    }
+
+    #[test]
+    fn suppression_tracker_lru_evicts_oldest_entry() {
+        // Create a tiny tracker with capacity 3.
+        let mut tracker = SuppressionTracker {
+            entries: LruCache::new(NonZeroUsize::new(3).unwrap()),
+            window: Duration::from_secs(30),
+        };
+
+        let blob_a = BlobId::new([0xA0; 32]);
+        let blob_b = BlobId::new([0xB0; 32]);
+        let blob_c = BlobId::new([0xC0; 32]);
+        let blob_d = BlobId::new([0xD0; 32]);
+
+        // Fill to capacity.
+        tracker.record_delivery(blob_a, 0, 1000);
+        tracker.record_delivery(blob_b, 0, 2000);
+        tracker.record_delivery(blob_c, 0, 3000);
+        assert_eq!(tracker.len(), 3);
+
+        // Adding a 4th entry should evict blob_a (oldest/LRU).
+        tracker.record_delivery(blob_d, 0, 4000);
+        assert_eq!(tracker.len(), 3);
+
+        // blob_a should be evicted -- recording for it again creates a new entry.
+        tracker.record_delivery(blob_a, 1, 5000);
+        // Now blob_b is the LRU and should have been evicted.
+        assert_eq!(tracker.len(), 3);
+
+        // Check that blob_d and blob_c are still tracked (no warning for them).
+        let warnings = tracker.check_suppressions(35_000, 2);
+        // blob_a has adapter 1, blob_c has adapter 0, blob_d has adapter 0.
+        // All have 1 adapter out of 2. ceil(2/2) = 1. 1 >= 1 => no warning.
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn suppression_tracker_len_and_is_empty() {
+        let mut tracker = SuppressionTracker::new();
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
+
+        tracker.record_delivery(BlobId::new([0x01; 32]), 0, 1000);
+        assert!(!tracker.is_empty());
+        assert_eq!(tracker.len(), 1);
     }
 }

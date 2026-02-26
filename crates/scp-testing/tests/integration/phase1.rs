@@ -90,8 +90,10 @@ async fn receive_envelope(
                 TransportEvent::Terminated { reason } => {
                     panic!("subscription terminated: {reason}")
                 }
-                // BackfillComplete, Reconnected — skip silently.
-                TransportEvent::BackfillComplete | TransportEvent::Reconnected => {}
+                // BackfillComplete, Reconnected, SuppressionDetected — skip silently.
+                TransportEvent::BackfillComplete
+                | TransportEvent::Reconnected
+                | TransportEvent::SuppressionDetected(_) => {}
             }
         }
         panic!("stream ended without delivering an envelope");
