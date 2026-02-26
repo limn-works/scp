@@ -230,17 +230,6 @@ impl RevocationChecker for InMemoryRevocationChecker {
     }
 }
 
-/// No-op [`ProofResolver`] for Phase 2 (root tokens only, no delegation chains).
-pub struct NoOpProofResolver;
-
-impl ProofResolver for NoOpProofResolver {
-    fn resolve_proof(&self, cid: &str) -> Result<UcanToken, UcanError> {
-        Err(UcanError::DelegationChainBroken(format!(
-            "proof resolution not implemented in Phase 2: {cid}"
-        )))
-    }
-}
-
 /// In-memory [`ProofResolver`] backed by a `HashMap`.
 ///
 /// Maps proof CIDs to their corresponding [`UcanToken`]s. Used for testing
@@ -814,37 +803,8 @@ mod tests {
         (custody, handle, did, pk_bytes)
     }
 
-    /// Build a [`ValidationContext`] with in-memory implementations and
-    /// [`NoOpProofResolver`].
+    /// Build a [`ValidationContext`] with in-memory implementations.
     fn build_context<'a, S: BuildHasher>(
-        did_resolver: &'a InMemoryDidResolver,
-        nonce_tracker: &'a mut InMemoryNonceTracker,
-        revocation_checker: &'a InMemoryRevocationChecker,
-        ceiling: &'a HashSet<String, S>,
-        context_creator_did: &'a str,
-        presenting_agent_did: &'a str,
-    ) -> ValidationContext<
-        'a,
-        InMemoryDidResolver,
-        InMemoryNonceTracker,
-        InMemoryRevocationChecker,
-        NoOpProofResolver,
-        S,
-    > {
-        ValidationContext {
-            did_resolver,
-            nonce_tracker,
-            revocation_checker,
-            proof_resolver: &NoOpProofResolver,
-            ceiling,
-            context_creator_did,
-            presenting_agent_did,
-        }
-    }
-
-    /// Build a [`ValidationContext`] with an [`InMemoryProofResolver`] for
-    /// delegation chain tests.
-    fn build_context_with_proofs<'a, S: BuildHasher>(
         did_resolver: &'a InMemoryDidResolver,
         nonce_tracker: &'a mut InMemoryNonceTracker,
         revocation_checker: &'a InMemoryRevocationChecker,
@@ -934,6 +894,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -942,6 +903,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -982,6 +944,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -990,6 +953,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1079,7 +1043,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1159,7 +1123,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1210,7 +1174,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1255,6 +1219,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -1264,6 +1229,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             "did:dht:z6MkWrongCreator",
             "did:dht:z6MkMember",
@@ -1348,7 +1314,7 @@ mod tests {
         let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
 
         // The context creator is "did:dht:z6MkRealCreator" -- not non_creator.
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1393,6 +1359,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -1402,6 +1369,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkWrongAgent",
@@ -1442,6 +1410,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         // Request a capability the token does NOT grant.
@@ -1451,6 +1420,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1491,6 +1461,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         // Request specific context capability -- wildcard should match.
@@ -1500,6 +1471,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1583,7 +1555,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-att", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1628,6 +1600,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
 
         // Ceiling does NOT include context:close.
         let ceiling: HashSet<String> = ["messages:read".to_owned(), "messages:write".to_owned()]
@@ -1640,6 +1613,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1680,6 +1654,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-nonce", "messages", "write");
 
@@ -1688,6 +1663,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1700,6 +1676,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1745,6 +1722,7 @@ mod tests {
             .revoked
             .insert(compute_revocation_cid(&token.payload));
 
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
 
@@ -1752,6 +1730,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1793,6 +1772,7 @@ mod tests {
         let mut revocation_checker = InMemoryRevocationChecker::new();
         revocation_checker.revoked.insert(revocation_cid.clone());
 
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-cid", "messages", "write");
 
@@ -1800,6 +1780,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1843,6 +1824,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -1851,6 +1833,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -2115,6 +2098,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-roundtrip", "messages", "write");
@@ -2123,6 +2107,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -2263,7 +2248,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-full", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
