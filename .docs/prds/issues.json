@@ -1171,7 +1171,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/validate.rs"
       ],
@@ -1192,7 +1192,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/67"
       ],
-      "details": {}
+      "details": {},
+      "result": "Added CircularDelegation error variant. verify_delegation_chain collects issuer DIDs in HashSet; cycles detected before processing. 5 tests including A->B->C->A cycle, self-delegation, MAX_CHAIN_DEPTH."
     },
     {
       "id": "SCP-192",
@@ -1269,7 +1270,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/event_log/tree.rs",
         "crates/scp-core/src/event_log/proof.rs"
@@ -1292,7 +1293,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/58"
       ],
-      "details": {}
+      "details": {},
+      "result": "Implemented prove_absence and verify_absence with AbsenceProof struct in proof.rs. Sorted-neighbor approach. 7 tests added."
     },
     {
       "id": "SCP-195",
@@ -1329,7 +1331,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/client.rs"
       ],
@@ -1349,7 +1351,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/55"
       ],
-      "details": {}
+      "details": {},
+      "result": "Timeout branch now removes pending entry and drops oneshot sender. Prevents memory leak on repeated timeouts."
     },
     {
       "id": "SCP-197",
@@ -1422,7 +1425,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/credential.rs"
       ],
@@ -1442,7 +1445,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/47"
       ],
-      "details": {}
+      "details": {},
+      "result": "Added DID format validation in ScpCredential::new. InvalidDidFormat error variant. Updated all test DID strings to valid did:dht:z format. 4 tests added."
     },
     {
       "id": "SCP-200",
