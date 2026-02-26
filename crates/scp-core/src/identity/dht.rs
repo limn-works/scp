@@ -661,13 +661,16 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .await
             .map_err(IdentityError::Platform)?;
 
-        let sig_bytes = proof_sig.into_bytes();
-        if sig_bytes.len() != 64 {
-            return Err(IdentityError::KeyRotationFailed(format!(
-                "expected 64-byte signature, got {} bytes",
-                sig_bytes.len()
-            )));
-        }
+        let sig_bytes: [u8; 64] =
+            proof_sig
+                .into_bytes()
+                .try_into()
+                .map_err(|v: Vec<u8>| {
+                    IdentityError::KeyRotationFailed(format!(
+                        "expected 64-byte signature, got {} bytes",
+                        v.len()
+                    ))
+                })?;
 
         let old_pub_bytes: [u8; 32] =
             old_identity_public
@@ -989,17 +992,7 @@ pub fn verify_migration(
         IdentityError::MigrationVerificationFailed(format!("invalid old public key: {e}"))
     })?;
 
-    let sig_bytes: [u8; 64] = migration_proof
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            IdentityError::MigrationVerificationFailed(format!(
-                "expected 64-byte signature, got {} bytes",
-                migration_proof.signature.len()
-            ))
-        })?;
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let signature = ed25519_dalek::Signature::from_bytes(&migration_proof.signature);
 
     verifying_key.verify_strict(&digest, &signature).map_err(|e| {
         IdentityError::MigrationVerificationFailed(format!(
@@ -2152,7 +2145,7 @@ mod tests {
             old_did: "did:dht:zOld".to_owned(),
             new_did: "did:dht:zNew".to_owned(),
             migration_proof: MigrationProof {
-                signature: vec![0xAA; 64],
+                signature: [0xAA; 64],
                 old_public_key: [0xBB; 32],
             },
             pre_rotation_proof: Some(PreRotationProof {
