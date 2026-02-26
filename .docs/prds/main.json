@@ -1,258 +1,4 @@
 {
-  "project": "scp",
-  "description": "Shareable Context Protocol — cryptographic identity, governed contexts, encrypted communication, capability-based auth, and transparent provenance for AI agent infrastructure.",
-  "gates": [
-    {
-      "id": "gate-1",
-      "name": "Phase 1: Crypto Proof",
-      "priority": "P0",
-      "status": "pending",
-      "stories": [
-        "SCP-001",
-        "SCP-002",
-        "SCP-003",
-        "SCP-004",
-        "SCP-005",
-        "SCP-006",
-        "SCP-007",
-        "SCP-008",
-        "SCP-009",
-        "SCP-010",
-        "SCP-011",
-        "SCP-012",
-        "SCP-013",
-        "SCP-014",
-        "SCP-015",
-        "SCP-016",
-        "SCP-017"
-      ]
-    },
-    {
-      "id": "gate-2",
-      "name": "Phase 2: Context + Transport",
-      "priority": "P0",
-      "status": "pending",
-      "stories": [
-        "SCP-018",
-        "SCP-019",
-        "SCP-020",
-        "SCP-021",
-        "SCP-022",
-        "SCP-023",
-        "SCP-024",
-        "SCP-025",
-        "SCP-026",
-        "SCP-027",
-        "SCP-028",
-        "SCP-029",
-        "SCP-030",
-        "SCP-031",
-        "SCP-032",
-        "SCP-033",
-        "SCP-034",
-        "SCP-035",
-        "SCP-135",
-        "SCP-137",
-        "SCP-138"
-      ]
-    },
-    {
-      "id": "gate-3",
-      "name": "Phase 3: Python SDK + MCP",
-      "priority": "P0",
-      "status": "pending",
-      "stories": [
-        "SCP-036",
-        "SCP-037",
-        "SCP-038",
-        "SCP-039",
-        "SCP-040",
-        "SCP-041",
-        "SCP-042",
-        "SCP-043",
-        "SCP-044",
-        "SCP-045",
-        "SCP-046",
-        "SCP-047",
-        "SCP-048",
-        "SCP-049",
-        "SCP-050",
-        "SCP-051",
-        "SCP-052",
-        "SCP-053",
-        "SCP-054",
-        "SCP-055",
-        "SCP-056",
-        "SCP-057",
-        "SCP-058"
-      ]
-    },
-    {
-      "id": "gate-3a",
-      "name": "ADR Completion: Phases 4-5 Stubs",
-      "priority": "P0",
-      "status": "pending",
-      "stories": [
-        "SCP-059",
-        "SCP-060"
-      ]
-    },
-    {
-      "id": "gate-4",
-      "name": "Phase 4: Trust + TypeScript",
-      "priority": "P1",
-      "status": "pending",
-      "stories": [
-        "SCP-061",
-        "SCP-062",
-        "SCP-063",
-        "SCP-064",
-        "SCP-065",
-        "SCP-066",
-        "SCP-067",
-        "SCP-068",
-        "SCP-069",
-        "SCP-070",
-        "SCP-071",
-        "SCP-072",
-        "SCP-073",
-        "SCP-074",
-        "SCP-075",
-        "SCP-076",
-        "SCP-077",
-        "SCP-078",
-        "SCP-079",
-        "SCP-080",
-        "SCP-081",
-        "SCP-134"
-      ]
-    },
-    {
-      "id": "gate-4a",
-      "name": "ADR Completion: Phases 5-6 Stubs",
-      "priority": "P1",
-      "status": "pending",
-      "stories": [
-        "SCP-082",
-        "SCP-083"
-      ]
-    },
-    {
-      "id": "gate-5",
-      "name": "Phase 5: Platform Adapters + Swift + Bridges + Media",
-      "priority": "P1",
-      "status": "pending",
-      "stories": [
-        "SCP-084",
-        "SCP-085",
-        "SCP-086",
-        "SCP-087",
-        "SCP-088",
-        "SCP-089",
-        "SCP-090",
-        "SCP-091",
-        "SCP-092",
-        "SCP-093",
-        "SCP-094",
-        "SCP-095",
-        "SCP-096",
-        "SCP-097",
-        "SCP-098",
-        "SCP-099",
-        "SCP-100",
-        "SCP-101",
-        "SCP-102",
-        "SCP-103",
-        "SCP-104"
-      ]
-    },
-    {
-      "id": "gate-5a",
-      "name": "ADR Completion: Phase 6 Stubs",
-      "priority": "P2",
-      "status": "pending",
-      "stories": [
-        "SCP-105",
-        "SCP-106",
-        "SCP-107",
-        "SCP-108",
-        "SCP-109"
-      ]
-    },
-    {
-      "id": "gate-6",
-      "name": "Phase 6: Scale + Harden",
-      "priority": "P2",
-      "status": "pending",
-      "stories": [
-        "SCP-110",
-        "SCP-111",
-        "SCP-112",
-        "SCP-113",
-        "SCP-114",
-        "SCP-115",
-        "SCP-116",
-        "SCP-117",
-        "SCP-118",
-        "SCP-119",
-        "SCP-120",
-        "SCP-121",
-        "SCP-122",
-        "SCP-123",
-        "SCP-124",
-        "SCP-125",
-        "SCP-126",
-        "SCP-127",
-        "SCP-128",
-        "SCP-129",
-        "SCP-130",
-        "SCP-131",
-        "SCP-132",
-        "SCP-133",
-        "SCP-136",
-        "SCP-139"
-      ]
-    },
-    {
-      "id": "gate-addr",
-      "name": "Addressability and Deployment",
-      "priority": "P0",
-      "status": "pending",
-      "stories": [
-        "SCP-140",
-        "SCP-141",
-        "SCP-142",
-        "SCP-143",
-        "SCP-144",
-        "SCP-145",
-        "SCP-146",
-        "SCP-147",
-        "SCP-148"
-      ]
-    },
-    {
-      "id": "gate-econ",
-      "name": "Economic Governance: Implementation",
-      "priority": "P1",
-      "status": "pending",
-      "stories": [
-        "SCP-150",
-        "SCP-149",
-        "SCP-151",
-        "SCP-152",
-        "SCP-153",
-        "SCP-154",
-        "SCP-155",
-        "SCP-156",
-        "SCP-157",
-        "SCP-158",
-        "SCP-159",
-        "SCP-160",
-        "SCP-161",
-        "SCP-162"
-      ]
-    }
-  ],
   "stories": [
     {
       "id": "SCP-001",
@@ -2976,7 +2722,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/mcp.py"
       ],
@@ -3013,7 +2759,8 @@
       "details": {
         "python_usage": "from scp_sdk.mcp import serve_mcp\n\nserver = await serve_mcp(\n    identity=my_identity,\n    contexts=[context_a, context_b],\n    transport=\"stdio\",\n)",
         "cli_usage": "scp-mcp serve --identity <did> --relay <relay_url> --transport stdio"
-      }
+      },
+      "result": "Created bindings/python/scp_sdk/mcp.py with serve_mcp(), McpClient, and CLI entry point. All Python SDK patterns followed."
     },
     {
       "id": "SCP-052",
@@ -4931,7 +4678,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/bridge/claiming.rs"
       ],
@@ -4979,7 +4726,8 @@
           "ADR-003": "Shadow claiming uses identity attestation (§3.5) to bind external handle to DID.",
           "ADR-011": "Claiming is a context event."
         }
-      }
+      },
+      "result": "Created crates/scp-core/src/bridge/claiming.rs with ClaimRequest, ClaimResult, ClaimError types and claim_shadow() function. One-way irreversible claiming with attestation verification."
     },
     {
       "id": "SCP-089",
@@ -7369,7 +7117,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/nesting.rs"
       ],
@@ -7410,7 +7158,8 @@
       "details": {
         "Scope files": "| File | Purpose |\n|------|---------||\n| `nesting.rs` | Parent-child relationship management: ceiling intersection validation, eligibility enforcement, lifecycle coupling, ParentGovernanceConfig, MLS group_context extension construction (parent context IDs + governance config content hash) |",
         "Origin": "Split from SCP-022. Context nesting (§5.13) requires a complete Phase 2 context system as foundation. Not Phase 2 scope."
-      }
+      },
+      "result": "Created crates/scp-core/src/context/nesting.rs with ParentGovernanceConfig, ceiling intersection validation, eligibility enforcement, lifecycle coupling, multi-parent governance."
     },
     {
       "id": "SCP-135",
@@ -8449,7 +8198,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/spending.rs",
         "crates/scp-core/src/crypto/ucan/validate.rs",
@@ -8522,7 +8271,8 @@
         "ADR-033 criterion 5": "SpendingCapability is a valid UCAN capability type. AND-composition enforced: action requiring both messagesWrite and SpendingCapability fails if either is missing.",
         "ADR-033 criterion 6": "UCAN attenuation: sub-delegated SpendingCapability must narrow (lower max_per_action, max_total) — widening is rejected.",
         "Novel contribution": "No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not DID-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP bridges both."
-      }
+      },
+      "result": "Created crates/scp-core/src/crypto/ucan/spending.rs with SpendingCapability, AND-composition, attenuation validation, 24h expiry, BudgetTracker, mint/validate functions. 53 tests."
     },
     {
       "id": "SCP-154",
@@ -8843,7 +8593,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/config.rs",
         "crates/scp-transport/src/relay/wellknown.rs",
@@ -8905,7 +8655,8 @@
         "ADR-033 criterion 14": "Free relays exist in the default bootstrap relay list — at least one relay in the SDK's fallback list has no economic config.",
         "Relay trust model": "Paid relays remain untrusted — they see opaque blobs. Relay payment is for transport, not content access. Encryption-as-access-control (§9) unchanged. A relay that charges for storage cannot read what it stores.",
         "JSON structure": "The economic field is nested inside relay_config. Fields: per_publish (amount+currency), per_byte_stored (amount+currency), payment_adapters (array of adapter ID strings), payee (DID string)."
-      }
+      },
+      "result": "Created RelayEconomicConfig, extended .well-known/scp parsing, added cost-aware relay selection to TransportManager, free relay bootstrap validation."
     },
     {
       "id": "SCP-159",
@@ -9962,7 +9713,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/spending.rs",
         "crates/scp-core/src/crypto/ucan/validate.rs",
@@ -10035,7 +9786,8 @@
         "ADR-033 criterion 5": "SpendingCapability is a valid UCAN capability type. AND-composition enforced: action requiring both messagesWrite and SpendingCapability fails if either is missing.",
         "ADR-033 criterion 6": "UCAN attenuation: sub-delegated SpendingCapability must narrow (lower max_per_action, max_total) — widening is rejected.",
         "Novel contribution": "No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not DID-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP bridges both."
-      }
+      },
+      "result": "Created crates/scp-core/src/crypto/ucan/spending.rs with SpendingCapability, AND-composition, attenuation validation, 24h expiry, BudgetTracker, mint/validate functions. 53 tests."
     },
     {
       "id": "SCP-154",
@@ -10356,7 +10108,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/config.rs",
         "crates/scp-transport/src/relay/wellknown.rs",
@@ -10418,7 +10170,8 @@
         "ADR-033 criterion 14": "Free relays exist in the default bootstrap relay list — at least one relay in the SDK's fallback list has no economic config.",
         "Relay trust model": "Paid relays remain untrusted — they see opaque blobs. Relay payment is for transport, not content access. Encryption-as-access-control (§9) unchanged. A relay that charges for storage cannot read what it stores.",
         "JSON structure": "The economic field is nested inside relay_config. Fields: per_publish (amount+currency), per_byte_stored (amount+currency), payment_adapters (array of adapter ID strings), payee (DID string)."
-      }
+      },
+      "result": "Created RelayEconomicConfig, extended .well-known/scp parsing, added cost-aware relay selection to TransportManager, free relay bootstrap validation."
     },
     {
       "id": "SCP-159",
