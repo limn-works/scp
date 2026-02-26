@@ -24,6 +24,8 @@ from scp_sdk.errors import (
     UcanPermissionError,
     ValidationError,
 )
+from scp_sdk.identity import DIDDocument, Identity
+from scp_sdk.sync import run_sync
 from scp_sdk.tools import TestVector, ToolDefinition
 from scp_sdk.types import (
     Capability,
@@ -50,6 +52,11 @@ __all__ = [
     "TransportError",
     "UcanPermissionError",
     "ValidationError",
+    # Identity
+    "DIDDocument",
+    "Identity",
+    # Sync
+    "run_sync",
     # Types
     "Capability",
     "DiscoveryMethod",
