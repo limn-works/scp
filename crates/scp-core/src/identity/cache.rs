@@ -237,7 +237,7 @@ impl<C: Clock> DidCache<C> {
     /// Inserts or updates a cached DID document.
     ///
     /// If the DID already exists in the cache, the entry is only updated if
-    /// the new sequence number is greater than or equal to the existing one
+    /// the new sequence number is strictly greater than the existing one
     /// (BEP44 ordering). The `last_verified` timestamp is set to the current
     /// time.
     ///
@@ -247,9 +247,9 @@ impl<C: Clock> DidCache<C> {
         let mut entries = self.entries.lock().await;
         let now = self.clock.now();
 
-        // If entry exists, only update if new sequence is >= existing.
+        // If entry exists, only update if new sequence is strictly greater.
         if let Some(existing) = entries.get(did)
-            && sequence < existing.sequence
+            && sequence <= existing.sequence
         {
             return;
         }
@@ -428,6 +428,22 @@ mod tests {
 
         cache.insert(did, doc1.clone(), 5).await;
         cache.insert(did, doc2, 3).await;
+
+        let result = cache.get(did).await.unwrap();
+        assert_eq!(result.document, doc1);
+        assert_eq!(result.sequence, 5);
+    }
+
+    #[tokio::test]
+    async fn insert_with_same_sequence_is_rejected() {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = DidCache::with_clock(clock);
+        let did = "did:dht:zTest123";
+        let doc1 = make_document(did);
+        let doc2 = DidDocument::new(did, &[10u8; 32], &[20u8; 32], &[30u8; 32]);
+
+        cache.insert(did, doc1.clone(), 5).await;
+        cache.insert(did, doc2, 5).await;
 
         let result = cache.get(did).await.unwrap();
         assert_eq!(result.document, doc1);
