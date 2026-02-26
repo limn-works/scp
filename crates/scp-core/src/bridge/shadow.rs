@@ -354,6 +354,27 @@ impl ShadowRegistry {
     pub fn max_total_shadows(&self) -> usize {
         self.max_total_shadows
     }
+
+    /// Returns a mutable reference to a shadow identity by ID.
+    ///
+    /// This is a crate-internal accessor used by the claiming module to
+    /// transition a shadow's provenance status from `Shadow` to `Claimed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShadowError::ShadowNotFound`] if no shadow with the given ID
+    /// exists.
+    pub(crate) fn find_shadow_mut(
+        &mut self,
+        shadow_id: &str,
+    ) -> Result<&mut ShadowIdentity, ShadowError> {
+        self.shadows
+            .iter_mut()
+            .find(|s| s.shadow_id == shadow_id)
+            .ok_or_else(|| ShadowError::ShadowNotFound {
+                shadow_id: shadow_id.to_owned(),
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
