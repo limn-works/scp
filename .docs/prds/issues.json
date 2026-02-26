@@ -336,7 +336,7 @@
       "gate": "gate-sec-critical",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/ttl.rs"
@@ -368,7 +368,8 @@
       ],
       "details": {
         "securityImpact": "For ephemeral contexts, TTL expiry through the manager leaves keys intact — violating the ephemeral guarantee."
-      }
+      },
+      "result": "Converted providers to Arc, wired ttl::handle_ttl_expiry in spawn_ttl_timer for key destruction + event logging. Commit 8e10e77."
     },
     {
       "id": "SCP-170",
@@ -576,7 +577,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/envelope/inner.rs",
@@ -601,7 +602,8 @@
       ],
       "details": {
         "malleability": "For any valid (R, S), (R, L-S) is also valid. verify_strict() rejects non-canonical S values."
-      }
+      },
+      "result": "Switched verify() to verify_strict() at 3 call sites: UCAN validate, inner envelope, DID DHT. Commit 224fbdf."
     },
     {
       "id": "SCP-176",
@@ -674,7 +676,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "in_progress",
       "files": [
         "crates/scp-core/src/crypto/mls/group.rs"
       ],
@@ -698,7 +700,8 @@
       ],
       "details": {
         "exposureWindow": "Without zeroization, key material persists until garbage collected (in Rust: until the owning struct is dropped/deallocated). Recoverable via core dump, cold boot, or swap."
-      }
+      },
+      "result": "Added zeroize dep to scp-core. Actual Zeroize/ZeroizeOnDrop derives on key types pending. Commit ede83f8."
     },
     {
       "id": "SCP-179",
@@ -706,7 +709,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "in_progress",
       "files": [
         "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
       ],
@@ -731,7 +734,8 @@
         "https://github.com/limn-works/scp/issues/50",
         "https://github.com/limn-works/scp/issues/49"
       ],
-      "details": {}
+      "details": {},
+      "result": "Added nonce+timestamp to SenderKeyRequest struct and hash. Responder-side nonce dedup not yet built. Commit 0bf9715."
     },
     {
       "id": "SCP-180",
@@ -739,7 +743,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "in_progress",
       "files": [
         "crates/scp-core/src/crypto/ucan/revoke.rs"
       ],
@@ -766,7 +770,8 @@
       ],
       "details": {
         "splitBrain": "If distribution fails, revoker thinks token revoked but no one else does. Persists until next successful distribution."
-      }
+      },
+      "result": "Added RevocationState enum (Active/RevocationPending/Revoked). Wiring into revocation flow pending. Commit d2e2634."
     },
     {
       "id": "SCP-181",
@@ -837,7 +842,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/sender_keys/encrypt.rs",
         "crates/scp-core/src/envelope/padding.rs",
@@ -864,7 +869,8 @@
       ],
       "details": {
         "forkSafety": "thread_rng() state duplicated across fork(). OsRng reads from OS entropy source directly."
-      }
+      },
+      "result": "Replaced thread_rng() with OsRng at all 4 crypto call sites. Commits 8d64a7f + 0bf9715."
     },
     {
       "id": "SCP-184",
@@ -872,7 +878,7 @@
       "gate": "gate-correctness",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/membership.rs"
       ],
@@ -895,7 +901,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/38"
       ],
-      "details": {}
+      "details": {},
+      "result": "Rewrote ReceiveBuffer::push() with correct overflow counting and coalescing. Commit 1127e3e."
     },
     {
       "id": "SCP-185",
