@@ -110,6 +110,15 @@ pub enum UcanError {
     #[error("token not yet valid")]
     TokenNotYetValid,
 
+    /// The token's time range is invalid (`nbf >= exp`).
+    #[error("invalid time range: nbf ({nbf}) must be less than exp ({exp})")]
+    InvalidTimeRange {
+        /// The `nbf` (not-before) timestamp.
+        nbf: u64,
+        /// The `exp` (expiry) timestamp.
+        exp: u64,
+    },
+
     /// The nonce has been seen before in this context.
     #[error("nonce reused: {0}")]
     NonceReused(String),

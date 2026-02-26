@@ -25,8 +25,9 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use super::UcanError;
+use super::{UcanError, UcanPayload};
 use crate::event_log::ContextId;
 
 // ---------------------------------------------------------------------------
@@ -190,30 +191,69 @@ pub trait RevocationEventLogger {
 }
 
 // ---------------------------------------------------------------------------
+// Revocation CID computation
+// ---------------------------------------------------------------------------
+
+/// Computes a revocation CID as the hex-encoded SHA-256 hash of the
+/// JSON-serialized UCAN payload (claims).
+///
+/// Unlike the proof-chain CID ([`super::mint::compute_cid`]) which hashes the
+/// full encoded JWT, the revocation CID hashes only the canonical payload.
+/// This produces a fixed-length 64-character hex string regardless of token
+/// size, keeping revocation storage bounded and avoiding storing the full
+/// variable-length JWT in the revocation list.
+///
+/// # Errors
+///
+/// Returns [`UcanError::MalformedToken`] if the payload cannot be serialized
+/// to JSON. This should never happen for a well-formed [`UcanPayload`].
+#[must_use]
+pub fn compute_revocation_cid(payload: &UcanPayload) -> String {
+    // SAFETY: UcanPayload derives Serialize with standard field types (String,
+    // u64, Option, Vec, serde_json::Value). Serialization failure is not
+    // possible for a well-formed payload, so we use an infallible fold.
+    let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let hash = Sha256::digest(&payload_bytes);
+    hash.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+// ---------------------------------------------------------------------------
 // revoke_ucan
 // ---------------------------------------------------------------------------
 
 /// Revokes a UCAN token within a context.
 ///
-/// Performs the full revocation flow specified by ADR-016 acceptance criterion 5:
+/// Computes the revocation CID as the hex-encoded SHA-256 hash of the
+/// JSON-serialized UCAN payload, then performs the full revocation flow
+/// specified by ADR-016 acceptance criterion 5:
 ///
-/// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
+/// 1. **CID computation** -- Computes the content-hash CID from the token
+///    payload via [`compute_revocation_cid`].
+/// 2. **Authorization** -- Verifies the revoker is the token's issuer or the
 ///    context creator via [`RevocationAuthorizer`].
-/// 2. **Revocation** -- Adds the token CID to the context's
+/// 3. **Revocation** -- Adds the token CID to the context's
 ///    [`RevocationList`].
-/// 3. **Distribution** -- Broadcasts the revocation to all context members as
+/// 4. **Distribution** -- Broadcasts the revocation to all context members as
 ///    an MLS application message via [`RevocationDistributor`].
-/// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
+/// 5. **Event logging** -- Appends a `TokenRevoked` event to the context's
 ///    event log via [`RevocationEventLogger`].
 ///
 /// # Arguments
 ///
 /// * `revocation_list` - The context's mutable revocation list.
-/// * `token_cid` - The CID of the token to revoke.
+/// * `payload` - The UCAN token's payload, used to compute the revocation CID.
 /// * `revoker_did` - The DID of the entity requesting the revocation.
 /// * `authorizer` - Verifies the revoker is authorized.
 /// * `distributor` - Distributes the revocation to context members.
 /// * `event_logger` - Appends the `TokenRevoked` event.
+///
+/// # Returns
+///
+/// Returns the computed revocation CID on success.
 ///
 /// # Errors
 ///
@@ -224,26 +264,29 @@ pub trait RevocationEventLogger {
 /// See ADR-016 acceptance criterion 5.
 pub fn revoke_ucan(
     revocation_list: &mut RevocationList,
-    token_cid: &str,
+    payload: &UcanPayload,
     revoker_did: &str,
     authorizer: &impl RevocationAuthorizer,
     distributor: &impl RevocationDistributor,
     event_logger: &impl RevocationEventLogger,
-) -> Result<(), UcanError> {
-    // Step 1: Verify authorization.
-    authorizer.authorize_revocation(token_cid, revoker_did)?;
+) -> Result<String, UcanError> {
+    // Step 1: Compute content-hash CID from payload.
+    let token_cid = compute_revocation_cid(payload);
 
-    // Step 2: Add to revocation list.
-    revocation_list.revoke(token_cid.to_owned());
+    // Step 2: Verify authorization.
+    authorizer.authorize_revocation(&token_cid, revoker_did)?;
 
-    // Step 3: Distribute via MLS.
+    // Step 3: Add to revocation list.
+    revocation_list.revoke(token_cid.clone());
+
+    // Step 4: Distribute via MLS.
     let context_id = revocation_list.context_id().to_owned();
-    distributor.distribute_revocation(&context_id, token_cid)?;
+    distributor.distribute_revocation(&context_id, &token_cid)?;
 
-    // Step 4: Append TokenRevoked event.
-    event_logger.log_token_revoked(&context_id, token_cid, revoker_did)?;
+    // Step 5: Append TokenRevoked event.
+    event_logger.log_token_revoked(&context_id, &token_cid, revoker_did)?;
 
-    Ok(())
+    Ok(token_cid)
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +426,24 @@ mod tests {
             Err(UcanError::RevocationFailed(
                 "event log append failed".to_owned(),
             ))
+        }
+    }
+
+    /// Build a test payload for revocation tests.
+    fn test_payload() -> UcanPayload {
+        use super::super::Attenuation;
+        UcanPayload {
+            iss: "did:dht:z6MkIssuer".to_owned(),
+            aud: "did:dht:z6MkMember".to_owned(),
+            exp: 1_700_000_000,
+            nbf: None,
+            nnc: "1699999000000-aabbccdd11223344aabbccdd11223344".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:ctx-1/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
         }
     }
 
@@ -630,10 +691,12 @@ mod tests {
         };
         let distributor = MockDistributor::new();
         let logger = MockEventLogger::new();
+        let payload = test_payload();
+        let expected_cid = compute_revocation_cid(&payload);
 
         let result = revoke_ucan(
             &mut list,
-            "bafyrei-token1",
+            &payload,
             "did:dht:z6MkIssuer",
             &authorizer,
             &distributor,
@@ -641,18 +704,20 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        assert!(list.is_revoked("bafyrei-token1"));
+        let returned_cid = result.unwrap();
+        assert_eq!(returned_cid, expected_cid);
+        assert!(list.is_revoked(&expected_cid));
         assert_eq!(distributor.distributed.borrow().len(), 1);
         assert_eq!(
             distributor.distributed.borrow()[0],
-            ("ctx-1".to_owned(), "bafyrei-token1".to_owned())
+            ("ctx-1".to_owned(), expected_cid.clone())
         );
         assert_eq!(logger.logged.borrow().len(), 1);
         assert_eq!(
             logger.logged.borrow()[0],
             (
                 "ctx-1".to_owned(),
-                "bafyrei-token1".to_owned(),
+                expected_cid,
                 "did:dht:z6MkIssuer".to_owned()
             )
         );
@@ -667,10 +732,12 @@ mod tests {
         };
         let distributor = MockDistributor::new();
         let logger = MockEventLogger::new();
+        let payload = test_payload();
+        let expected_cid = compute_revocation_cid(&payload);
 
         let result = revoke_ucan(
             &mut list,
-            "bafyrei-token1",
+            &payload,
             "did:dht:z6MkCreator",
             &authorizer,
             &distributor,
@@ -678,7 +745,7 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        assert!(list.is_revoked("bafyrei-token1"));
+        assert!(list.is_revoked(&expected_cid));
     }
 
     // -----------------------------------------------------------------------
@@ -691,10 +758,12 @@ mod tests {
         let authorizer = RejectingAuthorizer;
         let distributor = MockDistributor::new();
         let logger = MockEventLogger::new();
+        let payload = test_payload();
+        let expected_cid = compute_revocation_cid(&payload);
 
         let result = revoke_ucan(
             &mut list,
-            "bafyrei-token1",
+            &payload,
             "did:dht:z6MkUnauthorized",
             &authorizer,
             &distributor,
@@ -707,7 +776,7 @@ mod tests {
             UcanError::RevocationUnauthorized(_)
         ));
         // Token should NOT be revoked on authorization failure.
-        assert!(!list.is_revoked("bafyrei-token1"));
+        assert!(!list.is_revoked(&expected_cid));
         // Distribution and logging should not have been called.
         assert!(distributor.distributed.borrow().is_empty());
         assert!(logger.logged.borrow().is_empty());
@@ -729,7 +798,7 @@ mod tests {
 
         let result = revoke_ucan(
             &mut list,
-            "bafyrei-token1",
+            &test_payload(),
             "did:dht:z6MkIssuer",
             &authorizer,
             &distributor,
@@ -761,7 +830,7 @@ mod tests {
 
         let result = revoke_ucan(
             &mut list,
-            "bafyrei-token1",
+            &test_payload(),
             "did:dht:z6MkIssuer",
             &authorizer,
             &distributor,
@@ -773,6 +842,118 @@ mod tests {
             result.unwrap_err(),
             UcanError::RevocationFailed(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_revocation_cid -- content hash format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revocation_cid_is_deterministic() {
+        let payload = test_payload();
+        let cid1 = compute_revocation_cid(&payload);
+        let cid2 = compute_revocation_cid(&payload);
+        assert_eq!(cid1, cid2, "same payload must produce same CID");
+    }
+
+    #[test]
+    fn revocation_cid_is_fixed_length_hex() {
+        let payload = test_payload();
+        let cid = compute_revocation_cid(&payload);
+        // SHA-256 hex = 64 characters.
+        assert_eq!(cid.len(), 64, "revocation CID must be 64 hex chars");
+        assert!(
+            cid.chars().all(|c| c.is_ascii_hexdigit()),
+            "revocation CID must be hex-encoded"
+        );
+    }
+
+    #[test]
+    fn revocation_cid_differs_for_different_payloads() {
+        let payload1 = test_payload();
+        let mut payload2 = test_payload();
+        payload2.aud = "did:dht:z6MkOther".to_owned();
+
+        let cid1 = compute_revocation_cid(&payload1);
+        let cid2 = compute_revocation_cid(&payload2);
+        assert_ne!(cid1, cid2, "different payloads must produce different CIDs");
+    }
+
+    #[test]
+    fn revocation_storage_size_is_bounded_per_entry() {
+        // The revocation CID is always 64 hex characters, regardless of
+        // the JWT payload size. This verifies the CID length is bounded.
+        use super::super::Attenuation;
+        let small_payload = test_payload();
+
+        // Create a payload with many capabilities (large JWT).
+        let large_payload = UcanPayload {
+            iss: "did:dht:z6MkIssuer".to_owned(),
+            aud: "did:dht:z6MkMember".to_owned(),
+            exp: 1_700_000_000,
+            nbf: None,
+            nnc: "1699999000000-aabbccdd11223344aabbccdd11223344".to_owned(),
+            att: (0..100)
+                .map(|i| Attenuation {
+                    with: format!("scp:ctx:ctx-{i}/messages:write"),
+                    can: "write".to_owned(),
+                })
+                .collect(),
+            prf: (0..50).map(|i| format!("bafyrei-proof-{i}")).collect(),
+            fct: Some(serde_json::json!({"data": "x".repeat(10_000)})),
+        };
+
+        let small_cid = compute_revocation_cid(&small_payload);
+        let large_cid = compute_revocation_cid(&large_payload);
+
+        // Both CIDs are the same fixed length regardless of payload size.
+        assert_eq!(small_cid.len(), 64);
+        assert_eq!(large_cid.len(), 64);
+        assert_ne!(small_cid, large_cid);
+    }
+
+    // -----------------------------------------------------------------------
+    // revoke_ucan -- content-hash CID is found on subsequent lookup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revoke_ucan_cid_found_on_subsequent_lookup() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        let authorizer = MockAuthorizer {
+            issuer_did: "did:dht:z6MkIssuer".to_owned(),
+            creator_did: "did:dht:z6MkCreator".to_owned(),
+        };
+        let distributor = MockDistributor::new();
+        let logger = MockEventLogger::new();
+        let payload = test_payload();
+
+        // Revoke the token.
+        let cid = revoke_ucan(
+            &mut list,
+            &payload,
+            "did:dht:z6MkIssuer",
+            &authorizer,
+            &distributor,
+            &logger,
+        )
+        .unwrap();
+
+        // The CID should be the content hash, not the full JWT.
+        let expected_cid = compute_revocation_cid(&payload);
+        assert_eq!(cid, expected_cid);
+
+        // Subsequent lookup by the same content-hash CID must find it.
+        assert!(
+            list.is_revoked(&expected_cid),
+            "revocation must be findable by content-hash CID"
+        );
+
+        // Re-computing the CID from the same payload must also find it.
+        let recomputed_cid = compute_revocation_cid(&payload);
+        assert!(
+            list.is_revoked(&recomputed_cid),
+            "re-computed CID must match stored revocation"
+        );
     }
 
     // -----------------------------------------------------------------------

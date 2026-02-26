@@ -28,7 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::Verifier;
 
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
-use super::mint::compute_cid;
+use super::revoke::compute_revocation_cid;
 use super::{UcanError, UcanHeader, UcanPayload, UcanToken};
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
@@ -455,9 +455,11 @@ where
         .check_and_record(&token.payload.nnc, token.payload.exp)?;
 
     // Step 10: Revocation — verify token CID not revoked.
-    let token_cid = compute_cid(token);
-    if ctx.revocation_checker.is_revoked(&token_cid) {
-        return Err(UcanError::TokenRevoked(token_cid));
+    // Uses the content-hash revocation CID (SHA-256 of the payload) to match
+    // the format used by revoke_ucan.
+    let revocation_cid = compute_revocation_cid(&token.payload);
+    if ctx.revocation_checker.is_revoked(&revocation_cid) {
+        return Err(UcanError::TokenRevoked(revocation_cid));
     }
 
     // Step 11: Expiry — verify exp > now and nbf <= now.
@@ -712,16 +714,29 @@ fn verify_attenuation(
 /// Step 11: Verify token expiry.
 ///
 /// Checks that:
+/// - `nbf < exp` (if present, the time range is valid)
 /// - `exp > now` (not expired)
 /// - `exp <= now + 24h` (not too far in the future)
 /// - `nbf <= now` (if present, the token is already valid)
 ///
 /// # Errors
 ///
+/// Returns [`UcanError::InvalidTimeRange`] if `nbf >= exp`.
 /// Returns [`UcanError::TokenExpired`] if the token has expired.
 /// Returns [`UcanError::ExpiryTooFar`] if `exp` exceeds now + 24 hours.
 /// Returns [`UcanError::TokenNotYetValid`] if `nbf > now`.
 fn verify_expiry(token: &UcanToken) -> Result<(), UcanError> {
+    // Check nbf < exp first — a token with nbf >= exp is inherently invalid
+    // regardless of the current time.
+    if let Some(nbf) = token.payload.nbf
+        && nbf >= token.payload.exp
+    {
+        return Err(UcanError::InvalidTimeRange {
+            nbf,
+            exp: token.payload.exp,
+        });
+    }
+
     let now = now_secs();
 
     if token.payload.exp <= now {
@@ -1694,9 +1709,11 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
-        // Add the token's CID to the revocation list.
+        // Add the token's revocation CID (content hash) to the revocation list.
         let mut revocation_checker = InMemoryRevocationChecker::new();
-        revocation_checker.revoked.insert(compute_cid(&token));
+        revocation_checker
+            .revoked
+            .insert(compute_revocation_cid(&token.payload));
 
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -1718,7 +1735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_ucan_revocation_uses_compute_cid() {
+    async fn validate_ucan_revocation_uses_content_hash_cid() {
         let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
         let caps = vec!["messages:write".to_owned()];
 
@@ -1735,16 +1752,16 @@ mod tests {
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
-        let token_cid = compute_cid(&token);
+        let revocation_cid = compute_revocation_cid(&token.payload);
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
-        // Revoke using compute_cid.
+        // Revoke using content-hash CID (SHA-256 of payload).
         let mut revocation_checker = InMemoryRevocationChecker::new();
-        revocation_checker.revoked.insert(token_cid.clone());
+        revocation_checker.revoked.insert(revocation_cid.clone());
 
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-cid", "messages", "write");
@@ -1760,8 +1777,8 @@ mod tests {
 
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(
-            matches!(result, Err(UcanError::TokenRevoked(ref cid)) if cid == &token_cid),
-            "token revoked by compute_cid must be rejected: {result:?}"
+            matches!(result, Err(UcanError::TokenRevoked(ref cid)) if cid == &revocation_cid),
+            "token revoked by content-hash CID must be rejected: {result:?}"
         );
     }
 
@@ -1872,8 +1889,8 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkCreator".to_owned(),
                 aud: "did:dht:z6MkMember".to_owned(),
-                exp: now + 3600,
-                nbf: Some(now + 7200), // Not valid for 2 hours.
+                exp: now + 7200,
+                nbf: Some(now + 3600), // nbf < exp, but nbf > now (not yet valid).
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
                 att: vec![],
                 prf: vec![],
@@ -1907,6 +1924,84 @@ mod tests {
         };
 
         assert!(verify_expiry(&token).is_ok());
+    }
+
+    #[test]
+    fn verify_expiry_rejects_nbf_greater_than_exp() {
+        let now = now_secs();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: now + 3600,
+                nbf: Some(now + 7200), // nbf > exp
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let result = verify_expiry(&token);
+        assert!(
+            matches!(result, Err(UcanError::InvalidTimeRange { nbf, exp }) if nbf == now + 7200 && exp == now + 3600),
+            "nbf > exp must return InvalidTimeRange: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_expiry_rejects_nbf_equal_to_exp() {
+        let now = now_secs();
+        let exp_time = now + 3600;
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: exp_time,
+                nbf: Some(exp_time), // nbf == exp
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let result = verify_expiry(&token);
+        assert!(
+            matches!(result, Err(UcanError::InvalidTimeRange { .. })),
+            "nbf == exp must return InvalidTimeRange: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_expiry_accepts_nbf_less_than_exp() {
+        let now = now_secs();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: now + 3600,
+                nbf: Some(now - 60), // nbf < exp and nbf <= now
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        assert!(
+            verify_expiry(&token).is_ok(),
+            "nbf < exp must pass time range validation"
+        );
     }
 
     // -----------------------------------------------------------------------
