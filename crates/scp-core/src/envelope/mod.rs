@@ -113,4 +113,12 @@ pub enum EnvelopeError {
     /// is attempted.
     #[error("sender key decryption failed: {0}")]
     SenderKeyDecryptionFailed(String),
+
+    /// The sender is not a member of the MLS group.
+    ///
+    /// The `sender_did` from the inner envelope does not match any credential
+    /// in the MLS group's member list. This indicates the inner envelope was
+    /// constructed with a DID that is not part of the group.
+    #[error("unknown sender: {0}")]
+    UnknownSender(String),
 }

@@ -126,6 +126,103 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     }
 }
 
+/// Decrypts an MLS `PrivateMessage` and returns both the plaintext bytes and
+/// the sender's Ed25519 signature key (as extracted from the MLS group state).
+///
+/// This function performs the same decryption as [`decrypt`] but additionally
+/// resolves the sender's identity from the MLS group tree. The sender's
+/// `signature_key` from their leaf node is returned alongside the plaintext,
+/// enabling the caller to verify inner envelope signatures without requiring
+/// the sender's public key as an external parameter.
+///
+/// # Arguments
+///
+/// * `group` - The MLS group to decrypt within. Must be active.
+/// * `ciphertext` - The serialized MLS ciphertext bytes.
+///
+/// # Returns
+///
+/// A tuple of `(plaintext, sender_signature_key)` where `sender_signature_key`
+/// is the Ed25519 public key bytes from the sender's MLS leaf node.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
+/// Returns [`MlsError::DecryptionFailed`] if decryption or sender resolution
+/// fails.
+/// Returns [`MlsError::NotApplicationMessage`] if the decrypted message is
+/// not an application message.
+///
+/// See SCP-177: resolve sender key internally in `open_envelope`.
+pub fn decrypt_with_sender_key(
+    group: &mut ScpMlsGroup,
+    ciphertext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), MlsError> {
+    if group.group.is_none() {
+        return Err(MlsError::GroupDestroyed);
+    }
+
+    // Deserialize the ciphertext bytes into an MlsMessageIn.
+    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
+
+    // Convert to a ProtocolMessage for processing.
+    let protocol_message = message_in
+        .try_into_protocol_message()
+        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
+
+    // Process the message — this verifies membership tag and generation number.
+    //
+    // OpenMLS may panic on AEAD decryption failure for tampered ciphertexts.
+    // We guard against this with catch_unwind (same as in `decrypt`).
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let process_result = catch_unwind(AssertUnwindSafe(|| {
+        g.process_message(&group.provider, protocol_message)
+    }));
+
+    let processed = match process_result {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Err(_) => {
+            return Err(MlsError::DecryptionFailed(
+                "OpenMLS panicked during message processing".to_string(),
+            ));
+        }
+    };
+
+    // Extract the sender's leaf index from the ProcessedMessage before
+    // consuming it with into_content().
+    let sender = processed.sender().clone();
+    let sender_leaf_index = match sender {
+        Sender::Member(idx) => idx,
+        _ => {
+            return Err(MlsError::DecryptionFailed(
+                "sender is not a group member".to_string(),
+            ));
+        }
+    };
+
+    // Look up the sender's signature key from the group member list.
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let sender_signature_key = g
+        .members()
+        .find(|m| m.index == sender_leaf_index)
+        .map(|m| m.signature_key.clone())
+        .ok_or_else(|| {
+            MlsError::DecryptionFailed(format!(
+                "sender leaf index {sender_leaf_index:?} not found in group members"
+            ))
+        })?;
+
+    // Extract the application message content.
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app_msg) => {
+            Ok((app_msg.into_bytes(), sender_signature_key))
+        }
+        _ => Err(MlsError::NotApplicationMessage),
+    }
+}
+
 /// Serializes an [`MlsMessageOut`] to bytes for transmission.
 ///
 /// This is a convenience function for converting the output of [`encrypt`]

@@ -125,6 +125,36 @@ impl ScpMlsGroup {
         let g = self.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
         Ok(g.own_leaf_index())
     }
+
+    /// Signs data using the local member's MLS signing key.
+    ///
+    /// This is the key that `open_envelope` resolves from the MLS group tree
+    /// when verifying inner envelope signatures (SCP-177). Inner envelopes
+    /// must be signed with this key for `open_envelope` verification to pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
+    /// Returns [`MlsError::EncryptionFailed`] if signing fails.
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, MlsError> {
+        let signer = self.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        openmls_traits::signatures::Signer::sign(signer, data)
+            .map_err(|e| MlsError::EncryptionFailed(format!("signing failed: {e:?}")))
+    }
+
+    /// Returns the local member's MLS signing public key bytes.
+    ///
+    /// This is the Ed25519 public key stored in the member's leaf node in the
+    /// MLS tree. `open_envelope` resolves this key from the sender's leaf node
+    /// to verify inner envelope signatures (SCP-177).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
+    pub fn signer_public_key(&self) -> Result<Vec<u8>, MlsError> {
+        let signer = self.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        Ok(signer.to_public_vec())
+    }
 }
 
 /// Creates a new MLS group with the creator as the sole member.
