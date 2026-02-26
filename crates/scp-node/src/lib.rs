@@ -16,7 +16,7 @@ use scp_core::identity::document::DidDocument;
 use scp_core::identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer};
-use scp_transport::native::storage::InMemoryBlobStorage;
+use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -183,7 +183,7 @@ impl<S: Storage> ApplicationNode<S> {
 ///
 /// Convenience function equivalent to `ApplicationNodeBuilder::new()`.
 #[must_use]
-pub const fn builder() -> ApplicationNodeBuilder {
+pub fn builder() -> ApplicationNodeBuilder {
     ApplicationNodeBuilder::new()
 }
 
@@ -234,36 +234,46 @@ pub struct ApplicationNodeBuilder<
     K: KeyCustody = NoOpCustody,
     D: DidMethod = NoOpDidMethod,
     S: Storage = NoOpStorage,
+    B: BlobStorage = InMemoryBlobStorage,
 > {
     domain: Option<String>,
     identity_source: Option<IdentitySource<K, D>>,
     storage: Option<Arc<S>>,
+    blob_storage: Option<B>,
     bind_addr: Option<SocketAddr>,
+    // Intentional dead code: TLS provisioning is not yet implemented (ADR-032 AC 7).
+    // This field is part of the builder API surface per SCP-145. It will be consumed
+    // when TLS certificate provisioning is added.
+    #[allow(dead_code)]
     acme_email: Option<String>,
 }
 
 impl ApplicationNodeBuilder {
     /// Creates a new builder with all fields unset.
+    ///
+    /// The relay uses [`InMemoryBlobStorage`] by default. Call
+    /// [`blob_storage`](Self::blob_storage) to use a different backend.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             domain: None,
             identity_source: None,
             storage: None,
+            blob_storage: Some(InMemoryBlobStorage::new()),
             bind_addr: None,
             acme_email: None,
         }
     }
 }
 
-impl Default for ApplicationNodeBuilder {
+impl Default for ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, NoOpStorage, InMemoryBlobStorage> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
-    ApplicationNodeBuilder<K, D, S>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, B: BlobStorage + 'static>
+    ApplicationNodeBuilder<K, D, S, B>
 {
     /// Sets the domain this node serves.
     ///
@@ -296,25 +306,48 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static> ApplicationNodeBuilder<K, D, NoOpStorage> {
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static> ApplicationNodeBuilder<K, D, NoOpStorage, B> {
     /// Sets an explicit storage backend.
     ///
     /// If not called, `.build()` uses a default no-op storage.
     pub fn storage<S2: Storage + 'static>(
         self,
         storage: Arc<S2>,
-    ) -> ApplicationNodeBuilder<K, D, S2> {
+    ) -> ApplicationNodeBuilder<K, D, S2, B> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: self.identity_source,
             storage: Some(storage),
+            blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
         }
     }
 }
 
-impl<S: Storage + 'static> ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S> {
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
+    ApplicationNodeBuilder<K, D, S, InMemoryBlobStorage>
+{
+    /// Sets a custom blob storage backend for the relay server.
+    ///
+    /// If not called, the relay uses [`InMemoryBlobStorage`] (all blobs lost on restart).
+    /// Accepts any type implementing [`BlobStorage`].
+    pub fn blob_storage<B2: BlobStorage + 'static>(
+        self,
+        blob_storage: B2,
+    ) -> ApplicationNodeBuilder<K, D, S, B2> {
+        ApplicationNodeBuilder {
+            domain: self.domain,
+            identity_source: self.identity_source,
+            storage: self.storage,
+            blob_storage: Some(blob_storage),
+            bind_addr: self.bind_addr,
+            acme_email: self.acme_email,
+        }
+    }
+}
+
+impl<S: Storage + 'static, B: BlobStorage + 'static> ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S, B> {
     /// Sets an explicit identity and DID document to use.
     ///
     /// The identity will be published to the DHT with `SCPRelay` entries
@@ -324,7 +357,7 @@ impl<S: Storage + 'static> ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S>
         identity: ScpIdentity,
         document: DidDocument,
         did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<NoOpCustody, D2, S> {
+    ) -> ApplicationNodeBuilder<NoOpCustody, D2, S, B> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: Some(IdentitySource::Explicit(Box::new(ExplicitIdentity {
@@ -333,6 +366,7 @@ impl<S: Storage + 'static> ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S>
                 did_method,
             }))),
             storage: self.storage,
+            blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
         }
@@ -345,7 +379,7 @@ impl<S: Storage + 'static> ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S>
         self,
         key_custody: Arc<K2>,
         did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<K2, D2, S> {
+    ) -> ApplicationNodeBuilder<K2, D2, S, B> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: Some(IdentitySource::Generate {
@@ -353,14 +387,15 @@ impl<S: Storage + 'static> ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S>
                 did_method,
             }),
             storage: self.storage,
+            blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
         }
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static>
-    ApplicationNodeBuilder<K, D, S>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static, B: BlobStorage + 'static>
+    ApplicationNodeBuilder<K, D, S, B>
 {
     /// Builds the [`ApplicationNode`].
     ///
@@ -423,7 +458,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             ..RelayConfig::default()
         };
 
-        let blob_storage = InMemoryBlobStorage::new();
+        let blob_storage = self
+            .blob_storage
+            .ok_or(NodeError::MissingField("blob_storage"))?;
         let relay_server = RelayServer::new(relay_config, blob_storage);
         let bound_addr = relay_server.start().await?;
 
