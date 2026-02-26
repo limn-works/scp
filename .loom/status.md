@@ -1,7 +1,7 @@
 # Loom Status
 
 ## Failing Tests
-None. All 1,977 workspace tests pass (1,497 scp-core including 1 new phase2_integration + 158 scp-mcp + 64 scp-node + 10 scp-media + 44 scp-platform + 195 scp-transport + others). Python SDK smoke tests pass.
+None. All 1,977 workspace tests pass (1,497 scp-core + 158 scp-mcp + 64 scp-node + 10 scp-media + 44 scp-platform + 195 scp-transport + others).
 
 ## Uncommitted Changes
 None. All changes committed.
@@ -10,26 +10,31 @@ None. All changes committed.
 No previously-failing tests.
 
 ## Tests Added / Updated
-- `crates/scp-core/tests/phase2_integration.rs`: New Phase 2 end-to-end integration test exercising 12-step scenario (identity, context lifecycle, UCAN roles, tool invocation, event log, checkpoints, TTL expiry, multi-relay transport simulation).
-- `bindings/python/tests/test_types.py`: New Python SDK unit tests for dataclasses, exception hierarchy, and shared types (51 tests).
+No new test files this iteration. The scp-ffi crate has `test = false` (cdylib requires Python dev headers); tests run via maturin/pytest.
 
 ## Tool-Gated Stories
 None.
 
 ## Subagent Outcomes
-All three subagents committed directly to the main branch (worktree isolation commits to current branch, no separate branch merging needed).
+Three subagents launched in parallel with worktree isolation. All three completed successfully. Branches merged with one conflict resolution needed (SCP-040 branch conflicted with merged SCP-038+SCP-039 changes in lib.rs, Cargo.toml, types.rs, Cargo.lock — all resolved by combining both sides).
 
-1. **SCP-035** (Phase 2 integration test) — **DONE**. Created `crates/scp-core/tests/phase2_integration.rs` with full 12-step scenario matching `.docs/adrs/phase-2.md`. Tests identity creation, context lifecycle with ContextParams (ceiling, roles, tools, TTL, ephemeral scope), UCAN role assignment and enforcement, tool invocation with schema validation, event logging in Merkle tree, consistency checkpoint comparison, TTL expiry with key destruction, and simulated multi-relay transport via mpsc channels.
+1. **SCP-038** (PyO3 identity bridge) — **DONE**. Created `crates/scp-ffi/src/identity.rs` (431 lines) with `PyIdentity` and `PyDIDDocument` opaque pyclass types + 4 bridge functions (`py_identity_create`, `py_identity_load`, `py_identity_resolve`, `py_identity_rotate_key`) + `register_identity` module registration. Added `scp-platform` dependency with `testing` feature for `InMemoryKeyCustody`.
 
-2. **SCP-037** (PyO3 error mapping and type conversion) — **DONE**. Created `crates/scp-ffi/src/error.rs` with `ScpPyError` enum (6 variants), Python exception hierarchy rooted at `ScpError` via `create_exception!`, `From<ScpPyError> for PyErr`, and `From` impls for all 18 scp-core/scp-transport error types with actionable messages. Created `crates/scp-ffi/src/types.rs` with bidirectional `py_dict_to_json`/`json_to_py_dict` conversion handling all JSON-compatible Python types.
+2. **SCP-039** (PyO3 context bridge) — **DONE**. Created `crates/scp-ffi/src/context.rs` (696 lines) with `PyContextHandle`, `PyContextParams`, `PyMessage`, `PyMessageReceiver` (async iterator via `__aiter__`/`__anext__`) pyclass types + 6 bridge functions (`py_context_create`, `py_context_join`, `py_context_leave`, `py_context_close`, `py_context_send`, `py_context_receive`) + `register_context` module registration.
 
-3. **SCP-044** (Python SDK dataclasses and exception hierarchy) — **DONE**. Created `bindings/python/scp_sdk/` package with `errors.py` (ScpError + 7 subclasses, UcanPermissionError avoids shadowing builtins, BRIDGE_ERROR_MAP), `tools.py` (ToolDefinition, TestVector dataclasses), `types.py` (Message, Provenance, Capability dataclasses, MemoryScope/SourceType/DiscoveryMethod enums), and `__init__.py` re-exports.
+3. **SCP-040** (PyO3 tool/transport/UCAN/event_log bridge) — **DONE**. Created 4 files:
+   - `crates/scp-ffi/src/tools.rs` — `PyToolRegistration`, `PyToolVerificationResult` + 3 bridge functions
+   - `crates/scp-ffi/src/transport.rs` — `PyTransportStatus` + 2 bridge functions
+   - `crates/scp-ffi/src/ucan.rs` — `PyUcanToken` + 3 bridge functions
+   - `crates/scp-ffi/src/event_log.rs` — `PyEvent`, `PyProof` + 2 bridge functions
+   All registered via `register_*` functions in `lib.rs`.
 
 ## Remaining Stories
 Next unblocked stories after this iteration:
-- **SCP-038** (PyO3 identity bridge) — blocked by SCP-037 (now done) → UNBLOCKED
-- **SCP-039** (PyO3 context bridge) — blocked by SCP-037 (now done) → UNBLOCKED
-- **SCP-040** (PyO3 tool/transport/UCAN/event_log bridge) — blocked by SCP-037 (now done) → UNBLOCKED
-- **SCP-042** (Python SDK Identity class) — blocked by SCP-038
-- **SCP-043** (Python SDK Context class) — blocked by SCP-039
-- **SCP-045** (Python SDK EventLog/transport/trust) — blocked by SCP-040
+- **SCP-041** (Python type stubs) — blocked by SCP-038, SCP-039, SCP-040 (all now done) → UNBLOCKED
+- **SCP-042** (Python SDK Identity class) — blocked by SCP-038 (now done) → UNBLOCKED
+- **SCP-043** (Python SDK Context class) — blocked by SCP-039 (now done) → UNBLOCKED
+- **SCP-045** (Python SDK EventLog/transport/trust) — blocked by SCP-040 (now done) → UNBLOCKED
+- **SCP-057** (Python UCAN wrapper) — blocked by SCP-040, SCP-044 (both done) → UNBLOCKED
+- **SCP-046** (Python SDK package root) — blocked by SCP-042, SCP-043, SCP-044, SCP-045
+- **SCP-051** (MCP Python wrapper) — blocked by SCP-046, SCP-048, SCP-049, SCP-050
