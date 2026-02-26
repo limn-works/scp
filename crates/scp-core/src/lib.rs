@@ -21,6 +21,7 @@ pub mod bridge;
 pub mod context;
 pub mod crypto;
 pub mod discovery;
+pub mod economy;
 pub mod envelope;
 pub mod event_log;
 pub mod identity;

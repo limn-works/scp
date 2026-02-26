@@ -153,6 +153,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             memory_scope: MemoryScope::Ephemeral,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::BilateralEphemeral),
+            economic_policy: None,
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -165,6 +166,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::BilateralPersistent),
+            economic_policy: None,
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -177,6 +179,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             memory_scope: MemoryScope::Summary,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::Coordination),
+            economic_policy: None,
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -189,6 +192,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::GroupDiscussion),
+            economic_policy: None,
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -201,6 +205,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::PublicBroadcast),
+            economic_policy: None,
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -213,6 +218,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::GatedBroadcast),
+            economic_policy: None,
         },
     }
 }

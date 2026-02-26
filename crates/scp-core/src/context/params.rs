@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::economy::EconomicPolicy;
+
 // ---------------------------------------------------------------------------
 // Capability (unified type from roles module)
 // ---------------------------------------------------------------------------
@@ -245,6 +247,14 @@ pub struct ContextParams {
     /// template. When present, all other fields must match the template
     /// definition exactly.
     pub template_id: Option<TemplateId>,
+
+    /// Economic policy for this context. `None` means the context is free
+    /// (no economic policy). When present, defines costs, accepted payment
+    /// adapters, optional dynamic pricing, and the payee DID.
+    ///
+    /// See spec section 19.3 and ADR-033.
+    #[serde(default)]
+    pub economic_policy: Option<EconomicPolicy>,
 }
 
 impl Default for ContextParams {
@@ -260,6 +270,7 @@ impl Default for ContextParams {
             memory_scope: MemoryScope::Ephemeral,
             governance: GovernanceModel::SingleAdmin,
             template_id: None,
+            economic_policy: None,
         }
     }
 }
@@ -292,6 +303,7 @@ mod tests {
         assert_eq!(params.memory_scope, MemoryScope::Ephemeral);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert!(params.template_id.is_none());
+        assert!(params.economic_policy.is_none());
     }
 
     #[test]
@@ -319,6 +331,7 @@ mod tests {
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::PublicBroadcast),
+            economic_policy: None,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -331,6 +344,7 @@ mod tests {
         assert_eq!(params.ttl, Some(Duration::from_secs(3600)));
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
+        assert!(params.economic_policy.is_none());
     }
 
     #[test]
@@ -410,6 +424,7 @@ mod tests {
             memory_scope: MemoryScope::Summary,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::BilateralEphemeral),
+            economic_policy: None,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -417,5 +432,74 @@ mod tests {
         let deserialized: Result<ContextParams, _> =
             serde_json::from_str(json.as_deref().unwrap_or(""));
         assert_eq!(deserialized.ok(), Some(params));
+    }
+
+    #[test]
+    fn context_params_with_economic_policy_serde_roundtrip() {
+        use crate::economy::{
+            Amount, CostSchedule, CurrencyCode, EconomicPolicy, PricingFormula, PricingMetric,
+            PricingVariable, Coefficient,
+        };
+        use crate::identity::DID;
+
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: vec![Capability::new("messages:read")],
+            ceiling_policy: CeilingPolicy::Immutable,
+            promotion_policy: PromotionPolicy::NoPromotion,
+            roles: vec![],
+            tools: vec![],
+            ttl: None,
+            memory_scope: MemoryScope::Full,
+            governance: GovernanceModel::SingleAdmin,
+            template_id: None,
+            economic_policy: Some(EconomicPolicy {
+                locked: false,
+                cost_schedule: CostSchedule {
+                    currency: CurrencyCode::from("USD"),
+                    per_message: Some(Amount(1)),
+                    per_tool_invoke: None,
+                    per_join: Some(Amount(100)),
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec!["x402".to_owned()],
+                pricing_formula: Some(PricingFormula {
+                    base_cost: Amount(10),
+                    variables: vec![PricingVariable::Linear {
+                        metric: PricingMetric::MemberCount,
+                        coefficient: Coefficient(500_000),
+                    }],
+                    cap: Some(Amount(1000)),
+                    floor: None,
+                }),
+                payee: DID::from("did:dht:z6MkPayee"),
+            }),
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: ContextParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, params);
+        assert!(deserialized.economic_policy.is_some());
+    }
+
+    #[test]
+    fn context_params_deserialize_without_economic_policy_field() {
+        // Verify that JSON without economic_policy field still deserializes
+        // (backwards compatibility via #[serde(default)]).
+        let json = r#"{
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion",
+            "roles": [],
+            "tools": [],
+            "ttl": null,
+            "memory_scope": "Ephemeral",
+            "governance": "SingleAdmin",
+            "template_id": null
+        }"#;
+        let params: ContextParams = serde_json::from_str(json).unwrap();
+        assert!(params.economic_policy.is_none());
     }
 }
