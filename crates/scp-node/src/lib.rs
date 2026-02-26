@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod tls;
+
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
