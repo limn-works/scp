@@ -1,10 +1,12 @@
 //! JSON Schema validation helpers and MCP compatibility utilities.
 //!
 //! Provides structural validation for JSON Schema objects used in tool
-//! registration. Full JSON Schema validation (via the `jsonschema` crate)
-//! is deferred until that dependency is integrated. Current validation checks
-//! that schemas are JSON objects with a `"type"` field -- sufficient for
-//! structural correctness in Phase 2.
+//! registration and full JSON Schema validation (via the `jsonschema` crate)
+//! for validating values against schemas at runtime. Schema structure checks
+//! verify that schemas are JSON objects with a `"type"` field.
+//! Value validation delegates to the `jsonschema` crate for full constraint
+//! enforcement (properties, required, additionalProperties, items,
+//! numeric/string constraints, etc.).
 //!
 //! MCP compatibility: tool schemas follow the MCP (Model Context Protocol)
 //! JSON Schema convention where both input and output are described as
@@ -54,7 +56,6 @@ const VALID_SCHEMA_TYPES: &[&str] = &[
 /// 3. The `"type"` field is a string with a recognized JSON Schema type.
 ///
 /// This is a basic structural check, not a full JSON Schema validation.
-/// Full validation would require the `jsonschema` crate.
 ///
 /// # Errors
 ///
@@ -86,49 +87,30 @@ pub fn validate_schema(schema: &Value) -> Result<(), SchemaValidationError> {
     Ok(())
 }
 
-/// Validates that a JSON value conforms to a given JSON Schema (basic check).
+/// Validates that a JSON value conforms to a given JSON Schema.
 ///
-/// Phase 2 implementation: performs a best-effort structural check. Validates
-/// the top-level type constraint only. Full property-level validation requires
-/// the `jsonschema` crate.
+/// Uses the `jsonschema` crate for full JSON Schema validation, including
+/// properties, required fields, `additionalProperties`, array items,
+/// numeric/string constraints, enums, and patterns.
+///
+/// When the schema is not a JSON object (e.g., a bare string or number),
+/// validation is rejected -- callers must provide a valid schema object.
 ///
 /// # Errors
 ///
-/// Returns an error message if the value does not match the schema's type
-/// constraint.
+/// Returns an error message describing the first validation failure if the
+/// value does not conform to the schema.
 pub fn validate_value_against_schema(value: &Value, schema: &Value) -> Result<(), String> {
-    let schema_obj = schema
-        .as_object()
-        .ok_or_else(|| "schema is not a JSON object".to_owned())?;
-
-    let Some(type_field) = schema_obj.get("type") else {
-        // If the schema has no type constraint, any value is valid.
-        return Ok(());
-    };
-
-    let Some(expected_type) = type_field.as_str() else {
-        return Ok(());
-    };
-
-    let matches = match expected_type {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => value.is_i64() || value.is_u64(),
-        "boolean" => value.is_boolean(),
-        "null" => value.is_null(),
-        _ => true, // Unknown type -- pass through.
-    };
-
-    if matches {
-        Ok(())
-    } else {
-        Err(format!(
-            "expected JSON type \"{expected_type}\", got {actual}",
-            actual = json_type_name(value),
-        ))
+    if !schema.is_object() {
+        return Err("schema is not a JSON object".to_owned());
     }
+
+    let validator =
+        jsonschema::validator_for(schema).map_err(|e| format!("invalid schema: {e}"))?;
+
+    validator
+        .validate(value)
+        .map_err(|e| format!("schema validation failed: {e}"))
 }
 
 /// Returns a human-readable name for a JSON value's type.
@@ -334,5 +316,242 @@ mod tests {
             format!("{err}"),
             "unrecognized JSON Schema type: \"foobar\""
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Full JSON Schema validation (SCP-189)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_value_rejects_non_object_schema() {
+        let schema = serde_json::json!("not an object");
+        let value = serde_json::json!(42);
+        let err = validate_value_against_schema(&value, &schema).unwrap_err();
+        assert!(err.contains("not a JSON object"));
+    }
+
+    #[test]
+    fn validate_value_rejects_missing_required_field() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name", "age"]
+        });
+        let value = serde_json::json!({"name": "Alice"});
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_accepts_all_required_fields_present() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name", "age"]
+        });
+        let value = serde_json::json!({"name": "Alice", "age": 30});
+        assert!(validate_value_against_schema(&value, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_extra_properties_when_forbidden() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "additionalProperties": false
+        });
+        let value = serde_json::json!({"name": "Alice", "secret": "payload"});
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_accepts_no_extra_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "additionalProperties": false
+        });
+        let value = serde_json::json!({"name": "Alice"});
+        assert!(validate_value_against_schema(&value, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_wrong_property_type() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer"}
+            }
+        });
+        let value = serde_json::json!({"count": "not a number"});
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_rejects_invalid_array_items() {
+        let schema = serde_json::json!({
+            "type": "array",
+            "items": {"type": "integer"}
+        });
+        let value = serde_json::json!([1, 2, "three"]);
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_accepts_valid_array_items() {
+        let schema = serde_json::json!({
+            "type": "array",
+            "items": {"type": "integer"}
+        });
+        let value = serde_json::json!([1, 2, 3]);
+        assert!(validate_value_against_schema(&value, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_number_below_minimum() {
+        let schema = serde_json::json!({
+            "type": "number",
+            "minimum": 10
+        });
+        let value = serde_json::json!(5);
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_rejects_number_above_maximum() {
+        let schema = serde_json::json!({
+            "type": "number",
+            "maximum": 100
+        });
+        let value = serde_json::json!(150);
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_accepts_number_in_range() {
+        let schema = serde_json::json!({
+            "type": "number",
+            "minimum": 10,
+            "maximum": 100
+        });
+        let value = serde_json::json!(50);
+        assert!(validate_value_against_schema(&value, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_string_below_min_length() {
+        let schema = serde_json::json!({
+            "type": "string",
+            "minLength": 5
+        });
+        let value = serde_json::json!("abc");
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_rejects_string_above_max_length() {
+        let schema = serde_json::json!({
+            "type": "string",
+            "maxLength": 3
+        });
+        let value = serde_json::json!("toolong");
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_accepts_string_within_length_bounds() {
+        let schema = serde_json::json!({
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 10
+        });
+        let value = serde_json::json!("hello");
+        assert!(validate_value_against_schema(&value, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_string_not_matching_pattern() {
+        let schema = serde_json::json!({
+            "type": "string",
+            "pattern": "^[a-z]+$"
+        });
+        let value = serde_json::json!("ABC123");
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_accepts_string_matching_pattern() {
+        let schema = serde_json::json!({
+            "type": "string",
+            "pattern": "^[a-z]+$"
+        });
+        let value = serde_json::json!("abc");
+        assert!(validate_value_against_schema(&value, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_value_not_in_enum() {
+        let schema = serde_json::json!({
+            "type": "string",
+            "enum": ["red", "green", "blue"]
+        });
+        let value = serde_json::json!("yellow");
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_accepts_value_in_enum() {
+        let schema = serde_json::json!({
+            "type": "string",
+            "enum": ["red", "green", "blue"]
+        });
+        let value = serde_json::json!("green");
+        assert!(validate_value_against_schema(&value, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_unknown_type_in_schema() {
+        let schema = serde_json::json!({"type": "foobar"});
+        let value = serde_json::json!("anything");
+        // The jsonschema crate rejects unknown types -- no wildcard pass-through.
+        assert!(validate_value_against_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_value_nested_object_validation() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "zip": {"type": "string", "pattern": "^\\d{5}$"}
+                    },
+                    "required": ["city", "zip"]
+                }
+            },
+            "required": ["address"]
+        });
+        // Valid nested object.
+        let valid = serde_json::json!({"address": {"city": "Portland", "zip": "97201"}});
+        assert!(validate_value_against_schema(&valid, &schema).is_ok());
+
+        // Invalid: missing nested required field.
+        let missing_zip = serde_json::json!({"address": {"city": "Portland"}});
+        assert!(validate_value_against_schema(&missing_zip, &schema).is_err());
+
+        // Invalid: zip does not match pattern.
+        let bad_zip = serde_json::json!({"address": {"city": "Portland", "zip": "abcde"}});
+        assert!(validate_value_against_schema(&bad_zip, &schema).is_err());
     }
 }
