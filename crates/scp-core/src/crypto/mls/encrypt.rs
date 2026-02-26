@@ -51,13 +51,10 @@ use super::group::ScpMlsGroup;
 ///
 /// See ADR-001 acceptance criterion 4.
 pub fn encrypt(group: &mut ScpMlsGroup, plaintext: &[u8]) -> Result<MlsMessageOut, MlsError> {
-    if group.destroyed {
-        return Err(MlsError::GroupDestroyed);
-    }
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
 
-    group
-        .group
-        .create_message(&group.provider, &group.signer, plaintext)
+    g.create_message(&group.provider, signer, plaintext)
         .map_err(|e| MlsError::EncryptionFailed(e.to_string()))
 }
 
@@ -88,7 +85,7 @@ pub fn encrypt(group: &mut ScpMlsGroup, plaintext: &[u8]) -> Result<MlsMessageOu
 ///
 /// See ADR-001 acceptance criterion 5.
 pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, MlsError> {
-    if group.destroyed {
+    if group.group.is_none() {
         return Err(MlsError::GroupDestroyed);
     }
 
@@ -107,10 +104,9 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     // (e.g., corrupted authentication tags). We guard against this with
     // catch_unwind to convert the panic into an MlsError::DecryptionFailed,
     // preventing a malicious relay from crashing the client process (DoS).
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let process_result = catch_unwind(AssertUnwindSafe(|| {
-        group
-            .group
-            .process_message(&group.provider, protocol_message)
+        g.process_message(&group.provider, protocol_message)
     }));
 
     let processed = match process_result {

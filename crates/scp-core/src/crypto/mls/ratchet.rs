@@ -45,13 +45,10 @@ pub fn process_commit(
     commit_bytes: &[u8],
     grace_store: &mut EpochGraceStore,
 ) -> Result<(), MlsError> {
-    if group.destroyed {
-        return Err(MlsError::GroupDestroyed);
-    }
-
     // Record the current epoch before processing the Commit. This epoch will
     // enter the grace window after the Commit is merged.
-    let old_epoch = group.group.epoch().as_u64();
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let old_epoch = g.epoch().as_u64();
 
     // Deserialize the Commit bytes into an MlsMessageIn.
     let message_in = MlsMessageIn::tls_deserialize(&mut &*commit_bytes)
@@ -63,8 +60,8 @@ pub fn process_commit(
     })?;
 
     // Process the message — this validates the Commit and produces a StagedCommit.
-    let processed = group
-        .group
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let processed = g
         .process_message(&group.provider, protocol_message)
         .map_err(|e| MlsError::CommitProcessingFailed(e.to_string()))?;
 
@@ -79,9 +76,8 @@ pub fn process_commit(
     };
 
     // Merge the staged commit to advance the group to the new epoch.
-    group
-        .group
-        .merge_staged_commit(&group.provider, staged_commit)
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    g.merge_staged_commit(&group.provider, staged_commit)
         .map_err(|e| MlsError::CommitProcessingFailed(format!("merging staged commit: {e}")))?;
 
     // Place the old epoch into the grace window. In-flight messages encrypted
@@ -126,18 +122,16 @@ pub fn process_commit(
 ///
 /// See ADR-001 acceptance criterion 7.
 pub fn propose_update(group: &mut ScpMlsGroup) -> Result<MlsMessageOut, MlsError> {
-    if group.destroyed {
-        return Err(MlsError::GroupDestroyed);
-    }
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
 
     // self_update() generates an Update proposal, builds a Commit that includes
     // it, and stages the commit. It returns a CommitMessageBundle containing the
     // Commit (and optionally a Welcome if there were pending Add proposals).
-    let bundle = group
-        .group
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let bundle = g
         .self_update(
             &group.provider,
-            &group.signer,
+            signer,
             LeafNodeParameters::default(),
         )
         .map_err(|e| MlsError::UpdateFailed(e.to_string()))?;
@@ -146,9 +140,8 @@ pub fn propose_update(group: &mut ScpMlsGroup) -> Result<MlsMessageOut, MlsError
     let commit = bundle.into_commit();
 
     // Merge the pending commit to advance the group epoch locally.
-    group
-        .group
-        .merge_pending_commit(&group.provider)
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    g.merge_pending_commit(&group.provider)
         .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
 
     Ok(commit)
