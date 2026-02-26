@@ -30,6 +30,9 @@ classifiers = [
 langchain = ["langchain-core>=0.1.0"]
 mcp = ["mcp>=1.0.0"]
 
+[project.scripts]
+scp-mcp = "scp_sdk.mcp:cli_main"
+
 [project.urls]
 Repository = "https://github.com/limn-scp/scp-protocol-core"
 Documentation = "https://scp.dev/docs"
