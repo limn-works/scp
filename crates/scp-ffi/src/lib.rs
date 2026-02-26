@@ -26,6 +26,8 @@
 // FFI bridge requires targeted unsafe for PyO3 interop. Each usage is documented.
 #![allow(unsafe_code)]
 
+pub mod context;
+
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -145,6 +147,9 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
+
+    // Step 4: Register domain bridge modules.
+    context::register_context(m)?;
 
     Ok(())
 }
