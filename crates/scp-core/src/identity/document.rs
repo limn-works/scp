@@ -435,48 +435,9 @@ fn hex_encode(bytes: &[u8]) -> String {
     })
 }
 
-/// Base58btc encoding (Bitcoin alphabet).
-///
-/// This is a minimal implementation sufficient for encoding Ed25519 public keys
-/// (32 bytes). Production deployments may replace this with a dedicated crate.
+/// Base58btc encoding (Bitcoin alphabet) via the `bs58` crate.
 fn base58btc_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-    if input.is_empty() {
-        return String::new();
-    }
-
-    // Count leading zeros.
-    let zero_count = input.iter().take_while(|&&b| b == 0).count();
-
-    // Convert to base58 via repeated division.
-    let mut digits: Vec<u8> = Vec::new();
-    for &byte in input {
-        let mut carry = u32::from(byte);
-        for digit in &mut digits {
-            carry += u32::from(*digit) << 8;
-            *digit = (carry % 58) as u8;
-            carry /= 58;
-        }
-        while carry > 0 {
-            digits.push((carry % 58) as u8);
-            carry /= 58;
-        }
-    }
-
-    let mut result = String::with_capacity(zero_count + digits.len());
-
-    // Leading '1' characters for each leading zero byte.
-    for _ in 0..zero_count {
-        result.push('1');
-    }
-
-    // Digits are in reverse order.
-    for &d in digits.iter().rev() {
-        result.push(ALPHABET[d as usize] as char);
-    }
-
-    result
+    bs58::encode(input).into_string()
 }
 
 #[cfg(test)]
@@ -556,6 +517,19 @@ mod tests {
         let input = [0, 0, 1];
         let encoded = base58btc_encode(&input);
         assert!(encoded.starts_with("11"));
+    }
+
+    #[test]
+    fn base58btc_encode_known_vector() {
+        // "Hello World" in base58btc (Bitcoin alphabet) is "JxF12TrwUP45BMd".
+        assert_eq!(base58btc_encode(b"Hello World"), "JxF12TrwUP45BMd");
+    }
+
+    #[test]
+    fn base58btc_encode_single_byte() {
+        // 0x00 encodes to "1", 0x01 encodes to "2", etc.
+        assert_eq!(base58btc_encode(&[0x00]), "1");
+        assert_eq!(base58btc_encode(&[0x01]), "2");
     }
 
     // --- SCPRelay tests (SCP-140) ---
