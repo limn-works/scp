@@ -496,6 +496,12 @@ pub async fn finalize_close(
     transport: &dyn ContextTransportProvider,
     event_log: &dyn ContextEventLogProvider,
 ) -> Result<(), ContextError> {
+    // Validate state transition BEFORE destroying any key material.
+    // Key destruction is irreversible — once zeroized, encrypted content
+    // becomes permanently unreadable. If the transition fails (e.g. context
+    // is not in Closing state), no keys must be destroyed.
+    handle.transition_to(&ContextState::Closed).await?;
+
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = context_id_to_bytes(&context_id);
     let memory_scope = handle.params().memory_scope;
@@ -511,7 +517,6 @@ pub async fn finalize_close(
         let _ = transport.delete_published(&context_id_bytes);
     }
 
-    handle.transition_to(&ContextState::Closed).await?;
     event_log.append_context_event(&context_id_bytes, "ContextClosed")?;
 
     Ok(())
@@ -970,6 +975,80 @@ mod tests {
             finalize_close(&handle, &crypto, &transport, &event_log)
                 .await
                 .is_err()
+        );
+    }
+
+    /// SCP-164: Calling finalize_close on a context NOT in Closing state
+    /// must return an error AND must NOT destroy any key material.
+    #[tokio::test]
+    async fn finalize_close_on_active_context_returns_error_and_preserves_keys() {
+        let handle = active_handle("ctx-164-guard", MemoryScope::Ephemeral);
+        make_active(&handle).await;
+        // Context is Active, not Closing.
+        let crypto = MockCrypto::default();
+        let transport = MockTransport::connected();
+        let event_log = MockEventLog::default();
+
+        let result = finalize_close(&handle, &crypto, &transport, &event_log).await;
+
+        // Must return an InvalidTransition error.
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::InvalidTransition {
+                from: ContextState::Active,
+                to: ContextState::Closed,
+            }
+        ));
+        // Keys must NOT have been destroyed.
+        assert!(
+            crypto.mls_destroyed.lock().unwrap().is_empty(),
+            "MLS group must not be destroyed when state transition fails"
+        );
+        assert!(
+            crypto.sender_keys_destroyed.lock().unwrap().is_empty(),
+            "sender keys must not be destroyed when state transition fails"
+        );
+        // State must remain Active.
+        assert_eq!(handle.state().await, ContextState::Active);
+    }
+
+    /// SCP-164: Calling finalize_close on a Closing context must succeed,
+    /// transition to Closed, and destroy keys in the correct order
+    /// (state transition validated before key destruction).
+    #[tokio::test]
+    async fn finalize_close_on_closing_context_succeeds_and_destroys_keys() {
+        let handle = active_handle("ctx-164-happy", MemoryScope::Ephemeral);
+        make_active(&handle).await;
+        handle.transition_to(&ContextState::Closing).await.unwrap();
+
+        let crypto = MockCrypto::default();
+        let transport = MockTransport::connected();
+        let event_log = MockEventLog::default();
+
+        let result = finalize_close(&handle, &crypto, &transport, &event_log).await;
+
+        // Must succeed.
+        assert!(result.is_ok());
+        // State must be Closed.
+        assert_eq!(handle.state().await, ContextState::Closed);
+        // MLS group must have been destroyed.
+        assert_eq!(
+            crypto.mls_destroyed.lock().unwrap().len(),
+            1,
+            "MLS group must be destroyed on successful finalize_close"
+        );
+        // Sender keys must have been destroyed.
+        assert_eq!(
+            crypto.sender_keys_destroyed.lock().unwrap().len(),
+            1,
+            "sender keys must be destroyed on successful finalize_close"
+        );
+        // Event log must contain the ContextClosed event.
+        assert_eq!(
+            event_log.events.lock().unwrap().len(),
+            1,
+            "ContextClosed event must be recorded"
         );
     }
 
