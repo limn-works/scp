@@ -18,6 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::identity::DidMethod;
+
 /// The `.well-known/scp` JSON document.
 ///
 /// Enables web-based discovery of SCP infrastructure associated with a
@@ -98,7 +100,7 @@ pub struct RelayConfig {
 }
 
 /// Validation error for `.well-known/scp` documents.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum WellKnownValidationError {
     /// A listed context has a mode other than `"broadcast"`, or the
     /// mode field is absent (defaults to `"encrypted"`, which MUST NOT
@@ -113,9 +115,100 @@ pub enum WellKnownValidationError {
         /// The mode value (or `"encrypted"` if absent/defaulted).
         mode: String,
     },
+
+    /// DID resolution via DHT failed during `.well-known/scp` verification.
+    #[error("DID resolution failed for '{did}': {reason}")]
+    DidResolutionFailed {
+        /// The DID that could not be resolved.
+        did: String,
+        /// The underlying resolution error.
+        reason: String,
+    },
+
+    /// The relay URL in `.well-known/scp` does not match any `SCPRelay`
+    /// service entry in the resolved DID document (§18.3.2).
+    #[error(
+        "relay URL '{relay_url}' not found in DID document SCPRelay entries \
+         for '{did}'"
+    )]
+    RelayMismatch {
+        /// The relay URL from the `.well-known/scp` document.
+        relay_url: String,
+        /// The DID whose document was checked.
+        did: String,
+    },
+
+    /// The operator DID in `.well-known/scp` does not match the resolved
+    /// DID document's subject.
+    #[error(
+        "operator DID mismatch: .well-known/scp declares '{claimed}' but \
+         resolved document subject is '{resolved}'"
+    )]
+    OperatorDidMismatch {
+        /// The DID claimed in the `.well-known/scp` document.
+        claimed: String,
+        /// The DID subject in the resolved document.
+        resolved: String,
+    },
 }
 
 impl WellKnownScp {
+    /// Verifies `.well-known/scp` data against a DHT-resolved DID document
+    /// (§18.3.2).
+    ///
+    /// Resolves the operator DID via the provided [`DidMethod`] implementation
+    /// and cross-references the relay URL, operator DID, and context listings.
+    /// This MUST be called on every fetch — not cached from first use (no TOFU).
+    ///
+    /// # Verification Steps
+    ///
+    /// 1. Resolve the operator DID from `self.did` via `did_method.resolve()`.
+    /// 2. Verify the resolved document's subject matches `self.did`.
+    /// 3. Extract `SCPRelay` service entries from the resolved document.
+    /// 4. Verify `self.relay` matches at least one `SCPRelay` service endpoint.
+    ///
+    /// # Errors
+    ///
+    /// - [`WellKnownValidationError::DidResolutionFailed`] if the DID cannot
+    ///   be resolved.
+    /// - [`WellKnownValidationError::OperatorDidMismatch`] if the resolved
+    ///   document subject does not match the claimed operator DID.
+    /// - [`WellKnownValidationError::RelayMismatch`] if the relay URL is not
+    ///   found in any `SCPRelay` service entry.
+    pub async fn verify_against_did<M: DidMethod>(
+        &self,
+        did_method: &M,
+    ) -> Result<(), WellKnownValidationError> {
+        // Step 1: Resolve the operator DID document via DHT.
+        let document = did_method.resolve(&self.did).await.map_err(|e| {
+            WellKnownValidationError::DidResolutionFailed {
+                did: self.did.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+        // Step 2: Verify the resolved document subject matches the claimed DID.
+        if document.id != self.did {
+            return Err(WellKnownValidationError::OperatorDidMismatch {
+                claimed: self.did.clone(),
+                resolved: document.id.clone(),
+            });
+        }
+
+        // Step 3: Extract SCPRelay service endpoint URLs from the resolved document.
+        let relay_urls = document.relay_service_urls();
+
+        // Step 4: Verify the .well-known/scp relay URL matches at least one entry.
+        if !relay_urls.iter().any(|url| url == &self.relay) {
+            return Err(WellKnownValidationError::RelayMismatch {
+                relay_url: self.relay.clone(),
+                did: self.did.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Validates the document against §18.3 privacy constraints.
     ///
     /// Returns an error if any listed context has a mode other than
@@ -146,7 +239,135 @@ impl WellKnownScp {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::identity::document::{DidDocument, Service};
+    use crate::identity::{DidMethod, IdentityError, ScpIdentity};
+
+    use scp_platform::traits::KeyCustody;
+
+    // -----------------------------------------------------------------------
+    // Mock DidMethod
+    // -----------------------------------------------------------------------
+
+    /// Result type returned by the mock resolver.
+    enum MockResolveResult {
+        /// Return the given DID document on resolve.
+        Ok(DidDocument),
+        /// Return an error on resolve.
+        Err(String),
+    }
+
+    /// A mock [`DidMethod`] implementation for testing `verify_against_did`.
+    ///
+    /// Only `resolve` is meaningful; all other trait methods panic.
+    struct MockDidMethod {
+        result: Arc<MockResolveResult>,
+    }
+
+    impl MockDidMethod {
+        /// Creates a mock that resolves to the given DID document.
+        fn resolves_to(doc: DidDocument) -> Self {
+            Self {
+                result: Arc::new(MockResolveResult::Ok(doc)),
+            }
+        }
+
+        /// Creates a mock that fails DID resolution with the given message.
+        fn fails_with(msg: &str) -> Self {
+            Self {
+                result: Arc::new(MockResolveResult::Err(msg.to_owned())),
+            }
+        }
+    }
+
+    impl DidMethod for MockDidMethod {
+        fn create(
+            &self,
+            _key_custody: &impl KeyCustody,
+        ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
+        {
+            async { unimplemented!("not needed for well_known tests") }
+        }
+
+        fn verify(&self, _did_string: &str, _public_key: &[u8]) -> bool {
+            unimplemented!("not needed for well_known tests")
+        }
+
+        fn publish(
+            &self,
+            _identity: &ScpIdentity,
+            _document: &DidDocument,
+        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+            async { unimplemented!("not needed for well_known tests") }
+        }
+
+        fn resolve(
+            &self,
+            _did_string: &str,
+        ) -> impl Future<Output = Result<DidDocument, IdentityError>> + Send {
+            let result = Arc::clone(&self.result);
+            async move {
+                match &*result {
+                    MockResolveResult::Ok(doc) => Ok(doc.clone()),
+                    MockResolveResult::Err(msg) => {
+                        Err(IdentityError::DhtResolveFailed(msg.clone()))
+                    }
+                }
+            }
+        }
+
+        fn rotate(
+            &self,
+            _identity: &ScpIdentity,
+            _key_custody: &impl KeyCustody,
+        ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
+        {
+            async { unimplemented!("not needed for well_known tests") }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // DID document helpers
+    // -----------------------------------------------------------------------
+
+    /// Creates a DID document with the given DID and relay URLs.
+    fn did_document_with_relays(did: &str, relay_urls: &[&str]) -> DidDocument {
+        let mut services = vec![Service {
+            id: format!("{did}#pre-rotation"),
+            service_type: "PreRotationCommitment".to_owned(),
+            service_endpoint: "sha256:0000000000000000000000000000000000000000\
+                000000000000000000000000"
+                .to_owned(),
+        }];
+
+        for (i, url) in relay_urls.iter().enumerate() {
+            services.push(Service {
+                id: format!("{did}#scp-relay-{}", i + 1),
+                service_type: "SCPRelay".to_owned(),
+                service_endpoint: (*url).to_owned(),
+            });
+        }
+
+        DidDocument {
+            context: vec![
+                "https://www.w3.org/ns/did/v1".to_owned(),
+                "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+            ],
+            id: did.to_owned(),
+            verification_method: Vec::new(),
+            authentication: Vec::new(),
+            assertion_method: Vec::new(),
+            also_known_as: Vec::new(),
+            service: services,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing helpers
+    // -----------------------------------------------------------------------
 
     /// Helper: a full document with all fields populated.
     fn full_document() -> WellKnownScp {
@@ -301,13 +522,13 @@ mod tests {
         };
 
         let err = doc.validate().expect_err("should reject encrypted context");
-        assert_eq!(
+        assert!(matches!(
             err,
             WellKnownValidationError::NonBroadcastContext {
-                context_id: "deadbeef".to_owned(),
-                mode: "encrypted".to_owned(),
-            }
-        );
+                context_id,
+                mode,
+            } if context_id == "deadbeef" && mode == "encrypted"
+        ));
     }
 
     #[test]
@@ -326,13 +547,13 @@ mod tests {
         };
 
         let err = doc.validate().expect_err("should reject absent mode");
-        assert_eq!(
+        assert!(matches!(
             err,
             WellKnownValidationError::NonBroadcastContext {
-                context_id: "cafebabe".to_owned(),
-                mode: "encrypted".to_owned(),
-            }
-        );
+                context_id,
+                mode,
+            } if context_id == "cafebabe" && mode == "encrypted"
+        ));
     }
 
     #[test]
@@ -351,13 +572,13 @@ mod tests {
         };
 
         let err = doc.validate().expect_err("should reject unknown mode");
-        assert_eq!(
+        assert!(matches!(
             err,
             WellKnownValidationError::NonBroadcastContext {
-                context_id: "f00dcafe".to_owned(),
-                mode: "private".to_owned(),
-            }
-        );
+                context_id,
+                mode,
+            } if context_id == "f00dcafe" && mode == "private"
+        ));
     }
 
     #[test]
@@ -374,5 +595,177 @@ mod tests {
         assert!(json.get("max_blob_ttl").is_none());
         assert!(json.get("rate_limit_publish").is_none());
         assert!(json.get("rate_limit_subscribe").is_none());
+    }
+
+    // -- verify_against_did tests (SCP-188) --------------------------------
+
+    #[tokio::test]
+    async fn verify_against_did_passes_with_matching_relay() {
+        let did = "did:dht:zOperator123";
+        let relay_url = "wss://relay.example.com/scp/v1";
+
+        let doc = did_document_with_relays(did, &[relay_url]);
+        let mock = MockDidMethod::resolves_to(doc);
+
+        let well_known = WellKnownScp {
+            version: 1,
+            did: did.to_owned(),
+            relay: relay_url.to_owned(),
+            contexts: None,
+            relay_config: None,
+        };
+
+        assert!(well_known.verify_against_did(&mock).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_against_did_passes_with_multiple_relays() {
+        let did = "did:dht:zOperator123";
+        let relay_url = "wss://relay2.example.com/scp/v1";
+
+        let doc = did_document_with_relays(
+            did,
+            &[
+                "wss://relay1.example.com/scp/v1",
+                relay_url,
+                "wss://relay3.example.com/scp/v1",
+            ],
+        );
+        let mock = MockDidMethod::resolves_to(doc);
+
+        let well_known = WellKnownScp {
+            version: 1,
+            did: did.to_owned(),
+            relay: relay_url.to_owned(),
+            contexts: None,
+            relay_config: None,
+        };
+
+        assert!(well_known.verify_against_did(&mock).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_against_did_fails_with_mismatched_relay() {
+        let did = "did:dht:zOperator123";
+        let claimed_relay = "wss://evil.example.com/scp/v1";
+        let actual_relay = "wss://legit.example.com/scp/v1";
+
+        let doc = did_document_with_relays(did, &[actual_relay]);
+        let mock = MockDidMethod::resolves_to(doc);
+
+        let well_known = WellKnownScp {
+            version: 1,
+            did: did.to_owned(),
+            relay: claimed_relay.to_owned(),
+            contexts: None,
+            relay_config: None,
+        };
+
+        let err = well_known
+            .verify_against_did(&mock)
+            .await
+            .expect_err("should fail with relay mismatch");
+
+        match err {
+            WellKnownValidationError::RelayMismatch {
+                relay_url,
+                did: err_did,
+            } => {
+                assert_eq!(relay_url, claimed_relay);
+                assert_eq!(err_did, did);
+            }
+            other => panic!("expected RelayMismatch, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_against_did_fails_when_did_resolution_fails() {
+        let did = "did:dht:zUnresolvable";
+
+        let mock = MockDidMethod::fails_with("network timeout");
+
+        let well_known = WellKnownScp {
+            version: 1,
+            did: did.to_owned(),
+            relay: "wss://relay.example.com/scp/v1".to_owned(),
+            contexts: None,
+            relay_config: None,
+        };
+
+        let err = well_known
+            .verify_against_did(&mock)
+            .await
+            .expect_err("should fail with resolution error");
+
+        match err {
+            WellKnownValidationError::DidResolutionFailed {
+                did: err_did,
+                reason,
+            } => {
+                assert_eq!(err_did, did);
+                assert!(reason.contains("network timeout"));
+            }
+            other => panic!("expected DidResolutionFailed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_against_did_fails_with_operator_did_mismatch() {
+        let claimed_did = "did:dht:zClaimedOperator";
+        let actual_did = "did:dht:zActualOperator";
+        let relay_url = "wss://relay.example.com/scp/v1";
+
+        // The resolved document has a different subject DID.
+        let doc = did_document_with_relays(actual_did, &[relay_url]);
+        let mock = MockDidMethod::resolves_to(doc);
+
+        let well_known = WellKnownScp {
+            version: 1,
+            did: claimed_did.to_owned(),
+            relay: relay_url.to_owned(),
+            contexts: None,
+            relay_config: None,
+        };
+
+        let err = well_known
+            .verify_against_did(&mock)
+            .await
+            .expect_err("should fail with operator DID mismatch");
+
+        match err {
+            WellKnownValidationError::OperatorDidMismatch { claimed, resolved } => {
+                assert_eq!(claimed, claimed_did);
+                assert_eq!(resolved, actual_did);
+            }
+            other => panic!("expected OperatorDidMismatch, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_against_did_fails_with_no_relay_services() {
+        let did = "did:dht:zOperator123";
+        let relay_url = "wss://relay.example.com/scp/v1";
+
+        // Document has no SCPRelay service entries.
+        let doc = did_document_with_relays(did, &[]);
+        let mock = MockDidMethod::resolves_to(doc);
+
+        let well_known = WellKnownScp {
+            version: 1,
+            did: did.to_owned(),
+            relay: relay_url.to_owned(),
+            contexts: None,
+            relay_config: None,
+        };
+
+        let err = well_known
+            .verify_against_did(&mock)
+            .await
+            .expect_err("should fail with relay mismatch");
+
+        assert!(matches!(
+            err,
+            WellKnownValidationError::RelayMismatch { .. }
+        ));
     }
 }

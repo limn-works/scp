@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub use bootstrap::{BootstrapConfig, BootstrapResolver};
+pub use bootstrap::{BootstrapConfig, BootstrapResolver, WellKnownBootstrapError};
 pub use context::{
     AgentDeregisterParams, AgentDeregisterResult, AgentRegisterParams, AgentRegisterResult,
     AgentSearchParams, AgentSearchResult, DiscoveryContext, DiscoveryContextError, MAX_WRITERS,
