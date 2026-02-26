@@ -3,6 +3,10 @@ name: PR Review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 jobs:
   review:
