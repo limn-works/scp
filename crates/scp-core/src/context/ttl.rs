@@ -395,6 +395,35 @@ impl TtlExtensionProposal {
         &self.governance
     }
 
+    /// Returns `true` if sufficient consent has been collected from active
+    /// members only.
+    ///
+    /// Votes from members who were removed after casting their vote are
+    /// excluded from the tally. The threshold is evaluated against the count
+    /// of active-member votes only.
+    ///
+    /// See SCP-195.
+    #[must_use]
+    pub fn is_approved_active(&self, active_members: &HashSet<DID>) -> bool {
+        self.consent.is_unanimous_active(active_members)
+    }
+
+    /// Returns the number of consents from currently active members.
+    ///
+    /// See SCP-195.
+    #[must_use]
+    pub fn active_consent_count(&self, active_members: &HashSet<DID>) -> usize {
+        self.consent.active_consent_count(active_members)
+    }
+
+    /// Returns the number of active-member consents still needed.
+    ///
+    /// See SCP-195.
+    #[must_use]
+    pub fn active_remaining(&self, active_members: &HashSet<DID>) -> usize {
+        self.consent.active_remaining(active_members)
+    }
+
     /// Computes the new deadline by adding the proposed duration to now.
     #[must_use]
     pub const fn compute_new_deadline(&self, now: u64) -> u64 {
@@ -680,6 +709,43 @@ impl TtlExtension {
     #[must_use]
     pub fn remaining(&self) -> usize {
         self.required_count.saturating_sub(self.consented.len())
+    }
+
+    /// Returns the number of consents from members who are still active.
+    ///
+    /// Votes from members who have been removed since casting their vote are
+    /// excluded from the count. This prevents a removed member's stale vote
+    /// from contributing to the tally at evaluation time.
+    ///
+    /// See SCP-195.
+    #[must_use]
+    pub fn active_consent_count(&self, active_members: &HashSet<DID>) -> usize {
+        self.consented
+            .iter()
+            .filter(|did| active_members.contains(*did))
+            .count()
+    }
+
+    /// Returns `true` if sufficient consent has been collected from active
+    /// members only.
+    ///
+    /// Votes from removed members are excluded. The threshold is evaluated
+    /// against the count of active-member votes, not the total historical
+    /// vote count.
+    ///
+    /// See SCP-195.
+    #[must_use]
+    pub fn is_unanimous_active(&self, active_members: &HashSet<DID>) -> bool {
+        self.active_consent_count(active_members) >= self.required_count
+    }
+
+    /// Returns the number of active-member consents still needed.
+    ///
+    /// See SCP-195.
+    #[must_use]
+    pub fn active_remaining(&self, active_members: &HashSet<DID>) -> usize {
+        self.required_count
+            .saturating_sub(self.active_consent_count(active_members))
     }
 }
 
@@ -1148,6 +1214,161 @@ mod tests {
         let mut ext = TtlExtension::new(Duration::from_secs(600), 1);
         assert!(ext.add_consent("did:key:alice".into()));
         assert!(ext.is_unanimous());
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-195 tests: active-member consent validation at tally time
+    // -----------------------------------------------------------------------
+
+    /// SCP-195: Active member's vote is counted in the tally.
+    #[test]
+    fn ttl_extension_active_member_vote_counted() {
+        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        ext.add_consent("did:key:alice".into());
+        ext.add_consent("did:key:bob".into());
+
+        let active: HashSet<DID> =
+            ["did:key:alice".to_owned(), "did:key:bob".to_owned()]
+                .into_iter()
+                .collect();
+
+        assert_eq!(ext.active_consent_count(&active), 2);
+        assert!(ext.is_unanimous_active(&active));
+    }
+
+    /// SCP-195: Removed member's vote is excluded from the tally.
+    #[test]
+    fn ttl_extension_removed_member_vote_excluded() {
+        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        ext.add_consent("did:key:alice".into());
+        ext.add_consent("did:key:bob".into());
+
+        // Bob was removed before tally time -- only Alice is active.
+        let active: HashSet<DID> = ["did:key:alice".to_owned()].into_iter().collect();
+
+        assert_eq!(ext.active_consent_count(&active), 1);
+        assert!(!ext.is_unanimous_active(&active));
+        assert_eq!(ext.active_remaining(&active), 1);
+    }
+
+    /// SCP-195: Threshold evaluated against active votes only.
+    ///
+    /// Scenario: 3 members, threshold=3 (AllMember). Alice, Bob, Charlie all
+    /// vote. Charlie is removed before tally. Only 2 of 3 required consents
+    /// remain active, so the proposal is NOT approved.
+    #[test]
+    fn ttl_extension_threshold_against_active_votes_only() {
+        let mut ext = TtlExtension::new(Duration::from_secs(3600), 3);
+        ext.add_consent("did:key:alice".into());
+        ext.add_consent("did:key:bob".into());
+        ext.add_consent("did:key:charlie".into());
+
+        // Without active-member filtering, the old method passes.
+        assert!(ext.is_unanimous());
+
+        // Charlie removed -- only Alice and Bob are active.
+        let active: HashSet<DID> = [
+            "did:key:alice".to_owned(),
+            "did:key:bob".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+
+        // Active tally: 2 of 3 required -- not enough.
+        assert_eq!(ext.active_consent_count(&active), 2);
+        assert!(!ext.is_unanimous_active(&active));
+    }
+
+    /// SCP-195: Majority threshold passes with active members.
+    ///
+    /// Scenario: 3 active members, required_count=2 (governance-based
+    /// majority). 2 of 3 active members consent => passes.
+    #[test]
+    fn ttl_extension_majority_threshold_with_active_members() {
+        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        ext.add_consent("did:key:alice".into());
+        ext.add_consent("did:key:bob".into());
+
+        let active: HashSet<DID> = [
+            "did:key:alice".to_owned(),
+            "did:key:bob".to_owned(),
+            "did:key:charlie".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(ext.active_consent_count(&active), 2);
+        assert!(ext.is_unanimous_active(&active));
+    }
+
+    /// SCP-195: Edge case -- all voters removed means no consent.
+    #[test]
+    fn ttl_extension_all_voters_removed_no_consent() {
+        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        ext.add_consent("did:key:alice".into());
+        ext.add_consent("did:key:bob".into());
+
+        // Both voters removed -- no active members who voted.
+        let active: HashSet<DID> = HashSet::new();
+
+        assert_eq!(ext.active_consent_count(&active), 0);
+        assert!(!ext.is_unanimous_active(&active));
+        assert_eq!(ext.active_remaining(&active), 2);
+    }
+
+    /// SCP-195: TtlExtensionProposal delegates active-member checks correctly.
+    #[test]
+    fn extension_proposal_active_member_validation() {
+        let mut proposal = TtlExtensionProposal::new(
+            "did:key:alice".into(),
+            Duration::from_secs(3600),
+            2,
+            GovernanceModel::SingleAdmin,
+        );
+        proposal.record_consent("did:key:alice".into());
+        proposal.record_consent("did:key:bob".into());
+
+        // Both active -- approved.
+        let both_active: HashSet<DID> =
+            ["did:key:alice".to_owned(), "did:key:bob".to_owned()]
+                .into_iter()
+                .collect();
+        assert!(proposal.is_approved_active(&both_active));
+        assert_eq!(proposal.active_consent_count(&both_active), 2);
+        assert_eq!(proposal.active_remaining(&both_active), 0);
+
+        // Bob removed -- not approved.
+        let alice_only: HashSet<DID> = ["did:key:alice".to_owned()].into_iter().collect();
+        assert!(!proposal.is_approved_active(&alice_only));
+        assert_eq!(proposal.active_consent_count(&alice_only), 1);
+        assert_eq!(proposal.active_remaining(&alice_only), 1);
+    }
+
+    /// SCP-195: Vote cast by member active at vote time but removed before
+    /// tally is excluded from the count.
+    #[test]
+    fn extension_proposal_vote_then_remove_before_tally() {
+        // Bilateral context (member_count=2) uses AllMember consent mode,
+        // requiring both members to consent.
+        let mut proposal = TtlExtensionProposal::new(
+            "did:key:alice".into(),
+            Duration::from_secs(3600),
+            2,
+            GovernanceModel::SingleAdmin,
+        );
+        // Both members vote while active.
+        proposal.record_consent("did:key:alice".into());
+        proposal.record_consent("did:key:bob".into());
+
+        // Old method: approved (both voted, required 2 for AllMember mode).
+        assert!(proposal.is_approved());
+
+        // Bob is removed before tally time.
+        let active: HashSet<DID> = ["did:key:alice".to_owned()].into_iter().collect();
+
+        // Active method: NOT approved (only 1 of 2 required active votes).
+        assert!(!proposal.is_approved_active(&active));
+        assert_eq!(proposal.active_consent_count(&active), 1);
     }
 
     // SCP-066 tests: check_ttl
