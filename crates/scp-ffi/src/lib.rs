@@ -31,6 +31,9 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 
+pub mod error;
+pub mod types;
+
 /// Global tokio runtime, created once at module import.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -141,7 +144,10 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let shutdown_fn = m.getattr("shutdown_runtime")?;
     atexit.call_method1("register", (shutdown_fn,))?;
 
-    // Step 3: Register bridge functions.
+    // Step 3: Register exception class hierarchy.
+    error::register_exceptions(m)?;
+
+    // Step 4: Register bridge functions.
     m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;

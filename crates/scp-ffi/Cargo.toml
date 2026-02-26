@@ -15,6 +15,9 @@ test = false
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module", "experimental-async"] }
 tokio = { workspace = true }
+scp-core = { path = "../scp-core" }
+scp-transport = { path = "../scp-transport" }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 pyo3 = { version = "0.23", features = ["auto-initialize"] }
