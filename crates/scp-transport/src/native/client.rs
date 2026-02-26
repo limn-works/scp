@@ -28,6 +28,7 @@ use tokio::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use scp_core::envelope::OuterEnvelope;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -80,6 +81,16 @@ pub enum SubscriptionMessage {
     /// The client reconnected to the relay. Subscribers should expect
     /// possible duplicate envelopes from the overlap window.
     Reconnected,
+    /// A received blob's content did not match its declared `blob_id`.
+    ///
+    /// The relay provided a `blob_id` (SHA-256 hash) that does not match
+    /// `SHA-256(blob)`, indicating a malicious or buggy relay.
+    BlobIntegrityError {
+        /// The `blob_id` declared by the relay (hex-encoded).
+        expected: String,
+        /// The SHA-256 hash of the actual blob content (hex-encoded).
+        actual: String,
+    },
 }
 
 /// Subscription state tracked for reconnection recovery.
@@ -295,9 +306,37 @@ impl NativeRelayClient {
             RelayMessage::Blob {
                 routing_id,
                 blob_id,
+                blob,
                 stored_at,
                 ..
             } => {
+                // Verify blob integrity: SHA-256(blob) must match relay-provided blob_id.
+                let computed_hash: [u8; 32] = Sha256::digest(blob).into();
+                if computed_hash != *blob_id {
+                    let expected = hex_encode(blob_id);
+                    let actual = hex_encode(&computed_hash);
+                    tracing::warn!(
+                        expected = %expected,
+                        actual = %actual,
+                        "blob integrity check failed: SHA-256(blob) does not match \
+                         relay-provided blob_id; possible malicious relay"
+                    );
+
+                    // Emit BlobIntegrityError to the subscription channel if one exists.
+                    let maybe_tx = inner
+                        .read()
+                        .await
+                        .subscriptions
+                        .get(routing_id)
+                        .map(|sub| sub.tx.clone());
+                    if let Some(tx) = maybe_tx {
+                        let _ = tx
+                            .send(SubscriptionMessage::BlobIntegrityError { expected, actual })
+                            .await;
+                    }
+                    return;
+                }
+
                 let receive_time = Instant::now();
                 let mut state = inner.write().await;
 
@@ -775,6 +814,17 @@ impl NativeRelayClient {
     }
 }
 
+/// Hex-encodes a byte slice into a lowercase hex string.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 /// Assigns a `ref_id` to a [`ClientMessage`] for request-response correlation.
 fn assign_ref_id(msg: &mut ClientMessage, ref_id: &str) {
     match msg {
@@ -867,5 +917,145 @@ mod tests {
     #[test]
     fn reconnect_overlap_is_5_seconds() {
         assert_eq!(RECONNECT_OVERLAP.as_secs(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Blob integrity verification tests (SCP-193)
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates a `ClientInner` with a subscription for the given
+    /// routing ID, returning the inner state and the subscription receiver.
+    fn setup_inner_with_subscription(
+        routing_id: [u8; 32],
+    ) -> (
+        Arc<RwLock<ClientInner>>,
+        mpsc::Receiver<SubscriptionMessage>,
+    ) {
+        let (tx, rx) = mpsc::channel(16);
+        let inner = Arc::new(RwLock::new(ClientInner {
+            pending: HashMap::new(),
+            next_ref_id: 1,
+            subscriptions: HashMap::from([(
+                routing_id,
+                SubscriptionState {
+                    routing_id,
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                },
+            )]),
+            seen_blob_ids: HashSet::new(),
+            connected: true,
+        }));
+        (inner, rx)
+    }
+
+    /// Computes SHA-256 of the given data, returning a 32-byte array.
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        Sha256::digest(data).into()
+    }
+
+    #[tokio::test]
+    async fn dispatch_blob_with_correct_hash_accepted() {
+        let routing_id = [0xAA; 32];
+        let blob_data = vec![0x01, 0x02, 0x03];
+        let correct_blob_id = sha256(&blob_data);
+        let (inner, mut rx) = setup_inner_with_subscription(routing_id);
+
+        let msg = RelayMessage::Blob {
+            routing_id,
+            blob_id: correct_blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_data,
+        };
+
+        NativeRelayClient::dispatch_relay_message(&inner, msg.clone()).await;
+
+        // The blob should be delivered to the subscription channel.
+        let received = rx.try_recv().unwrap();
+        assert!(
+            matches!(
+                received,
+                SubscriptionMessage::Relay(RelayMessage::Blob { .. })
+            ),
+            "expected Relay(Blob), got {received:?}"
+        );
+
+        // The blob_id should be in the dedup set.
+        assert!(inner.read().await.seen_blob_ids.contains(&correct_blob_id));
+    }
+
+    #[tokio::test]
+    async fn dispatch_blob_with_tampered_content_rejected() {
+        let routing_id = [0xBB; 32];
+        let original_blob = vec![0x01, 0x02, 0x03];
+        let original_blob_id = sha256(&original_blob);
+        let tampered_blob = vec![0xFF, 0xFE, 0xFD]; // Different content.
+        let (inner, mut rx) = setup_inner_with_subscription(routing_id);
+
+        let msg = RelayMessage::Blob {
+            routing_id,
+            blob_id: original_blob_id, // Hash of original, not tampered.
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: tampered_blob,
+        };
+
+        NativeRelayClient::dispatch_relay_message(&inner, msg).await;
+
+        // Should receive a BlobIntegrityError, not a Blob.
+        let received = rx.try_recv().unwrap();
+        assert!(
+            matches!(received, SubscriptionMessage::BlobIntegrityError { .. }),
+            "expected BlobIntegrityError, got {received:?}"
+        );
+
+        // The blob_id should NOT be in the dedup set (tampered blob rejected).
+        assert!(!inner.read().await.seen_blob_ids.contains(&original_blob_id));
+    }
+
+    #[tokio::test]
+    async fn dispatch_empty_blob_with_correct_hash_accepted() {
+        let routing_id = [0xCC; 32];
+        let empty_blob: Vec<u8> = vec![];
+        let correct_blob_id = sha256(&empty_blob);
+        let (inner, mut rx) = setup_inner_with_subscription(routing_id);
+
+        let msg = RelayMessage::Blob {
+            routing_id,
+            blob_id: correct_blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: empty_blob,
+        };
+
+        NativeRelayClient::dispatch_relay_message(&inner, msg).await;
+
+        // Empty blob with correct hash should be accepted.
+        let received = rx.try_recv().unwrap();
+        assert!(
+            matches!(
+                received,
+                SubscriptionMessage::Relay(RelayMessage::Blob { .. })
+            ),
+            "expected Relay(Blob), got {received:?}"
+        );
+
+        assert!(inner.read().await.seen_blob_ids.contains(&correct_blob_id));
+    }
+
+    #[test]
+    fn hex_encode_produces_lowercase_hex() {
+        let bytes = [0xAB, 0xCD, 0xEF, 0x01];
+        assert_eq!(hex_encode(&bytes), "abcdef01");
+    }
+
+    #[test]
+    fn hex_encode_empty_is_empty() {
+        assert_eq!(hex_encode(&[]), "");
     }
 }
