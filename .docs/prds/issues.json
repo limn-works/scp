@@ -1457,7 +1457,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/republish.rs"
       ],
@@ -1483,7 +1483,8 @@
       ],
       "details": {
         "implementationNote": "The source issue specifies only 'republished periodically with a redirect to the new DID.' Specific interval, redirect mechanism (alsoKnownAs), and TTL are implementation choices not specified in the source."
-      }
+      },
+      "result": "MigrationRepublisher implemented with configurable interval, cancellation handle, 3 tests"
     },
     {
       "id": "SCP-201",
@@ -1584,7 +1585,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/params.rs",
         "crates/scp-core/src/context/roles.rs"
@@ -1612,7 +1613,8 @@
         "paramsType": "params::Capability is Capability(String) with name() accessor — a newtype wrapper around String.",
         "rolesType": "roles::Capability is an enum with variants like Custom(String) — a discriminated union.",
         "mismatchRisk": "The two types have the same name but different structures, creating potential for mismatched capability checks at module boundaries."
-      }
+      },
+      "result": "Unified Capability type: params re-exports roles::Capability enum with new() and name() methods"
     },
     {
       "id": "SCP-205",
@@ -1620,7 +1622,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/tools/mod.rs",
         "crates/scp-core/src/context/mod.rs"
@@ -1643,7 +1645,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/13"
       ],
-      "details": {}
+      "details": {},
+      "result": "Removed NoOpProofResolver from ucan/validate.rs; tests updated to use InMemoryProofResolver"
     },
     {
       "id": "SCP-206",
@@ -1651,7 +1654,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs"
       ],
@@ -1671,7 +1674,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/11"
       ],
-      "details": {}
+      "details": {},
+      "result": "Added #[allow(dead_code)] with comment referencing ADR-032 AC 7 and SCP-145"
     },
     {
       "id": "SCP-207",
@@ -1679,7 +1683,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs"
       ],
@@ -1701,7 +1705,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/10"
       ],
-      "details": {}
+      "details": {},
+      "result": "Added B: BlobStorage type parameter to ApplicationNodeBuilder with InMemoryBlobStorage default; blob_storage() builder method"
     },
     {
       "id": "SCP-208",
