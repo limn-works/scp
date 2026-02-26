@@ -72,20 +72,21 @@ jobs:
 
             Do NOT read every changed file. Sample the most important ones per area.
 
-            ## Step 3: Report
+            ## Step 3: Report — YOU MUST ALWAYS COMMENT ON THE PR
 
-            If drift is found, comment on the PR with all findings:
+            You MUST run exactly one of these two commands. Never exit without commenting.
+
+            **If drift was found**, post findings:
             ```bash
             gh pr comment ${{ github.event.pull_request.number }} --body "<drift report>"
             ```
-
             Format each finding as:
             - **File:** `path/to/file.rs`
             - **Spec:** `.docs/specs/XX-name.md` section Y.Z
             - **Type:** structural | behavioral | missing | unauthorized
             - **Description:** what diverges and how
 
-            If no drift is found, post a short confirmation comment:
+            **If NO drift was found**, post confirmation:
             ```bash
             gh pr comment ${{ github.event.pull_request.number }} --body "**Spec Drift Check: PASSED** — No drift detected. [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
             ```
