@@ -20,3 +20,6 @@
 #![forbid(unsafe_code)]
 
 pub mod conformance;
+pub mod test_adapter;
+
+pub use test_adapter::TestAdapter;
