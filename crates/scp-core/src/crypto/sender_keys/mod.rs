@@ -26,11 +26,11 @@ use rand::rngs::OsRng;
 
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
-    BlockNotification, RotateForBlockResult, SenderKeyEpochAdvance, SenderKeyRequest,
+    BlockNotification, NonceDedup, RotateForBlockResult, SenderKeyEpochAdvance, SenderKeyRequest,
     SenderKeyRequestResult, SenderKeyResponse, handle_sender_key_request, open_sender_key_response,
     publish_sender_key_epoch_advance, request_sender_key, rotate_sender_key_for_block,
-    send_block_notification, verify_block_notification, verify_epoch_advance,
-    verify_sender_key_request,
+    send_block_notification, validate_block_notification_freshness, verify_block_notification,
+    verify_epoch_advance, verify_sender_key_request,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,14 @@ pub enum SenderKeyError {
     /// A key custody operation failed.
     #[error("key custody error: {0}")]
     KeyCustodyError(String),
+
+    /// A sender key request was replayed (duplicate nonce within the expiry window).
+    #[error("replayed request: duplicate nonce detected")]
+    ReplayedRequest,
+
+    /// A block notification timestamp is too old to be considered fresh.
+    #[error("stale block notification: timestamp outside freshness window")]
+    StaleBlockNotification,
 }
 
 // ---------------------------------------------------------------------------
