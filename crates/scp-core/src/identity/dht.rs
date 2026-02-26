@@ -766,43 +766,13 @@ fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
     })
 }
 
-/// Base58btc decoding (Bitcoin alphabet).
+/// Base58btc decoding (Bitcoin alphabet) via the `bs58` crate.
 ///
 /// Inverse of the `base58btc_encode` function in `document.rs`.
 fn base58btc_decode(input: &str) -> Result<Vec<u8>, String> {
-    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Count leading '1' characters (these map to leading zero bytes).
-    let zero_count = input.bytes().take_while(|&b| b == b'1').count();
-
-    // Convert from base58 to base256 via repeated division.
-    // We use u32 for the carry to avoid usize-to-u8 truncation warnings.
-    let mut bytes: Vec<u8> = Vec::new();
-    for ch in input.bytes() {
-        let Some(val) = ALPHABET.iter().position(|&a| a == ch) else {
-            return Err(format!("invalid base58 character: {}", ch as char));
-        };
-        // val is always < 58, so this cast is safe.
-        #[allow(clippy::cast_possible_truncation)]
-        let mut carry = val as u32;
-        for byte in &mut bytes {
-            carry += u32::from(*byte) * 58;
-            *byte = (carry & 0xFF) as u8;
-            carry >>= 8;
-        }
-        while carry > 0 {
-            bytes.push((carry & 0xFF) as u8);
-            carry >>= 8;
-        }
-    }
-
-    let mut result = vec![0u8; zero_count];
-    result.extend(bytes.into_iter().rev());
-    Ok(result)
+    bs58::decode(input)
+        .into_vec()
+        .map_err(|e| format!("base58btc decode error: {e}"))
 }
 
 // The trait uses RPITIT (`-> impl Future<...> + Send`), so each impl method
@@ -1485,6 +1455,41 @@ mod tests {
         let vm = encoded.verification_method_by_fragment("0").unwrap();
         let decoded = decode_multibase_key(&vm.public_key_multibase).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn base58btc_decode_known_vector() {
+        // "JxF12TrwUP45BMd" is the base58btc encoding of "Hello World".
+        let decoded = base58btc_decode("JxF12TrwUP45BMd").unwrap();
+        assert_eq!(decoded, b"Hello World");
+    }
+
+    #[test]
+    fn base58btc_decode_leading_ones() {
+        // Leading '1' characters map to leading zero bytes.
+        let decoded = base58btc_decode("112").unwrap();
+        assert_eq!(decoded, vec![0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn base58btc_decode_empty_input() {
+        let decoded = base58btc_decode("").unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn base58btc_decode_rejects_invalid_characters() {
+        // '0', 'O', 'I', 'l' are not in the Bitcoin base58 alphabet.
+        assert!(base58btc_decode("0OIl").is_err());
+    }
+
+    #[test]
+    fn base58btc_roundtrip_32_byte_key() {
+        // Direct roundtrip: encode with bs58, then decode with our function.
+        let key = [0xABu8; 32];
+        let encoded = bs58::encode(&key).into_string();
+        let decoded = base58btc_decode(&encoded).unwrap();
+        assert_eq!(decoded, key);
     }
 
     #[test]
