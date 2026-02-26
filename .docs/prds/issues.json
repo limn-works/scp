@@ -78,9 +78,7 @@
         "SCP-206",
         "SCP-207",
         "SCP-208",
-        "SCP-209",
-        "SCP-210",
-        "SCP-211"
+        "SCP-209"
       ]
     }
   ],
@@ -1771,84 +1769,6 @@
       "details": {
         "currentBehavior": "build() returns Result — misconfiguration is a runtime error, not a compile error.",
         "designRationale": "A type-state builder would make misconfiguration a compile error rather than a runtime error."
-      }
-    },
-    {
-      "id": "SCP-210",
-      "title": "Design Sybil-resistant blocking mechanism",
-      "gate": "gate-harden",
-      "priority": "P2",
-      "severity": "major",
-      "status": "pending",
-      "files": [
-        "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
-      ],
-      "description": "handle_sender_key_request in crypto/sender_keys/key_protocol.rs checks block_list.contains(&request.requester_did) — per-DID blocking only. A Sybil identity (new DID controlled by the same actor) not in the block list can request and receive the new sender key. The protocol tenet \"every agent traces to a human DID\" is not mechanically enforced. Classification: Architectural. Requires identity-level (not DID-level) blocking or external Sybil resistance.",
-      "acceptanceCriteria": [
-        "A design document or ADR describes the chosen Sybil-resistant blocking approach",
-        "The blocking mechanism supports identity-level blocking (not just per-DID), or external Sybil resistance",
-        "Implementation in key_protocol.rs uses the new blocking mechanism",
-        "Unit test: blocked identity cannot obtain sender keys even with a new DID",
-        "Unit test: non-blocked identity can obtain sender keys normally",
-        "The approach integrates with SCP's existing DID and UCAN infrastructure"
-      ],
-      "actionItems": [
-        "Research Sybil resistance compatible with DID identity",
-        "Write design note in .docs/",
-        "Refactor to identity-level blocking",
-        "Add tests"
-      ],
-      "blockedBy": [],
-      "tools": [],
-      "sources": [
-        "https://github.com/limn-works/scp/issues/22"
-      ],
-      "details": {
-        "classification": "Architectural. Requires identity-level (not DID-level) blocking or external Sybil resistance.",
-        "currentCode": "block_list.contains(&request.requester_did) — per-DID blocking only.",
-        "protocolTenet": "The protocol tenet 'every agent traces to a human DID' is not mechanically enforced.",
-        "sybilDefinition": "A Sybil identity is a new DID controlled by the same actor."
-      }
-    },
-    {
-      "id": "SCP-211",
-      "title": "Design pseudonym rotation for traffic analysis resistance",
-      "gate": "gate-harden",
-      "priority": "P2",
-      "severity": "major",
-      "status": "pending",
-      "files": [
-        "crates/scp-core/src/envelope/pseudonym.rs",
-        "crates/scp-transport/src/native/server.rs"
-      ],
-      "description": "Pseudonym derivation in envelope/pseudonym.rs is HMAC-SHA256(identity_key_material, context_id || \"scp-pseudonym\") — deterministic, never rotated. The relay sees routing_id and recipient_hint on every envelope. deliver_to_subscribers delivers blobs by routing_id with no delay/batching, making timing correlation trivial. Cross-relay fanout sends identical envelopes simultaneously. Classification: Architectural (P2/defense-in-depth). Requires pseudonym rotation or traffic analysis resistance mechanisms.",
-      "acceptanceCriteria": [
-        "A design document or ADR describes the chosen pseudonym rotation and traffic analysis resistance approach",
-        "Pseudonym derivation supports epoch-based or event-triggered rotation",
-        "Relay delivery path supports configurable delay/batching to resist timing analysis",
-        "The recipient_hint visibility to relays is addressed (rotation or obfuscation)",
-        "Unit test: pseudonyms change after rotation trigger",
-        "Unit test: old pseudonyms are still resolvable during a grace period",
-        "The design addresses cross-relay fanout correlation (identical envelopes sent simultaneously)"
-      ],
-      "actionItems": [
-        "Research rotation strategies",
-        "Write design note in .docs/",
-        "Design rotation mechanism",
-        "Design delivery batching/delay",
-        "Add tests"
-      ],
-      "blockedBy": [],
-      "tools": [],
-      "sources": [
-        "https://github.com/limn-works/scp/issues/17"
-      ],
-      "details": {
-        "classification": "Architectural (P2/defense-in-depth). Requires design decision.",
-        "hmacConstruction": "HMAC-SHA256(identity_key_material, context_id || \"scp-pseudonym\") — deterministic, never rotated.",
-        "relayVisibility": "The relay sees routing_id and recipient_hint on every envelope.",
-        "timingCorrelation": "deliver_to_subscribers delivers blobs by routing_id with no delay/batching, making timing correlation trivial.",
-        "crossRelayCorrelation": "Cross-relay fanout sends identical envelopes simultaneously."
       }
     }
   ]

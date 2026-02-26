@@ -2,7 +2,8 @@
 .fastembed_cache/
 target/
 
-# Loom autonomous loop
+.claude/worktrees
+
 .loom/logs/
 .loom/.stop
 .loom/.pid
