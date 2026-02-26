@@ -72,26 +72,51 @@ jobs:
 
             Do NOT read every changed file. Sample the most important ones per area.
 
+            ## Step 2b: Cross-reference with PRD
+
+            Read the pending stories from the PRD to determine which spec gaps are planned work:
+            ```bash
+            gh pr view ${{ github.event.pull_request.number }} --json baseRefName --jq '.baseRefName'
+            ```
+            Then read `.docs/prds/main.json` and extract pending story titles:
+            ```
+            jq '[.stories[] | select(.status == "pending") | .title]' .docs/prds/main.json
+            ```
+
+            For each drift finding, check if a pending story clearly covers that gap. If so,
+            classify it as **Planned** (non-actionable). If no pending story covers it, classify
+            it as **Action Required**.
+
             ## Step 3: Report — YOU MUST ALWAYS COMMENT ON THE PR
 
             IMPORTANT: Always write the comment body to a file first, then post with --body-file.
             Do NOT pass the body inline with --body (it breaks permission matching on multi-line content).
 
-            **If drift was found:**
-            1. Write findings to /tmp/drift-report.md. Format each finding as:
-               - **File:** `path/to/file.rs`
-               - **Spec:** `.docs/specs/XX-name.md` section Y.Z
-               - **Type:** structural | behavioral | missing | unauthorized
-               - **Description:** what diverges and how
-            2. Post:
+            Write the report to /tmp/drift-report.md, then post:
             ```bash
             gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/drift-report.md
             ```
 
-            **If NO drift was found:**
-            1. Write to /tmp/drift-report.md:
-               `**Spec Drift Check: PASSED** — No drift detected. [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`
-            2. Post:
-            ```bash
-            gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/drift-report.md
-            ```
+            **Report format:**
+
+            Always start with a header line:
+            `## Spec Drift Check — [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+
+            **If there are Action Required findings**, list them first under:
+            `### Action Required`
+            Format each as:
+            - **File:** `path/to/file.rs`
+            - **Spec:** `.docs/specs/XX-name.md` section Y.Z
+            - **Type:** structural | behavioral | missing | unauthorized
+            - **Description:** what diverges and how
+
+            **If there are Planned findings**, list them under:
+            `### Planned (covered by pending stories)`
+            Format each as:
+            - **File:** `path/to/file.rs`
+            - **Spec:** `.docs/specs/XX-name.md` section Y.Z
+            - **Story:** title of the pending PRD story that covers this
+            - **Description:** brief note on what's missing
+
+            **If no drift at all**, write:
+            `**PASSED** — No drift detected.`
