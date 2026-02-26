@@ -2,16 +2,21 @@
 //!
 //! This module defines the core economic types used across all SCP economic
 //! operations: amounts, currency codes, coefficients, cost schedules, pricing
-//! formulas, and economic policy. All types use integer arithmetic exclusively
-//! for cross-party determinism.
+//! formulas, economic policy, and the payment adapter trait. All monetary types
+//! use integer arithmetic exclusively for cross-party determinism.
 //!
 //! See spec section 19 (Economic Governance) and ADR-033 in
 //! `.docs/adrs/phase-3.md`.
 
+pub mod adapter;
 pub mod types;
 
+pub use adapter::{
+    AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata,
+    PaymentReceipt, RefundConfirmation, VerificationResult,
+};
 pub use types::{
     Amount, COEFFICIENT_SCALE, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy,
-    PaymentAdapterRef, PricingFormula, PricingMetric, PricingVariable, SubscriptionCost,
-    SubscriptionPeriod,
+    PaidActionType, PaymentAdapterRef, PricingFormula, PricingMetric, PricingVariable,
+    SubscriptionCost, SubscriptionPeriod,
 };

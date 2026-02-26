@@ -249,6 +249,30 @@ pub struct SubscriptionCost {
 pub type PaymentAdapterRef = String;
 
 // ---------------------------------------------------------------------------
+// PaidActionType
+// ---------------------------------------------------------------------------
+
+/// Action type for which a payment is made.
+///
+/// Used in [`PaymentReceipt`](super::adapter::PaymentReceipt) and cost
+/// estimation to identify the category of paid action.
+///
+/// See spec section 19.1.1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaidActionType {
+    /// Sending a message in a context.
+    MessageSend,
+    /// Invoking a tool.
+    ToolInvoke,
+    /// Joining a context.
+    ContextJoin,
+    /// A subscription period payment.
+    SubscriptionPeriod,
+    /// Per-byte storage cost.
+    ByteStored,
+}
+
+// ---------------------------------------------------------------------------
 // PricingMetric
 // ---------------------------------------------------------------------------
 
