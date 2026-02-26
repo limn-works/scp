@@ -994,7 +994,7 @@
       "gate": "gate-correctness",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/mod.rs",
         "crates/scp-core/src/context/membership.rs",
@@ -1038,7 +1038,8 @@
           "scp-media/session.rs",
           "envelope/mod.rs"
         ]
-      }
+      },
+      "result": "Consolidated all 8 type DID = String aliases into pub struct DID(pub String) in identity/mod.rs. 36 files updated. Commit fea6efa."
     },
     {
       "id": "SCP-188",
@@ -1302,7 +1303,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/ttl.rs"
       ],
@@ -1323,7 +1324,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/56"
       ],
-      "details": {}
+      "details": {},
+      "result": "Added active-member filtering to TTL consent tallying. 7 tests. Commit 695a30c."
     },
     {
       "id": "SCP-196",
