@@ -6,10 +6,28 @@
 //! lists. The revocation list is append-only: once a token CID is revoked, it
 //! cannot be un-revoked.
 //!
+//! # Revocation states
+//!
+//! Each token tracked by the revocation list is in one of three states:
+//!
+//! - [`RevocationState::Active`] -- Not revoked. This is the default state and
+//!   is not stored explicitly (absence from the map means Active).
+//! - [`RevocationState::RevocationPending`] -- Revocation has been initiated
+//!   locally but MLS distribution has not yet succeeded. Capability exercise
+//!   is **denied** in this state (fail-closed).
+//! - [`RevocationState::Revoked`] -- Revocation is fully committed: the token
+//!   has been revoked locally and the revocation has been distributed to all
+//!   context members via MLS.
+//!
+//! The [`revoke_ucan`] function is transactional: if MLS distribution fails,
+//! the local revocation is rolled back so there is no split-brain between the
+//! revoker and other context members.
+//!
 //! # Types
 //!
 //! - [`RevocationList`] -- Per-context set of revoked token CIDs with merge
 //!   support for MLS-distributed synchronization.
+//! - [`RevocationState`] -- Per-token revocation state.
 //!
 //! # Traits
 //!
@@ -28,6 +46,36 @@ use serde::{Deserialize, Serialize};
 
 use super::UcanError;
 use crate::event_log::ContextId;
+
+// ---------------------------------------------------------------------------
+// RevocationState
+// ---------------------------------------------------------------------------
+
+/// Per-token revocation state.
+///
+/// Tokens progress through these states during the revocation flow:
+///
+/// ```text
+/// Active -> RevocationPending -> Revoked
+///                |
+///                +-> Active (on distribution failure -- rollback)
+/// ```
+///
+/// Both `RevocationPending` and `Revoked` are treated as revoked for
+/// capability validation purposes (fail-closed). This ensures that a token
+/// cannot be exercised during the propagation window between local revocation
+/// and MLS distribution completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RevocationState {
+    /// The token has not been revoked. This state is implicit -- tokens not
+    /// present in the revocation list are considered Active.
+    Active,
+    /// Revocation has been initiated locally but MLS distribution has not yet
+    /// succeeded. Capability exercise is denied in this state.
+    RevocationPending,
+    /// Revocation is fully committed: local revocation + MLS distribution.
+    Revoked,
+}
 
 // ---------------------------------------------------------------------------
 // RevocationList
