@@ -60,8 +60,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: "--model claude-sonnet-4-20250514 --max-turns 20"
-          settings: '{"permissions":{"allow":["Bash(gh *)","Bash(cargo *)","Bash(git add *)","Bash(git commit *)","Bash(git push *)","Bash(git log *)","Bash(git diff *)","Read","Write","Edit","Glob","Grep"]}}'
+          claude_args: '--model claude-sonnet-4-20250514 --max-turns 20 --allowedTools "Bash(gh *),Bash(cargo *),Bash(git add *),Bash(git commit *),Bash(git push *),Bash(git log *),Bash(git diff *),Read,Write,Edit,Glob,Grep"'
           prompt: |
             CI has failed on PR #${{ steps.pr.outputs.number }} (branch: ${{ steps.pr.outputs.branch }}).
 

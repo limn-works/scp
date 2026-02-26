@@ -24,8 +24,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: "--model claude-opus-4-20250514 --max-turns 40"
-          settings: '{"permissions":{"allow":["Bash(gh *)","Bash(cargo *)","Bash(git log *)","Bash(git diff *)","Bash(git show *)","Read","Glob","Grep","Task"]}}'
+          claude_args: '--model claude-opus-4-20250514 --max-turns 40 --allowedTools "Bash(gh *),Bash(cargo *),Bash(git log *),Bash(git diff *),Bash(git show *),Read,Glob,Grep,Task"'
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
 
