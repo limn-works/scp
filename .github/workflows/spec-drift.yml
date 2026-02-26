@@ -27,7 +27,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: '--model claude-sonnet-4-20250514 --max-turns 15 --allowedTools "Bash(gh *),Read,Glob,Grep"'
+          claude_args: '--model claude-sonnet-4-20250514 --max-turns 30 --allowedTools "Bash(gh *),Read,Glob,Grep"'
           prompt: |
             Check PR #${{ github.event.pull_request.number }} for spec drift — implementation
             that diverges from the project's specifications.
