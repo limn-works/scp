@@ -1,7 +1,7 @@
 # Loom Status
 
 ## Failing Tests
-None. All ~2,193 workspace tests pass (1,667 scp-core + 1 scp-core integration + 158 scp-mcp + 64 scp-node + 31 scp-media + 4 scp-testing + 44 scp-platform + 215 scp-transport + doctests).
+None. All ~2,297 workspace tests pass (1,759 scp-core + 1 scp-core integration + 158 scp-mcp + 64 scp-node + 31 scp-media + 4 scp-testing + 19 scp-testing conformance + 44 scp-platform + 215 scp-transport + doctests).
 
 ## Uncommitted Changes
 None. All changes committed.
@@ -10,37 +10,35 @@ None. All changes committed.
 No previously-failing tests.
 
 ## Tests Added / Updated
-- **Phase 3 integration test** (SCP-058): `tests/integration/phase3_integration_test.py` — 13-step end-to-end Python SDK test exercising Identity, Context, Tools, UCAN, MCP, EventLog across PyO3 bridge.
-- **Addressability integration tests** (SCP-148): `crates/scp-node/tests/integration.rs` — 4 scenarios: ApplicationNode lifecycle, .well-known/scp discovery, DID resolution, scp:// URI roundtrip.
-- **Auto-accept policy tests** (SCP-135): Unit tests in `crates/scp-core/src/context/policy.rs` — CRUD roundtrip, persistence across restart, absent policy returns None, economic policy hard rule.
-- **Standing channels tests** (SCP-138): Unit tests in `crates/scp-core/src/context/standing.rs` — idempotent get-or-create, new context creation, re-invitation on peer left, startup reconnection.
-- **PaymentAdapter conformance** (SCP-151): `payment_adapter_conformance!()` macro in `crates/scp-testing/src/conformance/payment.rs` generating 8 test cases. Unit tests in `crates/scp-core/src/economy/adapter.rs`.
+- **Governance interface** (SCP-129): 34 tests in `crates/scp-core/src/context/governance/mod.rs` — proposal lifecycle state machine, SingleAdminEngine, typed governance actions, event recording.
+- **Invitation evaluation** (SCP-137): 10 tests in `crates/scp-core/src/context/invitation.rs` — template check, auto-accept, economic guard, rate limiting, agent prompt fallback.
+- **TestAdapter conformance** (SCP-152): 19 tests in `crates/scp-testing/src/test_adapter.rs` — full PaymentAdapter conformance (authorize/capture/void/verify/refund), plus `payment_adapter_conformance!(TestAdapter)` macro invocation.
+- **Anti-spam SenderVelocity** (SCP-159): 12 tests in `crates/scp-core/src/economy/antispam.rs` — sliding window tracking, step-function escalation, per-sender isolation, thread safety.
+- **Event log metrics** (SCP-128): 19 tests in `crates/scp-core/src/event_log/metrics.rs` — growth rate tracking, proof benchmarking, snapshot history, JSON export.
 
 ## Tool-Gated Stories
 None.
 
 ## Subagent Outcomes
-Five subagents launched in parallel with worktree isolation. All committed directly to the loom/scp-protocol-core branch.
+Six subagents launched in parallel with worktree isolation. All completed successfully.
 
-1. **SCP-058** (Phase 3 integration test) — **DONE**. Created `tests/integration/phase3_integration_test.py` with pytest/pytest-asyncio test exercising full Python SDK surface: identity creation, context with tools, member join, UCAN-validated messaging, tool invocation, UCAN rejection, MCP server/client, event log verification, capability revocation.
+1. **SCP-059** (Write ADR-021: UniFFI Bridge Definitions) — **DONE**. Completed ADR-021 in `.docs/adrs/phase-4.md` with full Decision (proc-macro approach), Rationale, Implementation (type mappings, async bridging via UniFFI polling futures), Dependencies, Acceptance Criteria, and Scope sections. Merged from `worktree-agent-a4f489c2` branch.
 
-2. **SCP-148** (Addressability integration test) — **DONE**. Created `crates/scp-node/tests/integration.rs` with 4 test scenarios covering ApplicationNode builder lifecycle, .well-known/scp HTTP endpoint discovery, DID-based relay discovery, and scp:// URI roundtrip parsing.
+2. **SCP-152** (TestAdapter in-memory payment adapter) — **DONE**. Created `crates/scp-testing/src/test_adapter.rs` with TestAdapter implementing PaymentAdapter trait. In-memory ledger with balance tracking per (DID, CurrencyCode), authorize/capture/void/verify/refund lifecycle, thread-safe via Arc<Mutex>. Passes all 8 conformance tests.
 
-3. **SCP-135** (Auto-accept policy persistence) — **DONE**. Created `crates/scp-core/src/context/policy.rs` with AutoAcceptPolicy struct, CRUD via Storage trait (key convention `policy/{did}/auto_accept`), and hard rule blocking auto-accept for contexts with economic policy requiring payment.
+3. **SCP-159** (Anti-spam cost escalation) — **DONE**. Created `crates/scp-core/src/economy/antispam.rs` with SenderVelocityTracker using sliding window timestamps per sender DID. Lazy expiry cleanup, configurable window duration, step-function cost escalation integration with PricingFormula. Thread-safe via Mutex.
 
-4. **SCP-138** (Standing channels) — **DONE**. Created `crates/scp-core/src/context/standing.rs` with StandingChannelManager implementing 4-step get-or-create logic (check local state → return if active → create if missing → re-invite if peer left) and startup reconnection via `reconnect_all()`.
+4. **SCP-137** (Invitation evaluation pipeline) — **DONE**. Created `crates/scp-core/src/context/invitation.rs` with 3-step sequential evaluation: template check (anti-spoofing), auto-accept check (trust + TTL + rate limit), agent prompt fallback. Economic policy hard guard prevents auto-accept for paid contexts. TrustOracle and SpendingContext traits for pluggable evaluation.
 
-5. **SCP-151** (PaymentAdapter trait) — **DONE**. Created `crates/scp-core/src/economy/adapter.rs` with PaymentAdapter trait (#[async_trait], Send + Sync), AdapterCapabilities, PaymentAuthorization, PaymentReceipt, PaymentError, VerificationResult, RefundConfirmation, PaymentMetadata types. Created `crates/scp-testing/src/conformance/payment.rs` with `payment_adapter_conformance!()` macro generating 8 test cases.
+5. **SCP-128** (Event log growth monitoring) — **DONE**. Created `crates/scp-core/src/event_log/metrics.rs` with EventLogMetrics tracking event count, byte totals, timestamps. GrowthSnapshot for point-in-time state. ProofBenchmark for gen/verify profiling. Growth rate calculation and JSON export.
 
-## PRD Maintenance
-- Deduplicated PRD entries: SCP-140, 142, 143, 144, 145, 146, 147, 149, 150, 153, 158 had duplicate "done"/"pending" entries. Fixed by keeping first occurrence (the "done" version). PRD reduced from ~168 to 162 stories.
+6. **SCP-129** (Governance interface contract) — **DONE**. Created `crates/scp-core/src/context/governance/mod.rs` with GovernanceEngine trait (propose/approve/reject), GovernanceProposal with state machine (Proposed -> Approved/Rejected), GovernanceAction enum (5 typed variants per §5.9), SingleAdminEngine baseline impl, GovernanceEvent for Merkle log recording. Merged from `worktree-agent-ae729e9b` branch with conflict resolution in context/mod.rs.
 
 ## Remaining Stories
 Next unblocked stories after this iteration:
-- **SCP-059** (Write ADR-021: UniFFI) — blocked by SCP-058 (now done) → UNBLOCKED
-- **SCP-121** (Hours-scale offline buffering) — all blockers done → UNBLOCKED
+- **SCP-060** (Write ADR-022: TypeScript SDK) — blocked by SCP-059 (now done) → UNBLOCKED
+- **SCP-082** (Write ADR-025: Apple Platform) — blocked by SCP-059 (now done) → UNBLOCKED
+- **SCP-154** (EconomicPolicy evaluation) — blocked by SCP-149/151/022 (all done) → UNBLOCKED
+- **SCP-155** (PaymentReceipt type) — blocked by SCP-151/030/149 (all done) → UNBLOCKED
+- **SCP-160** (Economic governance integration test) — blocked by SCP-156/157/158/159 (SCP-159 now done, others to check)
 - **SCP-125** (Event log checkpoint creation) — all blockers done → UNBLOCKED
-- **SCP-128** (Event log growth monitoring) — all blockers done → UNBLOCKED
-- **SCP-129** (Governance interface contract) — all blockers done → UNBLOCKED
-- **SCP-154** (SpendingLedger) — check if SCP-153 (done) + SCP-150 (done) unblocks it
-- **SCP-155** (PaymentAdapter x402) — check if SCP-151 (now done) unblocks it
