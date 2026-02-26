@@ -27,49 +27,54 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: '--model claude-sonnet-4-20250514 --max-turns 30 --allowedTools "Bash(gh *),Read,Glob,Grep"'
+          claude_args: '--model claude-sonnet-4-20250514 --max-turns 50 --allowedTools "Bash(gh *),Read,Glob,Grep"'
           prompt: |
             Check PR #${{ github.event.pull_request.number }} for spec drift — implementation
             that diverges from the project's specifications.
 
-            ## Step 1: Understand the changes
+            IMPORTANT: Be turn-efficient. Use parallel tool calls aggressively. Read multiple
+            files in one turn. Use `gh pr view --json files` (NOT `gh pr diff`) to get the
+            file list — do NOT read the full diff, it may be enormous.
+
+            ## Step 1: Get changed files and group by spec area
 
             ```bash
-            gh pr diff ${{ github.event.pull_request.number }}
-            gh pr view ${{ github.event.pull_request.number }} --json files
+            gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path'
             ```
 
-            ## Step 2: Map changes to specs
-
-            For each changed file, determine which spec section(s) it relates to:
-
-            - `crates/scp-core/` or `scp-core/` → Multiple specs depending on module
-            - `**/identity/**` or `**/did/**` → `.docs/specs/01-identity.md`
-            - `**/crypto/**` or `**/mls/**` → `.docs/specs/04-encryption.md`
+            Group files into spec areas using these path prefixes:
+            - `**/identity/**`, `**/did/**` → `.docs/specs/01-identity.md`
+            - `**/crypto/**`, `**/mls/**` → `.docs/specs/04-encryption.md`
             - `**/context/**` → `.docs/specs/05-contexts.md`
-            - `**/message/**` or `**/messaging/**` → `.docs/specs/04-encryption.md`, `.docs/specs/06-cross-context-communication.md`
-            - `**/capability/**` or `**/ucan/**` → `.docs/specs/07-capabilities.md`
+            - `**/message/**`, `**/messaging/**` → `.docs/specs/04-encryption.md`, `.docs/specs/06-cross-context-communication.md`
+            - `**/capability/**`, `**/ucan/**` → `.docs/specs/07-capabilities.md`
             - `**/provenance/**` → `.docs/specs/08-provenance.md`
-            - `**/transport/**` or `**/relay/**` → `.docs/specs/10-transport.md`
+            - `**/transport/**`, `**/relay/**` → `.docs/specs/10-transport.md`
             - `**/discovery/**` → `.docs/specs/12-discovery.md`
             - `**/governance/**` → `.docs/specs/13-governance.md`
-            - `**/storage/**` or `**/persist/**` → `.docs/specs/17-persistence-and-storage.md`
+            - `**/storage/**`, `**/persist/**` → `.docs/specs/17-persistence-and-storage.md`
 
-            Also read `.docs/sketch.md` for API surface expectations.
+            Skip files that don't map to any spec (Cargo.toml, Cargo.lock, .docs/*, tests, etc.).
 
-            ## Step 3: Check for drift
+            ## Step 2: Check each spec area (batched)
 
-            For each mapping, read the relevant spec section and compare against the
-            implementation. Look for:
+            For each spec area, IN PARALLEL:
+            1. Read the spec file
+            2. Read the 2-3 most structurally significant changed files in that area
+               (prefer files with new types, trait impls, or public APIs over test files or minor edits)
+            3. Compare public types, field names, method signatures, and behavioral contracts against spec
 
-            - **Structural drift:** Implementation uses different types, fields, or relationships than spec describes
-            - **Behavioral drift:** Implementation handles cases differently than spec defines
-            - **Missing implementation:** Spec requires something the implementation omits
-            - **Unauthorized extras:** Implementation adds behavior not described in any spec
+            Focus on:
+            - **Structural drift:** types, fields, or relationships differ from spec
+            - **Behavioral drift:** handling differs from spec-defined behavior
+            - **Missing implementation:** spec requires something the code omits
+            - **Unauthorized extras:** code adds behavior not in any spec
 
-            ## Step 4: Report
+            Do NOT read every changed file. Sample the most important ones per area.
 
-            If drift is found, comment on the PR:
+            ## Step 3: Report
+
+            If drift is found, comment on the PR with all findings:
             ```bash
             gh pr comment ${{ github.event.pull_request.number }} --body "<drift report>"
             ```
