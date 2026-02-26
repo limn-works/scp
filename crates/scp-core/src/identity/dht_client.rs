@@ -105,6 +105,12 @@ impl InMemoryDhtClient {
             items: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Removes all stored items. Test-only utility for verifying republish behavior.
+    pub async fn clear(&self) {
+        let mut items = self.items.lock().await;
+        items.clear();
+    }
 }
 
 #[allow(clippy::manual_async_fn)]

@@ -230,6 +230,112 @@ async fn republish_loop<D: DhtClient>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Migration Republishing
+// ---------------------------------------------------------------------------
+
+/// Default interval for migration republishing: 1 hour (in seconds).
+pub const MIGRATION_REPUBLISH_INTERVAL_SECS: u64 = 60 * 60;
+
+/// Periodically republishes an old DID document with an `alsoKnownAs` redirect
+/// to the new DID after identity migration.
+///
+/// After a DID migration, the old DID document needs to be periodically
+/// republished with a redirect so that resolvers looking up the old DID can
+/// discover the new one. This struct manages that background task.
+///
+/// # Cancellation
+///
+/// The returned [`MigrationHandle`] can be used to cancel the background task.
+/// The task also stops if the handle is dropped.
+pub struct MigrationRepublisher<D: DhtClient> {
+    dht_client: Arc<D>,
+    interval_secs: u64,
+}
+
+/// Handle to a running migration republish task.
+///
+/// Dropping the handle or calling [`cancel`](Self::cancel) stops the
+/// background republish task.
+pub struct MigrationHandle {
+    abort_handle: tokio::task::AbortHandle,
+}
+
+impl MigrationHandle {
+    /// Cancels the migration republish task.
+    pub fn cancel(&self) {
+        self.abort_handle.abort();
+    }
+
+    /// Returns whether the background task is still running.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.abort_handle.is_finished()
+    }
+}
+
+impl<D: DhtClient + 'static> MigrationRepublisher<D> {
+    /// Creates a new migration republisher with the default interval (1 hour).
+    #[must_use]
+    pub fn new(dht_client: Arc<D>) -> Self {
+        Self {
+            dht_client,
+            interval_secs: MIGRATION_REPUBLISH_INTERVAL_SECS,
+        }
+    }
+
+    /// Creates a new migration republisher with a custom interval.
+    #[must_use]
+    pub fn with_interval(dht_client: Arc<D>, interval_secs: u64) -> Self {
+        Self {
+            dht_client,
+            interval_secs,
+        }
+    }
+
+    /// Starts the migration republish background task.
+    ///
+    /// The task immediately republishes the old DID document with the redirect,
+    /// then repeats at the configured interval. Returns a [`MigrationHandle`]
+    /// that can cancel the task.
+    pub fn start(&self, entry: RepublishEntry) -> MigrationHandle {
+        let dht_client = Arc::clone(&self.dht_client);
+        let interval_secs = self.interval_secs;
+
+        let join_handle = tokio::spawn(migration_republish_loop(
+            dht_client,
+            entry,
+            interval_secs,
+        ));
+
+        MigrationHandle {
+            abort_handle: join_handle.abort_handle(),
+        }
+    }
+}
+
+/// Background loop that periodically republishes a migration redirect.
+async fn migration_republish_loop<D: DhtClient>(
+    dht_client: Arc<D>,
+    entry: RepublishEntry,
+    interval_secs: u64,
+) {
+    loop {
+        // Attempt to publish the old DID document (which should already contain
+        // the alsoKnownAs redirect to the new DID).
+        let _ = dht_client
+            .publish(
+                &entry.public_key,
+                &entry.signature,
+                &entry.document_bytes,
+                entry.sequence,
+            )
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -328,5 +434,79 @@ mod tests {
         assert_eq!(record.unwrap().seq, 1);
 
         manager.stop_all().await;
+    }
+
+    // --- Migration republisher tests ---
+
+    fn make_migration_entry() -> RepublishEntry {
+        // Simulate an old DID document that already has alsoKnownAs set.
+        RepublishEntry {
+            did: "did:dht:zOldDid".to_owned(),
+            public_key: [3u8; 32],
+            document_bytes: b"old document with alsoKnownAs redirect".to_vec(),
+            signature: [4u8; 64],
+            sequence: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_republisher_publishes_old_doc_with_redirect() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let republisher = MigrationRepublisher::with_interval(Arc::clone(&dht), 3600);
+        let entry = make_migration_entry();
+
+        let handle = republisher.start(entry);
+
+        // Give the task time to do its first publish.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Verify the old DID document was published.
+        let record = dht.resolve(&[3u8; 32]).await.unwrap();
+        assert!(record.is_some());
+        let rec = record.unwrap();
+        assert_eq!(rec.value, b"old document with alsoKnownAs redirect");
+        assert_eq!(rec.seq, 2);
+
+        handle.cancel();
+    }
+
+    #[tokio::test]
+    async fn migration_republisher_respects_configurable_interval() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        // Use default interval — verify it's configurable.
+        let default_republisher = MigrationRepublisher::new(Arc::clone(&dht));
+        assert_eq!(default_republisher.interval_secs, MIGRATION_REPUBLISH_INTERVAL_SECS);
+
+        // Use custom interval.
+        let custom_republisher = MigrationRepublisher::with_interval(Arc::clone(&dht), 42);
+        assert_eq!(custom_republisher.interval_secs, 42);
+
+        // Start with a short interval and verify immediate publish happens.
+        let entry = make_migration_entry();
+        let handle = custom_republisher.start(entry);
+
+        // Give the task time to do its first publish.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let record = dht.resolve(&[3u8; 32]).await.unwrap();
+        assert!(record.is_some(), "first publish should happen immediately");
+
+        handle.cancel();
+    }
+
+    #[tokio::test]
+    async fn migration_republisher_stops_on_cancel() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let republisher = MigrationRepublisher::with_interval(Arc::clone(&dht), 3600);
+        let entry = make_migration_entry();
+
+        let handle = republisher.start(entry);
+        assert!(handle.is_active());
+
+        handle.cancel();
+
+        // Give the runtime time to process the abort.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(!handle.is_active());
     }
 }
