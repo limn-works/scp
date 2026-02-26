@@ -9,12 +9,14 @@
 //! `.docs/adrs/phase-3.md`.
 
 pub mod adapter;
+pub mod antispam;
 pub mod types;
 
 pub use adapter::{
     AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata,
     PaymentReceipt, RefundConfirmation, VerificationResult,
 };
+pub use antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
 pub use types::{
     Amount, COEFFICIENT_SCALE, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy,
     PaidActionType, PaymentAdapterRef, PricingFormula, PricingMetric, PricingVariable,
