@@ -276,49 +276,60 @@ impl ReceiveBuffer {
 
     /// Pushes an event into the buffer.
     ///
-    /// If the buffer is full, the oldest event is dropped and a
-    /// [`ContextEvent::BufferOverflow`] warning is emitted. The overflow
-    /// warning replaces the dropped event's slot, so the buffer size never
-    /// exceeds `capacity`.
-    pub fn push(&mut self, event: ContextEvent) {
-        if self.events.len() >= self.capacity {
-            // Drop the oldest event.
+    /// If the buffer is full, the oldest event(s) are dropped to make room
+    /// for a [`ContextEvent::BufferOverflow`] warning and the new event.
+    /// The `BufferOverflow` event is always emitted when events are
+    /// displaced, and consecutive overflows coalesce into a single
+    /// `BufferOverflow` with an updated count.
+    ///
+    /// Returns `Some(BufferOverflow { dropped_count })` when events were
+    /// displaced, or `None` when the event was inserted without overflow.
+    pub fn push(&mut self, event: ContextEvent) -> Option<ContextEvent> {
+        if self.events.len() < self.capacity {
+            // Room available -- no overflow.
+            self.events.push_back(event);
+            return None;
+        }
+
+        // Buffer is full. We need to make room for the new event, and
+        // also ensure a BufferOverflow marker is present.
+
+        // Check if the last event is already a BufferOverflow we can
+        // update in place. If so, we only need to drop one oldest event
+        // (the overflow marker is already occupying its slot).
+        if let Some(ContextEvent::BufferOverflow { .. }) = self.events.back() {
+            // Drop the oldest event to make room for the new event.
             self.events.pop_front();
             self.dropped_since_last_consume += 1;
 
-            // Emit a BufferOverflow warning event. This replaces the slot
-            // freed by dropping the oldest event, so we still have room for
-            // the new event.
-            let overflow_event = ContextEvent::BufferOverflow {
-                dropped_count: self.dropped_since_last_consume,
-            };
-
-            // Check if the last event is already a BufferOverflow -- if so,
-            // update it instead of adding another one.
-            if let Some(ContextEvent::BufferOverflow { .. }) = self.events.back() {
-                // Replace the existing overflow event with updated count.
-                self.events.pop_back();
-                self.events.push_back(overflow_event);
-            } else {
-                // Need to make room: drop another oldest if we're at capacity.
-                if self.events.len() >= self.capacity {
-                    self.events.pop_front();
-                    self.dropped_since_last_consume += 1;
-                    // Update overflow event with new count.
-                    let updated = ContextEvent::BufferOverflow {
-                        dropped_count: self.dropped_since_last_consume,
-                    };
-                    self.events.push_back(updated);
-                } else {
-                    self.events.push_back(overflow_event);
-                }
+            // Update the existing overflow marker's count in place.
+            if let Some(ContextEvent::BufferOverflow { dropped_count }) =
+                self.events.back_mut()
+            {
+                *dropped_count = self.dropped_since_last_consume;
             }
-        }
 
-        // Now push the actual event.
-        if self.events.len() < self.capacity {
+            // Push the new event.
+            self.events.push_back(event);
+        } else {
+            // No existing overflow marker. We need two slots: one for the
+            // overflow marker and one for the new event. Drop two oldest.
+            self.events.pop_front();
+            self.dropped_since_last_consume += 1;
+            self.events.pop_front();
+            self.dropped_since_last_consume += 1;
+
+            // Push the overflow marker and the new event.
+            self.events.push_back(ContextEvent::BufferOverflow {
+                dropped_count: self.dropped_since_last_consume,
+            });
             self.events.push_back(event);
         }
+
+        // Return the overflow indicator.
+        Some(ContextEvent::BufferOverflow {
+            dropped_count: self.dropped_since_last_consume,
+        })
     }
 
     /// Consumes and returns the oldest event from the buffer.
