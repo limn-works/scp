@@ -307,6 +307,10 @@ impl ContextManager {
 
     /// Removes a member from a context.
     ///
+    /// Authorization: the caller must either be removing themselves
+    /// (`caller_did == member_did`, self-removal) or hold the `MemberRemove`
+    /// capability. Self-removal is always permitted regardless of role.
+    ///
     /// Removes from MLS group (ADR-001), removes sender keys, and appends
     /// a `MemberLeft` event. If the member count reaches zero, transitions
     /// the context to `Closing`.
@@ -317,16 +321,37 @@ impl ContextManager {
     ///
     /// Returns [`ContextError`] if:
     /// - The context is not in `Active` state.
+    /// - The caller is neither the member being removed nor holds `MemberRemove`.
     /// - The member is not found.
     /// - Any crypto or event log operation fails.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn leave_context(
         &self,
         handle: &ContextHandle,
+        caller_did: &DID,
         member_did: &DID,
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
+
+        // Authorization check: self-removal is always allowed; otherwise
+        // the caller must hold MemberRemove capability.
+        if caller_did != member_did {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(&context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            if !ctx
+                .role_state
+                .member_has_capability(caller_did, &Capability::MemberRemove)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {caller_did} cannot remove {member_did}: \
+                     requires self-removal or member:remove capability"
+                )));
+            }
+            drop(contexts);
+        }
 
         // Crypto operations -- no lock held.
         self.crypto.remove_member(&context_id_bytes, member_did)?;
@@ -1147,9 +1172,9 @@ mod tests {
     async fn leave_removes_member_and_transitions_to_closing_when_empty() {
         let (manager, handle) = setup_active_context().await;
 
-        // Remove the only member (creator).
+        // Remove the only member (creator -- self-removal).
         let result = manager
-            .leave_context(&handle, &"did:key:creator".into())
+            .leave_context(&handle, &"did:key:creator".into(), &"did:key:creator".into())
             .await;
         assert!(result.is_ok());
 
@@ -1180,9 +1205,11 @@ mod tests {
         manager.join_context(&handle, kp).await.unwrap();
         assert_eq!(manager.member_count("test-ctx").await, Some(2));
 
-        // Remove bob.
+        // Remove bob (self-removal).
         manager.drain_events("test-ctx").await; // Clear join event.
-        let result = manager.leave_context(&handle, &"did:key:bob".into()).await;
+        let result = manager
+            .leave_context(&handle, &"did:key:bob".into(), &"did:key:bob".into())
+            .await;
         assert!(result.is_ok());
 
         // Context should still be Active (creator is still there).
@@ -1197,13 +1224,139 @@ mod tests {
         handle.transition_to(&ContextState::Closing).await.unwrap();
 
         let result = manager
-            .leave_context(&handle, &"did:key:creator".into())
+            .leave_context(&handle, &"did:key:creator".into(), &"did:key:creator".into())
             .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             ContextError::ContextNotActive
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Leave context authorization tests (SCP-167)
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates a context whose ceiling includes `member:remove` so
+    /// that the admin can remove other members. Adds an observer member
+    /// (`did:key:observer`) alongside the admin creator (`did:key:creator`).
+    async fn setup_context_with_member_remove() -> (ContextManager, ContextHandle) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("member:remove"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("auth-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add an observer member.
+        let kp = KeyPackage {
+            owner_did: "did:key:observer".into(),
+        };
+        manager.join_context(&handle, kp).await.unwrap();
+
+        // Reassign to observer role (joined members default to "member").
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("auth-ctx").unwrap();
+            roles::assign_role(
+                &mut ctx.role_state,
+                "did:key:observer",
+                "observer",
+                "did:key:creator",
+            )
+            .unwrap();
+            // Update the membership tracking to reflect the new role.
+            if let Some(info) = ctx.membership.get_mut("did:key:observer") {
+                info.role_name = "observer".into();
+            }
+        }
+
+        (manager, handle)
+    }
+
+    /// SCP-167: observer calls leave_context with admin's DID — returns
+    /// authorization error.
+    #[tokio::test]
+    async fn leave_observer_cannot_remove_admin() {
+        let (manager, handle) = setup_context_with_member_remove().await;
+
+        // Observer tries to remove the admin — should fail.
+        let result = manager
+            .leave_context(
+                &handle,
+                &"did:key:observer".into(),
+                &"did:key:creator".into(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(_)),
+            "observer should not be able to remove admin"
+        );
+
+        // Admin should still be a member.
+        assert!(manager.is_member("auth-ctx", "did:key:creator").await);
+    }
+
+    /// SCP-167: admin calls leave_context with observer's DID — succeeds
+    /// (admin has `MemberRemove` capability).
+    #[tokio::test]
+    async fn leave_admin_can_remove_observer() {
+        let (manager, handle) = setup_context_with_member_remove().await;
+
+        // Admin removes the observer — should succeed.
+        let result = manager
+            .leave_context(
+                &handle,
+                &"did:key:creator".into(),
+                &"did:key:observer".into(),
+            )
+            .await;
+
+        assert!(result.is_ok(), "admin should be able to remove observer");
+
+        // Observer should no longer be a member.
+        assert!(!manager.is_member("auth-ctx", "did:key:observer").await);
+        // Admin should still be a member.
+        assert!(manager.is_member("auth-ctx", "did:key:creator").await);
+    }
+
+    /// SCP-167: member calls leave_context with own DID — succeeds
+    /// (self-removal is always allowed regardless of role).
+    #[tokio::test]
+    async fn leave_self_removal_always_allowed() {
+        let (manager, handle) = setup_context_with_member_remove().await;
+
+        // Observer self-removes — should always succeed.
+        let result = manager
+            .leave_context(
+                &handle,
+                &"did:key:observer".into(),
+                &"did:key:observer".into(),
+            )
+            .await;
+
+        assert!(result.is_ok(), "self-removal should always be allowed");
+
+        // Observer should no longer be a member.
+        assert!(!manager.is_member("auth-ctx", "did:key:observer").await);
+        // Admin should still be a member.
+        assert!(manager.is_member("auth-ctx", "did:key:creator").await);
     }
 
     // -----------------------------------------------------------------------
