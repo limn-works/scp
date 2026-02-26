@@ -137,7 +137,7 @@
       "gate": "gate-sec-critical",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/close.rs"
       ],
@@ -167,7 +167,8 @@
         "currentOrdering": "1. Destroy keys 2. Validate state transition 3. Emit event",
         "correctOrdering": "1. Validate state transition 2. Destroy keys 3. Emit event",
         "irreversibility": "Key destruction is irreversible — once zeroized, encrypted content becomes permanently unreadable."
-      }
+      },
+      "result": "Reordered finalize_close: validate state before key destruction. 2 tests added."
     },
     {
       "id": "SCP-165",
@@ -175,7 +176,7 @@
       "gate": "gate-sec-critical",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/encrypt.rs",
         "crates/scp-core/src/crypto/mls/error.rs",
@@ -203,7 +204,8 @@
       ],
       "details": {
         "attackVector": "Malicious relay sends crafted ciphertext that crashes client process via panic, achieving denial of service."
-      }
+      },
+      "result": "Wrapped process_message in catch_unwind, converted #[should_panic] test. 2 tests added."
     },
     {
       "id": "SCP-166",
@@ -252,7 +254,7 @@
       "gate": "gate-sec-critical",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/membership.rs"
@@ -284,7 +286,8 @@
       ],
       "details": {
         "attackScenario": "Observer calls leave_context with admin's DID. Admin removed. In bilateral context, this destroys the context."
-      }
+      },
+      "result": "Auth logic already correct; added 3 authorization scenario tests."
     },
     {
       "id": "SCP-168",
@@ -459,7 +462,7 @@
       "gate": "gate-sec-critical",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/manager.rs",
         "crates/scp-transport/src/scoring.rs",
@@ -496,7 +499,8 @@
         "partiallyFixed": "Issue #21 checkpoint signature verification already implemented via commit fbc2256 in PR #8. Only selective suppression and delivery channel circularity remain unfixed. Do not re-implement checkpoint signatures.",
         "attackMechanism": "A relay that artificially fills a target's channel buffer causes selective message drops.",
         "wiringLocation": "Integration point is TransportManager.subscribe_context — SuppressionTracker.record_delivery() must be called from subscription delivery paths."
-      }
+      },
+      "result": "Wired record_delivery in MergedStream, periodic check_suppressions, SuppressionDetected event, LRU bounded tracker, try_send failure tracking. 6 tests added."
     },
     {
       "id": "SCP-173",
@@ -504,7 +508,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/validate.rs"
       ],
@@ -530,7 +534,8 @@
       "details": {
         "statelessSkips": "Steps 3 (chain), 7 (attenuation), 9 (nonce), 10 (revocation)",
         "clockFallback": "Duration::ZERO bypasses all nbf/exp checks"
-      }
+      },
+      "result": "Already implemented: pub(crate) visibility, ClockError variant, 4 tests."
     },
     {
       "id": "SCP-174",
@@ -538,7 +543,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/envelope/inner.rs"
       ],
@@ -562,7 +567,8 @@
       ],
       "details": {
         "crossProtocolRisk": "Ed25519 keys reused across signing contexts — envelope, UCAN, DID auth. Without domain separator, signature from one context could be valid in another."
-      }
+      },
+      "result": "Already implemented: DOMAIN_SEPARATOR constant, prepended in compute_canonical_hash, test."
     },
     {
       "id": "SCP-175",
@@ -603,7 +609,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/dht.rs"
       ],
@@ -623,7 +629,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/42"
       ],
-      "details": {}
+      "details": {},
+      "result": "Already implemented: Acquire/Release/AcqRel ordering, concurrent monotonicity test."
     },
     {
       "id": "SCP-177",
