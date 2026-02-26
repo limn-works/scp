@@ -43,11 +43,15 @@ pub mod capability;
 pub mod mint;
 pub mod nonce;
 pub mod revoke;
+pub mod spending;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
 
 pub use capability::CapabilityUri;
+pub use spending::{
+    Amount, BudgetTracker, CurrencyCode, SpendingCapability, SpendingError, SpendingScope,
+};
 
 // ---------------------------------------------------------------------------
 // UcanError
