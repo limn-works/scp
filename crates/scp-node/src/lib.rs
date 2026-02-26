@@ -369,8 +369,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
     /// 1. Validates required fields (domain, identity source).
     /// 2. Initializes storage (uses provided or creates default).
     /// 3. Loads or generates identity.
-    /// 4. Starts relay server.
-    /// 5. Publishes DID document with `SCPRelay` entry.
+    /// 4. Adds `SCPRelay` service entry to the DID document.
+    /// 5. Starts relay server (must be listening before publication).
+    /// 6. Publishes DID document to the DHT.
     ///
     /// DID publication happens once on `.build()`, not continuously
     /// (spec section 18.6.4).
@@ -408,11 +409,11 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             }
         };
 
-        // 4. Add SCPRelay entry and publish DID document.
+        // 4. Add SCPRelay service entry to the DID document (local-only, no network).
         document.add_relay_service(&relay_url)?;
-        did_method.publish(&identity, &document).await?;
 
-        // 5. Start relay server.
+        // 5. Start relay server — must be listening before we publish the DID
+        //    so that clients resolving the DID can immediately connect.
         let bind_addr = self
             .bind_addr
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
@@ -425,6 +426,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
         let blob_storage = InMemoryBlobStorage::new();
         let relay_server = RelayServer::new(relay_config, blob_storage);
         let bound_addr = relay_server.start().await?;
+
+        // 6. Publish DID document now that the relay is confirmed listening.
+        did_method.publish(&identity, &document).await?;
 
         tracing::info!(
             domain = %domain,
@@ -860,6 +864,100 @@ mod tests {
             connect_result.is_ok(),
             "relay should accept connections from any SCP client, got error: {:?}",
             connect_result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_listening_before_did_publish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Create a DID method that verifies the relay is listening when
+        // publish() is called.
+        struct RelayCheckDidMethod {
+            inner: TestDidDht,
+            relay_was_listening_at_publish: Arc<AtomicBool>,
+            bind_addr: SocketAddr,
+        }
+
+        impl DidMethod for RelayCheckDidMethod {
+            fn create(
+                &self,
+                key_custody: &impl KeyCustody,
+            ) -> impl std::future::Future<
+                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+            > + Send {
+                self.inner.create(key_custody)
+            }
+
+            fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
+                self.inner.verify(did_string, public_key)
+            }
+
+            fn publish(
+                &self,
+                identity: &ScpIdentity,
+                document: &DidDocument,
+            ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+                // Probe the relay bind address to see if it's listening.
+                let addr = self.bind_addr;
+                let flag = Arc::clone(&self.relay_was_listening_at_publish);
+                let inner = &self.inner;
+                async move {
+                    // Attempt a TCP connection to the relay's bound port.
+                    if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    inner.publish(identity, document).await
+                }
+            }
+
+            fn resolve(
+                &self,
+                did_string: &str,
+            ) -> impl std::future::Future<Output = Result<DidDocument, IdentityError>> + Send
+            {
+                self.inner.resolve(did_string)
+            }
+
+            fn rotate(
+                &self,
+                identity: &ScpIdentity,
+                key_custody: &impl KeyCustody,
+            ) -> impl std::future::Future<
+                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+            > + Send {
+                self.inner.rotate(identity, key_custody)
+            }
+        }
+
+        // We need to know the bind address ahead of time so the DID method
+        // can probe it.  Bind to port 0 and let the OS pick a port — but the
+        // relay picks the port, so we pre-bind a listener, record its address,
+        // then drop it and hand the same address to the builder.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = listener.local_addr().unwrap();
+        drop(listener); // free the port for the relay
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let relay_was_listening = Arc::new(AtomicBool::new(false));
+
+        let check_method = Arc::new(RelayCheckDidMethod {
+            inner: make_test_dht(&custody),
+            relay_was_listening_at_publish: Arc::clone(&relay_was_listening),
+            bind_addr,
+        });
+
+        let _node = ApplicationNodeBuilder::new()
+            .domain("relay-order.example.com")
+            .generate_identity_with(custody, check_method)
+            .bind_addr(bind_addr)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            relay_was_listening.load(Ordering::SeqCst),
+            "relay must be listening BEFORE DID document is published"
         );
     }
 
