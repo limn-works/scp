@@ -42,13 +42,22 @@ pub struct ScpCredential {
 impl ScpCredential {
     /// Creates a new SCP credential with the given DID and optional UCAN token.
     ///
+    /// The DID must be a valid `did:dht` identifier starting with `"did:dht:z"`.
+    ///
     /// # Arguments
     ///
-    /// * `did` - The participant's `did:dht` identifier.
+    /// * `did` - The participant's `did:dht` identifier (must start with `"did:dht:z"`).
     /// * `ucan_token` - An optional UCAN authorization token.
-    #[must_use]
-    pub const fn new(did: String, ucan_token: Option<String>) -> Self {
-        Self { did, ucan_token }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::InvalidDidFormat`] if the DID does not start with
+    /// `"did:dht:z"`.
+    pub fn new(did: String, ucan_token: Option<String>) -> Result<Self, MlsError> {
+        if !did.starts_with("did:dht:z") {
+            return Err(MlsError::InvalidDidFormat(did));
+        }
+        Ok(Self { did, ucan_token })
     }
 
     /// Serializes this credential to `MessagePack` bytes.
@@ -91,7 +100,8 @@ mod tests {
         let cred = ScpCredential::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
             Some("eyJhbGciOiJFZERTQSJ9.test-ucan-token".to_string()),
-        );
+        )
+        .unwrap();
         let bytes = cred.to_bytes().unwrap();
         let decoded = ScpCredential::from_bytes(&bytes).unwrap();
         assert_eq!(cred, decoded);
@@ -103,7 +113,8 @@ mod tests {
         let cred = ScpCredential::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
             None,
-        );
+        )
+        .unwrap();
         let bytes = cred.to_bytes().unwrap();
         let decoded = ScpCredential::from_bytes(&bytes).unwrap();
         assert_eq!(cred, decoded);
@@ -112,6 +123,38 @@ mod tests {
     #[test]
     fn credential_from_invalid_bytes_returns_error() {
         let result = ScpCredential::from_bytes(&[0xff, 0xfe, 0xfd]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn new_accepts_valid_did() {
+        let cred = ScpCredential::new(
+            "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cred.did,
+            "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+        );
+    }
+
+    #[test]
+    fn new_rejects_empty_did() {
+        let result = ScpCredential::new(String::new(), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_wrong_method() {
+        let result = ScpCredential::new("did:key:z6MkSomething".to_string(), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_missing_z_prefix() {
+        let result = ScpCredential::new("did:dht:abc123".to_string(), None);
         assert!(result.is_err());
     }
 }

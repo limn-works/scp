@@ -56,7 +56,7 @@ pub struct KeyPackageEntry {
 /// # Usage
 ///
 /// ```rust,ignore
-/// let cred = ScpCredential::new("did:dht:z6MkAlice".to_string(), None);
+/// let cred = ScpCredential::new("did:dht:z6MkAlice".to_string(), None)?;
 /// let mut buffer = KeyPackageBuffer::new(cred, 10, 5)?;
 ///
 /// // Take a key package to give to someone who wants to add us.
@@ -188,8 +188,9 @@ mod tests {
     use super::*;
     use crate::crypto::mls::group::SCP_CIPHERSUITE;
 
+    #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(format!("did:dht:z6Mk{name}"), None)
+        ScpCredential::new(format!("did:dht:z6Mk{name}"), None).unwrap()
     }
 
     #[test]

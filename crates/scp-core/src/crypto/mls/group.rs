@@ -525,8 +525,9 @@ pub fn join_group(
 mod tests {
     use super::*;
 
+    #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(format!("did:dht:z6Mk{name}"), None)
+        ScpCredential::new(format!("did:dht:z6Mk{name}"), None).unwrap()
     }
 
     #[test]

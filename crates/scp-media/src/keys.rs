@@ -253,8 +253,9 @@ mod tests {
         add_member, create_group, destroy_group, generate_key_package, join_group, remove_member,
     };
 
+    #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(format!("did:dht:z6Mk{name}"), None)
+        ScpCredential::new(format!("did:dht:z6Mk{name}"), None).unwrap()
     }
 
     const TEST_KEY_LENGTH: usize = 32;

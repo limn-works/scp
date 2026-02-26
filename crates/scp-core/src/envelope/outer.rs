@@ -408,8 +408,9 @@ mod seal_open_tests {
     use crate::envelope::inner::{Provenance, create_inner_envelope};
     use crate::envelope::padding::strip_padding;
 
+    #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(format!("did:dht:z6Mk{name}"), None)
+        ScpCredential::new(format!("did:dht:z6Mk{name}"), None).unwrap()
     }
 
     /// Sets up Alice and Bob in a shared MLS group.

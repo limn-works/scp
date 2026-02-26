@@ -199,7 +199,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 3: Alice creates an MLS group (ADR-001)
     // ---------------------------------------------------------------
-    let alice_cred = ScpCredential::new(alice_id.did.clone(), None);
+    let alice_cred = ScpCredential::new(alice_id.did.clone(), None).unwrap();
     let mut alice_group = create_group(&alice_cred).unwrap();
 
     // ---------------------------------------------------------------
@@ -228,7 +228,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 5: Bob publishes key packages (ADR-001)
     // ---------------------------------------------------------------
-    let bob_cred = ScpCredential::new(bob_id.did.clone(), None);
+    let bob_cred = ScpCredential::new(bob_id.did.clone(), None).unwrap();
     let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
 
     // ---------------------------------------------------------------
