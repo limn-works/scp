@@ -196,6 +196,17 @@ pub enum ContextEvent {
         /// The message payload (encrypted in production; plaintext for tests).
         payload: Vec<u8>,
     },
+    /// The context is being closed by a participant or governance action.
+    ///
+    /// Replaces the former sentinel DID string `"__close_notification:<did>"`.
+    SystemClose {
+        /// The DID of the participant who initiated the close, if any.
+        initiator_did: DID,
+    },
+    /// The context expired due to TTL.
+    ///
+    /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.
+    Expired,
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
     /// Emitted when the buffer is full and the oldest event is dropped.
@@ -662,5 +673,90 @@ mod tests {
     fn receive_buffer_default_capacity() {
         let buffer = ReceiveBuffer::default();
         assert_eq!(buffer.capacity(), DEFAULT_BUFFER_CAPACITY);
+    }
+
+    // -----------------------------------------------------------------------
+    // SystemClose / Expired variant tests (SCP-203)
+    // -----------------------------------------------------------------------
+
+    /// SCP-203: `SystemClose` variant carries the initiator DID.
+    #[test]
+    fn system_close_event_carries_initiator_did() {
+        let event = ContextEvent::SystemClose {
+            initiator_did: "did:key:admin".into(),
+        };
+
+        match &event {
+            ContextEvent::SystemClose { initiator_did } => {
+                assert_eq!(initiator_did, "did:key:admin");
+            }
+            _ => panic!("expected SystemClose variant"),
+        }
+    }
+
+    /// SCP-203: `Expired` variant is a unit variant (no sentinel DID).
+    #[test]
+    fn expired_event_is_unit_variant() {
+        let event = ContextEvent::Expired;
+        assert_eq!(event, ContextEvent::Expired);
+    }
+
+    /// SCP-203: `SystemClose` and `Expired` implement `Eq` / `Clone`.
+    #[test]
+    fn close_and_expiry_events_are_eq_and_clone() {
+        let close = ContextEvent::SystemClose {
+            initiator_did: "did:key:alice".into(),
+        };
+        let close2 = close.clone();
+        assert_eq!(close, close2);
+
+        let expired = ContextEvent::Expired;
+        let expired2 = expired.clone();
+        assert_eq!(expired, expired2);
+    }
+
+    /// SCP-203: `SystemClose` is distinct from `MemberLeft`.
+    #[test]
+    fn system_close_is_not_member_left() {
+        let close = ContextEvent::SystemClose {
+            initiator_did: "did:key:alice".into(),
+        };
+        let left = ContextEvent::MemberLeft {
+            member_did: "did:key:alice".into(),
+        };
+        assert_ne!(close, left);
+    }
+
+    /// SCP-203: `Expired` is distinct from `MemberLeft`.
+    #[test]
+    fn expired_is_not_member_left() {
+        let expired = ContextEvent::Expired;
+        let left = ContextEvent::MemberLeft {
+            member_did: "__ttl_expiry_notification".into(),
+        };
+        assert_ne!(expired, left);
+    }
+
+    /// SCP-203: Buffer can hold `SystemClose` and `Expired` events.
+    #[test]
+    fn buffer_holds_close_and_expiry_events() {
+        let mut buffer = ReceiveBuffer::new();
+        buffer.push(ContextEvent::SystemClose {
+            initiator_did: "did:key:admin".into(),
+        });
+        buffer.push(ContextEvent::Expired);
+
+        assert_eq!(buffer.len(), 2);
+
+        let first = buffer.pop().unwrap();
+        assert_eq!(
+            first,
+            ContextEvent::SystemClose {
+                initiator_did: "did:key:admin".into(),
+            }
+        );
+
+        let second = buffer.pop().unwrap();
+        assert_eq!(second, ContextEvent::Expired);
     }
 }

@@ -754,20 +754,18 @@ impl TtlExtension {
 // ContextEvent variants for close/expiry notifications
 // ---------------------------------------------------------------------------
 
-/// Creates a `ContextClosing` notification event.
+/// Creates a `SystemClose` notification event.
 #[must_use]
 pub fn closing_notification(initiator_did: &DID) -> ContextEvent {
-    ContextEvent::MemberLeft {
-        member_did: format!("__close_notification:{initiator_did}").into(),
+    ContextEvent::SystemClose {
+        initiator_did: initiator_did.clone(),
     }
 }
 
 /// Creates a `ContextExpired` notification event.
 #[must_use]
-pub fn expiry_notification() -> ContextEvent {
-    ContextEvent::MemberLeft {
-        member_did: "__ttl_expiry_notification".into(),
-    }
+pub const fn expiry_notification() -> ContextEvent {
+    ContextEvent::Expired
 }
 
 // ---------------------------------------------------------------------------
@@ -1688,5 +1686,48 @@ mod tests {
         assert!(enforcer.check(&clock).is_ok());
         clock.set(9200);
         assert!(enforcer.check(&clock).is_err());
+    }
+
+    // SCP-203 tests: closing/expiry notifications use proper ContextEvent variants
+
+    /// SCP-203: `closing_notification` returns `SystemClose` (not `MemberLeft`
+    /// with a sentinel DID).
+    #[test]
+    fn closing_notification_returns_system_close_variant() {
+        let event = closing_notification(&"did:key:admin".into());
+        match event {
+            ContextEvent::SystemClose { initiator_did } => {
+                assert_eq!(initiator_did, "did:key:admin");
+            }
+            _ => panic!("expected SystemClose, got {event:?}"),
+        }
+    }
+
+    /// SCP-203: `expiry_notification` returns `Expired` (not `MemberLeft` with
+    /// a sentinel DID).
+    #[test]
+    fn expiry_notification_returns_expired_variant() {
+        let event = expiry_notification();
+        assert_eq!(event, ContextEvent::Expired);
+    }
+
+    /// SCP-203: closing notification no longer uses sentinel DID strings.
+    #[test]
+    fn closing_notification_is_not_member_left() {
+        let event = closing_notification(&"did:key:alice".into());
+        assert!(
+            !matches!(event, ContextEvent::MemberLeft { .. }),
+            "closing notification must not use MemberLeft variant"
+        );
+    }
+
+    /// SCP-203: expiry notification no longer uses sentinel DID strings.
+    #[test]
+    fn expiry_notification_is_not_member_left() {
+        let event = expiry_notification();
+        assert!(
+            !matches!(event, ContextEvent::MemberLeft { .. }),
+            "expiry notification must not use MemberLeft variant"
+        );
     }
 }

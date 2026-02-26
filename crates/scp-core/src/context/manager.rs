@@ -586,8 +586,8 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
                 ctx.ttl_timer.cancel();
-                ctx.receive_buffer.push(ContextEvent::MemberLeft {
-                    member_did: format!("__close_notification:{initiator_did}").into(),
+                ctx.receive_buffer.push(ContextEvent::SystemClose {
+                    initiator_did: initiator_did.clone(),
                 });
             }
         }
@@ -639,9 +639,7 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
-                ctx.receive_buffer.push(ContextEvent::MemberLeft {
-                    member_did: "__ttl_expiry_notification".into(),
-                });
+                ctx.receive_buffer.push(ContextEvent::Expired);
             }
         }
 
