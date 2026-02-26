@@ -1,7 +1,7 @@
 # Loom Status
 
 ## Failing Tests
-None. All 1,978 workspace tests pass (1,496 scp-core + 158 scp-mcp + 64 scp-node [was 10 lib + doc] + 10 scp-media + 44 scp-platform + 195 scp-transport + others).
+None. All 1,977 workspace tests pass (1,497 scp-core including 1 new phase2_integration + 158 scp-mcp + 64 scp-node + 10 scp-media + 44 scp-platform + 195 scp-transport + others). Python SDK smoke tests pass.
 
 ## Uncommitted Changes
 None. All changes committed.
@@ -10,17 +10,26 @@ None. All changes committed.
 No previously-failing tests.
 
 ## Tests Added / Updated
-- `crates/scp-transport/src/native/server.rs`: 3 new shutdown lifecycle tests (shutdown_does_not_panic, shutdown_stops_accepting_connections, in_flight_connection_survives_shutdown).
-- `crates/scp-node/src/lib.rs`: Replaced 2 runtime validation tests (build_requires_domain, build_requires_identity_source) with 2 type-state compile-pass tests (type_state_builder_compiles_with_all_required_fields, type_state_optional_fields_at_any_point).
+- `crates/scp-core/tests/phase2_integration.rs`: New Phase 2 end-to-end integration test exercising 12-step scenario (identity, context lifecycle, UCAN roles, tool invocation, event log, checkpoints, TTL expiry, multi-relay transport simulation).
+- `bindings/python/tests/test_types.py`: New Python SDK unit tests for dataclasses, exception hierarchy, and shared types (51 tests).
 
 ## Tool-Gated Stories
 None.
 
 ## Subagent Outcomes
-Subagents were launched with worktree isolation but their branches did not contain commits (worktree cleanup issue). Both stories were implemented directly in the main working tree.
+All three subagents committed directly to the main branch (worktree isolation commits to current branch, no separate branch merging needed).
 
-1. **SCP-208** (Add relay graceful shutdown handle) — **DONE**. ShutdownHandle wrapping CancellationToken. start() returns (ShutdownHandle, SocketAddr). Accept loop and TTL expiry task use biased select! on cancellation token. In-flight connections drain naturally. RelayHandle in scp-node stores ShutdownHandle. ApplicationNode exposes shutdown() convenience method. All callers updated (server.rs, client.rs, phase1.rs, lib.rs). 3 lifecycle tests added.
-2. **SCP-209** (Type-state builder for ApplicationNode) — **DONE**. Added NoDomain/HasDomain and NoIdentity/HasIdentity marker types with PhantomData. domain() transitions NoDomain→HasDomain. identity()/generate_identity_with() transition NoIdentity→HasIdentity. build() restricted to HasDomain+HasIdentity. Optional setters generic over Dom and Id. 2 compile-pass tests replace 2 runtime tests.
+1. **SCP-035** (Phase 2 integration test) — **DONE**. Created `crates/scp-core/tests/phase2_integration.rs` with full 12-step scenario matching `.docs/adrs/phase-2.md`. Tests identity creation, context lifecycle with ContextParams (ceiling, roles, tools, TTL, ephemeral scope), UCAN role assignment and enforcement, tool invocation with schema validation, event logging in Merkle tree, consistency checkpoint comparison, TTL expiry with key destruction, and simulated multi-relay transport via mpsc channels.
+
+2. **SCP-037** (PyO3 error mapping and type conversion) — **DONE**. Created `crates/scp-ffi/src/error.rs` with `ScpPyError` enum (6 variants), Python exception hierarchy rooted at `ScpError` via `create_exception!`, `From<ScpPyError> for PyErr`, and `From` impls for all 18 scp-core/scp-transport error types with actionable messages. Created `crates/scp-ffi/src/types.rs` with bidirectional `py_dict_to_json`/`json_to_py_dict` conversion handling all JSON-compatible Python types.
+
+3. **SCP-044** (Python SDK dataclasses and exception hierarchy) — **DONE**. Created `bindings/python/scp_sdk/` package with `errors.py` (ScpError + 7 subclasses, UcanPermissionError avoids shadowing builtins, BRIDGE_ERROR_MAP), `tools.py` (ToolDefinition, TestVector dataclasses), `types.py` (Message, Provenance, Capability dataclasses, MemoryScope/SourceType/DiscoveryMethod enums), and `__init__.py` re-exports.
 
 ## Remaining Stories
-No actionable stories remain in the PRD. All stories are done or cancelled.
+Next unblocked stories after this iteration:
+- **SCP-038** (PyO3 identity bridge) — blocked by SCP-037 (now done) → UNBLOCKED
+- **SCP-039** (PyO3 context bridge) — blocked by SCP-037 (now done) → UNBLOCKED
+- **SCP-040** (PyO3 tool/transport/UCAN/event_log bridge) — blocked by SCP-037 (now done) → UNBLOCKED
+- **SCP-042** (Python SDK Identity class) — blocked by SCP-038
+- **SCP-043** (Python SDK Context class) — blocked by SCP-039
+- **SCP-045** (Python SDK EventLog/transport/trust) — blocked by SCP-040
