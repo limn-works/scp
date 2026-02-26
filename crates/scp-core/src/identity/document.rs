@@ -20,6 +20,36 @@
 use super::IdentityError;
 use serde::{Deserialize, Serialize};
 
+/// Custom serde module for `[u8; 64]` fields.
+///
+/// Serde does not natively support arrays larger than 32 elements. This module
+/// serializes `[u8; 64]` via `Vec<u8>` (leveraging `serde_bytes` for compact
+/// binary representation) and validates the exact length on deserialization,
+/// rejecting anything other than exactly 64 bytes.
+mod serde_signature_64 {
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!(
+                "expected 64-byte signature, got {} bytes",
+                v.len()
+            ))
+        })
+    }
+}
+
 /// A W3C DID Document for an SCP identity.
 ///
 /// Contains verification methods, authentication references, assertion method
@@ -390,9 +420,9 @@ pub struct DidRotationEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MigrationProof {
     /// Ed25519 signature of `SHA-256(old_did || new_did || rotated_at)`
-    /// signed by the old Identity Key.
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
+    /// signed by the old Identity Key. Must be exactly 64 bytes (Ed25519).
+    #[serde(with = "serde_signature_64")]
+    pub signature: [u8; 64],
     /// The old Identity Key's public bytes, for verification without resolving
     /// the old DID document.
     pub old_public_key: [u8; 32],
@@ -791,5 +821,65 @@ mod tests {
         let urls = doc.relay_service_urls();
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0], "wss://existing.example.com/scp/v1");
+    }
+
+    // --- MigrationProof.signature [u8; 64] tests (SCP-202) ---
+
+    /// Helper: build a JSON object for `MigrationProof` with a signature of
+    /// the given length. The `old_public_key` is always a valid 32-byte array.
+    fn migration_proof_json_with_sig_len(len: usize) -> String {
+        let sig_array: Vec<String> = (0..len).map(|i| ((i % 256) as u8).to_string()).collect();
+        let pk_array: Vec<String> = (0..32).map(|_| "1".to_owned()).collect();
+        format!(
+            r#"{{"signature":[{}],"old_public_key":[{}]}}"#,
+            sig_array.join(","),
+            pk_array.join(",")
+        )
+    }
+
+    #[test]
+    fn migration_proof_64_byte_signature_accepted() {
+        let json = migration_proof_json_with_sig_len(64);
+        let proof: MigrationProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(proof.signature.len(), 64);
+        // Verify the bytes are correct.
+        for (i, &b) in proof.signature.iter().enumerate() {
+            assert_eq!(b, (i % 256) as u8);
+        }
+    }
+
+    #[test]
+    fn migration_proof_63_byte_signature_rejected() {
+        let json = migration_proof_json_with_sig_len(63);
+        let result = serde_json::from_str::<MigrationProof>(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("64-byte"),
+            "error should mention 64-byte, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn migration_proof_65_byte_signature_rejected() {
+        let json = migration_proof_json_with_sig_len(65);
+        let result = serde_json::from_str::<MigrationProof>(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("64-byte"),
+            "error should mention 64-byte, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn migration_proof_signature_json_roundtrip() {
+        let proof = MigrationProof {
+            signature: [0xAA; 64],
+            old_public_key: [0xBB; 32],
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        let parsed: MigrationProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(proof, parsed);
     }
 }
