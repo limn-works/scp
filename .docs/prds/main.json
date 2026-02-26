@@ -2511,7 +2511,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/_scp_core.pyi"
       ],
@@ -2539,7 +2539,8 @@
           "section": "## ADR-013: PyO3 Bridge Layer"
         }
       ],
-      "details": {}
+      "details": {},
+      "result": "Implemented in iteration 3"
     },
     {
       "id": "SCP-042",
@@ -2547,7 +2548,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/identity.py",
         "bindings/python/scp_sdk/sync.py"
@@ -2584,7 +2585,8 @@
       ],
       "details": {
         "sync_helper": "import asyncio\nimport threading\n\n_sync_loop: asyncio.AbstractEventLoop | None = None\n_sync_loop_lock = threading.Lock()\n\ndef _get_sync_loop() -> asyncio.AbstractEventLoop:\n    global _sync_loop\n    if _sync_loop is None or _sync_loop.is_closed():\n        with _sync_loop_lock:\n            if _sync_loop is None or _sync_loop.is_closed():\n                _sync_loop = asyncio.new_event_loop()\n                t = threading.Thread(target=_sync_loop.run_forever, daemon=True)\n                t.start()\n    return _sync_loop\n\ndef run_sync(coro):\n    loop = _get_sync_loop()\n    future = asyncio.run_coroutine_threadsafe(coro, loop)\n    return future.result()"
-      }
+      },
+      "result": "Implemented in iteration 3"
     },
     {
       "id": "SCP-043",
@@ -2592,7 +2594,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/context.py"
       ],
@@ -2639,7 +2641,8 @@
           "section": "### Receive stream buffer tests"
         }
       ],
-      "details": {}
+      "details": {},
+      "result": "Implemented in iteration 3"
     },
     {
       "id": "SCP-044",
@@ -2696,7 +2699,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/event_log.py",
         "bindings/python/scp_sdk/transport.py",
@@ -2731,7 +2734,8 @@
       ],
       "details": {
         "event_log_api": "class EventLog:\n    async def query(self, filter=None, since=None, actor=None, event_type=None) -> list[Event]: ...\n    async def verify(self, claim: dict) -> Proof: ...\n    async def checkpoint(self) -> Checkpoint: ..."
-      }
+      },
+      "result": "Implemented in iteration 3"
     },
     {
       "id": "SCP-046",
@@ -3254,7 +3258,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/ucan.py"
       ],
@@ -3288,7 +3292,8 @@
       ],
       "details": {
         "python_usage": "from scp_sdk.ucan import validate, mint, revoke\n\ntoken = await mint(\n    issuer=my_identity,\n    audience=agent_did,\n    capabilities=[\"messages:write\", \"tool_invoke:assistant\"],\n    context=my_context,\n    expiry=3600,\n)\n\nawait validate(\n    context=my_context,\n    token=token,\n    capability=\"messages:write\",\n)\n\nawait revoke(context=my_context, token=token)\n\n# Implicit validation:\nawait context.send(\"hello\")  # Internally calls validate() before sending"
-      }
+      },
+      "result": "Implemented in iteration 3"
     },
     {
       "id": "SCP-058",
