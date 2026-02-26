@@ -21,7 +21,6 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
-
 use super::credential::ScpCredential;
 use super::error::MlsError;
 use super::storage::ScpMlsProvider;
