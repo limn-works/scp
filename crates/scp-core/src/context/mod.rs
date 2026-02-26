@@ -28,6 +28,7 @@
 
 pub mod builder;
 pub mod close;
+pub mod governance;
 pub mod manager;
 pub mod membership;
 pub mod memory_scope;
@@ -103,6 +104,13 @@ pub use memory_scope::{
     DeletionResponseStatus, KeyDestructionAttestation, KeyDestructionLevel,
     KeyDestructionOrchestrator, RelayDeletionRequest, RelayDeletionTracker,
     validate_memory_scope_for_broadcast,
+};
+
+// Re-export governance types (SCP-129, ADR-031).
+pub use governance::{
+    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
+    GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
+    SignedVote, SingleAdminEngine, VoteType,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).
