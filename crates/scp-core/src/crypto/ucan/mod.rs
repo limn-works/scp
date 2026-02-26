@@ -147,6 +147,10 @@ pub enum UcanError {
     #[error("delegation chain broken: {0}")]
     DelegationChainBroken(String),
 
+    /// A circular delegation was detected in the proof chain (e.g., A->B->A).
+    #[error("circular delegation detected: {0}")]
+    CircularDelegation(String),
+
     /// The token has been revoked.
     #[error("token revoked: {0}")]
     TokenRevoked(String),

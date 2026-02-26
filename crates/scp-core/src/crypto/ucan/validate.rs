@@ -601,6 +601,7 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
 /// # Errors
 ///
 /// Returns [`UcanError::DelegationChainBroken`] if any link is invalid.
+/// Returns [`UcanError::CircularDelegation`] if the chain contains a cycle.
 /// Returns [`UcanError::SignatureInvalid`] if any parent signature is invalid.
 fn verify_delegation_chain(
     token: &UcanToken,
@@ -611,18 +612,24 @@ fn verify_delegation_chain(
         return Ok(token.payload.iss.clone());
     }
 
-    verify_chain_recursive(token, did_resolver, proof_resolver, 0)
+    let mut seen_issuers = HashSet::new();
+    seen_issuers.insert(token.payload.iss.clone());
+    verify_chain_recursive(token, did_resolver, proof_resolver, 0, &mut seen_issuers)
 }
 
 /// Recursive helper for delegation chain verification.
 ///
 /// Walks the proof chain from child to root, verifying signatures and
 /// `aud`/`iss` linkage at each step. Returns the root issuer DID.
+///
+/// `seen_issuers` tracks all issuer DIDs encountered during the chain walk
+/// to detect circular delegations (e.g., A->B->A).
 fn verify_chain_recursive(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
     depth: usize,
+    seen_issuers: &mut HashSet<String>,
 ) -> Result<String, UcanError> {
     if depth > MAX_CHAIN_DEPTH {
         return Err(UcanError::DelegationChainBroken(
@@ -641,6 +648,15 @@ fn verify_chain_recursive(
     for proof_cid in &token.payload.prf {
         let parent = proof_resolver.resolve_proof(proof_cid)?;
 
+        // Circular delegation detection: if the parent's issuer has already
+        // been seen in the chain, we have a cycle.
+        if !seen_issuers.insert(parent.payload.iss.clone()) {
+            return Err(UcanError::CircularDelegation(format!(
+                "issuer '{}' appears multiple times in the delegation chain",
+                parent.payload.iss
+            )));
+        }
+
         // Verify parent's aud matches this token's iss.
         if parent.payload.aud != token.payload.iss {
             return Err(UcanError::DelegationChainBroken(format!(
@@ -653,7 +669,8 @@ fn verify_chain_recursive(
         verify_signature(&parent, did_resolver)?;
 
         // Recurse to find the root.
-        let found_root = verify_chain_recursive(&parent, did_resolver, proof_resolver, depth + 1)?;
+        let found_root =
+            verify_chain_recursive(&parent, did_resolver, proof_resolver, depth + 1, seen_issuers)?;
 
         // All proof chains must converge to the same root issuer.
         if let Some(ref existing_root) = root_issuer {
@@ -2296,6 +2313,286 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "system clock error: system clock before Unix epoch: test"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Circular delegation detection (SCP-191)
+    // -----------------------------------------------------------------------
+
+    /// A->B->C->A cycle must be rejected with `CircularDelegation`.
+    #[tokio::test]
+    async fn validate_ucan_rejects_circular_delegation_a_b_c_a() {
+        let (custody_a, key_a, did_a, pk_a) = setup_identity().await;
+        let (custody_b, key_b, did_b, pk_b) = setup_identity().await;
+        let (custody_c, key_c, did_c, pk_c) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned()];
+
+        let token_a_to_b = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: &did_b,
+                context_id: "ctx-cycle",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+        let cid_a_to_b = compute_cid(&token_a_to_b);
+
+        let token_b_to_c = mint_ucan(
+            &MintParams {
+                issuer_did: &did_b,
+                issuer_key: &key_b,
+                audience_did: &did_c,
+                context_id: "ctx-cycle",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![cid_a_to_b.clone()],
+                facts: None,
+            },
+            &custody_b,
+        )
+        .await
+        .unwrap();
+        let cid_b_to_c = compute_cid(&token_b_to_c);
+
+        let token_c_to_a = mint_ucan(
+            &MintParams {
+                issuer_did: &did_c,
+                issuer_key: &key_c,
+                audience_did: &did_a,
+                context_id: "ctx-cycle",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![cid_b_to_c.clone()],
+                facts: None,
+            },
+            &custody_c,
+        )
+        .await
+        .unwrap();
+        let cid_c_to_a = compute_cid(&token_c_to_a);
+
+        let token_presenting = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: "did:dht:z6MkPresenter",
+                context_id: "ctx-cycle",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![cid_c_to_a.clone()],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [
+                (did_a.clone(), pk_a),
+                (did_b.clone(), pk_b),
+                (did_c.clone(), pk_c),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([
+                (cid_a_to_b, token_a_to_b),
+                (cid_b_to_c, token_b_to_c),
+                (cid_c_to_a, token_c_to_a),
+            ]),
+        };
+
+        let result = verify_delegation_chain(&token_presenting, &resolver, &proof_resolver);
+        assert!(
+            matches!(result, Err(UcanError::CircularDelegation(_))),
+            "A->B->C->A cycle must be rejected with CircularDelegation: {result:?}"
+        );
+    }
+
+    /// A->B->C (no cycle) must pass chain verification.
+    #[tokio::test]
+    async fn validate_ucan_accepts_linear_chain_a_b_c() {
+        use crate::crypto::ucan::Attenuation;
+        use crate::crypto::ucan::mint::DelegateParams;
+
+        let (custody_a, key_a, did_a, pk_a) = setup_identity().await;
+        let (custody_b, key_b, did_b, pk_b) = setup_identity().await;
+        let (_custody_c, _key_c, did_c, _pk_c) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned()];
+
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: &did_b,
+                context_id: "ctx-linear",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+        let root_cid = compute_cid(&root_token);
+
+        let delegated_token = crate::crypto::ucan::mint::delegate_ucan(
+            &DelegateParams {
+                parent_token: &root_token,
+                delegator_did: &did_b,
+                delegator_key: &key_b,
+                delegatee_did: &did_c,
+                attenuated_capabilities: &[Attenuation {
+                    with: "scp:ctx:ctx-linear/messages:write".to_owned(),
+                    can: "write".to_owned(),
+                }],
+                lifetime_secs: 1800,
+                facts: None,
+            },
+            &custody_b,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [(did_a.clone(), pk_a), (did_b.clone(), pk_b)]
+                .into_iter()
+                .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let result = verify_delegation_chain(&delegated_token, &resolver, &proof_resolver);
+        assert!(result.is_ok(), "linear chain A->B->C must pass: {result:?}");
+        assert_eq!(result.unwrap(), did_a);
+    }
+
+    /// Self-delegation A->A must be rejected with `CircularDelegation`.
+    #[tokio::test]
+    async fn validate_ucan_rejects_self_delegation_a_to_a() {
+        let (custody_a, key_a, did_a, pk_a) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned()];
+
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: &did_a,
+                context_id: "ctx-self",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+        let root_cid = compute_cid(&root_token);
+
+        let child_token = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: "did:dht:z6MkSomeone",
+                context_id: "ctx-self",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![root_cid.clone()],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((did_a.clone(), pk_a)).collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let result = verify_delegation_chain(&child_token, &resolver, &proof_resolver);
+        assert!(
+            matches!(result, Err(UcanError::CircularDelegation(_))),
+            "self-delegation A->A must be rejected with CircularDelegation: {result:?}"
+        );
+    }
+
+    /// MAX_CHAIN_DEPTH guard still terminates excessively long chains.
+    #[test]
+    fn verify_chain_recursive_rejects_excessive_depth() {
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkA".to_owned(),
+                aud: "did:dht:z6MkB".to_owned(),
+                exp: now_secs().unwrap() + 3600,
+                nbf: None,
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec!["bafyrei-some-proof".to_owned()],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let resolver = InMemoryDidResolver {
+            keys: std::collections::HashMap::new(),
+        };
+        let proof_resolver = InMemoryProofResolver::new();
+        let mut seen = HashSet::new();
+
+        let result = verify_chain_recursive(
+            &token,
+            &resolver,
+            &proof_resolver,
+            MAX_CHAIN_DEPTH + 1,
+            &mut seen,
+        );
+
+        assert!(
+            matches!(result, Err(UcanError::DelegationChainBroken(ref msg)) if msg.contains("maximum depth")),
+            "chain exceeding MAX_CHAIN_DEPTH must be rejected: {result:?}"
+        );
+    }
+
+    /// `CircularDelegation` error displays correctly.
+    #[test]
+    fn circular_delegation_error_display() {
+        let err = UcanError::CircularDelegation(
+            "issuer 'did:dht:z6MkA' appears multiple times".to_owned(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "circular delegation detected: issuer 'did:dht:z6MkA' appears multiple times"
         );
     }
 }
