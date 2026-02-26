@@ -21,9 +21,11 @@ jobs:
           fetch-depth: 0
 
       - name: Run Claude PR review
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          show_full_output: true
           claude_args: '--model claude-opus-4-20250514 --max-turns 100 --allowedTools "Bash,Read,Glob,Grep,Task"'
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
@@ -77,13 +79,23 @@ jobs:
               -f body="<comment>" -f path="<file>" -f commit_id="<sha>" -F line=<line> -f side=RIGHT
             ```
 
-            Then post a summary comment on the PR:
+            Then submit your review verdict. If there are no critical or warning-level issues:
             ```bash
-            gh pr comment ${{ github.event.pull_request.number }} --body "<summary>"
+            gh pr review ${{ github.event.pull_request.number }} --approve --body "<summary>"
+            ```
+
+            If there are critical issues that must be fixed:
+            ```bash
+            gh pr review ${{ github.event.pull_request.number }} --request-changes --body "<summary>"
+            ```
+
+            If there are only notes/suggestions (no critical or warning):
+            ```bash
+            gh pr review ${{ github.event.pull_request.number }} --comment --body "<summary>"
             ```
 
             The summary should include:
-            - A brief overall assessment (approve / request changes / comments only)
+            - A brief overall assessment
             - A section per perspective with key findings (or "No issues found")
             - Total issue count by severity (critical / warning / note)
 
