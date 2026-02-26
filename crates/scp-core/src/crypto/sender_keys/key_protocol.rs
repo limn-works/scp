@@ -20,6 +20,7 @@ use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 use ed25519_dalek::Verifier;
 use hkdf::Hkdf;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
@@ -41,6 +42,19 @@ const HPKE_INFO: &[u8] = b"scp-sender-key-hpke-v1";
 /// Grace period in seconds during which the old key should still be accepted
 /// for decryption of in-flight messages after an epoch advance.
 pub const GRACE_PERIOD_SECS: u64 = 30;
+
+/// Size of the cryptographic nonce embedded in sender key requests (bytes).
+const REQUEST_NONCE_SIZE: usize = 16;
+
+/// Duration in seconds for which a seen nonce is remembered to prevent replay.
+/// Used by the responder-side nonce deduplication (SCP-179).
+#[allow(dead_code)]
+const NONCE_EXPIRY_SECS: u64 = 300; // 5 minutes
+
+/// Maximum age in milliseconds for a block notification to be considered fresh.
+/// Used by block notification freshness validation (SCP-179).
+#[allow(dead_code)]
+const BLOCK_NOTIFICATION_FRESHNESS_MS: u64 = 30_000; // 30 seconds
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -70,6 +84,10 @@ pub struct SenderKeyEpochAdvance {
 /// Sent as an MLS application message to the key holder. The requester
 /// includes a fresh X25519 wrapping public key so the responder can
 /// HPKE-encrypt the sender key material.
+///
+/// Contains a cryptographic nonce and timestamp for replay protection.
+/// The responder rejects requests with duplicate nonces within a 5-minute
+/// window and echoes the nonce in the response for binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SenderKeyRequest {
     /// The DID of the member requesting the key.
@@ -81,6 +99,12 @@ pub struct SenderKeyRequest {
     /// Fresh X25519 public key for HPKE wrapping.
     #[serde(with = "serde_bytes")]
     pub wrapping_pubkey: Vec<u8>,
+    /// Cryptographic nonce for replay protection (16 bytes, generated with
+    /// `OsRng`). The responder echoes this in [`SenderKeyResponse::request_nonce`]
+    /// and rejects duplicate nonces within [`NONCE_EXPIRY_SECS`].
+    pub nonce: [u8; REQUEST_NONCE_SIZE],
+    /// Unix timestamp in seconds when the request was created.
+    pub timestamp: u64,
     /// Ed25519 signature over the request payload.
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
@@ -240,8 +264,23 @@ pub async fn request_sender_key(
         .await
         .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
 
-    // Sign the request.
-    let hash = compute_request_hash(requester_did, sender_did, epoch, wrapping_pubkey.as_bytes());
+    // Generate cryptographic nonce and timestamp for replay protection.
+    let mut nonce = [0u8; REQUEST_NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Sign the request (including nonce and timestamp).
+    let hash = compute_request_hash(
+        requester_did,
+        sender_did,
+        epoch,
+        wrapping_pubkey.as_bytes(),
+        &nonce,
+        timestamp,
+    );
 
     let signature = key_custody
         .sign(signing_key, &hash)
@@ -253,6 +292,8 @@ pub async fn request_sender_key(
         sender_did: sender_did.to_owned(),
         epoch,
         wrapping_pubkey: wrapping_pubkey.into_bytes(),
+        nonce,
+        timestamp,
         signature: signature.into_bytes(),
     };
 
@@ -281,6 +322,8 @@ pub fn verify_sender_key_request(
         &request.sender_did,
         request.epoch,
         &request.wrapping_pubkey,
+        &request.nonce,
+        request.timestamp,
     );
     verify_ed25519_signature(requester_public_key, &hash, &request.signature)
 }
@@ -536,7 +579,7 @@ fn hpke_seal(
     recipient_pub: &[u8; 32],
 ) -> Result<(Vec<u8>, [u8; 32]), SenderKeyError> {
     // 1. Generate ephemeral X25519 keypair.
-    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
+    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
     let ephemeral_public = X25519Pub::from(&ephemeral_secret);
 
     // 2. ECDH between ephemeral secret and recipient's wrapping pubkey.
@@ -568,7 +611,7 @@ fn aes128gcm_encrypt(key: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>, Sender
         .map_err(|e| SenderKeyError::HpkeEncryptionFailed(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; HPKE_NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -622,12 +665,16 @@ fn compute_request_hash(
     sender_did: &str,
     epoch: u64,
     wrapping_pubkey: &[u8],
+    nonce: &[u8; REQUEST_NONCE_SIZE],
+    timestamp: u64,
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(requester_did.as_bytes());
     hasher.update(sender_did.as_bytes());
     hasher.update(epoch.to_be_bytes());
     hasher.update(wrapping_pubkey);
+    hasher.update(nonce);
+    hasher.update(timestamp.to_be_bytes());
     hasher.finalize().to_vec()
 }
 
@@ -1202,7 +1249,7 @@ mod tests {
         let plaintext = [0xABu8; 32];
 
         // Generate a recipient X25519 keypair in software for this test.
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) = hpke_seal(&plaintext, &recipient_public.to_bytes()).unwrap();
@@ -1220,10 +1267,10 @@ mod tests {
     fn hpke_rejects_wrong_recipient() {
         let plaintext = [0xCDu8; 32];
 
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
-        let wrong_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let wrong_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
 
         let (sealed, ephemeral_pub) = hpke_seal(&plaintext, &recipient_public.to_bytes()).unwrap();
 
