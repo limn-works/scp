@@ -1714,7 +1714,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-transport/src/native/server.rs"
@@ -1736,7 +1736,8 @@
       "sources": [
         "https://github.com/limn-works/scp/issues/9"
       ],
-      "details": {}
+      "details": {},
+      "result": "ShutdownHandle via CancellationToken, 3 lifecycle tests, all callers updated"
     },
     {
       "id": "SCP-209",
@@ -1744,7 +1745,7 @@
       "gate": "gate-harden",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs"
       ],
@@ -1774,7 +1775,8 @@
       "details": {
         "currentBehavior": "build() returns Result — misconfiguration is a runtime error, not a compile error.",
         "designRationale": "A type-state builder would make misconfiguration a compile error rather than a runtime error."
-      }
+      },
+      "result": "Type-state builder with NoDomain/HasDomain + NoIdentity/HasIdentity phantom params, build() restricted to HasDomain+HasIdentity"
     }
   ]
 }
