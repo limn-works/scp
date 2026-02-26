@@ -19,7 +19,7 @@ tracing = { workspace = true }
 lru = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
 rmpv = { version = "1", features = ["with-serde"] }

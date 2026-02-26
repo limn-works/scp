@@ -474,7 +474,7 @@ impl NativeRelayClient {
             .write()
             .await
             .pending
-            .insert(ref_id, PendingRequest { tx });
+            .insert(ref_id.clone(), PendingRequest { tx });
 
         // Serialize and send.
         let bytes = msg
@@ -491,10 +491,18 @@ impl NativeRelayClient {
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
         // Wait for the response with timeout.
-        tokio::time::timeout(Duration::from_secs(30), rx)
-            .await
-            .map_err(|_| TransportError::Timeout)?
-            .map_err(|_| TransportError::SendFailed("response channel closed".to_string()))
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => Err(TransportError::SendFailed(
+                "response channel closed".to_string(),
+            )),
+            Err(_) => {
+                // Timeout: remove the pending entry so the oneshot sender is
+                // dropped and memory is not leaked.
+                self.inner.write().await.pending.remove(&ref_id);
+                Err(TransportError::Timeout)
+            }
+        }
     }
 
     /// Registers a subscription for a routing ID.
@@ -812,6 +820,14 @@ impl NativeRelayClient {
     pub async fn clear_dedup_set(&self) {
         self.inner.write().await.seen_blob_ids.clear();
     }
+
+    /// Returns the number of entries in the pending request map.
+    ///
+    /// Exposed for testing to verify cleanup on timeout.
+    #[cfg(test)]
+    async fn pending_len(&self) -> usize {
+        self.inner.read().await.pending.len()
+    }
 }
 
 /// Hex-encodes a byte slice into a lowercase hex string.
@@ -1057,5 +1073,151 @@ mod tests {
     #[test]
     fn hex_encode_empty_is_empty() {
         assert_eq!(hex_encode(&[]), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending request timeout cleanup tests (SCP-196)
+    // -----------------------------------------------------------------------
+
+    /// Starts a WebSocket server that accepts connections and upgrades them
+    /// but never sends any response messages, causing client requests to
+    /// time out.
+    async fn start_silent_ws_server() -> String {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let ws = tokio_tungstenite::accept_async(stream).await;
+                    if let Ok(ws) = ws {
+                        // Hold the connection open, read frames but never
+                        // send responses.
+                        let (_sink, mut source) = ws.split();
+                        while source.next().await.is_some() {}
+                    }
+                });
+            }
+        });
+
+        url
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_request_timeout_cleans_pending_map() {
+        let url = start_silent_ws_server().await;
+
+        // Resume time briefly to allow the TCP/WS handshake to complete.
+        tokio::time::resume();
+        let client: &'static NativeRelayClient =
+            Box::leak(Box::new(NativeRelayClient::connect(&url).await.unwrap()));
+        tokio::time::pause();
+
+        assert_eq!(client.pending_len().await, 0);
+
+        let msg = ClientMessage::Publish {
+            ref_id: None,
+            routing_id: [0xAA; 32],
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![0x01],
+        };
+
+        let result = tokio::spawn(async move { client.send_request(msg).await });
+
+        // Advance past the 30-second timeout.
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        let err = result.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, TransportError::Timeout),
+            "expected Timeout, got {err:?}"
+        );
+
+        // The pending map must be empty after the timeout cleans up.
+        assert_eq!(client.pending_len().await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_map_does_not_grow_under_repeated_timeouts() {
+        let url = start_silent_ws_server().await;
+
+        tokio::time::resume();
+        let client: &'static NativeRelayClient =
+            Box::leak(Box::new(NativeRelayClient::connect(&url).await.unwrap()));
+        tokio::time::pause();
+
+        for i in 0u8..10 {
+            let msg = ClientMessage::Publish {
+                ref_id: None,
+                routing_id: [i; 32],
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![i],
+            };
+
+            let result = tokio::spawn(async move { client.send_request(msg).await });
+
+            tokio::time::advance(Duration::from_secs(31)).await;
+
+            let err = result.await.unwrap().unwrap_err();
+            assert!(
+                matches!(err, TransportError::Timeout),
+                "iteration {i}: expected Timeout, got {err:?}"
+            );
+
+            // After each timeout the map must be empty.
+            assert_eq!(
+                client.pending_len().await,
+                0,
+                "iteration {i}: pending map leaked"
+            );
+        }
+
+        // Final check: no residual entries.
+        assert_eq!(client.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn send_request_success_still_works() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::InMemoryBlobStorage;
+        use std::net::SocketAddr;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            ..RelayConfig::default()
+        };
+        let storage = InMemoryBlobStorage::new();
+        let server = RelayServer::new(config, storage);
+        let addr = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+        assert_eq!(client.pending_len().await, 0);
+
+        let msg = ClientMessage::Publish {
+            ref_id: None,
+            routing_id: [0xAA; 32],
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![0xDE, 0xAD],
+        };
+
+        let response = client.send_request(msg).await.unwrap();
+        assert!(
+            matches!(response, RelayMessage::Ok { .. }),
+            "expected Ok, got {response:?}"
+        );
+
+        // Pending map must be empty after successful response.
+        assert_eq!(client.pending_len().await, 0);
     }
 }
