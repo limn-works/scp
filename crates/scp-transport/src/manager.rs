@@ -14,7 +14,8 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -81,7 +82,9 @@ pub struct TransportManager {
     /// Registered transport adapters, in insertion order.
     adapters: Vec<Box<dyn TransportAdapter>>,
     /// Per-context relay set assignments: context -> adapter indices.
-    relay_assignments: HashMap<ContextId, Vec<usize>>,
+    /// Wrapped in `RwLock` for interior mutability so that `send_to_context`
+    /// and `assign_relay_set` can take `&self`, enabling concurrent sends.
+    relay_assignments: RwLock<HashMap<ContextId, Vec<usize>>>,
     /// Per-relay reliability scores keyed by adapter index (as string).
     /// Shared with `MergedStream` so suppression downgrades apply immediately.
     reliability_scores: Arc<Mutex<HashMap<String, ReliabilityScore>>>,
@@ -90,7 +93,8 @@ pub struct TransportManager {
     /// TTL for deduplication cache entries.
     dedup_ttl: Duration,
     /// Round-robin counter for relay assignment spread.
-    assignment_counter: usize,
+    /// Atomic for interior mutability without locking.
+    assignment_counter: AtomicUsize,
     /// Multi-relay suppression cross-check tracker (spec section 9.9.2).
     /// Shared with `MergedStream` for recording deliveries and checking
     /// suppressions during stream polling.
@@ -112,11 +116,11 @@ impl TransportManager {
     pub fn new(adapter: Box<dyn TransportAdapter>) -> Self {
         Self {
             adapters: vec![adapter],
-            relay_assignments: HashMap::new(),
+            relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
             dedup_cache: LruCache::new(nonzero_capacity(DEFAULT_DEDUP_CAPACITY)),
             dedup_ttl: DEFAULT_DEDUP_TTL,
-            assignment_counter: 0,
+            assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
         }
     }
@@ -129,11 +133,11 @@ impl TransportManager {
     pub fn builder() -> Self {
         Self {
             adapters: Vec::new(),
-            relay_assignments: HashMap::new(),
+            relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
             dedup_cache: LruCache::new(nonzero_capacity(DEFAULT_DEDUP_CAPACITY)),
             dedup_ttl: DEFAULT_DEDUP_TTL,
-            assignment_counter: 0,
+            assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
         }
     }
@@ -145,11 +149,11 @@ impl TransportManager {
     pub fn with_config(config: &TransportConfig) -> Self {
         Self {
             adapters: Vec::new(),
-            relay_assignments: HashMap::new(),
+            relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
             dedup_cache: LruCache::new(nonzero_capacity(config.dedup_cache_size)),
             dedup_ttl: config.dedup_cache_ttl,
-            assignment_counter: 0,
+            assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
         }
     }
@@ -205,7 +209,7 @@ impl TransportManager {
     /// or no relay set is assigned to the context.
     /// Returns [`TransportError::SendFailed`] if fewer than 2 relays succeed.
     pub async fn send_to_context(
-        &mut self,
+        &self,
         envelope: &OuterEnvelope,
         context_id: &ContextId,
     ) -> Result<Vec<BlobId>, TransportError> {
@@ -215,6 +219,8 @@ impl TransportManager {
 
         let relay_indices = self
             .relay_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(context_id)
             .ok_or_else(|| {
                 TransportError::SendFailed(format!(
@@ -353,6 +359,8 @@ impl TransportManager {
 
         let relay_indices = self
             .relay_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(context_id)
             .ok_or_else(|| {
                 TransportError::SubscriptionFailed(format!(
@@ -481,10 +489,7 @@ impl TransportManager {
     /// # Errors
     ///
     /// Returns [`TransportError::NotConnected`] if no adapters are registered.
-    pub fn assign_relay_set(
-        &mut self,
-        context_id: &ContextId,
-    ) -> Result<Vec<usize>, TransportError> {
+    pub fn assign_relay_set(&self, context_id: &ContextId) -> Result<Vec<usize>, TransportError> {
         if self.adapters.is_empty() {
             return Err(TransportError::NotConnected);
         }
@@ -496,10 +501,20 @@ impl TransportManager {
         //   (overlap count ASC, reliability score DESC, round-robin offset ASC).
         // This prefers adapters least used by other contexts and with higher
         // reliability.
-        let scores = self.reliability_scores.lock().unwrap_or_else(|e| e.into_inner());
+        let scores = self
+            .reliability_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let assignments = self
+            .relay_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut candidates: Vec<(usize, usize, f64)> = (0..adapter_count)
             .map(|idx| {
-                let overlap = self.overlap_count(idx);
+                let overlap = assignments
+                    .values()
+                    .filter(|set| set.contains(&idx))
+                    .count();
                 let reliability = scores
                     .get(&idx.to_string())
                     .map_or(1.0, ReliabilityScore::composite_score);
@@ -507,8 +522,11 @@ impl TransportManager {
             })
             .collect();
         drop(scores);
+        drop(assignments);
 
-        let counter = self.assignment_counter;
+        let counter = self
+            .assignment_counter
+            .fetch_add(set_size, Ordering::Relaxed);
         candidates.sort_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
@@ -526,8 +544,9 @@ impl TransportManager {
             .map(|(idx, _, _)| *idx)
             .collect();
 
-        self.assignment_counter += set_size;
         self.relay_assignments
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(context_id.clone(), assigned.clone());
 
         Ok(assigned)
@@ -535,8 +554,12 @@ impl TransportManager {
 
     /// Returns the relay set currently assigned to a context, if any.
     #[must_use]
-    pub fn get_relay_set(&self, context_id: &ContextId) -> Option<&Vec<usize>> {
-        self.relay_assignments.get(context_id)
+    pub fn get_relay_set(&self, context_id: &ContextId) -> Option<Vec<usize>> {
+        self.relay_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(context_id)
+            .cloned()
     }
 
     /// Returns the reliability score for an adapter by index.
@@ -544,7 +567,10 @@ impl TransportManager {
     /// Returns a clone of the score to avoid holding the lock.
     #[must_use]
     pub fn get_reliability_score(&self, adapter_index: usize) -> Option<ReliabilityScore> {
-        let scores = self.reliability_scores.lock().unwrap_or_else(|e| e.into_inner());
+        let scores = self
+            .reliability_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         scores.get(&adapter_index.to_string()).cloned()
     }
 
@@ -555,8 +581,11 @@ impl TransportManager {
     /// historical.
     ///
     /// See ADR-012 acceptance criterion 5.
-    pub fn update_score(&mut self, relay_url: &str, outcome: DeliveryOutcome) {
-        let mut scores = self.reliability_scores.lock().unwrap_or_else(|e| e.into_inner());
+    pub fn update_score(&self, relay_url: &str, outcome: DeliveryOutcome) {
+        let mut scores = self
+            .reliability_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         scoring::update_score(&mut scores, relay_url, outcome);
     }
 
@@ -565,7 +594,10 @@ impl TransportManager {
     /// Returns a clone of the score to avoid holding the lock.
     #[must_use]
     pub fn get_score(&self, relay_url: &str) -> Option<ReliabilityScore> {
-        let scores = self.reliability_scores.lock().unwrap_or_else(|e| e.into_inner());
+        let scores = self
+            .reliability_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         scores.get(relay_url).cloned()
     }
 
@@ -579,15 +611,6 @@ impl TransportManager {
     #[must_use]
     pub fn reliability_scores(&self) -> Arc<Mutex<HashMap<String, ReliabilityScore>>> {
         Arc::clone(&self.reliability_scores)
-    }
-
-    /// Counts how many existing context relay sets include the given adapter
-    /// index.
-    fn overlap_count(&self, adapter_index: usize) -> usize {
-        self.relay_assignments
-            .values()
-            .filter(|set| set.contains(&adapter_index))
-            .count()
     }
 }
 
@@ -1115,7 +1138,11 @@ mod tests {
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
 
         let ctx = "ctx-1".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await.unwrap();
@@ -1135,7 +1162,11 @@ mod tests {
         ))));
 
         let ctx = "ctx-fail".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await;
@@ -1153,7 +1184,11 @@ mod tests {
         ))));
 
         let ctx = "ctx-partial".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await.unwrap();
@@ -1170,7 +1205,11 @@ mod tests {
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
 
         let ctx = "ctx-score".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let _ = manager.send_to_context(&envelope, &ctx).await;
@@ -1228,7 +1267,11 @@ mod tests {
         manager.add_adapter(Box::new(adapter2));
 
         let ctx = "ctx-dedup".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1]);
 
         let routing_id = RoutingId::new([0xAA; 32]);
         let mut stream = manager
@@ -1265,7 +1308,11 @@ mod tests {
         manager.add_adapter(Box::new(adapter2));
 
         let ctx = "ctx-distinct".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1]);
 
         let routing_id = RoutingId::new([0xAA; 32]);
         let mut stream = manager
@@ -1354,12 +1401,12 @@ mod tests {
         let set = manager.assign_relay_set(&ctx).unwrap();
 
         let retrieved = manager.get_relay_set(&ctx).unwrap();
-        assert_eq!(&set, retrieved);
+        assert_eq!(set, retrieved);
     }
 
     #[tokio::test]
     async fn assign_relay_set_no_adapters_returns_error() {
-        let mut manager = TransportManager::builder();
+        let manager = TransportManager::builder();
         let result = manager.assign_relay_set(&"ctx-empty".to_string());
         assert!(matches!(result, Err(TransportError::NotConnected)));
     }
@@ -1511,7 +1558,11 @@ mod tests {
         manager.add_adapter(Box::new(adapter2));
 
         let ctx = "ctx-suppress-both".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1]);
 
         let routing_id = RoutingId::new([0xAA; 32]);
         let mut stream = manager
@@ -1584,6 +1635,8 @@ mod tests {
         let ctx = "ctx-suppress-one".to_string();
         manager
             .relay_assignments
+            .write()
+            .unwrap()
             .insert(ctx.clone(), vec![0, 1, 2, 3]);
 
         let routing_id = RoutingId::new([0xAA; 32]);
@@ -1644,11 +1697,7 @@ mod tests {
             let mut scores = manager.reliability_scores.lock().unwrap();
             let all_adapters: HashSet<usize> = (0..3).collect();
             for &missing in all_adapters.difference(&warning.delivered_by) {
-                scoring::update_score(
-                    &mut scores,
-                    &missing.to_string(),
-                    DeliveryOutcome::Failure,
-                );
+                scoring::update_score(&mut scores, &missing.to_string(), DeliveryOutcome::Failure);
             }
         }
 
@@ -1673,5 +1722,45 @@ mod tests {
             (score1.delivery_success_rate - 1.0).abs() < f64::EPSILON,
             "adapter 1 should not be downgraded"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn concurrent_sends_to_different_contexts_do_not_block() {
+        // 10 tasks send to 10 different contexts through Arc<TransportManager>.
+        // All sends should complete without deadlock.
+        let mut manager = TransportManager::builder();
+        for _ in 0..5 {
+            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0xAA; 32]))));
+        }
+
+        // Assign relay sets for 10 contexts.
+        for i in 0..10 {
+            let ctx = format!("ctx-concurrent-{i}");
+            manager.assign_relay_set(&ctx).unwrap();
+        }
+
+        let manager = Arc::new(manager);
+
+        let mut handles = Vec::with_capacity(10);
+        for i in 0..10 {
+            let mgr = Arc::clone(&manager);
+            let ctx = format!("ctx-concurrent-{i}");
+            handles.push(tokio::spawn(async move {
+                let envelope = test_envelope();
+                mgr.send_to_context(&envelope, &ctx).await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.expect("task should not panic");
+            assert!(
+                result.is_ok(),
+                "send_to_context should succeed, got: {result:?}"
+            );
+        }
     }
 }
