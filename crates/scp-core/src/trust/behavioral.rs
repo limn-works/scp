@@ -15,7 +15,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::event_log::{ContextId, DID, Event, EventType};
+use crate::event_log::{ContextId, Event, EventType};
+use crate::identity::DID;
 
 use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolId, TrustError};
 
@@ -202,7 +203,7 @@ pub fn compute_behavioral_record(
     };
 
     Ok(BehavioralRecord {
-        subject_did: subject_did.to_owned(),
+        subject_did: subject_did.into(),
         context_id: context_id.to_owned(),
         participation_count,
         participation_duration_seconds,
@@ -247,7 +248,7 @@ fn extract_target_did_from_payload(data: &[u8]) -> Option<DID> {
     if s.is_empty() {
         return None;
     }
-    Some(s.to_owned())
+    Some(s.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +273,7 @@ mod tests {
     ) -> Event {
         Event {
             event_type,
-            actor_did: actor_did.to_owned(),
+            actor_did: actor_did.into(),
             timestamp,
             sequence,
             payload: EventPayload { data: payload },
@@ -378,7 +379,7 @@ mod tests {
         assert_eq!(record.governance_actions_by[0].event_sequence, 0);
         assert_eq!(
             record.governance_actions_by[0].target_did,
-            Some("did:key:bob".to_owned())
+            Some("did:key:bob".into())
         );
         // Second action has empty payload -> no target.
         assert_eq!(record.governance_actions_by[1].target_did, None);
@@ -629,7 +630,7 @@ mod tests {
     fn extract_target_did_handles_valid_did() {
         assert_eq!(
             extract_target_did_from_payload(b"did:key:alice"),
-            Some("did:key:alice".to_owned())
+            Some("did:key:alice".into())
         );
     }
 
@@ -637,7 +638,7 @@ mod tests {
     fn extract_target_did_handles_null_terminated() {
         assert_eq!(
             extract_target_did_from_payload(b"did:key:alice\0extra"),
-            Some("did:key:alice".to_owned())
+            Some("did:key:alice".into())
         );
     }
 }

@@ -25,16 +25,16 @@ use std::hash::BuildHasher;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::Verifier;
 
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
-use super::mint::compute_cid;
+use super::revoke::compute_revocation_cid;
 use super::{UcanError, UcanHeader, UcanPayload, UcanToken};
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+#[cfg(test)]
 const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
 
 /// Maximum delegation chain depth to prevent infinite loops.
@@ -125,12 +125,18 @@ impl DidResolver for InMemoryDidResolver {
 /// Validates nonce format (`{unix_millis}-{32_hex_chars}`), freshness
 /// (timestamp within +/- 5 minutes of now), and uniqueness.
 ///
+/// Restricted to test builds — production code should use
+/// [`nonce::NonceTracker`](super::nonce::NonceTracker) which provides
+/// per-context scoping, capacity limits, and automatic pruning.
+///
 /// See ADR-016 acceptance criterion 6.
-pub struct InMemoryNonceTracker {
+#[cfg(test)]
+pub(crate) struct InMemoryNonceTracker {
     /// Map of nonce -> (`first_seen_timestamp_secs`, `token_expiry_secs`).
     seen: std::collections::HashMap<String, (u64, u64)>,
 }
 
+#[cfg(test)]
 impl InMemoryNonceTracker {
     /// Creates a new empty nonce tracker.
     #[must_use]
@@ -141,12 +147,14 @@ impl InMemoryNonceTracker {
     }
 }
 
+#[cfg(test)]
 impl Default for InMemoryNonceTracker {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl NonceTracker for InMemoryNonceTracker {
     fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
         // Validate nonce format: {unix_millis}-{32_hex_chars}
@@ -168,7 +176,7 @@ impl NonceTracker for InMemoryNonceTracker {
         // Freshness check: timestamp within now +/- 5 minutes.
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))?
             .as_millis();
 
         if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
@@ -219,17 +227,6 @@ impl Default for InMemoryRevocationChecker {
 impl RevocationChecker for InMemoryRevocationChecker {
     fn is_revoked(&self, token_cid: &str) -> bool {
         self.revoked.contains(token_cid)
-    }
-}
-
-/// No-op [`ProofResolver`] for Phase 2 (root tokens only, no delegation chains).
-pub struct NoOpProofResolver;
-
-impl ProofResolver for NoOpProofResolver {
-    fn resolve_proof(&self, cid: &str) -> Result<UcanToken, UcanError> {
-        Err(UcanError::DelegationChainBroken(format!(
-            "proof resolution not implemented in Phase 2: {cid}"
-        )))
     }
 }
 
@@ -353,11 +350,16 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
 // ---------------------------------------------------------------------------
 
 /// Returns the current Unix timestamp in seconds.
-fn now_secs() -> u64 {
+///
+/// # Errors
+///
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix
+/// epoch. Defaulting to zero would silently bypass all `nbf`/`exp` checks.
+fn now_secs() -> Result<u64, UcanError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))
 }
 
 /// Validates a UCAN token using the 11-step pipeline from ADR-016.
@@ -455,9 +457,11 @@ where
         .check_and_record(&token.payload.nnc, token.payload.exp)?;
 
     // Step 10: Revocation — verify token CID not revoked.
-    let token_cid = compute_cid(token);
-    if ctx.revocation_checker.is_revoked(&token_cid) {
-        return Err(UcanError::TokenRevoked(token_cid));
+    // Uses the content-hash revocation CID (SHA-256 of the payload) to match
+    // the format used by revoke_ucan.
+    let revocation_cid = compute_revocation_cid(&token.payload);
+    if ctx.revocation_checker.is_revoked(&revocation_cid) {
+        return Err(UcanError::TokenRevoked(revocation_cid));
     }
 
     // Step 11: Expiry — verify exp > now and nbf <= now.
@@ -478,7 +482,7 @@ where
 /// # Errors
 ///
 /// Returns a specific [`UcanError`] variant indicating which step failed.
-pub fn validate_ucan_stateless<D, S>(
+pub(crate) fn validate_ucan_stateless<D, S>(
     token: &UcanToken,
     required_capability: &CapabilityUri,
     did_resolver: &D,
@@ -572,7 +576,7 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
     verifying_key
-        .verify(signing_input.as_bytes(), &signature)
+        .verify_strict(signing_input.as_bytes(), &signature)
         .map_err(|_| UcanError::SignatureInvalid)
 }
 
@@ -588,6 +592,7 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
 /// # Errors
 ///
 /// Returns [`UcanError::DelegationChainBroken`] if any link is invalid.
+/// Returns [`UcanError::CircularDelegation`] if the chain contains a cycle.
 /// Returns [`UcanError::SignatureInvalid`] if any parent signature is invalid.
 fn verify_delegation_chain(
     token: &UcanToken,
@@ -598,18 +603,24 @@ fn verify_delegation_chain(
         return Ok(token.payload.iss.clone());
     }
 
-    verify_chain_recursive(token, did_resolver, proof_resolver, 0)
+    let mut seen_issuers = HashSet::new();
+    seen_issuers.insert(token.payload.iss.clone());
+    verify_chain_recursive(token, did_resolver, proof_resolver, 0, &mut seen_issuers)
 }
 
 /// Recursive helper for delegation chain verification.
 ///
 /// Walks the proof chain from child to root, verifying signatures and
 /// `aud`/`iss` linkage at each step. Returns the root issuer DID.
+///
+/// `seen_issuers` tracks all issuer DIDs encountered during the chain walk
+/// to detect circular delegations (e.g., A->B->A).
 fn verify_chain_recursive(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
     depth: usize,
+    seen_issuers: &mut HashSet<String>,
 ) -> Result<String, UcanError> {
     if depth > MAX_CHAIN_DEPTH {
         return Err(UcanError::DelegationChainBroken(
@@ -628,6 +639,15 @@ fn verify_chain_recursive(
     for proof_cid in &token.payload.prf {
         let parent = proof_resolver.resolve_proof(proof_cid)?;
 
+        // Circular delegation detection: if the parent's issuer has already
+        // been seen in the chain, we have a cycle.
+        if !seen_issuers.insert(parent.payload.iss.clone()) {
+            return Err(UcanError::CircularDelegation(format!(
+                "issuer '{}' appears multiple times in the delegation chain",
+                parent.payload.iss
+            )));
+        }
+
         // Verify parent's aud matches this token's iss.
         if parent.payload.aud != token.payload.iss {
             return Err(UcanError::DelegationChainBroken(format!(
@@ -640,7 +660,8 @@ fn verify_chain_recursive(
         verify_signature(&parent, did_resolver)?;
 
         // Recurse to find the root.
-        let found_root = verify_chain_recursive(&parent, did_resolver, proof_resolver, depth + 1)?;
+        let found_root =
+            verify_chain_recursive(&parent, did_resolver, proof_resolver, depth + 1, seen_issuers)?;
 
         // All proof chains must converge to the same root issuer.
         if let Some(ref existing_root) = root_issuer {
@@ -712,17 +733,30 @@ fn verify_attenuation(
 /// Step 11: Verify token expiry.
 ///
 /// Checks that:
+/// - `nbf < exp` (if present, the time range is valid)
 /// - `exp > now` (not expired)
 /// - `exp <= now + 24h` (not too far in the future)
 /// - `nbf <= now` (if present, the token is already valid)
 ///
 /// # Errors
 ///
+/// Returns [`UcanError::InvalidTimeRange`] if `nbf >= exp`.
 /// Returns [`UcanError::TokenExpired`] if the token has expired.
 /// Returns [`UcanError::ExpiryTooFar`] if `exp` exceeds now + 24 hours.
 /// Returns [`UcanError::TokenNotYetValid`] if `nbf > now`.
 fn verify_expiry(token: &UcanToken) -> Result<(), UcanError> {
-    let now = now_secs();
+    // Check nbf < exp first — a token with nbf >= exp is inherently invalid
+    // regardless of the current time.
+    if let Some(nbf) = token.payload.nbf
+        && nbf >= token.payload.exp
+    {
+        return Err(UcanError::InvalidTimeRange {
+            nbf,
+            exp: token.payload.exp,
+        });
+    }
+
+    let now = now_secs()?;
 
     if token.payload.exp <= now {
         return Err(UcanError::TokenExpired);
@@ -769,37 +803,8 @@ mod tests {
         (custody, handle, did, pk_bytes)
     }
 
-    /// Build a [`ValidationContext`] with in-memory implementations and
-    /// [`NoOpProofResolver`].
+    /// Build a [`ValidationContext`] with in-memory implementations.
     fn build_context<'a, S: BuildHasher>(
-        did_resolver: &'a InMemoryDidResolver,
-        nonce_tracker: &'a mut InMemoryNonceTracker,
-        revocation_checker: &'a InMemoryRevocationChecker,
-        ceiling: &'a HashSet<String, S>,
-        context_creator_did: &'a str,
-        presenting_agent_did: &'a str,
-    ) -> ValidationContext<
-        'a,
-        InMemoryDidResolver,
-        InMemoryNonceTracker,
-        InMemoryRevocationChecker,
-        NoOpProofResolver,
-        S,
-    > {
-        ValidationContext {
-            did_resolver,
-            nonce_tracker,
-            revocation_checker,
-            proof_resolver: &NoOpProofResolver,
-            ceiling,
-            context_creator_did,
-            presenting_agent_did,
-        }
-    }
-
-    /// Build a [`ValidationContext`] with an [`InMemoryProofResolver`] for
-    /// delegation chain tests.
-    fn build_context_with_proofs<'a, S: BuildHasher>(
         did_resolver: &'a InMemoryDidResolver,
         nonce_tracker: &'a mut InMemoryNonceTracker,
         revocation_checker: &'a InMemoryRevocationChecker,
@@ -889,6 +894,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -897,6 +903,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -937,6 +944,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -945,6 +953,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1034,7 +1043,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1114,7 +1123,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1165,7 +1174,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1210,6 +1219,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -1219,6 +1229,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             "did:dht:z6MkWrongCreator",
             "did:dht:z6MkMember",
@@ -1303,7 +1314,7 @@ mod tests {
         let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
 
         // The context creator is "did:dht:z6MkRealCreator" -- not non_creator.
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1348,6 +1359,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -1357,6 +1369,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkWrongAgent",
@@ -1397,6 +1410,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         // Request a capability the token does NOT grant.
@@ -1406,6 +1420,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1446,6 +1461,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         // Request specific context capability -- wildcard should match.
@@ -1455,6 +1471,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1538,7 +1555,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-att", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -1583,6 +1600,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
 
         // Ceiling does NOT include context:close.
         let ceiling: HashSet<String> = ["messages:read".to_owned(), "messages:write".to_owned()]
@@ -1595,6 +1613,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1635,6 +1654,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-nonce", "messages", "write");
 
@@ -1643,6 +1663,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1655,6 +1676,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1694,10 +1716,13 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
-        // Add the token's CID to the revocation list.
+        // Add the token's revocation CID (content hash) to the revocation list.
         let mut revocation_checker = InMemoryRevocationChecker::new();
-        revocation_checker.revoked.insert(compute_cid(&token));
+        revocation_checker
+            .revoked
+            .insert(compute_revocation_cid(&token.payload));
 
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
 
@@ -1705,6 +1730,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1718,7 +1744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_ucan_revocation_uses_compute_cid() {
+    async fn validate_ucan_revocation_uses_content_hash_cid() {
         let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
         let caps = vec!["messages:write".to_owned()];
 
@@ -1735,17 +1761,18 @@ mod tests {
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
-        let token_cid = compute_cid(&token);
+        let revocation_cid = compute_revocation_cid(&token.payload);
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
-        // Revoke using compute_cid.
+        // Revoke using content-hash CID (SHA-256 of payload).
         let mut revocation_checker = InMemoryRevocationChecker::new();
-        revocation_checker.revoked.insert(token_cid.clone());
+        revocation_checker.revoked.insert(revocation_cid.clone());
 
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-cid", "messages", "write");
 
@@ -1753,6 +1780,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1760,8 +1788,8 @@ mod tests {
 
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(
-            matches!(result, Err(UcanError::TokenRevoked(ref cid)) if cid == &token_cid),
-            "token revoked by compute_cid must be rejected: {result:?}"
+            matches!(result, Err(UcanError::TokenRevoked(ref cid)) if cid == &revocation_cid),
+            "token revoked by content-hash CID must be rejected: {result:?}"
         );
     }
 
@@ -1796,6 +1824,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-test", "messages", "write");
@@ -1804,6 +1833,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -1818,12 +1848,12 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_token_with_exp_beyond_24h() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: now + MAX_EXPIRY_SECS + 3600, // 25 hours from now
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -1847,8 +1877,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: 1, // Long expired.
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -1866,14 +1896,14 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_not_yet_valid() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
                 iss: "did:dht:z6MkCreator".to_owned(),
                 aud: "did:dht:z6MkMember".to_owned(),
-                exp: now + 3600,
-                nbf: Some(now + 7200), // Not valid for 2 hours.
+                exp: now + 7200,
+                nbf: Some(now + 3600), // nbf < exp, but nbf > now (not yet valid).
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
                 att: vec![],
                 prf: vec![],
@@ -1889,12 +1919,12 @@ mod tests {
 
     #[test]
     fn verify_expiry_accepts_valid_token() {
-        let now = now_secs();
+        let now = now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: now + 3600,
                 nbf: Some(now - 60),
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -1907,6 +1937,84 @@ mod tests {
         };
 
         assert!(verify_expiry(&token).is_ok());
+    }
+
+    #[test]
+    fn verify_expiry_rejects_nbf_greater_than_exp() {
+        let now = now_secs().unwrap();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: now + 3600,
+                nbf: Some(now + 7200), // nbf > exp
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let result = verify_expiry(&token);
+        assert!(
+            matches!(result, Err(UcanError::InvalidTimeRange { nbf, exp }) if nbf == now + 7200 && exp == now + 3600),
+            "nbf > exp must return InvalidTimeRange: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_expiry_rejects_nbf_equal_to_exp() {
+        let now = now_secs().unwrap();
+        let exp_time = now + 3600;
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: exp_time,
+                nbf: Some(exp_time), // nbf == exp
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let result = verify_expiry(&token);
+        assert!(
+            matches!(result, Err(UcanError::InvalidTimeRange { .. })),
+            "nbf == exp must return InvalidTimeRange: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_expiry_accepts_nbf_less_than_exp() {
+        let now = now_secs().unwrap();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".to_owned(),
+                aud: "did:dht:z6MkMember".to_owned(),
+                exp: now + 3600,
+                nbf: Some(now - 60), // nbf < exp and nbf <= now
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        assert!(
+            verify_expiry(&token).is_ok(),
+            "nbf < exp must pass time range validation"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1922,7 +2030,7 @@ mod tests {
             .as_millis();
 
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
-        let expiry = now_secs() + 3600;
+        let expiry = now_secs().unwrap() + 3600;
 
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         let result = tracker.check_and_record(&nonce, expiry);
@@ -1935,7 +2043,7 @@ mod tests {
     #[test]
     fn nonce_tracker_rejects_malformed_nonce() {
         let mut tracker = InMemoryNonceTracker::new();
-        let expiry = now_secs() + 3600;
+        let expiry = now_secs().unwrap() + 3600;
 
         // No separator.
         let result = tracker.check_and_record("nohyphen", expiry);
@@ -1990,6 +2098,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
 
         let required_cap = CapabilityUri::new("ctx-roundtrip", "messages", "write");
@@ -1998,6 +2107,7 @@ mod tests {
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
+            &proof_resolver,
             &ceiling,
             &issuer_did,
             "did:dht:z6MkMember",
@@ -2138,7 +2248,7 @@ mod tests {
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-full", "messages", "write");
 
-        let mut ctx = build_context_with_proofs(
+        let mut ctx = build_context(
             &resolver,
             &mut nonce_tracker,
             &revocation_checker,
@@ -2171,8 +2281,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: 1_700_000_000,
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -2191,5 +2301,379 @@ mod tests {
 
         let result = proof_resolver.resolve_proof("bafyrei-test").unwrap();
         assert_eq!(result, token);
+    }
+
+    // -----------------------------------------------------------------------
+    // Clock error / epoch-0 bypass prevention (SCP-173)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `now_secs()` returns `Ok` on a normal system (Result
+    /// signature works correctly after the `unwrap_or_default()` removal).
+    #[test]
+    fn now_secs_returns_ok_on_normal_system() {
+        let result = now_secs();
+        assert!(
+            result.is_ok(),
+            "now_secs() should succeed on a normal system"
+        );
+        assert!(
+            result.unwrap() > 0,
+            "current time should be after Unix epoch"
+        );
+    }
+
+    /// A UCAN with exp=0 and nbf=0 must be rejected. Before the clock-error
+    /// fix, `unwrap_or_default()` would produce `Duration::ZERO` if the system
+    /// clock returned an error, making `now == 0`. That would cause `exp <= now`
+    /// to be `0 <= 0` (expired) but more critically, `nbf <= now` would be
+    /// `0 <= 0` (valid). With exp=1 and nbf=0, the token would pass all checks.
+    ///
+    /// This test verifies that epoch-0 tokens are always rejected on a
+    /// correctly-running system (where now >> 0), and that `now_secs()` no
+    /// longer defaults to zero.
+    #[test]
+    fn verify_expiry_rejects_epoch_zero_token() {
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: 0,
+                nbf: Some(0),
+                nnc: "0000000000000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let result = verify_expiry(&token);
+        // nbf == exp triggers InvalidTimeRange before TokenExpired.
+        assert!(
+            matches!(result, Err(UcanError::InvalidTimeRange { nbf: 0, exp: 0 })),
+            "epoch-0 token with nbf==exp must be rejected as InvalidTimeRange: {result:?}"
+        );
+    }
+
+    /// A UCAN with exp=1 and nbf=0 must still be rejected. Before the fix,
+    /// if `now_secs()` defaulted to 0 on clock error, `exp (1) > now (0)`
+    /// would pass, and `nbf (0) <= now (0)` would also pass — a full bypass.
+    /// With the fix, `now_secs()` returns `ClockError` on failure, and on
+    /// normal systems now >> 0 so exp=1 is expired.
+    #[test]
+    fn verify_expiry_rejects_near_epoch_token() {
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: 1,
+                nbf: Some(0),
+                nnc: "0000000000000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let result = verify_expiry(&token);
+        assert!(
+            matches!(result, Err(UcanError::TokenExpired)),
+            "near-epoch token (exp=1) must be rejected: {result:?}"
+        );
+    }
+
+    /// Verify that `ClockError` displays correctly.
+    #[test]
+    fn clock_error_display() {
+        let err = UcanError::ClockError("system clock before Unix epoch: test".to_owned());
+        assert_eq!(
+            err.to_string(),
+            "system clock error: system clock before Unix epoch: test"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Circular delegation detection (SCP-191)
+    // -----------------------------------------------------------------------
+
+    /// A->B->C->A cycle must be rejected with `CircularDelegation`.
+    #[tokio::test]
+    async fn validate_ucan_rejects_circular_delegation_a_b_c_a() {
+        let (custody_a, key_a, did_a, pk_a) = setup_identity().await;
+        let (custody_b, key_b, did_b, pk_b) = setup_identity().await;
+        let (custody_c, key_c, did_c, pk_c) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned()];
+
+        let token_a_to_b = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: &did_b,
+                context_id: "ctx-cycle",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+        let cid_a_to_b = compute_cid(&token_a_to_b);
+
+        let token_b_to_c = mint_ucan(
+            &MintParams {
+                issuer_did: &did_b,
+                issuer_key: &key_b,
+                audience_did: &did_c,
+                context_id: "ctx-cycle",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![cid_a_to_b.clone()],
+                facts: None,
+            },
+            &custody_b,
+        )
+        .await
+        .unwrap();
+        let cid_b_to_c = compute_cid(&token_b_to_c);
+
+        let token_c_to_a = mint_ucan(
+            &MintParams {
+                issuer_did: &did_c,
+                issuer_key: &key_c,
+                audience_did: &did_a,
+                context_id: "ctx-cycle",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![cid_b_to_c.clone()],
+                facts: None,
+            },
+            &custody_c,
+        )
+        .await
+        .unwrap();
+        let cid_c_to_a = compute_cid(&token_c_to_a);
+
+        let token_presenting = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: "did:dht:z6MkPresenter",
+                context_id: "ctx-cycle",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![cid_c_to_a.clone()],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [
+                (did_a.clone(), pk_a),
+                (did_b.clone(), pk_b),
+                (did_c.clone(), pk_c),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([
+                (cid_a_to_b, token_a_to_b),
+                (cid_b_to_c, token_b_to_c),
+                (cid_c_to_a, token_c_to_a),
+            ]),
+        };
+
+        let result = verify_delegation_chain(&token_presenting, &resolver, &proof_resolver);
+        assert!(
+            matches!(result, Err(UcanError::CircularDelegation(_))),
+            "A->B->C->A cycle must be rejected with CircularDelegation: {result:?}"
+        );
+    }
+
+    /// A->B->C (no cycle) must pass chain verification.
+    #[tokio::test]
+    async fn validate_ucan_accepts_linear_chain_a_b_c() {
+        use crate::crypto::ucan::Attenuation;
+        use crate::crypto::ucan::mint::DelegateParams;
+
+        let (custody_a, key_a, did_a, pk_a) = setup_identity().await;
+        let (custody_b, key_b, did_b, pk_b) = setup_identity().await;
+        let (_custody_c, _key_c, did_c, _pk_c) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned()];
+
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: &did_b,
+                context_id: "ctx-linear",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+        let root_cid = compute_cid(&root_token);
+
+        let delegated_token = crate::crypto::ucan::mint::delegate_ucan(
+            &DelegateParams {
+                parent_token: &root_token,
+                delegator_did: &did_b,
+                delegator_key: &key_b,
+                delegatee_did: &did_c,
+                attenuated_capabilities: &[Attenuation {
+                    with: "scp:ctx:ctx-linear/messages:write".to_owned(),
+                    can: "write".to_owned(),
+                }],
+                lifetime_secs: 1800,
+                facts: None,
+            },
+            &custody_b,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [(did_a.clone(), pk_a), (did_b.clone(), pk_b)]
+                .into_iter()
+                .collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let result = verify_delegation_chain(&delegated_token, &resolver, &proof_resolver);
+        assert!(result.is_ok(), "linear chain A->B->C must pass: {result:?}");
+        assert_eq!(result.unwrap(), did_a);
+    }
+
+    /// Self-delegation A->A must be rejected with `CircularDelegation`.
+    #[tokio::test]
+    async fn validate_ucan_rejects_self_delegation_a_to_a() {
+        let (custody_a, key_a, did_a, pk_a) = setup_identity().await;
+
+        let caps = vec!["messages:write".to_owned()];
+
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: &did_a,
+                context_id: "ctx-self",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+        let root_cid = compute_cid(&root_token);
+
+        let child_token = mint_ucan(
+            &MintParams {
+                issuer_did: &did_a,
+                issuer_key: &key_a,
+                audience_did: "did:dht:z6MkSomeone",
+                context_id: "ctx-self",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![root_cid.clone()],
+                facts: None,
+            },
+            &custody_a,
+        )
+        .await
+        .unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((did_a.clone(), pk_a)).collect(),
+        };
+
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+        };
+
+        let result = verify_delegation_chain(&child_token, &resolver, &proof_resolver);
+        assert!(
+            matches!(result, Err(UcanError::CircularDelegation(_))),
+            "self-delegation A->A must be rejected with CircularDelegation: {result:?}"
+        );
+    }
+
+    /// MAX_CHAIN_DEPTH guard still terminates excessively long chains.
+    #[test]
+    fn verify_chain_recursive_rejects_excessive_depth() {
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkA".into(),
+                aud: "did:dht:z6MkB".into(),
+                exp: now_secs().unwrap() + 3600,
+                nbf: None,
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec!["bafyrei-some-proof".to_owned()],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        let resolver = InMemoryDidResolver {
+            keys: std::collections::HashMap::new(),
+        };
+        let proof_resolver = InMemoryProofResolver::new();
+        let mut seen = HashSet::new();
+
+        let result = verify_chain_recursive(
+            &token,
+            &resolver,
+            &proof_resolver,
+            MAX_CHAIN_DEPTH + 1,
+            &mut seen,
+        );
+
+        assert!(
+            matches!(result, Err(UcanError::DelegationChainBroken(ref msg)) if msg.contains("maximum depth")),
+            "chain exceeding MAX_CHAIN_DEPTH must be rejected: {result:?}"
+        );
+    }
+
+    /// `CircularDelegation` error displays correctly.
+    #[test]
+    fn circular_delegation_error_display() {
+        let err = UcanError::CircularDelegation(
+            "issuer 'did:dht:z6MkA' appears multiple times".to_owned(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "circular delegation detected: issuer 'did:dht:z6MkA' appears multiple times"
+        );
     }
 }

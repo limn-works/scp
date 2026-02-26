@@ -35,8 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::keys::MediaError;
 
-/// A DID string (e.g., `"did:dht:z6Mk..."`).
-pub type DID = String;
+use scp_core::identity::DID;
 
 /// A context identifier string.
 pub type ContextId = String;
@@ -490,7 +489,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -510,7 +509,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice, MediaCapability::Video],
-            vec![ALICE.to_owned(), BOB.to_owned()],
+            vec![ALICE.into(), BOB.into()],
             TS_START,
         )
         .unwrap();
@@ -526,7 +525,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice, MediaCapability::Video],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap_err();
@@ -541,7 +540,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap_err();
@@ -556,7 +555,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap_err();
@@ -586,7 +585,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -594,7 +593,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -609,7 +608,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -617,7 +616,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![BOB.to_owned()],
+            vec![BOB.into()],
             TS_START,
         )
         .unwrap();
@@ -634,7 +633,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -650,7 +649,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -667,7 +666,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -687,15 +686,15 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
         activate_session(&mut session).unwrap();
 
-        join_media_session(&mut session, BOB.to_owned()).unwrap();
+        join_media_session(&mut session, BOB.into()).unwrap();
         assert_eq!(session.participants.len(), 2);
-        assert!(session.participants.contains(&BOB.to_owned()));
+        assert!(session.participants.contains(&DID::from(BOB)));
     }
 
     #[test]
@@ -705,12 +704,12 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
 
-        assert!(join_media_session(&mut session, BOB.to_owned()).is_ok());
+        assert!(join_media_session(&mut session, BOB.into()).is_ok());
     }
 
     #[test]
@@ -720,13 +719,13 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
         activate_session(&mut session).unwrap();
 
-        join_media_session(&mut session, ALICE.to_owned()).unwrap();
+        join_media_session(&mut session, ALICE.into()).unwrap();
         assert_eq!(session.participants.len(), 1, "duplicate DID should not be added");
     }
 
@@ -737,14 +736,14 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
         activate_session(&mut session).unwrap();
         end_media_session(&mut session, TS_END).unwrap();
 
-        let err = join_media_session(&mut session, BOB.to_owned()).unwrap_err();
+        let err = join_media_session(&mut session, BOB.into()).unwrap_err();
         assert!(matches!(err, MediaError::InvalidSessionState { .. }));
     }
 
@@ -755,14 +754,14 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
         activate_session(&mut session).unwrap();
 
-        join_media_session(&mut session, BOB.to_owned()).unwrap();
-        join_media_session(&mut session, CAROL.to_owned()).unwrap();
+        join_media_session(&mut session, BOB.into()).unwrap();
+        join_media_session(&mut session, CAROL.into()).unwrap();
         assert_eq!(session.participants.len(), 3);
     }
 
@@ -775,7 +774,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned(), BOB.to_owned()],
+            vec![ALICE.into(), BOB.into()],
             TS_START,
         )
         .unwrap();
@@ -799,7 +798,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -816,7 +815,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -835,7 +834,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -853,17 +852,17 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
         activate_session(&mut session).unwrap();
-        join_media_session(&mut session, BOB.to_owned()).unwrap();
-        join_media_session(&mut session, CAROL.to_owned()).unwrap();
+        join_media_session(&mut session, BOB.into()).unwrap();
+        join_media_session(&mut session, CAROL.into()).unwrap();
 
         let metadata = end_media_session(&mut session, TS_END).unwrap();
         assert_eq!(metadata.participants.len(), 3);
-        assert!(metadata.participants.contains(&CAROL.to_owned()));
+        assert!(metadata.participants.contains(&DID::from(CAROL)));
     }
 
     // ── SessionMetadata serialization ──────────────────────────────────
@@ -873,7 +872,7 @@ mod tests {
         let metadata = SessionMetadata {
             session_id: "ms-test".to_owned(),
             context_id: CTX.to_owned(),
-            participants: vec![ALICE.to_owned(), BOB.to_owned()],
+            participants: vec![ALICE.into(), BOB.into()],
             capabilities: vec![MediaCapability::Voice, MediaCapability::Video],
             started_at: TS_START,
             ended_at: TS_END,
@@ -891,7 +890,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice, MediaCapability::Video],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -921,7 +920,7 @@ mod tests {
                 MediaCapability::Video,
                 MediaCapability::ScreenShare,
             ],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();
@@ -932,8 +931,8 @@ mod tests {
         assert_eq!(session.state, MediaSessionState::Active);
 
         // 3. Join additional participants
-        join_media_session(&mut session, BOB.to_owned()).unwrap();
-        join_media_session(&mut session, CAROL.to_owned()).unwrap();
+        join_media_session(&mut session, BOB.into()).unwrap();
+        join_media_session(&mut session, CAROL.into()).unwrap();
         assert_eq!(session.participants.len(), 3);
 
         // 4. End
@@ -959,7 +958,7 @@ mod tests {
             CTX.to_owned(),
             &ceiling,
             vec![MediaCapability::Voice],
-            vec![ALICE.to_owned()],
+            vec![ALICE.into()],
             TS_START,
         )
         .unwrap();

@@ -35,23 +35,100 @@ use std::net::SocketAddr;
 use futures::StreamExt;
 
 use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
+use scp_core::crypto::mls::group::{
+    ScpMlsGroup, add_member, create_group, generate_key_package, join_group,
+};
 use scp_core::crypto::sender_keys::{
-    SenderKeyStore, decrypt_sender_layer, encrypt_sender_layer, generate_sender_key,
-    handle_sender_key_request, open_sender_key_response, publish_sender_key_epoch_advance,
-    request_sender_key, verify_epoch_advance,
+    SenderKeyStore, generate_sender_key, handle_sender_key_request, open_sender_key_response,
+    publish_sender_key_epoch_advance, request_sender_key, verify_epoch_advance,
 };
 use scp_core::envelope::inner::create_inner_envelope;
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
 use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
 use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
+use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::traits::KeyCustody;
+use scp_platform::traits::{
+    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
+    Signature,
+};
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::InMemoryBlobStorage;
 use scp_transport::traits::{RoutingId, TransportAdapter, TransportEvent};
+
+/// A [`KeyCustody`] adapter that delegates signing to an [`ScpMlsGroup`]'s
+/// MLS signer key. This is used in integration tests to create inner envelopes
+/// signed by the correct MLS key, as required by SCP-177.
+///
+/// Only `sign` and `public_key` are implemented; other methods return errors
+/// since they are not needed for inner envelope creation.
+struct MlsGroupKeyCustody<'a> {
+    group: &'a ScpMlsGroup,
+}
+
+#[allow(clippy::manual_async_fn)]
+impl KeyCustody for MlsGroupKeyCustody<'_> {
+    fn generate_keypair(
+        &self,
+        _key_type: KeyType,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
+
+    fn sign(
+        &self,
+        _key: &KeyHandle,
+        data: &[u8],
+    ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
+        let result = self
+            .group
+            .sign(data)
+            .map(Signature::new)
+            .map_err(|e| PlatformError::CustodyError(e.to_string()));
+        async { result }
+    }
+
+    fn public_key(
+        &self,
+        _key: &KeyHandle,
+    ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
+        let result = self
+            .group
+            .signer_public_key()
+            .map(PublicKey::new)
+            .map_err(|e| PlatformError::CustodyError(e.to_string()));
+        async { result }
+    }
+
+    fn destroy_key(
+        &self,
+        _key: &KeyHandle,
+    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
+
+    fn dh_agree(
+        &self,
+        _key: &KeyHandle,
+        _peer_public: &[u8; 32],
+    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
+
+    fn derive_pseudonym(
+        &self,
+        _key: &KeyHandle,
+        _context_id: &[u8],
+    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
+
+    fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
+        CustodyType::InMemory
+    }
+}
 
 /// Starts a native relay server on an ephemeral port and returns its address.
 async fn start_relay() -> SocketAddr {
@@ -61,7 +138,8 @@ async fn start_relay() -> SocketAddr {
     };
     let storage = InMemoryBlobStorage::new();
     let server = RelayServer::new(config, storage);
-    server.start().await.unwrap()
+    let (_handle, addr) = server.start().await.unwrap();
+    addr
 }
 
 /// Creates an SCP identity using the in-memory DID:DHT method.
@@ -91,8 +169,10 @@ async fn receive_envelope(
                 TransportEvent::Terminated { reason } => {
                     panic!("subscription terminated: {reason}")
                 }
-                // BackfillComplete, Reconnected — skip silently.
-                TransportEvent::BackfillComplete | TransportEvent::Reconnected => {}
+                // BackfillComplete, Reconnected, SuppressionDetected — skip silently.
+                TransportEvent::BackfillComplete
+                | TransportEvent::Reconnected
+                | TransportEvent::SuppressionDetected(_) => {}
             }
         }
         panic!("stream ended without delivering an envelope");
@@ -120,7 +200,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 3: Alice creates an MLS group (ADR-001)
     // ---------------------------------------------------------------
-    let alice_cred = ScpCredential::new(alice_id.did.clone(), None);
+    let alice_cred = ScpCredential::new(alice_id.did.clone(), None).unwrap();
     let mut alice_group = create_group(&alice_cred).unwrap();
 
     // ---------------------------------------------------------------
@@ -149,7 +229,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 5: Bob publishes key packages (ADR-001)
     // ---------------------------------------------------------------
-    let bob_cred = ScpCredential::new(bob_id.did.clone(), None);
+    let bob_cred = ScpCredential::new(bob_id.did.clone(), None).unwrap();
     let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
 
     // ---------------------------------------------------------------
@@ -217,14 +297,20 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     bob_sk_store.set(ctx_id, &alice_id.did, received_sk);
 
     // ---------------------------------------------------------------
-    // Step 8: Alice encrypts message with sender key, wraps in envelopes (ADR-002, ADR-007)
+    // Step 8: Alice wraps message in envelopes with sender key + MLS (ADR-002, ADR-007)
     // ---------------------------------------------------------------
     let original_msg = b"Hello Bob, this is a secret message from Alice!";
 
-    // 8a. Encrypt with sender key (ADR-007).
-    let sk_encrypted = encrypt_sender_layer(&alice_sender_key, original_msg).unwrap();
-
-    // 8b. Create inner envelope with signature (ADR-002).
+    // 8a. Create inner envelope with signature (ADR-002).
+    //     The inner envelope must be signed with the MLS group signer's key
+    //     (not Alice's identity key) because open_envelope resolves the
+    //     sender's public key from the MLS group tree (SCP-177).
+    let alice_mls_custody = MlsGroupKeyCustody {
+        group: &alice_group,
+    };
+    // The handle value doesn't matter — MlsGroupKeyCustody ignores it
+    // and always delegates to the group's signer.
+    let dummy_handle = KeyHandle::new(0);
     let inner_env = create_inner_envelope(
         ctx_id,
         &alice_id.did,
@@ -232,15 +318,15 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
         0, // generation
         1, // sequence
         1_700_000_000,
-        &sk_encrypted,
+        original_msg,
         None, // no provenance for this test
-        &alice_custody,
-        &alice_id.active_signing_key,
+        &alice_mls_custody,
+        &dummy_handle,
     )
     .await
     .unwrap();
 
-    // 8c. Derive pseudonym for routing (ADR-002).
+    // 8b. Derive pseudonym for routing (ADR-002).
     let pseudonym = derive_pseudonym(&alice_custody, &alice_id.identity_key, ctx_id.as_bytes())
         .await
         .unwrap();
@@ -248,10 +334,12 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     let routing_bytes = pseudonym.public_key.as_bytes();
     let routing_arr: [u8; 32] = routing_bytes.try_into().unwrap();
 
-    // 8d. Seal: serialize inner, encrypt with MLS, wrap in outer envelope (ADR-001, ADR-002).
+    // 8c. Seal: serialize inner, encrypt with sender key, encrypt with MLS,
+    //     wrap in outer envelope (ADR-001, ADR-002, ADR-007).
     let outer_env = seal_envelope(
         &inner_env,
         &mut alice_group,
+        &alice_sender_key,
         &routing_arr,
         None, // broadcast
         3600, // 1 hour TTL
@@ -290,17 +378,18 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     //          verifies inner envelope signature (ADR-001, ADR-002, ADR-007)
     // ---------------------------------------------------------------
 
-    // 11a. Open outer envelope: MLS decrypt + inner signature verification.
-    let verified_inner = open_envelope(&received_outer, &mut bob_group, &alice_pubkey).unwrap();
-
-    // 11b. Strip padding to get the sender-key-encrypted payload.
-    let sk_encrypted_payload = strip_padding(&verified_inner.payload).unwrap();
-
-    // 11c. Decrypt sender key layer (ADR-007).
+    // 11a. Open outer envelope: MLS decrypt + sender key decrypt + inner
+    //      signature verification (ADR-001, ADR-002, ADR-007).
+    //      The sender's Ed25519 public key is resolved internally from the
+    //      MLS group state (SCP-177) — no explicit public key argument needed.
     let bob_alice_sk = bob_sk_store
         .get(ctx_id, &alice_id.did)
         .expect("Bob must have Alice's sender key");
-    let decrypted_msg = decrypt_sender_layer(bob_alice_sk, &sk_encrypted_payload).unwrap();
+    let verified_inner =
+        open_envelope(&received_outer, &mut bob_group, bob_alice_sk).unwrap();
+
+    // 11b. Strip padding to recover original plaintext.
+    let decrypted_msg = strip_padding(&verified_inner.payload).unwrap();
 
     // ---------------------------------------------------------------
     // Step 12: Bob reads Alice's message — content matches original

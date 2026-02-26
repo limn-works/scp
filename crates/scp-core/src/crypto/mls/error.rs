@@ -91,4 +91,8 @@ pub enum MlsError {
     /// The key package buffer is empty and cannot provide a key package.
     #[error("key package buffer exhausted")]
     KeyPackageBufferExhausted,
+
+    /// The provided DID does not match the expected `did:dht:z...` format.
+    #[error("invalid DID format: {0}")]
+    InvalidDidFormat(String),
 }

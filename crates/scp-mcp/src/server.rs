@@ -25,6 +25,7 @@
 
 use std::collections::HashSet;
 
+use scp_core::context::tools::validate_value_against_schema;
 use serde_json::Value;
 
 use crate::namespace::{
@@ -381,9 +382,10 @@ impl<P: ContextProvider> McpServer<P> {
     // Tool invocation
     // -----------------------------------------------------------------------
 
-    /// Handles `tools/call` -- parses context namespace, validates capability,
-    /// validates input against schema, invokes the tool, validates output, and
-    /// attaches provenance.
+    /// Handles `tools/call` -- parses context namespace, validates membership
+    /// and capability, validates input against schema, invokes the tool,
+    /// validates output, and attaches provenance.
+    #[allow(clippy::too_many_lines)]
     fn handle_tools_call(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let params: ToolsCallParams = match parse_params(request.params.as_ref()) {
             Ok(p) => p,
@@ -405,6 +407,25 @@ impl<P: ContextProvider> McpServer<P> {
             }
         };
 
+        // Verify caller is a member of the target context.
+        if !self
+            .provider
+            .active_context_ids()
+            .iter()
+            .any(|id| id == &context_id)
+        {
+            return JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError {
+                    code: protocol::INTERNAL_ERROR,
+                    message: format!(
+                        "membership check failed: caller is not a member of context {context_id}"
+                    ),
+                    data: None,
+                },
+            );
+        }
+
         // Validate UCAN capability.
         if let Err(msg) = self.provider.validate_capability(&context_id, tool_name) {
             return JsonRpcResponse::error(
@@ -419,13 +440,13 @@ impl<P: ContextProvider> McpServer<P> {
 
         // Validate input against schema.
         if let Some(schema) = self.find_input_schema(&context_id, tool_name)
-            && let Err(msg) = validate_input(&params.arguments, &schema)
+            && let Err(msg) = validate_value_against_schema(&params.arguments, &schema)
         {
             return JsonRpcResponse::error(
                 request.id.clone(),
                 JsonRpcError {
                     code: protocol::INVALID_PARAMS,
-                    message: msg,
+                    message: format!("schema validation failed: {msg}"),
                     data: None,
                 },
             );
@@ -439,7 +460,7 @@ impl<P: ContextProvider> McpServer<P> {
             Ok(output) => {
                 // Validate output against schema if available.
                 if let Some(out_schema) = self.find_output_schema(&context_id, tool_name)
-                    && let Err(msg) = validate_output(&output, &out_schema)
+                    && let Err(msg) = validate_value_against_schema(&output, &out_schema)
                 {
                     return JsonRpcResponse::error(
                         request.id.clone(),
@@ -571,6 +592,22 @@ impl<P: ContextProvider> McpServer<P> {
                 JsonRpcError {
                     code: protocol::RESOURCE_NOT_FOUND,
                     message: format!("context not found: {context_id}"),
+                    data: None,
+                },
+            );
+        }
+
+        // Validate UCAN capability for the requested resource type.
+        let capability_name = format!("resource:{resource_type}");
+        if let Err(msg) = self
+            .provider
+            .validate_capability(&context_id, &capability_name)
+        {
+            return JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError {
+                    code: protocol::CAPABILITY_DENIED,
+                    message: msg,
                     data: None,
                 },
             );
@@ -749,61 +786,6 @@ fn internal_error(id: RequestId, message: &str) -> JsonRpcResponse {
             data: None,
         },
     )
-}
-
-/// Validates tool input against a JSON schema.
-///
-/// Uses the basic structural validation from the schema module's convention:
-/// checks the top-level type constraint.
-fn validate_input(input: &Value, schema: &Value) -> Result<(), String> {
-    let Some(schema_obj) = schema.as_object() else {
-        return Ok(()); // No schema to validate against.
-    };
-
-    let Some(type_field) = schema_obj.get("type") else {
-        return Ok(());
-    };
-
-    let Some(expected_type) = type_field.as_str() else {
-        return Ok(());
-    };
-
-    let matches = match expected_type {
-        "object" => input.is_object(),
-        "array" => input.is_array(),
-        "string" => input.is_string(),
-        "number" => input.is_number(),
-        "integer" => input.is_i64() || input.is_u64(),
-        "boolean" => input.is_boolean(),
-        "null" => input.is_null(),
-        _ => true,
-    };
-
-    if matches {
-        Ok(())
-    } else {
-        Err(format!(
-            "input validation failed: expected {expected_type}, got {}",
-            json_type_name(input)
-        ))
-    }
-}
-
-/// Validates tool output against a JSON schema (same logic as input).
-fn validate_output(output: &Value, schema: &Value) -> Result<(), String> {
-    validate_input(output, schema)
-}
-
-/// Returns a human-readable name for a JSON value's type.
-const fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 /// Parses a resource URI into `(context_id, resource_type)`.
@@ -1277,7 +1259,7 @@ mod tests {
         let resp = server.handle_request(&req).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, protocol::INVALID_PARAMS);
-        assert!(err.message.contains("input validation failed"));
+        assert!(err.message.contains("schema validation failed"));
     }
 
     #[test]
@@ -1329,6 +1311,24 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, protocol::TOOL_EXECUTION_ERROR);
         assert!(err.message.contains("tool crashed"));
+    }
+
+    #[test]
+    fn tools_call_rejects_non_member_context() {
+        // Agent only belongs to ctx_a and ctx_b, not ctx_x.
+        let mut server = initialized_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_TOOLS_CALL,
+            Some(serde_json::json!({
+                "name": "ctx_x/send_message",
+                "arguments": {"content": "hello"}
+            })),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, protocol::INTERNAL_ERROR);
+        assert!(err.message.contains("membership check failed"));
+        assert!(err.message.contains("ctx_x"));
     }
 
     #[test]
@@ -1494,6 +1494,39 @@ mod tests {
         assert_eq!(err.code, protocol::RESOURCE_NOT_FOUND);
     }
 
+    #[test]
+    fn resources_read_rejects_denied_ucan_capability() {
+        // Deny the resource:members capability for ctx_a.
+        let provider = MockProvider {
+            denied_capabilities: vec![("ctx_a".to_owned(), "resource:members".to_owned())],
+            ..MockProvider::default()
+        };
+        let mut server = initialized_server(provider);
+        let req = make_request(
+            protocol::METHOD_RESOURCES_READ,
+            Some(serde_json::json!({"uri": "scp://ctx_a/members"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, protocol::CAPABILITY_DENIED);
+    }
+
+    #[test]
+    fn resources_read_succeeds_with_valid_ucan_and_membership() {
+        // Default provider has ctx_a as active and no denied capabilities.
+        let mut server = initialized_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_RESOURCES_READ,
+            Some(serde_json::json!({"uri": "scp://ctx_a/members"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        let contents = result["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["uri"], "scp://ctx_a/members");
+    }
+
     // -----------------------------------------------------------------------
     // resources/subscribe tests
     // -----------------------------------------------------------------------
@@ -1568,36 +1601,35 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Input/output validation
+    // Input/output validation (delegates to scp_core shared validation)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_input_accepts_matching_type() {
+    fn shared_validation_accepts_matching_type() {
         let schema = serde_json::json!({"type": "object"});
         let input = serde_json::json!({"key": "value"});
-        assert!(validate_input(&input, &schema).is_ok());
+        assert!(validate_value_against_schema(&input, &schema).is_ok());
     }
 
     #[test]
-    fn validate_input_rejects_type_mismatch() {
+    fn shared_validation_rejects_type_mismatch() {
         let schema = serde_json::json!({"type": "object"});
         let input = serde_json::json!("string value");
-        let err = validate_input(&input, &schema).unwrap_err();
-        assert!(err.contains("expected object"));
+        assert!(validate_value_against_schema(&input, &schema).is_err());
     }
 
     #[test]
-    fn validate_input_passes_when_no_schema() {
+    fn shared_validation_passes_when_no_type_constraint() {
         let schema = serde_json::json!({});
         let input = serde_json::json!(42);
-        assert!(validate_input(&input, &schema).is_ok());
+        assert!(validate_value_against_schema(&input, &schema).is_ok());
     }
 
     #[test]
-    fn validate_input_passes_for_non_object_schema() {
+    fn shared_validation_rejects_non_object_schema() {
         let schema = serde_json::json!("not an object");
         let input = serde_json::json!(42);
-        assert!(validate_input(&input, &schema).is_ok());
+        assert!(validate_value_against_schema(&input, &schema).is_err());
     }
 
     // -----------------------------------------------------------------------

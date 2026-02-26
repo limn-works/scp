@@ -135,7 +135,8 @@ Invalid transitions (must return error):
    - Issues UCAN tokens for the joiner's role capabilities (ADR-009).
    - Appends `MemberJoined` event to event log.
 
-4. **`leave_context(handle: &ContextHandle, member_did: &DID) -> Result<(), ContextError>`**
+4. **`leave_context(handle: &ContextHandle, caller_did: &DID, member_did: &DID) -> Result<(), ContextError>`**
+   - Authorization: self-removal (`caller_did == member_did`) is always allowed; otherwise caller must hold `MemberRemove` capability.
    - Calls ADR-001 `remove_member()` to remove from MLS group.
    - Removes member's sender key from all members' stores.
    - Appends `MemberLeft` event to event log.

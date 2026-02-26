@@ -18,6 +18,7 @@ use futures::Stream;
 use scp_core::envelope::OuterEnvelope;
 
 use crate::error::TransportError;
+use crate::scoring::SuppressionWarning;
 
 /// Opaque blob identifier -- the SHA-256 hash of the blob's wire bytes.
 ///
@@ -121,6 +122,13 @@ pub enum TransportEvent {
         /// Human-readable reason for the termination.
         reason: String,
     },
+
+    /// A suppression was detected: a blob was delivered by fewer than half
+    /// the context's relays within the cross-check window.
+    ///
+    /// The consuming layer should downgrade the reliability scores of relays
+    /// that failed to deliver the blob.
+    SuppressionDetected(SuppressionWarning),
 }
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all

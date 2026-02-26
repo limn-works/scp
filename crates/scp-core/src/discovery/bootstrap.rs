@@ -12,6 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::identity::DidMethod;
+use crate::well_known::{WellKnownScp, WellKnownValidationError};
+
 use super::{ContextId, DiscoveryError};
 
 // ---------------------------------------------------------------------------
@@ -165,6 +168,41 @@ impl BootstrapResolver {
             .collect()
     }
 
+    /// Processes a `.well-known/scp` document with full DID cross-verification.
+    ///
+    /// Performs both privacy validation (§18.3) and DHT cross-verification
+    /// (§18.3.2) before trusting the document. This method MUST be called on
+    /// every fetch — verification is not cached from first use (no TOFU).
+    ///
+    /// # Verification Steps
+    ///
+    /// 1. Validate the document against §18.3 privacy constraints.
+    /// 2. Resolve the operator DID via DHT and cross-reference the relay URL,
+    ///    operator DID, and context listings against the resolved DID document.
+    ///
+    /// # Arguments
+    ///
+    /// * `well_known` -- The `.well-known/scp` document to verify.
+    /// * `did_method` -- A [`DidMethod`] implementation for DID resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WellKnownBootstrapError::ValidationFailed`] if privacy
+    /// validation or DID cross-verification fails.
+    pub async fn process_well_known<M: DidMethod>(
+        &self,
+        well_known: &WellKnownScp,
+        did_method: &M,
+    ) -> Result<(), WellKnownBootstrapError> {
+        // Step 1: Privacy validation.
+        well_known.validate()?;
+
+        // Step 2: DHT cross-verification (§18.3.2). Called on every fetch.
+        well_known.verify_against_did(did_method).await?;
+
+        Ok(())
+    }
+
     /// Attempts to resolve discovery context IDs, falling back to DID
     /// resolution if configured and no contexts are available.
     ///
@@ -204,6 +242,18 @@ impl BootstrapResolver {
             )))
         }
     }
+}
+
+/// Errors produced when processing `.well-known/scp` data during bootstrap.
+#[derive(Debug, thiserror::Error)]
+pub enum WellKnownBootstrapError {
+    /// The `.well-known/scp` document failed privacy or DID verification.
+    #[error("well-known validation failed: {0}")]
+    ValidationFailed(#[from] WellKnownValidationError),
+
+    /// A discovery error occurred during bootstrap processing.
+    #[error("discovery error: {0}")]
+    Discovery(#[from] DiscoveryError),
 }
 
 impl From<BootstrapConfig> for BootstrapResolver {

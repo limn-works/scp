@@ -22,6 +22,8 @@
 //!
 //! See ADR-001 acceptance criteria 4 and 5.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use openmls::prelude::*;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
@@ -49,13 +51,10 @@ use super::group::ScpMlsGroup;
 ///
 /// See ADR-001 acceptance criterion 4.
 pub fn encrypt(group: &mut ScpMlsGroup, plaintext: &[u8]) -> Result<MlsMessageOut, MlsError> {
-    if group.destroyed {
-        return Err(MlsError::GroupDestroyed);
-    }
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
 
-    group
-        .group
-        .create_message(&group.provider, &group.signer, plaintext)
+    g.create_message(&group.provider, signer, plaintext)
         .map_err(|e| MlsError::EncryptionFailed(e.to_string()))
 }
 
@@ -86,7 +85,7 @@ pub fn encrypt(group: &mut ScpMlsGroup, plaintext: &[u8]) -> Result<MlsMessageOu
 ///
 /// See ADR-001 acceptance criterion 5.
 pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, MlsError> {
-    if group.destroyed {
+    if group.group.is_none() {
         return Err(MlsError::GroupDestroyed);
     }
 
@@ -100,14 +99,126 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
     // Process the message — this verifies membership tag and generation number.
-    let processed = group
-        .group
-        .process_message(&group.provider, protocol_message)
-        .map_err(|e| MlsError::DecryptionFailed(e.to_string()))?;
+    //
+    // OpenMLS may panic on AEAD decryption failure for tampered ciphertexts
+    // (e.g., corrupted authentication tags). We guard against this with
+    // catch_unwind to convert the panic into an MlsError::DecryptionFailed,
+    // preventing a malicious relay from crashing the client process (DoS).
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let process_result = catch_unwind(AssertUnwindSafe(|| {
+        g.process_message(&group.provider, protocol_message)
+    }));
+
+    let processed = match process_result {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Err(_) => {
+            return Err(MlsError::DecryptionFailed(
+                "OpenMLS panicked during message processing".to_string(),
+            ));
+        }
+    };
 
     // Extract the application message content.
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(app_msg.into_bytes()),
+        _ => Err(MlsError::NotApplicationMessage),
+    }
+}
+
+/// Decrypts an MLS `PrivateMessage` and returns both the plaintext bytes and
+/// the sender's Ed25519 signature key (as extracted from the MLS group state).
+///
+/// This function performs the same decryption as [`decrypt`] but additionally
+/// resolves the sender's identity from the MLS group tree. The sender's
+/// `signature_key` from their leaf node is returned alongside the plaintext,
+/// enabling the caller to verify inner envelope signatures without requiring
+/// the sender's public key as an external parameter.
+///
+/// # Arguments
+///
+/// * `group` - The MLS group to decrypt within. Must be active.
+/// * `ciphertext` - The serialized MLS ciphertext bytes.
+///
+/// # Returns
+///
+/// A tuple of `(plaintext, sender_signature_key)` where `sender_signature_key`
+/// is the Ed25519 public key bytes from the sender's MLS leaf node.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
+/// Returns [`MlsError::DecryptionFailed`] if decryption or sender resolution
+/// fails.
+/// Returns [`MlsError::NotApplicationMessage`] if the decrypted message is
+/// not an application message.
+///
+/// See SCP-177: resolve sender key internally in `open_envelope`.
+pub fn decrypt_with_sender_key(
+    group: &mut ScpMlsGroup,
+    ciphertext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), MlsError> {
+    if group.group.is_none() {
+        return Err(MlsError::GroupDestroyed);
+    }
+
+    // Deserialize the ciphertext bytes into an MlsMessageIn.
+    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
+
+    // Convert to a ProtocolMessage for processing.
+    let protocol_message = message_in
+        .try_into_protocol_message()
+        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
+
+    // Process the message — this verifies membership tag and generation number.
+    //
+    // OpenMLS may panic on AEAD decryption failure for tampered ciphertexts.
+    // We guard against this with catch_unwind (same as in `decrypt`).
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let process_result = catch_unwind(AssertUnwindSafe(|| {
+        g.process_message(&group.provider, protocol_message)
+    }));
+
+    let processed = match process_result {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Err(_) => {
+            return Err(MlsError::DecryptionFailed(
+                "OpenMLS panicked during message processing".to_string(),
+            ));
+        }
+    };
+
+    // Extract the sender's leaf index from the ProcessedMessage before
+    // consuming it with into_content().
+    let sender = processed.sender().clone();
+    let sender_leaf_index = match sender {
+        Sender::Member(idx) => idx,
+        _ => {
+            return Err(MlsError::DecryptionFailed(
+                "sender is not a group member".to_string(),
+            ));
+        }
+    };
+
+    // Look up the sender's signature key from the group member list.
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let sender_signature_key = g
+        .members()
+        .find(|m| m.index == sender_leaf_index)
+        .map(|m| m.signature_key.clone())
+        .ok_or_else(|| {
+            MlsError::DecryptionFailed(format!(
+                "sender leaf index {sender_leaf_index:?} not found in group members"
+            ))
+        })?;
+
+    // Extract the application message content.
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app_msg) => {
+            Ok((app_msg.into_bytes(), sender_signature_key))
+        }
         _ => Err(MlsError::NotApplicationMessage),
     }
 }
@@ -133,8 +244,9 @@ mod tests {
     use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 
+    #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(format!("did:dht:z6Mk{name}"), None)
+        ScpCredential::new(format!("did:dht:z6Mk{name}"), None).unwrap()
     }
 
     /// Helper: set up Alice and Bob in a shared group.
@@ -295,6 +407,65 @@ mod tests {
                 "message {i} must roundtrip correctly"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn decrypt_returns_error_for_tampered_aead_tag() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+
+        let plaintext = b"tamper target";
+
+        // Alice encrypts a legitimate message.
+        let ciphertext_msg = encrypt(&mut alice_group, plaintext).unwrap();
+        let mut ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
+
+        // Tamper with the last byte (corrupts the AEAD authentication tag).
+        if let Some(byte) = ciphertext_bytes.last_mut() {
+            *byte ^= 0xFF;
+        }
+
+        // Must return an error (not panic) thanks to the catch_unwind guard.
+        let result = decrypt(&mut bob_group, &ciphertext_bytes);
+        assert!(
+            result.is_err(),
+            "decrypt must return error for tampered AEAD tag, not panic"
+        );
+
+        // Verify the error is DecryptionFailed.
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("decryption failed"),
+            "error should indicate decryption failure, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn group_remains_usable_after_caught_decrypt_panic() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+
+        // First: trigger a caught panic via tampered ciphertext.
+        let ct_msg = encrypt(&mut alice_group, b"will be tampered").unwrap();
+        let mut tampered_bytes = serialize_ciphertext(&ct_msg).unwrap();
+        if let Some(byte) = tampered_bytes.last_mut() {
+            *byte ^= 0xFF;
+        }
+
+        let bad_result = decrypt(&mut bob_group, &tampered_bytes);
+        assert!(bad_result.is_err(), "tampered ciphertext must fail");
+
+        // Second: encrypt and decrypt a legitimate message to prove the
+        // group is still functional after the caught panic.
+        let good_plaintext = b"still works";
+        let good_ct_msg = encrypt(&mut alice_group, good_plaintext).unwrap();
+        let good_ct_bytes = serialize_ciphertext(&good_ct_msg).unwrap();
+
+        let decrypted = decrypt(&mut bob_group, &good_ct_bytes).unwrap();
+        assert_eq!(
+            decrypted, good_plaintext,
+            "group must remain usable after a caught decrypt panic"
+        );
     }
 
     mod proptest_tests {

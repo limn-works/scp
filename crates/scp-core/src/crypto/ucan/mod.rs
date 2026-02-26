@@ -110,6 +110,15 @@ pub enum UcanError {
     #[error("token not yet valid")]
     TokenNotYetValid,
 
+    /// The token's time range is invalid (`nbf >= exp`).
+    #[error("invalid time range: nbf ({nbf}) must be less than exp ({exp})")]
+    InvalidTimeRange {
+        /// The `nbf` (not-before) timestamp.
+        nbf: u64,
+        /// The `exp` (expiry) timestamp.
+        exp: u64,
+    },
+
     /// The nonce has been seen before in this context.
     #[error("nonce reused: {0}")]
     NonceReused(String),
@@ -125,6 +134,11 @@ pub enum UcanError {
     /// The nonce format is invalid.
     #[error("invalid nonce format: {0}")]
     NonceFormatInvalid(String),
+
+    /// The nonce tracker has reached its capacity limit and all entries are
+    /// still within their retention window.
+    #[error("nonce tracker full: capacity {0} reached with no expired entries to prune")]
+    NonceTrackerFull(usize),
 
     /// The requested capability is not within the context's ceiling.
     #[error("capability outside ceiling: {0}")]
@@ -142,6 +156,10 @@ pub enum UcanError {
     #[error("delegation chain broken: {0}")]
     DelegationChainBroken(String),
 
+    /// A circular delegation was detected in the proof chain (e.g., A->B->A).
+    #[error("circular delegation detected: {0}")]
+    CircularDelegation(String),
+
     /// The token has been revoked.
     #[error("token revoked: {0}")]
     TokenRevoked(String),
@@ -158,6 +176,13 @@ pub enum UcanError {
     /// Capability URI parsing failed.
     #[error("invalid capability URI: {0}")]
     InvalidCapabilityUri(String),
+
+    /// System clock returned an error (e.g., time before Unix epoch).
+    ///
+    /// This is a hard failure — defaulting to epoch 0 would bypass all
+    /// `nbf`/`exp` checks.
+    #[error("system clock error: {0}")]
+    ClockError(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +609,12 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "expiry too far in the future: 100000s exceeds 24h maximum"
+        );
+
+        let err = UcanError::NonceTrackerFull(100_000);
+        assert_eq!(
+            err.to_string(),
+            "nonce tracker full: capacity 100000 reached with no expired entries to prune"
         );
     }
 }

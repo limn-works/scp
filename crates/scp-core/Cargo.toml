@@ -27,11 +27,15 @@ x25519-dalek = { workspace = true }
 hkdf = { workspace = true }
 percent-encoding = { workspace = true }
 base64 = { workspace = true }
+bs58 = { workspace = true }
 uuid = { workspace = true }
+jsonschema = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 
 [lints]

@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ed25519_dalek::{Verifier, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
@@ -181,12 +181,12 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// Returns the current sequence number.
     #[must_use]
     pub fn current_sequence(&self) -> u64 {
-        self.sequence.load(Ordering::Relaxed)
+        self.sequence.load(Ordering::Acquire)
     }
 
     /// Sets the sequence number (e.g., when loading from persistent storage).
     pub fn set_sequence(&self, seq: u64) {
-        self.sequence.store(seq, Ordering::Relaxed);
+        self.sequence.store(seq, Ordering::Release);
     }
 
     /// Constructs the BEP44 signable payload for a value and sequence number.
@@ -228,7 +228,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let sig = ed25519_dalek::Signature::from_bytes(signature);
         let payload = Self::bep44_signable(value, seq);
 
-        verifying_key.verify(&payload, &sig).map_err(|e| {
+        verifying_key.verify_strict(&payload, &sig).map_err(|e| {
             IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
         })
     }
@@ -291,7 +291,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let value = doc_json.as_bytes();
 
         // Increment the sequence number.
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Construct the BEP44 signable payload and sign it.
         let signable = Self::bep44_signable(value, seq);
@@ -661,13 +661,16 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .await
             .map_err(IdentityError::Platform)?;
 
-        let sig_bytes = proof_sig.into_bytes();
-        if sig_bytes.len() != 64 {
-            return Err(IdentityError::KeyRotationFailed(format!(
-                "expected 64-byte signature, got {} bytes",
-                sig_bytes.len()
-            )));
-        }
+        let sig_bytes: [u8; 64] =
+            proof_sig
+                .into_bytes()
+                .try_into()
+                .map_err(|v: Vec<u8>| {
+                    IdentityError::KeyRotationFailed(format!(
+                        "expected 64-byte signature, got {} bytes",
+                        v.len()
+                    ))
+                })?;
 
         let old_pub_bytes: [u8; 32] =
             old_identity_public
@@ -766,43 +769,13 @@ fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
     })
 }
 
-/// Base58btc decoding (Bitcoin alphabet).
+/// Base58btc decoding (Bitcoin alphabet) via the `bs58` crate.
 ///
 /// Inverse of the `base58btc_encode` function in `document.rs`.
 fn base58btc_decode(input: &str) -> Result<Vec<u8>, String> {
-    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Count leading '1' characters (these map to leading zero bytes).
-    let zero_count = input.bytes().take_while(|&b| b == b'1').count();
-
-    // Convert from base58 to base256 via repeated division.
-    // We use u32 for the carry to avoid usize-to-u8 truncation warnings.
-    let mut bytes: Vec<u8> = Vec::new();
-    for ch in input.bytes() {
-        let Some(val) = ALPHABET.iter().position(|&a| a == ch) else {
-            return Err(format!("invalid base58 character: {}", ch as char));
-        };
-        // val is always < 58, so this cast is safe.
-        #[allow(clippy::cast_possible_truncation)]
-        let mut carry = val as u32;
-        for byte in &mut bytes {
-            carry += u32::from(*byte) * 58;
-            *byte = (carry & 0xFF) as u8;
-            carry >>= 8;
-        }
-        while carry > 0 {
-            bytes.push((carry & 0xFF) as u8);
-            carry >>= 8;
-        }
-    }
-
-    let mut result = vec![0u8; zero_count];
-    result.extend(bytes.into_iter().rev());
-    Ok(result)
+    bs58::decode(input)
+        .into_vec()
+        .map_err(|e| format!("base58btc decode error: {e}"))
 }
 
 // The trait uses RPITIT (`-> impl Future<...> + Send`), so each impl method
@@ -1019,19 +992,9 @@ pub fn verify_migration(
         IdentityError::MigrationVerificationFailed(format!("invalid old public key: {e}"))
     })?;
 
-    let sig_bytes: [u8; 64] = migration_proof
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            IdentityError::MigrationVerificationFailed(format!(
-                "expected 64-byte signature, got {} bytes",
-                migration_proof.signature.len()
-            ))
-        })?;
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let signature = ed25519_dalek::Signature::from_bytes(&migration_proof.signature);
 
-    verifying_key.verify(&digest, &signature).map_err(|e| {
+    verifying_key.verify_strict(&digest, &signature).map_err(|e| {
         IdentityError::MigrationVerificationFailed(format!(
             "migration proof signature verification failed: {e}"
         ))
@@ -1485,6 +1448,41 @@ mod tests {
         let vm = encoded.verification_method_by_fragment("0").unwrap();
         let decoded = decode_multibase_key(&vm.public_key_multibase).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn base58btc_decode_known_vector() {
+        // "JxF12TrwUP45BMd" is the base58btc encoding of "Hello World".
+        let decoded = base58btc_decode("JxF12TrwUP45BMd").unwrap();
+        assert_eq!(decoded, b"Hello World");
+    }
+
+    #[test]
+    fn base58btc_decode_leading_ones() {
+        // Leading '1' characters map to leading zero bytes.
+        let decoded = base58btc_decode("112").unwrap();
+        assert_eq!(decoded, vec![0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn base58btc_decode_empty_input() {
+        let decoded = base58btc_decode("").unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn base58btc_decode_rejects_invalid_characters() {
+        // '0', 'O', 'I', 'l' are not in the Bitcoin base58 alphabet.
+        assert!(base58btc_decode("0OIl").is_err());
+    }
+
+    #[test]
+    fn base58btc_roundtrip_32_byte_key() {
+        // Direct roundtrip: encode with bs58, then decode with our function.
+        let key = [0xABu8; 32];
+        let encoded = bs58::encode(&key).into_string();
+        let decoded = base58btc_decode(&encoded).unwrap();
+        assert_eq!(decoded, key);
     }
 
     #[test]
@@ -2147,7 +2145,7 @@ mod tests {
             old_did: "did:dht:zOld".to_owned(),
             new_did: "did:dht:zNew".to_owned(),
             migration_proof: MigrationProof {
-                signature: vec![0xAA; 64],
+                signature: [0xAA; 64],
                 old_public_key: [0xBB; 32],
             },
             pre_rotation_proof: Some(PreRotationProof {
@@ -2408,6 +2406,64 @@ mod tests {
         assert_eq!(
             resolved.document.relay_service_urls()[0],
             "wss://relay.example.com/scp/v1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-176 — Concurrent sequence number monotonicity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_fetch_add_produces_unique_monotonic_values() {
+        use std::sync::atomic::AtomicU64;
+        use std::thread;
+
+        let num_threads = 8;
+        let increments_per_thread = 1_000;
+        let seq = Arc::new(AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let seq = Arc::clone(&seq);
+                thread::spawn(move || {
+                    let mut values = Vec::with_capacity(increments_per_thread);
+                    for _ in 0..increments_per_thread {
+                        let v = seq.fetch_add(1, Ordering::AcqRel);
+                        values.push(v);
+                    }
+                    values
+                })
+            })
+            .collect();
+
+        let mut all_values: Vec<u64> = Vec::with_capacity(num_threads * increments_per_thread);
+        for handle in handles {
+            let thread_values = handle.join().unwrap();
+            // Each thread's values must be strictly monotonically increasing.
+            for window in thread_values.windows(2) {
+                assert!(
+                    window[0] < window[1],
+                    "per-thread values not monotonic: {} >= {}",
+                    window[0],
+                    window[1]
+                );
+            }
+            all_values.extend(thread_values);
+        }
+
+        // All values across all threads must be unique.
+        all_values.sort_unstable();
+        all_values.dedup();
+        assert_eq!(
+            all_values.len(),
+            num_threads * increments_per_thread,
+            "duplicate sequence values detected across threads"
+        );
+
+        // Final counter value must equal total increments.
+        assert_eq!(
+            seq.load(Ordering::Acquire),
+            (num_threads * increments_per_thread) as u64
         );
     }
 }

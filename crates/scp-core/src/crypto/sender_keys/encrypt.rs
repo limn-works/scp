@@ -20,6 +20,7 @@
 
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use rand::RngCore;
+use rand::rngs::OsRng;
 
 use super::{SenderKey, SenderKeyError};
 
@@ -43,7 +44,7 @@ pub fn encrypt_sender_layer(
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher

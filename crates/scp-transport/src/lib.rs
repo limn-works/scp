@@ -39,4 +39,5 @@ pub mod traits;
 pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
 pub use error::TransportError;
 pub use manager::TransportManager;
+pub use scoring::SuppressionWarning;
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};

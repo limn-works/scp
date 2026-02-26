@@ -33,11 +33,7 @@ use serde::{Deserialize, Serialize};
 // Type aliases for domain clarity
 // ---------------------------------------------------------------------------
 
-/// A DID string (e.g., `"did:dht:z6Mk..."`).
-///
-/// Represented as a plain `String` for Phase 2. This matches the pattern used
-/// in the envelope module (`InnerEnvelope::sender_did: String`).
-pub type DID = String;
+use crate::identity::DID;
 
 /// A context identifier string.
 ///

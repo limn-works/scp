@@ -10,30 +10,16 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Capability (placeholder)
+// Capability (unified type from roles module)
 // ---------------------------------------------------------------------------
 
-/// A capability token representing a single permission within a context.
+/// Re-export of the unified [`Capability`](super::roles::Capability) type.
 ///
-/// Phase 2 placeholder: capabilities are represented as named strings (e.g.,
-/// `"messages:read"`, `"messages:write"`, `"tool:invoke"`). Full UCAN-backed
-/// capability types will be introduced in SCP-024.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Capability(String);
-
-impl Capability {
-    /// Creates a new capability from a name string.
-    #[must_use]
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-
-    /// Returns the capability name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.0
-    }
-}
+/// This was previously a separate `Capability(String)` newtype. It is now the
+/// same enum used in `roles.rs`, supporting well-known variants (e.g.,
+/// `MessagesRead`, `MessagesWrite`) plus `Custom(String)`. Use
+/// [`Capability::new`] to construct from a string name.
+pub use super::roles::Capability;
 
 // ---------------------------------------------------------------------------
 // RoleDefinition (placeholder)

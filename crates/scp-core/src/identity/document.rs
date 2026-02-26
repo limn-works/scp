@@ -20,6 +20,36 @@
 use super::IdentityError;
 use serde::{Deserialize, Serialize};
 
+/// Custom serde module for `[u8; 64]` fields.
+///
+/// Serde does not natively support arrays larger than 32 elements. This module
+/// serializes `[u8; 64]` via `Vec<u8>` (leveraging `serde_bytes` for compact
+/// binary representation) and validates the exact length on deserialization,
+/// rejecting anything other than exactly 64 bytes.
+mod serde_signature_64 {
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!(
+                "expected 64-byte signature, got {} bytes",
+                v.len()
+            ))
+        })
+    }
+}
+
 /// A W3C DID Document for an SCP identity.
 ///
 /// Contains verification methods, authentication references, assertion method
@@ -390,9 +420,9 @@ pub struct DidRotationEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MigrationProof {
     /// Ed25519 signature of `SHA-256(old_did || new_did || rotated_at)`
-    /// signed by the old Identity Key.
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
+    /// signed by the old Identity Key. Must be exactly 64 bytes (Ed25519).
+    #[serde(with = "serde_signature_64")]
+    pub signature: [u8; 64],
     /// The old Identity Key's public bytes, for verification without resolving
     /// the old DID document.
     pub old_public_key: [u8; 32],
@@ -435,48 +465,9 @@ fn hex_encode(bytes: &[u8]) -> String {
     })
 }
 
-/// Base58btc encoding (Bitcoin alphabet).
-///
-/// This is a minimal implementation sufficient for encoding Ed25519 public keys
-/// (32 bytes). Production deployments may replace this with a dedicated crate.
+/// Base58btc encoding (Bitcoin alphabet) via the `bs58` crate.
 fn base58btc_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-    if input.is_empty() {
-        return String::new();
-    }
-
-    // Count leading zeros.
-    let zero_count = input.iter().take_while(|&&b| b == 0).count();
-
-    // Convert to base58 via repeated division.
-    let mut digits: Vec<u8> = Vec::new();
-    for &byte in input {
-        let mut carry = u32::from(byte);
-        for digit in &mut digits {
-            carry += u32::from(*digit) << 8;
-            *digit = (carry % 58) as u8;
-            carry /= 58;
-        }
-        while carry > 0 {
-            digits.push((carry % 58) as u8);
-            carry /= 58;
-        }
-    }
-
-    let mut result = String::with_capacity(zero_count + digits.len());
-
-    // Leading '1' characters for each leading zero byte.
-    for _ in 0..zero_count {
-        result.push('1');
-    }
-
-    // Digits are in reverse order.
-    for &d in digits.iter().rev() {
-        result.push(ALPHABET[d as usize] as char);
-    }
-
-    result
+    bs58::encode(input).into_string()
 }
 
 #[cfg(test)]
@@ -556,6 +547,19 @@ mod tests {
         let input = [0, 0, 1];
         let encoded = base58btc_encode(&input);
         assert!(encoded.starts_with("11"));
+    }
+
+    #[test]
+    fn base58btc_encode_known_vector() {
+        // "Hello World" in base58btc (Bitcoin alphabet) is "JxF12TrwUP45BMd".
+        assert_eq!(base58btc_encode(b"Hello World"), "JxF12TrwUP45BMd");
+    }
+
+    #[test]
+    fn base58btc_encode_single_byte() {
+        // 0x00 encodes to "1", 0x01 encodes to "2", etc.
+        assert_eq!(base58btc_encode(&[0x00]), "1");
+        assert_eq!(base58btc_encode(&[0x01]), "2");
     }
 
     // --- SCPRelay tests (SCP-140) ---
@@ -791,5 +795,65 @@ mod tests {
         let urls = doc.relay_service_urls();
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0], "wss://existing.example.com/scp/v1");
+    }
+
+    // --- MigrationProof.signature [u8; 64] tests (SCP-202) ---
+
+    /// Helper: build a JSON object for `MigrationProof` with a signature of
+    /// the given length. The `old_public_key` is always a valid 32-byte array.
+    fn migration_proof_json_with_sig_len(len: usize) -> String {
+        let sig_array: Vec<String> = (0..len).map(|i| ((i % 256) as u8).to_string()).collect();
+        let pk_array: Vec<String> = (0..32).map(|_| "1".to_owned()).collect();
+        format!(
+            r#"{{"signature":[{}],"old_public_key":[{}]}}"#,
+            sig_array.join(","),
+            pk_array.join(",")
+        )
+    }
+
+    #[test]
+    fn migration_proof_64_byte_signature_accepted() {
+        let json = migration_proof_json_with_sig_len(64);
+        let proof: MigrationProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(proof.signature.len(), 64);
+        // Verify the bytes are correct.
+        for (i, &b) in proof.signature.iter().enumerate() {
+            assert_eq!(b, (i % 256) as u8);
+        }
+    }
+
+    #[test]
+    fn migration_proof_63_byte_signature_rejected() {
+        let json = migration_proof_json_with_sig_len(63);
+        let result = serde_json::from_str::<MigrationProof>(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("64-byte"),
+            "error should mention 64-byte, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn migration_proof_65_byte_signature_rejected() {
+        let json = migration_proof_json_with_sig_len(65);
+        let result = serde_json::from_str::<MigrationProof>(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("64-byte"),
+            "error should mention 64-byte, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn migration_proof_signature_json_roundtrip() {
+        let proof = MigrationProof {
+            signature: [0xAA; 64],
+            old_public_key: [0xBB; 32],
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        let parsed: MigrationProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(proof, parsed);
     }
 }

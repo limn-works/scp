@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::event_log::{DID, Event, EventType};
+use crate::event_log::{Event, EventType};
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // ConsequenceTrigger
@@ -286,7 +287,7 @@ mod tests {
     ) -> Event {
         Event {
             event_type,
-            actor_did: actor_did.to_owned(),
+            actor_did: actor_did.into(),
             timestamp,
             sequence,
             payload: EventPayload { data: payload },

@@ -91,8 +91,7 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// Converts a [`params::Capability`](super::params::Capability) string
-    /// name to a [`roles::Capability`] enum variant.
+    /// Creates a capability from a string name.
     ///
     /// Recognized names: `"messages:read"`, `"messages:write"`,
     /// `"tool:invoke:*"`, `"tool:register"`, `"member:invite"`,
@@ -101,8 +100,8 @@ impl Capability {
     /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
     /// Anything else maps to `Custom(name)`.
     #[must_use]
-    pub fn from_param_capability(param: &super::params::Capability) -> Self {
-        match param.name() {
+    pub fn new(name: impl AsRef<str>) -> Self {
+        match name.as_ref() {
             "messages:read" => Self::MessagesRead,
             "messages:write" => Self::MessagesWrite,
             "tool:invoke:*" => Self::ToolInvokeAll,
@@ -118,6 +117,26 @@ impl Capability {
                 || Self::Custom(other.to_owned()),
                 |tool_id| Self::ToolInvoke(tool_id.to_owned()),
             ),
+        }
+    }
+
+    /// Returns the canonical string name of this capability.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::MessagesRead => "messages:read",
+            Self::MessagesWrite => "messages:write",
+            Self::ToolInvoke(_) => "tool:invoke",
+            Self::ToolInvokeAll => "tool:invoke:*",
+            Self::ToolRegister => "tool:register",
+            Self::MemberInvite => "member:invite",
+            Self::MemberRemove => "member:remove",
+            Self::RoleAssign => "role:assign",
+            Self::GovernancePropose => "governance:propose",
+            Self::GovernanceVote => "governance:vote",
+            Self::ContextClose => "context:close",
+            Self::ChildContextCreate => "context:child:create",
+            Self::Custom(name) => name,
         }
     }
 }

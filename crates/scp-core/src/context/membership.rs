@@ -37,11 +37,10 @@ pub const MIN_BUFFER_CAPACITY: usize = 100;
 pub const MAX_BUFFER_CAPACITY: usize = 10_000;
 
 // ---------------------------------------------------------------------------
-// DID type alias
+// DID (re-exported from identity module -- SCP-187)
 // ---------------------------------------------------------------------------
 
-/// Decentralized Identifier string.
-pub type DID = String;
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // KeyPackage (stub)
@@ -143,8 +142,8 @@ impl MembershipState {
     }
 
     /// Returns all member DIDs.
-    pub fn member_dids(&self) -> impl Iterator<Item = &str> {
-        self.members.keys().map(String::as_str)
+    pub fn member_dids(&self) -> impl Iterator<Item = &DID> {
+        self.members.keys()
     }
 
     /// Returns all members as an iterator.
@@ -197,6 +196,17 @@ pub enum ContextEvent {
         /// The message payload (encrypted in production; plaintext for tests).
         payload: Vec<u8>,
     },
+    /// The context is being closed by a participant or governance action.
+    ///
+    /// Replaces the former sentinel DID string `"__close_notification:<did>"`.
+    SystemClose {
+        /// The DID of the participant who initiated the close, if any.
+        initiator_did: DID,
+    },
+    /// The context expired due to TTL.
+    ///
+    /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.
+    Expired,
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
     /// Emitted when the buffer is full and the oldest event is dropped.
@@ -276,49 +286,60 @@ impl ReceiveBuffer {
 
     /// Pushes an event into the buffer.
     ///
-    /// If the buffer is full, the oldest event is dropped and a
-    /// [`ContextEvent::BufferOverflow`] warning is emitted. The overflow
-    /// warning replaces the dropped event's slot, so the buffer size never
-    /// exceeds `capacity`.
-    pub fn push(&mut self, event: ContextEvent) {
-        if self.events.len() >= self.capacity {
-            // Drop the oldest event.
+    /// If the buffer is full, the oldest event(s) are dropped to make room
+    /// for a [`ContextEvent::BufferOverflow`] warning and the new event.
+    /// The `BufferOverflow` event is always emitted when events are
+    /// displaced, and consecutive overflows coalesce into a single
+    /// `BufferOverflow` with an updated count.
+    ///
+    /// Returns `Some(BufferOverflow { dropped_count })` when events were
+    /// displaced, or `None` when the event was inserted without overflow.
+    pub fn push(&mut self, event: ContextEvent) -> Option<ContextEvent> {
+        if self.events.len() < self.capacity {
+            // Room available -- no overflow.
+            self.events.push_back(event);
+            return None;
+        }
+
+        // Buffer is full. We need to make room for the new event, and
+        // also ensure a BufferOverflow marker is present.
+
+        // Check if the last event is already a BufferOverflow we can
+        // update in place. If so, we only need to drop one oldest event
+        // (the overflow marker is already occupying its slot).
+        if let Some(ContextEvent::BufferOverflow { .. }) = self.events.back() {
+            // Drop the oldest event to make room for the new event.
             self.events.pop_front();
             self.dropped_since_last_consume += 1;
 
-            // Emit a BufferOverflow warning event. This replaces the slot
-            // freed by dropping the oldest event, so we still have room for
-            // the new event.
-            let overflow_event = ContextEvent::BufferOverflow {
-                dropped_count: self.dropped_since_last_consume,
-            };
-
-            // Check if the last event is already a BufferOverflow -- if so,
-            // update it instead of adding another one.
-            if let Some(ContextEvent::BufferOverflow { .. }) = self.events.back() {
-                // Replace the existing overflow event with updated count.
-                self.events.pop_back();
-                self.events.push_back(overflow_event);
-            } else {
-                // Need to make room: drop another oldest if we're at capacity.
-                if self.events.len() >= self.capacity {
-                    self.events.pop_front();
-                    self.dropped_since_last_consume += 1;
-                    // Update overflow event with new count.
-                    let updated = ContextEvent::BufferOverflow {
-                        dropped_count: self.dropped_since_last_consume,
-                    };
-                    self.events.push_back(updated);
-                } else {
-                    self.events.push_back(overflow_event);
-                }
+            // Update the existing overflow marker's count in place.
+            if let Some(ContextEvent::BufferOverflow { dropped_count }) =
+                self.events.back_mut()
+            {
+                *dropped_count = self.dropped_since_last_consume;
             }
-        }
 
-        // Now push the actual event.
-        if self.events.len() < self.capacity {
+            // Push the new event.
+            self.events.push_back(event);
+        } else {
+            // No existing overflow marker. We need two slots: one for the
+            // overflow marker and one for the new event. Drop two oldest.
+            self.events.pop_front();
+            self.dropped_since_last_consume += 1;
+            self.events.pop_front();
+            self.dropped_since_last_consume += 1;
+
+            // Push the overflow marker and the new event.
+            self.events.push_back(ContextEvent::BufferOverflow {
+                dropped_count: self.dropped_since_last_consume,
+            });
             self.events.push_back(event);
         }
+
+        // Return the overflow indicator.
+        Some(ContextEvent::BufferOverflow {
+            dropped_count: self.dropped_since_last_consume,
+        })
     }
 
     /// Consumes and returns the oldest event from the buffer.
@@ -421,7 +442,7 @@ mod tests {
         state.add_member("did:key:alice".into(), "admin".into(), vec![]);
         state.add_member("did:key:bob".into(), "member".into(), vec![]);
 
-        let mut dids: Vec<&str> = state.member_dids().collect();
+        let mut dids: Vec<&str> = state.member_dids().map(|d| d.as_ref()).collect();
         dids.sort_unstable();
         assert_eq!(dids, vec!["did:key:alice", "did:key:bob"]);
     }
@@ -652,5 +673,90 @@ mod tests {
     fn receive_buffer_default_capacity() {
         let buffer = ReceiveBuffer::default();
         assert_eq!(buffer.capacity(), DEFAULT_BUFFER_CAPACITY);
+    }
+
+    // -----------------------------------------------------------------------
+    // SystemClose / Expired variant tests (SCP-203)
+    // -----------------------------------------------------------------------
+
+    /// SCP-203: `SystemClose` variant carries the initiator DID.
+    #[test]
+    fn system_close_event_carries_initiator_did() {
+        let event = ContextEvent::SystemClose {
+            initiator_did: "did:key:admin".into(),
+        };
+
+        match &event {
+            ContextEvent::SystemClose { initiator_did } => {
+                assert_eq!(initiator_did, "did:key:admin");
+            }
+            _ => panic!("expected SystemClose variant"),
+        }
+    }
+
+    /// SCP-203: `Expired` variant is a unit variant (no sentinel DID).
+    #[test]
+    fn expired_event_is_unit_variant() {
+        let event = ContextEvent::Expired;
+        assert_eq!(event, ContextEvent::Expired);
+    }
+
+    /// SCP-203: `SystemClose` and `Expired` implement `Eq` / `Clone`.
+    #[test]
+    fn close_and_expiry_events_are_eq_and_clone() {
+        let close = ContextEvent::SystemClose {
+            initiator_did: "did:key:alice".into(),
+        };
+        let close2 = close.clone();
+        assert_eq!(close, close2);
+
+        let expired = ContextEvent::Expired;
+        let expired2 = expired.clone();
+        assert_eq!(expired, expired2);
+    }
+
+    /// SCP-203: `SystemClose` is distinct from `MemberLeft`.
+    #[test]
+    fn system_close_is_not_member_left() {
+        let close = ContextEvent::SystemClose {
+            initiator_did: "did:key:alice".into(),
+        };
+        let left = ContextEvent::MemberLeft {
+            member_did: "did:key:alice".into(),
+        };
+        assert_ne!(close, left);
+    }
+
+    /// SCP-203: `Expired` is distinct from `MemberLeft`.
+    #[test]
+    fn expired_is_not_member_left() {
+        let expired = ContextEvent::Expired;
+        let left = ContextEvent::MemberLeft {
+            member_did: "__ttl_expiry_notification".into(),
+        };
+        assert_ne!(expired, left);
+    }
+
+    /// SCP-203: Buffer can hold `SystemClose` and `Expired` events.
+    #[test]
+    fn buffer_holds_close_and_expiry_events() {
+        let mut buffer = ReceiveBuffer::new();
+        buffer.push(ContextEvent::SystemClose {
+            initiator_did: "did:key:admin".into(),
+        });
+        buffer.push(ContextEvent::Expired);
+
+        assert_eq!(buffer.len(), 2);
+
+        let first = buffer.pop().unwrap();
+        assert_eq!(
+            first,
+            ContextEvent::SystemClose {
+                initiator_did: "did:key:admin".into(),
+            }
+        );
+
+        let second = buffer.pop().unwrap();
+        assert_eq!(second, ContextEvent::Expired);
     }
 }

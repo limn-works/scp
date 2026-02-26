@@ -11,7 +11,7 @@
 //!
 //! See ADR-007 in `.docs/adrs/phase-1.md` for the full protocol design.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,7 @@ use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 use ed25519_dalek::Verifier;
 use hkdf::Hkdf;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
@@ -41,6 +42,18 @@ const HPKE_INFO: &[u8] = b"scp-sender-key-hpke-v1";
 /// Grace period in seconds during which the old key should still be accepted
 /// for decryption of in-flight messages after an epoch advance.
 pub const GRACE_PERIOD_SECS: u64 = 30;
+
+/// Size of the cryptographic nonce embedded in sender key requests (bytes).
+const REQUEST_NONCE_SIZE: usize = 16;
+
+/// Duration in seconds for which a seen nonce is remembered to prevent replay.
+const NONCE_EXPIRY_SECS: u64 = 300; // 5 minutes
+
+/// Maximum age in milliseconds for a block notification to be considered fresh.
+const BLOCK_NOTIFICATION_FRESHNESS_MS: u64 = 30_000; // 30 seconds
+
+/// Maximum number of nonces tracked by [`NonceDedup`] to prevent memory exhaustion.
+const NONCE_DEDUP_CAPACITY: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -70,6 +83,10 @@ pub struct SenderKeyEpochAdvance {
 /// Sent as an MLS application message to the key holder. The requester
 /// includes a fresh X25519 wrapping public key so the responder can
 /// HPKE-encrypt the sender key material.
+///
+/// Contains a cryptographic nonce and timestamp for replay protection.
+/// The responder rejects requests with duplicate nonces within a 5-minute
+/// window and echoes the nonce in the response for binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SenderKeyRequest {
     /// The DID of the member requesting the key.
@@ -81,6 +98,12 @@ pub struct SenderKeyRequest {
     /// Fresh X25519 public key for HPKE wrapping.
     #[serde(with = "serde_bytes")]
     pub wrapping_pubkey: Vec<u8>,
+    /// Cryptographic nonce for replay protection (16 bytes, generated with
+    /// `OsRng`). The responder echoes this in [`SenderKeyResponse::request_nonce`]
+    /// and rejects duplicate nonces within [`NONCE_EXPIRY_SECS`].
+    pub nonce: [u8; REQUEST_NONCE_SIZE],
+    /// Unix timestamp in seconds when the request was created.
+    pub timestamp: u64,
     /// Ed25519 signature over the request payload.
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
@@ -90,6 +113,10 @@ pub struct SenderKeyRequest {
 ///
 /// Sent as an MLS application message back to the requester. The sender
 /// key is encrypted using HPKE: ephemeral X25519 ECDH + HKDF + AES-128-GCM.
+///
+/// The [`request_nonce`][SenderKeyResponse::request_nonce] field echoes the
+/// nonce from the corresponding [`SenderKeyRequest`] to bind the response to
+/// the originating request and prevent response substitution attacks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SenderKeyResponse {
     /// The DID of the sender whose key is being distributed.
@@ -102,6 +129,9 @@ pub struct SenderKeyResponse {
     /// The ephemeral X25519 public key used in the HPKE encapsulation.
     #[serde(with = "serde_bytes")]
     pub ephemeral_pubkey: Vec<u8>,
+    /// Echo of the request nonce from [`SenderKeyRequest::nonce`], binding
+    /// this response to the originating request.
+    pub request_nonce: [u8; REQUEST_NONCE_SIZE],
 }
 
 /// A signed block notification sent as an MLS application message.
@@ -240,8 +270,23 @@ pub async fn request_sender_key(
         .await
         .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
 
-    // Sign the request.
-    let hash = compute_request_hash(requester_did, sender_did, epoch, wrapping_pubkey.as_bytes());
+    // Generate cryptographic nonce and timestamp for replay protection.
+    let mut nonce = [0u8; REQUEST_NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Sign the request (including nonce and timestamp).
+    let hash = compute_request_hash(
+        requester_did,
+        sender_did,
+        epoch,
+        wrapping_pubkey.as_bytes(),
+        &nonce,
+        timestamp,
+    );
 
     let signature = key_custody
         .sign(signing_key, &hash)
@@ -253,6 +298,8 @@ pub async fn request_sender_key(
         sender_did: sender_did.to_owned(),
         epoch,
         wrapping_pubkey: wrapping_pubkey.into_bytes(),
+        nonce,
+        timestamp,
         signature: signature.into_bytes(),
     };
 
@@ -281,6 +328,8 @@ pub fn verify_sender_key_request(
         &request.sender_did,
         request.epoch,
         &request.wrapping_pubkey,
+        &request.nonce,
+        request.timestamp,
     );
     verify_ed25519_signature(requester_public_key, &hash, &request.signature)
 }
@@ -345,6 +394,7 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         epoch,
         hpke_sealed_key: sealed,
         ephemeral_pubkey: ephemeral_pub.to_vec(),
+        request_nonce: request.nonce,
     };
 
     let message = serde_json::to_vec(&response)
@@ -450,6 +500,32 @@ pub async fn send_block_notification(
         .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
 }
 
+/// Validates that a [`BlockNotification`] timestamp is within the freshness
+/// window.
+///
+/// Block notifications older than [`BLOCK_NOTIFICATION_FRESHNESS_MS`]
+/// milliseconds are rejected to prevent replay of old block events.
+///
+/// # Parameters
+///
+/// - `notification` -- The notification to validate.
+/// - `now_ms` -- The current Unix timestamp in milliseconds.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::StaleBlockNotification`] if the notification
+/// timestamp is outside the freshness window.
+pub fn validate_block_notification_freshness(
+    notification: &BlockNotification,
+    now_ms: u64,
+) -> Result<(), SenderKeyError> {
+    let age_ms = now_ms.saturating_sub(notification.timestamp);
+    if age_ms > BLOCK_NOTIFICATION_FRESHNESS_MS {
+        return Err(SenderKeyError::StaleBlockNotification);
+    }
+    Ok(())
+}
+
 /// Verifies the Ed25519 signature on a [`BlockNotification`].
 ///
 /// The caller must provide the `context_id` since it is not embedded in the
@@ -488,6 +564,8 @@ pub fn verify_block_notification(
 ///
 /// # Errors
 ///
+/// Returns [`SenderKeyError::EpochOverflow`] if the epoch counter is at
+/// `u64::MAX` and cannot be incremented.
 /// Returns [`SenderKeyError::SigningFailed`] if signing the epoch advance fails.
 /// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
 pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
@@ -501,7 +579,9 @@ pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
 ) -> Result<RotateForBlockResult, SenderKeyError> {
     // Generate new sender key.
     let new_key = generate_sender_key();
-    let new_epoch = current_epoch + 1;
+    let new_epoch = current_epoch
+        .checked_add(1)
+        .ok_or(SenderKeyError::EpochOverflow)?;
 
     // Add blocked DID to block list.
     block_list.insert(blocked_did.to_owned());
@@ -524,6 +604,61 @@ pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
 }
 
 // ---------------------------------------------------------------------------
+// Nonce deduplication
+// ---------------------------------------------------------------------------
+
+/// Bounded nonce deduplication cache for sender key request replay protection.
+///
+/// Tracks seen request nonces for up to [`NONCE_EXPIRY_SECS`] seconds and
+/// caps the stored count at [`NONCE_DEDUP_CAPACITY`] entries to prevent
+/// memory exhaustion from DoS attacks.
+///
+/// Callers should call [`NonceDedup::is_replayed`] before processing a
+/// request, then [`NonceDedup::record`] once the request is accepted.
+#[derive(Debug, Default)]
+pub struct NonceDedup {
+    /// Nonce bytes → Unix timestamp (seconds) when first seen.
+    seen: HashMap<[u8; REQUEST_NONCE_SIZE], u64>,
+}
+
+impl NonceDedup {
+    /// Creates a new, empty dedup cache.
+    pub fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Returns `true` if `nonce` has been seen within [`NONCE_EXPIRY_SECS`]
+    /// of `now_secs`, indicating a replay attempt.
+    ///
+    /// Also evicts entries older than [`NONCE_EXPIRY_SECS`].
+    pub fn is_replayed(&mut self, nonce: &[u8; REQUEST_NONCE_SIZE], now_secs: u64) -> bool {
+        self.seen
+            .retain(|_, seen_at| now_secs.saturating_sub(*seen_at) < NONCE_EXPIRY_SECS);
+        self.seen.contains_key(nonce)
+    }
+
+    /// Records `nonce` as seen at `now_secs`.
+    ///
+    /// If at capacity ([`NONCE_DEDUP_CAPACITY`]), the oldest entry is evicted
+    /// to make room.
+    pub fn record(&mut self, nonce: [u8; REQUEST_NONCE_SIZE], now_secs: u64) {
+        if self.seen.len() >= NONCE_DEDUP_CAPACITY {
+            if let Some(oldest_key) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, ts)| *ts)
+                .map(|(k, _)| *k)
+            {
+                self.seen.remove(&oldest_key);
+            }
+        }
+        self.seen.insert(nonce, now_secs);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HPKE helpers
 // ---------------------------------------------------------------------------
 
@@ -536,7 +671,7 @@ fn hpke_seal(
     recipient_pub: &[u8; 32],
 ) -> Result<(Vec<u8>, [u8; 32]), SenderKeyError> {
     // 1. Generate ephemeral X25519 keypair.
-    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
+    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
     let ephemeral_public = X25519Pub::from(&ephemeral_secret);
 
     // 2. ECDH between ephemeral secret and recipient's wrapping pubkey.
@@ -568,7 +703,7 @@ fn aes128gcm_encrypt(key: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>, Sender
         .map_err(|e| SenderKeyError::HpkeEncryptionFailed(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; HPKE_NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -622,12 +757,16 @@ fn compute_request_hash(
     sender_did: &str,
     epoch: u64,
     wrapping_pubkey: &[u8],
+    nonce: &[u8; REQUEST_NONCE_SIZE],
+    timestamp: u64,
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(requester_did.as_bytes());
     hasher.update(sender_did.as_bytes());
     hasher.update(epoch.to_be_bytes());
     hasher.update(wrapping_pubkey);
+    hasher.update(nonce);
+    hasher.update(timestamp.to_be_bytes());
     hasher.finalize().to_vec()
 }
 
@@ -912,7 +1051,7 @@ mod tests {
 
         // Alice has Bob on her block list.
         let mut block_list = HashSet::new();
-        block_list.insert("did:dht:bob".to_owned());
+        block_list.insert("did:dht:bob".into());
 
         let response = handle_sender_key_request(
             &request,
@@ -957,7 +1096,7 @@ mod tests {
 
         // Block list has someone else, not Bob.
         let mut block_list = HashSet::new();
-        block_list.insert("did:dht:dave".to_owned());
+        block_list.insert("did:dht:dave".into());
 
         let response = handle_sender_key_request(
             &request,
@@ -1194,6 +1333,32 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Epoch overflow
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rotate_sender_key_for_block_epoch_overflow_returns_error() {
+        let (custody, signing_key) = setup().await;
+        let mut block_list = HashSet::new();
+
+        let result = rotate_sender_key_for_block(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            u64::MAX,
+            "did:dht:dave",
+            &mut block_list,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SenderKeyError::EpochOverflow)),
+            "epoch at u64::MAX should return EpochOverflow, got {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // HPKE helpers
     // -------------------------------------------------------------------
 
@@ -1202,7 +1367,7 @@ mod tests {
         let plaintext = [0xABu8; 32];
 
         // Generate a recipient X25519 keypair in software for this test.
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) = hpke_seal(&plaintext, &recipient_public.to_bytes()).unwrap();
@@ -1220,10 +1385,10 @@ mod tests {
     fn hpke_rejects_wrong_recipient() {
         let plaintext = [0xCDu8; 32];
 
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
-        let wrong_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let wrong_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
 
         let (sealed, ephemeral_pub) = hpke_seal(&plaintext, &recipient_public.to_bytes()).unwrap();
 
@@ -1249,5 +1414,170 @@ mod tests {
     fn verify_ed25519_rejects_invalid_signature_length() {
         let result = verify_ed25519_signature(&[0u8; 32], &[0u8; 32], &[0u8; 32]);
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // NonceDedup — replay protection (SCP-179)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn nonce_dedup_accepts_fresh_nonce() {
+        let mut dedup = NonceDedup::new();
+        let nonce = [1u8; REQUEST_NONCE_SIZE];
+        let now = 1_700_000_000u64;
+        assert!(!dedup.is_replayed(&nonce, now), "fresh nonce should not be replayed");
+    }
+
+    #[test]
+    fn nonce_dedup_rejects_recorded_nonce_within_window() {
+        let mut dedup = NonceDedup::new();
+        let nonce = [2u8; REQUEST_NONCE_SIZE];
+        let now = 1_700_000_000u64;
+        dedup.record(nonce, now);
+        assert!(
+            dedup.is_replayed(&nonce, now + 60),
+            "nonce recorded 60s ago should still be replayed within 5-min window"
+        );
+    }
+
+    #[test]
+    fn nonce_dedup_evicts_expired_nonce() {
+        let mut dedup = NonceDedup::new();
+        let nonce = [3u8; REQUEST_NONCE_SIZE];
+        let now = 1_700_000_000u64;
+        dedup.record(nonce, now);
+        // Advance time past the expiry window.
+        let future = now + NONCE_EXPIRY_SECS + 1;
+        assert!(
+            !dedup.is_replayed(&nonce, future),
+            "expired nonce should be evicted and not considered replayed"
+        );
+    }
+
+    #[test]
+    fn nonce_dedup_distinct_nonces_not_replayed() {
+        let mut dedup = NonceDedup::new();
+        let nonce_a = [10u8; REQUEST_NONCE_SIZE];
+        let nonce_b = [20u8; REQUEST_NONCE_SIZE];
+        let now = 1_700_000_000u64;
+        dedup.record(nonce_a, now);
+        assert!(!dedup.is_replayed(&nonce_b, now), "different nonce should not be replayed");
+    }
+
+    #[test]
+    fn nonce_dedup_evicts_oldest_at_capacity() {
+        let mut dedup = NonceDedup::new();
+        let now = 1_700_000_000u64;
+
+        // Fill to capacity using distinct nonces.
+        for i in 0..NONCE_DEDUP_CAPACITY {
+            let mut nonce = [0u8; REQUEST_NONCE_SIZE];
+            let i_bytes = (i as u64).to_be_bytes();
+            nonce[..8].copy_from_slice(&i_bytes);
+            dedup.record(nonce, now + i as u64);
+        }
+
+        // Adding one more should evict the oldest without panicking.
+        let mut new_nonce = [0xFFu8; REQUEST_NONCE_SIZE];
+        new_nonce[0] = 0xAA;
+        let check_time = now + NONCE_DEDUP_CAPACITY as u64 + 1;
+        // Before recording: the new nonce is not a replay.
+        assert!(!dedup.is_replayed(&new_nonce, check_time));
+        // Recording it makes subsequent uses a replay.
+        dedup.record(new_nonce, check_time);
+        assert!(dedup.is_replayed(&new_nonce, check_time));
+    }
+
+    // -------------------------------------------------------------------
+    // validate_block_notification_freshness (SCP-179)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fresh_block_notification_passes_freshness_check() {
+        let (custody, signing_key) = setup().await;
+        let msg = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+        )
+        .await
+        .unwrap();
+
+        let notification: BlockNotification = serde_json::from_slice(&msg).unwrap();
+        let now_ms = current_timestamp_ms();
+        let result = validate_block_notification_freshness(&notification, now_ms);
+        assert!(result.is_ok(), "fresh notification should pass freshness check");
+    }
+
+    #[tokio::test]
+    async fn stale_block_notification_rejected() {
+        let (custody, signing_key) = setup().await;
+        let msg = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+        )
+        .await
+        .unwrap();
+
+        let notification: BlockNotification = serde_json::from_slice(&msg).unwrap();
+        // Simulate the notification being received far in the future.
+        let far_future_ms = notification.timestamp + BLOCK_NOTIFICATION_FRESHNESS_MS + 1_000;
+        let result = validate_block_notification_freshness(&notification, far_future_ms);
+        assert!(
+            matches!(result, Err(SenderKeyError::StaleBlockNotification)),
+            "stale notification should be rejected with StaleBlockNotification"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_key_response_echoes_request_nonce() {
+        let alice_custody = InMemoryKeyCustody::new();
+        let alice_signing_key = alice_custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let requester_custody = InMemoryKeyCustody::new();
+        let requester_signing_key =
+            requester_custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        // The requester's *public* key is used by the responder to verify the request signature.
+        let requester_pubkey = requester_custody.public_key(&requester_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+        let block_list: HashSet<String> = HashSet::new();
+
+        let result = request_sender_key(
+            &requester_custody,
+            &requester_signing_key,
+            "did:dht:requester",
+            "did:dht:alice",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            serde_json::from_slice(&result.request_message).unwrap();
+        let original_nonce = request.nonce;
+
+        let response_bytes = handle_sender_key_request(
+            &request,
+            requester_pubkey.as_bytes(), // verify requester's signature
+            &sender_key,
+            "did:dht:alice",
+            1,
+            &block_list,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let response: SenderKeyResponse = serde_json::from_slice(&response_bytes).unwrap();
+        assert_eq!(
+            response.request_nonce, original_nonce,
+            "response must echo the request nonce"
+        );
     }
 }

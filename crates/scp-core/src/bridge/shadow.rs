@@ -141,6 +141,17 @@ pub enum ShadowError {
         /// Human-readable description of which limit was exceeded.
         reason: String,
     },
+
+    /// The shadow identity collides with an existing context member DID or
+    /// another shadow identity in the same context.
+    ///
+    /// Prevents a bridge operator from mapping a shadow identity to a real
+    /// member's DID, which would enable message forgery.
+    #[error("shadow identity collision: {reason}")]
+    ShadowIdentityCollision {
+        /// Human-readable description of the collision.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -363,9 +374,17 @@ impl ShadowRegistry {
 /// - `bridge_id` -- The bridge connector creating this shadow.
 /// - `bridge_mode` -- The operating mode of the bridge.
 /// - `platform_handle` -- The external platform handle (e.g., `"@user#1234"`).
+/// - `context_member_dids` -- Current context member DIDs. The shadow ID is
+///   validated against this set to prevent a bridge operator from mapping a
+///   shadow identity to a real member's DID (which would enable message
+///   forgery). Pass an empty slice if member validation is not available.
 /// - `timestamp` -- Unix timestamp (seconds) of creation.
 ///
 /// # Errors
+///
+/// Returns [`ShadowError::ShadowIdentityCollision`] if the shadow ID
+/// matches an existing context member DID or another shadow in the same
+/// context.
 ///
 /// Returns [`ShadowError::ShadowAlreadyExists`] if a shadow with the same
 /// ID already exists.
@@ -383,9 +402,26 @@ pub fn create_shadow(
     bridge_id: &str,
     bridge_mode: BridgeMode,
     platform_handle: &str,
+    context_member_dids: &[&str],
     timestamp: u64,
 ) -> Result<(ShadowIdentity, ShadowCreationEvent), ShadowError> {
-    // Check for duplicate shadow ID.
+    // Defense-in-depth: reject shadow ID that collides with a real context
+    // member DID. A bridge operator could otherwise map a shadow to a real
+    // member's DID, enabling message forgery.
+    if context_member_dids.iter().any(|did| *did == shadow_id) {
+        return Err(ShadowError::ShadowIdentityCollision {
+            reason: format!(
+                "shadow ID {shadow_id} collides with existing context member DID"
+            ),
+        });
+    }
+
+    // Defense-in-depth: reject shadow ID that collides with an existing
+    // shadow in the same context (registry). This is distinct from the
+    // ShadowAlreadyExists check below, which matches on shadow_id only --
+    // this catches the broader case where the proposed shadow_id matches
+    // *any* shadow's shadow_id in the registry, preventing identity
+    // confusion between shadows.
     if registry.shadows.iter().any(|s| s.shadow_id == shadow_id) {
         return Err(ShadowError::ShadowAlreadyExists {
             shadow_id: shadow_id.to_owned(),
@@ -673,7 +709,7 @@ mod tests {
 
     fn make_governance(context_id: &str) -> GovernanceAction {
         GovernanceAction {
-            governance_did: GOVERNANCE_DID.to_owned(),
+            governance_did: GOVERNANCE_DID.into(),
             context_id: context_id.to_owned(),
             timestamp: 1_700_001_000,
             justification: "promoted by governance".to_owned(),
@@ -691,6 +727,7 @@ mod tests {
             BRIDGE_ID,
             BridgeMode::Relay,
             handle,
+            &[],
             1_700_000_100,
         )
         .unwrap()
@@ -788,6 +825,7 @@ mod tests {
             BRIDGE_ID,
             BridgeMode::Relay,
             "@bob",
+            &[],
             1_700_000_200,
         );
 
@@ -797,6 +835,83 @@ mod tests {
             err.to_string().contains("shadow already exists"),
             "expected ShadowAlreadyExists, got: {err}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // SCP-181: shadow identity collision validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_shadow_rejects_collision_with_context_member_did() {
+        let mut registry = make_registry();
+        // Simulate a context where "did:dht:real-member" is an existing member.
+        let member_dids = ["did:dht:real-member"];
+
+        let result = create_shadow(
+            &mut registry,
+            "did:dht:real-member", // shadow ID collides with real member
+            BRIDGE_ID,
+            BridgeMode::Relay,
+            "@attacker",
+            member_dids.as_slice(),
+            1_700_000_100,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ShadowError::ShadowIdentityCollision { .. }),
+            "expected ShadowIdentityCollision, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("context member DID"),
+            "error message should mention context member DID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_shadow_rejects_collision_with_existing_shadow() {
+        let mut registry = make_registry();
+        // Create a shadow with a known ID.
+        create_test_shadow(&mut registry, "shadow-existing", "@alice");
+
+        // Attempt to create another shadow with the same ID on a different bridge.
+        // The existing ShadowAlreadyExists check catches same-ID within the registry.
+        let result = create_shadow(
+            &mut registry,
+            "shadow-existing",
+            "bridge-002", // different bridge
+            BridgeMode::Api,
+            "@attacker",
+            &[],
+            1_700_000_200,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ShadowError::ShadowAlreadyExists { .. }),
+            "duplicate shadow ID should be rejected as ShadowAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_shadow_allows_non_colliding_id() {
+        let mut registry = make_registry();
+        // Context has real members, but shadow ID doesn't collide.
+        let member_dids = ["did:dht:alice", "did:dht:bob"];
+
+        let result = create_shadow(
+            &mut registry,
+            "did:dht:shadow-charlie", // does not collide with members
+            BRIDGE_ID,
+            BridgeMode::Relay,
+            "@charlie",
+            member_dids.as_slice(),
+            1_700_000_100,
+        );
+
+        assert!(result.is_ok(), "non-colliding shadow should be created");
     }
 
     #[test]
@@ -810,6 +925,7 @@ mod tests {
             BRIDGE_ID,
             BridgeMode::Relay,
             "@alice",
+            &[],
             1_700_000_200,
         );
 
@@ -832,6 +948,7 @@ mod tests {
             "bridge-002",
             BridgeMode::Api,
             "@alice",
+            &[],
             1_700_000_200,
         );
 
@@ -861,6 +978,7 @@ mod tests {
                 &bridge_id,
                 mode.clone(),
                 &handle,
+                &[],
                 1_700_000_100,
             );
 
@@ -889,6 +1007,7 @@ mod tests {
                 &bridge_id,
                 BridgeMode::Relay,
                 &handle,
+                &[],
                 1_700_000_100,
             )
             .unwrap();
@@ -901,6 +1020,7 @@ mod tests {
             "bridge-new",
             BridgeMode::Relay,
             "@overflow",
+            &[],
             1_700_000_200,
         );
 
@@ -930,6 +1050,7 @@ mod tests {
                 BRIDGE_ID,
                 BridgeMode::Relay,
                 &handle,
+                &[],
                 1_700_000_100,
             )
             .unwrap();
@@ -942,6 +1063,7 @@ mod tests {
             BRIDGE_ID,
             BridgeMode::Relay,
             "@overflow",
+            &[],
             1_700_000_200,
         );
 
@@ -971,6 +1093,7 @@ mod tests {
                 "bridge-001",
                 BridgeMode::Relay,
                 &handle,
+                &[],
                 1_700_000_100,
             )
             .unwrap();
@@ -983,6 +1106,7 @@ mod tests {
             "bridge-002",
             BridgeMode::Relay,
             "@user-b-0",
+            &[],
             1_700_000_200,
         );
         assert!(
@@ -1131,6 +1255,7 @@ mod tests {
             "bridge-002",
             BridgeMode::Api,
             "@charlie",
+            &[],
             1_700_000_300,
         )
         .unwrap();
@@ -1304,7 +1429,7 @@ mod tests {
             shadow_id: "shadow-ser".to_owned(),
             previous_role: "observer".to_owned(),
             new_role: "contributor".to_owned(),
-            governance_did: GOVERNANCE_DID.to_owned(),
+            governance_did: GOVERNANCE_DID.into(),
             context_id: CTX.to_owned(),
             timestamp: 1_700_001_000,
         };
@@ -1323,7 +1448,7 @@ mod tests {
     #[test]
     fn governance_action_serialization_roundtrip() {
         let action = GovernanceAction {
-            governance_did: GOVERNANCE_DID.to_owned(),
+            governance_did: GOVERNANCE_DID.into(),
             context_id: CTX.to_owned(),
             timestamp: 1_700_001_000,
             justification: "testing".to_owned(),

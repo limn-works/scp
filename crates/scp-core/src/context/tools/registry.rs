@@ -261,7 +261,7 @@ pub fn register_tool(
         description: registration.description.clone(),
         implementation_hash: registration.implementation_hash,
         operator_did: registration.operator_did.clone(),
-        registrant_did: registrant_did.to_owned(),
+        registrant_did: registrant_did.into(),
         test_vector_count: registration.test_vectors.len(),
     };
 
@@ -356,7 +356,7 @@ pub fn update_tool(
         tool_id: tool_id.to_owned(),
         old_implementation_hash: old_registration.implementation_hash,
         new_implementation_hash: new_registration.implementation_hash,
-        updater_did: updater_did.to_owned(),
+        updater_did: updater_did.into(),
         changed_fields,
     };
 
@@ -536,7 +536,7 @@ mod tests {
                     description: "3 * 4 = 12".to_owned(),
                 },
             ],
-            operator_did: "did:dht:z6MkTestOperator".to_owned(),
+            operator_did: "did:dht:z6MkTestOperator".into(),
             economic_metadata: None,
         }
     }
@@ -632,7 +632,7 @@ mod tests {
         let role_state = test_role_state("did:dht:z6MkCreator");
         let mut registry = ToolRegistry::new();
         let mut registration = valid_registration("tool-1");
-        registration.operator_did = String::new();
+        registration.operator_did = DID::from("");
 
         let result = register_tool(
             &mut registry,
@@ -652,7 +652,7 @@ mod tests {
         let role_state = test_role_state("did:dht:z6MkCreator");
         let mut registry = ToolRegistry::new();
         let mut registration = valid_registration("tool-1");
-        registration.operator_did = "not-a-did".to_owned();
+        registration.operator_did = "not-a-did".into();
 
         let result = register_tool(
             &mut registry,
@@ -703,7 +703,7 @@ mod tests {
         registration.economic_metadata = Some(ToolEconomicMetadata {
             cost_per_invoke: 100,
             cost_formula: None,
-            payee: "did:dht:z6MkPayee".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
         });
 
         let result = register_tool(
@@ -731,7 +731,7 @@ mod tests {
 
         // Register with operator DID.
         let mut registration = valid_registration("tool-1");
-        registration.operator_did = "did:dht:z6MkOperator".to_owned();
+        registration.operator_did = "did:dht:z6MkOperator".into();
         register_tool(
             &mut registry,
             &role_state,
@@ -742,7 +742,7 @@ mod tests {
 
         // Update by operator.
         let mut new_reg = valid_registration("tool-1");
-        new_reg.operator_did = "did:dht:z6MkOperator".to_owned();
+        new_reg.operator_did = "did:dht:z6MkOperator".into();
         new_reg.name = "updated-calculator".to_owned();
         new_reg.implementation_hash = [0xCD; 32];
 
@@ -1137,7 +1137,7 @@ mod tests {
     #[test]
     fn tool_error_display_messages() {
         let err = ToolError::RegistrantNotAuthorized {
-            did: "did:dht:z6MkTest".to_owned(),
+            did: "did:dht:z6MkTest".into(),
         };
         assert!(format!("{err}").contains("ToolRegister capability"));
 
@@ -1205,7 +1205,7 @@ mod tests {
         let meta = ToolEconomicMetadata {
             cost_per_invoke: 500,
             cost_formula: Some("linear".to_owned()),
-            payee: "did:dht:z6MkPayee".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let deserialized: ToolEconomicMetadata = serde_json::from_str(&json).unwrap();

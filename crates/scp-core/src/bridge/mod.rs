@@ -37,11 +37,7 @@ use serde::{Deserialize, Serialize};
 // Type aliases for domain clarity
 // ---------------------------------------------------------------------------
 
-/// A DID string (e.g., `"did:dht:z6Mk..."`).
-///
-/// Represented as a plain `String`. This matches the type alias pattern used
-/// across `scp-core` modules (`event_log`, `discovery`, `context`).
-pub type DID = String;
+use crate::identity::DID;
 
 /// A context identifier string.
 ///
@@ -229,7 +225,7 @@ mod tests {
     fn bridge_connector_construction_has_expected_fields() {
         let connector = BridgeConnector {
             bridge_id: "bridge-001".to_owned(),
-            operator_did: "did:dht:z6MkTest".to_owned(),
+            operator_did: "did:dht:z6MkTest".into(),
             platform: "discord".to_owned(),
             mode: BridgeMode::Relay,
             status: BridgeStatus::Active,
@@ -296,7 +292,7 @@ mod tests {
     fn bridge_connector_serialization_roundtrip() {
         let connector = BridgeConnector {
             bridge_id: "bridge-002".to_owned(),
-            operator_did: "did:dht:z6MkOp".to_owned(),
+            operator_did: "did:dht:z6MkOp".into(),
             platform: "slack".to_owned(),
             mode: BridgeMode::Puppet,
             status: BridgeStatus::Suspended,
@@ -412,7 +408,7 @@ mod tests {
     fn bridge_connector_clone_produces_independent_copy() {
         let original = BridgeConnector {
             bridge_id: "bridge-clone".to_owned(),
-            operator_did: "did:dht:z6MkClone".to_owned(),
+            operator_did: "did:dht:z6MkClone".into(),
             platform: "matrix".to_owned(),
             mode: BridgeMode::Cooperative,
             status: BridgeStatus::Active,

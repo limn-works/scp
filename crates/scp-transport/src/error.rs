@@ -38,4 +38,17 @@ pub enum TransportError {
     /// version mismatch).
     #[error("protocol error: {0}")]
     ProtocolError(String),
+
+    /// A received blob's content does not match its declared `blob_id`.
+    ///
+    /// The relay provided a `blob_id` (SHA-256 hash) that does not match
+    /// `SHA-256(blob)`. This indicates a malicious or buggy relay returning
+    /// mismatched content.
+    #[error("blob integrity error: expected {expected}, got {actual}")]
+    BlobIntegrityError {
+        /// The `blob_id` declared by the relay (hex-encoded).
+        expected: String,
+        /// The SHA-256 hash of the actual blob content (hex-encoded).
+        actual: String,
+    },
 }

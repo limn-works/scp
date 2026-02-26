@@ -14,6 +14,8 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -24,7 +26,9 @@ use scp_core::envelope::OuterEnvelope;
 
 use crate::config::TransportConfig;
 use crate::error::TransportError;
-use crate::scoring::{self, DeliveryOutcome, ReliabilityScore, SuppressionTracker};
+use crate::scoring::{
+    self, DeliveryOutcome, ReliabilityScore, SuppressionTracker, SuppressionWarning,
+};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
 
 /// Context identifier — a string alias matching the project-wide convention.
@@ -78,17 +82,23 @@ pub struct TransportManager {
     /// Registered transport adapters, in insertion order.
     adapters: Vec<Box<dyn TransportAdapter>>,
     /// Per-context relay set assignments: context -> adapter indices.
-    relay_assignments: HashMap<ContextId, Vec<usize>>,
+    /// Wrapped in `RwLock` for interior mutability so that `send_to_context`
+    /// and `assign_relay_set` can take `&self`, enabling concurrent sends.
+    relay_assignments: RwLock<HashMap<ContextId, Vec<usize>>>,
     /// Per-relay reliability scores keyed by adapter index (as string).
-    reliability_scores: HashMap<String, ReliabilityScore>,
+    /// Shared with `MergedStream` so suppression downgrades apply immediately.
+    reliability_scores: Arc<Mutex<HashMap<String, ReliabilityScore>>>,
     /// Deduplication cache: maps `BlobId` to the time it was first seen.
     dedup_cache: LruCache<BlobId, Instant>,
     /// TTL for deduplication cache entries.
     dedup_ttl: Duration,
     /// Round-robin counter for relay assignment spread.
-    assignment_counter: usize,
+    /// Atomic for interior mutability without locking.
+    assignment_counter: AtomicUsize,
     /// Multi-relay suppression cross-check tracker (spec section 9.9.2).
-    suppression_tracker: SuppressionTracker,
+    /// Shared with `MergedStream` for recording deliveries and checking
+    /// suppressions during stream polling.
+    suppression_tracker: Arc<Mutex<SuppressionTracker>>,
 }
 
 /// Helper to create a `NonZeroUsize` for LRU capacity, falling back to 1.
@@ -106,12 +116,12 @@ impl TransportManager {
     pub fn new(adapter: Box<dyn TransportAdapter>) -> Self {
         Self {
             adapters: vec![adapter],
-            relay_assignments: HashMap::new(),
-            reliability_scores: HashMap::new(),
+            relay_assignments: RwLock::new(HashMap::new()),
+            reliability_scores: Arc::new(Mutex::new(HashMap::new())),
             dedup_cache: LruCache::new(nonzero_capacity(DEFAULT_DEDUP_CAPACITY)),
             dedup_ttl: DEFAULT_DEDUP_TTL,
-            assignment_counter: 0,
-            suppression_tracker: SuppressionTracker::new(),
+            assignment_counter: AtomicUsize::new(0),
+            suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
         }
     }
 
@@ -123,12 +133,12 @@ impl TransportManager {
     pub fn builder() -> Self {
         Self {
             adapters: Vec::new(),
-            relay_assignments: HashMap::new(),
-            reliability_scores: HashMap::new(),
+            relay_assignments: RwLock::new(HashMap::new()),
+            reliability_scores: Arc::new(Mutex::new(HashMap::new())),
             dedup_cache: LruCache::new(nonzero_capacity(DEFAULT_DEDUP_CAPACITY)),
             dedup_ttl: DEFAULT_DEDUP_TTL,
-            assignment_counter: 0,
-            suppression_tracker: SuppressionTracker::new(),
+            assignment_counter: AtomicUsize::new(0),
+            suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
         }
     }
 
@@ -139,12 +149,12 @@ impl TransportManager {
     pub fn with_config(config: &TransportConfig) -> Self {
         Self {
             adapters: Vec::new(),
-            relay_assignments: HashMap::new(),
-            reliability_scores: HashMap::new(),
+            relay_assignments: RwLock::new(HashMap::new()),
+            reliability_scores: Arc::new(Mutex::new(HashMap::new())),
             dedup_cache: LruCache::new(nonzero_capacity(config.dedup_cache_size)),
             dedup_ttl: config.dedup_cache_ttl,
-            assignment_counter: 0,
-            suppression_tracker: SuppressionTracker::new(),
+            assignment_counter: AtomicUsize::new(0),
+            suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
         }
     }
 
@@ -155,8 +165,9 @@ impl TransportManager {
     /// scoring.
     pub fn add_adapter(&mut self, adapter: Box<dyn TransportAdapter>) {
         let idx = self.adapters.len();
-        self.reliability_scores
-            .insert(idx.to_string(), ReliabilityScore::new(idx.to_string()));
+        if let Ok(mut scores) = self.reliability_scores.lock() {
+            scores.insert(idx.to_string(), ReliabilityScore::new(idx.to_string()));
+        }
         self.adapters.push(adapter);
     }
 
@@ -198,7 +209,7 @@ impl TransportManager {
     /// or no relay set is assigned to the context.
     /// Returns [`TransportError::SendFailed`] if fewer than 2 relays succeed.
     pub async fn send_to_context(
-        &mut self,
+        &self,
         envelope: &OuterEnvelope,
         context_id: &ContextId,
     ) -> Result<Vec<BlobId>, TransportError> {
@@ -208,6 +219,8 @@ impl TransportManager {
 
         let relay_indices = self
             .relay_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(context_id)
             .ok_or_else(|| {
                 TransportError::SendFailed(format!(
@@ -242,14 +255,16 @@ impl TransportManager {
         }
 
         // Record delivery outcomes for reliability scoring via EMA.
-        for (idx, success) in outcomes {
-            let key = idx.to_string();
-            let outcome = if success {
-                DeliveryOutcome::Success { latency_ms: 0 }
-            } else {
-                DeliveryOutcome::Failure
-            };
-            scoring::update_score(&mut self.reliability_scores, &key, outcome);
+        if let Ok(mut scores) = self.reliability_scores.lock() {
+            for (idx, success) in outcomes {
+                let key = idx.to_string();
+                let outcome = if success {
+                    DeliveryOutcome::Success { latency_ms: 0 }
+                } else {
+                    DeliveryOutcome::Failure
+                };
+                scoring::update_score(&mut scores, &key, outcome);
+            }
         }
 
         if successes.len() < MIN_SUCCESSFUL_SENDS {
@@ -287,24 +302,33 @@ impl TransportManager {
             return Err(TransportError::NotConnected);
         }
 
-        // Collect subscription streams from all adapters.
-        let mut streams: Vec<SubscriptionStream> = Vec::with_capacity(self.adapters.len());
+        // Collect subscription streams from all adapters with their indices.
+        let mut indexed_streams: Vec<(usize, SubscriptionStream)> =
+            Vec::with_capacity(self.adapters.len());
 
-        for adapter in &self.adapters {
+        for (idx, adapter) in self.adapters.iter().enumerate() {
             let stream = adapter.subscribe(routing_id, since).await?;
-            streams.push(stream);
+            indexed_streams.push((idx, stream));
         }
 
         // Phase 1 optimization: single adapter, no merging needed.
-        if streams.len() == 1
-            && let Some(stream) = streams.pop()
+        if indexed_streams.len() == 1
+            && let Some((_idx, stream)) = indexed_streams.pop()
         {
             return Ok(stream);
         }
 
         // Phase 2: merge streams with LRU + TTL deduplication by BlobId.
+        let total_relays = indexed_streams.len();
         let dedup_capacity = self.dedup_cache.cap();
-        let merged = MergedStream::new(streams, dedup_capacity, self.dedup_ttl);
+        let merged = MergedStream::new(
+            indexed_streams,
+            dedup_capacity,
+            self.dedup_ttl,
+            Arc::clone(&self.suppression_tracker),
+            Arc::clone(&self.reliability_scores),
+            total_relays,
+        );
         Ok(Box::pin(merged))
     }
 
@@ -335,6 +359,8 @@ impl TransportManager {
 
         let relay_indices = self
             .relay_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(context_id)
             .ok_or_else(|| {
                 TransportError::SubscriptionFailed(format!(
@@ -343,27 +369,36 @@ impl TransportManager {
             })?
             .clone();
 
-        let mut streams: Vec<SubscriptionStream> = Vec::with_capacity(relay_indices.len());
+        let mut indexed_streams: Vec<(usize, SubscriptionStream)> =
+            Vec::with_capacity(relay_indices.len());
         for &idx in &relay_indices {
             if let Some(adapter) = self.adapters.get(idx) {
                 let stream = adapter.subscribe(routing_id, since).await?;
-                streams.push(stream);
+                indexed_streams.push((idx, stream));
             }
         }
 
-        if streams.is_empty() {
+        if indexed_streams.is_empty() {
             return Err(TransportError::NotConnected);
         }
 
         // Single relay optimization: no merging needed.
-        if streams.len() == 1
-            && let Some(stream) = streams.pop()
+        if indexed_streams.len() == 1
+            && let Some((_idx, stream)) = indexed_streams.pop()
         {
             return Ok(stream);
         }
 
+        let total_relays = indexed_streams.len();
         let dedup_capacity = self.dedup_cache.cap();
-        let merged = MergedStream::new(streams, dedup_capacity, self.dedup_ttl);
+        let merged = MergedStream::new(
+            indexed_streams,
+            dedup_capacity,
+            self.dedup_ttl,
+            Arc::clone(&self.suppression_tracker),
+            Arc::clone(&self.reliability_scores),
+            total_relays,
+        );
         Ok(Box::pin(merged))
     }
 
@@ -454,10 +489,7 @@ impl TransportManager {
     /// # Errors
     ///
     /// Returns [`TransportError::NotConnected`] if no adapters are registered.
-    pub fn assign_relay_set(
-        &mut self,
-        context_id: &ContextId,
-    ) -> Result<Vec<usize>, TransportError> {
+    pub fn assign_relay_set(&self, context_id: &ContextId) -> Result<Vec<usize>, TransportError> {
         if self.adapters.is_empty() {
             return Err(TransportError::NotConnected);
         }
@@ -469,18 +501,32 @@ impl TransportManager {
         //   (overlap count ASC, reliability score DESC, round-robin offset ASC).
         // This prefers adapters least used by other contexts and with higher
         // reliability.
+        let scores = self
+            .reliability_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let assignments = self
+            .relay_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut candidates: Vec<(usize, usize, f64)> = (0..adapter_count)
             .map(|idx| {
-                let overlap = self.overlap_count(idx);
-                let reliability = self
-                    .reliability_scores
+                let overlap = assignments
+                    .values()
+                    .filter(|set| set.contains(&idx))
+                    .count();
+                let reliability = scores
                     .get(&idx.to_string())
                     .map_or(1.0, ReliabilityScore::composite_score);
                 (idx, overlap, reliability)
             })
             .collect();
+        drop(scores);
+        drop(assignments);
 
-        let counter = self.assignment_counter;
+        let counter = self
+            .assignment_counter
+            .fetch_add(set_size, Ordering::Relaxed);
         candidates.sort_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
@@ -498,8 +544,9 @@ impl TransportManager {
             .map(|(idx, _, _)| *idx)
             .collect();
 
-        self.assignment_counter += set_size;
         self.relay_assignments
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(context_id.clone(), assigned.clone());
 
         Ok(assigned)
@@ -507,14 +554,24 @@ impl TransportManager {
 
     /// Returns the relay set currently assigned to a context, if any.
     #[must_use]
-    pub fn get_relay_set(&self, context_id: &ContextId) -> Option<&Vec<usize>> {
-        self.relay_assignments.get(context_id)
+    pub fn get_relay_set(&self, context_id: &ContextId) -> Option<Vec<usize>> {
+        self.relay_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(context_id)
+            .cloned()
     }
 
     /// Returns the reliability score for an adapter by index.
+    ///
+    /// Returns a clone of the score to avoid holding the lock.
     #[must_use]
-    pub fn get_reliability_score(&self, adapter_index: usize) -> Option<&ReliabilityScore> {
-        self.reliability_scores.get(&adapter_index.to_string())
+    pub fn get_reliability_score(&self, adapter_index: usize) -> Option<ReliabilityScore> {
+        let scores = self
+            .reliability_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        scores.get(&adapter_index.to_string()).cloned()
     }
 
     /// Updates the reliability score for a relay after an operation.
@@ -524,41 +581,41 @@ impl TransportManager {
     /// historical.
     ///
     /// See ADR-012 acceptance criterion 5.
-    pub fn update_score(&mut self, relay_url: &str, outcome: DeliveryOutcome) {
-        scoring::update_score(&mut self.reliability_scores, relay_url, outcome);
+    pub fn update_score(&self, relay_url: &str, outcome: DeliveryOutcome) {
+        let mut scores = self
+            .reliability_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        scoring::update_score(&mut scores, relay_url, outcome);
     }
 
     /// Returns the current reliability score for a relay URL.
     ///
-    /// Delegates to [`scoring::get_score`].
+    /// Returns a clone of the score to avoid holding the lock.
     #[must_use]
-    pub fn get_score(&self, relay_url: &str) -> Option<&ReliabilityScore> {
-        scoring::get_score(&self.reliability_scores, relay_url)
+    pub fn get_score(&self, relay_url: &str) -> Option<ReliabilityScore> {
+        let scores = self
+            .reliability_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        scores.get(relay_url).cloned()
     }
 
-    /// Returns a mutable reference to the suppression tracker.
-    ///
-    /// Used by the subscription layer to record per-blob deliveries and
-    /// check for suppression across relays.
-    pub fn suppression_tracker_mut(&mut self) -> &mut SuppressionTracker {
-        &mut self.suppression_tracker
-    }
-
-    /// Returns a reference to the suppression tracker.
+    /// Returns a shared reference to the suppression tracker.
     #[must_use]
-    pub fn suppression_tracker(&self) -> &SuppressionTracker {
-        &self.suppression_tracker
+    pub fn suppression_tracker(&self) -> Arc<Mutex<SuppressionTracker>> {
+        Arc::clone(&self.suppression_tracker)
     }
 
-    /// Counts how many existing context relay sets include the given adapter
-    /// index.
-    fn overlap_count(&self, adapter_index: usize) -> usize {
-        self.relay_assignments
-            .values()
-            .filter(|set| set.contains(&adapter_index))
-            .count()
+    /// Returns a shared reference to the reliability scores.
+    #[must_use]
+    pub fn reliability_scores(&self) -> Arc<Mutex<HashMap<String, ReliabilityScore>>> {
+        Arc::clone(&self.reliability_scores)
     }
 }
+
+/// Interval between periodic suppression cross-check calls during stream polling.
+const SUPPRESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A merged stream that combines multiple adapter subscription streams with
 /// deduplication by [`BlobId`] for [`TransportEvent::Envelope`] variants.
@@ -567,31 +624,57 @@ impl TransportManager {
 /// Entries older than the TTL are treated as expired, allowing the same
 /// `BlobId` to be delivered again if it arrives after the TTL window.
 ///
+/// Records per-adapter deliveries in the shared [`SuppressionTracker`] and
+/// periodically checks for suppression, emitting
+/// [`TransportEvent::SuppressionDetected`] events and downgrading relay
+/// reliability scores when suppression is detected.
+///
 /// Control events ([`BackfillComplete`](TransportEvent::BackfillComplete),
 /// [`Reconnected`](TransportEvent::Reconnected),
 /// [`Terminated`](TransportEvent::Terminated),
 /// [`Error`](TransportEvent::Error)) are passed through per-adapter without
 /// deduplication.
 struct MergedStream {
-    /// The underlying adapter streams being merged.
-    streams: Vec<SubscriptionStream>,
+    /// The underlying adapter streams being merged, paired with their adapter
+    /// indices for suppression tracking.
+    streams: Vec<(usize, SubscriptionStream)>,
     /// LRU cache of `BlobId`s already yielded, with timestamps for TTL expiry.
     seen: LruCache<BlobId, Instant>,
     /// TTL for deduplication cache entries.
     ttl: Duration,
+    /// Shared suppression tracker for recording deliveries and checking
+    /// suppressions across relays.
+    suppression_tracker: Arc<Mutex<SuppressionTracker>>,
+    /// Shared reliability scores for downgrading on suppression detection.
+    reliability_scores: Arc<Mutex<HashMap<String, ReliabilityScore>>>,
+    /// Total number of relays in this context's relay set.
+    total_relays: usize,
+    /// Timestamp of the last suppression cross-check.
+    last_suppression_check: Instant,
+    /// Pending suppression warnings to emit as events.
+    pending_warnings: Vec<SuppressionWarning>,
 }
 
 impl MergedStream {
-    /// Creates a new `MergedStream` from multiple adapter streams.
+    /// Creates a new `MergedStream` from multiple adapter streams with
+    /// suppression tracking.
     fn new(
-        streams: Vec<SubscriptionStream>,
+        indexed_streams: Vec<(usize, SubscriptionStream)>,
         capacity: std::num::NonZeroUsize,
         ttl: Duration,
+        suppression_tracker: Arc<Mutex<SuppressionTracker>>,
+        reliability_scores: Arc<Mutex<HashMap<String, ReliabilityScore>>>,
+        total_relays: usize,
     ) -> Self {
         Self {
-            streams,
+            streams: indexed_streams,
             seen: LruCache::new(capacity),
             ttl,
+            suppression_tracker,
+            reliability_scores,
+            total_relays,
+            last_suppression_check: Instant::now(),
+            pending_warnings: Vec::new(),
         }
     }
 
@@ -610,6 +693,46 @@ impl MergedStream {
         self.seen.put(*blob_id, now);
         false
     }
+
+    /// Runs a periodic suppression check if the interval has elapsed.
+    /// Returns any new suppression warnings and downgrade the flagged relays.
+    #[allow(clippy::cast_possible_truncation)]
+    fn check_suppressions_if_due(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_suppression_check) < SUPPRESSION_CHECK_INTERVAL {
+            return;
+        }
+        self.last_suppression_check = now;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let warnings = if let Ok(mut tracker) = self.suppression_tracker.lock() {
+            tracker.check_suppressions(now_ms, self.total_relays)
+        } else {
+            return;
+        };
+
+        if warnings.is_empty() {
+            return;
+        }
+
+        // Downgrade reliability scores for adapters that failed to deliver.
+        if let Ok(mut scores) = self.reliability_scores.lock() {
+            for warning in &warnings {
+                let all_adapters: std::collections::HashSet<usize> =
+                    (0..self.total_relays).collect();
+                for &missing_adapter in all_adapters.difference(&warning.delivered_by) {
+                    let key = missing_adapter.to_string();
+                    scoring::update_score(&mut scores, &key, DeliveryOutcome::Failure);
+                }
+            }
+        }
+
+        self.pending_warnings.extend(warnings);
+    }
 }
 
 impl Stream for MergedStream {
@@ -618,18 +741,45 @@ impl Stream for MergedStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
+        // Emit any pending suppression warnings before polling streams.
+        if let Some(warning) = this.pending_warnings.pop() {
+            cx.waker().wake_by_ref();
+            return Poll::Ready(Some(TransportEvent::SuppressionDetected(warning)));
+        }
+
+        // Check for suppressions periodically.
+        this.check_suppressions_if_due();
+        if let Some(warning) = this.pending_warnings.pop() {
+            cx.waker().wake_by_ref();
+            return Poll::Ready(Some(TransportEvent::SuppressionDetected(warning)));
+        }
+
         // Round-robin poll across all streams. Return the first ready item
         // that passes deduplication. If all streams are pending, return
         // Pending. If all streams are exhausted, return None.
         let mut all_done = true;
         let mut any_pending = false;
 
-        for stream in &mut this.streams {
+        for i in 0..this.streams.len() {
+            let (adapter_index, stream) = &mut this.streams[i];
+            let adapter_idx = *adapter_index;
             match stream.poll_next_unpin(cx) {
                 Poll::Ready(Some(event)) => {
                     match &event {
                         TransportEvent::Envelope(envelope) => {
                             let blob_id = BlobId::from_sha256(&envelope.encrypted_blob);
+
+                            // Record this delivery for suppression tracking,
+                            // regardless of whether it's a duplicate.
+                            if let Ok(mut tracker) = this.suppression_tracker.lock() {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                tracker.record_delivery(blob_id, adapter_idx, now_ms);
+                            }
+
                             if !this.is_duplicate(&blob_id) {
                                 return Poll::Ready(Some(event));
                             }
@@ -641,7 +791,8 @@ impl Stream for MergedStream {
                         TransportEvent::Error(_)
                         | TransportEvent::BackfillComplete
                         | TransportEvent::Reconnected
-                        | TransportEvent::Terminated { .. } => {
+                        | TransportEvent::Terminated { .. }
+                        | TransportEvent::SuppressionDetected(_) => {
                             return Poll::Ready(Some(event));
                         }
                     }
@@ -735,6 +886,9 @@ mod tests {
                         TransportEvent::Terminated { reason } => TransportEvent::Terminated {
                             reason: reason.clone(),
                         },
+                        TransportEvent::SuppressionDetected(w) => {
+                            TransportEvent::SuppressionDetected(w.clone())
+                        }
                     })
                     .collect();
                 let s: SubscriptionStream = Box::pin(stream::iter(items));
@@ -984,7 +1138,11 @@ mod tests {
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
 
         let ctx = "ctx-1".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await.unwrap();
@@ -1004,7 +1162,11 @@ mod tests {
         ))));
 
         let ctx = "ctx-fail".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await;
@@ -1022,7 +1184,11 @@ mod tests {
         ))));
 
         let ctx = "ctx-partial".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let result = manager.send_to_context(&envelope, &ctx).await.unwrap();
@@ -1039,7 +1205,11 @@ mod tests {
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
 
         let ctx = "ctx-score".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1, 2]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2]);
 
         let envelope = test_envelope();
         let _ = manager.send_to_context(&envelope, &ctx).await;
@@ -1097,7 +1267,11 @@ mod tests {
         manager.add_adapter(Box::new(adapter2));
 
         let ctx = "ctx-dedup".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1]);
 
         let routing_id = RoutingId::new([0xAA; 32]);
         let mut stream = manager
@@ -1134,7 +1308,11 @@ mod tests {
         manager.add_adapter(Box::new(adapter2));
 
         let ctx = "ctx-distinct".to_string();
-        manager.relay_assignments.insert(ctx.clone(), vec![0, 1]);
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1]);
 
         let routing_id = RoutingId::new([0xAA; 32]);
         let mut stream = manager
@@ -1223,12 +1401,12 @@ mod tests {
         let set = manager.assign_relay_set(&ctx).unwrap();
 
         let retrieved = manager.get_relay_set(&ctx).unwrap();
-        assert_eq!(&set, retrieved);
+        assert_eq!(set, retrieved);
     }
 
     #[tokio::test]
     async fn assign_relay_set_no_adapters_returns_error() {
-        let mut manager = TransportManager::builder();
+        let manager = TransportManager::builder();
         let result = manager.assign_relay_set(&"ctx-empty".to_string());
         assert!(matches!(result, Err(TransportError::NotConnected)));
     }
@@ -1241,17 +1419,12 @@ mod tests {
         }
 
         // Degrade reliability for adapters 0 and 1 using the scoring API.
-        for _ in 0..10 {
-            scoring::update_score(
-                &mut manager.reliability_scores,
-                "0",
-                DeliveryOutcome::Failure,
-            );
-            scoring::update_score(
-                &mut manager.reliability_scores,
-                "1",
-                DeliveryOutcome::Failure,
-            );
+        {
+            let mut scores = manager.reliability_scores.lock().unwrap();
+            for _ in 0..10 {
+                scoring::update_score(&mut scores, "0", DeliveryOutcome::Failure);
+                scoring::update_score(&mut scores, "1", DeliveryOutcome::Failure);
+            }
         }
 
         let ctx = "ctx-reliable".to_string();
@@ -1355,5 +1528,239 @@ mod tests {
         let score = scoring::get_score(&scores, relay).unwrap();
         // EMA: 1.0 → 1.0 → 0.3*0.0 + 0.7*1.0 = 0.7
         assert!((score.composite_score() - 0.7).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Suppression tracker wiring tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn merged_stream_records_delivery_in_suppression_tracker() {
+        // Two adapters deliver the same envelope. After consuming the stream,
+        // the suppression tracker should show both adapters delivered the blob.
+        let envelope = test_envelope();
+        let envelope_clone = envelope.clone();
+        let blob_id = BlobId::from_sha256(&envelope.encrypted_blob);
+
+        let adapter1 = MockAdapter {
+            send_result: Ok(BlobId::new([0xAA; 32])),
+            query_result: Ok(Vec::new()),
+            subscribe_events: Arc::new(vec![TransportEvent::Envelope(envelope)]),
+        };
+        let adapter2 = MockAdapter {
+            send_result: Ok(BlobId::new([0xBB; 32])),
+            query_result: Ok(Vec::new()),
+            subscribe_events: Arc::new(vec![TransportEvent::Envelope(envelope_clone)]),
+        };
+
+        let mut manager = TransportManager::builder();
+        manager.add_adapter(Box::new(adapter1));
+        manager.add_adapter(Box::new(adapter2));
+
+        let ctx = "ctx-suppress-both".to_string();
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1]);
+
+        let routing_id = RoutingId::new([0xAA; 32]);
+        let mut stream = manager
+            .subscribe_context(&routing_id, &ctx, None)
+            .await
+            .unwrap();
+
+        // Drain the stream.
+        while stream.next().await.is_some() {}
+
+        // Verify suppression tracker recorded deliveries from both adapters.
+        let tracker = manager.suppression_tracker.lock().unwrap();
+        assert!(
+            !tracker.is_empty(),
+            "suppression tracker should have recorded the blob"
+        );
+        // The tracker should have an entry for this blob with both adapter indices.
+        // We can't peek directly into the LRU, but we can verify via check_suppressions:
+        // 2 out of 2 relays delivered => no warning.
+        drop(tracker);
+        let mut tracker = manager.suppression_tracker.lock().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 31_000; // simulate 31 seconds later
+        let warnings = tracker.check_suppressions(now_ms, 2);
+        assert!(
+            warnings.is_empty(),
+            "no suppression warning expected when both adapters delivered; got {warnings:?}"
+        );
+        let _ = blob_id; // used for clarity, suppression check validates internally
+    }
+
+    #[tokio::test]
+    async fn merged_stream_records_delivery_for_single_adapter_envelope() {
+        // Only one adapter out of four delivers a blob. After consuming, the
+        // suppression tracker should show only that adapter delivered.
+        // With 4 relays, threshold = ceil(4/2) = 2, so 1 delivery < 2 triggers
+        // a suppression warning.
+        let envelope1 = test_envelope_with_blob(vec![0x10, 0x20, 0x30]);
+
+        let adapter1 = MockAdapter {
+            send_result: Ok(BlobId::new([0xAA; 32])),
+            query_result: Ok(Vec::new()),
+            subscribe_events: Arc::new(vec![TransportEvent::Envelope(envelope1)]),
+        };
+        let adapter2 = MockAdapter {
+            send_result: Ok(BlobId::new([0xBB; 32])),
+            query_result: Ok(Vec::new()),
+            subscribe_events: Arc::new(Vec::new()), // delivers nothing
+        };
+        let adapter3 = MockAdapter {
+            send_result: Ok(BlobId::new([0xCC; 32])),
+            query_result: Ok(Vec::new()),
+            subscribe_events: Arc::new(Vec::new()), // delivers nothing
+        };
+        let adapter4 = MockAdapter {
+            send_result: Ok(BlobId::new([0xDD; 32])),
+            query_result: Ok(Vec::new()),
+            subscribe_events: Arc::new(Vec::new()), // delivers nothing
+        };
+
+        let mut manager = TransportManager::builder();
+        manager.add_adapter(Box::new(adapter1));
+        manager.add_adapter(Box::new(adapter2));
+        manager.add_adapter(Box::new(adapter3));
+        manager.add_adapter(Box::new(adapter4));
+
+        let ctx = "ctx-suppress-one".to_string();
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![0, 1, 2, 3]);
+
+        let routing_id = RoutingId::new([0xAA; 32]);
+        let mut stream = manager
+            .subscribe_context(&routing_id, &ctx, None)
+            .await
+            .unwrap();
+
+        // Drain the stream.
+        while stream.next().await.is_some() {}
+
+        // The suppression tracker should have 1 delivery from adapter 0 only.
+        // With 4 total relays, threshold = ceil(4/2) = 2. Only 1 delivered
+        // => 1 < 2 => warning should be emitted.
+        let mut tracker = manager.suppression_tracker.lock().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 31_000;
+        let warnings = tracker.check_suppressions(now_ms, 4);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected 1 suppression warning when only 1 of 4 adapters delivered"
+        );
+        assert!(warnings[0].delivered_by.contains(&0));
+        assert!(!warnings[0].delivered_by.contains(&1));
+        assert!(!warnings[0].delivered_by.contains(&2));
+        assert!(!warnings[0].delivered_by.contains(&3));
+    }
+
+    #[tokio::test]
+    async fn suppression_warning_downgrades_reliability_score() {
+        // Set up a scenario where suppression is detected and verify the
+        // reliability score of the non-delivering adapter is downgraded.
+        use crate::scoring::SuppressionWarning;
+        use std::collections::HashSet;
+
+        let mut manager = TransportManager::builder();
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+
+        // Manually simulate what MergedStream::check_suppressions_if_due does:
+        // a warning where adapter 2 did not deliver.
+        let mut delivered_by = HashSet::new();
+        delivered_by.insert(0usize);
+        delivered_by.insert(1usize);
+        let warning = SuppressionWarning {
+            blob_id: BlobId::new([0xFF; 32]),
+            delivered_by,
+            total_relays: 3,
+        };
+
+        // Apply the downgrade manually (same logic as MergedStream).
+        {
+            let mut scores = manager.reliability_scores.lock().unwrap();
+            let all_adapters: HashSet<usize> = (0..3).collect();
+            for &missing in all_adapters.difference(&warning.delivered_by) {
+                scoring::update_score(&mut scores, &missing.to_string(), DeliveryOutcome::Failure);
+            }
+        }
+
+        // Adapter 2 should have been downgraded (started at 1.0, one failure
+        // => EMA: 0.3*0 + 0.7*1.0 = 0.7).
+        let score2 = manager.get_reliability_score(2).unwrap();
+        assert!(
+            (score2.delivery_success_rate - 0.7).abs() < 1e-10,
+            "expected adapter 2 to be downgraded to 0.7, got {}",
+            score2.delivery_success_rate
+        );
+        assert_eq!(score2.total_failures, 1);
+
+        // Adapters 0 and 1 should be unaffected.
+        let score0 = manager.get_reliability_score(0).unwrap();
+        assert!(
+            (score0.delivery_success_rate - 1.0).abs() < f64::EPSILON,
+            "adapter 0 should not be downgraded"
+        );
+        let score1 = manager.get_reliability_score(1).unwrap();
+        assert!(
+            (score1.delivery_success_rate - 1.0).abs() < f64::EPSILON,
+            "adapter 1 should not be downgraded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn concurrent_sends_to_different_contexts_do_not_block() {
+        // 10 tasks send to 10 different contexts through Arc<TransportManager>.
+        // All sends should complete without deadlock.
+        let mut manager = TransportManager::builder();
+        for _ in 0..5 {
+            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0xAA; 32]))));
+        }
+
+        // Assign relay sets for 10 contexts.
+        for i in 0..10 {
+            let ctx = format!("ctx-concurrent-{i}");
+            manager.assign_relay_set(&ctx).unwrap();
+        }
+
+        let manager = Arc::new(manager);
+
+        let mut handles = Vec::with_capacity(10);
+        for i in 0..10 {
+            let mgr = Arc::clone(&manager);
+            let ctx = format!("ctx-concurrent-{i}");
+            handles.push(tokio::spawn(async move {
+                let envelope = test_envelope();
+                mgr.send_to_context(&envelope, &ctx).await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.expect("task should not panic");
+            assert!(
+                result.is_ok(),
+                "send_to_context should succeed, got: {result:?}"
+            );
+        }
     }
 }

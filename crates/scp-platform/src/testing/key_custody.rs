@@ -136,6 +136,20 @@ impl InMemoryKeyCustody {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         KeyHandle::new(id)
     }
+
+    /// Imports an existing Ed25519 private key and returns a handle to it.
+    ///
+    /// This is used in tests where the signing key must match an externally
+    /// provided key (e.g., the MLS group member's signing key for inner
+    /// envelope signing in `open_envelope` tests).
+    pub async fn import_ed25519_key(&self, private_key_bytes: &[u8; 32]) -> KeyHandle {
+        let handle = self.next_handle();
+        let signing_key = SigningKey::from_bytes(private_key_bytes);
+        let mut store = self.store.lock().await;
+        store.ed25519_keys.insert(handle.id(), signing_key);
+        store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
+        handle
+    }
 }
 
 impl Default for InMemoryKeyCustody {

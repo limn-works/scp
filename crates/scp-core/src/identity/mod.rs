@@ -37,7 +37,83 @@ pub use dht_client::{DhtClient, InMemoryDhtClient};
 pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 pub use republish::RepublishManager;
 
+use serde::{Deserialize, Serialize};
+
 use scp_platform::traits::{KeyCustody, KeyHandle};
+
+// ---------------------------------------------------------------------------
+// DID newtype (SCP-187)
+// ---------------------------------------------------------------------------
+
+/// Decentralized Identifier string (e.g., `"did:dht:z6Mk..."`).
+///
+/// A newtype wrapper around `String` providing type safety across the SCP
+/// codebase. Replaces the independent `type DID = String` aliases that were
+/// previously scattered across modules.
+///
+/// Implements `Deref<Target = str>` for ergonomic access to `&str` methods,
+/// `Borrow<str>` for `HashMap`/`HashSet` lookups with `&str` keys, and
+/// `#[serde(transparent)]` for zero-overhead JSON serialization.
+///
+/// See SCP-187 in `.docs/prds/prd.json`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DID(pub String);
+
+impl std::ops::Deref for DID {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for DID {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for DID {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for DID {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl PartialEq<str> for DID {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for DID {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for DID {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::borrow::Borrow<str> for DID {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 /// An SCP identity containing the DID string, key handles, and pre-rotation
 /// commitment.

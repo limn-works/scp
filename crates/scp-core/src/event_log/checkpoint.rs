@@ -311,6 +311,7 @@ mod tests {
     use scp_platform::traits::KeyType;
 
     use super::*;
+    use crate::identity::DID;
     use crate::event_log::tree::{self, GENESIS_PREV_HASH};
     use crate::event_log::{Event, EventLog, EventPayload, EventType};
 
@@ -327,7 +328,7 @@ mod tests {
     }
 
     /// Helper: encode a public key as a test DID (`did:key:<hex>`).
-    fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
+    fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
         let hex: String = verifying_key
             .as_bytes()
             .iter()
@@ -336,7 +337,7 @@ mod tests {
                 let _ = write!(acc, "{b:02x}");
                 acc
             });
-        format!("did:key:{hex}")
+        format!("did:key:{hex}").into()
     }
 
     /// Helper: compute the canonical hash for signing an event.
@@ -390,7 +391,7 @@ mod tests {
     ) -> Event {
         let mut event = Event {
             event_type,
-            actor_did: actor_did.to_owned(),
+            actor_did: actor_did.into(),
             timestamp,
             sequence,
             payload: EventPayload { data: payload },
@@ -407,7 +408,7 @@ mod tests {
 
     /// Helper: build a log with `n` events and return the log, leaf hashes,
     /// and the DID used for signing.
-    fn build_log(n: u64) -> (EventLog, Vec<[u8; 32]>, String) {
+    fn build_log(n: u64) -> (EventLog, Vec<[u8; 32]>, DID) {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
         let mut log = EventLog::new("ctx-checkpoint-test".to_owned());
@@ -434,7 +435,7 @@ mod tests {
     }
 
     /// Helper: build two identical logs with `n` events each.
-    fn build_matching_logs(n: u64) -> (EventLog, EventLog, String) {
+    fn build_matching_logs(n: u64) -> (EventLog, EventLog, DID) {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
         let mut log_a = EventLog::new("ctx-checkpoint-test".to_owned());
@@ -511,7 +512,7 @@ mod tests {
         let log = EventLog::new("ctx-empty".to_owned());
         let custody = InMemoryKeyCustody::new();
         let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let did = "did:key:test".to_owned();
+        let did: DID = "did:key:test".into();
 
         let checkpoint = generate_checkpoint(&log, &did, 0, &custody, &key)
             .await
@@ -706,7 +707,7 @@ mod tests {
         let log_b = EventLog::new("ctx-empty".to_owned());
         let custody = InMemoryKeyCustody::new();
         let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let did = "did:key:test".to_owned();
+        let did: DID = "did:key:test".into();
 
         let checkpoint = generate_checkpoint(&log_a, &did, 0, &custody, &key)
             .await

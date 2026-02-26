@@ -74,10 +74,7 @@ pub use schema::{SchemaValidationError, validate_schema, validate_value_against_
 /// module-local clarity. These are the same underlying type (`String`).
 pub type ToolId = String;
 
-/// A DID string (e.g., `"did:dht:z6Mk..."`).
-///
-/// Represented as a plain `String` for Phase 2.
-pub type DID = String;
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // ToolError

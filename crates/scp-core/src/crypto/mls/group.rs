@@ -21,7 +21,6 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
-
 use super::credential::ScpCredential;
 use super::error::MlsError;
 use super::storage::ScpMlsProvider;
@@ -52,12 +51,14 @@ pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 ///
 /// See ADR-001 for the MLS wrapper design.
 pub struct ScpMlsGroup {
-    /// The underlying `OpenMLS` group.
-    pub(crate) group: MlsGroup,
+    /// The underlying `OpenMLS` group. `None` after [`destroy_group`]
+    /// drops the MLS state (tree secrets, epoch keys, etc.).
+    pub(crate) group: Option<MlsGroup>,
     /// The MLS provider (crypto + storage) for this group.
     pub(crate) provider: ScpMlsProvider,
-    /// The local member's Ed25519 signing key pair.
-    pub(crate) signer: SignatureKeyPair,
+    /// The local member's Ed25519 signing key pair. `None` after
+    /// [`destroy_group`] drops the private key material.
+    pub(crate) signer: Option<SignatureKeyPair>,
     /// Whether the group has been destroyed.
     pub(crate) destroyed: bool,
 }
@@ -71,11 +72,8 @@ impl ScpMlsGroup {
     /// # Errors
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
-    pub const fn inner(&self) -> Result<&MlsGroup, MlsError> {
-        if self.destroyed {
-            return Err(MlsError::GroupDestroyed);
-        }
-        Ok(&self.group)
+    pub fn inner(&self) -> Result<&MlsGroup, MlsError> {
+        self.group.as_ref().ok_or(MlsError::GroupDestroyed)
     }
 
     /// Returns a reference to the provider for this group.
@@ -92,10 +90,8 @@ impl ScpMlsGroup {
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
     pub fn epoch(&self) -> Result<u64, MlsError> {
-        if self.destroyed {
-            return Err(MlsError::GroupDestroyed);
-        }
-        Ok(self.group.epoch().as_u64())
+        let g = self.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        Ok(g.epoch().as_u64())
     }
 
     /// Returns the group ID as bytes.
@@ -104,10 +100,8 @@ impl ScpMlsGroup {
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
     pub fn group_id(&self) -> Result<&[u8], MlsError> {
-        if self.destroyed {
-            return Err(MlsError::GroupDestroyed);
-        }
-        Ok(self.group.group_id().as_slice())
+        let g = self.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        Ok(g.group_id().as_slice())
     }
 
     /// Returns the list of group members.
@@ -118,10 +112,8 @@ impl ScpMlsGroup {
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
     pub fn members(&self) -> Result<Vec<Member>, MlsError> {
-        if self.destroyed {
-            return Err(MlsError::GroupDestroyed);
-        }
-        Ok(self.group.members().collect())
+        let g = self.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        Ok(g.members().collect())
     }
 
     /// Returns the local member's own leaf index in the group tree.
@@ -130,10 +122,38 @@ impl ScpMlsGroup {
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
     pub fn own_leaf_index(&self) -> Result<LeafNodeIndex, MlsError> {
-        if self.destroyed {
-            return Err(MlsError::GroupDestroyed);
-        }
-        Ok(self.group.own_leaf_index())
+        let g = self.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        Ok(g.own_leaf_index())
+    }
+
+    /// Signs data using the local member's MLS signing key.
+    ///
+    /// This is the key that `open_envelope` resolves from the MLS group tree
+    /// when verifying inner envelope signatures (SCP-177). Inner envelopes
+    /// must be signed with this key for `open_envelope` verification to pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
+    /// Returns [`MlsError::EncryptionFailed`] if signing fails.
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, MlsError> {
+        let signer = self.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        openmls_traits::signatures::Signer::sign(signer, data)
+            .map_err(|e| MlsError::EncryptionFailed(format!("signing failed: {e:?}")))
+    }
+
+    /// Returns the local member's MLS signing public key bytes.
+    ///
+    /// This is the Ed25519 public key stored in the member's leaf node in the
+    /// MLS tree. `open_envelope` resolves this key from the sender's leaf node
+    /// to verify inner envelope signatures (SCP-177).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
+    pub fn signer_public_key(&self) -> Result<Vec<u8>, MlsError> {
+        let signer = self.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        Ok(signer.to_public_vec())
     }
 }
 
@@ -199,9 +219,9 @@ pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError>
     .map_err(|e| MlsError::GroupCreationFailed(e.to_string()))?;
 
     Ok(ScpMlsGroup {
-        group,
+        group: Some(group),
         provider,
-        signer,
+        signer: Some(signer),
         destroyed: false,
     })
 }
@@ -252,30 +272,27 @@ pub fn add_member(
     group: &mut ScpMlsGroup,
     key_package: KeyPackageIn,
 ) -> Result<AddMemberResult, MlsError> {
-    if group.destroyed {
-        return Err(MlsError::GroupDestroyed);
-    }
-
     // Validate the key package.
     let verified_key_package = key_package
         .validate(group.provider.crypto(), ProtocolVersion::Mls10)
         .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
 
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+
     // Add the member to the group. Returns (commit, welcome, group_info).
     // Both commit and welcome are MlsMessageOut.
-    let (commit, welcome, group_info) = group
-        .group
+    let (commit, welcome, group_info) = g
         .add_members(
             &group.provider,
-            &group.signer,
+            signer,
             core::slice::from_ref(&verified_key_package),
         )
         .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
 
     // Merge the pending commit to advance the group epoch locally.
-    group
-        .group
-        .merge_pending_commit(&group.provider)
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    g.merge_pending_commit(&group.provider)
         .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
 
     Ok(AddMemberResult {
@@ -329,24 +346,21 @@ pub fn remove_member(
     group: &mut ScpMlsGroup,
     leaf_index: LeafNodeIndex,
 ) -> Result<RemoveMemberResult, MlsError> {
-    if group.destroyed {
-        return Err(MlsError::GroupDestroyed);
-    }
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
 
     // Remove the member. Returns (commit, optional_welcome, group_info).
-    let (commit, _welcome, group_info) = group
-        .group
+    let (commit, _welcome, group_info) = g
         .remove_members(
             &group.provider,
-            &group.signer,
+            signer,
             core::slice::from_ref(&leaf_index),
         )
         .map_err(|e| MlsError::RemoveMemberFailed(e.to_string()))?;
 
     // Merge the pending commit to advance the group epoch locally.
-    group
-        .group
-        .merge_pending_commit(&group.provider)
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    g.merge_pending_commit(&group.provider)
         .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
 
     Ok(RemoveMemberResult { commit, group_info })
@@ -372,15 +386,25 @@ pub fn remove_member(
 /// destroyed.
 ///
 /// See ADR-001 acceptance criterion 9.
-pub const fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
+pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     if group.destroyed {
         return Err(MlsError::GroupDestroyed);
     }
 
+    // Eagerly drop cryptographic state. `Option::take` moves the value out,
+    // leaving `None`, and the taken value is dropped at the end of the
+    // statement. This releases:
+    //   - MlsGroup: tree secrets, epoch key schedules, ratchet state
+    //   - SignatureKeyPair: Ed25519 private key (Vec<u8>)
+    drop(group.group.take());
+    drop(group.signer.take());
+
+    // Replace the provider with a fresh empty instance. The old provider's
+    // MemoryStorage contains encryption key pairs, key packages, and other
+    // MLS artifacts — dropping it releases all of that key material.
+    group.provider = ScpMlsProvider::default();
+
     // Mark the group as destroyed so all future operations are rejected.
-    // The in-memory provider and group state will be cleaned up when the
-    // ScpMlsGroup is dropped. For Phase 1 (in-memory storage), dropping
-    // the provider suffices to destroy all cryptographic state.
     group.destroyed = true;
 
     Ok(())
@@ -490,9 +514,9 @@ pub fn join_group(
         .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
 
     Ok(ScpMlsGroup {
-        group,
+        group: Some(group),
         provider,
-        signer,
+        signer: Some(signer),
         destroyed: false,
     })
 }
@@ -501,8 +525,9 @@ pub fn join_group(
 mod tests {
     use super::*;
 
+    #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(format!("did:dht:z6Mk{name}"), None)
+        ScpCredential::new(format!("did:dht:z6Mk{name}"), None).unwrap()
     }
 
     #[test]
@@ -663,6 +688,29 @@ mod tests {
 
         // Double destroy should also error.
         assert!(destroy_group(&mut group).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn destroy_group_releases_crypto_state() {
+        let cred = test_credential("alice");
+        let mut group = create_group(&cred).unwrap();
+
+        // Before destroy: group and signer are Some.
+        assert!(group.group.is_some());
+        assert!(group.signer.is_some());
+
+        destroy_group(&mut group).unwrap();
+
+        // After destroy: group and signer are None, provider is fresh.
+        assert!(
+            group.group.is_none(),
+            "MLS group must be dropped on destroy"
+        );
+        assert!(
+            group.signer.is_none(),
+            "signing key must be dropped on destroy"
+        );
     }
 
     #[test]

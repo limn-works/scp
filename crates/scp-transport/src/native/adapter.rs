@@ -238,6 +238,12 @@ fn subscription_message_to_event(msg: SubscriptionMessage) -> Option<TransportEv
     match msg {
         SubscriptionMessage::Relay(relay_msg) => relay_message_to_event(relay_msg),
         SubscriptionMessage::Reconnected => Some(TransportEvent::Reconnected),
+        SubscriptionMessage::BlobIntegrityError { expected, actual } => {
+            Some(TransportEvent::Error(TransportError::BlobIntegrityError {
+                expected,
+                actual,
+            }))
+        }
     }
 }
 
@@ -417,5 +423,24 @@ mod tests {
         let msg = SubscriptionMessage::Relay(relay_msg);
         let event = subscription_message_to_event(msg);
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn subscription_blob_integrity_error_to_error_event() {
+        let msg = SubscriptionMessage::BlobIntegrityError {
+            expected: "aa".repeat(32),
+            actual: "bb".repeat(32),
+        };
+        let event = subscription_message_to_event(msg);
+        match event {
+            Some(TransportEvent::Error(TransportError::BlobIntegrityError {
+                expected,
+                actual,
+            })) => {
+                assert_eq!(expected, "aa".repeat(32));
+                assert_eq!(actual, "bb".repeat(32));
+            }
+            other => panic!("expected BlobIntegrityError event, got {other:?}"),
+        }
     }
 }

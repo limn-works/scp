@@ -293,7 +293,7 @@ where
     // Per-call UCAN governance: validate invoker has ToolInvoke capability.
     if !has_tool_invoke_capability(role_state, invoker_did, &tool_id) {
         return Err(ToolError::InvokerNotAuthorized {
-            did: invoker_did.to_owned(),
+            did: invoker_did.to_string(),
             tool_id: tool_id.clone(),
         });
     }
@@ -443,7 +443,7 @@ mod tests {
             },
             implementation_hash: [0xAA; 32],
             test_vectors: vec![],
-            operator_did: "did:dht:z6MkOperator".to_owned(),
+            operator_did: "did:dht:z6MkOperator".into(),
             economic_metadata: None,
         };
         register_tool(&mut registry, role_state, registration, registrant_did).unwrap();
@@ -699,7 +699,7 @@ mod tests {
             &context,
             "sess-expired",
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             add_executor,
         )
         .await;
@@ -805,7 +805,7 @@ mod tests {
             &context,
             &session_id,
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             add_executor,
         )
         .await;
@@ -823,7 +823,7 @@ mod tests {
             &context,
             &session_id,
             serde_json::json!({"a": 3, "b": 4}),
-            &member_did.to_owned(),
+            &DID::from(member_did),
             add_executor,
         )
         .await;
@@ -854,7 +854,7 @@ mod tests {
             &context,
             "nonexistent-session",
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             add_executor,
         )
         .await;
@@ -897,7 +897,7 @@ mod tests {
             &context,
             &session_id,
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             add_executor,
         )
         .await
@@ -916,7 +916,7 @@ mod tests {
             &context,
             &session_id,
             serde_json::json!({"a": 10, "b": 20}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             add_executor,
         )
         .await
@@ -959,7 +959,7 @@ mod tests {
             &context,
             "sess-1",
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             add_executor,
         )
         .await;
@@ -1029,7 +1029,7 @@ mod tests {
             &context,
             &session_id,
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             failing_executor,
         )
         .await;
