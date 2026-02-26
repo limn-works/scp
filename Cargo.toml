@@ -45,6 +45,7 @@ tracing = "0.1"
 lru = "0.12"
 axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

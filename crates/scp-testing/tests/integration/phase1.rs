@@ -138,7 +138,8 @@ async fn start_relay() -> SocketAddr {
     };
     let storage = InMemoryBlobStorage::new();
     let server = RelayServer::new(config, storage);
-    server.start().await.unwrap()
+    let (_handle, addr) = server.start().await.unwrap();
+    addr
 }
 
 /// Creates an SCP identity using the in-memory DID:DHT method.

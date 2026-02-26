@@ -1197,7 +1197,7 @@ mod tests {
         };
         let storage = InMemoryBlobStorage::new();
         let server = RelayServer::new(config, storage);
-        let addr = server.start().await.unwrap();
+        let (_handle, addr) = server.start().await.unwrap();
         let url = format!("ws://{addr}/scp/v1");
 
         let client = NativeRelayClient::connect(&url).await.unwrap();
