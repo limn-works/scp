@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod http;
+pub mod tls;
 mod well_known;
 
 use std::marker::PhantomData;
