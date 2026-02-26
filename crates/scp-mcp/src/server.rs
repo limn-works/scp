@@ -25,6 +25,7 @@
 
 use std::collections::HashSet;
 
+use scp_core::context::tools::validate_value_against_schema;
 use serde_json::Value;
 
 use crate::namespace::{
@@ -439,13 +440,13 @@ impl<P: ContextProvider> McpServer<P> {
 
         // Validate input against schema.
         if let Some(schema) = self.find_input_schema(&context_id, tool_name)
-            && let Err(msg) = validate_input(&params.arguments, &schema)
+            && let Err(msg) = validate_value_against_schema(&params.arguments, &schema)
         {
             return JsonRpcResponse::error(
                 request.id.clone(),
                 JsonRpcError {
                     code: protocol::INVALID_PARAMS,
-                    message: msg,
+                    message: format!("schema validation failed: {msg}"),
                     data: None,
                 },
             );
@@ -459,7 +460,7 @@ impl<P: ContextProvider> McpServer<P> {
             Ok(output) => {
                 // Validate output against schema if available.
                 if let Some(out_schema) = self.find_output_schema(&context_id, tool_name)
-                    && let Err(msg) = validate_output(&output, &out_schema)
+                    && let Err(msg) = validate_value_against_schema(&output, &out_schema)
                 {
                     return JsonRpcResponse::error(
                         request.id.clone(),
@@ -785,61 +786,6 @@ fn internal_error(id: RequestId, message: &str) -> JsonRpcResponse {
             data: None,
         },
     )
-}
-
-/// Validates tool input against a JSON schema.
-///
-/// Uses the basic structural validation from the schema module's convention:
-/// checks the top-level type constraint.
-fn validate_input(input: &Value, schema: &Value) -> Result<(), String> {
-    let Some(schema_obj) = schema.as_object() else {
-        return Ok(()); // No schema to validate against.
-    };
-
-    let Some(type_field) = schema_obj.get("type") else {
-        return Ok(());
-    };
-
-    let Some(expected_type) = type_field.as_str() else {
-        return Ok(());
-    };
-
-    let matches = match expected_type {
-        "object" => input.is_object(),
-        "array" => input.is_array(),
-        "string" => input.is_string(),
-        "number" => input.is_number(),
-        "integer" => input.is_i64() || input.is_u64(),
-        "boolean" => input.is_boolean(),
-        "null" => input.is_null(),
-        _ => true,
-    };
-
-    if matches {
-        Ok(())
-    } else {
-        Err(format!(
-            "input validation failed: expected {expected_type}, got {}",
-            json_type_name(input)
-        ))
-    }
-}
-
-/// Validates tool output against a JSON schema (same logic as input).
-fn validate_output(output: &Value, schema: &Value) -> Result<(), String> {
-    validate_input(output, schema)
-}
-
-/// Returns a human-readable name for a JSON value's type.
-const fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 /// Parses a resource URI into `(context_id, resource_type)`.
@@ -1313,7 +1259,7 @@ mod tests {
         let resp = server.handle_request(&req).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, protocol::INVALID_PARAMS);
-        assert!(err.message.contains("input validation failed"));
+        assert!(err.message.contains("schema validation failed"));
     }
 
     #[test]
@@ -1655,36 +1601,35 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Input/output validation
+    // Input/output validation (delegates to scp_core shared validation)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_input_accepts_matching_type() {
+    fn shared_validation_accepts_matching_type() {
         let schema = serde_json::json!({"type": "object"});
         let input = serde_json::json!({"key": "value"});
-        assert!(validate_input(&input, &schema).is_ok());
+        assert!(validate_value_against_schema(&input, &schema).is_ok());
     }
 
     #[test]
-    fn validate_input_rejects_type_mismatch() {
+    fn shared_validation_rejects_type_mismatch() {
         let schema = serde_json::json!({"type": "object"});
         let input = serde_json::json!("string value");
-        let err = validate_input(&input, &schema).unwrap_err();
-        assert!(err.contains("expected object"));
+        assert!(validate_value_against_schema(&input, &schema).is_err());
     }
 
     #[test]
-    fn validate_input_passes_when_no_schema() {
+    fn shared_validation_passes_when_no_type_constraint() {
         let schema = serde_json::json!({});
         let input = serde_json::json!(42);
-        assert!(validate_input(&input, &schema).is_ok());
+        assert!(validate_value_against_schema(&input, &schema).is_ok());
     }
 
     #[test]
-    fn validate_input_passes_for_non_object_schema() {
+    fn shared_validation_rejects_non_object_schema() {
         let schema = serde_json::json!("not an object");
         let input = serde_json::json!(42);
-        assert!(validate_input(&input, &schema).is_ok());
+        assert!(validate_value_against_schema(&input, &schema).is_err());
     }
 
     // -----------------------------------------------------------------------
