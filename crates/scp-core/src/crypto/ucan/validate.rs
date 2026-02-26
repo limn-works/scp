@@ -25,7 +25,6 @@ use std::hash::BuildHasher;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::Verifier;
 
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
 use super::mint::compute_cid;
@@ -581,7 +580,7 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
     verifying_key
-        .verify(signing_input.as_bytes(), &signature)
+        .verify_strict(signing_input.as_bytes(), &signature)
         .map_err(|_| UcanError::SignatureInvalid)
 }
 

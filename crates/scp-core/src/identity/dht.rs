@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ed25519_dalek::{Verifier, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
@@ -228,7 +228,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let sig = ed25519_dalek::Signature::from_bytes(signature);
         let payload = Self::bep44_signable(value, seq);
 
-        verifying_key.verify(&payload, &sig).map_err(|e| {
+        verifying_key.verify_strict(&payload, &sig).map_err(|e| {
             IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
         })
     }
@@ -1031,7 +1031,7 @@ pub fn verify_migration(
         })?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
-    verifying_key.verify(&digest, &signature).map_err(|e| {
+    verifying_key.verify_strict(&digest, &signature).map_err(|e| {
         IdentityError::MigrationVerificationFailed(format!(
             "migration proof signature verification failed: {e}"
         ))

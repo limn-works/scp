@@ -14,7 +14,6 @@
 //!
 //! See ADR-002 acceptance criteria 2 and 6 in `.docs/adrs/phase-1.md`.
 
-use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -223,7 +222,7 @@ pub fn verify_inner_signature(
     );
 
     // Verify.
-    match verifying_key.verify(&canonical_hash, &signature) {
+    match verifying_key.verify_strict(&canonical_hash, &signature) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
