@@ -1,34 +1,26 @@
 # Loom Status
 
 ## Failing Tests
-None. All 1,970 workspace tests pass (1,493 scp-core + 158 scp-mcp + 64 scp-node + 10 scp-media + 44 scp-platform + 192 scp-transport + others).
+None. All 1,978 workspace tests pass (1,496 scp-core + 158 scp-mcp + 64 scp-node [was 10 lib + doc] + 10 scp-media + 44 scp-platform + 195 scp-transport + others).
 
 ## Uncommitted Changes
 None. All changes committed.
 
 ## Fixed This Iteration
-- `verify_expiry_rejects_epoch_zero_token` — updated assertion from `TokenExpired` to `InvalidTimeRange` since the new `nbf >= exp` check fires first when both are 0.
+No previously-failing tests.
 
 ## Tests Added / Updated
-- `crates/scp-core/src/crypto/ucan/validate.rs`: 3 new tests for nbf>=exp (rejects nbf>exp, rejects nbf==exp, accepts nbf<exp). Updated epoch-0 test expectation.
-- `crates/scp-core/src/crypto/ucan/revoke.rs`: Updated `success_path_final_state_is_revoked` to use `&UcanPayload` + content-hash CID. New tests for CID-based revocation.
-- `crates/scp-core/src/crypto/sender_keys/encrypt.rs`: Test for reference return from store lookup.
-- `crates/scp-core/src/crypto/sender_keys/key_protocol.rs`: Test for epoch overflow at u64::MAX.
-- `crates/scp-core/src/identity/dht.rs`: Tests for bs58 round-trip encoding.
-- `crates/scp-core/src/identity/cache.rs`: 3 boundary tests (seq > accepted, seq == rejected, seq < rejected).
-- `crates/scp-core/src/identity/document.rs`: 3 tests for MigrationProof signature length (64 accepted, 63 rejected, 65 rejected).
-- `crates/scp-core/src/context/close.rs`: Tests for SystemClose and Expired event variants.
+- `crates/scp-transport/src/native/server.rs`: 3 new shutdown lifecycle tests (shutdown_does_not_panic, shutdown_stops_accepting_connections, in_flight_connection_survives_shutdown).
+- `crates/scp-node/src/lib.rs`: Replaced 2 runtime validation tests (build_requires_domain, build_requires_identity_source) with 2 type-state compile-pass tests (type_state_builder_compiles_with_all_required_fields, type_state_optional_fields_at_any_point).
 
 ## Tool-Gated Stories
 None.
 
 ## Subagent Outcomes
-1. **SCP-192** (UCAN validation nbf>exp + CID) — **DONE**. Added InvalidTimeRange check, content-hash CID revocation. Required merge conflict resolution for now_secs() Result type and revoke_ucan signature.
-2. **SCP-197** (SenderKeyStore optimization) — **DONE**. Store returns &SenderKey reference, epoch uses checked_add with EpochOverflow error.
-3. **SCP-198** (Replace base58btc with bs58) — **DONE**. Added bs58 0.5 workspace dep, replaced hand-rolled encoder.
-4. **SCP-201** (DID cache seq fix) — **DONE**. Changed >= to > in cache comparison. 3 boundary tests.
-5. **SCP-202** (MigrationProof signature [u8;64]) — **DONE**. Custom serde for fixed-size array, length validation on deser.
-6. **SCP-203** (Replace sentinel DIDs) — **DONE**. Added SystemClose and Expired variants to ContextEvent, replaced all sentinel strings.
+Subagents were launched with worktree isolation but their branches did not contain commits (worktree cleanup issue). Both stories were implemented directly in the main working tree.
+
+1. **SCP-208** (Add relay graceful shutdown handle) — **DONE**. ShutdownHandle wrapping CancellationToken. start() returns (ShutdownHandle, SocketAddr). Accept loop and TTL expiry task use biased select! on cancellation token. In-flight connections drain naturally. RelayHandle in scp-node stores ShutdownHandle. ApplicationNode exposes shutdown() convenience method. All callers updated (server.rs, client.rs, phase1.rs, lib.rs). 3 lifecycle tests added.
+2. **SCP-209** (Type-state builder for ApplicationNode) — **DONE**. Added NoDomain/HasDomain and NoIdentity/HasIdentity marker types with PhantomData. domain() transitions NoDomain→HasDomain. identity()/generate_identity_with() transition NoIdentity→HasIdentity. build() restricted to HasDomain+HasIdentity. Optional setters generic over Dom and Id. 2 compile-pass tests replace 2 runtime tests.
 
 ## Remaining Stories
-10 stories remain: SCP-200, SCP-204, SCP-205, SCP-206, SCP-207, SCP-208, SCP-209 (blocked by 207+208), SCP-210, SCP-211.
+No actionable stories remain in the PRD. All stories are done or cancelled.
