@@ -554,7 +554,6 @@ mod seal_open_tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "Ciphertext decryption failed")]
     async fn open_envelope_rejects_tampered_encrypted_blob() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
         let (inner, pubkey) = create_test_inner(b"test", None).await;
@@ -571,14 +570,24 @@ mod seal_open_tests {
         )
         .unwrap();
 
-        // Tamper with the encrypted blob.
+        // Tamper with the encrypted blob (corrupt AEAD tag).
         if let Some(byte) = outer.encrypted_blob.last_mut() {
             *byte ^= 0xFF;
         }
 
-        // OpenMLS panics internally on AEAD decryption failure rather than
-        // returning an error. This is a known upstream behavior.
-        let _result = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey);
+        // Previously OpenMLS panicked on AEAD decryption failure; the
+        // catch_unwind guard now converts the panic to an error.
+        let result = open_envelope(&outer, &mut bob_group, &sender_key, &pubkey);
+        assert!(
+            result.is_err(),
+            "open_envelope must reject tampered encrypted_blob"
+        );
+
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("MlsDecryptionFailed"),
+            "error should be MlsDecryptionFailed, got: {err_msg}"
+        );
     }
 
     #[tokio::test]

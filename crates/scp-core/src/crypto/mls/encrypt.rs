@@ -22,6 +22,8 @@
 //!
 //! See ADR-001 acceptance criteria 4 and 5.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use openmls::prelude::*;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
@@ -100,10 +102,26 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
     // Process the message — this verifies membership tag and generation number.
-    let processed = group
-        .group
-        .process_message(&group.provider, protocol_message)
-        .map_err(|e| MlsError::DecryptionFailed(e.to_string()))?;
+    //
+    // OpenMLS may panic on AEAD decryption failure for tampered ciphertexts
+    // (e.g., corrupted authentication tags). We guard against this with
+    // catch_unwind to convert the panic into an MlsError::DecryptionFailed,
+    // preventing a malicious relay from crashing the client process (DoS).
+    let process_result = catch_unwind(AssertUnwindSafe(|| {
+        group
+            .group
+            .process_message(&group.provider, protocol_message)
+    }));
+
+    let processed = match process_result {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Err(_) => {
+            return Err(MlsError::DecryptionFailed(
+                "OpenMLS panicked during message processing".to_string(),
+            ));
+        }
+    };
 
     // Extract the application message content.
     match processed.into_content() {
@@ -295,6 +313,65 @@ mod tests {
                 "message {i} must roundtrip correctly"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn decrypt_returns_error_for_tampered_aead_tag() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+
+        let plaintext = b"tamper target";
+
+        // Alice encrypts a legitimate message.
+        let ciphertext_msg = encrypt(&mut alice_group, plaintext).unwrap();
+        let mut ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
+
+        // Tamper with the last byte (corrupts the AEAD authentication tag).
+        if let Some(byte) = ciphertext_bytes.last_mut() {
+            *byte ^= 0xFF;
+        }
+
+        // Must return an error (not panic) thanks to the catch_unwind guard.
+        let result = decrypt(&mut bob_group, &ciphertext_bytes);
+        assert!(
+            result.is_err(),
+            "decrypt must return error for tampered AEAD tag, not panic"
+        );
+
+        // Verify the error is DecryptionFailed.
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("decryption failed"),
+            "error should indicate decryption failure, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn group_remains_usable_after_caught_decrypt_panic() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+
+        // First: trigger a caught panic via tampered ciphertext.
+        let ct_msg = encrypt(&mut alice_group, b"will be tampered").unwrap();
+        let mut tampered_bytes = serialize_ciphertext(&ct_msg).unwrap();
+        if let Some(byte) = tampered_bytes.last_mut() {
+            *byte ^= 0xFF;
+        }
+
+        let bad_result = decrypt(&mut bob_group, &tampered_bytes);
+        assert!(bad_result.is_err(), "tampered ciphertext must fail");
+
+        // Second: encrypt and decrypt a legitimate message to prove the
+        // group is still functional after the caught panic.
+        let good_plaintext = b"still works";
+        let good_ct_msg = encrypt(&mut alice_group, good_plaintext).unwrap();
+        let good_ct_bytes = serialize_ciphertext(&good_ct_msg).unwrap();
+
+        let decrypted = decrypt(&mut bob_group, &good_ct_bytes).unwrap();
+        assert_eq!(
+            decrypted, good_plaintext,
+            "group must remain usable after a caught decrypt panic"
+        );
     }
 
     mod proptest_tests {
