@@ -122,6 +122,9 @@ pub use policy::{
     set_auto_accept_policy,
 };
 
+// Re-export standing channel types (SCP-138).
+pub use standing::{StandingChannelError, StandingChannelManager};
+
 // Re-export TTL management types (SCP-021, SCP-066).
 pub use ttl::{CloseResult, TtlExtension, TtlTimer};
 pub use ttl::{
