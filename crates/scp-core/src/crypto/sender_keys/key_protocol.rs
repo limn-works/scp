@@ -564,6 +564,8 @@ pub fn verify_block_notification(
 ///
 /// # Errors
 ///
+/// Returns [`SenderKeyError::EpochOverflow`] if the epoch counter is at
+/// `u64::MAX` and cannot be incremented.
 /// Returns [`SenderKeyError::SigningFailed`] if signing the epoch advance fails.
 /// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
 pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
@@ -577,7 +579,9 @@ pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
 ) -> Result<RotateForBlockResult, SenderKeyError> {
     // Generate new sender key.
     let new_key = generate_sender_key();
-    let new_epoch = current_epoch + 1;
+    let new_epoch = current_epoch
+        .checked_add(1)
+        .ok_or(SenderKeyError::EpochOverflow)?;
 
     // Add blocked DID to block list.
     block_list.insert(blocked_did.to_owned());
@@ -1325,6 +1329,32 @@ mod tests {
         assert!(
             response.is_none(),
             "blocked Dave should not receive Alice's new key"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Epoch overflow
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rotate_sender_key_for_block_epoch_overflow_returns_error() {
+        let (custody, signing_key) = setup().await;
+        let mut block_list = HashSet::new();
+
+        let result = rotate_sender_key_for_block(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            u64::MAX,
+            "did:dht:dave",
+            &mut block_list,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SenderKeyError::EpochOverflow)),
+            "epoch at u64::MAX should return EpochOverflow, got {result:?}"
         );
     }
 
