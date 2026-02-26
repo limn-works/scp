@@ -66,7 +66,7 @@ const CAP_MESSAGES_READ: &str = "messages:read";
 /// Standard capability name for writing messages.
 const CAP_MESSAGES_WRITE: &str = "messages:write";
 /// Standard capability name for invoking any registered tool.
-const CAP_TOOL_INVOKE_ALL: &str = "tool:invoke_all";
+const CAP_TOOL_INVOKE_ALL: &str = "tool:invoke:*";
 /// Standard capability name for registering new tools.
 const CAP_TOOL_REGISTER: &str = "tool:register";
 /// Standard capability name for inviting new members.

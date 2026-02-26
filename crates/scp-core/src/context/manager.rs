@@ -171,9 +171,8 @@ impl ContextManager {
         )
         .await?;
 
-        // Build ceiling from params.
-        let ceiling =
-            CapabilityCeiling::new(params.ceiling.iter().map(Capability::from_param_capability));
+        // Build ceiling from params (params::Capability is now the same type as roles::Capability).
+        let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
 
         // Initialize role state with the creator as admin.
         let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
