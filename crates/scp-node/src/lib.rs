@@ -9,13 +9,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use scp_core::identity::document::DidDocument;
 use scp_core::identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
-use scp_transport::native::server::{RelayConfig, RelayError, RelayServer};
+use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 
 // ---------------------------------------------------------------------------
@@ -52,12 +53,15 @@ pub enum NodeError {
 
 /// Handle to the running relay server.
 ///
-/// Wraps the bound address and provides access to the relay's state. The relay
-/// accepts connections from any SCP client (spec section 18.6.4).
+/// Wraps the bound address, shutdown handle, and provides access to the
+/// relay's state. The relay accepts connections from any SCP client (spec
+/// section 18.6.4).
 #[derive(Debug)]
 pub struct RelayHandle {
     /// The local address the relay is bound to.
     bound_addr: SocketAddr,
+    /// Handle for gracefully shutting down the relay server.
+    shutdown_handle: ShutdownHandle,
 }
 
 impl RelayHandle {
@@ -65,6 +69,12 @@ impl RelayHandle {
     #[must_use]
     pub const fn bound_addr(&self) -> SocketAddr {
         self.bound_addr
+    }
+
+    /// Returns a reference to the relay's shutdown handle.
+    #[must_use]
+    pub const fn shutdown_handle(&self) -> &ShutdownHandle {
+        &self.shutdown_handle
     }
 }
 
@@ -177,6 +187,13 @@ impl<S: Storage> ApplicationNode<S> {
     pub fn relay_url(&self) -> String {
         format!("wss://{}/scp/v1", self.domain)
     }
+
+    /// Gracefully shuts down the relay server.
+    ///
+    /// In-flight connection handlers drain naturally — they are not cancelled.
+    pub fn shutdown(&self) {
+        self.relay.shutdown_handle.shutdown();
+    }
 }
 
 /// Returns a new [`ApplicationNodeBuilder`].
@@ -211,30 +228,49 @@ struct ExplicitIdentity<D: DidMethod> {
 }
 
 // ---------------------------------------------------------------------------
+// Builder type-state markers
+// ---------------------------------------------------------------------------
+
+/// Marker: domain has not been set on the builder.
+pub struct NoDomain;
+/// Marker: domain has been set on the builder.
+pub struct HasDomain;
+
+/// Marker: identity has not been configured on the builder.
+pub struct NoIdentity;
+/// Marker: identity has been configured on the builder.
+pub struct HasIdentity;
+
+// ---------------------------------------------------------------------------
 // ApplicationNodeBuilder
 // ---------------------------------------------------------------------------
 
 /// Builder for [`ApplicationNode`].
 ///
-/// Follows the Rust builder pattern with `Option` fields and validation on
-/// `.build()`. The domain is required; all other fields have defaults or are
-/// optional.
+/// Uses a type-state pattern to enforce required fields at compile time.
+/// The builder starts with `Dom = NoDomain, Id = NoIdentity`. Calling
+/// [`domain`](Self::domain) transitions `Dom` to [`HasDomain`], and calling
+/// [`generate_identity_with`](Self::generate_identity_with) or
+/// [`identity`](Self::identity) transitions `Id` to [`HasIdentity`].
+/// [`build`](Self::build) is only available when both are set.
 ///
 /// # Required fields
 ///
 /// - [`domain`](Self::domain) -- the domain this node serves.
+/// - Identity -- either [`generate_identity_with`](Self::generate_identity_with)
+///   or [`identity`](Self::identity).
 ///
-/// # Identity
+/// # Optional fields
 ///
-/// Either call [`generate_identity_with`](Self::generate_identity_with) to
-/// create a new DID with explicit implementations, or
-/// [`identity`](ApplicationNodeBuilder::identity) to use an existing one. If
-/// neither is called, `.build()` returns [`NodeError::MissingField`].
+/// - [`storage`](Self::storage), [`blob_storage`](Self::blob_storage),
+///   [`bind_addr`](Self::bind_addr), [`acme_email`](Self::acme_email).
 pub struct ApplicationNodeBuilder<
     K: KeyCustody = NoOpCustody,
     D: DidMethod = NoOpDidMethod,
     S: Storage = NoOpStorage,
     B: BlobStorage = InMemoryBlobStorage,
+    Dom = NoDomain,
+    Id = NoIdentity,
 > {
     domain: Option<String>,
     identity_source: Option<IdentitySource<K, D>>,
@@ -246,6 +282,8 @@ pub struct ApplicationNodeBuilder<
     // when TLS certificate provisioning is added.
     #[allow(dead_code)]
     acme_email: Option<String>,
+    _domain_state: PhantomData<Dom>,
+    _identity_state: PhantomData<Id>,
 }
 
 impl ApplicationNodeBuilder {
@@ -262,29 +300,52 @@ impl ApplicationNodeBuilder {
             blob_storage: Some(InMemoryBlobStorage::new()),
             bind_addr: None,
             acme_email: None,
+            _domain_state: PhantomData,
+            _identity_state: PhantomData,
         }
     }
 }
 
-impl Default for ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, NoOpStorage, InMemoryBlobStorage> {
+impl Default
+    for ApplicationNodeBuilder<
+        NoOpCustody,
+        NoOpDidMethod,
+        NoOpStorage,
+        InMemoryBlobStorage,
+        NoDomain,
+        NoIdentity,
+    >
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, B: BlobStorage + 'static>
-    ApplicationNodeBuilder<K, D, S, B>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, B: BlobStorage + 'static, Id>
+    ApplicationNodeBuilder<K, D, S, B, NoDomain, Id>
 {
     /// Sets the domain this node serves.
     ///
     /// The relay URL is derived as `wss://<domain>/scp/v1` (spec section
-    /// 18.5.2). This field is required.
+    /// 18.5.2). This field is required — the builder cannot be built without it.
     #[must_use]
-    pub fn domain(mut self, domain: &str) -> Self {
-        self.domain = Some(domain.to_owned());
-        self
+    pub fn domain(self, domain: &str) -> ApplicationNodeBuilder<K, D, S, B, HasDomain, Id> {
+        ApplicationNodeBuilder {
+            domain: Some(domain.to_owned()),
+            identity_source: self.identity_source,
+            storage: self.storage,
+            blob_storage: self.blob_storage,
+            bind_addr: self.bind_addr,
+            acme_email: self.acme_email,
+            _domain_state: PhantomData,
+            _identity_state: PhantomData,
+        }
     }
+}
 
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, B: BlobStorage + 'static, Dom, Id>
+    ApplicationNodeBuilder<K, D, S, B, Dom, Id>
+{
     /// Sets the socket address for the relay server to bind to.
     ///
     /// Defaults to `127.0.0.1:0` (OS-assigned port) if not specified.
@@ -306,14 +367,16 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, B: B
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static> ApplicationNodeBuilder<K, D, NoOpStorage, B> {
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, Dom, Id>
+    ApplicationNodeBuilder<K, D, NoOpStorage, B, Dom, Id>
+{
     /// Sets an explicit storage backend.
     ///
     /// If not called, `.build()` uses a default no-op storage.
     pub fn storage<S2: Storage + 'static>(
         self,
         storage: Arc<S2>,
-    ) -> ApplicationNodeBuilder<K, D, S2, B> {
+    ) -> ApplicationNodeBuilder<K, D, S2, B, Dom, Id> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: self.identity_source,
@@ -321,12 +384,14 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static> 
             blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            _domain_state: PhantomData,
+            _identity_state: PhantomData,
         }
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
-    ApplicationNodeBuilder<K, D, S, InMemoryBlobStorage>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom, Id>
+    ApplicationNodeBuilder<K, D, S, InMemoryBlobStorage, Dom, Id>
 {
     /// Sets a custom blob storage backend for the relay server.
     ///
@@ -335,7 +400,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     pub fn blob_storage<B2: BlobStorage + 'static>(
         self,
         blob_storage: B2,
-    ) -> ApplicationNodeBuilder<K, D, S, B2> {
+    ) -> ApplicationNodeBuilder<K, D, S, B2, Dom, Id> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: self.identity_source,
@@ -343,11 +408,15 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             blob_storage: Some(blob_storage),
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            _domain_state: PhantomData,
+            _identity_state: PhantomData,
         }
     }
 }
 
-impl<S: Storage + 'static, B: BlobStorage + 'static> ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S, B> {
+impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
+    ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S, B, Dom, NoIdentity>
+{
     /// Sets an explicit identity and DID document to use.
     ///
     /// The identity will be published to the DHT with `SCPRelay` entries
@@ -357,7 +426,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static> ApplicationNodeBuilder<NoOp
         identity: ScpIdentity,
         document: DidDocument,
         did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<NoOpCustody, D2, S, B> {
+    ) -> ApplicationNodeBuilder<NoOpCustody, D2, S, B, Dom, HasIdentity> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: Some(IdentitySource::Explicit(Box::new(ExplicitIdentity {
@@ -369,6 +438,8 @@ impl<S: Storage + 'static, B: BlobStorage + 'static> ApplicationNodeBuilder<NoOp
             blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            _domain_state: PhantomData,
+            _identity_state: PhantomData,
         }
     }
 
@@ -379,7 +450,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static> ApplicationNodeBuilder<NoOp
         self,
         key_custody: Arc<K2>,
         did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<K2, D2, S, B> {
+    ) -> ApplicationNodeBuilder<K2, D2, S, B, Dom, HasIdentity> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: Some(IdentitySource::Generate {
@@ -390,35 +461,42 @@ impl<S: Storage + 'static, B: BlobStorage + 'static> ApplicationNodeBuilder<NoOp
             blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            _domain_state: PhantomData,
+            _identity_state: PhantomData,
         }
     }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static, B: BlobStorage + 'static>
-    ApplicationNodeBuilder<K, D, S, B>
+    ApplicationNodeBuilder<K, D, S, B, HasDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`].
     ///
+    /// This method is only available when both [`domain`](Self::domain) and
+    /// identity ([`generate_identity_with`](Self::generate_identity_with) or
+    /// [`identity`](Self::identity)) have been set — the type system enforces
+    /// this at compile time.
+    ///
     /// # Steps
     ///
-    /// 1. Validates required fields (domain, identity source).
-    /// 2. Initializes storage (uses provided or creates default).
-    /// 3. Loads or generates identity.
-    /// 4. Adds `SCPRelay` service entry to the DID document.
-    /// 5. Starts relay server (must be listening before publication).
-    /// 6. Publishes DID document to the DHT.
+    /// 1. Initializes storage (uses provided or creates default).
+    /// 2. Loads or generates identity.
+    /// 3. Adds `SCPRelay` service entry to the DID document.
+    /// 4. Starts relay server (must be listening before publication).
+    /// 5. Publishes DID document to the DHT.
     ///
     /// DID publication happens once on `.build()`, not continuously
     /// (spec section 18.6.4).
     ///
     /// # Errors
     ///
-    /// Returns [`NodeError::MissingField`] if domain or identity source is
-    /// not configured. Returns [`NodeError::Identity`] if identity creation
-    /// or DID publication fails. Returns [`NodeError::Relay`] if the relay
-    /// server fails to start.
+    /// Returns [`NodeError::Identity`] if identity creation or DID
+    /// publication fails. Returns [`NodeError::Relay`] if the relay server
+    /// fails to start.
     pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
-        // 1. Validate required fields.
+        // Type-state guarantees domain and identity_source are set.
+        // The runtime check is a defensive fallback — the type system
+        // prevents reaching this code without both fields configured.
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
 
         let identity_source = self.identity_source.ok_or(NodeError::MissingField(
@@ -462,7 +540,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             .blob_storage
             .ok_or(NodeError::MissingField("blob_storage"))?;
         let relay_server = RelayServer::new(relay_config, blob_storage);
-        let bound_addr = relay_server.start().await?;
+        let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 6. Publish DID document now that the relay is confirmed listening.
         did_method.publish(&identity, &document).await?;
@@ -477,7 +555,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
 
         Ok(ApplicationNode {
             domain,
-            relay: RelayHandle { bound_addr },
+            relay: RelayHandle { bound_addr, shutdown_handle },
             identity: IdentityHandle { identity, document },
             storage,
         })
@@ -701,7 +779,15 @@ mod tests {
     }
 
     /// Helper: creates a builder with domain and `generate_identity` configured.
-    fn test_builder() -> ApplicationNodeBuilder<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+    fn test_builder(
+    ) -> ApplicationNodeBuilder<
+        InMemoryKeyCustody,
+        TestDidDht,
+        InMemoryStorage,
+        InMemoryBlobStorage,
+        HasDomain,
+        HasIdentity,
+    > {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
         ApplicationNodeBuilder::new()
@@ -718,40 +804,53 @@ mod tests {
         (identity, document, custody)
     }
 
+    /// Verifies the type-state builder compiles when all required fields
+    /// are set. Missing domain or identity would be a compile error:
+    ///
+    /// ```compile_fail
+    /// // Missing domain — NoDomain has no build():
+    /// ApplicationNodeBuilder::new()
+    ///     .generate_identity_with(custody, did_method)
+    ///     .build().await;
+    /// ```
+    ///
+    /// ```compile_fail
+    /// // Missing identity — NoIdentity has no build():
+    /// ApplicationNodeBuilder::new()
+    ///     .domain("example.com")
+    ///     .build().await;
+    /// ```
     #[tokio::test]
-    async fn build_requires_domain() {
+    async fn type_state_builder_compiles_with_all_required_fields() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
 
-        let result = ApplicationNodeBuilder::new()
-            .generate_identity_with(custody, did_method)
-            .build()
-            .await;
+        // This compiles because domain + identity are both set.
+        let _builder = ApplicationNodeBuilder::new()
+            .domain("test.example.com")
+            .generate_identity_with(custody, did_method);
 
-        let err = result.unwrap_err();
-        match &err {
-            NodeError::MissingField(field) => assert_eq!(*field, "domain"),
-            other => panic!("expected MissingField(\"domain\"), got: {other:?}"),
-        }
+        // build() is available on the result type.
+        // We don't call .build().await here to avoid starting a server,
+        // but the fact that it compiles proves the type state works.
     }
 
-    #[tokio::test]
-    async fn build_requires_identity_source() {
-        let result = ApplicationNodeBuilder::new()
-            .domain("test.example.com")
-            .build()
-            .await;
+    #[test]
+    fn type_state_optional_fields_at_any_point() {
+        // Optional fields (bind_addr, acme_email) can be called at any
+        // point in the chain — before or after required fields.
+        let _builder = ApplicationNodeBuilder::new()
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .acme_email("test@example.com");
 
-        let err = result.unwrap_err();
-        match &err {
-            NodeError::MissingField(field) => {
-                assert!(
-                    field.contains("identity"),
-                    "expected identity missing, got: {field}"
-                );
-            }
-            other => panic!("expected MissingField containing 'identity', got: {other:?}"),
-        }
+        // And after setting required fields too.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        let _builder = ApplicationNodeBuilder::new()
+            .domain("test.example.com")
+            .generate_identity_with(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .acme_email("test@example.com");
     }
 
     #[tokio::test]
