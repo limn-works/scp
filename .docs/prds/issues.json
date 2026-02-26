@@ -640,9 +640,15 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
-        "crates/scp-core/src/envelope/outer.rs"
+        "crates/scp-core/src/envelope/outer.rs",
+        "crates/scp-core/src/envelope/mod.rs",
+        "crates/scp-core/src/crypto/mls/encrypt.rs",
+        "crates/scp-core/src/crypto/mls/group.rs",
+        "crates/scp-platform/src/testing/key_custody.rs",
+        "crates/scp-testing/tests/integration/phase1.rs",
+        "crates/scp-core/Cargo.toml"
       ],
       "description": "ADR-002 specifies that open_envelope should resolve the sender public key internally from the MLS group state. Current implementation requires caller to provide it, creating opportunity to supply wrong key.",
       "acceptanceCriteria": [
@@ -668,7 +674,8 @@
       ],
       "details": {
         "adrRequirement": "ADR-002: envelope processing layer should be self-contained given MLS group state"
-      }
+      },
+      "result": "open_envelope signature changed from 4 to 3 params (removed sender_public_key). Added decrypt_with_sender_key() that extracts sender's Ed25519 key from MLS tree via ProcessedMessage.sender() leaf index lookup. Added verify_sender_in_group() to check sender_did against MLS credentials. Added UnknownSender error variant. Added sign()/signer_public_key() to ScpMlsGroup. All 1495 tests pass including 2 new SCP-177 tests."
     },
     {
       "id": "SCP-178",
