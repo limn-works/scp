@@ -2381,7 +2381,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/pyo3/identity.rs"
       ],
@@ -2414,7 +2414,8 @@
       ],
       "details": {
         "function_signatures": "py_identity_create(custody: &str) -> PyResult<PyIdentity>\npy_identity_load(did: &str) -> PyResult<PyIdentity>\npy_identity_resolve(py: Python<'py>, did: &str) -> PyResult<Bound<'py, PyAny>>\npy_identity_rotate_key(identity: &PyIdentity) -> PyResult<PyIdentity>"
-      }
+      },
+      "result": "PyIdentity, PyDIDDocument opaque types + 4 bridge functions (create, load, resolve, rotate_key) + module registration in identity.rs"
     },
     {
       "id": "SCP-039",
@@ -2422,7 +2423,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/pyo3/context.rs"
       ],
@@ -2455,7 +2456,8 @@
           "section": "## ADR-013: PyO3 Bridge Layer"
         }
       ],
-      "details": {}
+      "details": {},
+      "result": "PyContextHandle, PyContextParams, PyMessage, PyMessageReceiver types + 6 bridge functions (create, join, leave, close, send, receive) + async iterator in context.rs"
     },
     {
       "id": "SCP-040",
@@ -2463,7 +2465,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/pyo3/tools.rs",
         "crates/scp-ffi/pyo3/transport.rs",
@@ -2500,7 +2502,8 @@
           "section": "## ADR-013: PyO3 Bridge Layer"
         }
       ],
-      "details": {}
+      "details": {},
+      "result": "PyToolRegistration, PyToolVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof types + 10 bridge functions across tools.rs, transport.rs, ucan.rs, event_log.rs"
     },
     {
       "id": "SCP-041",
