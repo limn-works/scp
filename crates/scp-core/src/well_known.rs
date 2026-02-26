@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::economy::types::{Amount, CurrencyCode, PaymentAdapterRef};
 use crate::identity::DidMethod;
 
 /// The `.well-known/scp` JSON document.
@@ -97,6 +98,40 @@ pub struct RelayConfig {
     /// Maximum concurrent subscriptions per connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_subscribe: Option<u32>,
+
+    /// Relay economic configuration (section 19.8). Optional. Absence = free
+    /// relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economic: Option<RelayEconomicConfig>,
+}
+
+/// Relay economic configuration exposed in `.well-known/scp`.
+///
+/// Declares per-action costs, accepted payment adapters, and the payee
+/// DID for the relay operator. All `Amount` values are in the smallest
+/// currency unit specified by `currency` (section 19.1.1). Absence of
+/// this entire object means the relay is free.
+///
+/// See section 19.8 and ADR-033 acceptance criterion 12.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayEconomicConfig {
+    /// Currency code for all amounts in this economic config (e.g., `"USD"`).
+    pub currency: CurrencyCode,
+
+    /// Cost per PUBLISH operation as `Amount` in smallest currency unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_publish: Option<Amount>,
+
+    /// Cost per byte stored as `Amount` in smallest currency unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_byte_stored: Option<Amount>,
+
+    /// Accepted payment adapter IDs (e.g., `["x402", "lightning"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payment_adapters: Vec<PaymentAdapterRef>,
+
+    /// Relay operator's DID for receiving payments.
+    pub payee: String,
 }
 
 /// Validation error for `.well-known/scp` documents.
@@ -390,6 +425,7 @@ mod tests {
                 max_blob_ttl: Some(86_400),
                 rate_limit_publish: Some(100),
                 rate_limit_subscribe: Some(50),
+                economic: None,
             }),
         }
     }
@@ -588,6 +624,7 @@ mod tests {
             max_blob_ttl: None,
             rate_limit_publish: None,
             rate_limit_subscribe: None,
+            economic: None,
         };
         let json = serde_json::to_value(&config).expect("serialization failed");
 
