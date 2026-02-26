@@ -28,6 +28,7 @@
 
 pub mod builder;
 pub mod close;
+pub mod invitation;
 pub mod manager;
 pub mod membership;
 pub mod memory_scope;
@@ -120,6 +121,12 @@ pub use policy::{
     AutoAcceptPolicy, PolicyStorageError, RateLimit, TrustRequirement, auto_accept_allowed,
     delete_auto_accept_policy, get_auto_accept_policy, has_tool_capabilities, requires_payment,
     set_auto_accept_policy,
+};
+
+// Re-export invitation evaluation pipeline types (SCP-137).
+pub use invitation::{
+    EvaluationDecision, InvitationError, RateLimitTracker, SpendingContext, TrustOracle,
+    evaluate_invitation,
 };
 
 // Re-export standing channel types (SCP-138).
