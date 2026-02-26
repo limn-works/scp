@@ -676,7 +676,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "in_progress",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/group.rs"
       ],
@@ -701,7 +701,7 @@
       "details": {
         "exposureWindow": "Without zeroization, key material persists until garbage collected (in Rust: until the owning struct is dropped/deallocated). Recoverable via core dump, cold boot, or swap."
       },
-      "result": "Added zeroize dep to scp-core. Actual Zeroize/ZeroizeOnDrop derives on key types pending. Commit ede83f8."
+      "result": "destroy_group now drops MLS group, signer, and provider state via Option::take. Tests pass. Commit pending."
     },
     {
       "id": "SCP-179",
@@ -743,7 +743,7 @@
       "gate": "gate-sec-medium",
       "priority": "P1",
       "severity": "major",
-      "status": "in_progress",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/revoke.rs"
       ],
@@ -771,7 +771,7 @@
       "details": {
         "splitBrain": "If distribution fails, revoker thinks token revoked but no one else does. Persists until next successful distribution."
       },
-      "result": "Added RevocationState enum (Active/RevocationPending/Revoked). Wiring into revocation flow pending. Commit d2e2634."
+      "result": "RevocationList uses HashMap<String,RevocationState>. revoke_ucan now: mark_pending -> distribute -> confirm on success / rollback on failure. is_revoked returns true for both Pending and Revoked (fail-closed). 8 new tests. Commit pending."
     },
     {
       "id": "SCP-181",
