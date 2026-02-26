@@ -3124,7 +3124,7 @@
       "gate": "gate-3a",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/adrs/phase-4.md"
       ],
@@ -3166,7 +3166,8 @@
       "details": {
         "adrCompletionStory": true,
         "note": "This story writes the ADR itself, not the implementation. Implementation stories for UniFFI are blocked by this."
-      }
+      },
+      "result": "ADR-021 UniFFI Bridge Definitions completed with full Decision, Rationale, Implementation, Dependencies, Acceptance Criteria, and Scope sections"
     },
     {
       "id": "SCP-060",
@@ -6786,7 +6787,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/event_log/metrics.rs"
       ],
@@ -6824,7 +6825,8 @@
           "ADR-011 — Event log design",
           "§10.3 — Protocol state footprint"
         ]
-      }
+      },
+      "result": "EventLogMetrics, GrowthSnapshot, ProofBenchmark types implemented with growth rate tracking, proof gen/verify profiling, storage consumption monitoring, JSON export, 19 unit tests passing"
     },
     {
       "id": "SCP-129",
@@ -6832,7 +6834,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/governance/interface.rs"
       ],
@@ -6887,7 +6889,8 @@
           "ADR-009 — Role assignment and capability ceiling",
           "ADR-016 — UCAN validation"
         ]
-      }
+      },
+      "result": "GovernanceEngine trait, GovernanceProposal lifecycle state machine, SingleAdminEngine baseline implementation, typed proposal variants for all §5.9 governance actions, GovernanceEvent for Merkle log recording, 34 unit tests passing"
     },
     {
       "id": "SCP-130",
@@ -7279,7 +7282,7 @@
       "gate": "gate-2",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/invitation.rs",
         "crates/scp-core/context/manager.rs"
@@ -7323,7 +7326,8 @@
       ],
       "details": {
         "Evaluation pipeline": "1. Template check — validate params match template exactly. Reject spoofing.\n2. Auto-accept check — evaluate trust, TTL cap, rate limit. Join if all pass.\n3. Agent prompt — surface to agent/human for decision. Includes full context metadata (§5.7) + template ID."
-      }
+      },
+      "result": "Invitation evaluation pipeline implemented with 3-step sequential evaluation (template check, auto-accept, agent prompt), economic policy guard, rate limiting, 10 unit tests passing"
     },
     {
       "id": "SCP-138",
@@ -8136,7 +8140,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/src/test_adapter.rs",
         "crates/scp-testing/src/lib.rs"
@@ -8195,7 +8199,8 @@
         "ADR-033 criterion 4": "TestAdapter passes payment_adapter_conformance!().",
         "Conformance test expectations": "1. Authorize/capture roundtrip: seed balance, authorize, capture, verify receipt amount matches. 2. Authorize/void roundtrip: authorize, void, balance restored, capture fails. 3. Double-capture: authorize, capture, second capture returns error. 4. Insufficient balance: authorize with amount > seeded balance returns error. 5. Verify roundtrip: capture, verify returns valid. 6. Currency mismatch: authorize with unsupported currency returns error. 7. Concurrent isolation: two authorizations against same payer, capture both independently. 8. Refund: capture, refund, verify payee balance decreased and payer balance increased.",
         "Not production": "Protocol does NOT ship production adapters (payment rails are external dependencies with licensing/compliance considerations)."
-      }
+      },
+      "result": "TestAdapter implemented in scp-testing crate with in-memory ledger, full PaymentAdapter trait conformance, and all 8 conformance tests passing"
     },
     {
       "id": "SCP-153",
@@ -8669,7 +8674,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/economy/antispam.rs",
         "crates/scp-core/src/economy/mod.rs"
@@ -8724,7 +8729,8 @@
         "Cost escalation example": "base_cost: $0.001. Thresholds: (10/min, +$0.001), (50/min, +$0.01), (200/min, +$0.10). Cap: $1.00. Normal conversation (1-5 msg/min): negligible ($0.001). Spam rates (200+ msg/min): $0.112/msg = $1,344/hr. Self-limiting.",
         "Sybil deterrent": "N identities = N x cost. Each identity needs its own spending UCAN, own adapter credentials, own payment capacity. Compounds with device attestation (§9.3) — Sybil attacks are expensive to create AND expensive to sustain.",
         "DDoS inversion": "DDoS against a priced relay is paying the operator to absorb the attack."
-      }
+      },
+      "result": "SenderVelocityTracker implemented with sliding window, step-function escalation integration with PricingFormula, thread-safe via Mutex, 12 unit tests passing"
     },
     {
       "id": "SCP-160",
