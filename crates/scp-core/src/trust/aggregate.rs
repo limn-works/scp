@@ -499,7 +499,7 @@ mod tests {
                     sequence: 0,
                     reason: "lock poisoned".to_owned(),
                 })?;
-            let key = (context_id.to_owned(), entry.attestation.subject.clone());
+            let key = (context_id.to_owned(), entry.attestation.subject.to_string());
             let entries = store.entry(key).or_default();
 
             // Replace existing entry with same ID, or append.
@@ -573,7 +573,7 @@ mod tests {
                     sequence: 0,
                     reason: "lock poisoned".to_owned(),
                 })?;
-            let key = (context_id.to_owned(), result.responder_did.clone());
+            let key = (context_id.to_owned(), result.responder_did.to_string());
             store.entry(key).or_default().push(result.clone());
             Ok(())
         }
@@ -620,7 +620,7 @@ mod tests {
     ) -> Event {
         Event {
             event_type,
-            actor_did: actor_did.to_owned(),
+            actor_did: actor_did.into(),
             timestamp,
             sequence,
             payload: EventPayload { data: payload },
@@ -633,8 +633,8 @@ mod tests {
         Attestation {
             id: id.to_owned(),
             attestation_type: att_type,
-            issuer: "did:key:issuer".to_owned(),
-            subject: subject.to_owned(),
+            issuer: "did:key:issuer".into(),
+            subject: subject.into(),
             claim: serde_json::json!({"test": true}),
             evidence: None,
             issued_at: 1000,
@@ -653,8 +653,8 @@ mod tests {
         use crate::trust::challenge::{ChallengeType, VerificationMethod};
         ChallengeVerification {
             challenge_id: challenge_id.to_owned(),
-            challenger_did: "did:key:challenger".to_owned(),
-            responder_did: responder.to_owned(),
+            challenger_did: "did:key:challenger".into(),
+            responder_did: responder.into(),
             challenge_type: ChallengeType::SchemaValidation,
             verification_method: VerificationMethod::ChallengeVerified {
                 challenge_type: ChallengeType::SchemaValidation,
@@ -1016,7 +1016,7 @@ mod tests {
             AttestationType::Endorsement,
             vec![
                 AttestorInfo {
-                    did: "did:key:attestor1".to_owned(),
+                    did: "did:key:attestor1".into(),
                     context_memberships: std::collections::HashSet::new(),
                     endorsements: std::collections::HashSet::new(),
                     attestation: Some(make_attestation(
@@ -1026,7 +1026,7 @@ mod tests {
                     )),
                 },
                 AttestorInfo {
-                    did: "did:key:attestor2".to_owned(),
+                    did: "did:key:attestor2".into(),
                     context_memberships: std::collections::HashSet::new(),
                     endorsements: std::collections::HashSet::new(),
                     attestation: Some(make_attestation(
@@ -1247,7 +1247,7 @@ mod tests {
         attestor_sets.insert(
             AttestationType::Endorsement,
             vec![AttestorInfo {
-                did: "did:key:a".to_owned(),
+                did: "did:key:a".into(),
                 context_memberships: std::collections::HashSet::new(),
                 endorsements: std::collections::HashSet::new(),
                 attestation: Some(make_attestation(

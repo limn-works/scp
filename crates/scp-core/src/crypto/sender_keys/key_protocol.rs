@@ -1047,7 +1047,7 @@ mod tests {
 
         // Alice has Bob on her block list.
         let mut block_list = HashSet::new();
-        block_list.insert("did:dht:bob".to_owned());
+        block_list.insert("did:dht:bob".into());
 
         let response = handle_sender_key_request(
             &request,
@@ -1092,7 +1092,7 @@ mod tests {
 
         // Block list has someone else, not Bob.
         let mut block_list = HashSet::new();
-        block_list.insert("did:dht:dave".to_owned());
+        block_list.insert("did:dht:dave".into());
 
         let response = handle_sender_key_request(
             &request,

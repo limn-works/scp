@@ -37,11 +37,10 @@ pub const MIN_BUFFER_CAPACITY: usize = 100;
 pub const MAX_BUFFER_CAPACITY: usize = 10_000;
 
 // ---------------------------------------------------------------------------
-// DID type alias
+// DID (re-exported from identity module -- SCP-187)
 // ---------------------------------------------------------------------------
 
-/// Decentralized Identifier string.
-pub type DID = String;
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // KeyPackage (stub)
@@ -143,8 +142,8 @@ impl MembershipState {
     }
 
     /// Returns all member DIDs.
-    pub fn member_dids(&self) -> impl Iterator<Item = &str> {
-        self.members.keys().map(String::as_str)
+    pub fn member_dids(&self) -> impl Iterator<Item = &DID> {
+        self.members.keys()
     }
 
     /// Returns all members as an iterator.
@@ -432,7 +431,7 @@ mod tests {
         state.add_member("did:key:alice".into(), "admin".into(), vec![]);
         state.add_member("did:key:bob".into(), "member".into(), vec![]);
 
-        let mut dids: Vec<&str> = state.member_dids().collect();
+        let mut dids: Vec<&str> = state.member_dids().map(|d| d.as_ref()).collect();
         dids.sort_unstable();
         assert_eq!(dids, vec!["did:key:alice", "did:key:bob"]);
     }

@@ -155,7 +155,7 @@ where
     // 2. Validate invoker has ToolInvoke(tool_id) or ToolInvokeAll capability.
     if !has_tool_invoke_capability(role_state, invoker_did, tool_id) {
         return Err(InvocationError::InvokerNotAuthorized {
-            did: invoker_did.to_owned(),
+            did: invoker_did.to_string(),
             tool_id: tool_id.to_owned(),
         });
     }
@@ -201,7 +201,7 @@ where
     let event = ToolInvokedEvent {
         request_id: uuid::Uuid::new_v4().to_string(),
         tool_id: tool_id.to_owned(),
-        invoker_did: invoker_did.to_owned(),
+        invoker_did: invoker_did.clone(),
         status: ToolStatus::Success,
         execution_time_ms,
         input_hash,
@@ -256,7 +256,7 @@ where
     // 2. Validate invoker has ToolInvoke(tool_id) or ToolInvokeAll capability.
     if !has_tool_invoke_capability(role_state, invoker_did, tool_id) {
         return Err(InvocationError::InvokerNotAuthorized {
-            did: invoker_did.to_owned(),
+            did: invoker_did.to_string(),
             tool_id: tool_id.to_owned(),
         });
     }
@@ -317,7 +317,7 @@ where
     let event = ToolInvokedEvent {
         request_id: uuid::Uuid::new_v4().to_string(),
         tool_id: tool_id.to_owned(),
-        invoker_did: invoker_did.to_owned(),
+        invoker_did: invoker_did.clone(),
         status: ToolStatus::Success,
         execution_time_ms,
         input_hash,
@@ -445,7 +445,7 @@ mod tests {
             },
             implementation_hash: [0xAA; 32],
             test_vectors: vec![],
-            operator_did: "did:dht:z6MkOperator".to_owned(),
+            operator_did: "did:dht:z6MkOperator".into(),
             economic_metadata: None,
         };
         register_tool(&mut registry, role_state, registration, registrant_did).unwrap();
@@ -490,7 +490,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             input,
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             add_executor,
         )
@@ -525,7 +525,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             add_executor,
         )
@@ -558,7 +558,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!({"a": 1, "b": 2}),
-            &member_did.to_owned(),
+            &DID::from(member_did),
             None,
             add_executor,
         )
@@ -589,7 +589,7 @@ mod tests {
             &role_state,
             &"nonexistent-tool".to_owned(),
             serde_json::json!({}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             add_executor,
         )
@@ -621,7 +621,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!("not an object"),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             add_executor,
         )
@@ -658,7 +658,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             Some(50), // 50ms timeout -- will expire before the 5s sleep.
             slow_executor,
         )
@@ -700,7 +700,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             slow_executor,
             cancel,
@@ -737,7 +737,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             failing_executor,
         )
@@ -774,7 +774,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             bad_output_executor,
         )
@@ -807,7 +807,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             input.clone(),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             add_executor,
         )
@@ -846,7 +846,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             None,
             add_executor,
         )
@@ -928,7 +928,7 @@ mod tests {
             &role_state,
             &"calculator".to_owned(),
             serde_json::json!({"a": 1, "b": 2}),
-            &creator_did.to_owned(),
+            &DID::from(creator_did),
             Some(999_999), // Above MAX_TIMEOUT_MS
             add_executor,
         )
@@ -949,7 +949,7 @@ mod tests {
         assert!(err.to_string().contains("Closing"));
 
         let err = InvocationError::InvokerNotAuthorized {
-            did: "did:dht:test".to_owned(),
+            did: "did:dht:test".into(),
             tool_id: "tool-1".to_owned(),
         };
         assert!(err.to_string().contains("did:dht:test"));

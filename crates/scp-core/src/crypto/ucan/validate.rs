@@ -1852,8 +1852,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: now + MAX_EXPIRY_SECS + 3600, // 25 hours from now
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -1877,8 +1877,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: 1, // Long expired.
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -1900,8 +1900,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: now + 3600,
                 nbf: Some(now + 7200), // Not valid for 2 hours.
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -1923,8 +1923,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: now + 3600,
                 nbf: Some(now - 60),
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -2201,8 +2201,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: 1_700_000_000,
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -2256,8 +2256,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: 0,
                 nbf: Some(0),
                 nnc: "0000000000000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -2286,8 +2286,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkCreator".to_owned(),
-                aud: "did:dht:z6MkMember".to_owned(),
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
                 exp: 1,
                 nbf: Some(0),
                 nnc: "0000000000000-aabbccdd11223344aabbccdd11223344".to_owned(),
@@ -2551,8 +2551,8 @@ mod tests {
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkA".to_owned(),
-                aud: "did:dht:z6MkB".to_owned(),
+                iss: "did:dht:z6MkA".into(),
+                aud: "did:dht:z6MkB".into(),
                 exp: now_secs().unwrap() + 3600,
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),

@@ -709,7 +709,7 @@ mod tests {
 
     fn make_governance(context_id: &str) -> GovernanceAction {
         GovernanceAction {
-            governance_did: GOVERNANCE_DID.to_owned(),
+            governance_did: GOVERNANCE_DID.into(),
             context_id: context_id.to_owned(),
             timestamp: 1_700_001_000,
             justification: "promoted by governance".to_owned(),
@@ -1429,7 +1429,7 @@ mod tests {
             shadow_id: "shadow-ser".to_owned(),
             previous_role: "observer".to_owned(),
             new_role: "contributor".to_owned(),
-            governance_did: GOVERNANCE_DID.to_owned(),
+            governance_did: GOVERNANCE_DID.into(),
             context_id: CTX.to_owned(),
             timestamp: 1_700_001_000,
         };
@@ -1448,7 +1448,7 @@ mod tests {
     #[test]
     fn governance_action_serialization_roundtrip() {
         let action = GovernanceAction {
-            governance_did: GOVERNANCE_DID.to_owned(),
+            governance_did: GOVERNANCE_DID.into(),
             context_id: CTX.to_owned(),
             timestamp: 1_700_001_000,
             justification: "testing".to_owned(),

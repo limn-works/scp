@@ -116,7 +116,7 @@ fn extract_capabilities(
         .unwrap_or(0);
 
     Ok(CapabilityEntry {
-        did: did.to_owned(),
+        did: did.into(),
         capabilities,
         service_endpoints,
         resolved_at: now,

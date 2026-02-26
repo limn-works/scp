@@ -27,7 +27,8 @@ use std::time::Duration;
 use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 
-use crate::event_log::{DID, Ed25519Signature};
+use crate::event_log::Ed25519Signature;
+use crate::identity::DID;
 use crate::identity::cache::Clock;
 
 use super::TrustError;
@@ -368,8 +369,8 @@ pub fn verify_challenge_response(
     // 2. Responder must be the challenged subject.
     if request.subject_did != response.responder_did {
         return Err(TrustError::ChallengeResponderMismatch {
-            expected: request.subject_did.clone(),
-            got: response.responder_did.clone(),
+            expected: request.subject_did.to_string(),
+            got: response.responder_did.to_string(),
         });
     }
 
@@ -526,8 +527,8 @@ mod tests {
         completed_at: u64,
     ) -> ChallengeResponse {
         let mut response = ChallengeResponse {
-            challenge_id: challenge_id.to_owned(),
-            responder_did: responder_did.to_owned(),
+            challenge_id: challenge_id.into(),
+            responder_did: responder_did.into(),
             result,
             completed_at,
             signature: vec![],
@@ -549,8 +550,8 @@ mod tests {
         let signer = TestSigner::new(challenger_key);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::SchemaValidation,
             serde_json::json!({"schema": "test"}),
             Duration::from_secs(300),
@@ -574,8 +575,8 @@ mod tests {
         let signer = TestSigner::new(challenger_key);
 
         let r1 = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::PromptInjectionResistance,
             serde_json::json!({}),
             Duration::from_secs(60),
@@ -584,8 +585,8 @@ mod tests {
         .unwrap();
 
         let r2 = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::PromptInjectionResistance,
             serde_json::json!({}),
             Duration::from_secs(60),
@@ -605,11 +606,11 @@ mod tests {
             ChallengeType::PromptInjectionResistance,
             ChallengeType::SchemaValidation,
             ChallengeType::RateLimitCompliance,
-            ChallengeType::Custom("my-test".to_owned()),
+            ChallengeType::Custom("my-test".into()),
         ] {
             let result = issue_challenge(
-                "did:key:c".to_owned(),
-                "did:key:s".to_owned(),
+                "did:key:c".into(),
+                "did:key:s".into(),
                 ct.clone(),
                 serde_json::json!({}),
                 Duration::from_secs(60),
@@ -635,8 +636,8 @@ mod tests {
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::SchemaValidation,
             serde_json::json!({"schema": "test"}),
             Duration::from_secs(300),
@@ -682,8 +683,8 @@ mod tests {
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::RateLimitCompliance,
             serde_json::json!({}),
             Duration::from_secs(600),
@@ -726,8 +727,8 @@ mod tests {
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::SchemaValidation,
             serde_json::json!({}),
             Duration::from_secs(300),
@@ -762,8 +763,8 @@ mod tests {
         resolver.add_key("did:key:imposter", imposter_pubkey);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::SchemaValidation,
             serde_json::json!({}),
             Duration::from_secs(300),
@@ -800,8 +801,8 @@ mod tests {
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::SchemaValidation,
             serde_json::json!({}),
             Duration::from_secs(60), // 60 second timeout
@@ -838,8 +839,8 @@ mod tests {
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::PromptInjectionResistance,
             serde_json::json!({}),
             Duration::from_secs(300), // 5-minute timeout
@@ -872,8 +873,8 @@ mod tests {
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::SchemaValidation,
             serde_json::json!({}),
             Duration::from_secs(300),
@@ -913,8 +914,8 @@ mod tests {
         resolver.add_key("did:key:subject", other_pubkey);
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::SchemaValidation,
             serde_json::json!({}),
             Duration::from_secs(300),
@@ -949,8 +950,8 @@ mod tests {
         let resolver = TestResolver::new();
 
         let request = issue_challenge(
-            "did:key:challenger".to_owned(),
-            "did:key:subject".to_owned(),
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
             ChallengeType::SchemaValidation,
             serde_json::json!({}),
             Duration::from_secs(300),
@@ -990,7 +991,7 @@ mod tests {
 
     #[test]
     fn challenge_type_custom_variant_preserves_key() {
-        let ct = ChallengeType::Custom("my-custom-test".to_owned());
+        let ct = ChallengeType::Custom("my-custom-test".into());
         let tag = challenge_type_tag(&ct);
         assert_eq!(tag, "Custom:my-custom-test");
     }
@@ -998,10 +999,10 @@ mod tests {
     #[test]
     fn canonical_bytes_are_deterministic() {
         let request = ChallengeRequest {
-            challenge_id: "test-id".to_owned(),
+            challenge_id: "test-id".into(),
             challenge_type: ChallengeType::SchemaValidation,
-            challenger_did: "did:key:c".to_owned(),
-            subject_did: "did:key:s".to_owned(),
+            challenger_did: "did:key:c".into(),
+            subject_did: "did:key:s".into(),
             parameters: serde_json::json!({"key": "value"}),
             timeout: Duration::from_secs(60),
             signature: vec![],
@@ -1012,8 +1013,8 @@ mod tests {
         assert_eq!(bytes1, bytes2);
 
         let response = ChallengeResponse {
-            challenge_id: "test-id".to_owned(),
-            responder_did: "did:key:s".to_owned(),
+            challenge_id: "test-id".into(),
+            responder_did: "did:key:s".into(),
             result: serde_json::json!({"ok": true}),
             completed_at: 1000,
             signature: vec![],

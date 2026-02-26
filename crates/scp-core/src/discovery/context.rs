@@ -491,7 +491,7 @@ impl DiscoveryContext {
         // Check for duplicate.
         if self.registry.contains_key(&params.did) {
             return Err(DiscoveryContextError::AlreadyRegistered {
-                did: params.did.clone(),
+                did: params.did.to_string(),
             });
         }
 
@@ -510,7 +510,7 @@ impl DiscoveryContext {
         // Record event.
         self.events.push(RegistrationEvent::Registered {
             entry: entry.clone(),
-            processed_by: writer_did.to_owned(),
+            processed_by: writer_did.into(),
         });
 
         // Store entry.
@@ -555,7 +555,7 @@ impl DiscoveryContext {
         // Look up existing entry.
         let entry = self.registry.get(requester_did).ok_or_else(|| {
             DiscoveryContextError::NotRegistered {
-                did: requester_did.to_owned(),
+                did: requester_did.into(),
             }
         })?;
 
@@ -563,7 +563,7 @@ impl DiscoveryContext {
         if entry.did != requester_did {
             return Err(DiscoveryContextError::OwnershipMismatch {
                 requester: requester_did.to_owned(),
-                owner: entry.did.clone(),
+                owner: entry.did.to_string(),
             });
         }
 
@@ -571,7 +571,7 @@ impl DiscoveryContext {
 
         // Apply update.
         let updated_entry = RegistrationEntry {
-            did: requester_did.to_owned(),
+            did: requester_did.into(),
             capabilities,
             metadata,
             entry_id,
@@ -581,11 +581,11 @@ impl DiscoveryContext {
         // Record event.
         self.events.push(RegistrationEvent::Updated {
             entry: updated_entry.clone(),
-            processed_by: writer_did.to_owned(),
+            processed_by: writer_did.into(),
         });
 
         self.registry
-            .insert(requester_did.to_owned(), updated_entry);
+            .insert(DID::from(requester_did), updated_entry);
 
         Ok(())
     }
@@ -623,14 +623,14 @@ impl DiscoveryContext {
             self.registry
                 .get(&params.did)
                 .ok_or_else(|| DiscoveryContextError::NotRegistered {
-                    did: params.did.clone(),
+                    did: params.did.to_string(),
                 })?;
 
         // Verify ownership.
         if entry.did != requester_did {
             return Err(DiscoveryContextError::OwnershipMismatch {
                 requester: requester_did.to_owned(),
-                owner: entry.did.clone(),
+                owner: entry.did.to_string(),
             });
         }
 
@@ -643,7 +643,7 @@ impl DiscoveryContext {
         self.events.push(RegistrationEvent::Deregistered {
             did: params.did.clone(),
             entry_id,
-            processed_by: writer_did.to_owned(),
+            processed_by: writer_did.into(),
         });
 
         Ok(AgentDeregisterResult { removed: true })
@@ -777,12 +777,12 @@ mod tests {
     const CTX_ID: &str = "ctx-discovery-test";
 
     fn new_ctx() -> DiscoveryContext {
-        DiscoveryContext::new(CTX_ID.to_owned(), WRITER_DID.to_owned())
+        DiscoveryContext::new(CTX_ID.into(), WRITER_DID.into())
     }
 
     fn register_params(did: &str, caps: &[&str]) -> AgentRegisterParams {
         AgentRegisterParams {
-            did: did.to_owned(),
+            did: did.into(),
             capabilities: caps.iter().map(|s| (*s).to_owned()).collect(),
             metadata: serde_json::json!({}),
         }
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn membership_tier_returns_correct_tier() {
         let mut ctx = new_ctx();
-        ctx.add_reader(READER_DID.to_owned()).unwrap();
+        ctx.add_reader(READER_DID.into()).unwrap();
 
         assert_eq!(
             ctx.membership_tier(WRITER_DID),
@@ -822,7 +822,7 @@ mod tests {
     fn add_writer_succeeds() {
         let mut ctx = new_ctx();
         let second_writer = "did:dht:z6MkWriter2";
-        ctx.add_writer(second_writer.to_owned()).unwrap();
+        ctx.add_writer(second_writer.into()).unwrap();
         assert_eq!(ctx.writers().len(), 2);
         assert!(ctx.is_writer(second_writer));
     }
@@ -830,20 +830,20 @@ mod tests {
     #[test]
     fn add_writer_deduplicates() {
         let mut ctx = new_ctx();
-        ctx.add_writer(WRITER_DID.to_owned()).unwrap();
+        ctx.add_writer(WRITER_DID.into()).unwrap();
         assert_eq!(ctx.writers().len(), 1);
     }
 
     #[test]
     fn add_writer_rejects_invalid_did() {
         let mut ctx = new_ctx();
-        let result = ctx.add_writer(String::new());
+        let result = ctx.add_writer(DID::from(""));
         assert!(matches!(
             result,
             Err(DiscoveryContextError::DidNotAuthenticated { .. })
         ));
 
-        let result = ctx.add_writer("not-a-did".to_owned());
+        let result = ctx.add_writer("not-a-did".into());
         assert!(matches!(
             result,
             Err(DiscoveryContextError::DidNotAuthenticated { .. })
@@ -855,11 +855,11 @@ mod tests {
         let mut ctx = new_ctx();
         // Fill to MAX_WRITERS (1 already exists: the creator).
         for i in 1..MAX_WRITERS {
-            ctx.add_writer(format!("did:dht:z6MkWriter{i}")).unwrap();
+            ctx.add_writer(format!("did:dht:z6MkWriter{i}").into()).unwrap();
         }
         assert_eq!(ctx.writers().len(), MAX_WRITERS);
 
-        let result = ctx.add_writer("did:dht:z6MkWriterOverflow".to_owned());
+        let result = ctx.add_writer("did:dht:z6MkWriterOverflow".into());
         assert!(matches!(result, Err(DiscoveryContextError::WriterTierFull)));
     }
 
@@ -868,22 +868,22 @@ mod tests {
     #[test]
     fn add_reader_succeeds() {
         let mut ctx = new_ctx();
-        ctx.add_reader(READER_DID.to_owned()).unwrap();
+        ctx.add_reader(READER_DID.into()).unwrap();
         assert_eq!(ctx.readers().len(), 1);
     }
 
     #[test]
     fn add_reader_deduplicates() {
         let mut ctx = new_ctx();
-        ctx.add_reader(READER_DID.to_owned()).unwrap();
-        ctx.add_reader(READER_DID.to_owned()).unwrap();
+        ctx.add_reader(READER_DID.into()).unwrap();
+        ctx.add_reader(READER_DID.into()).unwrap();
         assert_eq!(ctx.readers().len(), 1);
     }
 
     #[test]
     fn add_reader_rejects_invalid_did() {
         let mut ctx = new_ctx();
-        let result = ctx.add_reader("bad-did".to_owned());
+        let result = ctx.add_reader("bad-did".into());
         assert!(matches!(
             result,
             Err(DiscoveryContextError::DidNotAuthenticated { .. })
@@ -895,7 +895,7 @@ mod tests {
         let mut ctx = new_ctx();
         // Add more readers than the writer limit.
         for i in 0..(MAX_WRITERS + 100) {
-            ctx.add_reader(format!("did:dht:z6MkReader{i}")).unwrap();
+            ctx.add_reader(format!("did:dht:z6MkReader{i}").into()).unwrap();
         }
         assert_eq!(ctx.readers().len(), MAX_WRITERS + 100);
     }
@@ -988,8 +988,8 @@ mod tests {
 
     #[test]
     fn agent_can_register_different_capabilities_in_different_contexts() {
-        let mut ctx1 = DiscoveryContext::new("ctx-1".to_owned(), WRITER_DID.to_owned());
-        let mut ctx2 = DiscoveryContext::new("ctx-2".to_owned(), WRITER_DID.to_owned());
+        let mut ctx1 = DiscoveryContext::new("ctx-1".into(), WRITER_DID.into());
+        let mut ctx2 = DiscoveryContext::new("ctx-2".into(), WRITER_DID.into());
 
         let params1 = register_params(AGENT_A_DID, &["code_review"]);
         let params2 = register_params(AGENT_A_DID, &["translation", "summarization"]);
@@ -1213,7 +1213,7 @@ mod tests {
         ctx.agent_register(&params, WRITER_DID, 100).unwrap();
 
         let deregister_params = AgentDeregisterParams {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         let result = ctx
             .agent_deregister(&deregister_params, AGENT_A_DID, WRITER_DID)
@@ -1230,7 +1230,7 @@ mod tests {
         ctx.agent_register(&params, WRITER_DID, 100).unwrap();
 
         let deregister_params = AgentDeregisterParams {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         ctx.agent_deregister(&deregister_params, AGENT_A_DID, WRITER_DID)
             .unwrap();
@@ -1257,7 +1257,7 @@ mod tests {
         ctx.agent_register(&params, WRITER_DID, 100).unwrap();
 
         let deregister_params = AgentDeregisterParams {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         let result = ctx.agent_deregister(&deregister_params, AGENT_A_DID, "did:dht:z6MkNotWriter");
         assert!(matches!(result, Err(DiscoveryContextError::WriterRequired)));
@@ -1267,7 +1267,7 @@ mod tests {
     fn agent_deregister_rejects_non_registered() {
         let mut ctx = new_ctx();
         let deregister_params = AgentDeregisterParams {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         let result = ctx.agent_deregister(&deregister_params, AGENT_A_DID, WRITER_DID);
         assert!(matches!(
@@ -1283,7 +1283,7 @@ mod tests {
         ctx.agent_register(&params, WRITER_DID, 100).unwrap();
 
         let deregister_params = AgentDeregisterParams {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         // Agent B tries to deregister Agent A.
         let result = ctx.agent_deregister(&deregister_params, AGENT_B_DID, WRITER_DID);
@@ -1398,7 +1398,7 @@ mod tests {
     #[test]
     fn agent_register_params_serialization_roundtrip() {
         let params = AgentRegisterParams {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
             capabilities: vec!["testing".to_owned()],
             metadata: serde_json::json!({"key": "value"}),
         };
@@ -1410,7 +1410,7 @@ mod tests {
     #[test]
     fn agent_deregister_params_serialization_roundtrip() {
         let params = AgentDeregisterParams {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         let json = serde_json::to_string(&params).unwrap();
         let deserialized: AgentDeregisterParams = serde_json::from_str(&json).unwrap();
@@ -1439,7 +1439,7 @@ mod tests {
     #[test]
     fn registration_event_serialization_roundtrip() {
         let entry = RegistrationEntry {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
             capabilities: vec!["testing".to_owned()],
             metadata: serde_json::json!({}),
             entry_id: "reg-1".to_owned(),
@@ -1448,7 +1448,7 @@ mod tests {
 
         let event = RegistrationEvent::Registered {
             entry,
-            processed_by: WRITER_DID.to_owned(),
+            processed_by: WRITER_DID.into(),
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: RegistrationEvent = serde_json::from_str(&json).unwrap();
@@ -1463,17 +1463,17 @@ mod tests {
         assert!(err.to_string().contains("500"));
 
         let err = DiscoveryContextError::DidNotAuthenticated {
-            did: "bad".to_owned(),
+            did: "bad".into(),
         };
         assert!(err.to_string().contains("bad"));
 
         let err = DiscoveryContextError::AlreadyRegistered {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         assert!(err.to_string().contains(AGENT_A_DID));
 
         let err = DiscoveryContextError::NotRegistered {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         assert!(err.to_string().contains(AGENT_A_DID));
 
@@ -1578,7 +1578,7 @@ mod tests {
 
         // Deregister.
         let deregister_params = AgentDeregisterParams {
-            did: AGENT_A_DID.to_owned(),
+            did: AGENT_A_DID.into(),
         };
         ctx.agent_deregister(&deregister_params, AGENT_A_DID, WRITER_DID)
             .unwrap();
@@ -1597,7 +1597,7 @@ mod tests {
     fn agent_search_result_serialization_roundtrip() {
         let result = AgentSearchResult {
             entries: vec![RegistrationEntry {
-                did: AGENT_A_DID.to_owned(),
+                did: AGENT_A_DID.into(),
                 capabilities: vec!["testing".to_owned()],
                 metadata: serde_json::json!({}),
                 entry_id: "reg-1".to_owned(),

@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::DID;
+use crate::identity::DID;
 use crate::provenance::DataProvenance;
 
 /// Type alias for tool invocation provenance.
@@ -338,7 +338,7 @@ mod tests {
     fn tool_request_new_generates_uuid_v4() {
         let request = ToolRequest::new(
             "tool-1".to_owned(),
-            "did:dht:z6MkInvoker".to_owned(),
+            "did:dht:z6MkInvoker".into(),
             serde_json::json!({"x": 1}),
         );
         // UUID v4 format: 8-4-4-4-12 hex digits.
@@ -354,7 +354,7 @@ mod tests {
     fn tool_request_clamp_timeout_below_context_max() {
         let mut request = ToolRequest::new(
             "tool-1".to_owned(),
-            "did:dht:z6MkInvoker".to_owned(),
+            "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
         );
         request.timeout_ms = 10_000;
@@ -366,7 +366,7 @@ mod tests {
     fn tool_request_clamp_timeout_above_context_max() {
         let mut request = ToolRequest::new(
             "tool-1".to_owned(),
-            "did:dht:z6MkInvoker".to_owned(),
+            "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
         );
         request.timeout_ms = 120_000;
@@ -378,7 +378,7 @@ mod tests {
     fn tool_request_clamp_timeout_respects_protocol_maximum() {
         let mut request = ToolRequest::new(
             "tool-1".to_owned(),
-            "did:dht:z6MkInvoker".to_owned(),
+            "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
         );
         request.timeout_ms = 600_000;
@@ -447,7 +447,7 @@ mod tests {
         let request = ToolRequest {
             request_id: "abc-123".to_owned(),
             tool_id: "tool-1".to_owned(),
-            invoker_did: "did:dht:z6MkInvoker".to_owned(),
+            invoker_did: "did:dht:z6MkInvoker".into(),
             input: serde_json::json!({"a": 1}),
             timeout_ms: 5_000,
             session_id: Some("sess-1".to_owned()),
@@ -467,7 +467,7 @@ mod tests {
     fn tool_cancel_serialization_roundtrip() {
         let cancel = ToolCancel {
             request_id: "req-1".to_owned(),
-            invoker_did: "did:dht:z6MkInvoker".to_owned(),
+            invoker_did: "did:dht:z6MkInvoker".into(),
             timestamp: 999,
         };
         let json = serde_json::to_string(&cancel).unwrap();
@@ -519,7 +519,7 @@ mod tests {
         let event = ToolInvokedEvent {
             request_id: "req-1".to_owned(),
             tool_id: "tool-1".to_owned(),
-            invoker_did: "did:dht:z6MkInvoker".to_owned(),
+            invoker_did: "did:dht:z6MkInvoker".into(),
             status: ToolStatus::Success,
             execution_time_ms: 42,
             input_hash: "abcd".to_owned(),

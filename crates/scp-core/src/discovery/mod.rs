@@ -47,8 +47,7 @@ pub use search::{ContactCache, ContextQuerier, unified_search};
 // Type aliases (match event_log/mod.rs pattern)
 // ---------------------------------------------------------------------------
 
-/// A DID string (e.g., `"did:dht:z6Mk..."`).
-pub type DID = String;
+use crate::identity::DID;
 
 /// A context identifier string.
 pub type ContextId = String;
@@ -225,11 +224,11 @@ mod tests {
     #[test]
     fn discovery_result_entry_serialization_roundtrip() {
         let entry = DiscoveryResultEntry {
-            did: "did:dht:zTestDid".to_owned(),
+            did: "did:dht:zTestDid".into(),
             capabilities: vec!["code_review".to_owned(), "testing".to_owned()],
             behavioral_summary: Some(serde_json::json!({"participation": 42})),
             provenance: DataProvenance {
-                source_did: "did:dht:zSourceDid".to_owned(),
+                source_did: "did:dht:zSourceDid".into(),
                 source_context: Some("ctx-001".to_owned()),
                 timestamp: 1_700_000_000,
             },
@@ -245,7 +244,7 @@ mod tests {
     #[test]
     fn registration_entry_serialization_roundtrip() {
         let entry = RegistrationEntry {
-            did: "did:dht:zAgent123".to_owned(),
+            did: "did:dht:zAgent123".into(),
             capabilities: vec!["translation".to_owned()],
             metadata: serde_json::json!({"language": "es"}),
             entry_id: "reg-001".to_owned(),
@@ -275,7 +274,7 @@ mod tests {
     #[test]
     fn data_provenance_serialization_roundtrip() {
         let provenance = DataProvenance {
-            source_did: "did:dht:zProvSource".to_owned(),
+            source_did: "did:dht:zProvSource".into(),
             source_context: None,
             timestamp: 1_700_000_000,
         };

@@ -35,11 +35,7 @@ use crate::context::MemoryScope;
 // Type aliases (match event_log/mod.rs pattern)
 // ---------------------------------------------------------------------------
 
-/// A DID string (e.g., `"did:dht:z6Mk..."`).
-///
-/// Represented as a plain `String` for Phase 4. This matches the pattern used
-/// in the `event_log` module.
-pub type DID = String;
+use crate::identity::DID;
 
 /// A context identifier string.
 ///
@@ -223,8 +219,8 @@ mod tests {
             source_context: "ctx-abc-123".to_string(),
             source_type: SourceType::Persistent,
             counterparties: vec![
-                "did:dht:z6MkAlice".to_string(),
-                "did:dht:z6MkBob".to_string(),
+                "did:dht:z6MkAlice".into(),
+                "did:dht:z6MkBob".into(),
             ],
             purpose: Some("recipe sharing".to_string()),
             discovery_method: DiscoveryMethod::SharedContext("ctx-shared".to_string()),
@@ -248,7 +244,7 @@ mod tests {
         let provenance = DataProvenance {
             source_context: "ctx-origin".to_string(),
             source_type: SourceType::Ephemeral,
-            counterparties: vec!["did:dht:z6MkCharlie".to_string()],
+            counterparties: vec!["did:dht:z6MkCharlie".into()],
             purpose: None,
             discovery_method: DiscoveryMethod::Registry("ctx-registry".to_string()),
             age: Duration::from_secs(600),
@@ -382,7 +378,7 @@ mod tests {
         let provenance = DataProvenance {
             source_context: "ctx-serde-test".to_string(),
             source_type: SourceType::Persistent,
-            counterparties: vec!["did:dht:z6MkTest".to_string()],
+            counterparties: vec!["did:dht:z6MkTest".into()],
             purpose: Some("testing serde".to_string()),
             discovery_method: DiscoveryMethod::SharedContext("ctx-disc".to_string()),
             age: Duration::from_secs(42),
@@ -496,7 +492,7 @@ mod tests {
         let provenance = DataProvenance {
             source_context: "ctx-deep".to_string(),
             source_type: SourceType::Persistent,
-            counterparties: vec!["did:dht:z6MkDeep".to_string()],
+            counterparties: vec!["did:dht:z6MkDeep".into()],
             purpose: None,
             discovery_method: DiscoveryMethod::None,
             age: Duration::from_secs(1000),

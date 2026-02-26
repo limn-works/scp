@@ -30,7 +30,8 @@ use std::time::Duration;
 use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 
-use crate::event_log::{DID, Ed25519Signature};
+use crate::event_log::Ed25519Signature;
+use crate::identity::DID;
 use crate::identity::cache::Clock;
 
 use super::{AttestationType, TrustError};
@@ -596,8 +597,8 @@ mod tests {
         let mut attestation = Attestation {
             id: format!("att-{issued_at}"),
             attestation_type,
-            issuer: issuer.to_owned(),
-            subject: subject.to_owned(),
+            issuer: issuer.into(),
+            subject: subject.into(),
             claim: serde_json::json!({"test": true}),
             evidence,
             issued_at,
@@ -874,8 +875,8 @@ mod tests {
         let attestation = Attestation {
             id: "att-1".to_owned(),
             attestation_type: AttestationType::Endorsement,
-            issuer: "did:key:issuer".to_owned(),
-            subject: "did:key:subject".to_owned(),
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
             claim: serde_json::json!({}),
             evidence: None,
             issued_at: 900,
@@ -899,8 +900,8 @@ mod tests {
         let attestation = Attestation {
             id: "att-1".to_owned(),
             attestation_type: AttestationType::Endorsement,
-            issuer: "did:key:issuer".to_owned(),
-            subject: "did:key:subject".to_owned(),
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
             claim: serde_json::json!({}),
             evidence: None,
             issued_at: 900,
@@ -922,8 +923,8 @@ mod tests {
         let attestation = Attestation {
             id: "att-1".to_owned(),
             attestation_type: AttestationType::Endorsement,
-            issuer: "did:key:issuer".to_owned(),
-            subject: "did:key:subject".to_owned(),
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
             claim: serde_json::json!({}),
             evidence: None,
             issued_at: 900,
@@ -945,8 +946,8 @@ mod tests {
         let attestation = Attestation {
             id: "att-1".to_owned(),
             attestation_type: AttestationType::Endorsement,
-            issuer: "did:key:issuer".to_owned(),
-            subject: "did:key:subject".to_owned(),
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
             claim: serde_json::json!({}),
             evidence: None,
             issued_at: 900,
@@ -968,8 +969,8 @@ mod tests {
         let attestation = Attestation {
             id: "att-1".to_owned(),
             attestation_type: AttestationType::Endorsement,
-            issuer: "did:key:issuer".to_owned(),
-            subject: "did:key:subject".to_owned(),
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
             claim: serde_json::json!({}),
             evidence: None,
             issued_at: 900,
@@ -996,9 +997,9 @@ mod tests {
         attestation: Option<Attestation>,
     ) -> AttestorInfo {
         AttestorInfo {
-            did: did.to_owned(),
+            did: did.into(),
             context_memberships: contexts.iter().map(|s| (*s).to_owned()).collect(),
-            endorsements: endorsements.iter().map(|s| (*s).to_owned()).collect(),
+            endorsements: endorsements.iter().map(|s| DID::from(*s)).collect(),
             attestation,
         }
     }
@@ -1007,8 +1008,8 @@ mod tests {
         Attestation {
             id: format!("att-{issuer}"),
             attestation_type,
-            issuer: issuer.to_owned(),
-            subject: "did:key:subject".to_owned(),
+            issuer: issuer.into(),
+            subject: "did:key:subject".into(),
             claim: serde_json::json!({}),
             evidence: None,
             issued_at: 1000,

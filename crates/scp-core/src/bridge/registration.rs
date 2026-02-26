@@ -611,7 +611,7 @@ mod tests {
     fn make_request(bridge_id: &str, context_id: &str) -> BridgeRegistrationRequest {
         BridgeRegistrationRequest {
             bridge_id: bridge_id.to_owned(),
-            operator_did: OPERATOR_DID.to_owned(),
+            operator_did: OPERATOR_DID.into(),
             platform: "discord".to_owned(),
             mode: BridgeMode::Relay,
             context_id: context_id.to_owned(),
@@ -638,7 +638,7 @@ mod tests {
         let (connector, _event) = approve_registration(
             registry,
             bridge_id,
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -760,7 +760,7 @@ mod tests {
         let (connector, _event) = approve_registration(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -784,7 +784,7 @@ mod tests {
         approve_registration(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -808,7 +808,7 @@ mod tests {
         let (_connector, event) = approve_registration(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -825,7 +825,7 @@ mod tests {
         let result = approve_registration(
             &mut registry,
             "bridge-nonexistent",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         );
         assert!(matches!(
@@ -844,7 +844,7 @@ mod tests {
         let result = approve_registration(
             &mut registry,
             "bridge-001",
-            &OPERATOR_DID.to_owned(),
+            &DID::from(OPERATOR_DID),
             1_700_000_001,
         );
         assert!(matches!(
@@ -869,7 +869,7 @@ mod tests {
         reject_registration(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             "platform not allowed",
             1_700_000_001,
         )
@@ -887,7 +887,7 @@ mod tests {
         reject_registration(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             "not needed",
             1_700_000_001,
         )
@@ -905,7 +905,7 @@ mod tests {
         let event = reject_registration(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             "policy violation",
             1_700_000_001,
         )
@@ -926,7 +926,7 @@ mod tests {
         let result = reject_registration(
             &mut registry,
             "bridge-nonexistent",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             "reason",
             1_700_000_001,
         );
@@ -949,7 +949,7 @@ mod tests {
         revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -972,7 +972,7 @@ mod tests {
         revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -996,7 +996,7 @@ mod tests {
         revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -1015,7 +1015,7 @@ mod tests {
         let event = revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -1033,7 +1033,7 @@ mod tests {
         let result = revoke_bridge(
             &mut registry,
             "bridge-nonexistent",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         );
@@ -1052,7 +1052,7 @@ mod tests {
         revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -1062,7 +1062,7 @@ mod tests {
         let result = revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_003,
         );
@@ -1096,7 +1096,7 @@ mod tests {
         revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -1116,7 +1116,7 @@ mod tests {
         revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -1148,7 +1148,7 @@ mod tests {
         // Register same platform in context B.
         let request_b = BridgeRegistrationRequest {
             bridge_id: "bridge-discord-b".to_owned(),
-            operator_did: OPERATOR_DID.to_owned(),
+            operator_did: OPERATOR_DID.into(),
             platform: "discord".to_owned(),
             mode: BridgeMode::Relay,
             context_id: CTX_B.to_owned(),
@@ -1159,7 +1159,7 @@ mod tests {
         approve_registration(
             &mut registry_b,
             "bridge-discord-b",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -1202,7 +1202,7 @@ mod tests {
 
         let req_a = BridgeRegistrationRequest {
             bridge_id: "bridge-discord-ctx-a".to_owned(),
-            operator_did: OPERATOR_DID.to_owned(),
+            operator_did: OPERATOR_DID.into(),
             platform: "discord".to_owned(),
             mode: BridgeMode::Relay,
             context_id: CTX_A.to_owned(),
@@ -1213,14 +1213,14 @@ mod tests {
         approve_registration(
             &mut registry_a,
             "bridge-discord-ctx-a",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
 
         let req_b = BridgeRegistrationRequest {
             bridge_id: "bridge-discord-ctx-b".to_owned(),
-            operator_did: OPERATOR_DID.to_owned(),
+            operator_did: OPERATOR_DID.into(),
             platform: "discord".to_owned(),
             mode: BridgeMode::Puppet,
             context_id: CTX_B.to_owned(),
@@ -1231,7 +1231,7 @@ mod tests {
         approve_registration(
             &mut registry_b,
             "bridge-discord-ctx-b",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -1256,7 +1256,7 @@ mod tests {
         // Self-hosted bridge.
         let req_self = BridgeRegistrationRequest {
             bridge_id: "bridge-self".to_owned(),
-            operator_did: OPERATOR_DID.to_owned(),
+            operator_did: OPERATOR_DID.into(),
             platform: "discord".to_owned(),
             mode: BridgeMode::Puppet,
             context_id: CTX_A.to_owned(),
@@ -1267,7 +1267,7 @@ mod tests {
         let (self_hosted, _) = approve_registration(
             &mut registry,
             "bridge-self",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -1275,7 +1275,7 @@ mod tests {
         // Managed bridge.
         let req_managed = BridgeRegistrationRequest {
             bridge_id: "bridge-managed".to_owned(),
-            operator_did: "did:dht:z6MkOther".to_owned(),
+            operator_did: "did:dht:z6MkOther".into(),
             platform: "discord".to_owned(),
             mode: BridgeMode::Puppet,
             context_id: CTX_A.to_owned(),
@@ -1286,7 +1286,7 @@ mod tests {
         let (managed, _) = approve_registration(
             &mut registry,
             "bridge-managed",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -1313,7 +1313,7 @@ mod tests {
         approve_registration(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -1323,7 +1323,7 @@ mod tests {
         revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -1346,7 +1346,7 @@ mod tests {
         reject_registration(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             "policy violation",
             1_700_000_001,
         )
@@ -1386,8 +1386,8 @@ mod tests {
         let event = BridgeRegistrationEvent {
             action: BridgeRegistrationAction::Approved,
             bridge_id: "bridge-001".to_owned(),
-            operator_did: OPERATOR_DID.to_owned(),
-            governance_did: GOVERNANCE_DID.to_owned(),
+            operator_did: OPERATOR_DID.into(),
+            governance_did: GOVERNANCE_DID.into(),
             context_id: CTX_A.to_owned(),
             timestamp: 1_700_000_001,
         };
@@ -1467,7 +1467,7 @@ mod tests {
         assert!(format!("{err}").contains("b-4"));
 
         let err = BridgeRegistrationError::SelfApproval {
-            did: OPERATOR_DID.to_owned(),
+            did: OPERATOR_DID.into(),
         };
         assert!(format!("{err}").contains(OPERATOR_DID));
     }
@@ -1484,7 +1484,7 @@ mod tests {
 
         let req_slack = BridgeRegistrationRequest {
             bridge_id: "bridge-slack".to_owned(),
-            operator_did: "did:dht:z6MkSlackOp".to_owned(),
+            operator_did: "did:dht:z6MkSlackOp".into(),
             platform: "slack".to_owned(),
             mode: BridgeMode::Api,
             context_id: CTX_A.to_owned(),
@@ -1495,7 +1495,7 @@ mod tests {
         approve_registration(
             &mut registry,
             "bridge-slack",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             1_700_000_001,
         )
         .unwrap();
@@ -1530,7 +1530,7 @@ mod tests {
         revoke_bridge(
             &mut registry,
             "bridge-001",
-            &GOVERNANCE_DID.to_owned(),
+            &DID::from(GOVERNANCE_DID),
             &mut shadows,
             1_700_000_002,
         )
@@ -1565,7 +1565,7 @@ mod tests {
             let bridge_id = format!("bridge-{suffix}");
             let request = BridgeRegistrationRequest {
                 bridge_id: bridge_id.clone(),
-                operator_did: OPERATOR_DID.to_owned(),
+                operator_did: OPERATOR_DID.into(),
                 platform: "discord".to_owned(),
                 mode: mode.clone(),
                 context_id: CTX_A.to_owned(),
@@ -1576,7 +1576,7 @@ mod tests {
             let (connector, _) = approve_registration(
                 &mut registry,
                 &bridge_id,
-                &GOVERNANCE_DID.to_owned(),
+                &DID::from(GOVERNANCE_DID),
                 1_700_000_001,
             )
             .unwrap();

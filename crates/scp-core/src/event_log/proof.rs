@@ -422,7 +422,7 @@ mod tests {
     ) -> Event {
         let mut event = Event {
             event_type,
-            actor_did: actor_did.to_owned(),
+            actor_did: actor_did.into(),
             timestamp,
             sequence,
             payload: EventPayload { data: payload },

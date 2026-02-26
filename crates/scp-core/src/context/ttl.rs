@@ -46,7 +46,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::builder::{ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider};
-use super::membership::{ContextEvent, DID};
+use super::membership::ContextEvent;
+use crate::identity::DID;
 use super::params::GovernanceModel;
 use super::roles::{self, ContextRoleState};
 use super::{ContextError, ContextHandle, ContextState, MemoryScope};
@@ -757,7 +758,7 @@ impl TtlExtension {
 #[must_use]
 pub fn closing_notification(initiator_did: &DID) -> ContextEvent {
     ContextEvent::MemberLeft {
-        member_did: format!("__close_notification:{initiator_did}"),
+        member_did: format!("__close_notification:{initiator_did}").into(),
     }
 }
 
@@ -765,7 +766,7 @@ pub fn closing_notification(initiator_did: &DID) -> ContextEvent {
 #[must_use]
 pub fn expiry_notification() -> ContextEvent {
     ContextEvent::MemberLeft {
-        member_did: "__ttl_expiry_notification".to_owned(),
+        member_did: "__ttl_expiry_notification".into(),
     }
 }
 
@@ -1228,7 +1229,7 @@ mod tests {
         ext.add_consent("did:key:bob".into());
 
         let active: HashSet<DID> =
-            ["did:key:alice".to_owned(), "did:key:bob".to_owned()]
+            ["did:key:alice".into(), "did:key:bob".into()]
                 .into_iter()
                 .collect();
 
@@ -1244,7 +1245,7 @@ mod tests {
         ext.add_consent("did:key:bob".into());
 
         // Bob was removed before tally time -- only Alice is active.
-        let active: HashSet<DID> = ["did:key:alice".to_owned()].into_iter().collect();
+        let active: HashSet<DID> = ["did:key:alice".into()].into_iter().collect();
 
         assert_eq!(ext.active_consent_count(&active), 1);
         assert!(!ext.is_unanimous_active(&active));
@@ -1268,8 +1269,8 @@ mod tests {
 
         // Charlie removed -- only Alice and Bob are active.
         let active: HashSet<DID> = [
-            "did:key:alice".to_owned(),
-            "did:key:bob".to_owned(),
+            "did:key:alice".into(),
+            "did:key:bob".into(),
         ]
         .into_iter()
         .collect();
@@ -1290,9 +1291,9 @@ mod tests {
         ext.add_consent("did:key:bob".into());
 
         let active: HashSet<DID> = [
-            "did:key:alice".to_owned(),
-            "did:key:bob".to_owned(),
-            "did:key:charlie".to_owned(),
+            "did:key:alice".into(),
+            "did:key:bob".into(),
+            "did:key:charlie".into(),
         ]
         .into_iter()
         .collect();
@@ -1330,7 +1331,7 @@ mod tests {
 
         // Both active -- approved.
         let both_active: HashSet<DID> =
-            ["did:key:alice".to_owned(), "did:key:bob".to_owned()]
+            ["did:key:alice".into(), "did:key:bob".into()]
                 .into_iter()
                 .collect();
         assert!(proposal.is_approved_active(&both_active));
@@ -1338,7 +1339,7 @@ mod tests {
         assert_eq!(proposal.active_remaining(&both_active), 0);
 
         // Bob removed -- not approved.
-        let alice_only: HashSet<DID> = ["did:key:alice".to_owned()].into_iter().collect();
+        let alice_only: HashSet<DID> = ["did:key:alice".into()].into_iter().collect();
         assert!(!proposal.is_approved_active(&alice_only));
         assert_eq!(proposal.active_consent_count(&alice_only), 1);
         assert_eq!(proposal.active_remaining(&alice_only), 1);
@@ -1364,7 +1365,7 @@ mod tests {
         assert!(proposal.is_approved());
 
         // Bob is removed before tally time.
-        let active: HashSet<DID> = ["did:key:alice".to_owned()].into_iter().collect();
+        let active: HashSet<DID> = ["did:key:alice".into()].into_iter().collect();
 
         // Active method: NOT approved (only 1 of 2 required active votes).
         assert!(!proposal.is_approved_active(&active));

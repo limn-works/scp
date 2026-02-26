@@ -401,11 +401,11 @@ mod tests {
     /// Helper: create a test entry with the given DID and capabilities.
     fn make_entry(did: &str, caps: &[&str], source_context: Option<&str>) -> DiscoveryResultEntry {
         DiscoveryResultEntry {
-            did: did.to_owned(),
+            did: did.into(),
             capabilities: caps.iter().map(|c| (*c).to_owned()).collect(),
             behavioral_summary: None,
             provenance: DataProvenance {
-                source_did: did.to_owned(),
+                source_did: did.into(),
                 source_context: source_context.map(ToOwned::to_owned),
                 timestamp: 1_700_000_000,
             },
@@ -416,7 +416,7 @@ mod tests {
     /// Helper: create a registration entry for context querier responses.
     fn make_reg_entry(did: &str, caps: &[&str]) -> super::super::RegistrationEntry {
         super::super::RegistrationEntry {
-            did: did.to_owned(),
+            did: did.into(),
             capabilities: caps.iter().map(|c| (*c).to_owned()).collect(),
             metadata: serde_json::json!({}),
             entry_id: format!("reg-{did}"),
@@ -734,7 +734,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.entries.len(), 2);
-        let dids: Vec<&str> = result.entries.iter().map(|e| e.did.as_str()).collect();
+        let dids: Vec<&str> = result.entries.iter().map(|e| e.did.as_ref()).collect();
         assert!(dids.contains(&"did:dht:zAlice"));
         assert!(dids.contains(&"did:dht:zBob"));
     }

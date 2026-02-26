@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use super::MemoryScope;
-use super::membership::DID;
+use crate::identity::DID;
 use super::memory_scope::ContextId;
 use super::params::PromotionPolicy;
 
@@ -253,7 +253,7 @@ pub fn record_consent(
     is_member: bool,
 ) -> Result<bool, PromotionError> {
     if !is_member {
-        return Err(PromotionError::NotAMember(member_did));
+        return Err(PromotionError::NotAMember(member_did.to_string()));
     }
     Ok(proposal.consents.insert(member_did))
 }
@@ -336,7 +336,7 @@ mod tests {
     fn make_promotable_proposal(member_count: usize) -> PromotionProposal {
         propose_promotion(
             "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
+            "did:key:alice".into(),
             PromotionPolicy::Promotable,
             true,
             member_count,
@@ -352,7 +352,7 @@ mod tests {
     fn propose_promotion_succeeds_for_promotable_context() {
         let proposal = propose_promotion(
             "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
+            "did:key:alice".into(),
             PromotionPolicy::Promotable,
             true,
             3,
@@ -368,7 +368,7 @@ mod tests {
     fn propose_promotion_rejects_no_promotion_policy() {
         let result = propose_promotion(
             "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
+            "did:key:alice".into(),
             PromotionPolicy::NoPromotion,
             true,
             3,
@@ -384,7 +384,7 @@ mod tests {
     fn propose_promotion_rejects_non_active_context() {
         let result = propose_promotion(
             "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
+            "did:key:alice".into(),
             PromotionPolicy::Promotable,
             false,
             3,
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn record_consent_adds_new_member() {
         let mut proposal = make_promotable_proposal(3);
-        let result = record_consent(&mut proposal, "did:key:bob".to_owned(), true);
+        let result = record_consent(&mut proposal, "did:key:bob".into(), true);
         assert!(result.is_ok());
         assert!(result.unwrap());
         assert_eq!(proposal.consent_count(), 2);
@@ -424,10 +424,10 @@ mod tests {
     #[test]
     fn record_consent_is_idempotent() {
         let mut proposal = make_promotable_proposal(3);
-        record_consent(&mut proposal, "did:key:bob".to_owned(), true).unwrap();
+        record_consent(&mut proposal, "did:key:bob".into(), true).unwrap();
 
         // Second consent from the same member returns false (already recorded).
-        let result = record_consent(&mut proposal, "did:key:bob".to_owned(), true);
+        let result = record_consent(&mut proposal, "did:key:bob".into(), true);
         assert!(result.is_ok());
         assert!(!result.unwrap());
         assert_eq!(proposal.consent_count(), 2);
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn record_consent_rejects_non_member() {
         let mut proposal = make_promotable_proposal(3);
-        let result = record_consent(&mut proposal, "did:key:stranger".to_owned(), false);
+        let result = record_consent(&mut proposal, "did:key:stranger".into(), false);
         assert!(result.is_err());
         match result {
             Err(PromotionError::NotAMember(did)) => {
@@ -460,11 +460,11 @@ mod tests {
     #[test]
     fn proposal_becomes_unanimous_with_all_consents() {
         let mut proposal = make_promotable_proposal(3);
-        record_consent(&mut proposal, "did:key:bob".to_owned(), true).unwrap();
+        record_consent(&mut proposal, "did:key:bob".into(), true).unwrap();
         assert!(!proposal.is_unanimous());
         assert_eq!(proposal.remaining(), 1);
 
-        record_consent(&mut proposal, "did:key:charlie".to_owned(), true).unwrap();
+        record_consent(&mut proposal, "did:key:charlie".into(), true).unwrap();
         assert!(proposal.is_unanimous());
         assert_eq!(proposal.remaining(), 0);
     }
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn execute_promotion_succeeds_with_unanimous_consent() {
         let mut proposal = make_promotable_proposal(2);
-        record_consent(&mut proposal, "did:key:bob".to_owned(), true).unwrap();
+        record_consent(&mut proposal, "did:key:bob".into(), true).unwrap();
 
         let result = execute_promotion(&proposal, MemoryScope::Ephemeral, true, 1_700_000_000);
         assert!(result.is_ok());
@@ -545,17 +545,17 @@ mod tests {
     fn execute_promotion_consenting_members_are_sorted() {
         let mut proposal = make_promotable_proposal(3);
         // Add consents in non-alphabetical order.
-        record_consent(&mut proposal, "did:key:charlie".to_owned(), true).unwrap();
-        record_consent(&mut proposal, "did:key:bob".to_owned(), true).unwrap();
+        record_consent(&mut proposal, "did:key:charlie".into(), true).unwrap();
+        record_consent(&mut proposal, "did:key:bob".into(), true).unwrap();
 
         let result = execute_promotion(&proposal, MemoryScope::Ephemeral, true, 1_000).unwrap();
 
         assert_eq!(
             result.event.consenting_members,
             vec![
-                "did:key:alice".to_owned(),
-                "did:key:bob".to_owned(),
-                "did:key:charlie".to_owned(),
+                DID::from("did:key:alice"),
+                DID::from("did:key:bob"),
+                DID::from("did:key:charlie"),
             ]
         );
     }
@@ -568,8 +568,8 @@ mod tests {
     fn promotion_event_serialization_roundtrip() {
         let event = PromotionEvent {
             context_id: "ctx-42".to_owned(),
-            proposer_did: "did:key:alice".to_owned(),
-            consenting_members: vec!["did:key:alice".to_owned(), "did:key:bob".to_owned()],
+            proposer_did: "did:key:alice".into(),
+            consenting_members: vec!["did:key:alice".into(), "did:key:bob".into()],
             previous_memory_scope: MemoryScope::Ephemeral,
             new_memory_scope: MemoryScope::Full,
             ttl_removed: true,
@@ -614,7 +614,7 @@ mod tests {
             "a promotion proposal is already in progress"
         );
 
-        let err = PromotionError::NotAMember("did:key:stranger".to_owned());
+        let err = PromotionError::NotAMember("did:key:stranger".into());
         assert_eq!(
             format!("{err}"),
             "member did:key:stranger is not a participant in this context"
@@ -630,7 +630,7 @@ mod tests {
         // Step 1: Propose promotion in a bilateral (2-member) context.
         let mut proposal = propose_promotion(
             "ctx-bilateral".to_owned(),
-            "did:key:alice".to_owned(),
+            "did:key:alice".into(),
             PromotionPolicy::Promotable,
             true,
             2,
@@ -640,7 +640,7 @@ mod tests {
         assert!(!proposal.is_unanimous());
 
         // Step 2: Record the other member's consent.
-        record_consent(&mut proposal, "did:key:bob".to_owned(), true).unwrap();
+        record_consent(&mut proposal, "did:key:bob".into(), true).unwrap();
         assert!(proposal.is_unanimous());
 
         // Step 3: Execute promotion.
@@ -659,7 +659,7 @@ mod tests {
         // Step 1: Propose promotion in a multi-party (5-member) context.
         let mut proposal = propose_promotion(
             "ctx-group".to_owned(),
-            "did:key:alice".to_owned(),
+            "did:key:alice".into(),
             PromotionPolicy::Promotable,
             true,
             5,
@@ -667,13 +667,13 @@ mod tests {
         .unwrap();
 
         // Step 2: Collect all consents (unanimous required).
-        record_consent(&mut proposal, "did:key:bob".to_owned(), true).unwrap();
-        record_consent(&mut proposal, "did:key:charlie".to_owned(), true).unwrap();
-        record_consent(&mut proposal, "did:key:dave".to_owned(), true).unwrap();
+        record_consent(&mut proposal, "did:key:bob".into(), true).unwrap();
+        record_consent(&mut proposal, "did:key:charlie".into(), true).unwrap();
+        record_consent(&mut proposal, "did:key:dave".into(), true).unwrap();
         assert!(!proposal.is_unanimous());
         assert_eq!(proposal.remaining(), 1);
 
-        record_consent(&mut proposal, "did:key:eve".to_owned(), true).unwrap();
+        record_consent(&mut proposal, "did:key:eve".into(), true).unwrap();
         assert!(proposal.is_unanimous());
 
         // Step 3: Execute promotion.

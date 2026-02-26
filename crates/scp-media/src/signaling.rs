@@ -9,11 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A DID string (e.g., `"did:dht:z6Mk..."`).
-///
-/// Represented as a plain `String`. Matches the type alias pattern used
-/// across `scp-core` modules.
-pub type DID = String;
+use scp_core::identity::DID;
 
 /// Errors from signaling operations.
 #[derive(Debug, thiserror::Error)]
@@ -183,7 +179,7 @@ pub fn verify_sender_attribution(
 
     if claimed != envelope_sender_did {
         return Err(SignalingError::SenderMismatch {
-            claimed: claimed.clone(),
+            claimed: claimed.to_string(),
             envelope: envelope_sender_did.to_owned(),
         });
     }
@@ -198,7 +194,7 @@ mod tests {
 
     #[test]
     fn create_offer_returns_session_id_and_message() {
-        let (sid, msg) = create_offer("sess-1", "v=0\r\n".to_owned(), "did:dht:zAlice".to_owned());
+        let (sid, msg) = create_offer("sess-1", "v=0\r\n".into(), "did:dht:zAlice".into());
         assert_eq!(sid, "sess-1");
         match msg {
             SignalingMessage::Offer(desc) => {
@@ -211,7 +207,7 @@ mod tests {
 
     #[test]
     fn create_answer_returns_session_id_and_message() {
-        let (sid, msg) = create_answer("sess-2", "v=0\r\n".to_owned(), "did:dht:zBob".to_owned());
+        let (sid, msg) = create_answer("sess-2", "v=0\r\n".into(), "did:dht:zBob".into());
         assert_eq!(sid, "sess-2");
         match msg {
             SignalingMessage::Answer(desc) => {
@@ -229,7 +225,7 @@ mod tests {
             "candidate:1 1 UDP 2130706431 10.0.0.1 5000 typ host".to_owned(),
             Some("audio".to_owned()),
             Some(0),
-            "did:dht:zAlice".to_owned(),
+            "did:dht:zAlice".into(),
         );
         assert_eq!(sid, "sess-3");
         match msg {
@@ -250,7 +246,7 @@ mod tests {
             "candidate:2 1 UDP 1694498815 192.168.1.1 6000 typ srflx".to_owned(),
             None,
             None,
-            "did:dht:zBob".to_owned(),
+            "did:dht:zBob".into(),
         );
         match msg {
             SignalingMessage::IceCandidate(c) => {
@@ -266,7 +262,7 @@ mod tests {
         let (_, msg) = create_offer(
             "s1",
             "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n".to_owned(),
-            "did:dht:z1".to_owned(),
+            "did:dht:z1".into(),
         );
         let bytes = serialize_signaling(&msg).unwrap();
         let restored = deserialize_signaling(&bytes).unwrap();
@@ -286,7 +282,7 @@ mod tests {
             "candidate:1".to_owned(),
             Some("video".to_owned()),
             Some(1),
-            "did:dht:z2".to_owned(),
+            "did:dht:z2".into(),
         );
         let bytes = serialize_signaling(&msg).unwrap();
         let restored = deserialize_signaling(&bytes).unwrap();
@@ -316,14 +312,14 @@ mod tests {
 
     #[test]
     fn verify_sender_attribution_passes_for_matching_offer() {
-        let (_, msg) = create_offer("s1", "v=0\r\n".to_owned(), "did:dht:zAlice".to_owned());
+        let (_, msg) = create_offer("s1", "v=0\r\n".into(), "did:dht:zAlice".into());
         let result = verify_sender_attribution(&msg, "did:dht:zAlice");
         assert!(result.is_ok());
     }
 
     #[test]
     fn verify_sender_attribution_passes_for_matching_answer() {
-        let (_, msg) = create_answer("s1", "v=0\r\n".to_owned(), "did:dht:zBob".to_owned());
+        let (_, msg) = create_answer("s1", "v=0\r\n".into(), "did:dht:zBob".into());
         let result = verify_sender_attribution(&msg, "did:dht:zBob");
         assert!(result.is_ok());
     }
@@ -335,7 +331,7 @@ mod tests {
             "candidate:1".to_owned(),
             None,
             None,
-            "did:dht:zAlice".to_owned(),
+            "did:dht:zAlice".into(),
         );
         let result = verify_sender_attribution(&msg, "did:dht:zAlice");
         assert!(result.is_ok());
@@ -351,7 +347,7 @@ mod tests {
 
     #[test]
     fn verify_sender_attribution_fails_for_mismatched_offer() {
-        let (_, msg) = create_offer("s1", "v=0\r\n".to_owned(), "did:dht:zAlice".to_owned());
+        let (_, msg) = create_offer("s1", "v=0\r\n".into(), "did:dht:zAlice".into());
         let result = verify_sender_attribution(&msg, "did:dht:zEve");
         assert!(result.is_err());
 
@@ -369,7 +365,7 @@ mod tests {
 
     #[test]
     fn verify_sender_attribution_fails_for_mismatched_answer() {
-        let (_, msg) = create_answer("s1", "v=0\r\n".to_owned(), "did:dht:zBob".to_owned());
+        let (_, msg) = create_answer("s1", "v=0\r\n".into(), "did:dht:zBob".into());
         let result = verify_sender_attribution(&msg, "did:dht:zMallory");
         assert!(result.is_err());
     }
@@ -381,7 +377,7 @@ mod tests {
             "candidate:1".to_owned(),
             None,
             None,
-            "did:dht:zAlice".to_owned(),
+            "did:dht:zAlice".into(),
         );
         let result = verify_sender_attribution(&msg, "did:dht:zEve");
         assert!(result.is_err());

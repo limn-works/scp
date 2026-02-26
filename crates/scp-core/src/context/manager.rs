@@ -17,7 +17,8 @@ use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
-use super::membership::{ContextEvent, DID, KeyPackage, MembershipState, ReceiveBuffer};
+use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
+use crate::identity::DID;
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
 use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use super::{ContextError, ContextHandle, ContextParams, ContextState};
@@ -175,14 +176,14 @@ impl ContextManager {
             CapabilityCeiling::new(params.ceiling.iter().map(Capability::from_param_capability));
 
         // Initialize role state with the creator as admin.
-        let role_state = ContextRoleState::new(&context_id, &creator_did, ceiling, vec![])
+        let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
             .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
 
         // Initialize membership with the creator.
         let mut membership = MembershipState::new();
         let creator_tokens = role_state
             .assignments
-            .get(&creator_did)
+            .get(creator_did.as_ref())
             .map(|a| a.tokens.clone())
             .unwrap_or_default();
         membership.add_member(creator_did, "admin".into(), creator_tokens);
@@ -287,7 +288,7 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Add member to role state.
-            ctx.role_state.members.insert(member_did.clone());
+            ctx.role_state.members.insert(member_did.to_string());
 
             // Assign default "member" role.
             let creator_did = ctx.role_state.creator_did.clone();
@@ -378,15 +379,15 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             if !ctx.membership.remove_member(member_did) {
-                return Err(ContextError::MemberNotFound(member_did.clone()));
+                return Err(ContextError::MemberNotFound(member_did.to_string()));
             }
 
             // Remove from role state.
-            ctx.role_state.members.remove(member_did.as_str());
-            ctx.role_state.assignments.remove(member_did.as_str());
+            ctx.role_state.members.remove(member_did.as_ref());
+            ctx.role_state.assignments.remove(member_did.as_ref());
             ctx.role_state
                 .member_capabilities
-                .remove(member_did.as_str());
+                .remove(member_did.as_ref());
 
             // Emit MemberLeft event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MemberLeft {
@@ -459,7 +460,7 @@ impl ContextManager {
             let seq = ctx
                 .membership
                 .next_sequence_number(sender_did)
-                .ok_or_else(|| ContextError::MemberNotFound(sender_did.clone()))?;
+                .ok_or_else(|| ContextError::MemberNotFound(sender_did.to_string()))?;
 
             // Emit MessageSent event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MessageSent {
@@ -512,7 +513,7 @@ impl ContextManager {
             .lock()
             .await
             .get(context_id)
-            .map(|ctx| ctx.membership.member_dids().map(String::from).collect())
+            .map(|ctx| ctx.membership.member_dids().map(|d| d.to_string()).collect())
             .unwrap_or_default()
     }
 
@@ -586,7 +587,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get_mut(&context_id) {
                 ctx.ttl_timer.cancel();
                 ctx.receive_buffer.push(ContextEvent::MemberLeft {
-                    member_did: format!("__close_notification:{initiator_did}"),
+                    member_did: format!("__close_notification:{initiator_did}").into(),
                 });
             }
         }
@@ -639,7 +640,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
                 ctx.receive_buffer.push(ContextEvent::MemberLeft {
-                    member_did: "__ttl_expiry_notification".to_owned(),
+                    member_did: "__ttl_expiry_notification".into(),
                 });
             }
         }
@@ -674,7 +675,7 @@ impl ContextManager {
             .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
 
         if !ctx.membership.contains(member_did) {
-            return Err(ContextError::MemberNotFound(member_did.clone()));
+            return Err(ContextError::MemberNotFound(member_did.to_string()));
         }
 
         let member_count = ctx.membership.count();
@@ -1497,7 +1498,7 @@ mod tests {
         // Add members.
         for name in &["alice", "bob", "charlie"] {
             let kp = KeyPackage {
-                owner_did: format!("did:key:{name}"),
+                owner_did: format!("did:key:{name}").into(),
             };
             manager.join_context(&handle, kp).await.unwrap();
         }
@@ -1579,7 +1580,7 @@ mod tests {
             let h = std::sync::Arc::clone(&handle);
             join_handles.push(tokio::spawn(async move {
                 let kp = KeyPackage {
-                    owner_did: format!("did:key:member-{i}"),
+                    owner_did: format!("did:key:member-{i}").into(),
                 };
                 mgr.join_context(&h, kp).await
             }));

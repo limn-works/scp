@@ -140,9 +140,10 @@ mod tests {
 
     use super::*;
     use crate::context::MemoryScope;
+    use crate::identity::DID;
     use crate::provenance::DiscoveryMethod;
 
-    fn make_provenance(source_type: SourceType, counterparties: Vec<String>) -> DataProvenance {
+    fn make_provenance(source_type: SourceType, counterparties: Vec<DID>) -> DataProvenance {
         DataProvenance {
             source_context: "ctx-test".to_string(),
             source_type,

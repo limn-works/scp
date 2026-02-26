@@ -291,7 +291,7 @@ mod tests {
         DataProvenance {
             source_context: "ctx-bridge-test".to_string(),
             source_type: SourceType::Persistent,
-            counterparties: vec!["did:dht:z6MkAlice".to_string()],
+            counterparties: vec!["did:dht:z6MkAlice".into()],
             purpose: Some("bridged message".to_string()),
             discovery_method: DiscoveryMethod::SharedContext("ctx-shared".to_string()),
             age: Duration::from_secs(30),
@@ -304,7 +304,7 @@ mod tests {
     fn make_connector(platform: &str, mode: BridgeMode) -> BridgeConnector {
         BridgeConnector {
             bridge_id: "bridge-test-001".to_string(),
-            operator_did: "did:dht:z6MkOperator".to_string(),
+            operator_did: "did:dht:z6MkOperator".into(),
             platform: platform.to_string(),
             mode,
             status: BridgeStatus::Active,
