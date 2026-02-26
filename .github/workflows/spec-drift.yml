@@ -27,7 +27,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: '--model claude-opus-4-20250514 --max-turns 50 --allowedTools "Bash(gh *),Read,Glob,Grep"'
+          claude_args: '--model claude-opus-4-20250514 --max-turns 50 --allowedTools "Bash(gh *),Read,Write,Glob,Grep"'
           prompt: |
             Check PR #${{ github.event.pull_request.number }} for spec drift — implementation
             that diverges from the project's specifications.
@@ -74,19 +74,24 @@ jobs:
 
             ## Step 3: Report — YOU MUST ALWAYS COMMENT ON THE PR
 
-            You MUST run exactly one of these two commands. Never exit without commenting.
+            IMPORTANT: Always write the comment body to a file first, then post with --body-file.
+            Do NOT pass the body inline with --body (it breaks permission matching on multi-line content).
 
-            **If drift was found**, post findings:
+            **If drift was found:**
+            1. Write findings to /tmp/drift-report.md. Format each finding as:
+               - **File:** `path/to/file.rs`
+               - **Spec:** `.docs/specs/XX-name.md` section Y.Z
+               - **Type:** structural | behavioral | missing | unauthorized
+               - **Description:** what diverges and how
+            2. Post:
             ```bash
-            gh pr comment ${{ github.event.pull_request.number }} --body "<drift report>"
+            gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/drift-report.md
             ```
-            Format each finding as:
-            - **File:** `path/to/file.rs`
-            - **Spec:** `.docs/specs/XX-name.md` section Y.Z
-            - **Type:** structural | behavioral | missing | unauthorized
-            - **Description:** what diverges and how
 
-            **If NO drift was found**, post confirmation:
+            **If NO drift was found:**
+            1. Write to /tmp/drift-report.md:
+               `**Spec Drift Check: PASSED** — No drift detected. [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            2. Post:
             ```bash
-            gh pr comment ${{ github.event.pull_request.number }} --body "**Spec Drift Check: PASSED** — No drift detected. [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/drift-report.md
             ```
