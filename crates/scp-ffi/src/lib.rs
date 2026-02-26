@@ -1,4 +1,4 @@
-//! PyO3 FFI bridge for SCP — the `_scp_core` Python extension module.
+//! `PyO3` FFI bridge for SCP — the `_scp_core` Python extension module.
 //!
 //! This crate is the Rust half of the Python SDK. It exposes a flat set of
 //! `#[pyfunction]` and `#[pyclass]` definitions that map directly to
@@ -8,7 +8,7 @@
 //! # Async runtime
 //!
 //! A single tokio [`Runtime`] is created at module import time and stored in a
-//! [`OnceLock`]. All async bridge functions use PyO3's native async support
+//! [`OnceLock`]. All async bridge functions use `PyO3`'s native async support
 //! (`#[pyfunction] async fn`) which automatically bridges between the tokio
 //! runtime and Python's asyncio event loop.
 //!
@@ -34,8 +34,12 @@ use std::time::Duration;
 use pyo3::prelude::*;
 
 pub mod error;
+pub mod event_log;
 pub mod identity;
+pub mod tools;
+pub mod transport;
 pub mod types;
+pub mod ucan;
 
 /// Global tokio runtime, created once at module import.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -71,6 +75,7 @@ pub(crate) fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
 ///
 /// Returns `PyRuntimeError` if tokio runtime construction fails.
 #[allow(clippy::expect_used)] // OnceLock::get_or_init requires an infallible closure.
+#[allow(clippy::unnecessary_wraps)] // Returns PyResult for consistency with PyO3 module init.
 fn init_runtime() -> PyResult<()> {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -92,6 +97,7 @@ fn runtime_is_initialized() -> bool {
 
 /// Returns a version string for the `_scp_core` extension module.
 #[pyfunction]
+#[allow(clippy::missing_const_for_fn)] // PyO3 #[pyfunction] cannot be const.
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -119,7 +125,7 @@ fn shutdown_runtime() {
         // callbacks will be issued. The SHUTDOWN_TIMEOUT constant governs
         // how long we wait for tasks to drain.
         let deadline = SHUTDOWN_TIMEOUT;
-        let _ = rt.block_on(async move {
+        rt.block_on(async move {
             tokio::time::sleep(deadline).await;
         });
     }
@@ -158,8 +164,12 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
 
-    // Step 4: Register domain bridge modules.
+    // Step 6: Register domain bridge modules.
     context::register_context(m)?;
+    tools::register_tools(m)?;
+    transport::register_transport(m)?;
+    ucan::register_ucan(m)?;
+    event_log::register_event_log(m)?;
 
     Ok(())
 }
