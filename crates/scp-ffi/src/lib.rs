@@ -32,6 +32,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 
 pub mod error;
+pub mod identity;
 pub mod types;
 
 /// Global tokio runtime, created once at module import.
@@ -147,7 +148,10 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Step 3: Register exception class hierarchy.
     error::register_exceptions(m)?;
 
-    // Step 4: Register bridge functions.
+    // Step 4: Register identity bridge classes and functions.
+    identity::register_identity(m)?;
+
+    // Step 5: Register bridge functions.
     m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
