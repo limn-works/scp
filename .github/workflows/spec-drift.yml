@@ -85,4 +85,7 @@ jobs:
             - **Type:** structural | behavioral | missing | unauthorized
             - **Description:** what diverges and how
 
-            If no drift is found, do NOT comment. Exit silently.
+            If no drift is found, post a short confirmation comment:
+            ```bash
+            gh pr comment ${{ github.event.pull_request.number }} --body "**Spec Drift Check: PASSED** — No drift detected. [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            ```
