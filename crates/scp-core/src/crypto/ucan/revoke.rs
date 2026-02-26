@@ -40,7 +40,7 @@
 //!
 //! See ADR-016 acceptance criterion 5 and 7.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -97,8 +97,8 @@ pub enum RevocationState {
 /// [`merge`]: RevocationList::merge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevocationList {
-    /// Set of revoked token CIDs. Once a CID is added, it cannot be removed.
-    revoked: HashSet<String>,
+    /// Map of token CIDs to their revocation state. Absence means Active.
+    revoked: HashMap<String, RevocationState>,
     /// The context this revocation list belongs to.
     context_id: ContextId,
 }
@@ -108,7 +108,7 @@ impl RevocationList {
     #[must_use]
     pub fn new(context_id: ContextId) -> Self {
         Self {
-            revoked: HashSet::new(),
+            revoked: HashMap::new(),
             context_id,
         }
     }
@@ -119,20 +119,53 @@ impl RevocationList {
         &self.context_id
     }
 
-    /// Returns `true` if the given token CID has been revoked.
+    /// Returns `true` if the given token CID is in a revoked state.
     ///
-    /// This is a constant-time set membership test.
+    /// Both `RevocationPending` and `Revoked` return `true` (fail-closed).
     #[must_use]
     pub fn is_revoked(&self, token_cid: &str) -> bool {
-        self.revoked.contains(token_cid)
+        matches!(
+            self.revoked.get(token_cid),
+            Some(RevocationState::RevocationPending | RevocationState::Revoked)
+        )
     }
 
-    /// Adds a token CID to the revocation list.
-    ///
-    /// This operation is idempotent: revoking the same CID twice has no
-    /// additional effect. Once revoked, a token cannot be un-revoked.
+    /// Returns the [`RevocationState`] for a token CID.
+    #[must_use]
+    pub fn state(&self, token_cid: &str) -> RevocationState {
+        self.revoked
+            .get(token_cid)
+            .copied()
+            .unwrap_or(RevocationState::Active)
+    }
+
+    /// Adds a token CID as fully [`Revoked`](RevocationState::Revoked).
     pub fn revoke(&mut self, token_cid: String) {
-        self.revoked.insert(token_cid);
+        self.revoked.insert(token_cid, RevocationState::Revoked);
+    }
+
+    /// Marks a token CID as [`RevocationPending`](RevocationState::RevocationPending).
+    pub fn mark_pending(&mut self, token_cid: String) {
+        if self.revoked.get(&token_cid) == Some(&RevocationState::Revoked) {
+            return;
+        }
+        self.revoked
+            .insert(token_cid, RevocationState::RevocationPending);
+    }
+
+    /// Transitions a pending entry to Revoked.
+    pub fn confirm_revocation(&mut self, token_cid: &str) {
+        if self.revoked.get(token_cid) == Some(&RevocationState::RevocationPending) {
+            self.revoked
+                .insert(token_cid.to_owned(), RevocationState::Revoked);
+        }
+    }
+
+    /// Removes a pending entry (rollback to Active).
+    pub fn rollback_revocation(&mut self, token_cid: &str) {
+        if self.revoked.get(token_cid) == Some(&RevocationState::RevocationPending) {
+            self.revoked.remove(token_cid);
+        }
     }
 
     /// Merges a remote revocation list into this one.
@@ -151,8 +184,18 @@ impl RevocationList {
         if self.context_id != remote.context_id {
             return;
         }
-        for cid in &remote.revoked {
-            self.revoked.insert(cid.clone());
+        for (cid, remote_state) in &remote.revoked {
+            let local_state = self.revoked.get(cid).copied();
+            match (local_state, remote_state) {
+                (_, RevocationState::Revoked) => {
+                    self.revoked.insert(cid.clone(), RevocationState::Revoked);
+                }
+                (None | Some(RevocationState::Active), RevocationState::RevocationPending) => {
+                    self.revoked
+                        .insert(cid.clone(), RevocationState::RevocationPending);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -172,7 +215,7 @@ impl RevocationList {
     ///
     /// The iteration order is not guaranteed.
     pub fn iter(&self) -> impl Iterator<Item = &String> {
-        self.revoked.iter()
+        self.revoked.keys()
     }
 }
 
@@ -281,14 +324,20 @@ pub fn revoke_ucan(
     // Step 1: Verify authorization.
     authorizer.authorize_revocation(token_cid, revoker_did)?;
 
-    // Step 2: Add to revocation list.
-    revocation_list.revoke(token_cid.to_owned());
+    // Step 2: Mark as RevocationPending (fail-closed).
+    revocation_list.mark_pending(token_cid.to_owned());
 
-    // Step 3: Distribute via MLS.
+    // Step 3: Distribute via MLS. On failure, roll back.
     let context_id = revocation_list.context_id().to_owned();
-    distributor.distribute_revocation(&context_id, token_cid)?;
+    if let Err(e) = distributor.distribute_revocation(&context_id, token_cid) {
+        revocation_list.rollback_revocation(token_cid);
+        return Err(e);
+    }
 
-    // Step 4: Append TokenRevoked event.
+    // Step 4: Commit -- Pending to Revoked.
+    revocation_list.confirm_revocation(token_cid);
+
+    // Step 5: Append TokenRevoked event.
     event_logger.log_token_revoked(&context_id, token_cid, revoker_did)?;
 
     Ok(())
@@ -766,7 +815,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn revoke_ucan_fails_on_distribution_error() {
+    fn revoke_ucan_distribution_failure_rolls_back() {
         let mut list = RevocationList::new("ctx-1".to_owned());
         let authorizer = MockAuthorizer {
             issuer_did: "did:dht:z6MkIssuer".to_owned(),
@@ -789,7 +838,10 @@ mod tests {
             result.unwrap_err(),
             UcanError::RevocationFailed(_)
         ));
-        // Event logging should not have been called since distribution failed.
+        // The token must NOT remain after rollback.
+        assert!(!list.is_revoked("bafyrei-token1"));
+        assert_eq!(list.state("bafyrei-token1"), RevocationState::Active);
+        assert!(list.is_empty());
         assert!(logger.logged.borrow().is_empty());
     }
 
@@ -821,6 +873,77 @@ mod tests {
             result.unwrap_err(),
             UcanError::RevocationFailed(_)
         ));
+    }
+
+
+    // -----------------------------------------------------------------------
+    // State transitions and fail-closed behavior
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mark_pending_sets_pending_state() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        list.mark_pending("cid-a".to_owned());
+        assert_eq!(list.state("cid-a"), RevocationState::RevocationPending);
+        assert!(list.is_revoked("cid-a"));
+    }
+
+    #[test]
+    fn confirm_transitions_pending_to_revoked() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        list.mark_pending("cid-a".to_owned());
+        list.confirm_revocation("cid-a");
+        assert_eq!(list.state("cid-a"), RevocationState::Revoked);
+    }
+
+    #[test]
+    fn rollback_removes_pending_entry() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        list.mark_pending("cid-a".to_owned());
+        list.rollback_revocation("cid-a");
+        assert!(!list.is_revoked("cid-a"));
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn rollback_noop_for_revoked() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        list.revoke("cid-a".to_owned());
+        list.rollback_revocation("cid-a");
+        assert_eq!(list.state("cid-a"), RevocationState::Revoked);
+    }
+
+    #[test]
+    fn pending_denies_capability_exercise() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        list.mark_pending("bafyrei-token1".to_owned());
+        assert!(list.is_revoked("bafyrei-token1"));
+        assert_eq!(
+            list.state("bafyrei-token1"),
+            RevocationState::RevocationPending
+        );
+    }
+
+    #[test]
+    fn success_path_final_state_is_revoked() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        let authorizer = MockAuthorizer {
+            issuer_did: "did:dht:z6MkIssuer".to_owned(),
+            creator_did: "did:dht:z6MkCreator".to_owned(),
+        };
+        let distributor = MockDistributor::new();
+        let logger = MockEventLogger::new();
+        assert_eq!(list.state("bafyrei-token1"), RevocationState::Active);
+        revoke_ucan(
+            &mut list,
+            "bafyrei-token1",
+            "did:dht:z6MkIssuer",
+            &authorizer,
+            &distributor,
+            &logger,
+        )
+        .unwrap();
+        assert_eq!(list.state("bafyrei-token1"), RevocationState::Revoked);
     }
 
     // -----------------------------------------------------------------------
