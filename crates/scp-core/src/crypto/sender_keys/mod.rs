@@ -22,6 +22,7 @@ pub mod key_protocol;
 use std::collections::HashMap;
 
 use rand::RngCore;
+use rand::rngs::OsRng;
 
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
@@ -81,7 +82,7 @@ impl std::fmt::Debug for SenderKey {
 #[must_use]
 pub fn generate_sender_key() -> SenderKey {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     SenderKey(bytes)
 }
 
