@@ -298,6 +298,9 @@ mod tests {
             memory_scope: MemoryScope::Full,
             chain_depth: 0,
             chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         }
     }
 

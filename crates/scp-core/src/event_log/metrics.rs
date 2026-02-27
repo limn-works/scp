@@ -532,6 +532,10 @@ mod tests {
             EventType::KeyEpochAdvance => 18,
             EventType::MediaSessionStarted => 19,
             EventType::MediaSessionEnded => 20,
+            EventType::PaymentReceived => 21,
+            EventType::EconomicPolicyChanged => 22,
+            EventType::SpendingUcanGranted => 23,
+            EventType::SpendingUcanRevoked => 24,
         }
     }
 

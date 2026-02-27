@@ -14,6 +14,7 @@
 //! - [`policy`] — Economic policy evaluation, cost schedule lookup, formula
 //!   evaluation, lock enforcement, and auto-accept guard.
 //! - [`estimate`] — SDK-facing `estimate_cost` function.
+//! - [`receipt`] — Payment receipt verification and history queries.
 //!
 //! See spec section 19 (Economic Governance) and ADR-033 in
 //! `.docs/adrs/phase-3.md`.
@@ -22,6 +23,7 @@ pub mod adapter;
 pub mod antispam;
 pub mod estimate;
 pub mod policy;
+pub mod receipt;
 pub mod types;
 
 pub use adapter::{
@@ -35,6 +37,7 @@ pub use policy::{
     check_policy_lock, evaluate_cost, evaluate_formula, lookup_cost, policy_requires_payment,
     validate_policy_change, verify_cost_sufficiency,
 };
+pub use receipt::{PaymentVerifier, ReceiptFilter, payment_history};
 pub use types::{
     Amount, COEFFICIENT_SCALE, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy,
     PaidActionType, PaymentAdapterRef, PricingFormula, PricingMetric, PricingVariable,

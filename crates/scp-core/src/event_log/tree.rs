@@ -247,6 +247,10 @@ const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::KeyEpochAdvance => 18,
         EventType::MediaSessionStarted => 19,
         EventType::MediaSessionEnded => 20,
+        EventType::PaymentReceived => 21,
+        EventType::EconomicPolicyChanged => 22,
+        EventType::SpendingUcanGranted => 23,
+        EventType::SpendingUcanRevoked => 24,
     }
 }
 
@@ -770,6 +774,10 @@ mod tests {
             EventType::KeyEpochAdvance,
             EventType::MediaSessionStarted,
             EventType::MediaSessionEnded,
+            EventType::PaymentReceived,
+            EventType::EconomicPolicyChanged,
+            EventType::SpendingUcanGranted,
+            EventType::SpendingUcanRevoked,
         ];
 
         let mut prev_hash = GENESIS_PREV_HASH;
@@ -791,7 +799,7 @@ mod tests {
             prev_hash = leaf_hash;
         }
 
-        assert_eq!(event_count(&log), 21);
+        assert_eq!(event_count(&log), 25);
     }
 
     // -----------------------------------------------------------------------
