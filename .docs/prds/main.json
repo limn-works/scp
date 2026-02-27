@@ -5003,8 +5003,7 @@
       "status": "done",
       "files": [
         "crates/scp-media/Cargo.toml",
-        "crates/scp-media/src/lib.rs",
-        "crates/scp-media/src/mod.rs"
+        "crates/scp-media/src/lib.rs"
       ],
       "description": "Create the `scp-media/` crate with all media session types from ADR-024. Delegated model: context provides identity + trust + governance + MLS-derived key material. Media flows over WebRTC/DTLS-SRTP. Signaling (SDP offers/answers, ICE candidates) goes through SCP as standard encrypted governed messages. No media data touches SCP relays.\n\nKey types:\n\n```rust\npub struct MediaSession {\n    pub session_id: String,\n    pub context_id: ContextId,\n    pub participants: Vec<DID>,\n    pub capabilities: Vec<MediaCapability>,\n    pub state: MediaSessionState,\n    pub started_at: u64,\n}\n\npub enum MediaCapability {\n    Voice,        // maps to ceiling entry media.voice\n    Video,        // maps to ceiling entry media.video\n    ScreenShare,  // maps to ceiling entry media.screenShare\n}\n\npub enum MediaSessionState {\n    Initiating,\n    Active,\n    Ended,\n}\n\npub enum SignalingMessage {\n    Offer(SessionDescription),\n    Answer(SessionDescription),\n    IceCandidate(Candidate),\n    SessionEnd,\n}\n\npub struct SessionDescription {\n    pub sdp: String,\n    pub sender_did: DID,\n}\n\npub struct Candidate {\n    pub candidate: String,\n    pub sdp_mid: Option<String>,\n    pub sdp_mline_index: Option<u16>,\n    pub sender_did: DID,\n}\n\npub struct MediaKeyMaterial {\n    pub dtls_srtp_keys: Vec<u8>,\n    pub epoch: u64,\n    pub context_id: ContextId,\n}\n```\n\nModule declares `pub mod keys; pub mod session; pub mod signaling;` and re-exports all public types.",
       "acceptanceCriteria": [
@@ -7101,7 +7100,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "crates/scp-core/context/governance/interface.rs"
+        "crates/scp-core/src/context/governance/mod.rs"
       ],
       "description": "Define the governance interface contract with typed proposals and propose/approve/reject lifecycle. Governance is a pluggable interface (§5.9): protocol defines propose/approve/reject, implementations vary. Context governance controls: role changes, membership, settings, ceiling expansion, interface decisions (§5.9). Governance actions are context events in the Merkle log — auditable and verifiable. Exit as veto: members can leave if governance makes unacceptable decisions (§9.2.1).",
       "acceptanceCriteria": [
@@ -7438,8 +7437,7 @@
       "severity": "minor",
       "status": "done",
       "files": [
-        "crates/scp-core/context/policy.rs",
-        "crates/scp-core/store/protocol_store.rs"
+        "crates/scp-core/src/context/policy.rs"
       ],
       "description": "Implement auto-accept policy storage and retrieval. Auto-accept policies determine whether incoming context invitations are automatically accepted or require manual approval. Policies are stored locally via the SDK's Storage trait (same backend as protocol state), never transmitted over the wire. Each device configures independently — cross-device sync is not supported. Key convention: `policy/{identity_did}/auto_accept`.",
       "acceptanceCriteria": [
