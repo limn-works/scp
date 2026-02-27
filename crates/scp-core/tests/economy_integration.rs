@@ -159,6 +159,13 @@ impl PaymentAdapter for TestAdapter {
         })
     }
 
+    async fn verify_authorization(
+        &self,
+        _auth: &PaymentAuthorization,
+    ) -> Result<(), PaymentError> {
+        Ok(())
+    }
+
     async fn refund(
         &self,
         _receipt: &PaymentReceipt,

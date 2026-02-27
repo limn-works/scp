@@ -6804,7 +6804,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/sync/weeks_offline.rs"
       ],
@@ -6847,7 +6847,8 @@
           "§10.2 — Device as node design",
           "§9.12 — Compromise recovery"
         ]
-      }
+      },
+      "result": "Implemented weeks-offline forced re-join in sync/weeks_offline.rs. OfflineAssessment with epoch drift and time thresholds (MAX_EPOCH_DRIFT=1000, MAX_OFFLINE_DURATION=14 days). ReJoinPlan with state preservation (membership, governance, event log continuity). InFlightMessageHandling with queue/re-request/discard strategies. BilateralContextRecovery for 2-person contexts. ReJoinExecutor trait for MLS operations. 29 unit tests."
     },
     {
       "id": "SCP-124",
@@ -9022,7 +9023,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/tests/economy_integration.rs"
       ],
@@ -9091,7 +9092,8 @@
       "details": {
         "9 invariants from §19.14": "1. Economic policy visible before opt-in (legibility). 2. No implicit spending — spending UCAN always required. 3. Free operation is default — no economic policy = free. 4. Receipts are provenance records — every payment traceable and verifiable. 5. Payment adapters substitutable — no single rail privileged. 6. Economic policy mutable by default, optional immutability lock voluntary. 7. Payment data inside encrypted envelope — relays never see payment metadata. 8. Free relays MUST always exist in bootstrap list. 9. Auto-accept never applies to paid contexts.",
         "TestAdapter usage": "All integration tests use TestAdapter — in-memory, no real money. seed_balance() for setup, payment_adapter_conformance!() already validates adapter correctness separately."
-      }
+      },
+      "result": "40 integration tests covering all 9 invariants from §19.14. Tests cover: economic policy legibility, spending UCAN requirement, free-default operation, receipt provenance, adapter substitutability, policy mutability/lock, envelope privacy, free relay bootstrap, auto-accept rejection, dynamic pricing, anti-spam escalation."
     },
     {
       "id": "SCP-161",
@@ -9167,7 +9169,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/economy/credentials.rs",
         "crates/scp-core/src/economy/mod.rs",
@@ -9230,7 +9232,8 @@
         "credentialSeparation": "Spending UCAN = authorization ('you may spend $X'). Adapter credential = capability ('here's how to move money'). Both required for any payment. UCAN without credential = can't pay. Credential without UCAN = not authorized to pay.",
         "SPL-specific": "Human calls ApproveChecked granting agent's keypair delegate authority on their USDC ATA — single delegate per account, amount-capped.",
         "protocolSection": "§19.2.4, §19.2.5, §19.11"
-      }
+      },
+      "result": "Implemented adapter credential management in economy/credentials.rs with AdapterCredential, CredentialStore trait, InMemoryCredentialStore, configure_adapter(), list_adapter_credentials(). Added store/ module with ProtocolStore trait and economy storage interface. 24 unit tests. Credentials bound to human identity, not agent."
     }
   ]
 }
