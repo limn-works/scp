@@ -36,9 +36,12 @@
 //!
 //! Different governance models implement the same [`GovernanceEngine`] trait.
 //! The trait is object-safe for dynamic dispatch via `Box<dyn GovernanceEngine>`.
-//! Phase 6 will add `ThresholdEngine`, `MajorityEngine`, and `UnanimityEngine`.
+//! Phase 6 adds [`ThresholdEngine`](multisig::ThresholdEngine) (M-of-N),
+//! with `MajorityEngine` and `UnanimityEngine` to follow.
 //!
 //! See ADR-031 in `.docs/adrs/phase-6.md` for the full specification.
+
+pub mod multisig;
 
 use std::collections::HashMap;
 
@@ -64,7 +67,7 @@ pub type ProposalId = [u8; 32];
 ///
 /// Uses SHA-256 over the concatenation of context ID, proposer DID, serialized
 /// action bytes, and timestamp (big-endian u64).
-fn compute_proposal_id(
+pub(crate) fn compute_proposal_id(
     context_id: &str,
     proposer_did: &DID,
     action_bytes: &[u8],
@@ -378,6 +381,11 @@ pub enum GovernanceEvent {
         voter_did: DID,
         vote: VoteType,
     },
+    /// A previously cast vote was withdrawn.
+    VoteWithdrawn {
+        proposal_id: ProposalId,
+        voter_did: DID,
+    },
     /// A proposal was resolved (approved, rejected, expired, etc.).
     ProposalResolved {
         proposal_id: ProposalId,
@@ -645,7 +653,7 @@ impl GovernanceEngine for SingleAdminEngine {
 // ---------------------------------------------------------------------------
 
 /// Encode bytes as lowercase hex string for error messages.
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
         let _ = write!(acc, "{b:02x}");
