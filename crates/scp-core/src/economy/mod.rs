@@ -17,12 +17,15 @@
 //! - [`pricing`] — Dynamic pricing: EIP-1559-style relay pricing and governed
 //!   formula changes.
 //! - [`receipt`] — Payment receipt verification and history queries.
+//! - [`credentials`] — Adapter credential management: storage, validation,
+//!   and the `configureAdapter` SDK function.
 //!
 //! See spec section 19 (Economic Governance) and ADR-033 in
 //! `.docs/adrs/phase-3.md`.
 
 pub mod adapter;
 pub mod antispam;
+pub mod credentials;
 pub mod estimate;
 pub mod integration;
 pub mod policy;
@@ -48,6 +51,10 @@ pub use policy::{
 pub use pricing::{
     FormulaChange, FormulaChangeStatus, PriceDirection, RelayPriceAdjustment, RelayPricingConfig,
     adjust_relay_price,
+};
+pub use credentials::{
+    AdapterCredential, AdapterCredentialStore, CredentialError, configure_adapter,
+    retrieve_adapter_credential, validate_adapter,
 };
 pub use receipt::{PaymentVerifier, ReceiptFilter, payment_history};
 pub use types::{
