@@ -3175,7 +3175,7 @@
       "gate": "gate-3a",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/adrs/phase-4.md"
       ],
@@ -3215,7 +3215,8 @@
       "details": {
         "adrCompletionStory": true,
         "note": "This story writes the ADR itself, not the implementation. Implementation stories for TypeScript SDK are blocked by this."
-      }
+      },
+      "result": "ADR-022 completed with full Decision, Rationale, Implementation, Dependencies, Acceptance Criteria, and Scope sections. Specifies dual-target architecture: wasm-bindgen for browser, napi-rs for Node.js/Bun, unified @scp/sdk package with runtime detection. Committed at fe7927b."
     },
     {
       "id": "SCP-061",
@@ -4054,7 +4055,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/uniffi/src/scp.udl",
         "crates/scp-ffi/uniffi/src/lib.rs"
@@ -4106,7 +4107,8 @@
           "standards/rust.md"
         ],
         "targetFile": "crates/scp-ffi/uniffi/src/scp.udl"
-      }
+      },
+      "result": "UniFFI UDL type mappings and Rust scaffolding implemented. Created crates/scp-ffi/uniffi/ with scp.udl (namespace anchor), bridge.rs with ScpError enum, all record types, 19 async free functions, error conversions. lib.rs with tokio runtime init and callback interface traits. Uses proc-macro approach. UniFFI 0.29 required for Rust edition 2024. 6 tests pass. Committed at 080e770."
     },
     {
       "id": "SCP-078",
@@ -4375,7 +4377,7 @@
       "gate": "gate-4a",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/adrs/phase-5.md"
       ],
@@ -4412,7 +4414,8 @@
       "details": {
         "adrCompletionStory": true,
         "note": "This story writes the ADR itself. Implementation stories for Apple platform are blocked by this."
-      }
+      },
+      "result": "ADR-025 completed with full Decision, Rationale, Implementation, Dependencies, Acceptance Criteria, and Scope sections. Specifies Secure Enclave for P-256 signing, Keychain for Ed25519/X25519, App Attest for device attestation, APNs for push with opaque payloads, NSFileProtectionCompleteUntilFirstUserAuthentication for storage. Committed at 0e1afcc."
     },
     {
       "id": "SCP-083",
