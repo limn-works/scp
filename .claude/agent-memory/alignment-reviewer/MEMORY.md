@@ -52,6 +52,23 @@ All previous major findings resolved. Implementation code matches ADR specs.
 Phase 6 ADRs (029-031) are "Decided" but not yet implemented; no roadmap conflicts.
 Weighted voting deferral in ADR-031 is justified (requires unbuilt token/stake mechanism).
 
+## Gate 1 Verification (Phase 1: Crypto Proof) (2026-02-27)
+Deep verification of SCP-001 through SCP-017. All 17 stories VERIFIED.
+- All files exist at expected paths
+- All acceptance criteria met (spot-checked every story)
+- 2,630+ tests across scp-platform (45), scp-core (2,370), scp-transport (215), scp-testing (2 integration)
+- All tests pass green
+- No unwrap()/expect() in library code (only in #[cfg(test)] blocks)
+- #![forbid(unsafe_code)] present in all crate roots
+- Proptests for all required crypto operations
+- Feature gating correct: testing adapters behind `software_platform` feature
+- 0 material findings, 2 minor observations
+
+### Gate 1 verification patterns (reusable):
+- Test count from result fields can drift; always run `cargo test` to get actual counts
+- Feature flag naming: `software_platform` not `testing` -- the lib.rs aliases `testing` as `software`
+- The scp-core crate has 2,370 tests because it includes context, economy, bridge, etc. beyond Phase 1
+
 ## SCP-161 Review: Paid Context Templates (2026-02-27)
 Verdict: ALIGNED. All 14 acceptance criteria PASS. 71 tests pass.
 2 non-blocking actions:
@@ -63,3 +80,33 @@ Verdict: ALIGNED. All 14 acceptance criteria PASS. 71 tests pass.
 - For caller-supplied fields (like economic_policy): validation should be a separate function, not part of the generic field-comparison loop
 - Check serde(rename) consistency across all enum variants -- partial adoption creates wire-format inconsistencies
 - Template inheritance is conceptual in this codebase -- no formal extends mechanism, only comments and matching properties
+
+## Gate 3 Verification (Phase 3: Python SDK + MCP) (2026-02-27)
+Deep verification of SCP-036 through SCP-058. 23 stories, all marked "done". Verdict: **INCOMPLETE**.
+- 23/23 stories have code at correct locations
+- 17/23 stories have real, functional implementations
+- 6 stories have bridge stubs blocking end-to-end functionality
+- Rust MCP crate: 158 tests pass. UCAN crate: 273 tests pass. All green.
+
+### 3 Material findings:
+1. **Bridge stubs:** `tools.rs`, `ucan.rs`, `event_log.rs` in `crates/scp-ffi/src/` are stubs returning `Err("not implemented")`. Blocks SCP-040 (tools), SCP-041 (UCAN bridge), SCP-039 (event log).
+2. **Missing MCP bridge functions:** `mcp.py` calls 9 bridge functions (`py_mcp_serve`, `py_mcp_client_connect_stdio`, etc.) that do not exist in the `scp-ffi` bridge layer. Blocks SCP-046 (MCP Python wrapper).
+3. **Mock-based integration test:** `phase3_integration_test.py` uses `MagicMock` for the bridge -- validates Python SDK logic but not actual Rust integration. Only 3 of 16 test methods attempt real bridge calls. Blocks SCP-058 (integration test story).
+
+### 4 Minor findings:
+1. PRD `files` paths systematically wrong (missing `src/` segment) -- `crates/scp-ffi/pyo3/` should be `crates/scp-ffi/src/`
+2. Conflicting pyproject.toml: `crates/scp-ffi/pyproject.toml` says Python >=3.9, `bindings/python/pyproject.toml` says >=3.10
+3. `ToolError` in `errors.py` is unreachable -- `tools.rs` bridge raises generic `ScpError`, not `ToolError`
+4. Async pattern deviation: `context.py` uses `asyncio.to_thread()` instead of `py.allow_threads(|| rt.block_on(...))` pattern from other modules
+
+### What's solid:
+- Rust MCP crate (`scp-mcp`): protocol.rs, namespace.rs, server.rs, client.rs, stdio.rs, sse.rs -- all real, tested, comprehensive
+- Rust UCAN crate: 11-step validation pipeline, capability matching, nonce tracking, revocation, minting -- all real, 273 tests
+- Python SDK wrappers: identity.py, context.py, sync.py, types.py, errors.py, trust.py -- well-structured, correct patterns
+- PyO3 bridge: identity.rs, context.rs, error.rs -- real implementations calling scp-core
+
+### Gate 3 verification patterns (reusable):
+- PRD file paths can be systematically wrong; always glob to find actual locations
+- Bridge layers need function-by-function verification -- stub signatures look correct but return errors
+- Python wrappers that call non-existent bridge functions compile fine (dynamic dispatch) -- must cross-reference against bridge lib.rs module registration
+- Mock-based integration tests provide false confidence -- verify what the mocks are replacing
