@@ -36,7 +36,8 @@
 //!
 //! Different governance models implement the same [`GovernanceEngine`] trait.
 //! The trait is object-safe for dynamic dispatch via `Box<dyn GovernanceEngine>`.
-//! Phase 6 will add `ThresholdEngine`, `MajorityEngine`, and `UnanimityEngine`.
+//! Phase 6 adds [`ThresholdEngine`](multisig::ThresholdEngine) (M-of-N),
+//! with `MajorityEngine` and `UnanimityEngine` to follow.
 //!
 //! See ADR-031 in `.docs/adrs/phase-6.md` for the full specification.
 
