@@ -8,7 +8,7 @@
 //! - **Tier 1 (Short offline, < 4 hours):** Relay buffering and sequential MLS
 //!   catch-up. See [`hours_offline`].
 //! - **Tier 2 (Extended offline, 4 hours to 7 days):** State snapshot comparison
-//!   and delta sync with selective epoch reconstruction. (Future.)
+//!   and delta sync with selective epoch reconstruction. See [`days_offline`].
 //! - **Tier 3 (Long offline, > 7 days):** Forced re-join via MLS group state
 //!   reset. (Future.)
 //!
@@ -24,10 +24,14 @@
 //! - [`hours_offline`] — Tier 1 hours-scale offline recovery: relay message
 //!   buffer retrieval, MLS epoch catch-up, automatic Update issuance, reorder
 //!   buffering, and `KeyPackage` pre-publication for offline member addition.
+//! - [`days_offline`] — Tier 2 days-scale offline recovery: state snapshot
+//!   capture, delta computation and application, MLS group rebuild via
+//!   Welcome-based fast-forward, and multi-device divergence detection.
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
 pub mod conflict_resolution;
+pub mod days_offline;
 pub mod hours_offline;
 
 use std::time::Duration;
