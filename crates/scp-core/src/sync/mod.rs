@@ -18,12 +18,16 @@
 //!
 //! # Module layout
 //!
+//! - [`conflict_resolution`] — Offline conflict resolution for concurrent
+//!   governance changes: metadata last-writer-wins, governance Merkle-ordered
+//!   resolution, deadlock detection, and context fork (SCP-124).
 //! - [`hours_offline`] — Tier 1 hours-scale offline recovery: relay message
 //!   buffer retrieval, MLS epoch catch-up, automatic Update issuance, reorder
 //!   buffering, and `KeyPackage` pre-publication for offline member addition.
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
+pub mod conflict_resolution;
 pub mod hours_offline;
 
 use std::time::Duration;
