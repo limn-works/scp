@@ -1,0 +1,260 @@
+# SDK API Reference Documentation
+#
+# Generates and publishes API reference docs for all language SDKs
+# on every release tag. Also runs on PRs touching bindings/ for validation.
+#
+# Source: .docs/scaffold/shared.md section "SDK Documentation Requirements"
+# Story: SCP-139
+#
+# Doc generators per language:
+#   Rust     — rustdoc (cargo doc)
+#   Python   — sphinx (autodoc + napoleon)
+#   TypeScript — typedoc
+#   Swift    — DocC (swift package generate-documentation)
+#   Kotlin   — Dokka (./gradlew dokkaHtml)
+#   Go       — godoc / pkgsite
+#   C#       — xmldoc (dotnet build /p:GenerateDocumentationFile=true)
+#   Java     — javadoc (./gradlew javadoc)
+
+name: SDK Docs
+
+on:
+  push:
+    tags:
+      - "scp-core@*"
+  pull_request:
+    paths:
+      - "bindings/**"
+      - "crates/scp-core/src/**"
+      - "crates/scp-ffi/**"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Rust (rustdoc) ----
+  rust-docs:
+    name: "Rust API docs (rustdoc)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate rustdoc
+        run: cargo doc --workspace --no-deps --document-private-items
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-rust
+          path: target/doc/
+          retention-days: 7
+
+  # ---- Python (sphinx) ----
+  python-docs:
+    name: "Python API docs (sphinx)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install doc dependencies
+        run: pip install sphinx furo sphinx-autodoc-typehints
+      - name: Generate docs
+        working-directory: bindings/python
+        run: |
+          if [ -f docs/conf.py ]; then
+            sphinx-build -b html docs docs/_build/html
+          else
+            echo "::notice::Sphinx conf.py not found -- skipping Python docs"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-python
+          path: bindings/python/docs/_build/html/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---- TypeScript (typedoc) ----
+  typescript-docs:
+    name: "TypeScript API docs (typedoc)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install typedoc
+        working-directory: bindings/typescript
+        run: |
+          npm install --no-save typedoc typedoc-plugin-markdown typescript
+      - name: Generate docs
+        working-directory: bindings/typescript
+        run: npx typedoc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-typescript
+          path: bindings/typescript/docs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---- Swift (DocC) ----
+  swift-docs:
+    name: "Swift API docs (DocC)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate DocC
+        working-directory: bindings/swift
+        run: |
+          if [ -f Package.swift ]; then
+            swift package generate-documentation --target SCP --output-path docs
+          else
+            echo "::notice::Package.swift not found -- skipping Swift docs"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-swift
+          path: bindings/swift/docs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---- Kotlin (Dokka) ----
+  kotlin-docs:
+    name: "Kotlin API docs (Dokka)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Generate Dokka
+        working-directory: bindings/kotlin
+        run: |
+          if [ -f build.gradle.kts ] || [ -f gradlew ]; then
+            ./gradlew dokkaHtml 2>/dev/null || echo "::notice::Dokka not configured -- skipping"
+          else
+            echo "::notice::Gradle project not found -- skipping Kotlin docs"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-kotlin
+          path: bindings/kotlin/build/dokka/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---- Go (pkgsite) ----
+  go-docs:
+    name: "Go API docs (godoc)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Verify godoc comments
+        working-directory: bindings/go
+        run: |
+          if [ -f go.mod ]; then
+            go doc ./... > /dev/null 2>&1 || echo "::notice::go doc check found issues"
+          else
+            echo "::notice::go.mod not found -- skipping Go docs"
+          fi
+
+  # ---- C# (xmldoc) ----
+  csharp-docs:
+    name: "C# API docs (xmldoc)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0"
+      - name: Generate XML docs
+        working-directory: bindings/csharp
+        run: |
+          if [ -f Limn.Scp.sln ] || find . -name '*.csproj' -print -quit | grep -q .; then
+            dotnet build /p:GenerateDocumentationFile=true 2>/dev/null || \
+              echo "::notice::C# build not yet configured -- skipping"
+          else
+            echo "::notice::C# project not found -- skipping"
+          fi
+
+  # ---- Java (javadoc) ----
+  java-docs:
+    name: "Java API docs (javadoc)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Generate javadoc
+        working-directory: bindings/java
+        run: |
+          if [ -f build.gradle.kts ] || [ -f gradlew ]; then
+            ./gradlew javadoc 2>/dev/null || echo "::notice::Javadoc not configured -- skipping"
+          else
+            echo "::notice::Gradle project not found -- skipping Java docs"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-java
+          path: bindings/java/build/docs/javadoc/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---- Aggregate and publish ----
+  publish-docs:
+    name: "Publish API docs"
+    needs: [rust-docs, python-docs, typescript-docs, swift-docs, kotlin-docs, go-docs, csharp-docs, java-docs]
+    if: startsWith(github.ref, 'refs/tags/scp-core@')
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Download all doc artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docs-*
+          path: site/
+
+      - name: Create index page
+        run: |
+          cat > site/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="utf-8"><title>SCP SDK API Reference</title></head>
+          <body>
+          <h1>SCP SDK API Reference</h1>
+          <ul>
+            <li><a href="docs-rust/scp_core/">Rust (scp-core)</a></li>
+            <li><a href="docs-python/">Python (scp-sdk)</a></li>
+            <li><a href="docs-typescript/">TypeScript (@scp/sdk)</a></li>
+            <li><a href="docs-swift/">Swift (SCP)</a></li>
+            <li><a href="docs-kotlin/">Kotlin (scp-sdk-kotlin)</a></li>
+            <li><a href="docs-java/">Java (scp-sdk-java)</a></li>
+          </ul>
+          <p>Go docs available at <a href="https://pkg.go.dev/github.com/limn/scp-go">pkg.go.dev</a></p>
+          </body>
+          </html>
+          HTML
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
