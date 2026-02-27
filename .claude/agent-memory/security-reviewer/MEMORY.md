@@ -71,19 +71,21 @@
 - shutdown_runtime reduced to 100ms (from 5s) but still blocks GIL
 - SHUTDOWN_TIMEOUT const stale (5s) vs actual behavior (100ms)
 
-### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- SCP-077 Review (2026-02-26)
-- CRITICAL: scp-platform testing feature in production deps -- InMemoryKeyCustody ships in cdylib
-- CRITICAL: Bridge functions hardcode InMemoryKeyCustody, bypass KeyCustodyProvider callback interface
-- MAJOR: Predictable context/tool IDs (nanosecond timestamp, not CSPRNG)
-- MAJOR: std::sync::Mutex in async context violates project standards
-- MAJOR: ContextHandle::state() silently defaults to Closed on poisoned mutex
-- MAJOR: eprintln in runtime() violates no-println standard
-- MINOR: rotate_key creates new identity instead of rotating existing one
-- MINOR: Error From impls may leak internal details across FFI
+### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 Review (2026-02-26)
+- CRITICAL: scp-platform testing feature STILL in production deps (cdylib)
+- HIGH: transport_connect accepts ANY URL scheme -- no wss:// enforcement (NAPI/WASM have it)
+- MEDIUM: std::sync::Mutex in async context (short holds, but latent deadlock risk)
+- MEDIUM: serde_json Error messages may leak struct details
+- LOW: identity_load hardcodes CustodyMethod::InMemory regardless of actual custody
+- LOW: HANDLE_COUNT uses Ordering::Relaxed -- shutdown race on ARM
+- FIXED: ContextHandle::state() now returns error on poisoned mutex (was silently defaulting)
+- FIXED: Context IDs now use UUID v4 CSPRNG (was nanosecond timestamp)
+- FIXED: runtime() uses tracing::error instead of eprintln
 - GOOD: OnceLock runtime pattern, abort on fatal init, Send+Sync on callbacks
-- GOOD: ScpError enum design with machine-readable codes
-- GOOD: Callback interface definitions (KeyCustodyProvider, StorageProvider, PushProvider)
-- STALE: SHUTDOWN_GRACE const (5s) #[allow(dead_code)] never used
+- GOOD: ScpError enum with machine-readable codes
+- GOOD: OpaqueInMemoryKeyCustody Debug redaction
+- GOOD: Handle ref counting with Drop for shutdown ordering
+- GOOD: Callback interfaces (KeyCustodyProvider, StorageProvider, PushProvider)
 
 ### TLS (`crates/scp-node/src/tls.rs`)
 - TLS 1.3 enforced via `with_protocol_versions` -- good
@@ -107,21 +109,36 @@
 - SingleAdminEngine has duplicate proposal check but placed after construction
 - GovernanceProposal tracks votes with signed votes (DID + signature)
 
-### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- SCP-079 Review (2026-02-26)
+### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 Review (2026-02-26)
 - Bridge-stub architecture: no scp-core dependency, delegates real logic to TypeScript SDK
 - GOOD: No unwrap/expect/panic in source; workspace clippy deny inherited
-- GOOD: CSPRNG context IDs via uuid v4 + getrandom/js (not predictable like UniFFI)
-- GOOD: All extern JS methods use `catch` -- no WASM trap from JS exceptions
+- GOOD: CSPRNG context IDs via uuid v4 + getrandom/js
+- GOOD: JsKeyCustody and JsStorage extern methods use `catch`
 - GOOD: No key material in Rust structs -- keys stay in JS WebCrypto boundary
-- GOOD: No scp-platform/scp-testing dependency (unlike UniFFI CRITICAL finding)
+- GOOD: No scp-platform/scp-testing dependency
 - GOOD: Stable error codes matching cross-SDK standard
-- HIGH: transport_connect accepts ws:// (plaintext) despite doc requiring wss://
+- FIXED: transport_connect NOW rejects non-wss:// URLs (was HIGH)
 - MEDIUM: WasmDIDDocument::from_fields performs zero validation on JS-provided strings
 - MEDIUM: context_send claims base64 validation but only checks is_empty()
 - MEDIUM: Panic hook leaks file paths and internal state to browser console
 - MEDIUM: Missing #![forbid(unsafe_code)] -- no architectural need for unsafe
 - MEDIUM: serde_json Error messages may leak struct details when typed deserialization added
-- NOTE: JsMessageCallback on_message/on_complete lack `catch` -- JS throw = WASM trap
+- MEDIUM: JsMessageCallback on_message/on_complete lack `catch` -- JS throw = WASM trap
+
+### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86 Review (2026-02-26)
+- CRITICAL: scp-platform testing feature in production deps (cdylib) -- same as UniFFI
+- HIGH: unreachable!() in identity_create match arm -- panic across FFI boundary
+- MEDIUM: std::sync::Mutex in async context (short holds, latent risk)
+- MEDIUM: Missing #![forbid(unsafe_code)]
+- MEDIUM: NapiTransportManager::status() silently defaults on poisoned mutex
+- LOW: transport_disconnect silently ignores poisoned lock on state update
+- LOW: identity_load hardcodes custody_type "in_memory"
+- LOW: HANDLE_COUNT uses Ordering::Relaxed
+- GOOD: OnceLock runtime pattern, abort on fatal init
+- GOOD: OpaqueInMemoryKeyCustody Debug redaction
+- GOOD: wss:// validation in transport_connect
+- GOOD: Handle ref counting with Drop for shutdown ordering
+- GOOD: thiserror + machine-readable error codes
 
 ### General Patterns
 - No `unwrap`/`expect` in lib code -- project standard via clippy deny

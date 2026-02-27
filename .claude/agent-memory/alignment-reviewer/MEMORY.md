@@ -39,7 +39,15 @@ ADR-022 (TypeScript SDK Dual-Target Architecture) reviewed and PASSED.
 - Force-try/force-unwrap keeps appearing in Swift examples despite builder tenets -- always flag
 
 ## ADR-025 Apple Platform Adapter Review (SCP-082) (2026-02-26)
-Verdict: FAIL (2 major, 1 minor).
-- **StrongBox is Android, not Apple** (major): Rationale "Why reject StrongBox" is factually wrong
-- **Force-try contradicts error handling claim** (major): `try!` in make() vs stated PlatformError return
-- **DeviceAttestationProvider missing from ADR-021** (minor): ADR-025 claims 4 callback interfaces but ADR-021 UDL only defines 3
+Initial review: FAIL (2 major, 1 minor). All 3 findings FIXED in PR #86.
+- StrongBox rationale moved to ADR-027 where it belongs
+- Force-try replaced with proper `throws` in `make()`
+- DeviceAttestationProvider now present in ADR-021 UDL (5 callback interfaces total)
+Remaining: ADR-025 example code (line 419) still has `.data(using: .utf8)!` force-unwrap, but implementation avoids it.
+
+## PR #86 Full Review (2026-02-26)
+Verdict: ALIGNED. ADRs 022, 025, 026, 027, 028, 029, 030, 031 all reviewed.
+3 minor doc issues: ADR-025 example force-unwrap, ADR-022 generator cleanup on break, ADR-028 ucanMint accessing private handle.
+All previous major findings resolved. Implementation code matches ADR specs.
+Phase 6 ADRs (029-031) are "Decided" but not yet implemented; no roadmap conflicts.
+Weighted voting deferral in ADR-031 is justified (requires unbuilt token/stake mechanism).

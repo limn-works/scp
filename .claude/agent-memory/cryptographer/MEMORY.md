@@ -33,6 +33,19 @@
 - Production: OsRng (CSPRNG) via KeyCustody trait
 - Tests: thread_rng() -- acceptable for test-only code
 
+### Apple Platform Adapter (PR #86 review)
+- AppleKeyCustody: Ed25519/X25519 via CryptoKit, Keychain software-backed
+- CRITICAL: CryptoKit Curve25519.Signing.PrivateKey(rawRepresentation:) uses RFC 8032 clamped scalar
+  ed25519_dalek SigningKey::from_bytes() treats input as seed (SHA-512 then clamp)
+  HMAC-derived pseudonym seeds will produce DIFFERENT public keys across platforms
+- AppleDeviceAttestation: clientDataHash = SHA-256(challenge||deviceId), no length prefix -- ambiguous
+- AppleDeviceAttestation: TOCTOU in resolveKeyId() -- concurrent calls can double-generate
+- AppleStorage: 32-byte key via SecRandomCopyBytes, Keychain-protected, in-memory dict placeholder
+- AppleStorage: encryptionKey as Data (no zeroization on dealloc)
+- No zeroization anywhere in Swift layer (Data is not zeroed on dealloc)
+- WASM custody: pure FFI boundary, delegates all crypto to JS WebCrypto
+- NAPI identity: InMemoryKeyCustody with OpaqueInMemoryKeyCustody redacted Debug wrapper
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs
@@ -40,3 +53,6 @@
 - `crates/scp-core/src/bridge/claiming.rs` -- shadow claiming, dual sig verification
 - `crates/scp-core/src/context/nesting.rs` -- governance config hashing, BTreeSet
 - `crates/scp-core/src/crypto/sender_keys/` -- sender key protocol, HKDF, X25519
+- `bindings/swift/Sources/SCP/Platform/` -- Apple platform adapters
+- `crates/scp-ffi/wasm/src/custody.rs` -- WASM key custody FFI boundary
+- `crates/scp-ffi/napi/src/identity.rs` -- Node/Bun identity bridge
