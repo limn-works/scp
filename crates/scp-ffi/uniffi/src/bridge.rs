@@ -26,9 +26,8 @@
 
 use std::sync::Arc;
 
-use scp_core::identity::cache::SystemClock;
-use scp_core::identity::{DidDht, DidMethod, InMemoryDhtClient};
-use scp_platform::testing::InMemoryKeyCustody;
+use scp_core::identity::{DidDht, DidMethod};
+use uuid::Uuid;
 
 use crate::runtime;
 
@@ -659,45 +658,18 @@ impl Identity {
     ///
     /// Returns `ScpError::Identity` if key rotation or DID document publish fails.
     pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Identity>, ScpError> {
-        let custody_type = self.custody_type.clone();
-        let _did = self.did.clone();
-
-        runtime()
-            .spawn(async move {
-                let key_custody = Arc::new(InMemoryKeyCustody::new());
-                let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(
-                    Arc::clone(&key_custody),
-                );
-                let dht_client = Arc::new(InMemoryDhtClient::new());
-                let cache = Arc::new(scp_core::identity::DidCache::new());
-                let did_method =
-                    DidDht::with_client_and_signer(dht_client, cache, sign_fn);
-
-                let (temp_identity, temp_doc) = did_method
-                    .create(key_custody.as_ref())
-                    .await
-                    .map_err(ScpError::from)?;
-
-                did_method
-                    .publish(&temp_identity, &temp_doc)
-                    .await
-                    .map_err(ScpError::from)?;
-
-                let (rotated, _rotated_doc) = did_method
-                    .rotate(&temp_identity, key_custody.as_ref())
-                    .await
-                    .map_err(ScpError::from)?;
-
-                Ok(Arc::new(Identity {
-                    did: rotated.did,
-                    custody_type,
-                }))
-            })
-            .await
-            .map_err(|e| ScpError::Identity {
-                message: format!("tokio task join error during key rotation: {e}"),
-                code: "SCP-IDN-1002".to_owned(),
-            })?
+        // Key rotation requires a wired KeyCustodyProvider (ADR-006 platform
+        // abstraction). InMemoryKeyCustody is not acceptable in production —
+        // it stores private key material in unprotected heap memory on mobile
+        // devices. Full implementation is tracked for the platform integration
+        // story that wires KeyCustodyProvider callbacks to scp-core.
+        Err(ScpError::Identity {
+            message: "key rotation requires a wired platform KeyCustodyProvider — \
+                      use the KeyCustodyProvider callback interface to inject \
+                      Secure Enclave (iOS) or Android Keystore (Android) backed custody"
+                .to_owned(),
+            code: "SCP-IDN-1002".to_owned(),
+        })
     }
 }
 
@@ -730,19 +702,22 @@ impl ContextHandle {
     /// Returns the context's current lifecycle state as a string.
     ///
     /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`.
-    pub fn state(&self) -> String {
-        match self
-            .state
-            .lock()
-            .as_deref()
-            .unwrap_or(&ContextState::Closed)
-        {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` if the state lock is poisoned.
+    pub fn state(&self) -> Result<String, ScpError> {
+        let guard = self.state.lock().map_err(|_| ScpError::Context {
+            message: "context state lock is poisoned".to_owned(),
+            code: "SCP-CTX-2012".to_owned(),
+        })?;
+        Ok(match *guard {
             ContextState::Creating => "creating".to_owned(),
             ContextState::Active => "active".to_owned(),
             ContextState::Closing => "closing".to_owned(),
             ContextState::Closed => "closed".to_owned(),
             ContextState::Expired => "expired".to_owned(),
-        }
+        })
     }
 
     /// Returns the DID of the context creator.
@@ -861,27 +836,20 @@ impl TransportManager {
 /// Returns `ScpError::Validation` if the custody string is not recognized.
 #[uniffi::export]
 pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> {
-    let custody_method = parse_custody_method(&custody)?;
+    let _custody_method = parse_custody_method(&custody)?;
 
-    runtime()
-        .spawn(async move {
-            let key_custody = Arc::new(InMemoryKeyCustody::new());
-            let did_method = DidDht::new();
-            let (identity, _document) = did_method
-                .create(key_custody.as_ref())
-                .await
-                .map_err(ScpError::from)?;
-
-            Ok(Arc::new(Identity {
-                did: identity.did,
-                custody_type: custody_method,
-            }))
-        })
-        .await
-        .map_err(|e| ScpError::Identity {
-            message: format!("tokio task join error during identity creation: {e}"),
-            code: "SCP-IDN-1003".to_owned(),
-        })?
+    // Identity creation requires a wired KeyCustodyProvider (ADR-006 platform
+    // abstraction). InMemoryKeyCustody is not acceptable in production — it
+    // stores private key material in unprotected heap memory on mobile devices.
+    // Full implementation is tracked for the platform integration story that
+    // wires KeyCustodyProvider callbacks to scp-core.
+    Err(ScpError::Identity {
+        message: "identity creation requires a wired platform KeyCustodyProvider — \
+                  use the KeyCustodyProvider callback interface to inject \
+                  Secure Enclave (iOS) or Android Keystore (Android) backed custody"
+            .to_owned(),
+        code: "SCP-IDN-1003".to_owned(),
+    })
 }
 
 /// Loads an existing identity from storage by its DID.
@@ -992,12 +960,7 @@ pub async fn context_create(
 ) -> Result<Arc<ContextHandle>, ScpError> {
     runtime()
         .spawn(async move {
-            let context_id = format!("ctx-{:016x}", {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            });
+            let context_id = format!("ctx-{}", Uuid::new_v4());
 
             Ok(Arc::new(ContextHandle {
                 context_id,
@@ -1302,13 +1265,7 @@ pub async fn tool_register(
             }
             drop(state);
 
-            let tool_id = format!(
-                "tool-{:016x}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            );
+            let tool_id = format!("tool-{}", Uuid::new_v4());
             let _ = definition;
             Ok(tool_id)
         })

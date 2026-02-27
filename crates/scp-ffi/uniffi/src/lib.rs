@@ -102,9 +102,9 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
             Ok(rt) => rt,
             Err(e) => {
                 // Abort is the correct response to a fatal FFI init failure.
-                // eprintln is used first to surface the error to stderr before
+                // tracing::error! is used to surface the error before
                 // the process terminates without a backtrace.
-                eprintln!("FATAL: failed to create SCP UniFFI tokio runtime: {e}");
+                tracing::error!("FATAL: failed to create SCP UniFFI tokio runtime: {e}");
                 std::process::abort();
             }
         }
