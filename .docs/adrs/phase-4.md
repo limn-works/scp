@@ -1091,17 +1091,25 @@ export class Context implements AsyncDisposable {
 
     const bridge = await getBridge();
     bridge.contextSubscribe(this._handle, {
-      onMessage: (msg: Message) => { queue.push(msg); resolve?.(); resolve = null; },
+      onMessage: (msg: Message) => { if (!done) { queue.push(msg); resolve?.(); resolve = null; } },
       onError: (_err: ScpError) => { done = true; resolve?.(); resolve = null; },
       onComplete: () => { done = true; resolve?.(); resolve = null; },
     });
 
-    while (!done || queue.length > 0) {
-      if (queue.length === 0) {
-        await new Promise<void>((r) => { resolve = r; });
+    try {
+      while (!done || queue.length > 0) {
+        if (queue.length === 0) {
+          await new Promise<void>((r) => { resolve = r; });
+        }
+        const msg = queue.shift();
+        if (msg !== undefined) yield msg;
       }
-      const msg = queue.shift();
-      if (msg !== undefined) yield msg;
+    } finally {
+      if (!done) {
+        done = true;
+        queue.length = 0;
+        bridge.contextUnsubscribe(this._handle);
+      }
     }
   }
 

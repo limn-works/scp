@@ -34,7 +34,7 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
-#[cfg(feature = "testing")]
+#[cfg(feature = "software_platform")]
 pub mod testing;
 pub mod traits;
 

@@ -100,7 +100,7 @@ impl From<scp_core::identity::IdentityError> for ScpError {
             message: format!(
                 "{e} — check DID format, key custody configuration, or DHT connectivity"
             ),
-            code: "SCP-IDN-1001".to_owned(),
+            code: "SCP-IDENT-1001".to_owned(),
         }
     }
 }
@@ -175,7 +175,7 @@ impl From<scp_core::context::tools::ToolError> for ScpError {
             message: format!(
                 "tool operation failed: {e} — check tool registration, permissions, and input schema"
             ),
-            code: "SCP-TOOL-5001".to_owned(),
+            code: "SCP-TOOL-6001".to_owned(),
         }
     }
 }
@@ -186,7 +186,7 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpError {
             message: format!(
                 "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
             ),
-            code: "SCP-TOOL-5002".to_owned(),
+            code: "SCP-TOOL-6002".to_owned(),
         }
     }
 }
@@ -197,7 +197,7 @@ impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpError 
             message: format!(
                 "schema validation failed: {e} — check input against the tool's JSON Schema"
             ),
-            code: "SCP-VAL-7001".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
         }
     }
 }
@@ -208,7 +208,7 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpError {
             message: format!(
                 "MLS operation failed: {e} — check group state and member key packages"
             ),
-            code: "SCP-CRY-3001".to_owned(),
+            code: "SCP-CRYPTO-4001".to_owned(),
         }
     }
 }
@@ -219,7 +219,7 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
             message: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
             ),
-            code: "SCP-CRY-3002".to_owned(),
+            code: "SCP-CRYPTO-4002".to_owned(),
         }
     }
 }
@@ -230,7 +230,7 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpError {
             message: format!(
                 "{e} — check token format, signatures, time bounds, and capability chain"
             ),
-            code: "SCP-PRM-4001".to_owned(),
+            code: "SCP-PERM-3001".to_owned(),
         }
     }
 }
@@ -241,7 +241,7 @@ impl From<scp_core::envelope::EnvelopeError> for ScpError {
             message: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
             ),
-            code: "SCP-CRY-3003".to_owned(),
+            code: "SCP-CRYPTO-4003".to_owned(),
         }
     }
 }
@@ -263,7 +263,7 @@ impl From<scp_core::provenance::ProvenanceError> for ScpError {
             message: format!(
                 "provenance validation failed: {e} — check cross-context chain depth"
             ),
-            code: "SCP-VAL-7002".to_owned(),
+            code: "SCP-VALID-7002".to_owned(),
         }
     }
 }
@@ -274,7 +274,7 @@ impl From<scp_core::trust::TrustError> for ScpError {
             message: format!(
                 "trust evaluation failed: {e} — check event log data and attestation validity"
             ),
-            code: "SCP-VAL-7003".to_owned(),
+            code: "SCP-VALID-7003".to_owned(),
         }
     }
 }
@@ -283,7 +283,7 @@ impl From<scp_core::uri::ScpUriError> for ScpError {
     fn from(e: scp_core::uri::ScpUriError) -> Self {
         Self::Validation {
             message: format!("invalid SCP URI: {e} — check URI format (scp://relay/context-id)"),
-            code: "SCP-VAL-7004".to_owned(),
+            code: "SCP-VALID-7004".to_owned(),
         }
     }
 }
@@ -292,7 +292,7 @@ impl From<scp_core::well_known::WellKnownValidationError> for ScpError {
     fn from(e: scp_core::well_known::WellKnownValidationError) -> Self {
         Self::Validation {
             message: format!("well-known validation failed: {e} — check relay configuration"),
-            code: "SCP-VAL-7005".to_owned(),
+            code: "SCP-VALID-7005".to_owned(),
         }
     }
 }
@@ -336,7 +336,7 @@ impl From<scp_transport::TransportError> for ScpError {
             message: format!(
                 "{e} — check relay URL, network connectivity, and transport configuration"
             ),
-            code: "SCP-TRP-6001".to_owned(),
+            code: "SCP-TRANS-5001".to_owned(),
         }
     }
 }
@@ -347,7 +347,7 @@ impl From<scp_platform::PlatformError> for ScpError {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
             ),
-            code: "SCP-CRY-3004".to_owned(),
+            code: "SCP-CRYPTO-4004".to_owned(),
         }
     }
 }
@@ -358,7 +358,7 @@ impl From<serde_json::Error> for ScpError {
             message: format!(
                 "JSON serialization/deserialization failed: {e} — check input format"
             ),
-            code: "SCP-VAL-7006".to_owned(),
+            code: "SCP-VALID-7006".to_owned(),
         }
     }
 }
@@ -381,6 +381,11 @@ pub enum CustodyMethod {
     Platform,
     /// Key material in software-managed encrypted storage (not HSM-backed).
     Software,
+    /// Identity loaded by DID string without local key material.
+    ///
+    /// Used by [`identity_load`] to represent an identity whose keys are
+    /// managed externally (e.g., via an injected `KeyCustodyProvider`).
+    External,
 }
 
 /// Context lifecycle state.
@@ -664,12 +669,13 @@ impl Identity {
 
     /// Returns the custody method string for this identity.
     ///
-    /// One of: `"in_memory"`, `"platform"`, `"software"`.
+    /// One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
     pub fn custody_type(&self) -> String {
         match self.custody_type {
             CustodyMethod::InMemory => "in_memory".to_owned(),
             CustodyMethod::Platform => "platform".to_owned(),
             CustodyMethod::Software => "software".to_owned(),
+            CustodyMethod::External => "external".to_owned(),
         }
     }
 
@@ -693,7 +699,7 @@ impl Identity {
                       use the KeyCustodyProvider callback interface to inject \
                       Secure Enclave (iOS) or Android Keystore (Android) backed custody"
                 .to_owned(),
-            code: "SCP-IDN-1002".to_owned(),
+            code: "SCP-IDENT-1002".to_owned(),
         })
     }
 }
@@ -941,8 +947,8 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                     increment_handle_count();
                     Ok(handle)
                 }
-                CustodyMethod::Platform | CustodyMethod::Software => {
-                    // Platform and software custody require a wired
+                CustodyMethod::Platform | CustodyMethod::Software | CustodyMethod::External => {
+                    // Platform, software, and external custody require a wired
                     // KeyCustodyProvider (ADR-006 platform abstraction).
                     // Full implementation is tracked for the platform
                     // integration story that wires KeyCustodyProvider
@@ -954,7 +960,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                              interface to inject Secure Enclave (iOS) or Android \
                              Keystore (Android) backed custody"
                         ),
-                        code: "SCP-IDN-1003".to_owned(),
+                        code: "SCP-IDENT-1003".to_owned(),
                     })
                 }
             }
@@ -962,7 +968,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
         .await
         .map_err(|e| ScpError::Identity {
             message: format!("tokio task join error during identity creation: {e}"),
-            code: "SCP-IDN-1007".to_owned(),
+            code: "SCP-IDENT-1007".to_owned(),
         })?
 }
 
@@ -989,7 +995,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                     message: format!(
                         "unsupported DID method: {did} — only did:dht is supported"
                     ),
-                    code: "SCP-IDN-1004".to_owned(),
+                    code: "SCP-IDENT-1004".to_owned(),
                 });
             }
 
@@ -997,7 +1003,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
             // require the KeyCustodyProvider callback interface to be wired.
             let handle = Arc::new(Identity {
                 did,
-                custody_type: CustodyMethod::InMemory,
+                custody_type: CustodyMethod::External,
                 scp_identity: None,
                 in_memory_custody: None,
             });
@@ -1007,7 +1013,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
         .await
         .map_err(|e| ScpError::Identity {
             message: format!("tokio task join error during identity load: {e}"),
-            code: "SCP-IDN-1005".to_owned(),
+            code: "SCP-IDENT-1005".to_owned(),
         })?
 }
 
@@ -1047,7 +1053,7 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
         .await
         .map_err(|e| ScpError::Identity {
             message: format!("tokio task join error during DID resolution: {e}"),
-            code: "SCP-IDN-1006".to_owned(),
+            code: "SCP-IDENT-1006".to_owned(),
         })?
 }
 
@@ -1346,7 +1352,7 @@ pub async fn tool_register(
                         "cannot register tool in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-5003".to_owned(),
+                    code: "SCP-TOOL-6003".to_owned(),
                 });
             }
             drop(state);
@@ -1358,7 +1364,7 @@ pub async fn tool_register(
         .await
         .map_err(|e| ScpError::Tool {
             message: format!("tokio task join error during tool registration: {e}"),
-            code: "SCP-TOOL-5004".to_owned(),
+            code: "SCP-TOOL-6004".to_owned(),
         })?
 }
 
@@ -1396,7 +1402,7 @@ pub async fn tool_invoke(
                         "cannot invoke tool in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-5005".to_owned(),
+                    code: "SCP-TOOL-6005".to_owned(),
                 });
             }
             drop(state);
@@ -1407,7 +1413,7 @@ pub async fn tool_invoke(
         .await
         .map_err(|e| ScpError::Tool {
             message: format!("tokio task join error during tool invocation: {e}"),
-            code: "SCP-TOOL-5006".to_owned(),
+            code: "SCP-TOOL-6006".to_owned(),
         })?
 }
 
@@ -1440,7 +1446,7 @@ pub async fn tool_verify(
                         "cannot verify tool in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-5007".to_owned(),
+                    code: "SCP-TOOL-6007".to_owned(),
                 });
             }
             drop(state);
@@ -1454,7 +1460,7 @@ pub async fn tool_verify(
         .await
         .map_err(|e| ScpError::Tool {
             message: format!("tokio task join error during tool verification: {e}"),
-            code: "SCP-TOOL-5008".to_owned(),
+            code: "SCP-TOOL-6008".to_owned(),
         })?
 }
 
@@ -1480,6 +1486,17 @@ pub async fn tool_verify(
 /// protocol mismatch, timeout, authentication failure).
 #[uniffi::export]
 pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager>, ScpError> {
+    if !relay_url.starts_with("wss://") {
+        return Err(ScpError::Transport {
+            message: format!(
+                "relay URL must use wss:// scheme, got: {:?} — \
+                 plain-text ws:// is not permitted; use TLS",
+                relay_url
+            ),
+            code: "SCP-TRANS-5001".to_owned(),
+        });
+    }
+
     runtime()
         .spawn(async move {
             let handle = Arc::new(TransportManager {
@@ -1495,7 +1512,7 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
         .await
         .map_err(|e| ScpError::Transport {
             message: format!("tokio task join error during transport connect: {e}"),
-            code: "SCP-TRP-6002".to_owned(),
+            code: "SCP-TRANS-5002".to_owned(),
         })?
 }
 
@@ -1545,13 +1562,13 @@ pub async fn ucan_validate(
             Err(ScpError::Permission {
                 message: "not yet connected to runtime — UCAN validation requires a live context"
                     .to_owned(),
-                code: "SCP-PRM-4002".to_owned(),
+                code: "SCP-PERM-3002".to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Permission {
             message: format!("tokio task join error during UCAN validation: {e}"),
-            code: "SCP-PRM-4003".to_owned(),
+            code: "SCP-PERM-3003".to_owned(),
         })?
 }
 
@@ -1583,13 +1600,13 @@ pub async fn ucan_mint(
             Err(ScpError::Permission {
                 message: "not yet connected to runtime — UCAN minting requires a live context"
                     .to_owned(),
-                code: "SCP-PRM-4004".to_owned(),
+                code: "SCP-PERM-3004".to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Permission {
             message: format!("tokio task join error during UCAN mint: {e}"),
-            code: "SCP-PRM-4005".to_owned(),
+            code: "SCP-PERM-3005".to_owned(),
         })?
 }
 
@@ -1619,13 +1636,13 @@ pub async fn ucan_revoke(
             Err(ScpError::Permission {
                 message: "not yet connected to runtime — UCAN revocation requires a live context"
                     .to_owned(),
-                code: "SCP-PRM-4006".to_owned(),
+                code: "SCP-PERM-3006".to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Permission {
             message: format!("tokio task join error during UCAN revocation: {e}"),
-            code: "SCP-PRM-4007".to_owned(),
+            code: "SCP-PERM-3007".to_owned(),
         })?
 }
 
@@ -1728,7 +1745,7 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
             message: format!(
                 "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
             ),
-            code: "SCP-VAL-7007".to_owned(),
+            code: "SCP-VALID-7007".to_owned(),
         }),
     }
 }

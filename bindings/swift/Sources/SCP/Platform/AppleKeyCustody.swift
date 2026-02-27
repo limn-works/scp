@@ -330,9 +330,10 @@ public final class AppleKeyCustody: Sendable {
         query[kSecValueData as String] = bytes as CFData
 
         let status = SecItemAdd(query as CFDictionary, nil)
-        guard status == errSecSuccess else {
+        guard status == errSecSuccess || status == errSecDuplicateItem else {
             throw PlatformError.keychainError(status)
         }
+        // errSecDuplicateItem: deterministic handle → same key bytes already stored. No-op.
     }
 }
 
@@ -648,8 +649,14 @@ extension AppleKeyCustody {
             let pseudonymKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seedBytes)
             let pseudonymPublicKey = pseudonymKey.publicKey.rawRepresentation
 
-            // Store the derived key in Keychain under a fresh handle.
-            let pseudonymHandle = UUID().uuidString
+            // Deterministic handle: HMAC-SHA256(key_handle_utf8, contextId || "scp-pseudonym-handle")
+            // Same inputs → same handle → same Keychain slot. No accumulation.
+            let handleHmacKey = SymmetricKey(data: Data(keyHandle.utf8))
+            var handleHmac = HMAC<SHA256>(key: handleHmacKey)
+            handleHmac.update(data: contextId)
+            handleHmac.update(data: Data("scp-pseudonym-handle".utf8))
+            let pseudonymHandle = Data(handleHmac.finalize()).map { String(format: "%02x", $0) }.joined()
+
             try storePrivateKeyBytes(
                 pseudonymKey.rawRepresentation,
                 for: pseudonymHandle,

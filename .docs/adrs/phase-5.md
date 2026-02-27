@@ -416,8 +416,9 @@ let status = SecItemAdd(query as CFDictionary, nil)
 let service = DCAppAttestService.shared
 service.generateKey { keyId, error in
     guard let keyId else { /* handle error */ return }
-    let clientDataHash = SHA256.hash(data: challenge + deviceId.data(using: .utf8)!)
-    service.attestKey(keyId, clientDataHash: Data(clientDataHash)) { attestation, error in
+    let clientDataJSON = "{\"challenge\":\"\(Data(challenge).base64EncodedString())\",\"deviceId\":\"\(deviceId.base64EncodedString())\",\"type\":\"scp-device-attestation-v1\"}"
+    let clientDataHash = Data(SHA256.hash(data: Data(clientDataJSON.utf8)))
+    service.attestKey(keyId, clientDataHash: clientDataHash) { attestation, error in
         // attestation: Data — forward to relay for server-side verification
     }
 }
@@ -486,7 +487,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - No Keychain item ever uses `kSecAttrAccessibleAlways` or an iCloud-synced protection class.
 
 3. **`AppleDeviceAttestation` — App Attest:**
-   - `attest() -> DeviceAttestationToken`: Generates an App Attest key via `DCAppAttestService.generateKey`, requests attestation with `clientDataHash = SHA256(challenge || deviceID)`. Returns a `DeviceAttestationToken` containing the raw attestation bytes and the key ID.
+   - `attest() -> DeviceAttestationToken`: Generates an App Attest key via `DCAppAttestService.generateKey`, requests attestation with `clientDataHash = SHA256(clientDataJSON)` where `clientDataJSON = '{"challenge":"<base64(challenge)>","deviceId":"<base64(deviceId)>","type":"scp-device-attestation-v1"}'` (fields in this exact order, RFC 4648 base64, no line breaks). Returns a `DeviceAttestationToken` containing the raw attestation bytes and the key ID.
    - `verify(token: DeviceAttestationToken) -> Bool`: Verifies the attestation token structure. Full verification is server-side (relay calls Apple's attestation endpoint). Client-side verification checks that the attestation bytes are non-empty and the key ID is present.
    - On simulator or when App Attest is unavailable: `DCAppAttestService.shared.isSupported == false` → returns a synthetic token with `method: .softwareOnly`. Does not crash or throw; the caller receives a valid (but software-only) token.
    - `generateAssertion(keyId: String, clientData: Data) -> Data`: Generates a per-request assertion via `DCAppAttestService.generateAssertion(_:clientData:)`. Used for subsequent authenticated operations after initial attestation.

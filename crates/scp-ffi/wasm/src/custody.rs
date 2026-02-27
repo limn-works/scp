@@ -95,4 +95,24 @@ extern "C" {
         this: &JsKeyCustody,
         key_id: &str,
     ) -> Result<(), JsValue>;
+
+    /// Perform X25519 DH key agreement.
+    /// peer_public: 32-byte peer X25519 public key as Uint8Array.
+    /// Returns 32-byte shared secret as Uint8Array.
+    #[wasm_bindgen(method, catch, js_name = "dhAgree")]
+    pub fn dh_agree(
+        this: &JsKeyCustody,
+        key_id: &str,
+        peer_public: &[u8],
+    ) -> Result<Vec<u8>, JsValue>;
+
+    /// Derive a context-scoped Ed25519 pseudonym keypair.
+    /// Algorithm: seed = HMAC-SHA256(sk_bytes, context_id || "scp-pseudonym"), Ed25519_keygen(seed[0..32])
+    /// Returns a JS object: { publicKeyBytes: Uint8Array, keyId: string }
+    #[wasm_bindgen(method, catch, js_name = "derivePseudonym")]
+    pub fn derive_pseudonym(
+        this: &JsKeyCustody,
+        key_id: &str,
+        context_id: &[u8],
+    ) -> Result<JsValue, JsValue>;
 }

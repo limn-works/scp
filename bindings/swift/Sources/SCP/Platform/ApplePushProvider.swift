@@ -132,7 +132,8 @@ public actor ApplePushProvider {
     ///
     /// Calls the platform-specific `registerForRemoteNotifications()` method and
     /// suspends until the AppDelegate delivers the token (or an error) via
-    /// ``tokenDidRegister(_:)`` / ``registrationDidFail(_:)``.
+    /// ``tokenDidRegister(_:)`` / ``registrationDidFail(_:)``. Races a 30-second
+    /// timeout so callers are never blocked indefinitely.
     ///
     /// - Returns: The raw APNs device token bytes (typically 32 bytes). The caller
     ///   (the SCP Rust engine via UniFFI) converts these bytes to the hex string
@@ -141,25 +142,55 @@ public actor ApplePushProvider {
     /// - Throws:
     ///   - ``PushError/registrationAlreadyInProgress`` if a concurrent call is
     ///     already awaiting a token.
-    ///   - ``PushError/registrationFailed(_:)`` if the platform rejects registration.
+    ///   - ``PushError/registrationFailed(_:)`` if the platform rejects registration
+    ///     or the 30-second timeout elapses.
     public func register() async throws -> Data {
         guard tokenContinuation == nil else {
             throw PushError.registrationAlreadyInProgress
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            self.tokenContinuation = continuation
-
-            // Dispatch registration onto the main actor. APNs requires that
-            // registerForRemoteNotifications() is called on the main thread.
-            Task { @MainActor in
-#if canImport(UIKit)
-                UIApplication.shared.registerForRemoteNotifications()
-#elseif canImport(AppKit)
-                NSApplication.shared.registerForRemoteNotifications()
-#endif
-            }
+        // Trigger registration on the main thread before suspending.
+        Task { @MainActor in
+            #if canImport(UIKit)
+            UIApplication.shared.registerForRemoteNotifications()
+            #elseif canImport(AppKit)
+            NSApplication.shared.registerForRemoteNotifications()
+            #endif
         }
+
+        // Start a 30-second timeout that calls back into the actor on expiry.
+        // Using `[weak self]` avoids a retain cycle; actor hop via `await` is
+        // implicit when calling `self?._timeoutRegistration()`.
+        let timeoutTask = Task { [weak self] in
+            try await Task.sleep(nanoseconds: 30_000_000_000)
+            await self?._timeoutRegistration()
+        }
+
+        do {
+            // `withCheckedThrowingContinuation` closure runs synchronously on
+            // the actor's executor — assigning `tokenContinuation` here is safe.
+            let result = try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Data, Error>) in
+                self.tokenContinuation = continuation
+            }
+            timeoutTask.cancel()
+            return result
+        } catch {
+            timeoutTask.cancel()
+            throw error
+        }
+    }
+
+    /// Called by the timeout `Task` when the 30-second window elapses.
+    ///
+    /// Runs on the actor's executor (via `await`). Resumes the pending
+    /// continuation with a timeout error; no-ops if the token already arrived.
+    private func _timeoutRegistration() {
+        guard let cont = tokenContinuation else { return }
+        tokenContinuation = nil
+        cont.resume(throwing: PushError.registrationFailed(
+            "APNs registration timed out after 30 s — ensure push entitlements are configured"
+        ))
     }
 
     /// Handle an incoming APNs silent push notification.
@@ -208,8 +239,9 @@ public actor ApplePushProvider {
     ///
     /// - Parameter token: The raw APNs device token bytes provided by the system.
     public func tokenDidRegister(_ token: Data) {
-        tokenContinuation?.resume(returning: token)
+        guard let cont = tokenContinuation else { return }
         tokenContinuation = nil
+        cont.resume(returning: token)
     }
 
     /// Called by the AppDelegate when APNs registration fails.
@@ -229,8 +261,9 @@ public actor ApplePushProvider {
     ///
     /// - Parameter error: The error returned by the platform.
     public func registrationDidFail(_ error: Error) {
-        tokenContinuation?.resume(throwing: PushError.registrationFailed(error.localizedDescription))
+        guard let cont = tokenContinuation else { return }
         tokenContinuation = nil
+        cont.resume(throwing: PushError.registrationFailed(error.localizedDescription))
     }
 
     // MARK: Payload validation
@@ -292,11 +325,18 @@ public actor ApplePushProvider {
             )
         }
 
-        // Rule 4: content-available must be the integer 1.
-        // APNs delivers numeric JSON values as NSNumber; the value 1 must compare equal.
-        guard let number = contentAvailable as? NSNumber, number.intValue == 1 else {
+        // Rule 4: content-available must be the integer 1 (not boolean true).
+        // JSONSerialization bridges both JSON numbers and JSON booleans to NSNumber.
+        // __NSCFBoolean is a NSNumber subclass; NSNumber(boolValue: true).intValue == 1,
+        // so intValue alone incorrectly accepts boolean true.
+        // CFGetTypeID disambiguates: CFBooleanGetTypeID() ≠ CFNumberGetTypeID().
+        guard
+            let number = contentAvailable as? NSNumber,
+            CFGetTypeID(number) == CFNumberGetTypeID(),
+            number.intValue == 1
+        else {
             throw PushError.opaquePayloadViolation(
-                "\"content-available\" must be 1 (integer), got \(contentAvailable)"
+                "\"content-available\" must be integer 1 (not boolean true or other value), got \(contentAvailable)"
             )
         }
     }
