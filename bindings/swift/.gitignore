@@ -1,0 +1,12 @@
+# XCFramework — built artifact, not tracked
+ScpFFI.xcframework/
+
+# UniFFI-generated C headers — rebuilt by build-xcframework.sh
+Headers/
+
+# Intermediate build directory
+.build-xcframework/
+
+# Swift Package Manager build artifacts
+.build/
+.swiftpm/
