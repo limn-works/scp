@@ -1,0 +1,211 @@
+/**
+ * Runtime detection and unified bridge interface for the SCP TypeScript SDK.
+ *
+ * This module selects the correct FFI backend at import time based on the
+ * runtime environment:
+ *
+ * - **Bun/Node.js** -> napi-rs native addon (`./native.js`)
+ * - **Browser** -> wasm-bindgen WASM module (`./wasm.js`)
+ *
+ * Bridge selection is synchronous — no top-level await — to preserve CJS
+ * compatibility. The actual bridge module is loaded lazily on first use via
+ * `getBridge()`.
+ *
+ * Application code never imports from `internal/`. The public API classes
+ * (`Identity`, `Context`, etc.) call `getBridge()` internally on their async
+ * factory methods.
+ *
+ * See ADR-022 in `.docs/adrs/phase-4.md`.
+ */
+
+import type {
+  Checkpoint,
+  DIDDocument,
+  Event,
+  EventClaim,
+  EventFilter,
+  Message,
+  Proof,
+  ToolDefinition,
+  ToolVerificationResult,
+  TransportStatus,
+  UcanToken,
+} from "../types.js";
+
+// ---------------------------------------------------------------------------
+// Bridge interface — the contract both native and WASM bridges implement
+// ---------------------------------------------------------------------------
+
+/**
+ * Unified bridge interface that both the native (napi-rs) and WASM
+ * (wasm-bindgen) bridges must satisfy.
+ *
+ * Each method maps to a flat bridge function exposed by the Rust FFI crate.
+ * The TypeScript wrapper classes (`Identity`, `Context`, etc.) delegate to
+ * these methods.
+ */
+export interface Bridge {
+  // Identity
+  identityCreate(custody: string): Promise<BridgeIdentityHandle>;
+  identityLoad(did: string): Promise<BridgeIdentityHandle>;
+  identityResolve(did: string): Promise<DIDDocument>;
+  identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle>;
+
+  // Context
+  contextCreate(identityDid: string, paramsJson: string): Promise<BridgeContextHandle>;
+  contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void>;
+  contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void>;
+  contextClose(handle: BridgeContextHandle, identityDid: string): Promise<void>;
+  contextSend(handle: BridgeContextHandle, identityDid: string, payload: Uint8Array): Promise<void>;
+  contextSubscribe(
+    handle: BridgeContextHandle,
+    identityDid: string,
+    callback: MessageCallback,
+  ): void;
+
+  // Tools
+  toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string>;
+  toolInvoke(
+    handle: BridgeContextHandle,
+    toolId: string,
+    inputJson: string,
+    identityDid: string,
+  ): Promise<string>;
+  toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult>;
+
+  // Transport
+  transportConnect(relayUrl: string): Promise<BridgeTransportHandle>;
+  transportStatus(handle: BridgeTransportHandle): Promise<TransportStatus>;
+  transportDisconnect(handle: BridgeTransportHandle): Promise<void>;
+
+  // UCAN
+  ucanValidate(handle: BridgeContextHandle, token: string, capability: string): Promise<void>;
+  ucanMint(
+    handle: BridgeContextHandle,
+    memberDid: string,
+    capabilities: readonly string[],
+  ): Promise<UcanToken>;
+  ucanRevoke(handle: BridgeContextHandle, tokenId: string): Promise<void>;
+
+  // Event Log
+  eventLogQuery(
+    handle: BridgeContextHandle,
+    filter: EventFilter | undefined,
+  ): Promise<readonly Event[]>;
+  eventLogVerify(handle: BridgeContextHandle, claim: EventClaim): Promise<Proof>;
+  eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint>;
+
+  // Lifecycle
+  version(): string;
+  shutdown(timeoutSecs: number): void;
+}
+
+// ---------------------------------------------------------------------------
+// Opaque bridge handle types
+// ---------------------------------------------------------------------------
+
+/** Opaque handle to an identity in the bridge layer. */
+export interface BridgeIdentityHandle {
+  readonly did: string;
+  readonly custodyType: string;
+}
+
+/** Opaque handle to a context in the bridge layer. */
+export interface BridgeContextHandle {
+  readonly contextId: string;
+  readonly state: string;
+  readonly creatorDid: string;
+}
+
+/** Opaque handle to a transport manager in the bridge layer. */
+export interface BridgeTransportHandle {
+  readonly isConnected: boolean;
+  readonly relayUrl: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Message callback interface (used by contextSubscribe)
+// ---------------------------------------------------------------------------
+
+/** Callback interface for receiving messages from a context subscription. */
+export interface MessageCallback {
+  onMessage(message: Message): void;
+  onComplete(): void;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime detection
+// ---------------------------------------------------------------------------
+
+/** The detected bridge target: `"native"` for Bun/Node, `"wasm"` for browser. */
+export type BridgeTarget = "native" | "wasm";
+
+/**
+ * Detects the runtime environment synchronously.
+ *
+ * - Bun exposes `process.versions.bun`.
+ * - Node.js exposes `process.versions.node` but not `bun`.
+ * - Browsers have neither.
+ *
+ * This function contains no top-level await and no I/O — it is safe to call
+ * at module import time, preserving CJS compatibility.
+ */
+function detectBridge(): BridgeTarget {
+  if (typeof process !== "undefined" && process.versions?.bun) {
+    return "native";
+  }
+  if (typeof process !== "undefined" && process.versions?.node) {
+    return "native";
+  }
+  return "wasm";
+}
+
+/** The detected bridge target, computed once at import time. */
+export const BRIDGE_TARGET: BridgeTarget = detectBridge();
+
+// ---------------------------------------------------------------------------
+// Lazy bridge loading
+// ---------------------------------------------------------------------------
+
+/** Cached bridge instance. `null` until first `getBridge()` call. */
+let _bridge: Bridge | null = null;
+
+/**
+ * Returns the initialized bridge instance, loading it lazily on first call.
+ *
+ * - For `"native"` targets: dynamically imports `./native.js`.
+ * - For `"wasm"` targets: dynamically imports `./wasm.js` and calls
+ *   `initWasm()` for one-time WASM initialization.
+ *
+ * Subsequent calls return the cached instance — no re-initialization.
+ *
+ * @returns The initialized `Bridge` instance.
+ */
+export async function getBridge(): Promise<Bridge> {
+  if (_bridge !== null) {
+    return _bridge;
+  }
+
+  if (BRIDGE_TARGET === "native") {
+    const mod = await import("./native.js");
+    _bridge = mod.createNativeBridge();
+  } else {
+    const mod = await import("./wasm.js");
+    await mod.initWasm();
+    _bridge = mod.createWasmBridge();
+  }
+
+  return _bridge;
+}
+
+/**
+ * Resets the cached bridge instance.
+ *
+ * This is intended for testing only — it allows tests to re-initialize the
+ * bridge with a mock or a different target.
+ *
+ * @internal
+ */
+export function _resetBridge(): void {
+  _bridge = null;
+}
