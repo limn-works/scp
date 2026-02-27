@@ -1,3 +1,5 @@
+import Foundation
+
 /// SCP error hierarchy. All variants carry a human-readable ``message`` and a
 /// machine-readable ``code`` in the format ``SCP-{CATEGORY}-{NUMBER}``.
 public nonisolated enum ScpError: Error, Sendable {

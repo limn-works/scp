@@ -232,7 +232,7 @@ public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked
         }
 
         return try await withCheckedThrowingContinuation { continuation in
-            service.generateAssertion(keyId, clientData: requestHash) { assertion, error in
+            service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
                 if let error {
                     continuation.resume(throwing: AttestationError.serviceError(error.localizedDescription))
                 } else if let assertion {
