@@ -723,7 +723,7 @@ pub struct ContextHandle {
     /// Unique identifier for this context.
     pub(crate) context_id: String,
     /// Current lifecycle state.
-    pub(crate) state: std::sync::Mutex<ContextState>,
+    pub(crate) state: tokio::sync::Mutex<ContextState>,
     /// DID of the context creator.
     pub(crate) creator_did: String,
 }
@@ -743,8 +743,8 @@ impl ContextHandle {
     ///
     /// Returns `ScpError::Context` if the state lock is poisoned.
     pub fn state(&self) -> Result<String, ScpError> {
-        let guard = self.state.lock().map_err(|_| ScpError::Context {
-            message: "context state lock is poisoned".to_owned(),
+        let guard = self.state.try_lock().map_err(|_| ScpError::Context {
+            message: "context state lock is contended — retry".to_owned(),
             code: "SCP-CTX-2012".to_owned(),
         })?;
         Ok(match *guard {
@@ -824,16 +824,11 @@ impl UcanToken {
     }
 }
 
-impl Drop for UcanToken {
-    /// Decrements the global FFI handle count.
-    ///
-    /// Called when the last `Arc<UcanToken>` is dropped. This allows
-    /// [`crate::scp_shutdown`] to detect when all handles are released
-    /// before tearing down the tokio runtime.
-    fn drop(&mut self) {
-        decrement_handle_count();
-    }
-}
+// NOTE: `Drop` for `UcanToken` is intentionally absent until `ucan_mint` is
+// wired to `scp-core`. When `ucan_mint` creates a real `UcanToken`, it MUST
+// call `increment_handle_count()` in the constructor path, and this `Drop`
+// impl MUST be re-added to call `decrement_handle_count()`. The symmetry
+// is required for `scp_shutdown` handle-drain logic to work correctly.
 
 /// Opaque handle to the transport layer.
 ///
@@ -1089,7 +1084,7 @@ pub async fn context_create(
 
             let handle = Arc::new(ContextHandle {
                 context_id,
-                state: std::sync::Mutex::new(ContextState::Active),
+                state: tokio::sync::Mutex::new(ContextState::Active),
                 creator_did: identity.did.clone(),
             });
             increment_handle_count();
@@ -1120,13 +1115,7 @@ pub async fn context_join(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let state = handle
-                .state
-                .lock()
-                .map_err(|_| ScpError::Context {
-                    message: "context state lock is poisoned".to_owned(),
-                    code: "SCP-CTX-2012".to_owned(),
-                })?;
+            let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Context {
@@ -1167,13 +1156,7 @@ pub async fn context_leave(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let state = handle
-                .state
-                .lock()
-                .map_err(|_| ScpError::Context {
-                    message: "context state lock is poisoned".to_owned(),
-                    code: "SCP-CTX-2012".to_owned(),
-                })?;
+            let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Context {
@@ -1217,13 +1200,7 @@ pub async fn context_close(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let mut state = handle
-                .state
-                .lock()
-                .map_err(|_| ScpError::Context {
-                    message: "context state lock is poisoned".to_owned(),
-                    code: "SCP-CTX-2012".to_owned(),
-                })?;
+            let mut state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Context {
@@ -1272,13 +1249,7 @@ pub async fn context_send(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let state = handle
-                .state
-                .lock()
-                .map_err(|_| ScpError::Context {
-                    message: "context state lock is poisoned".to_owned(),
-                    code: "SCP-CTX-2012".to_owned(),
-                })?;
+            let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Context {
@@ -1320,13 +1291,7 @@ pub async fn context_subscribe(
     handle: Arc<ContextHandle>,
     listener: Box<dyn crate::MessageListener>,
 ) -> Result<(), ScpError> {
-    let state = handle
-        .state
-        .lock()
-        .map_err(|_| ScpError::Context {
-            message: "context state lock is poisoned".to_owned(),
-            code: "SCP-CTX-2012".to_owned(),
-        })?;
+    let state = handle.state.lock().await;
 
     if !matches!(*state, ContextState::Active) {
         return Err(ScpError::Context {
@@ -1373,13 +1338,7 @@ pub async fn tool_register(
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
-            let state = handle
-                .state
-                .lock()
-                .map_err(|_| ScpError::Context {
-                    message: "context state lock is poisoned".to_owned(),
-                    code: "SCP-CTX-2012".to_owned(),
-                })?;
+            let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Tool {
@@ -1429,13 +1388,7 @@ pub async fn tool_invoke(
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
-            let state = handle
-                .state
-                .lock()
-                .map_err(|_| ScpError::Context {
-                    message: "context state lock is poisoned".to_owned(),
-                    code: "SCP-CTX-2012".to_owned(),
-                })?;
+            let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Tool {
@@ -1479,13 +1432,7 @@ pub async fn tool_verify(
 ) -> Result<ToolVerificationResult, ScpError> {
     runtime()
         .spawn(async move {
-            let state = handle
-                .state
-                .lock()
-                .map_err(|_| ScpError::Context {
-                    message: "context state lock is poisoned".to_owned(),
-                    code: "SCP-CTX-2012".to_owned(),
-                })?;
+            let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Tool {

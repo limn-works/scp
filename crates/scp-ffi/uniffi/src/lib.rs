@@ -23,7 +23,8 @@
 //! # Callback interfaces
 //!
 //! Platform trait injection (`KeyCustodyProvider`, `StorageProvider`,
-//! `PushProvider`) and the message streaming callback (`MessageListener`)
+//! `PushProvider`, `DeviceAttestationProvider`) and the message streaming
+//! callback (`MessageListener`)
 //! are defined via `#[uniffi::export(callback_interface)]` in this module.
 //! UniFFI generates the Swift and Kotlin callback wiring from these annotations.
 //!
@@ -352,6 +353,43 @@ pub trait PushProvider: Send + Sync {
     ///
     /// Returns wake signal bytes indicating which context has new messages.
     fn handle_notification(&self, payload: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+}
+
+/// Callback for platform device attestation.
+///
+/// Swift SDK: DCAppAttestService (App Attest on iOS 14+ / macOS 11+).
+/// Kotlin SDK: Play Integrity API on Android.
+///
+/// Implemented by Swift/Kotlin code and injected into the Rust engine.
+///
+/// # SAFETY: Thread execution context
+///
+/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
+/// NOT assume main-thread execution.
+///
+/// See sdk-common.md §"FFI Async Bridging Risks" rule 2.
+///
+/// See ADR-025 (Apple Platform Adapter) and ADR-021 acceptance criterion 12.
+#[uniffi::export(callback_interface)]
+pub trait DeviceAttestationProvider: Send + Sync {
+    /// Generate a cryptographic attestation for this device.
+    ///
+    /// `challenge` — server-provided challenge bytes (SHA-256 digested with
+    ///   `device_id` before submission to the platform attestation service).
+    /// `device_id` — stable identifier for this device instance.
+    ///
+    /// Returns the platform attestation object bytes (Apple: CBOR-encoded
+    /// attestation; Android: Play Integrity token bytes).
+    fn attest(&self, challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+
+    /// Generate a per-request assertion proving key possession.
+    ///
+    /// `request_hash` — SHA-256 hash of the request data being asserted.
+    ///
+    /// Returns the platform assertion object bytes (Apple: CBOR assertion;
+    /// Android: integrity verdict).
+    fn assert_request(&self, request_hash: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 
 // ---------------------------------------------------------------------------
