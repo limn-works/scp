@@ -44,6 +44,7 @@
 //! See ADR-031 in `.docs/adrs/phase-6.md` for the full specification.
 
 pub mod majority;
+pub mod mls_integration;
 pub mod multisig;
 pub mod unanimity;
 
