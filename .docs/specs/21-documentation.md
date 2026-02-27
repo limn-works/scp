@@ -1,0 +1,354 @@
+# 21. Documentation
+
+## 21.1 Goal
+
+An agent with no prior context should be able to visit the SCP repository, understand the protocol, build the project, use the SDK in any target language, run tests, and implement features or write a conforming implementation — without human guidance.
+
+## 21.2 Current State
+
+### Strong
+- Protocol specification: 95% complete (21 spec files, 6,700+ lines)
+- ADRs: 6 phase documents covering all architectural decisions
+- Module-level code documentation: 100% of Rust files have `//!` headers
+- Trait contracts: ~100% documented with invariants and error conditions
+- Standards: 8 languages, error hierarchy, async patterns, CI tiers
+
+### Gaps
+
+| Category | Current | Target | Priority |
+|---|---|---|---|
+| Getting started | None | Build guide, environment setup | P0 |
+| SDK binding READMEs | None | README per language with install + quickstart | P0 |
+| Example applications | Pseudocode only | Runnable examples per language | P0 |
+| Testing guide | Commands in standards only | Standalone how-to | P0 |
+| Inline doc coverage | 57% (scp-core) | 90%+ | P1 |
+| Architecture navigation | Dense 1,054-line doc | Reading guide with entry points | P1 |
+| Generated API reference | None | Hosted rustdoc, typedoc, etc. | P1 |
+| CI workflow | Placeholder | Working GitHub Actions | P1 |
+| Integration guides | None | "Add SCP to existing app" | P2 |
+| Transport adapter guide | None | "Implement a new transport" | P2 |
+| Relay operator guide | None | "Run and monitor a relay" | P2 |
+| Conformance testing guide | Spec only | Working macro examples | P2 |
+
+## 21.3 Documentation Architecture
+
+```
+README.md                        # What SCP is, capabilities, architecture, license
+LICENSING.md                     # License structure and FAQ
+GETTING-STARTED.md               # Clone → build → run in 15 minutes
+CONTRIBUTING.md                  # Branch naming, commits, testing, PR process, CLA
+TESTING.md                       # How to run tests, write tests, debug failures
+
+docs/                            # Published documentation (agent-facing)
+├── guides/
+│   ├── architecture.md          # Reading guide: where to start, what to focus on
+│   ├── sdk-quickstart.md        # Unified quickstart (all languages)
+│   ├── transport-adapters.md    # How to implement a new transport adapter
+│   ├── storage-backends.md      # How to implement a new storage backend
+│   ├── relay-operations.md      # How to run, monitor, and upgrade a relay
+│   └── conformance-testing.md   # How to use conformance macros
+├── examples/
+│   ├── python/                  # Working Python examples
+│   ├── typescript/              # Working TypeScript examples
+│   ├── swift/                   # Working Swift examples
+│   └── rust/                    # Working Rust examples
+└── api/                         # Generated API reference (rustdoc output, etc.)
+
+scaffolds/                       # Clonable barebones project setups
+├── rust-client/                 # Minimal Rust binary using scp-core
+├── python-agent/                # Python agent skeleton with async runtime
+├── typescript-web/              # Browser app with WASM binding
+├── typescript-node/             # Node.js agent with NAPI binding
+├── swift-ios/                   # iOS app with Keychain custody
+├── swift-macos/                 # macOS app with Secure Enclave custody
+├── kotlin-android/              # Android app with Keystore custody
+└── relay/                       # Minimal relay with scp-node, TLS, monitoring
+
+templates/                       # Clonable working applications for common use cases
+├── chat/                        # Two-party encrypted chat (CLI + web)
+├── agent-tool-provider/         # Agent exposing tools via SCP context + MCP
+├── collaborative-workspace/     # Multi-party context with roles and tools
+├── personal-relay/              # Self-hosted relay with auto-TLS
+├── broadcast-feed/              # Broadcast context with subscriber management
+└── cross-context-bridge/        # Tool interface bridging two contexts
+
+bindings/python/README.md        # Python SDK: install, quickstart, platform notes
+bindings/swift/README.md         # Swift SDK: install, quickstart, platform notes
+bindings/typescript/README.md    # TypeScript SDK: install, quickstart, platform notes (when created)
+
+crates/scp-ffi/README.md         # PyO3 bridge: build, architecture, for maintainers
+crates/scp-ffi/napi/README.md    # NAPI bridge: build, native addon compilation
+crates/scp-ffi/wasm/README.md    # WASM bridge: build, JS callback injection
+crates/scp-ffi/uniffi/README.md  # UniFFI bridge: build, XCFramework generation
+
+.docs/                           # Internal project knowledge (unchanged)
+```
+
+### Separation of concerns
+
+- **`docs/`** is for consumers: agents and developers using SCP. Published, navigable, example-rich.
+- **`.docs/`** is for contributors: protocol design, ADRs, standards, build blueprints. Internal.
+- **Root files** (`GETTING-STARTED.md`, `TESTING.md`, `CONTRIBUTING.md`) are for everyone.
+- **Binding READMEs** are the entry point for each language's SDK users.
+- **Crate READMEs** are for maintainers of the FFI bridges.
+
+## 21.4 P0: Getting Started
+
+### GETTING-STARTED.md
+
+Must answer in under 15 minutes of reading + doing:
+
+1. **Prerequisites** — Rust toolchain version, platform requirements, optional deps for bindings
+2. **Clone and build** — `git clone`, `cargo build`, expected output, expected time
+3. **Run tests** — `cargo nextest run --workspace`, what success looks like
+4. **Run the Phase 1 proof** — Two processes exchange encrypted messages, step by step
+5. **Next steps** — Links to SDK quickstart, architecture guide, contributing guide
+
+### Audience
+An agent or developer who has never seen the repo. They should go from zero to "I built it and saw encrypted messages flow" in one sitting.
+
+## 21.5 P0: SDK Binding READMEs
+
+Each binding directory gets a README answering:
+
+1. **What is this** — One sentence (e.g., "Python SDK for SCP, providing identity, contexts, encryption, and transport")
+2. **Install** — `pip install scp-sdk` / SPM / npm
+3. **Quickstart** — 10-20 lines of working code: create identity, create context, send message
+4. **Platform notes** — Language-specific considerations (Python: async, Swift: Keychain/Secure Enclave, TypeScript: WASM vs NAPI)
+5. **API overview** — Brief listing of main classes/modules with one-line descriptions
+6. **Link to full docs** — Point to `docs/guides/sdk-quickstart.md` and generated API reference
+
+### Template for each:
+```markdown
+# SCP SDK for {Language}
+
+{One sentence description.}
+
+## Install
+
+{Package manager command.}
+
+## Quickstart
+
+{10-20 lines of working code.}
+
+## Platform Notes
+
+{Language-specific considerations.}
+
+## API Overview
+
+{Main classes/modules with one-line descriptions.}
+
+## Documentation
+
+- [SDK Quickstart Guide](../../docs/guides/sdk-quickstart.md)
+- [API Reference](../../docs/api/)
+- [Full Protocol Specification](../../.docs/specs/)
+```
+
+## 21.6 P0: Example Applications
+
+Minimal, runnable examples in each target language demonstrating:
+
+1. **Identity creation** — Create a DID, inspect it
+2. **Context creation** — Create a context with governance parameters
+3. **Message exchange** — Two participants send and receive encrypted messages
+4. **Tool invocation** — Register and invoke a tool within a context
+
+Each example should be:
+- Self-contained (single file or minimal project)
+- Runnable with one command
+- Commented explaining each step
+- Linked from the binding README
+
+## 21.7 P0: Testing Guide
+
+### TESTING.md
+
+1. **Running tests** — Commands for Tier 1, 2, 3. What each tier covers.
+2. **Writing unit tests** — Where tests live, naming convention, template
+3. **Writing integration tests** — How to use the Phase 1/2/5 tests as templates
+4. **Conformance macros** — How `transport_conformance!()`, `payment_adapter_conformance!()` work
+5. **Property-based tests** — When required, how to use proptest
+6. **Debugging failures** — Common error patterns, how to interpret output
+7. **CI** — What runs on PR, merge, nightly. How to reproduce CI locally.
+
+## 21.8 P1: Inline Documentation
+
+### scp-core targets
+
+| Area | Gap | Items | Action |
+|---|---|---|---|
+| Struct fields | Most public fields undocumented | ~180 structs | Add field-level `///` docs |
+| Enum variants | Large enums lack per-variant docs | ~92 enums | Add variant-level `///` docs |
+| Utility functions | Helper functions undocumented | ~228 functions | Add `///` docs with contract |
+| Constants | Magic numbers unexplained | ~70 constants | Add "why this value" docs |
+
+Priority files (most undocumented items):
+1. `src/context/mod.rs` (40 items)
+2. `src/context/ttl.rs` (37 items)
+3. `src/context/roles.rs` (24 items)
+4. `src/economy/types.rs` (23 items)
+5. `src/discovery/context.rs` (23 items)
+
+### Supporting crate targets
+
+| Crate | Gap | Action |
+|---|---|---|
+| scp-mcp | `client.rs`, `stdio.rs`, `sse.rs` missing module docs | Add `//!` headers |
+| scp-node | `http.rs`, `tls.rs`, `well_known.rs` missing module docs | Add `//!` headers |
+
+### FFI crate targets
+
+All four FFI crates (`scp-ffi`, `napi`, `wasm`, `uniffi`) need README files explaining build process, architecture, and maintenance patterns.
+
+## 21.9 P1: Architecture Navigation Guide
+
+### docs/guides/architecture.md
+
+Not a replacement for `.docs/architecture.md` — a reading guide for it:
+
+1. **Start here** — The 5 concepts you need (contexts, DIDs, UCANs, MLS, relays)
+2. **Crate map** — Which crate does what, dependency graph, where to find things
+3. **Reading order** — Suggested path through specs and ADRs
+4. **Key flows** — Context creation, message send, tool invocation (simplified, with file references)
+5. **Glossary** — Protocol-specific terms with one-line definitions
+
+## 21.10 P1: Generated API Reference
+
+Set up `cargo doc` generation and hosting:
+
+1. Ensure all public items have doc comments (see §21.8)
+2. Add `#![doc = include_str!("../README.md")]` to each crate's `lib.rs`
+3. Generate with `cargo doc --workspace --no-deps`
+4. Host on GitHub Pages or similar
+5. For TypeScript: generate with typedoc from WASM/NAPI bindings
+6. For Python: generate from type stubs + docstrings
+7. For Swift: generate with DocC from UniFFI output
+
+## 21.11 P2: Implementation Guides
+
+### Transport adapter guide (docs/guides/transport-adapters.md)
+- What the `TransportAdapter` trait requires
+- How to implement one (step by step with a concrete example)
+- How to test with `transport_conformance!()`
+- How to register with `TransportManager`
+
+### Storage backend guide (docs/guides/storage-backends.md)
+- What the `Storage` trait and `BlobStore` trait require
+- How to implement (step by step)
+- How to test with conformance macros
+- Performance considerations
+
+### Relay operations guide (docs/guides/relay-operations.md)
+- How to build and run `scp-node`
+- Configuration options
+- Monitoring and health checks
+- Upgrading
+- TLS setup
+
+### Conformance testing guide (docs/guides/conformance-testing.md)
+- What conformance means in SCP
+- How to use each conformance macro
+- How to write a new conformance suite
+- Relationship between conformance and the spec
+
+## 21.12 Guides, Scaffolds, and Templates
+
+Three categories of practical resources for agents and developers building with SCP, in ascending order of specificity:
+
+### Guides (docs/guides/)
+
+Step-by-step instructions for achieving specific outcomes. An agent follows a guide to learn how to do something.
+
+**Examples:**
+- "Build a transport adapter" — trait requirements, implementation steps, conformance testing
+- "Add SCP to a LangChain agent" — install SDK, create identity, join context, wire to LangChain
+- "Run a community relay" — build scp-node, configure TLS, set up monitoring
+- "Implement blocking in a context" — sender key rotation, grace periods, verification
+
+Guides are written for the reference implementation and reference specific files, types, and APIs. They are **instructional** — they teach a process.
+
+### Scaffolds (scaffolds/)
+
+Clonable, barebones project setups for generalized use cases. An agent clones a scaffold as a starting point and builds on top of it.
+
+Each scaffold is a minimal, working project structure with:
+- Package configuration (Cargo.toml, pyproject.toml, Package.swift, package.json, etc.)
+- SCP SDK dependency wired up
+- Placeholder identity creation and context joining
+- Build and run instructions in a README
+- No application logic — just the SCP integration skeleton
+
+**Scaffold matrix:**
+
+| Scaffold | Language | What it provides |
+|---|---|---|
+| `scaffolds/rust-client/` | Rust | Minimal Rust binary using scp-core directly |
+| `scaffolds/python-agent/` | Python | Python agent with scp-sdk, async runtime, identity setup |
+| `scaffolds/typescript-web/` | TypeScript | Browser app using WASM binding, identity in IndexedDB |
+| `scaffolds/typescript-node/` | TypeScript | Node.js agent using NAPI binding |
+| `scaffolds/swift-ios/` | Swift | iOS app with Keychain custody, push notifications |
+| `scaffolds/swift-macos/` | Swift | macOS app with Secure Enclave custody |
+| `scaffolds/kotlin-android/` | Kotlin | Android app with Keystore custody |
+| `scaffolds/relay/` | Rust | Minimal relay setup with scp-node, TLS, monitoring |
+
+Scaffolds are **structural** — they provide the right project shape so agents don't have to figure out package configuration, FFI wiring, or platform integration from scratch.
+
+### Templates (templates/)
+
+Clonable, fully-functional project setups for popular use cases. An agent clones a template and has a working application immediately — then customizes it.
+
+Each template is a complete, running application that demonstrates a real use case:
+- All SCP integration working end-to-end
+- Application logic for the specific use case
+- UI where applicable (or CLI for agent-facing tools)
+- Tests covering the integration points
+- README explaining what it does and how to customize it
+
+**Template examples:**
+
+| Template | Language(s) | What it is |
+|---|---|---|
+| `templates/chat/` | Python + TypeScript | Two-party encrypted chat (CLI + web) |
+| `templates/agent-tool-provider/` | Python | Agent exposing tools via SCP context with MCP bridge |
+| `templates/collaborative-workspace/` | TypeScript | Multi-party context with roles, tools, and governance |
+| `templates/personal-relay/` | Rust | Self-hosted relay with automatic TLS and DID publishing |
+| `templates/broadcast-feed/` | Python | Broadcast context (§5.14) with subscriber management |
+| `templates/cross-context-bridge/` | Rust | Tool interface bridging two contexts (§6.2) |
+
+Templates are **functional** — they solve a real problem out of the box. An agent studying a template understands not just how SCP works mechanically but how it's used to build real things.
+
+### Relationship between the three
+
+```
+Guides          → "How do I do X?"          (learn a technique)
+Scaffolds       → "Set me up to build X"     (start from the right shape)
+Templates       → "Give me a working X"      (start from a working app)
+```
+
+An agent building something novel uses a **guide**. An agent building something common in an uncommon way uses a **scaffold**. An agent building something common in a common way uses a **template**.
+
+## 21.13 Documentation Website
+
+For public-facing documentation, a static site generated from `docs/`:
+
+- **Tool:** mdBook, Docusaurus, or similar
+- **Content:** Guides, examples, API reference, spec summaries
+- **Audience:** Agent builders, relay operators, protocol implementers
+- **Hosted at:** docs.limn.works or similar
+
+This is P2 — the content in `docs/` is the priority. The website is presentation.
+
+## 21.13 Compliance Documentation (Agent-Optimized)
+
+For agents implementing SCP from the spec (not using the reference implementation):
+
+1. **Protocol compliance checklist** — Every MUST/SHOULD/MAY from the spec, as a checkable list
+2. **Wire format reference** — MessagePack schemas for all envelope types
+3. **Cryptographic requirements** — Exact algorithms, parameters, key sizes, derivation paths
+4. **Test vectors** — Known-good inputs and outputs for crypto operations
+5. **Conformance test suite** — Language-independent test cases that any implementation must pass
+
+This is P2 but important for the protocol's long-term goal of multiple independent implementations.
