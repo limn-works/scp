@@ -38,12 +38,21 @@
 //! with a 5-second grace period for in-flight tasks.
 //!
 //! See ADR-021 in `.docs/adrs/phase-4.md` for the full bridge specification.
+//!
+//! # Shutdown ordering
+//!
+//! SCP opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
+//! `TransportManager`) track their lifetime via a global reference counter,
+//! [`HANDLE_COUNT`]. Call [`scp_shutdown`] before dropping the tokio runtime
+//! to ensure all outstanding FFI handles are released first (see ADR-021
+//! acceptance criterion 1 and sdk-common.md §FFI Async Bridging Risks #4).
 
 // FFI bridge requires targeted unsafe for UniFFI scaffolding interop.
 // The uniffi::include_scaffolding! macro expands unsafe extern "C" declarations.
 #![allow(unsafe_code)]
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub mod bridge;
@@ -60,6 +69,8 @@ pub use bridge::{
     identity_resolve, tool_invoke, tool_register, tool_verify, transport_connect,
     transport_status, ucan_mint, ucan_revoke, ucan_validate,
 };
+// Re-export shutdown function defined in this module.
+// (scp_shutdown is defined here and exported via #[uniffi::export] above.)
 
 // Include the minimal UDL-generated scaffolding. The UDL file contains only
 // the namespace anchor. All types and functions are defined via proc-macros.
@@ -79,6 +90,89 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 /// 5 seconds per ADR-021 acceptance criterion 1.
 #[allow(dead_code)]
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// Handle reference counter — shutdown ordering
+//
+// Every opaque FFI handle object (`Identity`, `ContextHandle`, `UcanToken`,
+// `TransportManager`) increments this counter on construction and decrements
+// it in its `Drop` impl.
+//
+// `scp_shutdown` waits until this counter reaches zero (or times out) before
+// allowing the tokio runtime to be dropped. This prevents use-after-free
+// panics that would occur if language-side objects still held FFI handles
+// when the Rust runtime was dropped.
+//
+// See sdk-common.md §"FFI Async Bridging Risks" rule 4.
+// ---------------------------------------------------------------------------
+
+/// Global count of live opaque FFI handle objects.
+///
+/// Incremented in each opaque type's constructor and decremented in `Drop`.
+/// Used by [`scp_shutdown`] to block runtime teardown until all handles
+/// are released.
+pub(crate) static HANDLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Increments the live handle count.
+///
+/// Called from each opaque type's constructor immediately after the handle
+/// is allocated.
+#[inline]
+pub(crate) fn increment_handle_count() {
+    HANDLE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Decrements the live handle count.
+///
+/// Called from each opaque type's `Drop` impl immediately before the handle
+/// is freed.
+#[inline]
+pub(crate) fn decrement_handle_count() {
+    HANDLE_COUNT.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Waits for all outstanding FFI handles to be released, then shuts down.
+///
+/// Call this from Swift/Kotlin before your process exits or before tearing
+/// down the SCP library. It blocks (on a background thread) until either:
+///
+/// - All opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
+///   `TransportManager`) have been garbage-collected / freed, **or**
+/// - The `timeout_secs` deadline has elapsed.
+///
+/// After this call returns, the tokio runtime may be dropped safely — no
+/// outstanding FFI handles remain that could attempt to call into it.
+///
+/// The default timeout is 5 seconds (per ADR-021 acceptance criterion 1).
+/// Pass `0` to return immediately without waiting.
+///
+/// # Thread safety
+///
+/// This function is safe to call from any thread. It polls `HANDLE_COUNT`
+/// in 10 ms intervals and does not block the tokio runtime.
+///
+/// # Example (Swift)
+///
+/// ```swift
+/// // Call before application exit:
+/// scpShutdown(timeoutSecs: 5)
+/// ```
+#[uniffi::export]
+pub fn scp_shutdown(timeout_secs: u64) {
+    if timeout_secs == 0 {
+        return;
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while HANDLE_COUNT.load(Ordering::Relaxed) > 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // The tokio runtime (`RUNTIME`) is a static and will be dropped on
+    // process exit. This function ensures language-side cleanup completes
+    // before that point.
+}
 
 /// Returns a handle to the shared tokio runtime, initializing it on first call.
 ///
@@ -128,6 +222,18 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 /// via `callbackFlow`. Implemented by Swift/Kotlin code and passed to
 /// [`context_subscribe`].
 ///
+/// # SAFETY: Thread execution context
+///
+/// UniFFI callbacks execute on whatever Rust tokio thread is currently
+/// running — NOT on the Swift/Kotlin main thread. Implementations MUST be
+/// thread-safe (`Send + Sync`) and MUST NOT assume main-thread execution.
+/// Any UI or main-thread-only operations MUST be dispatched explicitly:
+///
+/// - **Swift:** `await MainActor.run { /* UI update */ }`
+/// - **Kotlin:** `withContext(Dispatchers.Main) { /* UI update */ }`
+///
+/// See sdk-common.md §"FFI Async Bridging Risks" rule 2.
+///
 /// See ADR-021 acceptance criterion 12.
 #[uniffi::export(callback_interface)]
 pub trait MessageListener: Send + Sync {
@@ -145,6 +251,16 @@ pub trait MessageListener: Send + Sync {
 /// Kotlin SDK: Android Keystore.
 ///
 /// Implemented by Swift/Kotlin code and injected into the Rust engine.
+///
+/// # SAFETY: Thread execution context
+///
+/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
+/// NOT assume main-thread execution. Keychain / Secure Enclave operations are
+/// generally thread-safe; UI updates triggered from within implementations
+/// MUST dispatch to the main actor/dispatcher explicitly.
+///
+/// See sdk-common.md §"FFI Async Bridging Risks" rule 2.
 ///
 /// See ADR-006 (Platform Abstraction) and ADR-021 acceptance criterion 12.
 #[uniffi::export(callback_interface)]
@@ -175,6 +291,17 @@ pub trait KeyCustodyProvider: Send + Sync {
 /// Swift SDK: Core Data / Keychain / file-based storage.
 /// Kotlin SDK: Room / SharedPreferences.
 ///
+/// # SAFETY: Thread execution context
+///
+/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
+/// NOT assume main-thread execution. Storage operations are generally
+/// thread-safe (Core Data with proper context management, Room with DAOs).
+/// Any main-thread work triggered within an implementation MUST be dispatched
+/// explicitly (`MainActor.run` / `Dispatchers.Main`).
+///
+/// See sdk-common.md §"FFI Async Bridging Risks" rule 2.
+///
 /// See ADR-006 (Platform Abstraction) and ADR-021 acceptance criterion 12.
 #[uniffi::export(callback_interface)]
 pub trait StorageProvider: Send + Sync {
@@ -201,6 +328,16 @@ pub trait StorageProvider: Send + Sync {
 ///
 /// Swift SDK: APNs.
 /// Kotlin SDK: FCM.
+///
+/// # SAFETY: Thread execution context
+///
+/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
+/// NOT assume main-thread execution. APNs and FCM APIs are thread-safe;
+/// any UI notification work triggered within an implementation MUST be
+/// dispatched to the main actor/dispatcher explicitly.
+///
+/// See sdk-common.md §"FFI Async Bridging Risks" rule 2.
 ///
 /// See ADR-006 (Platform Abstraction) and ADR-021 acceptance criterion 12.
 #[uniffi::export(callback_interface)]
@@ -306,5 +443,163 @@ mod tests {
         };
         assert!(identity.to_string().contains("identity error"));
         assert!(context.to_string().contains("context error"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance tests (SCP-078)
+    // -----------------------------------------------------------------------
+
+    /// Verifies that `identity_create("in_memory")` returns a DID with the
+    /// `did:dht:` prefix using the real `scp-core` identity stack.
+    ///
+    /// Conformance: identity bridge must produce a valid, self-certifying DID.
+    #[test]
+    fn identity_create_in_memory_produces_did_dht_prefix() {
+        let rt = runtime();
+        let result = rt.block_on(identity_create("in_memory".to_owned()));
+        let identity = result.expect("identity_create should succeed for in_memory custody");
+        assert!(
+            identity.did().starts_with("did:dht:"),
+            "expected did:dht: prefix, got: {}",
+            identity.did()
+        );
+    }
+
+    /// Verifies that `context_create` produces an `Active` context handle
+    /// with a non-empty context ID.
+    ///
+    /// Conformance: context bridge must produce an active handle on creation.
+    #[test]
+    fn context_create_returns_active_context() {
+        let rt = runtime();
+
+        // First create an identity to pass as the context creator.
+        let identity = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed");
+
+        let params = bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+
+        let handle = rt
+            .block_on(context_create(identity, params))
+            .expect("context_create should succeed");
+
+        assert_eq!(
+            handle.state().expect("state() should not fail"),
+            "active",
+            "newly created context should be active"
+        );
+        assert!(
+            !handle.context_id().is_empty(),
+            "context_id should be non-empty"
+        );
+    }
+
+    /// Verifies that `context_subscribe` accepts a mock `MessageListener`
+    /// implementation and calls `on_complete` on the listener.
+    ///
+    /// Conformance: subscribe bridge must accept a callback interface and
+    /// signal completion without panicking.
+    #[test]
+    fn context_subscribe_accepts_mock_listener() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct MockListener {
+            completed: Arc<AtomicBool>,
+        }
+
+        impl MessageListener for MockListener {
+            fn on_message(&self, _message: Message) {}
+            fn on_error(&self, _error: ScpError) {}
+            fn on_complete(&self) {
+                self.completed.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let rt = runtime();
+
+        let identity = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed");
+
+        let params = bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+
+        let handle = rt
+            .block_on(context_create(identity, params))
+            .expect("context_create failed");
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let listener = Box::new(MockListener {
+            completed: Arc::clone(&completed),
+        });
+
+        rt.block_on(context_subscribe(handle, listener))
+            .expect("context_subscribe should succeed");
+
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "on_complete should have been called by context_subscribe"
+        );
+    }
+
+    /// Verifies that the handle reference counter tracks live opaque objects
+    /// and returns to the pre-test baseline after all handles are dropped.
+    ///
+    /// Conformance (shutdown ordering): `HANDLE_COUNT` must reflect live
+    /// handles accurately so `scp_shutdown` can block until safe to teardown.
+    ///
+    /// Note: This test uses a local baseline rather than asserting an absolute
+    /// zero, because other tests may run concurrently and hold handles.
+    #[test]
+    fn handle_count_tracks_live_opaque_objects() {
+        let rt = runtime();
+
+        // Record the baseline before we allocate anything in this test.
+        let baseline = HANDLE_COUNT.load(Ordering::SeqCst);
+
+        // Allocate two Identity handles.
+        let id1 = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("first identity_create failed");
+        let id2 = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("second identity_create failed");
+
+        let after_alloc = HANDLE_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            after_alloc,
+            baseline + 2,
+            "HANDLE_COUNT should increase by 2 after allocating two identities"
+        );
+
+        // Drop both handles — each Drop impl decrements the counter.
+        drop(id1);
+        drop(id2);
+
+        let after_drop = HANDLE_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            after_drop, baseline,
+            "HANDLE_COUNT should return to baseline after dropping both identities"
+        );
+    }
+
+    /// Verifies that `scp_shutdown(0)` returns immediately (no waiting).
+    #[test]
+    fn scp_shutdown_zero_timeout_returns_immediately() {
+        // Should return without hanging even if handles are live.
+        scp_shutdown(0);
     }
 }

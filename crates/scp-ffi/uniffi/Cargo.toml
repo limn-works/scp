@@ -14,7 +14,11 @@ uniffi = { version = "0.29", features = ["tokio"] }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
-scp-platform = { path = "../../scp-platform" }
+# The `testing` feature enables InMemoryKeyCustody, used by the `"in_memory"`
+# custody path in `identity_create`. This is an intentional bridge-layer
+# dependency: the in-memory custody path is needed for testing, CLI use, and
+# desktop contexts where no hardware security module is available.
+scp-platform = { path = "../../scp-platform", features = ["testing"] }
 scp-transport = { path = "../../scp-transport" }
 serde_json = { workspace = true }
 uuid = { workspace = true }

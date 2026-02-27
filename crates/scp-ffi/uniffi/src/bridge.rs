@@ -29,7 +29,7 @@ use std::sync::Arc;
 use scp_core::identity::{DidDht, DidMethod};
 use uuid::Uuid;
 
-use crate::runtime;
+use crate::{decrement_handle_count, increment_handle_count, runtime};
 
 // ---------------------------------------------------------------------------
 // ScpError — unified error type (maps to Swift throws / Kotlin exceptions)
@@ -673,6 +673,17 @@ impl Identity {
     }
 }
 
+impl Drop for Identity {
+    /// Decrements the global FFI handle count.
+    ///
+    /// Called when the last `Arc<Identity>` is dropped, releasing the handle.
+    /// This allows [`crate::scp_shutdown`] to detect when all handles are
+    /// gone before tearing down the tokio runtime.
+    fn drop(&mut self) {
+        decrement_handle_count();
+    }
+}
+
 /// Opaque handle to an SCP context.
 ///
 /// Stores context metadata (ID, state, creator DID). The actual context
@@ -723,6 +734,17 @@ impl ContextHandle {
     /// Returns the DID of the context creator.
     pub fn creator_did(&self) -> String {
         self.creator_did.clone()
+    }
+}
+
+impl Drop for ContextHandle {
+    /// Decrements the global FFI handle count.
+    ///
+    /// Called when the last `Arc<ContextHandle>` is dropped. This allows
+    /// [`crate::scp_shutdown`] to detect when all handles are released
+    /// before tearing down the tokio runtime.
+    fn drop(&mut self) {
+        decrement_handle_count();
     }
 }
 
@@ -777,6 +799,17 @@ impl UcanToken {
     }
 }
 
+impl Drop for UcanToken {
+    /// Decrements the global FFI handle count.
+    ///
+    /// Called when the last `Arc<UcanToken>` is dropped. This allows
+    /// [`crate::scp_shutdown`] to detect when all handles are released
+    /// before tearing down the tokio runtime.
+    fn drop(&mut self) {
+        decrement_handle_count();
+    }
+}
+
 /// Opaque handle to the transport layer.
 ///
 /// Exposes connection status and relay URL without leaking connection state.
@@ -814,6 +847,17 @@ impl TransportManager {
     }
 }
 
+impl Drop for TransportManager {
+    /// Decrements the global FFI handle count.
+    ///
+    /// Called when the last `Arc<TransportManager>` is dropped. This allows
+    /// [`crate::scp_shutdown`] to detect when all handles are released
+    /// before tearing down the tokio runtime.
+    fn drop(&mut self) {
+        decrement_handle_count();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Free functions — identity operations
 //
@@ -834,22 +878,64 @@ impl TransportManager {
 ///
 /// Returns `ScpError::Identity` if key generation or DID creation fails.
 /// Returns `ScpError::Validation` if the custody string is not recognized.
+///
+/// # In-memory custody
+///
+/// When `custody` is `"in_memory"`, this function creates a real
+/// `did:dht` identity using [`scp_core::identity::DidDht`] backed by
+/// [`scp_platform::testing::InMemoryKeyCustody`]. The returned DID is
+/// self-certifying and has the `did:dht:z` prefix.
+///
+/// `"in_memory"` custody stores key material in unprotected heap memory.
+/// It is suitable for testing and development but NOT for production use
+/// on mobile devices — use `"platform"` (Secure Enclave / Android Keystore)
+/// in production.
 #[uniffi::export]
 pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> {
-    let _custody_method = parse_custody_method(&custody)?;
+    let custody_method = parse_custody_method(&custody)?;
 
-    // Identity creation requires a wired KeyCustodyProvider (ADR-006 platform
-    // abstraction). InMemoryKeyCustody is not acceptable in production — it
-    // stores private key material in unprotected heap memory on mobile devices.
-    // Full implementation is tracked for the platform integration story that
-    // wires KeyCustodyProvider callbacks to scp-core.
-    Err(ScpError::Identity {
-        message: "identity creation requires a wired platform KeyCustodyProvider — \
-                  use the KeyCustodyProvider callback interface to inject \
-                  Secure Enclave (iOS) or Android Keystore (Android) backed custody"
-            .to_owned(),
-        code: "SCP-IDN-1003".to_owned(),
-    })
+    runtime()
+        .spawn(async move {
+            match custody_method {
+                CustodyMethod::InMemory => {
+                    // Wire to real scp-core using InMemoryKeyCustody.
+                    // The `testing` feature is always available in dev/test
+                    // builds; production builds use the "platform" custody path.
+                    let key_custody = scp_platform::testing::InMemoryKeyCustody::new();
+                    let dht = DidDht::new();
+                    let (scp_identity, _document) =
+                        dht.create(&key_custody).await.map_err(ScpError::from)?;
+
+                    let handle = Arc::new(Identity {
+                        did: scp_identity.did.clone(),
+                        custody_type: CustodyMethod::InMemory,
+                    });
+                    increment_handle_count();
+                    Ok(handle)
+                }
+                CustodyMethod::Platform | CustodyMethod::Software => {
+                    // Platform and software custody require a wired
+                    // KeyCustodyProvider (ADR-006 platform abstraction).
+                    // Full implementation is tracked for the platform
+                    // integration story that wires KeyCustodyProvider
+                    // callbacks to scp-core.
+                    Err(ScpError::Identity {
+                        message: format!(
+                            "custody type {custody:?} requires a wired platform \
+                             KeyCustodyProvider — use the KeyCustodyProvider callback \
+                             interface to inject Secure Enclave (iOS) or Android \
+                             Keystore (Android) backed custody"
+                        ),
+                        code: "SCP-IDN-1003".to_owned(),
+                    })
+                }
+            }
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            message: format!("tokio task join error during identity creation: {e}"),
+            code: "SCP-IDN-1007".to_owned(),
+        })?
 }
 
 /// Loads an existing identity from storage by its DID.
@@ -879,10 +965,12 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                 });
             }
 
-            Ok(Arc::new(Identity {
+            let handle = Arc::new(Identity {
                 did,
                 custody_type: CustodyMethod::InMemory,
-            }))
+            });
+            increment_handle_count();
+            Ok(handle)
         })
         .await
         .map_err(|e| ScpError::Identity {
@@ -962,11 +1050,13 @@ pub async fn context_create(
         .spawn(async move {
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
-            Ok(Arc::new(ContextHandle {
+            let handle = Arc::new(ContextHandle {
                 context_id,
                 state: std::sync::Mutex::new(ContextState::Active),
                 creator_did: identity.did.clone(),
-            }))
+            });
+            increment_handle_count();
+            Ok(handle)
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -1408,13 +1498,15 @@ pub async fn tool_verify(
 pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager>, ScpError> {
     runtime()
         .spawn(async move {
-            Ok(Arc::new(TransportManager {
+            let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
                     connected: true,
                     relay_url: Some(relay_url),
                     latency_ms: None,
                 }),
-            }))
+            });
+            increment_handle_count();
+            Ok(handle)
         })
         .await
         .map_err(|e| ScpError::Transport {
