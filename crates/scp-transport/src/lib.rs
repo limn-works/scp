@@ -32,6 +32,7 @@ pub mod config;
 pub mod error;
 pub mod manager;
 pub mod native;
+pub mod relay;
 pub mod scoring;
 pub mod traits;
 

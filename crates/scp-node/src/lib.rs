@@ -9,15 +9,23 @@
 
 #![forbid(unsafe_code)]
 
+pub mod http;
+pub mod tls;
+mod well_known;
+
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use tokio::sync::RwLock;
 
 use scp_core::identity::document::DidDocument;
 use scp_core::identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
+
+pub use http::BroadcastContext;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -45,6 +53,10 @@ pub enum NodeError {
     /// An invalid configuration value was provided.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// The HTTP server failed to bind or encountered a fatal I/O error.
+    #[error("serve error: {0}")]
+    Serve(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +154,8 @@ pub struct ApplicationNode<S: Storage> {
     identity: IdentityHandle,
     /// The storage backend.
     storage: Arc<S>,
+    /// Shared state for HTTP handlers (`.well-known/scp`, relay bridge).
+    state: Arc<http::NodeState>,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -186,6 +200,16 @@ impl<S: Storage> ApplicationNode<S> {
     #[must_use]
     pub fn relay_url(&self) -> String {
         format!("wss://{}/scp/v1", self.domain)
+    }
+
+    /// Registers a broadcast context so it appears in subsequent
+    /// `GET /.well-known/scp` responses.
+    ///
+    /// Only broadcast contexts may be registered (spec section 18.3
+    /// privacy constraints). Encrypted context IDs MUST NOT be exposed.
+    pub async fn register_broadcast_context(&self, id: String, name: Option<String>) {
+        let mut contexts = self.state.broadcast_contexts.write().await;
+        contexts.push(BroadcastContext { id, name });
     }
 
     /// Gracefully shuts down the relay server.
@@ -553,11 +577,19 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             "application node started"
         );
 
+        let state = Arc::new(http::NodeState {
+            did: identity.did.clone(),
+            relay_url: relay_url.clone(),
+            broadcast_contexts: RwLock::new(Vec::new()),
+            relay_addr: bound_addr,
+        });
+
         Ok(ApplicationNode {
             domain,
             relay: RelayHandle { bound_addr, shutdown_handle },
             identity: IdentityHandle { identity, document },
             storage,
+            state,
         })
     }
 }
@@ -1141,5 +1173,215 @@ mod tests {
             node.identity().did().starts_with("did:dht:"),
             "node should build successfully with acme_email set"
         );
+    }
+
+    // -- HTTP tests (SCP-147) ------------------------------------------------
+
+    mod http_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use scp_core::well_known::WellKnownScp;
+        use tower::ServiceExt;
+
+        /// Builds a node and returns it along with the well-known router
+        /// for direct testing via tower::ServiceExt.
+        async fn build_test_node() -> ApplicationNode<InMemoryStorage> {
+            test_builder()
+                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .build()
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn well_known_returns_valid_json() {
+            let node = build_test_node().await;
+            let router = node.well_known_router();
+
+            let request = Request::builder()
+                .uri("/.well-known/scp")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = router.oneshot(request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+
+            // Check Content-Type is application/json.
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .expect("should have content-type header")
+                .to_str()
+                .unwrap();
+            assert!(
+                content_type.contains("application/json"),
+                "Content-Type should be application/json, got: {content_type}"
+            );
+
+            // Parse the body as WellKnownScp.
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let doc: WellKnownScp = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(doc.version, 1);
+            assert!(
+                doc.did.starts_with("did:dht:"),
+                "DID should be the node's DID, got: {}",
+                doc.did
+            );
+            assert_eq!(doc.relay, "wss://test.example.com/scp/v1");
+            assert!(doc.contexts.is_none(), "no contexts registered yet");
+        }
+
+        #[tokio::test]
+        async fn well_known_includes_registered_broadcast_contexts() {
+            let node = build_test_node().await;
+
+            // Register a broadcast context.
+            node.register_broadcast_context(
+                "abc123".to_owned(),
+                Some("Test Broadcast".to_owned()),
+            )
+            .await;
+
+            let router = node.well_known_router();
+
+            let request = Request::builder()
+                .uri("/.well-known/scp")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let doc: WellKnownScp = serde_json::from_slice(&body).unwrap();
+
+            let contexts = doc.contexts.expect("should have contexts");
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(contexts[0].id, "abc123");
+            assert_eq!(contexts[0].name.as_deref(), Some("Test Broadcast"));
+            assert_eq!(contexts[0].mode.as_deref(), Some("broadcast"));
+            assert!(
+                contexts[0].uri.as_ref().unwrap().starts_with("scp://context/abc123"),
+                "URI should start with scp://context/abc123, got: {}",
+                contexts[0].uri.as_ref().unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn well_known_dynamic_updates_on_new_context() {
+            let node = build_test_node().await;
+
+            // First request: no contexts.
+            let router = node.well_known_router();
+            let request = Request::builder()
+                .uri("/.well-known/scp")
+                .body(Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let doc: WellKnownScp = serde_json::from_slice(&body).unwrap();
+            assert!(doc.contexts.is_none());
+
+            // Register a context.
+            node.register_broadcast_context("def456".to_owned(), None).await;
+
+            // Second request: context appears.
+            let router = node.well_known_router();
+            let request = Request::builder()
+                .uri("/.well-known/scp")
+                .body(Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let doc: WellKnownScp = serde_json::from_slice(&body).unwrap();
+
+            let contexts = doc.contexts.expect("should now have contexts");
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(contexts[0].id, "def456");
+        }
+
+        #[tokio::test]
+        async fn relay_router_upgrades_websocket() {
+            let node = build_test_node().await;
+            let _relay_addr = node.relay().bound_addr();
+
+            // Start the relay router on a separate port.
+            let relay_router = node.relay_router();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let http_addr = listener.local_addr().unwrap();
+
+            let server_handle = tokio::spawn(async move {
+                axum::serve(listener, relay_router).await.unwrap();
+            });
+
+            // Connect via WebSocket to the HTTP server's /scp/v1 endpoint.
+            let url = format!("ws://{http_addr}/scp/v1");
+            let connect_result = tokio_tungstenite::connect_async(&url).await;
+
+            assert!(
+                connect_result.is_ok(),
+                "WebSocket upgrade at /scp/v1 should succeed, got error: {:?}",
+                connect_result.err()
+            );
+
+            // Clean up.
+            server_handle.abort();
+            let _ = server_handle.await;
+        }
+
+        #[tokio::test]
+        async fn custom_app_routes_merge_with_scp_routes() {
+            let node = build_test_node().await;
+
+            // Create a simple app route.
+            let app_router = axum::Router::new().route(
+                "/health",
+                axum::routing::get(|| async { "ok" }),
+            );
+
+            // Merge with SCP routes.
+            let well_known = node.well_known_router();
+            let merged = app_router.merge(well_known);
+
+            // Test the custom route.
+            let request = Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap();
+            let response = merged.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"ok");
+
+            // Test the .well-known/scp route on the same merged router.
+            let request = Request::builder()
+                .uri("/.well-known/scp")
+                .body(Body::empty())
+                .unwrap();
+            let response = merged.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let doc: WellKnownScp = serde_json::from_slice(&body).unwrap();
+            assert_eq!(doc.version, 1);
+        }
     }
 }

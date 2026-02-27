@@ -1,4 +1,4 @@
-//! PyO3 FFI bridge for SCP — the `_scp_core` Python extension module.
+//! `PyO3` FFI bridge for SCP — the `_scp_core` Python extension module.
 //!
 //! This crate is the Rust half of the Python SDK. It exposes a flat set of
 //! `#[pyfunction]` and `#[pyclass]` definitions that map directly to
@@ -8,7 +8,7 @@
 //! # Async runtime
 //!
 //! A single tokio [`Runtime`] is created at module import time and stored in a
-//! [`OnceLock`]. All async bridge functions use PyO3's native async support
+//! [`OnceLock`]. All async bridge functions use `PyO3`'s native async support
 //! (`#[pyfunction] async fn`) which automatically bridges between the tokio
 //! runtime and Python's asyncio event loop.
 //!
@@ -17,25 +17,39 @@
 //!
 //! # Shutdown
 //!
-//! Runtime shutdown is handled on module finalization (Python interpreter exit).
-//! The runtime is dropped, which waits for in-flight tasks to complete with a
-//! 5-second timeout.
+//! Runtime shutdown is handled in two phases:
+//! 1. An `atexit` handler calls `shutdown_runtime()`, which blocks for 100ms
+//!    to let cooperative tasks observe shutdown. Kept short to avoid holding
+//!    the Python GIL.
+//! 2. On process exit, the static `OnceLock` is reclaimed and the tokio
+//!    runtime is dropped (which waits for remaining tasks to complete).
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` for the full specification.
 
 // FFI bridge requires targeted unsafe for PyO3 interop. Each usage is documented.
 #![allow(unsafe_code)]
 
+pub mod context;
+
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use pyo3::prelude::*;
 
+pub mod error;
+pub mod event_log;
+pub mod identity;
+pub mod tools;
+pub mod transport;
+pub mod types;
+pub mod ucan;
+
 /// Global tokio runtime, created once at module import.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-/// Shutdown timeout for the tokio runtime when the Python interpreter exits.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Brief drain window for in-flight tokio tasks during Python atexit.
+/// Kept short (100ms) to avoid blocking the Python GIL unnecessarily.
+const SHUTDOWN_DRAIN: Duration = Duration::from_millis(100);
 
 /// Returns a reference to the shared tokio runtime.
 ///
@@ -63,18 +77,28 @@ pub(crate) fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
 ///
 /// # Errors
 ///
-/// Returns `PyRuntimeError` if tokio runtime construction fails.
-#[allow(clippy::expect_used)] // OnceLock::get_or_init requires an infallible closure.
+/// Returns `PyRuntimeError` if tokio runtime construction fails, which
+/// prevents undefined behavior from panicking across the FFI boundary.
 fn init_runtime() -> PyResult<()> {
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("scp-tokio-worker")
-            .build()
-            // The runtime builder only fails on OS-level resource exhaustion,
-            // which is unrecoverable. This is the sole panic point.
-            .expect("failed to create SCP tokio runtime — OS resource exhaustion")
-    });
+    // If already initialized, return immediately.
+    if RUNTIME.get().is_some() {
+        return Ok(());
+    }
+
+    // Build the runtime, returning an error instead of panicking.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("scp-tokio-worker")
+        .build()
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to create SCP tokio runtime: {e}"
+            ))
+        })?;
+
+    // Store it. If another thread raced us, that's fine — OnceLock
+    // guarantees only one value is stored and our `rt` is simply dropped.
+    let _ = RUNTIME.set(rt);
     Ok(())
 }
 
@@ -86,6 +110,7 @@ fn runtime_is_initialized() -> bool {
 
 /// Returns a version string for the `_scp_core` extension module.
 #[pyfunction]
+#[allow(clippy::missing_const_for_fn)] // PyO3 #[pyfunction] cannot be const.
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -97,8 +122,8 @@ fn version() -> &'static str {
 /// This ordering ensures all Python destructors (`__del__`, weak-ref callbacks)
 /// complete before the tokio runtime is dropped.
 ///
-/// The actual runtime drop (which calls `shutdown_timeout` with
-/// [`SHUTDOWN_TIMEOUT`]) happens when the process exits and the static
+/// The actual runtime drop (which invokes tokio's `shutdown_timeout`)
+/// happens when the process exits and the static
 /// `OnceLock` is reclaimed. This function serves as a coordination point:
 /// it blocks briefly to let in-flight tokio tasks observe that Python is
 /// shutting down.
@@ -107,14 +132,17 @@ fn version() -> &'static str {
 /// shut down (or before it was initialized) is a no-op.
 #[pyfunction]
 fn shutdown_runtime() {
+    // Take no action if the runtime was never initialized.
+    // We cannot take ownership of the OnceLock value, so we signal
+    // graceful shutdown by spawning a brief drain and then returning.
+    // The actual runtime drop happens when the process exits and the
+    // static OnceLock is reclaimed.
     if let Some(rt) = RUNTIME.get() {
-        // Block briefly to allow in-flight tasks to complete. This runs
-        // during atexit, so the Python GIL is held and no new Python
-        // callbacks will be issued. The SHUTDOWN_TIMEOUT constant governs
-        // how long we wait for tasks to drain.
-        let deadline = SHUTDOWN_TIMEOUT;
-        let _ = rt.block_on(async move {
-            tokio::time::sleep(deadline).await;
+        // Give in-flight tasks a brief window to complete. 100ms is
+        // sufficient for cooperative tasks to observe shutdown and
+        // finish; anything longer blocks the Python GIL unnecessarily.
+        rt.block_on(async {
+            tokio::time::sleep(SHUTDOWN_DRAIN).await;
         });
     }
 }
@@ -141,10 +169,23 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let shutdown_fn = m.getattr("shutdown_runtime")?;
     atexit.call_method1("register", (shutdown_fn,))?;
 
-    // Step 3: Register bridge functions.
+    // Step 3: Register exception class hierarchy.
+    error::register_exceptions(m)?;
+
+    // Step 4: Register identity bridge classes and functions.
+    identity::register_identity(m)?;
+
+    // Step 5: Register bridge functions.
     m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
+
+    // Step 6: Register domain bridge modules.
+    context::register_context(m)?;
+    tools::register_tools(m)?;
+    transport::register_transport(m)?;
+    ucan::register_ucan(m)?;
+    event_log::register_event_log(m)?;
 
     Ok(())
 }

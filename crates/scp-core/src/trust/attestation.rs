@@ -421,7 +421,7 @@ pub fn check_threshold_attestation(
 /// The canonical form includes: id, `attestation_type` (debug string), issuer,
 /// subject, claim (compact JSON), and `issued_at`. This deterministic
 /// representation is what the issuer signs and what the verifier checks.
-fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> {
+pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(attestation.id.as_bytes());
     bytes.extend_from_slice(format!("{:?}", attestation.attestation_type).as_bytes());

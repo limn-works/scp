@@ -615,48 +615,253 @@ agent_deregister(did) -> { removed }
 
 ## ADR-021: UniFFI Bridge Definitions
 
-**Status:** Pending
+**Status:** Decided
 
-### What This ADR Will Decide
+### Context
 
-The UniFFI UDL (Universal Definition Language) file that defines the shared FFI surface for Swift and Kotlin SDKs. The UDL specifies which Rust types, functions, and traits are exposed across the FFI boundary, their argument/return types, error handling, and async bridging.
+The Swift and Kotlin SDKs require a shared FFI surface to the Rust protocol engine. UniFFI (Mozilla's Uniform Foreign Function Interface) generates Swift and Kotlin bindings from a single definition, producing idiomatic code for both platforms from one source of truth. The bridge layer is the boundary between `scp-core`, `scp-transport`, and `scp-platform` (Rust) and the Swift/Kotlin worlds. It must expose the same logical API surface as the PyO3 bridge (ADR-013) without leaking Rust concepts across the FFI boundary, while bridging async runtimes (tokio on the Rust side, Swift concurrency and Kotlin coroutines on the consumer side).
 
-### Blockers
+UniFFI supports two definition approaches: UDL files (external interface definition) and proc-macros (inline Rust annotations). The PyO3 bridge (ADR-013) established the FFI pattern for this project: flat function surface, opaque types for crypto state, async bridging, and a unified error hierarchy. The UniFFI bridge mirrors that surface for Swift and Kotlin.
 
-- Phase 1-2 Rust crate public API must be designed and implemented. The UDL maps to concrete Rust types (`Identity`, `ContextHandle`, `MlsGroup`, etc.) that don't exist yet.
-- ADR-013 (PyO3 bridge) establishes the FFI pattern — the UniFFI bridge should expose an equivalent surface.
+### Decision
 
-### Required Inputs When Writing
+Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros (`#[uniffi::export]`) as the primary definition approach, with a UDL file (`scp.udl`) as a supplementary definition for callback interfaces and complex type mappings that proc-macros cannot express. The bridge exposes a flat set of exported functions and object interfaces that map directly to scp-core's public API — mirroring the PyO3 bridge surface (ADR-013). Async functions use UniFFI's native async support (`async fn` in `#[uniffi::export]`) to bridge Rust futures (tokio) to Swift async/await and Kotlin suspend functions. Rust `Result<T, E>` types are mapped to Swift `throws` and Kotlin exceptions via a unified `ScpError` enum. All SCP domain types are exposed as either opaque object interfaces (for types holding crypto state) or record/enum value types (for pure data). Platform-specific traits (`KeyCustody`, `PushProvider`, `Storage`) are exposed as UniFFI callback interfaces, allowing Swift and Kotlin implementations to be injected into the Rust engine.
 
-- Final Rust public API types from `scp-core`, `scp-transport`, `scp-platform`.
-- OpenMLS `StorageProvider` interaction patterns (how MLS state flows through FFI).
-- Error type hierarchy as implemented (`ScpCoreError`, `TransportError`, `PlatformError`).
-- Async function signatures (which operations are async, which are sync).
+### Rationale
 
-### References
+- **UniFFI proc-macros over UDL-only:** Proc-macros (`#[uniffi::export]`) keep the FFI definition co-located with the Rust implementation, reducing drift between the bridge and the API it wraps. UDL files are supplementary for callback interfaces and advanced patterns that proc-macros do not support. This is the approach recommended by the UniFFI project for new codebases.
+- **UniFFI over cbindgen/manual FFI:** UniFFI generates idiomatic Swift and Kotlin bindings (classes, enums, async functions, error types) from a single definition. cbindgen generates C headers requiring manual wrapper code in each target language. Manual FFI would mean maintaining two separate hand-written binding layers. UniFFI eliminates this duplication and the consistency bugs it creates.
+- **UniFFI over SwiftBridgeModule/KotlinBridge custom solutions:** Project-specific bridge generators would require building and maintaining custom tooling. UniFFI is battle-tested (Firefox, Application Services, and the broader Mozilla ecosystem), actively maintained, and has established patterns for async bridging, error handling, and callback interfaces.
+- **Flat function surface mirroring ADR-013:** The bridge layer is deliberately flat (no deep class hierarchies). Each exported function maps to one Rust function. The idiomatic Swift API (actors, `AsyncSequence`, property wrappers) and idiomatic Kotlin API (coroutines, `Flow`, extension functions) are built in the pure language wrapper layers (Swift SDK, Kotlin SDK), not in the FFI bridge. This keeps the bridge thin and testable, matching the ADR-013 pattern where PyO3 exposes flat functions and the Python SDK wraps them.
+- **Opaque objects for crypto state, records for data:** SCP types like `Identity`, `ContextHandle`, and transport connections hold crypto state (MLS group secrets, signing keys, session keys) that must not be serialized across the FFI boundary. They are exposed as opaque UniFFI objects with method accessors. Pure data types (`Message`, `ToolDefinition`, `ContextParams`) are exposed as UniFFI records (value types), which become Swift structs and Kotlin data classes.
+- **Callback interfaces for platform injection:** `KeyCustody`, `PushProvider`, and `Storage` traits require platform-specific implementations (Secure Enclave on iOS, Android Keystore on Android, APNs vs FCM). UniFFI callback interfaces allow Swift and Kotlin code to implement these traits, which are then called from Rust. This preserves the dependency inversion architecture (ADR-006) across the FFI boundary.
+- **Native async over blocking wrappers:** UniFFI supports `async fn` in exported interfaces, generating Swift `async` functions and Kotlin `suspend` functions. This eliminates the need for blocking wrappers with `Dispatchers.IO` (as described in scaffold/kotlin.md as the fallback pattern). The Rust tokio runtime runs in background threads; UniFFI's async machinery bridges between the runtimes.
 
-- `scaffold/shared.md` — cross-language naming table, streaming types per language, conformance test framework.
-- `scaffold/swift.md` — Swift-specific patterns (actor isolation, `CheckedContinuation` bridging, XCFramework build).
-- `scaffold/kotlin.md` — Kotlin-specific patterns (coroutine bridging, JNA/JVM integration).
-- `standards/rust.md` — FFI bridge is the sole `unsafe` exception.
-- ADR-013/014 — PyO3 bridge as reference pattern (flat function surface, opaque types, async bridging).
-- Target file: `crates/scp-ffi/uniffi/src/scp.udl`.
+### Implementation
 
-### Expected Decisions
+- **Language:** Rust (UniFFI proc-macros + UDL) generating Swift and Kotlin bindings
+- **Libraries:** `uniffi` (latest stable), `tokio` (async runtime)
+- **Crate:** `scp-ffi/uniffi` (workspace member)
+- **UDL file:** `crates/scp-ffi/uniffi/src/scp.udl` — callback interface definitions and supplementary type mappings
+- **Build output:**
+  - Swift: `ScpBindings.swift` — imported by the `SCP` Swift package (bindings/swift/)
+  - Kotlin: `NativeLib.kt` — imported by the `scp-sdk-kotlin` module (bindings/kotlin/)
+  - C headers + module map for XCFramework packaging
+- **Async runtime:** A single tokio `Runtime` is created at library initialization (via `uniffi::setup_scaffolding!()` init hook) and stored in a `OnceLock<Runtime>`. All async bridge functions run on this runtime. Runtime shutdown occurs on library unload with a 5-second grace period for in-flight tasks.
+- **Platform libraries:** The Rust shared library is compiled for each target:
+  - iOS: `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios` (combined into XCFramework per scaffold/swift.md)
+  - macOS: `aarch64-apple-darwin`, `x86_64-apple-darwin` (universal2 fat library)
+  - Android: `aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`, `i686-linux-android` (bundled in AAR per scaffold/kotlin.md)
+  - Desktop: Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`), macOS (universal2), Windows (`x86_64-pc-windows-msvc`) for JVM/desktop Kotlin
 
-- UDL type mapping for all public domain types.
-- Async function bridging strategy (UniFFI supports async via polling futures).
-- Error mapping (Rust `Result` -> Swift `throws` / Kotlin exceptions).
-- Callback interface definitions for platform traits (`KeyCustody`, `PushProvider`, `Storage`).
-- Which types are passed by value (data classes) vs by reference (opaque handles).
+### Dependencies
 
-### Optimal Approach
+- **All Phase 1 ADRs (ADR-001 through ADR-007):** The bridge exposes MLS operations, envelope creation, DID identity, transport, sender keys, and platform adapters to Swift and Kotlin.
+- **All Phase 2 ADRs (ADR-008 through ADR-012):** The bridge exposes context lifecycle, role/UCAN enforcement, tool registration/invocation, event log queries, and multi-transport routing to Swift and Kotlin.
+- **ADR-013 (PyO3 Bridge):** Establishes the FFI pattern. The UniFFI bridge mirrors the same logical API surface: same function set, same type categories (opaque vs value), same error hierarchy. ADR-013 is the reference implementation; ADR-021 must expose an equivalent surface.
+- **ADR-006 (Platform Abstraction):** Platform traits (`KeyCustody`, `PushProvider`, `Storage`, `AttestationProvider`) are exposed as callback interfaces. Swift implementations use Secure Enclave/Keychain/APNs; Kotlin implementations use Android Keystore/SharedPreferences/FCM.
 
-Write after Phase 2 implementation stabilizes. Review the PyO3 bridge (ADR-013) surface and mirror it in UDL. Run UniFFI `bindgen` to verify Swift/Kotlin output compiles.
+### Acceptance Criteria
+
+1. **Tokio runtime initialization:**
+   - A tokio `Runtime` is created once at library initialization via `uniffi::setup_scaffolding!()` init hook.
+   - The runtime is multi-threaded (default thread count) and stored in a `OnceLock<Runtime>`.
+   - All async bridge functions use UniFFI's native async support. The tokio runtime runs in background threads; async calls bridge automatically between the runtime and the caller's concurrency context (Swift structured concurrency / Kotlin coroutine dispatchers).
+   - Runtime shutdown is handled on library unload. The `Runtime` is dropped, which waits for in-flight tasks to complete (with a 5-second timeout).
+
+2. **Identity bridge functions:**
+
+   ```rust
+   #[uniffi::export]
+   async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> { ... }
+
+   #[uniffi::export]
+   async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> { ... }
+
+   #[uniffi::export]
+   async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> { ... }
+   ```
+
+   - `identity_create(custody) -> Identity` — creates a new DID identity. `custody` is a string: `"platform"`, `"in_memory"`.
+   - `identity_load(did) -> Identity` — loads an existing identity from storage.
+   - `identity_resolve(did) -> DIDDocument` — resolves a DID to its document.
+   - `Identity` is an opaque object interface exposing: `did() -> String`, `custody_type() -> String`, `rotate_key() -> Identity`.
+
+3. **Context bridge functions:**
+
+   ```rust
+   #[uniffi::export]
+   async fn context_create(
+       identity: Arc<Identity>,
+       params: ContextParams,
+   ) -> Result<Arc<ContextHandle>, ScpError> { ... }
+
+   #[uniffi::export]
+   async fn context_join(
+       handle: Arc<ContextHandle>,
+       identity: Arc<Identity>,
+   ) -> Result<(), ScpError> { ... }
+   ```
+
+   - `context_create(identity, params) -> ContextHandle` — creates a context. `params` is a UniFFI record with ceiling, roles, governance, TTL, memory_scope fields.
+   - `context_join(handle, identity) -> void` — joins a context.
+   - `context_leave(handle, identity) -> void` — leaves a context.
+   - `context_close(handle, identity) -> void` — closes a context.
+   - `context_send(handle, identity, payload) -> void` — sends a message.
+   - `context_subscribe(handle, listener) -> void` — registers a callback interface for incoming messages (UniFFI callback; the Swift/Kotlin SDK layers convert this to `AsyncSequence` / `Flow<Message>` respectively).
+   - `ContextHandle` is an opaque object interface exposing: `context_id() -> String`, `state() -> String`.
+
+4. **Tool bridge functions:**
+   - `tool_register(handle, registration) -> String` — registers a tool (returns tool ID).
+   - `tool_invoke(handle, tool_id, input_json, identity) -> String` — invokes a tool (returns JSON string output).
+   - `tool_verify(handle, tool_id) -> ToolVerificationResult` — verifies a tool against test vectors.
+
+5. **Transport bridge functions:**
+   - `transport_connect(relay_url) -> void` — connects to an SCP relay.
+   - `transport_status() -> TransportStatus` — returns transport connection status.
+
+6. **UCAN bridge functions:**
+   - `ucan_validate(handle, token, capability) -> void` — validates a UCAN token (throws on failure).
+   - `ucan_mint(handle, member_did, capabilities) -> UcanToken` — mints UCAN tokens.
+   - `ucan_revoke(handle, token_id) -> void` — revokes a UCAN token.
+
+7. **Event log bridge functions:**
+   - `event_log_query(handle, filter_json) -> Vec<Event>` — queries the context event log.
+   - `event_log_verify(handle, claim_json) -> Proof` — verifies a claim against the event log.
+
+8. **Error mapping:**
+
+   ```rust
+   #[derive(Debug, uniffi::Error)]
+   pub enum ScpError {
+       Identity { message: String, code: String },
+       Context { message: String, code: String },
+       Permission { message: String, code: String },
+       Crypto { message: String, code: String },
+       Transport { message: String, code: String },
+       Tool { message: String, code: String },
+       Validation { message: String, code: String },
+   }
+   ```
+
+   - Every Rust error type from scp-core maps to a specific `ScpError` variant.
+   - Error codes follow the `SCP-{CATEGORY}-{NUMBER}` format (sdk-common.md).
+   - In Swift: `ScpError` becomes an `enum` conforming to `Error` with associated values (`message`, `code`). Functions that return `Result` generate Swift `throws` functions.
+   - In Kotlin: `ScpError` becomes a sealed exception hierarchy rooted at `ScpException`. Functions that return `Result` throw the corresponding exception subclass.
+   - Error messages include actionable detail (what failed, why, what to do).
+
+9. **Type mapping — opaque objects (passed by reference, hold state):**
+
+   | Rust type | UniFFI kind | Swift generated | Kotlin generated |
+   |-----------|-------------|-----------------|------------------|
+   | `Identity` | `#[uniffi::export] impl` (object) | `class Identity` | `class Identity` |
+   | `ContextHandle` | `#[uniffi::export] impl` (object) | `class ContextHandle` | `class ContextHandle` |
+   | `UcanToken` | `#[uniffi::export] impl` (object) | `class UcanToken` | `class UcanToken` |
+   | `TransportManager` | `#[uniffi::export] impl` (object) | `class TransportManager` | `class TransportManager` |
+
+   All opaque objects are wrapped in `Arc<T>` for thread-safe shared ownership across the FFI boundary. UniFFI handles `Arc` automatically — the generated Swift/Kotlin code manages reference counting.
+
+10. **Type mapping — records (passed by value, pure data):**
+
+    | Rust type | UniFFI kind | Swift generated | Kotlin generated |
+    |-----------|-------------|-----------------|------------------|
+    | `ContextParams` | `#[derive(uniffi::Record)]` | `struct ContextParams` | `data class ContextParams` |
+    | `Message` | `#[derive(uniffi::Record)]` | `struct Message` | `data class Message` |
+    | `DIDDocument` | `#[derive(uniffi::Record)]` | `struct DIDDocument` | `data class DIDDocument` |
+    | `ToolDefinition` | `#[derive(uniffi::Record)]` | `struct ToolDefinition` | `data class ToolDefinition` |
+    | `ToolVerificationResult` | `#[derive(uniffi::Record)]` | `struct ToolVerificationResult` | `data class ToolVerificationResult` |
+    | `TransportStatus` | `#[derive(uniffi::Record)]` | `struct TransportStatus` | `data class TransportStatus` |
+    | `Event` | `#[derive(uniffi::Record)]` | `struct Event` | `data class Event` |
+    | `Proof` | `#[derive(uniffi::Record)]` | `struct Proof` | `data class Proof` |
+
+11. **Type mapping — enums:**
+
+    | Rust type | UniFFI kind | Swift generated | Kotlin generated |
+    |-----------|-------------|-----------------|------------------|
+    | `CustodyMethod` | `#[derive(uniffi::Enum)]` | `enum CustodyMethod` | `enum class CustodyMethod` |
+    | `ContextState` | `#[derive(uniffi::Enum)]` | `enum ContextState` | `enum class ContextState` |
+    | `MemoryScope` | `#[derive(uniffi::Enum)]` | `enum MemoryScope` | `enum class MemoryScope` |
+    | `GovernanceModel` | `#[derive(uniffi::Enum)]` | `enum GovernanceModel` | `enum class GovernanceModel` |
+
+12. **Callback interfaces (platform trait injection):**
+
+    ```
+    // In scp.udl (callback interfaces require UDL definition)
+    callback interface KeyCustodyProvider {
+        [Throws=ScpError]
+        bytes sign(bytes message);
+
+        [Throws=ScpError]
+        bytes get_public_key();
+
+        [Throws=ScpError]
+        void destroy_key(string key_id);
+    };
+
+    callback interface StorageProvider {
+        [Throws=ScpError]
+        bytes? get(string key);
+
+        [Throws=ScpError]
+        void set(string key, bytes value);
+
+        [Throws=ScpError]
+        void delete(string key);
+
+        [Throws=ScpError]
+        sequence<string> list_keys(string prefix);
+    };
+
+    callback interface PushProvider {
+        [Throws=ScpError]
+        void register_for_push(string token);
+
+        [Throws=ScpError]
+        void send_push(string recipient_token, bytes payload);
+    };
+
+    callback interface MessageListener {
+        void on_message(Message message);
+        void on_error(ScpError error);
+        void on_complete();
+    };
+    ```
+
+    - `KeyCustodyProvider`: Swift implementation wraps Secure Enclave/Keychain; Kotlin implementation wraps Android Keystore.
+    - `StorageProvider`: Swift implementation wraps Core Data / UserDefaults / file-based storage; Kotlin implementation wraps Room / SharedPreferences.
+    - `PushProvider`: Swift implementation wraps APNs; Kotlin implementation wraps FCM.
+    - `MessageListener`: Callback for incoming message streams. The Swift SDK converts to `AsyncStream<Message>` via `AsyncStream.Continuation`; the Kotlin SDK converts to `Flow<Message>` via `callbackFlow`.
+
+13. **Async bridging:**
+    - All functions that perform I/O (network, storage, crypto operations) are declared `async` in the UniFFI export.
+    - UniFFI generates Swift `async` functions (bridged via `CheckedContinuation`) and Kotlin `suspend` functions (bridged via coroutine integration).
+    - The Rust tokio runtime executes the future; UniFFI's async scaffolding resumes the caller's async context on completion.
+    - Sync accessors on opaque objects (e.g., `Identity.did()`, `ContextHandle.context_id()`) are non-async and return immediately.
+    - Streaming (message receive) uses the `MessageListener` callback interface rather than async return, because UniFFI does not support returning `Stream` types. The Swift/Kotlin SDK wrapper layers convert the callback pattern to `AsyncSequence` / `Flow` respectively.
+
+14. **Thread safety:**
+    - All opaque objects are `Send + Sync` (guaranteed by `Arc` wrapping).
+    - UniFFI callbacks execute on Rust tokio threads. Callback implementations must not assume any specific thread or dispatcher (sdk-common.md risk #2). UI-bound operations in callbacks must dispatch to the appropriate context (`MainActor.run {}` in Swift, `Dispatchers.Main` in Kotlin).
+    - The generated binding code is safe for concurrent use from multiple Swift tasks / Kotlin coroutines.
+
+15. **Build and distribution:**
+    - `uniffi-bindgen generate` produces Swift and Kotlin source files from the proc-macro exports and UDL.
+    - Swift bindings are packaged into the `SCP` XCFramework (scaffold/swift.md build process).
+    - Kotlin bindings are packaged into the `scp-sdk-kotlin` AAR/JAR with native libraries bundled as resources (scaffold/kotlin.md).
+    - CI runs `uniffi-bindgen generate` and verifies that the generated Swift and Kotlin output compiles against the current Rust API.
 
 ### Scope
 
-`scp-ffi/uniffi/` — 1 UDL file, ~2 Rust source files.
+**Files (~4):**
+
+| File | Purpose |
+|------|---------|
+| `scp-ffi/uniffi/Cargo.toml` | Crate manifest with `uniffi` dependency and build configuration |
+| `scp-ffi/uniffi/src/lib.rs` | Crate root, `uniffi::setup_scaffolding!()`, tokio runtime init, re-exports of bridge modules |
+| `scp-ffi/uniffi/src/bridge.rs` | All `#[uniffi::export]` function definitions, opaque object `impl` blocks, record/enum derive macros, `ScpError` definition, `From` conversions from scp-core errors |
+| `scp-ffi/uniffi/src/scp.udl` | Supplementary UDL: callback interface definitions (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `MessageListener`), any type mappings that require UDL |
+
+**Estimated functions:** ~25-30 bridge functions, ~15-20 type definitions (records + enums + objects), ~10-15 conversion helpers, 4 callback interfaces.
 
 ---
 

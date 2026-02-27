@@ -99,6 +99,12 @@ pub struct TransportManager {
     /// Shared with `MergedStream` for recording deliveries and checking
     /// suppressions during stream polling.
     suppression_tracker: Arc<Mutex<SuppressionTracker>>,
+    /// Per-relay cost for cost-aware relay selection (section 19.8).
+    ///
+    /// Maps adapter index to per-publish cost (`Amount.value()`). Relays
+    /// without an entry are treated as free (cost = 0). Cost is the third
+    /// criterion in relay selection alongside reliability and latency.
+    relay_costs: RwLock<HashMap<usize, u64>>,
 }
 
 /// Helper to create a `NonZeroUsize` for LRU capacity, falling back to 1.
@@ -122,6 +128,7 @@ impl TransportManager {
             dedup_ttl: DEFAULT_DEDUP_TTL,
             assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
+            relay_costs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -139,6 +146,7 @@ impl TransportManager {
             dedup_ttl: DEFAULT_DEDUP_TTL,
             assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
+            relay_costs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -155,6 +163,7 @@ impl TransportManager {
             dedup_ttl: config.dedup_cache_ttl,
             assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
+            relay_costs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -498,9 +507,12 @@ impl TransportManager {
         let set_size = MIN_RELAYS_PER_CONTEXT.min(adapter_count);
 
         // Build a list of adapter indices sorted by:
-        //   (overlap count ASC, reliability score DESC, round-robin offset ASC).
-        // This prefers adapters least used by other contexts and with higher
-        // reliability.
+        //   (overlap count ASC, reliability score DESC, cost ASC,
+        //    round-robin offset ASC).
+        // This prefers adapters least used by other contexts, with higher
+        // reliability, and lower cost. Cost is the third criterion per
+        // section 19.8: agents prefer cheaper relays, creating market
+        // pressure.
         let scores = self
             .reliability_scores
             .lock()
@@ -509,7 +521,11 @@ impl TransportManager {
             .relay_assignments
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let mut candidates: Vec<(usize, usize, f64)> = (0..adapter_count)
+        let costs = self
+            .relay_costs
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut candidates: Vec<(usize, usize, f64, u64)> = (0..adapter_count)
             .map(|idx| {
                 let overlap = assignments
                     .values()
@@ -518,11 +534,13 @@ impl TransportManager {
                 let reliability = scores
                     .get(&idx.to_string())
                     .map_or(1.0, ReliabilityScore::composite_score);
-                (idx, overlap, reliability)
+                let cost = costs.get(&idx).copied().unwrap_or(0);
+                (idx, overlap, reliability, cost)
             })
             .collect();
         drop(scores);
         drop(assignments);
+        drop(costs);
 
         let counter = self
             .assignment_counter
@@ -530,6 +548,7 @@ impl TransportManager {
         candidates.sort_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.3.cmp(&b.3))
                 .then_with(|| {
                     // Round-robin offset for spread.
                     let a_off = (a.0 + adapter_count - counter % adapter_count) % adapter_count;
@@ -541,7 +560,7 @@ impl TransportManager {
         let assigned: Vec<usize> = candidates
             .iter()
             .take(set_size)
-            .map(|(idx, _, _)| *idx)
+            .map(|(idx, _, _, _)| *idx)
             .collect();
 
         self.relay_assignments
@@ -611,6 +630,34 @@ impl TransportManager {
     #[must_use]
     pub fn reliability_scores(&self) -> Arc<Mutex<HashMap<String, ReliabilityScore>>> {
         Arc::clone(&self.reliability_scores)
+    }
+
+    /// Sets the per-publish cost for an adapter by index.
+    ///
+    /// The cost is used as the third criterion in relay selection
+    /// (section 19.8): agents prefer cheaper relays, creating market
+    /// pressure. Cost is specified as a raw `u64` value in the smallest
+    /// currency unit (matching `Amount::value()`).
+    ///
+    /// A cost of 0 or absence of a cost entry means the relay is free.
+    pub fn set_relay_cost(&self, adapter_index: usize, cost: u64) {
+        let mut costs = self
+            .relay_costs
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        costs.insert(adapter_index, cost);
+    }
+
+    /// Returns the per-publish cost for an adapter by index.
+    ///
+    /// Returns `0` if no cost has been set (free relay).
+    #[must_use]
+    pub fn get_relay_cost(&self, adapter_index: usize) -> u64 {
+        let costs = self
+            .relay_costs
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        costs.get(&adapter_index).copied().unwrap_or(0)
     }
 }
 
@@ -1762,5 +1809,78 @@ mod tests {
                 "send_to_context should succeed, got: {result:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cost-aware relay selection tests (section 19.8)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn assign_relay_set_prefers_cheaper_relays() {
+        let mut manager = TransportManager::builder();
+        for _ in 0..5 {
+            manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        }
+
+        // Set high costs for adapters 0 and 1, leave 2, 3, 4 free.
+        manager.set_relay_cost(0, 1000);
+        manager.set_relay_cost(1, 500);
+
+        let ctx = "ctx-cost-aware".to_string();
+        let set = manager.assign_relay_set(&ctx).unwrap();
+
+        assert_eq!(set.len(), 3);
+        // The set should prefer adapters 2, 3, 4 (free) over 0, 1 (paid).
+        let free_count = set.iter().filter(|&&idx| idx >= 2).count();
+        assert!(
+            free_count >= 2,
+            "expected at least 2 free adapters, got {free_count} (set={set:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_relay_cost_and_get_relay_cost_roundtrip() {
+        let manager = TransportManager::builder();
+
+        // Default cost is 0.
+        assert_eq!(manager.get_relay_cost(0), 0);
+
+        manager.set_relay_cost(0, 42);
+        assert_eq!(manager.get_relay_cost(0), 42);
+
+        manager.set_relay_cost(0, 0);
+        assert_eq!(manager.get_relay_cost(0), 0);
+    }
+
+    #[tokio::test]
+    async fn assign_relay_set_cost_breaks_tie_between_equal_reliability() {
+        let mut manager = TransportManager::builder();
+        for _ in 0..4 {
+            manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        }
+
+        // All adapters have equal reliability (default 1.0).
+        // Set different costs: adapter 0 = 100, adapter 1 = 50,
+        // adapter 2 = 0, adapter 3 = 200.
+        manager.set_relay_cost(0, 100);
+        manager.set_relay_cost(1, 50);
+        // adapter 2 is free (default 0)
+        manager.set_relay_cost(3, 200);
+
+        let ctx = "ctx-cost-tie".to_string();
+        let set = manager.assign_relay_set(&ctx).unwrap();
+
+        assert_eq!(set.len(), 3);
+        // Adapter 2 (free) should always be selected.
+        assert!(
+            set.contains(&2),
+            "free adapter 2 should be in the set (set={set:?})"
+        );
+        // Adapter 3 (most expensive) should NOT be selected when
+        // 3 cheaper options exist.
+        assert!(
+            !set.contains(&3),
+            "most expensive adapter 3 should not be in the set (set={set:?})"
+        );
     }
 }

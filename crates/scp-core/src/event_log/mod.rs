@@ -22,6 +22,7 @@
 //! - [`tree::event_count`] -- Get the number of events in the log.
 
 pub mod checkpoint;
+pub mod metrics;
 pub mod proof;
 pub mod tree;
 

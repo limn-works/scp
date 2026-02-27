@@ -28,12 +28,17 @@
 
 pub mod builder;
 pub mod close;
+pub mod governance;
+pub mod invitation;
 pub mod manager;
 pub mod membership;
 pub mod memory_scope;
+pub mod nesting;
 pub mod params;
+pub mod policy;
 pub mod promotion;
 pub mod roles;
+pub mod standing;
 pub mod state_machine;
 pub mod templates;
 pub mod tools;
@@ -103,6 +108,36 @@ pub use memory_scope::{
     DeletionResponseStatus, KeyDestructionAttestation, KeyDestructionLevel,
     KeyDestructionOrchestrator, RelayDeletionRequest, RelayDeletionTracker,
     validate_memory_scope_for_broadcast,
+};
+
+// Re-export nesting types (SCP-134, spec section 5.13).
+pub use nesting::{
+    ApprovalRequirement, ContextNesting, MlsGroupContextExtension, NestingError, OnSeverPolicy,
+    ParentGovernanceConfig, ParentRef, SeverAction, compute_ceiling_intersection,
+    validate_child_ttl, validate_nesting_depth, MAX_NESTING_DEPTH,
+};
+
+// Re-export auto-accept policy types (SCP-135).
+pub use policy::{
+    AutoAcceptPolicy, PolicyStorageError, RateLimit, TrustRequirement, auto_accept_allowed,
+    delete_auto_accept_policy, get_auto_accept_policy, has_tool_capabilities, requires_payment,
+    set_auto_accept_policy,
+};
+
+// Re-export invitation evaluation pipeline types (SCP-137).
+pub use invitation::{
+    EvaluationDecision, InvitationError, RateLimitTracker, SpendingContext, TrustOracle,
+    evaluate_invitation,
+};
+
+// Re-export standing channel types (SCP-138).
+pub use standing::{StandingChannelError, StandingChannelManager};
+
+// Re-export governance types (SCP-129, ADR-031).
+pub use governance::{
+    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
+    GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
+    SignedVote, SingleAdminEngine, VoteType,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).

@@ -10,6 +10,8 @@ ci-tier2 = []
 ci-tier3 = []
 
 [dependencies]
+scp-core = { path = "../scp-core" }
+tokio = { workspace = true }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core" }

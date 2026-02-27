@@ -15,7 +15,6 @@ This project uses specialized agents for different architectural concerns. Each 
 | **Designer** | Product design, visual design, UX, animations, brand | `designer.md` |
 | **GFX** | Shaders, GPU rendering, visual effects, creative coding | `gfx.md` |
 | **Chronicler** | Documentation, knowledge capture, CLAUDE.md updates | `chronicler.md` |
-| | | |
 | **Review Agents** | | |
 | **Styler** | Conventions, naming, code organization | `styler.md` |
 | **Bug Catcher** | Concurrency, crashes, logic errors, subtle defects | `bug-catcher.md` |
@@ -44,7 +43,6 @@ This project uses specialized agents for different architectural concerns. Each 
 | **Designer** | New features needing design specs, visual polish, UX flows, brand alignment |
 | **GFX** | Shaders, GPU rendering, visual effects, performance-critical visuals |
 | **Chronicler** | After significant changes, artifact/doc changes, permanent instructions, implementation learnings |
-| | |
 | **Review — always on code:** | |
 | **Styler** | After writing code, during refactoring, convention changes |
 | **Bug Catcher** | After writing/modifying code, debugging crashes, concurrency-heavy changes |
@@ -52,7 +50,6 @@ This project uses specialized agents for different architectural concerns. Each 
 | **Lint Diagnostics** | After writing/modifying code, verifying builds compile |
 | **Architecture Reviewer** | Structural changes, new modules, protocol mods, any pattern-setting change |
 | **Alignment Reviewer** | Non-trivial feature work, any change that could diverge from spec/roadmap |
-| | |
 | **Review — when relevant:** | |
 | **Frontend Reviewer** | Views, components, navigation, any user-facing surface |
 | **API Design Reviewer** | New protocols, public interface changes, service APIs, module boundaries |

@@ -1,8 +1,11 @@
 //! Merkle tree operations for the event log.
 //!
 //! Implements the append-only Merkle tree following the Certificate
-//! Transparency (RFC 6962) structure. Leaf nodes are SHA-256 hashes of
-//! serialized events. Interior nodes are `SHA-256(left_child || right_child)`.
+//! Transparency (RFC 6962) structure with domain separation prefixes per
+//! Section 2.1. Leaf nodes are `SHA-256(0x00 || serialized_event)`. Interior
+//! nodes are `SHA-256(0x01 || left_child || right_child)`. The domain
+//! separation prevents second preimage attacks where a crafted payload could
+//! make a leaf hash collide with an interior node hash.
 //!
 //! # Operations
 //!
@@ -32,7 +35,8 @@ pub const GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
 /// 2. Verifies `event.prev_hash` matches the hash of the last leaf
 ///    (or the genesis sentinel for the first event).
 /// 3. Verifies the event signature against `event.actor_did`.
-/// 4. Serializes the event and computes `leaf_hash = SHA-256(serialize(event))`.
+/// 4. Serializes the event and computes `leaf_hash = SHA-256(0x00 || serialize(event))`
+///    (RFC 6962 Section 2.1 leaf domain separation).
 /// 5. Appends the leaf hash and recomputes affected interior nodes.
 /// 6. Inserts into the sorted leaf index.
 /// 7. Returns the leaf index (position in the log).
@@ -73,9 +77,12 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     // 3. Verify signature.
     verify_event_signature(event)?;
 
-    // 4. Serialize and hash.
+    // 4. Serialize and hash with 0x00 leaf domain prefix (RFC 6962 §2.1).
     let serialized = serialize_event_for_hashing(event)?;
-    let leaf_hash: [u8; 32] = Sha256::digest(&serialized).into();
+    let mut hasher = Sha256::new();
+    hasher.update(&[0x00]);
+    hasher.update(&serialized);
+    let leaf_hash: [u8; 32] = hasher.finalize().into();
 
     // 5. Append leaf and recompute tree.
     let leaf_index = log.leaves.len() as u64;
@@ -313,7 +320,7 @@ fn recompute_tree(log: &mut EventLog) {
         let mut i = 0;
         while i < current_layer.len() {
             if i + 1 < current_layer.len() {
-                // Hash pair: SHA-256(left || right)
+                // Hash pair: SHA-256(0x01 || left || right)
                 parents.push(hash_pair(&current_layer[i], &current_layer[i + 1]));
             } else {
                 // Odd node: promote by hashing with itself per RFC 6962.
@@ -334,11 +341,14 @@ fn recompute_tree(log: &mut EventLog) {
     }
 }
 
-/// Computes `SHA-256(left || right)` for an interior node.
+/// Computes `SHA-256(0x01 || left || right)` for an interior node.
 ///
-/// This is the RFC 6962 interior node hash function.
+/// This is the RFC 6962 Section 2.1 interior node hash function. The `0x01`
+/// prefix provides domain separation from leaf hashes (which use `0x00`),
+/// preventing second preimage attacks.
 fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update(&[0x01]);
     hasher.update(left);
     hasher.update(right);
     hasher.finalize().into()
@@ -406,6 +416,15 @@ mod tests {
         event
     }
 
+    /// Compute a leaf hash with the 0x00 domain separation prefix (RFC 6962).
+    fn leaf_hash_from_event(event: &Event) -> [u8; 32] {
+        let serialized = rmp_serde::to_vec(event).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&[0x00]);
+        hasher.update(&serialized);
+        hasher.finalize().into()
+    }
+
     // -----------------------------------------------------------------------
     // append updates tree and root correctly
     // -----------------------------------------------------------------------
@@ -432,7 +451,7 @@ mod tests {
         assert_eq!(event_count(&log), 1);
 
         // Root of a single-leaf tree is the leaf hash itself.
-        let leaf0_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event0).unwrap()).into();
+        let leaf0_hash = leaf_hash_from_event(&event0);
         assert_eq!(root(&log), leaf0_hash);
 
         // Append second event.
@@ -450,8 +469,8 @@ mod tests {
         assert_eq!(idx1, 1);
         assert_eq!(event_count(&log), 2);
 
-        // Root should be SHA-256(leaf0 || leaf1).
-        let leaf1_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event1).unwrap()).into();
+        // Root should be SHA-256(0x01 || leaf0 || leaf1).
+        let leaf1_hash = leaf_hash_from_event(&event1);
         let expected_root = hash_pair(&leaf0_hash, &leaf1_hash);
         assert_eq!(root(&log), expected_root);
 
@@ -600,7 +619,7 @@ mod tests {
 
             append(&mut log, &event).unwrap();
 
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            let leaf_hash = leaf_hash_from_event(&event);
             leaf_hashes.push(leaf_hash);
             prev_hash = leaf_hash;
 
@@ -641,7 +660,7 @@ mod tests {
             append(&mut log, &event).unwrap();
             assert_eq!(event_count(&log), i + 1);
 
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            let leaf_hash = leaf_hash_from_event(&event);
             prev_hash = leaf_hash;
         }
     }
@@ -702,7 +721,7 @@ mod tests {
 
             append(&mut log, &event).unwrap();
 
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            let leaf_hash = leaf_hash_from_event(&event);
             prev_hash = leaf_hash;
         }
 
@@ -768,7 +787,7 @@ mod tests {
             let idx = append(&mut log, &event).unwrap();
             assert_eq!(idx, i as u64);
 
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            let leaf_hash = leaf_hash_from_event(&event);
             prev_hash = leaf_hash;
         }
 

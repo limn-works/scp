@@ -36,3 +36,28 @@ Notes:
 - **Hardcoded zero measurements:** send_to_context records latency_ms: 0 for all successes. Pattern: scoring field exists but measurement not wired.
 - **Global tracker for per-context data:** Single SuppressionTracker for all contexts, but check_suppressions takes a single total_relays param applied to all blobs. Pattern: shared state that should be partitioned by context.
 - **Silent filter drop:** DiscoveryQuery.min_history silently dropped because AgentSearchParams lacks the field. Pattern: type conversion that loses fields without warning.
+
+### Known Bug Patterns (Feb 2026 Review — PR #76, initial)
+- **Empty-set attenuation bypass:** validate_spending_attenuation allows empty child.allowed_adapters to pass when parent restricts adapters. Pattern: for-loop over empty collection silently passes subset checks.
+- **Non-deterministic content_hash:** HashSet serialization order varies between runs, breaking ParentGovernanceConfig tamper detection. Pattern: HashSet + serde_json::to_string for "deterministic" hashing.
+- **TOCTOU in standing_channel:** Lock dropped before async create, re-acquired to insert — concurrent callers race. Pattern: check-then-act across async boundaries.
+- **Comment-code mismatch in ID generation:** generate_standing_channel_id comment says "timestamp makes re-creation unique" but no timestamp in hash. Pattern: Loom agents writing comments that describe intent, not implementation.
+- **FFI rotate_key returns wrong identity:** py_identity_rotate_key creates a new identity instead of rotating the passed-in one, discards original DID. Pattern: placeholder implementations shipped as functional API.
+- **Iterator termination on empty channel:** PyMessageReceiver.__anext__ returns Ok(None) for TryRecvError::Empty, ending Python async iteration prematurely. Pattern: collapsing distinct error states into single return value.
+- **UCAN delegate uses token_id as context:** Python delegate() passes parent_token.token_id instead of context_id to mint(). Pattern: semantic type confusion when both are strings.
+- **Unconditional sleep in shutdown:** shutdown_runtime sleeps for full SHUTDOWN_TIMEOUT instead of draining tasks. Pattern: using sleep for synchronization.
+
+### Known Bug Patterns (Feb 2026 Review — PR #76, review fixes)
+- **FIXED:** Non-deterministic content_hash (HashSet -> BTreeSet, content_hash returns Result).
+- **FIXED:** TOCTOU in standing_channel (tokio::Mutex held across get-or-create, no deadlock risk).
+- **FIXED:** RFC 6962 domain separation applied consistently in tree.rs, proof.rs, and all tests.
+- **FIXED:** Governance duplicate proposal check added.
+- **FIXED:** Unconditional sleep in shutdown reduced to 100ms (still uses sleep, but cosmetic).
+- **STILL PRESENT:** Empty-set attenuation bypass in validate_spending_attenuation (spending.rs:460-469). The check_and_record runtime check was added but the attenuation validation function still allows empty child to bypass parent restriction.
+- **STILL PRESENT:** Python delegate() still passes token_id as context (ucan.py:242). UcanToken has no context field; hasattr always False. The "fix" added hasattr guard but the field doesn't exist on the dataclass.
+- **Pattern:** "Fix" that adds a hasattr/getattr guard for a field that doesn't exist on the type — the guard always takes the fallback path. Must verify the type actually has the field being checked.
+
+### Known Bug Patterns (Feb 2026 — claiming.rs/shadow.rs/http.rs review)
+- **Divergent canonical attestation formats:** bridge/claiming.rs compute_attestation_canonical_hash uses SHA-256 + to_be_bytes, while trust/attestation.rs canonical_attestation_bytes uses raw concat + to_le_bytes. Pattern: independent re-implementations of canonical serialization that drift.
+- **Missing field separators in canonical hash:** compute_claim_canonical_hash and compute_attestation_canonical_hash concatenate fields without length prefixes or delimiters. Pattern: field boundary ambiguity in hash preimages.
+- **serve() double-bind (pre-existing):** ApplicationNode::serve() binds to relay.bound_addr which is already occupied by the relay server. Pattern: single address field used for two listeners.

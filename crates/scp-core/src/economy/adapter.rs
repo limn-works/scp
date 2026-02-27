@@ -1,0 +1,350 @@
+//! Payment adapter trait and supporting types for SCP economic governance.
+//!
+//! Defines the [`PaymentAdapter`] trait that abstracts over concrete payment
+//! rails (x402, Lightning, SPL, Stripe, etc.), following the same pattern as
+//! transport adapters (ADR-005, spec section 16.12.1). Also defines the
+//! supporting types: [`AdapterCapabilities`], [`PaymentAuthorization`],
+//! [`PaymentReceipt`], [`PaymentMetadata`], [`VerificationResult`],
+//! [`RefundConfirmation`], and [`PaymentError`].
+//!
+//! See spec section 19.2.1 (adapter trait) and 19.2.6 (conformance testing).
+//! See ADR-033 in `.docs/adrs/phase-3.md`.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::identity::DID;
+
+use super::types::{Amount, CurrencyCode, PaidActionType};
+
+// ---------------------------------------------------------------------------
+// ContextId (local alias)
+// ---------------------------------------------------------------------------
+
+/// Context identifier. Alias consistent with other economy-adjacent modules.
+pub type ContextId = String;
+
+// ---------------------------------------------------------------------------
+// PaymentAdapter trait
+// ---------------------------------------------------------------------------
+
+/// Abstraction over a concrete payment rail.
+///
+/// Implementors connect to real payment infrastructure (x402, Lightning, SPL
+/// tokens, Stripe, etc.) or provide in-memory test ledgers. The trait follows
+/// an authorize/capture two-phase pattern that accommodates both
+/// authorize-then-capture rails (x402, Stripe) and invoice-then-preimage
+/// rails (Lightning).
+///
+/// See spec section 19.2.1.
+pub trait PaymentAdapter: Send + Sync {
+    /// Returns the unique identifier for this adapter (e.g., `"x402"`,
+    /// `"lightning"`, `"spl"`, `"stripe"`, `"test"`).
+    fn adapter_id(&self) -> &str;
+
+    /// Returns the capabilities of this adapter.
+    fn capabilities(&self) -> AdapterCapabilities;
+
+    /// Authorizes (reserves) a payment from `payer` to `payee`.
+    ///
+    /// Returns a [`PaymentAuthorization`] that can later be captured or
+    /// voided. The authorization may have an expiry after which it is
+    /// automatically voided by the payment rail.
+    fn authorize(
+        &self,
+        payer: &DID,
+        payee: &DID,
+        amount: Amount,
+        currency: CurrencyCode,
+        metadata: PaymentMetadata,
+    ) -> impl std::future::Future<Output = Result<PaymentAuthorization, PaymentError>> + Send;
+
+    /// Captures (settles) a previously authorized payment.
+    ///
+    /// Moves funds from payer to payee. Returns a [`PaymentReceipt`] that
+    /// serves as a provenance record in the context event log.
+    fn capture(
+        &self,
+        auth: &PaymentAuthorization,
+    ) -> impl std::future::Future<Output = Result<PaymentReceipt, PaymentError>> + Send;
+
+    /// Voids (cancels) a previously authorized payment.
+    ///
+    /// Releases the reserved funds. Must be called if the associated action
+    /// fails after authorization (spec section 19.2.2, step 9).
+    fn void(
+        &self,
+        auth: &PaymentAuthorization,
+    ) -> impl std::future::Future<Output = Result<(), PaymentError>> + Send;
+
+    /// Verifies a payment receipt against the payment rail.
+    ///
+    /// Checks the adapter-specific proof (on-chain state, preimage hash,
+    /// etc.) to confirm the payment actually occurred.
+    fn verify(
+        &self,
+        receipt: &PaymentReceipt,
+    ) -> impl std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send;
+
+    /// Refunds a previously captured payment.
+    ///
+    /// If `amount` is `None`, refunds the full captured amount. If `Some`,
+    /// performs a partial refund of the specified amount.
+    fn refund(
+        &self,
+        receipt: &PaymentReceipt,
+        amount: Option<Amount>,
+    ) -> impl std::future::Future<Output = Result<RefundConfirmation, PaymentError>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// AdapterCapabilities
+// ---------------------------------------------------------------------------
+
+/// Describes the capabilities and constraints of a [`PaymentAdapter`].
+///
+/// Used by the SDK to select compatible adapters during payment negotiation
+/// (spec section 19.2.3).
+///
+/// See spec section 19.2.1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // Spec-defined fields (section 19.2.1).
+pub struct AdapterCapabilities {
+    /// Currencies this adapter can handle.
+    pub supported_currencies: Vec<CurrencyCode>,
+    /// Whether the adapter supports continuous streaming payments
+    /// (ILP/STREAM-style).
+    pub supports_streaming: bool,
+    /// Whether the adapter supports authorizing N units and capturing
+    /// incrementally.
+    pub supports_batch_auth: bool,
+    /// Whether the adapter supports skipping authorize and capturing
+    /// directly (low-latency path).
+    pub supports_single_step: bool,
+    /// Minimum amount the adapter can process, if any.
+    pub min_amount: Option<Amount>,
+    /// Maximum amount the adapter can process, if any.
+    pub max_amount: Option<Amount>,
+    /// Expected settlement latency in milliseconds.
+    pub typical_settlement_ms: u64,
+    /// Whether this adapter requires a facilitator to verify and settle
+    /// (e.g., x402).
+    pub requires_facilitator: bool,
+}
+
+// ---------------------------------------------------------------------------
+// PaymentMetadata
+// ---------------------------------------------------------------------------
+
+/// Metadata attached to a payment authorization request.
+///
+/// Provides context for the payment without revealing encrypted content.
+///
+/// See spec section 19.2.1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentMetadata {
+    /// The type of action being paid for.
+    pub action_type: PaidActionType,
+    /// The context in which the action occurs. `None` for relay-level payments.
+    pub context_id: Option<ContextId>,
+    /// Idempotency key to prevent duplicate authorization.
+    pub idempotency_key: [u8; 16],
+}
+
+// ---------------------------------------------------------------------------
+// PaymentAuthorization
+// ---------------------------------------------------------------------------
+
+/// A reserved payment that can be captured or voided.
+///
+/// Returned by [`PaymentAdapter::authorize`], consumed by
+/// [`PaymentAdapter::capture`] or [`PaymentAdapter::void`].
+///
+/// See spec section 19.2.1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentAuthorization {
+    /// Unique identifier for this authorization.
+    pub auth_id: [u8; 32],
+    /// The DID of the payer.
+    pub payer: DID,
+    /// The DID of the payee.
+    pub payee: DID,
+    /// The authorized amount.
+    pub amount: Amount,
+    /// The currency of the authorized amount.
+    pub currency: CurrencyCode,
+    /// The adapter that created this authorization.
+    pub adapter_id: String,
+    /// Unix timestamp (seconds) when the authorization was created.
+    pub created_at: u64,
+    /// Unix timestamp (seconds) when the authorization hold expires.
+    pub expires_at: u64,
+    /// Adapter-specific opaque state needed for capture/void.
+    pub adapter_state: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// PaymentReceipt
+// ---------------------------------------------------------------------------
+
+/// Proof that a payment was captured (settled).
+///
+/// Recorded in the context event log as a provenance record. Any party can
+/// call [`PaymentAdapter::verify`] to check the receipt against the payment
+/// rail.
+///
+/// See spec section 19.6.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentReceipt {
+    /// Unique identifier for this receipt.
+    pub receipt_id: [u8; 32],
+    /// The DID of the payer.
+    pub payer: DID,
+    /// The DID of the payee.
+    pub payee: DID,
+    /// The captured amount.
+    pub amount: Amount,
+    /// The currency of the captured amount.
+    pub currency: CurrencyCode,
+    /// The type of action that was paid for.
+    pub action_type: PaidActionType,
+    /// The context in which the action occurred. `None` for relay-level
+    /// payments.
+    pub context_id: Option<ContextId>,
+    /// The adapter that processed this payment.
+    pub adapter_id: String,
+    /// Adapter-specific proof of payment:
+    /// - x402: on-chain transaction hash
+    /// - Lightning: preimage
+    /// - SPL: transaction signature
+    pub adapter_proof: Vec<u8>,
+    /// Unix timestamp (seconds) when the payment was captured.
+    pub timestamp: u64,
+    /// Ed25519 signature by the payer over the receipt data.
+    pub signature: Vec<u8>,
+}
+
+impl fmt::Debug for PaymentReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PaymentReceipt")
+            .field("receipt_id", &self.receipt_id)
+            .field("payer", &self.payer)
+            .field("payee", &self.payee)
+            .field("amount", &self.amount)
+            .field("currency", &self.currency)
+            .field("action_type", &self.action_type)
+            .field("context_id", &self.context_id)
+            .field("adapter_id", &self.adapter_id)
+            .field("adapter_proof", &format!("[{} bytes]", self.adapter_proof.len()))
+            .field("timestamp", &self.timestamp)
+            .field("signature", &format!("[{} bytes]", self.signature.len()))
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VerificationResult
+// ---------------------------------------------------------------------------
+
+/// Result of verifying a [`PaymentReceipt`] against the payment rail.
+///
+/// See spec section 19.2.1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationResult {
+    /// Whether the receipt's proof verified successfully.
+    pub valid: bool,
+    /// The adapter that performed the verification.
+    pub adapter_id: String,
+    /// The amount confirmed by the payment rail.
+    pub verified_amount: Amount,
+    /// The currency confirmed by the payment rail.
+    pub verified_currency: CurrencyCode,
+    /// Unix timestamp (seconds) of the verification.
+    pub verification_timestamp: u64,
+}
+
+// ---------------------------------------------------------------------------
+// RefundConfirmation
+// ---------------------------------------------------------------------------
+
+/// Confirmation that a refund was processed by the payment rail.
+///
+/// See spec section 19.2.1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefundConfirmation {
+    /// Unique identifier for this refund.
+    pub refund_id: [u8; 32],
+    /// The receipt ID of the original payment that was refunded.
+    pub original_receipt_id: [u8; 32],
+    /// The amount refunded.
+    pub refunded_amount: Amount,
+    /// The currency of the refund.
+    pub currency: CurrencyCode,
+    /// Adapter-specific refund proof.
+    pub adapter_proof: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// PaymentError
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during payment operations.
+///
+/// See spec section 19.2.1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaymentError {
+    /// The payer does not have sufficient balance for the requested amount.
+    InsufficientBalance {
+        /// The balance available.
+        available: Amount,
+        /// The amount requested.
+        requested: Amount,
+    },
+    /// The requested currency is not supported by this adapter.
+    UnsupportedCurrency(CurrencyCode),
+    /// The authorization has expired.
+    AuthorizationExpired {
+        /// The expired authorization ID.
+        auth_id: [u8; 32],
+    },
+    /// The authorization has already been captured.
+    AlreadyCaptured {
+        /// The already-captured authorization ID.
+        auth_id: [u8; 32],
+    },
+    /// The authorization has already been voided.
+    AlreadyVoided {
+        /// The already-voided authorization ID.
+        auth_id: [u8; 32],
+    },
+    /// The receipt is invalid (e.g., corrupted proof, mismatched fields).
+    InvalidReceipt(String),
+    /// An adapter-specific error (passthrough).
+    AdapterError(String),
+    /// No compatible payment adapter found between payer and payee.
+    NoCompatiblePaymentAdapter,
+}
+
+impl std::fmt::Display for PaymentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsufficientBalance {
+                available,
+                requested,
+            } => write!(
+                f,
+                "insufficient balance: available {available}, requested {requested}"
+            ),
+            Self::UnsupportedCurrency(c) => write!(f, "unsupported currency: {c}"),
+            Self::AuthorizationExpired { .. } => write!(f, "authorization expired"),
+            Self::AlreadyCaptured { .. } => write!(f, "authorization already captured"),
+            Self::AlreadyVoided { .. } => write!(f, "authorization already voided"),
+            Self::InvalidReceipt(msg) => write!(f, "invalid receipt: {msg}"),
+            Self::AdapterError(msg) => write!(f, "adapter error: {msg}"),
+            Self::NoCompatiblePaymentAdapter => write!(f, "no compatible payment adapter"),
+        }
+    }
+}
+
+impl std::error::Error for PaymentError {}
