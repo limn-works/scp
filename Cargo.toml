@@ -9,6 +9,7 @@ members = [
     "crates/scp-media",
     "crates/scp-node",
     "crates/scp-ffi",
+    "crates/scp-ffi/uniffi",
 ]
 
 [workspace.package]
