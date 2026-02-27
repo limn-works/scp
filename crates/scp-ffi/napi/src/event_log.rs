@@ -18,7 +18,7 @@ use crate::error::ScpNapiError;
 
 /// A protocol event from the context event log.
 ///
-/// See ADR-011 (Event Log) and spec §13 (Event Log).
+/// See ADR-011 (Event Log) and spec section 13 (Event Log).
 #[napi(object)]
 pub struct NapiEvent {
     /// The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`).
@@ -74,6 +74,7 @@ pub struct NapiProof {
 /// - Rejects with `SCP-CTX-2023` when not yet connected to the runtime.
 /// - Rejects with `SCP-VALID-7000` if `filter_json` is not valid JSON.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn event_log_query(
     handle: &NapiContextHandle,
     filter_json: Option<String>,
@@ -110,15 +111,16 @@ pub async fn event_log_query(
 /// - Rejects with `SCP-VALID-7000` if `claim_json` is not valid JSON or
 ///   contains unrecognized proof type.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn event_log_verify(
     handle: &NapiContextHandle,
     claim_json: String,
 ) -> napi::Result<NapiProof> {
     let _ = (handle, claim_json);
     Err(ScpNapiError::Context {
-        message:
-            "not yet connected to runtime — event log verification requires a live context"
-                .to_owned(),
+        message: "not yet connected to runtime — event log verification requires a live context"
+            .to_owned(),
         code: "SCP-CTX-2025".to_owned(),
     }
     .into())
