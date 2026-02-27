@@ -60,7 +60,7 @@
       "id": "gate-3",
       "name": "Phase 3: Python SDK + MCP",
       "priority": "P0",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SCP-036",
         "SCP-037",
@@ -84,7 +84,8 @@
         "SCP-055",
         "SCP-056",
         "SCP-057",
-        "SCP-058"
+        "SCP-058",
+        "SCP-163"
       ]
     },
     {
@@ -234,7 +235,7 @@
       "id": "gate-econ",
       "name": "Economic Governance: Implementation",
       "priority": "P1",
-      "status": "in-progress",
+      "status": "done",
       "stories": [
         "SCP-149",
         "SCP-150",
@@ -6189,7 +6190,7 @@
         "KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025",
         "Ed25519 key generation uses Android Keystore on API 33+ devices",
         "Software fallback path exists for devices below API 33",
-        "TEE-backed key operations used by default; StrongBox available as opt-in for higher security",
+        "TEE-backed key operations used exclusively; StrongBox is not offered due to prohibitive latency for SCP's frequent signing operations (ADR-027)",
         "Key destruction verification via Android Keystore attestation per §9.15",
         "Compromise recovery follows same 6 steps from §9.12 with Android-specific key rotation",
         "Unit tests pass on both emulator and physical device targets"
@@ -6220,7 +6221,7 @@
         "note": "ADR not yet fully written — story derived from expected approach and known constraints",
         "expectedDecisions": {
           "minimumApiLevel": "API 33+ for Ed25519 Keystore, or software fallback for older devices",
-          "teeVsStrongBox": "Performance vs security tradeoff — StrongBox operations are dramatically slower than TEE-backed operations"
+          "teeVsStrongBox": "StrongBox excluded — 10-100x latency penalty is incompatible with SCP's per-message signing. TEE is the only option (ADR-027)"
         },
         "references": [
           "§17.8 — Android Keystore: TEE-backed, API 33+ for Ed25519",
@@ -9260,6 +9261,73 @@
         "protocolSection": "§19.2.4, §19.2.5, §19.11"
       },
       "result": "Implemented adapter credential management in economy/credentials.rs with AdapterCredential, CredentialStore trait, InMemoryCredentialStore, configure_adapter(), list_adapter_credentials(). Added store/ module with ProtocolStore trait and economy storage interface. 24 unit tests. Credentials bound to human identity, not agent."
+    },
+    {
+      "id": "SCP-163",
+      "title": "Complete PyO3 bridge wiring for tools, UCAN, event log, and MCP",
+      "gate": "gate-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/tools.rs",
+        "crates/scp-ffi/src/ucan.rs",
+        "crates/scp-ffi/src/event_log.rs",
+        "crates/scp-ffi/src/mcp.rs",
+        "crates/scp-ffi/src/lib.rs"
+      ],
+      "description": "Three PyO3 bridge files return `Err(\"not implemented\")` instead of delegating to real Rust implementations: `tools.rs`, `ucan.rs`, and `event_log.rs` in `crates/scp-ffi/src/`. Additionally, 9 MCP bridge functions called by `bindings/python/scp_sdk/mcp.py` (`py_mcp_serve`, `py_mcp_client_connect_stdio`, etc.) were never registered in the `#[pymodule]` in `crates/scp-ffi/src/lib.rs`. The Phase 3 integration test uses `MagicMock` for the bridge layer, masking these gaps — only 3 of 16 test methods attempt real bridge calls.\n\nThe underlying Rust implementations are solid (MCP crate: 158 tests, UCAN crate: 273 tests). The gap is exclusively in the PyO3 bridge wiring that connects them to the Python SDK.",
+      "acceptanceCriteria": [
+        "`crates/scp-ffi/src/tools.rs` delegates to real `scp-core` tool registration, invocation, and verification functions (no `Err(\"not implemented\")`)",
+        "`crates/scp-ffi/src/ucan.rs` delegates to real `scp-core` UCAN minting, validation, and revocation functions (no `Err(\"not implemented\")`)",
+        "`crates/scp-ffi/src/event_log.rs` delegates to real `scp-core` event log query, proof, and checkpoint functions (no `Err(\"not implemented\")`)",
+        "All 9 MCP bridge functions (`py_mcp_serve`, `py_mcp_client_connect_stdio`, etc.) are registered in the `#[pymodule]` in `lib.rs`",
+        "`crates/scp-ffi/src/mcp.rs` exists and delegates to real `scp-mcp` crate functions",
+        "`python -c \"from _scp_core import py_mcp_serve\"` does not raise `ImportError`",
+        "Phase 3 integration test (`tests/integration/phase3_integration_test.py`) passes without `MagicMock` for the bridge layer — real bridge calls succeed for all 16 test methods",
+        "No `\"not implemented\"` strings remain in any `crates/scp-ffi/src/*.rs` file"
+      ],
+      "actionItems": [
+        "Audit `crates/scp-ffi/src/tools.rs` — replace stub returns with real calls to `scp-core::context::tools` registration, invocation, and verification APIs",
+        "Audit `crates/scp-ffi/src/ucan.rs` — replace stub returns with real calls to `scp-core::crypto::ucan` minting, validation, and revocation APIs",
+        "Audit `crates/scp-ffi/src/event_log.rs` — replace stub returns with real calls to `scp-core::event_log` query, proof generation, and checkpoint APIs",
+        "Create `crates/scp-ffi/src/mcp.rs` — implement PyO3 bridge functions for MCP server and client operations, delegating to `scp-mcp` crate",
+        "Register all MCP bridge functions in the `#[pymodule]` function in `crates/scp-ffi/src/lib.rs`",
+        "Update `tests/integration/phase3_integration_test.py` to remove `MagicMock` usage for bridge calls and exercise real bridge functions",
+        "Run `cargo test -p scp-ffi` and verify all FFI tests pass",
+        "Run `python -m pytest tests/integration/phase3_integration_test.py` and verify all 16 test methods pass"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "## ADR-015: PyO3 Bridge"
+        },
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "## ADR-018: MCP Integration"
+        }
+      ],
+      "details": {
+        "stubFiles": [
+          "crates/scp-ffi/src/tools.rs — returns Err(\"not implemented\")",
+          "crates/scp-ffi/src/ucan.rs — returns Err(\"not implemented\")",
+          "crates/scp-ffi/src/event_log.rs — returns Err(\"not implemented\")"
+        ],
+        "missingMcpFunctions": [
+          "py_mcp_serve",
+          "py_mcp_client_connect_stdio",
+          "py_mcp_client_connect_sse",
+          "py_mcp_client_disconnect",
+          "py_mcp_client_list_tools",
+          "py_mcp_client_call_tool",
+          "py_mcp_server_register_tool",
+          "py_mcp_server_deregister_tool",
+          "py_mcp_server_list_contexts"
+        ],
+        "testGap": "Phase 3 integration test uses MagicMock for bridge layer — only 3 of 16 test methods attempt real bridge calls. All 16 must use real bridge after this story.",
+        "underlyingRustStatus": "MCP crate: 158 tests passing. UCAN crate: 273 tests passing. The Rust implementations are complete — only the PyO3 wiring is missing."
+      }
     }
   ]
 }
