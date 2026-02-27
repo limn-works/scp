@@ -278,6 +278,16 @@ pub enum ContextError {
     /// required by `Ephemeral` and `Summary` scopes.
     #[error("broadcast contexts only support MemoryScope::Full")]
     InvalidMemoryScopeForBroadcast,
+
+    /// An action-payment integration error occurred during a paid action.
+    ///
+    /// Wraps [`crate::economy::IntegrationError`] to preserve the specific
+    /// error variant (authorization failure, cost insufficient, adapter error,
+    /// etc.) rather than type-erasing to a string.
+    ///
+    /// See spec section 19.2.2.
+    #[error("payment integration failed: {0}")]
+    IntegrationFailed(#[from] crate::economy::IntegrationError),
 }
 
 // ---------------------------------------------------------------------------
