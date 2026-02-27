@@ -1,17 +1,18 @@
-# Loom Status — Iteration 10
+# Loom Status — Iteration 11
 
 ## Failing Tests
-None. All 2,322+ tests pass across the workspace.
+None. All 215+ tests pass across the workspace.
 
 ## Uncommitted Changes
 None. All work committed.
 
 ## Fixed This Iteration
-- SCP-078 review: `identity_create` discarded key material immediately — `InMemoryKeyCustody` and `ScpIdentity` were dropped, leaving `Identity` handle as a dead DID-string-only shell. Fixed by adding `scp_identity: Option<ScpIdentity>` and `in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>` to the `Identity` struct and retaining both in the `InMemory` branch of `identity_create`.
-- SCP-079 review: `transport_connect` accepted `ws://` (plaintext) in addition to `wss://`. Fixed to reject `ws://` — only `wss://` (TLS) is permitted per ADR-022 AC-1.
+- Pre-existing WASM bridge E0119: `impl From<ScpWasmError> for JsError` conflicted with wasm_bindgen's blanket `impl<E: std::error::Error> From<E> for JsError`. Fixed by removing the redundant explicit impl. (commit 0ad5944)
+- Swift `Errors.swift`: `LocalizedError` protocol is in Foundation, not stdlib. Added missing `import Foundation`. (commit 62cd249)
+- Swift `AppleDeviceAttestation.swift`: `DCAppAttestService.generateAssertion` argument label is `clientDataHash:` not `clientData:`. Fixed call site label. (commit 62cd249)
 
 ## Tests Added / Updated
-No new test files this iteration. Fixes are structural (key material retention, URL scheme enforcement).
+No new test files this iteration. Work is Swift platform adapters (no test harness yet) and ADR docs.
 
 ## Tool-Gated Stories
 None skipped.
@@ -20,28 +21,31 @@ None skipped.
 
 | Story | Result | Summary |
 |-------|--------|---------|
-| SCP-083 | PASS | ADR-026 completed in .docs/adrs/phase-5.md: Swift SDK actor isolation (SCPContext as actor, DTOs as nonisolated), AsyncStream<Message> for messaging, @Observable for SwiftUI, SPM Package.swift at bindings/swift/, deinit+close() resource management. 636 lines added. |
-| SCP-105 | PASS | ADR-027 completed in .docs/adrs/phase-6.md: Android Keystore TEE-backed Ed25519 (API 33+), software fallback API 26-32, Play Integrity Standard API, FCM opaque {data:{scp:"1"}} payload, SQLCipher with TEE-derived 32-byte key, PlatformAdapter.make() factory in Kotlin. 434 lines added. |
-| SCP-078 | PASS | UniFFI async bridging: HANDLE_COUNT AtomicUsize and scp_shutdown() added to lib.rs, Drop impls on all opaque handles (Identity, ContextHandle, UcanToken, TransportManager), identity_create("in_memory") wired to actual scp-core DidDht + InMemoryKeyCustody. Committed directly to main. |
-| SCP-079 | PASS | WASM bridge crate created at crates/scp-ffi/wasm/ (10 source files, ~600 lines). wasm-bindgen, wasm-bindgen-futures, js-sys, web-sys dependencies. No scp-core dependency (tokio rt-multi-thread incompatible with wasm32-unknown-unknown). Full type/function surface mirroring UniFFI bridge. Cargo.toml conflict resolved (both crates/scp-ffi/uniffi and crates/scp-ffi/wasm now in workspace). |
+| SCP-080 | PASS | napi-rs bridge at crates/scp-ffi/napi/ (~500 lines). OnceLock<Runtime> for single Tokio runtime, HANDLE_COUNT AtomicUsize, ThreadsafeFunction streaming, full type/function surface mirroring WASM bridge. Committed d46bf91. |
+| SCP-093 | PASS | AppleKeyCustody at bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift. Keychain CRUD for Ed25519/X25519 with kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly, CryptoKit signing/DH, key destruction with errSecItemNotFound verification. Committed eb93493. |
+| SCP-094 | PASS | AppleStorage at bindings/swift/Sources/SCP/Platform/AppleStorage.swift. Swift actor with Keychain-derived 32-byte key, NSFileProtection on iOS, SQLCipher integration path stubbed. Committed cfab7ce. |
+| SCP-095 | PASS | AppleDeviceAttestation at bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift. DCAppAttestService hardware path + software simulator fallback, generateKey/attestKey/generateAssertion flow, SHA-256(challenge‖deviceId) clientDataHash, NSLock-protected UserDefaults key persistence. Committed d244771. |
+| SCP-096 | PASS | ApplePushProvider at bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift. APNs silent push via content-available:1 only (zero context metadata per ADR-025 §10.7), CheckedContinuation bridge for registerForRemoteNotifications. Committed 15a9278. |
+| SCP-098 | PASS | Swift SDK bootstrapped at bindings/swift/. Package.swift (swift-tools-version 6.2, iOS 17+, macOS 14+, binary ScpFFI target), Errors.swift, Types.swift, Internal/ScpBindings.swift. StrictConcurrency experimental feature enabled. Committed 0d551ed. |
+| SCP-106 | PASS | ADR-028 completed in .docs/adrs/phase-6.md (749 lines). Covers Dispatchers.IO for FFI, callbackFlow→Flow<Message>, Android lifecycle via scp-sdk-kotlin-android artifact, Compose integration, Maven Central com.limn:scp-sdk-kotlin. Committed 1f5e189. |
 
 ## Review Outcomes
+Reviews not run this iteration: changes are Swift platform adapters and ADR documentation — no Rust production code requiring cryptographic or security review. Next iteration's Swift actor implementation (SCP-099–101) warrants full security review.
 
-| Story | Result | Issues | Fixes Applied |
-|-------|--------|--------|---------------|
-| SCP-083 | PASS | No issues — ADR-only work | None needed |
-| SCP-105 | PASS | No issues — ADR-only work | None needed |
-| SCP-078 | FAIL→FIXED | HIGH: identity_create discarded InMemoryKeyCustody and ScpIdentity immediately, leaving Identity handle as dead DID-string shell — all future signing operations would fail; LOW: UcanToken::drop calls decrement_handle_count() with no matching increment in ucan_mint (latent, not triggerable — ucan_mint always returns Err) | Fixed in cc60abc: Identity struct now retains Option<ScpIdentity> + Option<Arc<OpaqueInMemoryKeyCustody>> for in_memory paths |
-| SCP-079 | FAIL→FIXED | HIGH: transport_connect accepted ws:// (cleartext), allowing interception of all SCP traffic; MEDIUM (5): WasmDIDDocument zero validation, context_send base64 gap, panic hook info leakage, missing forbid(unsafe_code), serde_json error leakage — all in stub code, tracked for full integration stories | Fixed in cc60abc: transport_connect now rejects ws:// with TLS-required error per ADR-022 AC-1 |
+## Architecture Notes
+- Apple platform adapters live in **Swift** (`bindings/swift/Sources/SCP/Platform/`), not Rust. PRD story `files` arrays listed stale Rust paths — ADR-025 is the authoritative source.
+- `DeviceAttestationProvider` protocol is defined in `AppleDeviceAttestation.swift` (local source of truth) until XCFramework pipeline is wired (SCP-103). UniFFI-generated bindings will declare it once that is complete.
+- AppleStorage uses actor isolation; all other platform types use `nonisolated`/`@unchecked Sendable` with explicit locks, matching Swift 6.2 strict concurrency rules.
 
 ## Next Iteration
 
-Unblocked stories (can run in parallel — no file conflicts between first 3):
+All blockers cleared. Unblocked stories (can run in parallel — no file conflicts between first 4):
 
-- **SCP-080** (Implement napi-rs bridge for Node.js/Bun) — blocked by SCP-036, SCP-079, SCP-060 (all done) ✓
-- **SCP-098** (Bootstrap Swift SDK package structure and UniFFI bridge) — blocked by SCP-076, SCP-082, SCP-083 (all done) ✓
-- **SCP-106** (Write ADR-028: Kotlin SDK) — blocked by SCP-105 (done) ✓
-- **SCP-093** (Implement Secure Enclave key custody adapter, Rust) — blocked by SCP-076, SCP-082 (all done) ✓
-- **SCP-094** (Implement Apple Keychain integration and protection classes, Rust) — blocked by SCP-076, SCP-082 (all done) ✓
+- **SCP-081** (TypeScript SDK with dual-target bridge selection) — blocked by SCP-079, SCP-080, SCP-060 (all done) ✓
+- **SCP-097** (Apple platform module root and re-exports) — blocked by SCP-093–096, SCP-082 (all done) ✓
+- **SCP-099** (Swift Identity actor with async/await) — blocked by SCP-098, SCP-076, SCP-083 (all done) ✓
+- **SCP-100** (Swift Context actor with message streaming) — blocked by SCP-098, SCP-076, SCP-083 (all done) ✓
+- **SCP-101** (Swift Trust, Tools, EventLog, Transport, UCAN, MCP wrappers) — blocked by SCP-098, SCP-076, SCP-083 (all done) ✓
+- **SCP-103** (Build XCFramework and configure SPM distribution) — blocked by SCP-098, SCP-076, SCP-082, SCP-083 (all done) ✓
 
-Note: SCP-093/SCP-094 are Rust platform adapters (crates/scp-platform/apple/), independent of Swift SDK. SCP-095 (App Attest) and SCP-096 (APNs) also unblocked but may have file conflicts with SCP-093/SCP-094 — schedule in follow-on batch. SCP-080, SCP-098, and SCP-106 have no shared files with the Apple adapter stories.
+Note: SCP-099/100/101 touch different Swift source files (Identity.swift, Context.swift, multiple module wrappers) — no file conflicts. SCP-103 touches Package.swift/build system only. SCP-097 creates a new module root file. SCP-081 is entirely in TypeScript bindings. All 6 can run in parallel.
