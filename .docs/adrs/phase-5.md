@@ -379,44 +379,654 @@ Write after Phase 2 implementation stabilizes. Build the in-memory platform adap
 
 ## ADR-026: Swift SDK
 
-**Status:** Pending
+**Status:** Decided
 
-### What This ADR Will Decide
+### Context
 
-The Swift SDK ergonomics layer built on top of UniFFI-generated bindings. Covers Swift-specific patterns (async/await, actor isolation, SwiftUI integration), error types, resource management, and the Swift Package Manager distribution.
+The UniFFI bridge (ADR-021) generates raw Swift bindings from the Rust protocol engine. While functional, the generated surface is not idiomatic Swift — it lacks actor isolation, `AsyncSequence` streams, the `@Observable` macro, and the ergonomic patterns Swift developers expect. The Apple platform adapter (ADR-025) provides the `KeyCustody`, `PushProvider`, `Storage`, and `DeviceAttestationProvider` implementations injected into the Rust engine via UniFFI callback interfaces.
 
-### Blockers
+The Swift SDK ergonomics layer wraps the generated bindings to produce an idiomatic Swift API that feels native to the platform: `async/await` throughout, actor-isolated state, structured concurrency with `AsyncStream<Message>`, `@Observable` for SwiftUI, and `deinit`-safe resource cleanup. The ergonomics layer is pure Swift — zero protocol logic, zero duplication of Rust behavior. This mirrors the ADR-014 (Python SDK) pattern: flat FFI bridge → idiomatic language wrapper.
 
-- ADR-021 (UniFFI) must be written first — the Swift SDK wraps UniFFI-generated code.
-- ADR-025 (Apple platform) must be written — platform adapter is a dependency of the SDK.
-- Phase 1-3 implementation must be complete — SDK surface derives from Rust crate public API.
+Swift 6.2 with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` is the baseline, making `@MainActor` the default. Types that need to operate off the main actor (background crypto, streaming) explicitly opt out.
 
-### Required Inputs When Writing
+### Decision
 
-- UniFFI-generated Swift types and async functions.
-- Platform adapter implementations (Apple-specific `KeyCustody`, `PushProvider`, `Storage`).
-- Error hierarchy as exposed through UniFFI.
-- Cross-platform conformance test suite (from `scaffold/shared.md`).
+Implement the Swift SDK as the `SCP` Swift package at `bindings/swift/`. The package imports `ScpFFI.xcframework` (UniFFI-generated binary), re-exports it through `Sources/SCP/Internal/ScpBindings.swift`, and builds a pure Swift ergonomics layer in `Sources/SCP/`. The top-level entry point is `SCP` — an actor that initializes the identity and injects the Apple platform adapter. `SCPContext` is the primary interactive type — an actor exposing `AsyncStream<Message>` for streaming and a `close()` / `deinit` lifecycle.
 
-### References
+Actor isolation follows the Swift 6.2 approachable concurrency rules: data carrier types (`Message`, `DIDDocument`, `ToolDefinition`) are `nonisolated struct` and `Sendable` by definition. Interactive types (`SCP`, `SCPContext`, `SCPIdentity`) are custom actors. `SCPEventLog` and `SCPTransport` are `nonisolated` since they have no mutable state after construction. `SwiftUI` observation uses `@Observable` for SCP state containers (Swift 5.9+). Streaming uses `AsyncStream<Message>` (not Combine) — the right choice for Swift 6 structured concurrency. The SPM package is configured as a binary framework target with XCFramework checksum verification.
 
-- `scaffold/swift.md` — package structure, UniFFI bridging, async patterns (`CheckedContinuation`), actor isolation, XCFramework.
-- `standards/swift.md` — Swift 6 strict concurrency, `@MainActor` default, `nonisolated` DTOs, Swift Testing, iOS 17+.
-- `scaffold/shared.md` — cross-language naming (PascalCase types, camelCase functions), conformance tests.
-- ADR-014 — Python SDK wrappers as pattern (Pythonic ergonomics layer over flat FFI).
+### Rationale
 
-### Expected Decisions
+- **Actor isolation over `@MainActor` default for interactive types:** `SCP` and `SCPContext` manage mutable protocol state (MLS group, sender keys, connection handles). Custom actors enforce serial access to this state without blocking the main thread. `@MainActor` would block UI updates during crypto operations — wrong for any non-trivial workload.
+- **`AsyncStream<Message>` over Combine:** Swift 6 strict concurrency treats Combine as a compatibility layer, not the forward path. `AsyncStream` integrates naturally with `for await` loops, structured concurrency cancellation, and `TaskGroup`. It requires zero imported frameworks and works identically on iOS, macOS, and in Swift package tests. Combine's `Publisher` → `AsyncSequence` bridging adds indirection without benefit.
+- **`@Observable` for SwiftUI state:** The `@Observable` macro (Swift 5.9+, iOS 17+) tracks property access at the granularity of individual properties rather than the whole object. This means `SCPContextState` annotated with `@Observable` triggers minimal view updates when only `memberCount` changes, not when `lastMessage` changes. Property wrappers like `@Published` (Combine) are legacy in this context.
+- **`deinit` + explicit `close()` for resource cleanup:** SCP contexts hold live crypto state (MLS group keys, sender AES-256 keys) that must be zeroed on deallocation. `close()` is the user-visible method for graceful teardown (leave the MLS group, flush the event log, close the transport connection). `deinit` is the safety net — it schedules a `Task { try? await close() }` to prevent resource leaks when a context object is dropped without explicit close. This matches the `Symbol.asyncDispose` pattern in the TypeScript SDK.
+- **`nonisolated struct` for DTOs:** Data carrier types (`Message`, `DIDDocument`, `ToolDefinition`, `Provenance`) are value types with no mutable state after construction. Marking them `nonisolated struct` makes all members inherit nonisolated context, satisfying Swift 6 `Sendable` without `@unchecked Sendable`. They cross actor boundaries freely as `Sendable` values.
+- **`SCP.create()` as async factory, not `init`:** The identity initialization path (`identity_create()`) is async (involves key generation and DID registration). Swift actors cannot have `async init`. The factory pattern `await SCP.create()` is the idiomatic solution. `ApplePlatformAdapter.make()` is injected at creation time — the caller controls custody.
+- **SPM binary framework target:** XCFramework binary distribution via SPM `binaryTarget` with checksum verification gives consumers a single `Package.swift` dependency with no Rust toolchain requirement. Swift compiler verifies the binary against the declared checksum on resolution.
+- **Flat delegation pattern — no logic in Swift:** Every Swift SDK method calls exactly one UniFFI bridge function. Zero protocol logic lives in the Swift layer. This prevents divergence between the Rust engine and the Swift surface and ensures one implementation of every operation.
 
-- **Actor isolation strategy:** Which types are `@MainActor`, which are `nonisolated`, which use custom actors.
-- **Property wrapper patterns** for SCP state (e.g., `@SCPContext` for SwiftUI observation).
-- **Combine/AsyncSequence choice** for streaming (`AsyncSequence` preferred per Swift 6).
-- **Resource management:** `deinit` + explicit `close()` pattern for crypto state cleanup.
-- **SPM package configuration:** Binary framework target with checksum verification.
+### Implementation
 
-### Optimal Approach
+**Language:** Swift 6.2+
 
-Write after ADR-021 (UniFFI) produces generated Swift code. Review the generated API, then design the ergonomics layer. Follow the Python SDK pattern (ADR-014): flat FFI bridge -> idiomatic language wrapper.
+**Package:** `bindings/swift/` published as `SCP` Swift package via GitHub releases.
+
+**Dependencies from UniFFI:** `identity_create()`, `identity_load()`, `identity_resolve()`, `context_create()`, `context_join()`, `context_leave()`, `context_close()`, `context_send()`, `context_subscribe()` (callback interface), `tool_register()`, `tool_invoke()`, `tool_verify()`, `ucan_validate()`, `ucan_mint()`, `ucan_revoke()`, `event_log_query()`, `event_log_verify()`, `transport_connect()`, `transport_status()`, and the `ScpError` enum — all from `ScpBindings.swift`.
+
+**File layout:**
+
+```
+bindings/swift/
+  Package.swift                       # SPM package definition (binary + source targets)
+  Sources/
+    SCP/
+      SCP.swift                       # SCP actor — top-level entry point, identity + transport init
+      Identity.swift                  # SCPIdentity actor, DIDDocument struct
+      Context.swift                   # SCPContext actor, AsyncStream<Message>, lifecycle
+      Tools.swift                     # ToolDefinition, TestVector, ToolVerificationResult structs
+      Trust.swift                     # evaluateTrust(), TrustEvaluation struct
+      EventLog.swift                  # SCPEventLog class (nonisolated), Event, Proof, Checkpoint
+      Transport.swift                 # TransportConfig struct, transport connection helpers
+      Types.swift                     # Message, Provenance, Capability, ContextParams (nonisolated structs)
+      Errors.swift                    # ScpError enum (mirrors UniFFI ScpError), LocalizedError conformance
+      Ucan.swift                      # UCAN validate(), mint(), revoke() (nonisolated free functions)
+      Mcp.swift                       # serveMcp(), McpClient
+      Platform/
+        AppleKeyCustody.swift         # KeyCustodyProvider implementation (Keychain + Secure Enclave)
+        AppleDeviceAttestation.swift  # DeviceAttestationProvider (DCAppAttestService)
+        ApplePushProvider.swift       # PushProvider (APNs)
+        AppleStorage.swift            # StorageProvider (Core Data / file-based)
+        PlatformAdapter.swift         # ApplePlatformAdapter.make() factory
+      Internal/
+        ScpBindings.swift             # UniFFI-generated bindings (auto-generated, do not edit)
+  Tests/
+    SCPTests/
+      IdentityTests.swift
+      ContextTests.swift
+      ToolsTests.swift
+      UcanTests.swift
+      TransportTests.swift
+      EventLogTests.swift
+      McpTests.swift
+      Conformance/
+        ConformanceTests.swift        # Cross-language conformance test suite
+```
+
+**Package.swift:**
+
+```swift
+// swift-tools-version: 6.2
+import PackageDescription
+
+let package = Package(
+    name: "SCP",
+    platforms: [
+        .iOS(.v17),
+        .macOS(.v14),
+    ],
+    products: [
+        .library(name: "SCP", targets: ["SCP"]),
+    ],
+    targets: [
+        .binaryTarget(
+            name: "ScpFFI",
+            url: "https://github.com/limn/scp-swift/releases/download/0.1.0/ScpFFI.xcframework.zip",
+            checksum: "<sha256-checksum>"
+        ),
+        .target(
+            name: "SCP",
+            dependencies: ["ScpFFI"],
+            path: "Sources/SCP",
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "SCPTests",
+            dependencies: ["SCP"],
+            path: "Tests/SCPTests"
+        ),
+    ]
+)
+```
+
+**`SCP` actor — top-level entry point:**
+
+```swift
+/// Top-level SCP SDK entry point. Initialize once per process.
+public actor SCP {
+    public let identity: SCPIdentity
+
+    private init(identity: SCPIdentity) {
+        self.identity = identity
+    }
+
+    /// Create an SCP instance with the specified custody method.
+    /// On Apple platforms, `custody: .platform` uses Keychain-backed key storage.
+    /// `custody: .inMemory` uses software keys (testing only).
+    public static func create(custody: CustodyMethod = .platform) async throws -> SCP {
+        let adapter: ApplePlatformAdapter?
+        if custody == .platform {
+            adapter = try ApplePlatformAdapter.make()
+        } else {
+            adapter = nil
+        }
+        let handle = try await identity_create(
+            custody: custody.rawValue,
+            keyCustody: adapter?.keyCustody,
+            storage: adapter?.storage,
+            pushProvider: adapter?.pushProvider,
+            deviceAttestation: adapter?.deviceAttestation
+        )
+        let identity = SCPIdentity(handle: handle)
+        return SCP(identity: identity)
+    }
+
+    /// Create a new context.
+    public func createContext(params: ContextParams) async throws -> SCPContext {
+        let handle = try await context_create(identity: identity.handle, params: params.toRecord())
+        return SCPContext(handle: handle)
+    }
+
+    /// Join an existing context by ID.
+    public func joinContext(id: String) async throws -> SCPContext {
+        let handle = try await context_join_by_id(identity: identity.handle, contextId: id)
+        return SCPContext(handle: handle)
+    }
+}
+```
+
+**`SCPIdentity` actor:**
+
+```swift
+/// An SCP identity (DID). Holds the signing key handle — never exposes private key bytes.
+public actor SCPIdentity {
+    public let did: String
+    public let custodyType: String
+
+    internal let handle: IdentityHandle
+
+    internal init(handle: IdentityHandle) {
+        self.did = handle.did()
+        self.custodyType = handle.custodyType()
+        self.handle = handle
+    }
+
+    /// Load an existing identity from storage.
+    public static func load(did: String) async throws -> SCPIdentity {
+        let handle = try await identity_load(did: did)
+        return SCPIdentity(handle: handle)
+    }
+
+    /// Resolve another identity's DID document.
+    public func resolve(did: String) async throws -> DIDDocument {
+        let record = try await identity_resolve(did: did)
+        return DIDDocument(from: record)
+    }
+
+    /// Rotate this identity's signing key. Returns an updated identity.
+    public func rotateKey() async throws -> SCPIdentity {
+        let handle = try await identity_rotate_key(identity: self.handle)
+        return SCPIdentity(handle: handle)
+    }
+}
+```
+
+**`SCPContext` actor:**
+
+```swift
+/// An active SCP context. Send messages, receive streams, invoke tools.
+/// Always `close()` when done. `deinit` schedules close as a safety net.
+public actor SCPContext {
+    public let contextId: String
+    public private(set) var state: ContextState
+
+    private let handle: ContextHandle
+    private var streamContinuation: AsyncStream<Message>.Continuation?
+
+    internal init(handle: ContextHandle) {
+        self.contextId = handle.contextId()
+        self.state = ContextState(rawValue: handle.state()) ?? .active
+        self.handle = handle
+    }
+
+    deinit {
+        // Safety net: schedule close if caller forgot to call it explicitly.
+        // `try?` intentionally suppresses errors in the deinit path.
+        let h = handle
+        Task { try? await context_close(handle: h) }
+    }
+
+    /// Send a message to this context.
+    public func send(_ payload: Data) async throws {
+        guard state == .active else { throw ScpError.context(message: "Context is not active", code: "SCP-CTX-001") }
+        try await context_send(handle: handle, payload: payload)
+    }
+
+    /// AsyncStream of incoming messages. Yields until the context closes.
+    public var messages: AsyncStream<Message> {
+        AsyncStream { continuation in
+            self.streamContinuation = continuation
+            context_subscribe(handle: handle, listener: MessageListenerAdapter(continuation: continuation))
+        }
+    }
+
+    /// Invoke a registered tool in this context.
+    public func invoke(tool: String, input: Data) async throws -> Data {
+        let output = try await tool_invoke(handle: handle, toolId: tool, inputJson: input)
+        return output
+    }
+
+    /// Register a tool in this context. Returns the assigned tool ID.
+    public func registerTool(_ definition: ToolDefinition) async throws -> String {
+        try await tool_register(handle: handle, registration: definition.toRecord())
+    }
+
+    /// Leave this context gracefully.
+    public func leave() async throws {
+        try await context_leave(handle: handle, identity: nil)
+        state = .closed
+    }
+
+    /// Close this context (admin only). Terminates the context for all members.
+    public func close() async throws {
+        try await context_close(handle: handle)
+        state = .closed
+        streamContinuation?.finish()
+        streamContinuation = nil
+    }
+}
+
+/// Adapts the UniFFI `MessageListener` callback interface to `AsyncStream.Continuation`.
+private final class MessageListenerAdapter: MessageListener, @unchecked Sendable {
+    private let continuation: AsyncStream<Message>.Continuation
+
+    init(continuation: AsyncStream<Message>.Continuation) {
+        self.continuation = continuation
+    }
+
+    func onMessage(message: ScpMessage) {
+        continuation.yield(Message(from: message))
+    }
+
+    func onError(error: ScpError) {
+        continuation.finish()
+    }
+
+    func onComplete() {
+        continuation.finish()
+    }
+}
+```
+
+**Error hierarchy:**
+
+```swift
+/// Swift error enum mirroring the UniFFI ScpError variants.
+/// Conforms to LocalizedError for SwiftUI and system error presentation.
+public enum ScpError: Error, Sendable {
+    case identity(message: String, code: String)
+    case context(message: String, code: String)
+    case permission(message: String, code: String)
+    case crypto(message: String, code: String)
+    case transport(message: String, code: String)
+    case tool(message: String, code: String)
+    case validation(message: String, code: String)
+}
+
+extension ScpError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .identity(let message, _): return message
+        case .context(let message, _): return message
+        case .permission(let message, _): return message
+        case .crypto(let message, _): return message
+        case .transport(let message, _): return message
+        case .tool(let message, _): return message
+        case .validation(let message, _): return message
+        }
+    }
+
+    public var errorCode: String {
+        switch self {
+        case .identity(_, let code): return code
+        case .context(_, let code): return code
+        case .permission(_, let code): return code
+        case .crypto(_, let code): return code
+        case .transport(_, let code): return code
+        case .tool(_, let code): return code
+        case .validation(_, let code): return code
+        }
+    }
+}
+
+/// Maps UniFFI-generated ScpError to the Swift SDK ScpError.
+extension ScpError {
+    init(from ffiError: ScpBindings.ScpError) {
+        switch ffiError {
+        case .identity(let message, let code): self = .identity(message: message, code: code)
+        case .context(let message, let code): self = .context(message: message, code: code)
+        case .permission(let message, let code): self = .permission(message: message, code: code)
+        case .crypto(let message, let code): self = .crypto(message: message, code: code)
+        case .transport(let message, let code): self = .transport(message: message, code: code)
+        case .tool(let message, let code): self = .tool(message: message, code: code)
+        case .validation(let message, let code): self = .validation(message: message, code: code)
+        }
+    }
+}
+```
+
+**Data carrier types (`nonisolated struct`, `Sendable`):**
+
+```swift
+/// An incoming SCP message. Sendable value type — safe to pass across actor boundaries.
+public nonisolated struct Message: Sendable {
+    public let senderDid: String
+    public let content: Data
+    public let timestamp: TimeInterval
+    public let sequence: Int64
+    public let contextId: String
+    public let provenance: Provenance?
+
+    init(from record: ScpMessage) {
+        self.senderDid = record.senderDid
+        self.content = record.content
+        self.timestamp = TimeInterval(record.timestamp) / 1000.0
+        self.sequence = record.sequence
+        self.contextId = record.contextId
+        self.provenance = record.provenance.map(Provenance.init(from:))
+    }
+}
+
+/// Context creation parameters.
+public nonisolated struct ContextParams: Sendable {
+    public let ceiling: [String]
+    public let tools: [ToolDefinition]
+    public let governance: GovernanceModel
+    public let ttl: TimeInterval?
+    public let memoryScope: MemoryScope
+
+    public init(
+        ceiling: [String],
+        tools: [ToolDefinition] = [],
+        governance: GovernanceModel = .singleAdmin,
+        ttl: TimeInterval? = nil,
+        memoryScope: MemoryScope = .full
+    ) {
+        self.ceiling = ceiling
+        self.tools = tools
+        self.governance = governance
+        self.ttl = ttl
+        self.memoryScope = memoryScope
+    }
+}
+
+/// A registered SCP tool definition.
+public nonisolated struct ToolDefinition: Sendable {
+    public let name: String
+    public let description: String
+    public let inputSchema: String      // JSON Schema string
+    public let outputSchema: String     // JSON Schema string
+    public let operatorDid: String
+    public let testVectors: [TestVector]?
+    public let implementationHash: Data?
+}
+
+/// A DID document resolved from the DID network.
+public nonisolated struct DIDDocument: Sendable {
+    public let did: String
+    public let verificationMethods: [VerificationMethod]
+    public let services: [ServiceEndpoint]
+    public let resolvedAt: TimeInterval
+}
+```
+
+**SwiftUI `@Observable` state container:**
+
+```swift
+/// SwiftUI-observable state container for an SCP context.
+/// Use this as the `@State` in a view that displays context data.
+@Observable
+public final class SCPContextState: @unchecked Sendable {
+    public private(set) var messages: [Message] = []
+    public private(set) var memberCount: Int = 0
+    public private(set) var isActive: Bool = false
+
+    private var streamTask: Task<Void, Never>?
+
+    /// Attach this state container to a live context. Begins streaming messages.
+    public func attach(to context: SCPContext) {
+        isActive = true
+        streamTask = Task { [weak self] in
+            for await message in await context.messages {
+                guard let self else { break }
+                self.messages.append(message)
+            }
+            self?.isActive = false
+        }
+    }
+
+    deinit {
+        streamTask?.cancel()
+    }
+}
+```
+
+**UCAN free functions (nonisolated):**
+
+```swift
+/// Validate a UCAN token for a capability in a context.
+/// Throws `ScpError.permission` if the token is invalid or the capability is not granted.
+public func validateUcan(token: String, capability: String, contextId: String) async throws {
+    try await ucan_validate(token: token, capability: capability, contextId: contextId)
+}
+
+/// Mint a UCAN token delegating capabilities to a member DID.
+public func mintUcan(
+    identity: SCPIdentity,
+    memberDid: String,
+    capabilities: [String]
+) async throws -> String {
+    try await ucan_mint(identity: identity.handle, memberDid: memberDid, capabilities: capabilities)
+}
+
+/// Revoke a previously minted UCAN token.
+public func revokeUcan(identity: SCPIdentity, tokenId: String) async throws {
+    try await ucan_revoke(identity: identity.handle, tokenId: tokenId)
+}
+```
+
+**Async bridging pattern — `CheckedContinuation`:**
+
+UniFFI generates Swift `async` functions directly for all `async fn` bridge functions. The `CheckedContinuation` pattern is used only when wrapping the `context_subscribe` callback interface (which is callback-based, not async-return):
+
+```swift
+// Internal: wrap the UniFFI callback subscription in an AsyncStream.
+// AsyncStream.Continuation is the Swift-native equivalent of CheckedContinuation for streams.
+private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
+    AsyncStream { continuation in
+        let listener = MessageListenerAdapter(continuation: continuation)
+        context_subscribe(handle: handle, listener: listener)
+        continuation.onTermination = { _ in
+            // Cancellation propagates to the Rust subscription automatically
+            // when the MessageListenerAdapter is deallocated.
+        }
+    }
+}
+```
+
+### Dependencies
+
+- **ADR-021 (UniFFI Bridge):** The Swift SDK wraps the UniFFI-generated `ScpBindings.swift` and `ScpFFI.xcframework`. Every SDK public method calls exactly one UniFFI bridge function. The bridge defines the flat function surface (`identity_create`, `context_create`, etc.), opaque object handles (`IdentityHandle`, `ContextHandle`), value records (`ScpMessage`, `ContextParams`), the `ScpError` enum, and the `MessageListener` callback interface.
+- **ADR-025 (Apple Platform Adapter):** The `ApplePlatformAdapter` (implemented in ADR-025) is instantiated by `SCP.create(custody: .platform)` and injected into the Rust engine via UniFFI callback interfaces (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`). The Swift SDK depends on the `Platform/` files being present in `Sources/SCP/Platform/`.
+- **ADR-006 (Platform Abstraction):** Platform trait definitions (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) shape the UniFFI callback interface contracts that the Swift SDK implements.
+- **ADR-013 (PyO3 Bridge) / ADR-014 (Python SDK):** The ergonomics layer pattern — flat FFI bridge → idiomatic language wrapper — is established here and applied to Swift. Swift SDK mirrors the structural choices (no logic in the wrapper layer, delegation only) and the type category decisions (opaque handles for crypto state, value types for data).
+- **ADR-022 (TypeScript SDK):** Parallel patterns: `AsyncStream<Message>` (Swift) mirrors `AsyncIterable<Message>` (TypeScript); `deinit` + `close()` (Swift) mirrors `Symbol.asyncDispose` (TypeScript). Conformance test suite is shared.
+
+### Acceptance Criteria
+
+1. **Package builds for all Apple targets:**
+
+   ```bash
+   swift build
+   xcodebuild build -scheme SCP -destination 'platform=iOS Simulator,name=iPhone 16'
+   xcodebuild build -scheme SCP -destination 'platform=macOS'
+   ```
+
+   All three commands exit 0 with zero warnings at `SWIFT_STRICT_CONCURRENCY=complete`.
+
+2. **`SCP.create()` factory:**
+   - `await SCP.create(custody: .platform)` returns an `SCP` actor with a valid `identity.did` starting with `"did:dht:"`.
+   - `await SCP.create(custody: .inMemory)` returns an `SCP` actor with a software-backed identity (for testing).
+   - `SCP.create()` calls `ApplePlatformAdapter.make()` when `custody == .platform` and injects all four providers.
+
+3. **`SCPIdentity` operations:**
+
+   ```swift
+   let scp = try await SCP.create(custody: .inMemory)
+   let identity = scp.identity
+   #expect(await identity.did.hasPrefix("did:dht:"))
+   #expect(await identity.custodyType == "in_memory")
+
+   let doc = try await identity.resolve(did: await identity.did)
+   #expect(!doc.verificationMethods.isEmpty)
+
+   let rotated = try await identity.rotateKey()
+   #expect(await rotated.did == identity.did)  // DID is stable; key material rotates
+   ```
+
+4. **`SCPContext` lifecycle:**
+   - `await scp.createContext(params:)` returns an `SCPContext` with `state == .active`.
+   - `await context.send(payload)` delivers an encrypted message (no throw for valid payload).
+   - `await context.close()` transitions `state` to `.closed` and finishes the message stream.
+   - After `close()`, `send()` throws `ScpError.context` with code `"SCP-CTX-001"`.
+   - `deinit` without `close()` triggers cleanup — verified by allocating a context and setting its reference to nil without calling `close()`, then asserting no resource leak in the test teardown.
+
+5. **Message streaming via `AsyncStream<Message>`:**
+
+   ```swift
+   let context = try await scp.createContext(params: ContextParams(ceiling: ["messages:read", "messages:write"]))
+   let stream = await context.messages
+
+   // Producer task sends 3 messages
+   let producer = Task {
+       for i in 0..<3 {
+           try await context.send(Data("message \(i)".utf8))
+       }
+       try await context.close()
+   }
+
+   var received: [Message] = []
+   for await message in stream {
+       received.append(message)
+   }
+   #expect(received.count == 3)
+   ```
+
+6. **`ScpError` hierarchy:**
+   - All UniFFI `ScpError` variants map 1:1 to Swift `ScpError` cases.
+   - Each case has associated `message: String` and `code: String`.
+   - `ScpError` conforms to `LocalizedError` — `errorDescription` returns the human-readable message.
+   - Error codes follow `SCP-{CATEGORY}-{NUMBER}` format.
+   - Errors thrown from bridge functions surface as `ScpError` (not raw UniFFI types) in the ergonomics layer.
+
+7. **UCAN operations:**
+   - `mintUcan(identity:memberDid:capabilities:)` returns a non-empty token string.
+   - `validateUcan(token:capability:contextId:)` does not throw for a valid token and matching capability.
+   - `validateUcan(token:capability:contextId:)` throws `ScpError.permission` for an invalid or expired token.
+   - `revokeUcan(identity:tokenId:)` does not throw for a valid token ID.
+
+8. **Tool operations:**
+
+   ```swift
+   let toolId = try await context.registerTool(ToolDefinition(
+       name: "summarize",
+       description: "Summarize text",
+       inputSchema: #"{"type":"object","properties":{"text":{"type":"string"}}}"#,
+       outputSchema: #"{"type":"object","properties":{"summary":{"type":"string"}}}"#,
+       operatorDid: await scp.identity.did,
+       testVectors: nil,
+       implementationHash: nil
+   ))
+   #expect(toolId.hasPrefix("tool-"))
+   ```
+
+9. **Event log queries:**
+
+   ```swift
+   let eventLog = await context.eventLog()
+   let events = try await eventLog.query(since: Date().addingTimeInterval(-3600))
+   #expect(events.allSatisfy { $0.contextId == context.contextId })
+
+   let checkpoint = try await eventLog.checkpoint()
+   #expect(!checkpoint.merkleRoot.isEmpty)
+   ```
+
+10. **SwiftUI `@Observable` integration:**
+    - `SCPContextState` is `@Observable`.
+    - `attach(to:)` begins appending messages to `messages` array.
+    - `isActive` transitions `true` on attach, `false` when context closes.
+    - Changes to `SCPContextState` properties trigger SwiftUI view updates (verified via `withObservationTracking` in tests).
+
+11. **Swift 6 strict concurrency — zero warnings:**
+    - No `@unchecked Sendable` in `Sources/SCP/` (excluding `MessageListenerAdapter` which is a UniFFI callback adapter and is explicitly justified).
+    - No `nonisolated(unsafe)` anywhere.
+    - No force unwraps (`!`) and no force try (`try!`) anywhere.
+    - `swift build` with `-strict-concurrency=complete` exits 0 with zero warnings.
+
+12. **Test suite passes:**
+
+    ```bash
+    swift test                                                                   # All unit tests
+    xcodebuild test -scheme SCP -destination 'platform=iOS Simulator,name=iPhone 16'  # iOS
+    xcodebuild test -scheme SCP -destination 'platform=macOS'                   # macOS
+    ```
+
+    All tests use Swift Testing (`@Test`, `#expect`). No XCTest.
+
+13. **Conformance tests:**
+    - The cross-language conformance test suite (from `scaffold/shared.md`) passes for Swift.
+    - A context created by the Swift SDK is joinable by the Python SDK and TypeScript SDK (verified with shared test vectors).
+    - Messages sent from Swift are receivable by Python and TypeScript SDK consumers.
+
+14. **SPM distribution:**
+
+    ```swift
+    // In a consumer's Package.swift
+    dependencies: [
+        .package(url: "https://github.com/limn/scp-swift", from: "0.1.0"),
+    ],
+    targets: [
+        .target(name: "MyApp", dependencies: ["SCP"]),
+    ]
+    ```
+
+    `swift package resolve` completes successfully. No Rust toolchain required by the consumer.
 
 ### Scope
 
-`bindings/swift/` — ~10 files, ~30 functions (wrapping UniFFI-generated types).
+**Files (~16):**
+
+| File | Purpose |
+|------|---------|
+| `Package.swift` | SPM package definition — binary XCFramework target + SCP source target + test target |
+| `Sources/SCP/SCP.swift` | `SCP` actor — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
+| `Sources/SCP/Identity.swift` | `SCPIdentity` actor — DID, `load()`, `resolve()`, `rotateKey()` |
+| `Sources/SCP/Context.swift` | `SCPContext` actor — `send()`, `messages` stream, `invoke()`, `registerTool()`, `leave()`, `close()`, `deinit` |
+| `Sources/SCP/Tools.swift` | `ToolDefinition`, `TestVector`, `ToolVerificationResult` nonisolated structs |
+| `Sources/SCP/Trust.swift` | `evaluateTrust()`, `TrustEvaluation` struct |
+| `Sources/SCP/EventLog.swift` | `SCPEventLog` (nonisolated class), `Event`, `Proof`, `Checkpoint` structs |
+| `Sources/SCP/Transport.swift` | `TransportConfig` struct, transport connection helpers |
+| `Sources/SCP/Types.swift` | `Message`, `Provenance`, `Capability`, `ContextParams`, `DIDDocument`, enums — all nonisolated Sendable structs |
+| `Sources/SCP/Errors.swift` | `ScpError` enum, `LocalizedError` conformance, `init(from: ScpBindings.ScpError)` mapping |
+| `Sources/SCP/Ucan.swift` | `validateUcan()`, `mintUcan()`, `revokeUcan()` free functions |
+| `Sources/SCP/Mcp.swift` | `serveMcp()`, `McpClient` |
+| `Sources/SCP/Platform/PlatformAdapter.swift` | `ApplePlatformAdapter.make()` factory — assembles all four providers |
+| `Sources/SCP/Platform/AppleKeyCustody.swift` | `KeyCustodyProvider` — Keychain + DCAppAttestService |
+| `Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — DCAppAttestService |
+| `Sources/SCP/Platform/ApplePushProvider.swift` | `PushProvider` — APNs |
+| `Sources/SCP/Platform/AppleStorage.swift` | `StorageProvider` — file-based + Core Data |
+| `Sources/SCP/Internal/ScpBindings.swift` | UniFFI-generated bindings (auto-generated, never edit manually) |
+
+**Estimated functions:** ~35 public functions/methods, ~12 public types (actors + structs + enums), ~8 internal helpers.
