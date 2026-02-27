@@ -138,6 +138,7 @@ pub use governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
     SignedVote, SingleAdminEngine, VoteType,
+    majority::MajorityVoteEngine,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).

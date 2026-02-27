@@ -43,6 +43,7 @@
 //!
 //! See ADR-031 in `.docs/adrs/phase-6.md` for the full specification.
 
+pub mod majority;
 pub mod multisig;
 pub mod unanimity;
 
@@ -394,6 +395,11 @@ pub enum GovernanceEvent {
         proposal_id: ProposalId,
         voter_did: DID,
         vote: VoteType,
+    },
+    /// A vote was withdrawn from a proposal.
+    VoteWithdrawn {
+        proposal_id: ProposalId,
+        voter_did: DID,
     },
     /// A proposal was resolved (approved, rejected, expired, etc.).
     ProposalResolved {
