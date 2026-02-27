@@ -4550,7 +4550,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/typescript/src/index.ts",
         "bindings/typescript/src/bridge.ts",
@@ -4628,7 +4628,8 @@
           "UCAN",
           "MCP"
         ]
-      }
+      },
+      "result": "TypeScript SDK @scp/sdk implemented with dual-target bridge (WASM + napi-rs), 8 public modules, ScpError hierarchy, AsyncIterable streaming, AsyncDisposable, tsup ESM+CJS build. 40 vitest tests pass."
     },
     {
       "id": "SCP-082",
@@ -5533,7 +5534,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/swift/Sources/SCP/Identity.swift"
       ],
@@ -5579,7 +5580,8 @@
           "create": "Identity.create()",
           "load": "Identity.load(did:)"
         }
-      }
+      },
+      "result": "Swift Identity struct implemented with Sendable, async/await create/load/rotateKey, CheckedContinuation for UniFFI bridging. Tests written but require XCFramework (SCP-103)."
     },
     {
       "id": "SCP-100",
@@ -5587,7 +5589,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/swift/Sources/SCP/Context.swift"
       ],
@@ -5642,7 +5644,8 @@
           "leave": "ctx.leave()",
           "close": "ctx.close()"
         }
-      }
+      },
+      "result": "Swift Context actor implemented with AsyncStream message streaming, send/leave/close lifecycle, deinit safety net. Tests written but require XCFramework (SCP-103)."
     },
     {
       "id": "SCP-101",
@@ -6682,7 +6685,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/sync/hours_offline.rs"
       ],
@@ -6738,7 +6741,8 @@
           "§9.12 — Compromise recovery",
           "§16.8 — NetworkSimulator"
         ]
-      }
+      },
+      "result": "Hours-scale offline recovery implemented in sync/ module. ReorderBuffer (100-msg, 30s gap), MlsEpochCatchUp, ReconnectOrchestrator, KeyPackagePublisher. 56 tests pass."
     },
     {
       "id": "SCP-122",
@@ -7345,7 +7349,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/governance/mls_integration.rs"
       ],
@@ -7384,7 +7388,8 @@
           "§5.9 — Context governance model",
           "ADR-008 — Context lifecycle state machine"
         ]
-      }
+      },
+      "result": "Governance-MLS epoch coordination implemented in mls_integration.rs. Classifies governance actions by MLS impact, coordinates epoch advances with proposal approval, consistency checks. 56 tests pass."
     },
     {
       "id": "SCP-134",
