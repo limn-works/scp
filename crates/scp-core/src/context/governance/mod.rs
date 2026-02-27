@@ -25,6 +25,7 @@
 //! - [`SingleAdminEngine`] -- Phase 2 baseline: single-admin auto-approve.
 //! - [`GovernanceEvent`] -- Events recorded in the Merkle log for auditability.
 //! - [`multisig::ThresholdEngine`] -- M-of-N threshold governance (ADR-031 §4b).
+//! - [`unanimity::UnanimityEngine`] -- Unanimity governance (ADR-031 §4d).
 //!
 //! # Exit-as-veto
 //!
@@ -38,11 +39,12 @@
 //! Different governance models implement the same [`GovernanceEngine`] trait.
 //! The trait is object-safe for dynamic dispatch via `Box<dyn GovernanceEngine>`.
 //! `ThresholdEngine` (Phase 6, ADR-031 §4b) is in [`multisig`].
-//! Phase 6 will add `MajorityEngine` and `UnanimityEngine`.
+//! `UnanimityEngine` (Phase 6, ADR-031 §4d) is in [`unanimity`].
 //!
 //! See ADR-031 in `.docs/adrs/phase-6.md` for the full specification.
 
 pub mod multisig;
+pub mod unanimity;
 
 use std::collections::HashMap;
 
