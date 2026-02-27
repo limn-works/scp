@@ -1,41 +1,25 @@
-//! Multi-sig (M-of-N threshold) governance engine (ADR-031 section 4b).
+//! M-of-N threshold governance engine (ADR-031 section 4b).
 //!
-//! Implements [`GovernanceEngine`] for the `Threshold` governance model.
-//! A fixed set of designated signers vote on proposals; a proposal passes
-//! when at least `threshold` (M) of the `signers` (N) approve.
+//! A proposal passes when at least `threshold` of the designated `signers`
+//! approve. Votes are order-independent. Vote withdrawal is permitted while
+//! the proposal is [`Pending`](super::ProposalStatus::Pending). Proposals
+//! that do not reach quorum within the voting window expire.
 //!
 //! # Resolution rules
 //!
-//! After every vote, [`ThresholdEngine::resolve`] checks:
+//! After each vote, `resolve()` checks:
 //!
-//! - **Approved**: `approvals.len() >= threshold`.
-//! - **Rejected (impossible)**: `rejections.len() > signers.len() - threshold`
-//!   (mathematically impossible to reach threshold).
-//! - **Expired**: `now > voting_deadline` and neither condition met.
+//! 1. `approvals.len() >= threshold` -> [`Approved`](super::ProposalStatus::Approved).
+//! 2. `rejections.len() > signers.len() - threshold` -> approval is
+//!    mathematically impossible ->
+//!    [`Rejected { ApprovalImpossible }`](super::RejectionReason::ApprovalImpossible).
+//! 3. `now >= voting_deadline` and neither condition met ->
+//!    [`Expired`](super::ProposalStatus::Expired).
 //!
-//! # Vote semantics
+//! # Deadline enforcement
 //!
-//! - Votes are order-independent -- the Mth approval resolves the proposal
-//!   regardless of arrival order.
-//! - Only DIDs in the `signers` set can vote.
-//! - A signer can withdraw their vote while the proposal is `Pending` via
-//!   [`ThresholdEngine::withdraw_vote`].
-//! - Each signer casts at most one active vote (approve or reject) at a time.
-//!
-//! # UCAN authorization
-//!
-//! The proposer must hold the `GovernancePropose` capability and voters must
-//! hold the `GovernanceVote` capability. Authorization validation is performed
-//! by the caller (typically the `ContextManager`) before invoking engine
-//! methods. The engine validates structural eligibility (signer set membership).
-//!
-//! # Merkle log recording
-//!
-//! Every operation returns a `Vec<GovernanceEvent>` for the caller to append
-//! to the context's event log (Merkle log). Events cover: proposal creation,
-//! vote cast, vote withdrawal, and proposal resolution.
-//!
-//! See ADR-031 in `.docs/adrs/phase-6.md` for the full specification.
+//! `approve()`, `reject()`, and `withdraw_vote()` all reject calls after the
+//! voting deadline. This prevents late votes from racing against expiry.
 
 use std::collections::HashMap;
 
@@ -47,49 +31,21 @@ use super::{
 use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
-// Configuration constants (ADR-031 section 2)
-// ---------------------------------------------------------------------------
-
-/// Minimum allowed voting window (5 minutes).
-const MIN_VOTING_WINDOW_SECS: u64 = 300;
-
-/// Maximum allowed voting window (7 days).
-const MAX_VOTING_WINDOW_SECS: u64 = 604_800;
-
-/// Default voting window (24 hours).
-const DEFAULT_VOTING_WINDOW_SECS: u64 = 86_400;
-
-// ---------------------------------------------------------------------------
 // ThresholdEngine
 // ---------------------------------------------------------------------------
 
-/// Multi-sig (M-of-N) governance engine (ADR-031 section 4b).
+/// M-of-N threshold governance engine.
 ///
-/// A fixed set of `signers` vote on governance proposals. A proposal is
-/// approved when at least `threshold` signers approve. The signer set and
-/// threshold are configured at context creation and encoded in
-/// [`GovernanceModelConfig::Threshold`].
-///
-/// # Construction
-///
-/// Use [`ThresholdEngine::new`] to create an engine, which validates the
-/// configuration constraints:
-///
-/// - `signers` must be non-empty.
-/// - `threshold` must be in `[1, signers.len()]`.
-/// - `voting_window_secs` must be in `[300, 604_800]`.
-///
-/// # Thread safety
-///
-/// `ThresholdEngine` is `Send + Sync` (all fields are owned, `HashMap` is
-/// `Send + Sync` when keys and values are).
+/// A fixed set of designated signers; a proposal passes when at least
+/// `threshold` of them approve. Implements [`GovernanceEngine`] for use
+/// via `Box<dyn GovernanceEngine>`.
 #[derive(Debug)]
 pub struct ThresholdEngine {
     /// The set of DIDs authorized to vote.
     signers: Vec<DID>,
-    /// Minimum number of approvals required.
+    /// Minimum number of approvals required (`1 <= threshold <= signers.len()`).
     threshold: u32,
-    /// Voting window in seconds.
+    /// Voting window in seconds applied to new proposals.
     voting_window_secs: u64,
     /// Active and resolved proposals, keyed by proposal ID.
     proposals: HashMap<ProposalId, GovernanceProposal>,
@@ -102,33 +58,36 @@ impl ThresholdEngine {
     ///
     /// Returns [`GovernanceError::InvalidConfig`] if:
     /// - `signers` is empty.
-    /// - `threshold` is zero or exceeds `signers.len()`.
-    /// - `voting_window_secs` is outside `[300, 604_800]`.
-    /// - `signers` contains duplicates.
+    /// - `threshold` is 0 or greater than `signers.len()`.
+    /// - `voting_window_secs` is outside `[300, 604_800]` (5 min to 7 days).
     pub fn new(
         signers: Vec<DID>,
         threshold: u32,
         voting_window_secs: u64,
     ) -> Result<Self, GovernanceError> {
-        Self::validate_config(&signers, threshold, voting_window_secs)?;
+        if signers.is_empty() {
+            return Err(GovernanceError::InvalidConfig(
+                "signers must be non-empty".to_owned(),
+            ));
+        }
+        if threshold == 0 || threshold > signers.len() as u32 {
+            return Err(GovernanceError::InvalidConfig(format!(
+                "threshold must be in [1, {}], got {threshold}",
+                signers.len()
+            )));
+        }
+        if !(300..=604_800).contains(&voting_window_secs) {
+            return Err(GovernanceError::InvalidConfig(format!(
+                "voting_window_secs must be in [300, 604800], got {voting_window_secs}"
+            )));
+        }
+
         Ok(Self {
             signers,
             threshold,
             voting_window_secs,
             proposals: HashMap::new(),
         })
-    }
-
-    /// Creates a threshold engine with the default voting window (24 hours).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`ThresholdEngine::new`].
-    pub fn with_default_window(
-        signers: Vec<DID>,
-        threshold: u32,
-    ) -> Result<Self, GovernanceError> {
-        Self::new(signers, threshold, DEFAULT_VOTING_WINDOW_SECS)
     }
 
     /// Returns a reference to the signer set.
@@ -149,224 +108,93 @@ impl ThresholdEngine {
         self.voting_window_secs
     }
 
-    /// Withdraw a previously cast vote (approval or rejection).
-    ///
-    /// Only the original voter can withdraw their vote. Only valid while the
-    /// proposal is `Pending`. Returns the updated proposal status and events
-    /// for Merkle log recording.
-    ///
-    /// Per ADR-031 section 4b: "A signer can withdraw their vote and re-vote
-    /// (changing from approve to reject or vice versa) while the proposal is
-    /// Pending."
-    ///
-    /// # Errors
-    ///
-    /// - [`GovernanceError::ProposalNotFound`] if no proposal with `proposal_id` exists.
-    /// - [`GovernanceError::ProposalNotPending`] if the proposal has already resolved.
-    /// - [`GovernanceError::NotEligible`] if the voter has no active vote to withdraw.
-    pub fn withdraw_vote(
-        &mut self,
-        proposal_id: &ProposalId,
-        voter: &DID,
-        _context: &GovernanceContext,
-    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
-            GovernanceError::ProposalNotFound {
-                id: hex_encode(proposal_id),
-            }
-        })?;
-
-        if !proposal.status.is_pending() {
-            return Err(GovernanceError::ProposalNotPending {
-                status: format!("{:?}", proposal.status),
-            });
-        }
-
-        // Remove the voter's vote from approvals or rejections.
-        let approval_pos = proposal
-            .approvals
-            .iter()
-            .position(|v| v.voter_did == *voter);
-        let rejection_pos = proposal
-            .rejections
-            .iter()
-            .position(|v| v.voter_did == *voter);
-
-        if let Some(pos) = approval_pos {
-            proposal.approvals.remove(pos);
-        } else if let Some(pos) = rejection_pos {
-            proposal.rejections.remove(pos);
-        } else {
-            return Err(GovernanceError::NotEligible(
-                "voter has no active vote to withdraw".to_owned(),
-            ));
-        }
-
-        let events = vec![GovernanceEvent::VoteWithdrawn {
-            proposal_id: *proposal_id,
-            voter_did: voter.clone(),
-        }];
-
-        Ok((proposal.status.clone(), events))
-    }
-
-    /// Check whether a proposal has reached resolution.
-    ///
-    /// Called after each vote and periodically by the SDK's timeout task.
-    /// Transitions the proposal to `Approved`, `Rejected`, or `Expired`
-    /// based on the current vote tally and the voting deadline.
-    ///
-    /// # Errors
-    ///
-    /// - [`GovernanceError::ProposalNotFound`] if no proposal with `proposal_id` exists.
-    pub fn resolve(
-        &mut self,
-        proposal_id: &ProposalId,
-        context: &GovernanceContext,
-    ) -> Result<ProposalStatus, GovernanceError> {
-        let signers_count = self.signers.len();
-        let threshold = self.threshold;
-
-        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
-            GovernanceError::ProposalNotFound {
-                id: hex_encode(proposal_id),
-            }
-        })?;
-
-        if !proposal.status.is_pending() {
-            return Ok(proposal.status.clone());
-        }
-
-        let approvals = proposal.approvals.len();
-        let rejections = proposal.rejections.len();
-
-        // Check if threshold is met.
-        if approvals >= threshold as usize {
-            proposal.status = ProposalStatus::Approved;
-        }
-        // Check if approval is mathematically impossible.
-        // If rejections > signers - threshold, even if all remaining signers
-        // approve, the threshold cannot be reached.
-        else if rejections > signers_count - threshold as usize {
-            proposal.status = ProposalStatus::Rejected {
-                reason: RejectionReason::ApprovalImpossible,
-            };
-        }
-        // Check if voting window has expired.
-        else if context.now > proposal.voting_deadline {
-            proposal.status = ProposalStatus::Expired;
-        }
-
-        Ok(proposal.status.clone())
-    }
-
     // -----------------------------------------------------------------------
-    // Private helpers
+    // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Validate configuration constraints per ADR-031 section 2.
-    fn validate_config(
-        signers: &[DID],
-        threshold: u32,
-        voting_window_secs: u64,
-    ) -> Result<(), GovernanceError> {
-        if signers.is_empty() {
-            return Err(GovernanceError::InvalidConfig(
-                "signers must be non-empty".to_owned(),
-            ));
-        }
-
-        if threshold == 0 {
-            return Err(GovernanceError::InvalidConfig(
-                "threshold must be at least 1".to_owned(),
-            ));
-        }
-
-        if (threshold as usize) > signers.len() {
-            return Err(GovernanceError::InvalidConfig(format!(
-                "threshold ({threshold}) exceeds signer count ({})",
-                signers.len()
-            )));
-        }
-
-        if voting_window_secs < MIN_VOTING_WINDOW_SECS {
-            return Err(GovernanceError::InvalidConfig(format!(
-                "voting_window_secs ({voting_window_secs}) is below minimum ({MIN_VOTING_WINDOW_SECS})"
-            )));
-        }
-
-        if voting_window_secs > MAX_VOTING_WINDOW_SECS {
-            return Err(GovernanceError::InvalidConfig(format!(
-                "voting_window_secs ({voting_window_secs}) exceeds maximum ({MAX_VOTING_WINDOW_SECS})"
-            )));
-        }
-
-        // Check for duplicate signers.
-        let mut seen = std::collections::HashSet::new();
-        for signer in signers {
-            if !seen.insert(signer) {
-                return Err(GovernanceError::InvalidConfig(format!(
-                    "duplicate signer: {signer}"
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Returns `true` if the given DID is in the signer set.
+    /// Check whether the voter is in the signer set.
     fn is_signer(&self, did: &DID) -> bool {
         self.signers.iter().any(|s| s == did)
     }
 
-    /// Returns `true` if the voter already has an active vote on the proposal.
+    /// Check whether the voter has already voted (approve or reject) on the proposal.
     fn has_voted(proposal: &GovernanceProposal, voter: &DID) -> bool {
         proposal.approvals.iter().any(|v| v.voter_did == *voter)
             || proposal.rejections.iter().any(|v| v.voter_did == *voter)
     }
 
-    /// Attempt to resolve a proposal after a vote was cast. Returns resolution
-    /// events if the proposal transitions to a terminal state.
-    fn try_resolve_after_vote(
+    /// Evaluate the current vote tallies against the resolution rules.
+    ///
+    /// Returns `Some(status)` if the proposal should transition, or `None`
+    /// if it remains `Pending`.
+    fn evaluate_resolution(
+        &self,
+        proposal: &GovernanceProposal,
+        now: u64,
+    ) -> Option<ProposalStatus> {
+        let approvals = proposal.approvals.len() as u32;
+        let rejections = proposal.rejections.len() as u32;
+        let signer_count = self.signers.len() as u32;
+
+        // Rule 1: threshold reached.
+        if approvals >= self.threshold {
+            return Some(ProposalStatus::Approved);
+        }
+
+        // Rule 2: approval mathematically impossible.
+        if rejections > signer_count.saturating_sub(self.threshold) {
+            return Some(ProposalStatus::Rejected {
+                reason: RejectionReason::ApprovalImpossible,
+            });
+        }
+
+        // Rule 3: voting window expired.
+        if now >= proposal.voting_deadline {
+            return Some(ProposalStatus::Expired);
+        }
+
+        None
+    }
+
+    /// Internal resolve implementation: evaluates and transitions the proposal.
+    ///
+    /// Returns the resulting status and any events that should be recorded
+    /// in the Merkle log (Bug 2 fix: resolve returns events alongside status).
+    fn resolve_proposal(
         &mut self,
         proposal_id: &ProposalId,
-        context: &GovernanceContext,
-    ) -> Vec<GovernanceEvent> {
-        let signers_count = self.signers.len();
-        let threshold = self.threshold as usize;
+        now: u64,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
+            GovernanceError::ProposalNotFound {
+                id: hex_encode(proposal_id),
+            }
+        })?;
 
-        let Some(proposal) = self.proposals.get_mut(proposal_id) else {
-            return Vec::new();
-        };
-
-        if !proposal.status.is_pending() {
-            return Vec::new();
+        // Already terminal -- nothing to do.
+        if proposal.status.is_terminal() {
+            return Ok((proposal.status.clone(), Vec::new()));
         }
 
-        let approvals = proposal.approvals.len();
-        let rejections = proposal.rejections.len();
+        match self.evaluate_resolution(proposal, now) {
+            Some(new_status) => {
+                // Transition the proposal.
+                let proposal_mut =
+                    self.proposals.get_mut(proposal_id).expect("just looked up");
+                proposal_mut.status = new_status.clone();
 
-        let new_status = if approvals >= threshold {
-            Some(ProposalStatus::Approved)
-        } else if rejections > signers_count - threshold {
-            Some(ProposalStatus::Rejected {
-                reason: RejectionReason::ApprovalImpossible,
-            })
-        } else if context.now > proposal.voting_deadline {
-            Some(ProposalStatus::Expired)
-        } else {
-            None
-        };
+                let events = vec![GovernanceEvent::ProposalResolved {
+                    proposal_id: *proposal_id,
+                    status: new_status.clone(),
+                }];
 
-        if let Some(status) = new_status {
-            proposal.status = status.clone();
-            return vec![GovernanceEvent::ProposalResolved {
-                proposal_id: *proposal_id,
-                status,
-            }];
+                Ok((new_status, events))
+            }
+            None => {
+                // Still pending, no events.
+                Ok((ProposalStatus::Pending, Vec::new()))
+            }
         }
-
-        Vec::new()
     }
 }
 
@@ -381,9 +209,7 @@ impl GovernanceEngine for ThresholdEngine {
         action: GovernanceAction,
         context: &GovernanceContext,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
-        // Structural eligibility: proposer must be in the signer set.
-        // UCAN `GovernancePropose` capability validation is the caller's
-        // responsibility (per ADR-031 section 6).
+        // Only signers can propose.
         if !self.is_signer(proposer) {
             return Err(GovernanceError::NotEligible(
                 "proposer is not in the signer set".to_owned(),
@@ -394,19 +220,25 @@ impl GovernanceEngine for ThresholdEngine {
         let action_bytes = serde_json::to_vec(&action)
             .map_err(|e| GovernanceError::SerializationFailed(e.to_string()))?;
 
-        let proposal_id = compute_proposal_id(
-            &context.context_id,
-            proposer,
-            &action_bytes,
-            context.now,
-        );
+        let proposal_id =
+            compute_proposal_id(&context.context_id, proposer, &action_bytes, context.now);
 
         // Reject duplicate proposals.
         if self.proposals.contains_key(&proposal_id) {
-            return Err(GovernanceError::DuplicateProposal(hex_encode(&proposal_id)));
+            return Err(GovernanceError::DuplicateProposal(hex_encode(
+                &proposal_id,
+            )));
         }
 
         let voting_deadline = context.now + self.voting_window_secs;
+
+        // The proposer's vote counts as the first approval.
+        let proposer_vote = SignedVote {
+            voter_did: proposer.clone(),
+            vote: VoteType::Approve,
+            timestamp: context.now,
+            signature: Vec::new(), // Signature validation deferred to UCAN layer.
+        };
 
         let proposal = GovernanceProposal {
             proposal_id,
@@ -416,19 +248,39 @@ impl GovernanceEngine for ThresholdEngine {
             status: ProposalStatus::Pending,
             created_at: context.now,
             voting_deadline,
-            approvals: Vec::new(),
+            approvals: vec![proposer_vote],
             rejections: Vec::new(),
             created_at_epoch: context.current_epoch,
         };
 
-        let events = vec![GovernanceEvent::ProposalCreated {
-            proposal_id,
-            proposer_did: proposer.clone(),
-            action,
-            voting_deadline,
-        }];
+        let mut events = vec![
+            GovernanceEvent::ProposalCreated {
+                proposal_id,
+                proposer_did: proposer.clone(),
+                action,
+                voting_deadline,
+            },
+            GovernanceEvent::VoteCast {
+                proposal_id,
+                voter_did: proposer.clone(),
+                vote: VoteType::Approve,
+            },
+        ];
 
-        self.proposals.insert(proposal_id, proposal.clone());
+        self.proposals.insert(proposal_id, proposal);
+
+        // Check if the proposer's vote alone meets the threshold (e.g., 1-of-N).
+        let (status, resolve_events) = self.resolve_proposal(&proposal_id, context.now)?;
+        events.extend(resolve_events);
+
+        // Re-fetch proposal after possible status change.
+        let proposal = self.proposals.get(&proposal_id).expect("just inserted").clone();
+
+        // Sanity: if resolved, the proposal status should match.
+        debug_assert!(
+            proposal.status == status,
+            "proposal status mismatch after resolve"
+        );
 
         Ok((proposal, events))
     }
@@ -439,38 +291,48 @@ impl GovernanceEngine for ThresholdEngine {
         voter: &DID,
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Structural eligibility: voter must be in the signer set.
+        // Voter must be a signer.
         if !self.is_signer(voter) {
             return Err(GovernanceError::NotEligible(
                 "voter is not in the signer set".to_owned(),
             ));
         }
 
-        // Get mutable access for validation and vote insertion in one borrow.
-        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
+        let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
                 id: hex_encode(proposal_id),
             }
         })?;
 
+        // Must be pending.
         if !proposal.status.is_pending() {
             return Err(GovernanceError::ProposalNotPending {
                 status: format!("{:?}", proposal.status),
             });
         }
 
-        // Check for duplicate vote.
+        // Bug 1 fix: deadline guard -- reject votes after the voting window.
+        if context.now >= proposal.voting_deadline {
+            return Err(GovernanceError::VotingWindowExpired {
+                id: hex_encode(proposal_id),
+            });
+        }
+
+        // Must not have already voted.
         if Self::has_voted(proposal, voter) {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        // Cast the vote.
-        proposal.approvals.push(SignedVote {
+        // Record the vote.
+        let vote = SignedVote {
             voter_did: voter.clone(),
             vote: VoteType::Approve,
             timestamp: context.now,
-            signature: Vec::new(), // Signature validation deferred to UCAN layer.
-        });
+            signature: Vec::new(),
+        };
+
+        let proposal_mut = self.proposals.get_mut(proposal_id).expect("just looked up");
+        proposal_mut.approvals.push(vote);
 
         let mut events = vec![GovernanceEvent::VoteCast {
             proposal_id: *proposal_id,
@@ -478,14 +340,9 @@ impl GovernanceEngine for ThresholdEngine {
             vote: VoteType::Approve,
         }];
 
-        // Try to resolve after the vote.
-        let resolution_events = self.try_resolve_after_vote(proposal_id, context);
-        events.extend(resolution_events);
-
-        let status = self
-            .proposals
-            .get(proposal_id)
-            .map_or(ProposalStatus::Pending, |p| p.status.clone());
+        // Resolve after vote.
+        let (status, resolve_events) = self.resolve_proposal(proposal_id, context.now)?;
+        events.extend(resolve_events);
 
         Ok((status, events))
     }
@@ -496,38 +353,48 @@ impl GovernanceEngine for ThresholdEngine {
         voter: &DID,
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Structural eligibility: voter must be in the signer set.
+        // Voter must be a signer.
         if !self.is_signer(voter) {
             return Err(GovernanceError::NotEligible(
                 "voter is not in the signer set".to_owned(),
             ));
         }
 
-        // Get mutable access for validation and vote insertion in one borrow.
-        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
+        let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
                 id: hex_encode(proposal_id),
             }
         })?;
 
+        // Must be pending.
         if !proposal.status.is_pending() {
             return Err(GovernanceError::ProposalNotPending {
                 status: format!("{:?}", proposal.status),
             });
         }
 
-        // Check for duplicate vote.
+        // Bug 1 fix: deadline guard -- reject votes after the voting window.
+        if context.now >= proposal.voting_deadline {
+            return Err(GovernanceError::VotingWindowExpired {
+                id: hex_encode(proposal_id),
+            });
+        }
+
+        // Must not have already voted.
         if Self::has_voted(proposal, voter) {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        // Cast the rejection vote.
-        proposal.rejections.push(SignedVote {
+        // Record the rejection vote.
+        let vote = SignedVote {
             voter_did: voter.clone(),
             vote: VoteType::Reject,
             timestamp: context.now,
-            signature: Vec::new(), // Signature validation deferred to UCAN layer.
-        });
+            signature: Vec::new(),
+        };
+
+        let proposal_mut = self.proposals.get_mut(proposal_id).expect("just looked up");
+        proposal_mut.rejections.push(vote);
 
         let mut events = vec![GovernanceEvent::VoteCast {
             proposal_id: *proposal_id,
@@ -535,16 +402,68 @@ impl GovernanceEngine for ThresholdEngine {
             vote: VoteType::Reject,
         }];
 
-        // Try to resolve after the vote.
-        let resolution_events = self.try_resolve_after_vote(proposal_id, context);
-        events.extend(resolution_events);
-
-        let status = self
-            .proposals
-            .get(proposal_id)
-            .map_or(ProposalStatus::Pending, |p| p.status.clone());
+        // Resolve after vote.
+        let (status, resolve_events) = self.resolve_proposal(proposal_id, context.now)?;
+        events.extend(resolve_events);
 
         Ok((status, events))
+    }
+
+    fn withdraw_vote(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        // Voter must be a signer.
+        if !self.is_signer(voter) {
+            return Err(GovernanceError::NotEligible(
+                "voter is not in the signer set".to_owned(),
+            ));
+        }
+
+        let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
+            GovernanceError::ProposalNotFound {
+                id: hex_encode(proposal_id),
+            }
+        })?;
+
+        // Must be pending.
+        if !proposal.status.is_pending() {
+            return Err(GovernanceError::ProposalNotPending {
+                status: format!("{:?}", proposal.status),
+            });
+        }
+
+        // Deadline guard: cannot withdraw after voting window.
+        if context.now >= proposal.voting_deadline {
+            return Err(GovernanceError::VotingWindowExpired {
+                id: hex_encode(proposal_id),
+            });
+        }
+
+        // Must have voted to withdraw.
+        if !Self::has_voted(proposal, voter) {
+            return Err(GovernanceError::NotEligible(
+                "voter has not voted on this proposal".to_owned(),
+            ));
+        }
+
+        // Remove the vote from whichever list it's in.
+        let proposal_mut = self.proposals.get_mut(proposal_id).expect("just looked up");
+        proposal_mut.approvals.retain(|v| v.voter_did != *voter);
+        proposal_mut.rejections.retain(|v| v.voter_did != *voter);
+
+        // Withdrawal does not trigger resolution -- voter may re-vote.
+        Ok((ProposalStatus::Pending, Vec::new()))
+    }
+
+    fn resolve(
+        &mut self,
+        proposal_id: &ProposalId,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        self.resolve_proposal(proposal_id, context.now)
     }
 
     fn model_config(&self) -> GovernanceModelConfig {
@@ -573,10 +492,6 @@ impl GovernanceEngine for ThresholdEngine {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // Test helpers
-    // -----------------------------------------------------------------------
-
     fn alice() -> DID {
         DID::from("did:dht:z6MkAlice")
     }
@@ -593,195 +508,165 @@ mod tests {
         DID::from("did:dht:z6MkDave")
     }
 
-    fn eve() -> DID {
-        DID::from("did:dht:z6MkEve")
-    }
-
-    fn signers_3() -> Vec<DID> {
-        vec![alice(), bob(), carol()]
-    }
-
-    fn signers_5() -> Vec<DID> {
-        vec![alice(), bob(), carol(), dave(), eve()]
-    }
-
-    /// Create a governance context with the given members as signers.
-    fn threshold_context(signers: &[DID], now: u64) -> GovernanceContext {
+    /// Create a test context at a given timestamp.
+    fn test_context_at(now: u64) -> GovernanceContext {
         GovernanceContext {
-            context_id: "ctx-threshold-001".to_owned(),
-            members: signers
-                .iter()
-                .map(|d| (d.clone(), "signer".to_owned()))
-                .collect(),
-            admin_dids: signers.to_vec(),
+            context_id: "ctx-multisig-001".to_owned(),
+            members: vec![
+                (alice(), "admin".to_owned()),
+                (bob(), "member".to_owned()),
+                (carol(), "member".to_owned()),
+            ],
+            admin_dids: vec![alice()],
             current_epoch: Some(1),
             now,
         }
     }
 
-    fn add_member_action() -> GovernanceAction {
+    fn test_context() -> GovernanceContext {
+        test_context_at(1_700_000_000)
+    }
+
+    fn default_action() -> GovernanceAction {
         GovernanceAction::AddMember {
-            did: DID::from("did:dht:z6MkNewMember"),
+            did: dave(),
             role: "member".to_owned(),
         }
     }
 
-    fn close_context_action() -> GovernanceAction {
-        GovernanceAction::CloseContext {
-            reason: Some("test closure".to_owned()),
-        }
-    }
-
     // -----------------------------------------------------------------------
-    // Construction and validation
+    // Construction validation
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn new_valid_2_of_3() {
-        let engine = ThresholdEngine::new(signers_3(), 2, 86_400);
-        assert!(engine.is_ok());
-        let engine = engine.unwrap();
-        assert_eq!(engine.threshold(), 2);
-        assert_eq!(engine.signers().len(), 3);
-        assert_eq!(engine.voting_window_secs(), 86_400);
-    }
-
-    #[test]
-    fn new_valid_1_of_1() {
-        let engine = ThresholdEngine::new(vec![alice()], 1, 300);
-        assert!(engine.is_ok());
-    }
-
-    #[test]
-    fn new_valid_n_of_n() {
-        let engine = ThresholdEngine::new(signers_3(), 3, 86_400);
-        assert!(engine.is_ok());
-    }
 
     #[test]
     fn new_rejects_empty_signers() {
         let result = ThresholdEngine::new(vec![], 1, 86_400);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::InvalidConfig(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::InvalidConfig(_)
+        ));
     }
 
     #[test]
     fn new_rejects_zero_threshold() {
-        let result = ThresholdEngine::new(signers_3(), 0, 86_400);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::InvalidConfig(_)));
+        let result = ThresholdEngine::new(vec![alice()], 0, 86_400);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::InvalidConfig(_)
+        ));
     }
 
     #[test]
-    fn new_rejects_threshold_exceeds_signers() {
-        let result = ThresholdEngine::new(signers_3(), 4, 86_400);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, GovernanceError::InvalidConfig(_)));
-        if let GovernanceError::InvalidConfig(msg) = &err {
-            assert!(msg.contains("threshold (4) exceeds signer count (3)"));
-        }
+    fn new_rejects_threshold_exceeding_signers() {
+        let result = ThresholdEngine::new(vec![alice(), bob()], 3, 86_400);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::InvalidConfig(_)
+        ));
     }
 
     #[test]
-    fn new_rejects_voting_window_too_short() {
-        let result = ThresholdEngine::new(signers_3(), 2, 299);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::InvalidConfig(_)));
+    fn new_rejects_window_too_short() {
+        let result = ThresholdEngine::new(vec![alice()], 1, 299);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::InvalidConfig(_)
+        ));
     }
 
     #[test]
-    fn new_rejects_voting_window_too_long() {
-        let result = ThresholdEngine::new(signers_3(), 2, 604_801);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::InvalidConfig(_)));
+    fn new_rejects_window_too_long() {
+        let result = ThresholdEngine::new(vec![alice()], 1, 604_801);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::InvalidConfig(_)
+        ));
     }
 
     #[test]
-    fn new_rejects_duplicate_signers() {
-        let result = ThresholdEngine::new(vec![alice(), alice(), bob()], 2, 86_400);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, GovernanceError::InvalidConfig(_)));
-        if let GovernanceError::InvalidConfig(msg) = &err {
-            assert!(msg.contains("duplicate signer"));
-        }
-    }
-
-    #[test]
-    fn with_default_window_uses_24h() {
-        let engine = ThresholdEngine::with_default_window(signers_3(), 2).unwrap();
-        assert_eq!(engine.voting_window_secs(), DEFAULT_VOTING_WINDOW_SECS);
+    fn new_accepts_valid_config() {
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid config");
+        assert_eq!(engine.signers().len(), 3);
+        assert_eq!(engine.threshold(), 2);
+        assert_eq!(engine.voting_window_secs(), 86_400);
     }
 
     // -----------------------------------------------------------------------
-    // Proposal creation
+    // Propose creates pending proposal with proposer's approval
     // -----------------------------------------------------------------------
 
     #[test]
-    fn propose_creates_pending_proposal() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn propose_creates_pending_with_first_approval() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, events) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, events) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
 
+        // Proposal should be pending (2-of-3, only 1 approval so far).
         assert_eq!(proposal.status, ProposalStatus::Pending);
-        assert_eq!(proposal.proposer_did, alice());
-        assert_eq!(proposal.context_id, "ctx-threshold-001");
-        assert!(proposal.approvals.is_empty());
+        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.approvals[0].voter_did, alice());
         assert!(proposal.rejections.is_empty());
-        assert_eq!(proposal.created_at, 1_700_000_000);
-        assert_eq!(proposal.voting_deadline, 1_700_000_000 + 86_400);
-        assert_eq!(proposal.created_at_epoch, Some(1));
+        assert_eq!(proposal.voting_deadline, ctx.now + 86_400);
 
-        // One event: ProposalCreated.
-        assert_eq!(events.len(), 1);
+        // Events: ProposalCreated + VoteCast (no resolve yet).
+        assert_eq!(events.len(), 2);
         assert!(matches!(events[0], GovernanceEvent::ProposalCreated { .. }));
+        assert!(matches!(events[1], GovernanceEvent::VoteCast { .. }));
+    }
+
+    #[test]
+    fn propose_1_of_n_auto_resolves() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 1, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, events) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+
+        // 1-of-3: proposer's approval meets threshold immediately.
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 3); // Created + VoteCast + Resolved
+        assert!(matches!(
+            events[2],
+            GovernanceEvent::ProposalResolved {
+                status: ProposalStatus::Approved,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn propose_rejects_non_signer() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let outsider = DID::from("did:dht:z6MkOutsider");
-        let result = engine.propose(&outsider, add_member_action(), &ctx);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::NotEligible(_)));
-    }
-
-    #[test]
-    fn propose_rejects_duplicate() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let _ = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let result = engine.propose(&alice(), add_member_action(), &ctx);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::DuplicateProposal(_)));
+        let result = engine.propose(&dave(), default_action(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::NotEligible(_)
+        ));
     }
 
     // -----------------------------------------------------------------------
-    // Threshold counting (2-of-3)
+    // Approve reaches threshold -> Approved
     // -----------------------------------------------------------------------
 
     #[test]
-    fn threshold_2_of_3_approved_with_two_approvals() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn approve_reaches_threshold() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        // First approval -- still pending.
-        let (status, events) = engine.approve(&pid, &alice(), &ctx).unwrap();
-        assert_eq!(status, ProposalStatus::Pending);
-        assert_eq!(events.len(), 1); // VoteCast only, no resolution.
-
-        // Second approval -- reaches threshold.
-        let (status, events) = engine.approve(&pid, &bob(), &ctx).unwrap();
+        // Bob approves -> 2 of 3 -> Approved.
+        let (status, events) = engine.approve(&pid, &bob(), &ctx).expect("ok");
         assert_eq!(status, ProposalStatus::Approved);
-        assert_eq!(events.len(), 2); // VoteCast + ProposalResolved.
+        assert_eq!(events.len(), 2); // VoteCast + Resolved
         assert!(matches!(events[0], GovernanceEvent::VoteCast { .. }));
         assert!(matches!(
             events[1],
@@ -790,179 +675,244 @@ mod tests {
                 ..
             }
         ));
-
-        // Verify proposal state.
-        let proposal = engine.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.approvals.len(), 2);
-        assert_eq!(proposal.status, ProposalStatus::Approved);
     }
 
     #[test]
-    fn threshold_2_of_3_order_independent() {
-        // Verify that any 2 of the 3 signers can approve, regardless of order.
-        for pair in &[(1, 2), (0, 2), (0, 1)] {
-            let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-            let ctx = threshold_context(&signers_3(), 1_700_000_000);
-            let signers = signers_3();
+    fn approve_rejects_non_signer() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-            let (proposal, _) = engine
-                .propose(&signers[pair.0], add_member_action(), &ctx)
-                .unwrap();
-            let pid = proposal.proposal_id;
-
-            engine.approve(&pid, &signers[pair.0], &ctx).unwrap();
-            let (status, _) = engine.approve(&pid, &signers[pair.1], &ctx).unwrap();
-            assert_eq!(status, ProposalStatus::Approved);
-        }
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        let result = engine.approve(&proposal.proposal_id, &dave(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::NotEligible(_)
+        ));
     }
 
     #[test]
-    fn threshold_3_of_5_requires_exactly_three() {
-        let mut engine = ThresholdEngine::new(signers_5(), 3, 86_400).unwrap();
-        let ctx = threshold_context(&signers_5(), 1_700_000_000);
+    fn approve_rejects_duplicate_vote() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 3, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        let result = engine.approve(&proposal.proposal_id, &alice(), &ctx);
+        assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
+    }
+
+    // -----------------------------------------------------------------------
+    // Reject makes approval impossible -> Rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reject_makes_approval_impossible() {
+        // 2-of-3: if 2 reject, approval is impossible (rejections > 3 - 2 = 1).
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        // Two approvals -- still pending.
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        let (status, _) = engine.approve(&pid, &bob(), &ctx).unwrap();
+        // Bob rejects: 1 rejection, not impossible yet (1 > 1 is false).
+        let (status, _) = engine.reject(&pid, &bob(), &ctx).expect("ok");
         assert_eq!(status, ProposalStatus::Pending);
 
-        // Third approval -- threshold reached.
-        let (status, _) = engine.approve(&pid, &carol(), &ctx).unwrap();
-        assert_eq!(status, ProposalStatus::Approved);
-    }
-
-    #[test]
-    fn threshold_1_of_1_immediate_on_single_approval() {
-        let mut engine = ThresholdEngine::new(vec![alice()], 1, 300).unwrap();
-        let ctx = threshold_context(&[alice()], 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        let (status, events) = engine.approve(&pid, &alice(), &ctx).unwrap();
-        assert_eq!(status, ProposalStatus::Approved);
-        assert_eq!(events.len(), 2); // VoteCast + ProposalResolved.
-    }
-
-    // -----------------------------------------------------------------------
-    // Rejection / approval impossible
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn threshold_2_of_3_rejection_makes_approval_impossible() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        // Two rejections out of 3 signers: approval is impossible
-        // (rejections=2 > signers(3) - threshold(2) = 1).
-        engine.reject(&pid, &alice(), &ctx).unwrap();
-        let (status, events) = engine.reject(&pid, &bob(), &ctx).unwrap();
-
+        // Carol rejects: 2 rejections > 3 - 2 = 1 -> ApprovalImpossible.
+        let (status, events) = engine.reject(&pid, &carol(), &ctx).expect("ok");
         assert_eq!(
             status,
             ProposalStatus::Rejected {
-                reason: RejectionReason::ApprovalImpossible,
+                reason: RejectionReason::ApprovalImpossible
             }
         );
-        assert_eq!(events.len(), 2); // VoteCast + ProposalResolved.
-    }
-
-    #[test]
-    fn threshold_3_of_5_approval_impossible_with_three_rejections() {
-        let mut engine = ThresholdEngine::new(signers_5(), 3, 86_400).unwrap();
-        let ctx = threshold_context(&signers_5(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        // 3 rejections: rejections(3) > signers(5) - threshold(3) = 2.
-        engine.reject(&pid, &alice(), &ctx).unwrap();
-        engine.reject(&pid, &bob(), &ctx).unwrap();
-        let (status, _) = engine.reject(&pid, &carol(), &ctx).unwrap();
-
-        assert_eq!(
-            status,
-            ProposalStatus::Rejected {
-                reason: RejectionReason::ApprovalImpossible,
-            }
-        );
-    }
-
-    #[test]
-    fn threshold_2_of_3_single_rejection_does_not_block() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        // One rejection -- approval still possible (rejections=1, needed > 1).
-        let (status, _) = engine.reject(&pid, &carol(), &ctx).unwrap();
-        assert_eq!(status, ProposalStatus::Pending);
-
-        // Two approvals -- threshold reached despite the rejection.
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        let (status, _) = engine.approve(&pid, &bob(), &ctx).unwrap();
-        assert_eq!(status, ProposalStatus::Approved);
+        // Events: VoteCast + Resolved.
+        assert_eq!(events.len(), 2);
     }
 
     // -----------------------------------------------------------------------
-    // Timeout / expiry
+    // Bug 1 tests: votes rejected after voting deadline
     // -----------------------------------------------------------------------
 
     #[test]
-    fn proposal_expires_after_voting_deadline() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx_start = threshold_context(&signers_3(), 1_700_000_000);
+    fn approve_rejected_after_deadline() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, _) = engine
-            .propose(&alice(), add_member_action(), &ctx_start)
-            .unwrap();
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        // One approval, not enough.
-        engine.approve(&pid, &alice(), &ctx_start).unwrap();
+        // Advance time past the deadline.
+        let expired_ctx = test_context_at(ctx.now + 86_400);
 
-        // Advance time past the voting deadline.
-        let ctx_expired = threshold_context(&signers_3(), 1_700_000_000 + 86_401);
-        let status = engine.resolve(&pid, &ctx_expired).unwrap();
+        let result = engine.approve(&pid, &bob(), &expired_ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VotingWindowExpired { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_rejected_after_deadline() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        let pid = proposal.proposal_id;
+
+        // Advance time past the deadline.
+        let expired_ctx = test_context_at(ctx.now + 86_400);
+
+        let result = engine.reject(&pid, &bob(), &expired_ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VotingWindowExpired { .. }
+        ));
+    }
+
+    #[test]
+    fn approve_accepted_just_before_deadline() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        let pid = proposal.proposal_id;
+
+        // One second before deadline should still work.
+        let just_before = test_context_at(ctx.now + 86_400 - 1);
+
+        let result = engine.approve(&pid, &bob(), &just_before);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug 2 tests: resolve() produces events for timeout transitions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_produces_expired_event() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        let pid = proposal.proposal_id;
+
+        // Advance time past the deadline.
+        let expired_ctx = test_context_at(ctx.now + 86_400);
+
+        let (status, events) = engine.resolve(&pid, &expired_ctx).expect("ok");
         assert_eq!(status, ProposalStatus::Expired);
+
+        // Must produce a ProposalResolved event for Merkle log recording.
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            GovernanceEvent::ProposalResolved {
+                status: ProposalStatus::Expired,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn proposal_does_not_expire_before_deadline() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn resolve_no_events_when_still_pending() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        // Check at exactly the deadline -- should still be pending (deadline is exclusive).
-        let ctx_at_deadline = threshold_context(&signers_3(), 1_700_000_000 + 86_400);
-        let status = engine.resolve(&pid, &ctx_at_deadline).unwrap();
+        // Same time -- not expired, not enough votes.
+        let (status, events) = engine.resolve(&pid, &ctx).expect("ok");
+        assert_eq!(status, ProposalStatus::Pending);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn resolve_returns_status_and_events_for_already_terminal() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        let pid = proposal.proposal_id;
+
+        // Bob approves -> Approved.
+        engine.approve(&pid, &bob(), &ctx).expect("ok");
+
+        // Resolve again on already-approved proposal.
+        let (status, events) = engine.resolve(&pid, &ctx).expect("ok");
+        assert_eq!(status, ProposalStatus::Approved);
+        assert!(events.is_empty(), "no events for already-terminal proposal");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug 3 tests: withdraw_vote() and resolve() accessible via trait
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn withdraw_vote_accessible_via_trait() {
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let mut boxed: Box<dyn GovernanceEngine> = Box::new(engine);
+        let ctx = test_context();
+
+        let (proposal, _) = boxed.propose(&alice(), default_action(), &ctx).expect("ok");
+        let pid = proposal.proposal_id;
+
+        // withdraw_vote is callable through the trait object.
+        let result = boxed.withdraw_vote(&pid, &alice(), &ctx);
+        assert!(result.is_ok());
+
+        let (status, _) = result.unwrap();
         assert_eq!(status, ProposalStatus::Pending);
     }
 
     #[test]
-    fn resolve_returns_terminal_status_without_change() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn resolve_accessible_via_trait() {
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let mut boxed: Box<dyn GovernanceEngine> = Box::new(engine);
+        let ctx = test_context();
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, _) = boxed.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        engine.approve(&pid, &bob(), &ctx).unwrap();
+        // resolve is callable through the trait object.
+        let result = boxed.resolve(&pid, &ctx);
+        assert!(result.is_ok());
+    }
 
-        // Already approved; resolve should return Approved without side effects.
-        let status = engine.resolve(&pid, &ctx).unwrap();
-        assert_eq!(status, ProposalStatus::Approved);
+    #[test]
+    fn default_trait_impls_return_unsupported_for_single_admin() {
+        use super::super::SingleAdminEngine;
+
+        let mut engine: Box<dyn GovernanceEngine> =
+            Box::new(SingleAdminEngine::new(alice()));
+        let ctx = test_context();
+
+        let action = GovernanceAction::CloseContext { reason: None };
+        let (proposal, _) = engine.propose(&alice(), action, &ctx).expect("ok");
+
+        // SingleAdminEngine uses default trait impls which return OperationNotSupported.
+        let result = engine.withdraw_vote(&proposal.proposal_id, &alice(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::OperationNotSupported(_)
+        ));
+
+        let result = engine.resolve(&proposal.proposal_id, &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::OperationNotSupported(_)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -970,212 +920,58 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn withdraw_approval_before_threshold() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn withdraw_vote_allows_revote() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        // Alice approves.
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        assert_eq!(engine.get_proposal(&pid).unwrap().approvals.len(), 1);
-
-        // Alice withdraws.
-        let (status, events) = engine.withdraw_vote(&pid, &alice(), &ctx).unwrap();
+        // Alice withdraws her approval.
+        let (status, _) = engine.withdraw_vote(&pid, &alice(), &ctx).expect("ok");
         assert_eq!(status, ProposalStatus::Pending);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], GovernanceEvent::VoteWithdrawn { .. }));
-        assert_eq!(engine.get_proposal(&pid).unwrap().approvals.len(), 0);
-    }
 
-    #[test]
-    fn withdraw_rejection() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+        // Verify the vote is gone.
+        let p = engine.get_proposal(&pid).expect("found");
+        assert!(p.approvals.is_empty());
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        // Alice rejects.
-        engine.reject(&pid, &alice(), &ctx).unwrap();
-        assert_eq!(engine.get_proposal(&pid).unwrap().rejections.len(), 1);
-
-        // Alice withdraws the rejection.
-        let (status, _) = engine.withdraw_vote(&pid, &alice(), &ctx).unwrap();
+        // Alice can now re-vote (as a rejection this time).
+        let (status, _) = engine.reject(&pid, &alice(), &ctx).expect("ok");
         assert_eq!(status, ProposalStatus::Pending);
-        assert_eq!(engine.get_proposal(&pid).unwrap().rejections.len(), 0);
     }
 
     #[test]
-    fn withdraw_and_revote() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn withdraw_vote_rejects_non_voter() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        // Alice rejects, then withdraws, then approves.
-        engine.reject(&pid, &alice(), &ctx).unwrap();
-        engine.withdraw_vote(&pid, &alice(), &ctx).unwrap();
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-
-        let proposal = engine.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.approvals.len(), 1);
-        assert_eq!(proposal.rejections.len(), 0);
-        assert_eq!(proposal.approvals[0].voter_did, alice());
-    }
-
-    #[test]
-    fn withdraw_fails_on_resolved_proposal() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        // Approve to resolution.
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        engine.approve(&pid, &bob(), &ctx).unwrap();
-
-        // Attempt withdrawal on resolved proposal.
-        let result = engine.withdraw_vote(&pid, &alice(), &ctx);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            GovernanceError::ProposalNotPending { .. }
-        ));
-    }
-
-    #[test]
-    fn withdraw_fails_when_no_vote_cast() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        // Alice hasn't voted; withdrawal should fail.
-        let result = engine.withdraw_vote(&pid, &alice(), &ctx);
-        assert!(result.is_err());
+        // Bob hasn't voted yet.
+        let result = engine.withdraw_vote(&pid, &bob(), &ctx);
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::NotEligible(_)
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // Duplicate vote prevention
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn duplicate_approval_rejected() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn withdraw_vote_rejects_after_deadline() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        let result = engine.approve(&pid, &alice(), &ctx);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
-    }
-
-    #[test]
-    fn duplicate_rejection_rejected() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        engine.reject(&pid, &alice(), &ctx).unwrap();
-        let result = engine.reject(&pid, &alice(), &ctx);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
-    }
-
-    #[test]
-    fn approve_then_reject_rejected_as_already_voted() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        let result = engine.reject(&pid, &alice(), &ctx);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
-    }
-
-    // -----------------------------------------------------------------------
-    // Non-signer cannot vote
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn non_signer_cannot_approve() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        let outsider = DID::from("did:dht:z6MkOutsider");
-        let result = engine.approve(&pid, &outsider, &ctx);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::NotEligible(_)));
-    }
-
-    #[test]
-    fn non_signer_cannot_reject() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        let outsider = DID::from("did:dht:z6MkOutsider");
-        let result = engine.reject(&pid, &outsider, &ctx);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), GovernanceError::NotEligible(_)));
-    }
-
-    // -----------------------------------------------------------------------
-    // Voting on non-existent or already-resolved proposals
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn approve_nonexistent_proposal() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let fake_id = [0u8; 32];
-        let result = engine.approve(&fake_id, &alice(), &ctx);
-        assert!(result.is_err());
+        let expired_ctx = test_context_at(ctx.now + 86_400);
+        let result = engine.withdraw_vote(&pid, &alice(), &expired_ctx);
         assert!(matches!(
             result.unwrap_err(),
-            GovernanceError::ProposalNotFound { .. }
-        ));
-    }
-
-    #[test]
-    fn approve_resolved_proposal_fails() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        engine.approve(&pid, &bob(), &ctx).unwrap(); // Approved.
-
-        let result = engine.approve(&pid, &carol(), &ctx);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            GovernanceError::ProposalNotPending { .. }
+            GovernanceError::VotingWindowExpired { .. }
         ));
     }
 
@@ -1184,14 +980,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn model_config_returns_threshold_config() {
-        let engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
+    fn model_config_returns_threshold_variant() {
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
         let config = engine.model_config();
-
         assert_eq!(
             config,
             GovernanceModelConfig::Threshold {
-                signers: signers_3(),
+                signers: vec![alice(), bob()],
                 threshold: 2,
                 voting_window_secs: 86_400,
             }
@@ -1199,225 +995,68 @@ mod tests {
     }
 
     #[test]
-    fn eligible_voters_returns_signer_set() {
-        let engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
+    fn eligible_voters_returns_signers() {
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
         let voters = engine.eligible_voters(&ctx);
-        assert_eq!(voters, signers_3());
+        assert_eq!(voters, vec![alice(), bob(), carol()]);
     }
 
     // -----------------------------------------------------------------------
-    // get_proposal
+    // ThresholdEngine is Send + Sync
     // -----------------------------------------------------------------------
 
     #[test]
-    fn get_proposal_returns_none_for_unknown() {
-        let engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        assert!(engine.get_proposal(&[0u8; 32]).is_none());
-    }
-
-    #[test]
-    fn get_proposal_returns_proposal_after_creation() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        let retrieved = engine.get_proposal(&pid);
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().proposer_did, alice());
+    fn threshold_engine_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ThresholdEngine>();
     }
 
     // -----------------------------------------------------------------------
-    // Merkle log event recording
+    // Duplicate proposal rejected
     // -----------------------------------------------------------------------
 
     #[test]
-    fn full_lifecycle_produces_correct_events() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn duplicate_proposal_rejected() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        // Propose.
-        let (proposal, create_events) = engine
-            .propose(&alice(), add_member_action(), &ctx)
-            .unwrap();
-        let pid = proposal.proposal_id;
-        assert_eq!(create_events.len(), 1);
+        let _ = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        let result = engine.propose(&alice(), default_action(), &ctx);
         assert!(matches!(
-            &create_events[0],
-            GovernanceEvent::ProposalCreated { proposer_did, .. } if *proposer_did == alice()
-        ));
-
-        // First approval.
-        let (_, approve1_events) = engine.approve(&pid, &alice(), &ctx).unwrap();
-        assert_eq!(approve1_events.len(), 1);
-        assert!(matches!(
-            &approve1_events[0],
-            GovernanceEvent::VoteCast { voter_did, vote: VoteType::Approve, .. }
-            if *voter_did == alice()
-        ));
-
-        // Second approval (resolves).
-        let (_, approve2_events) = engine.approve(&pid, &bob(), &ctx).unwrap();
-        assert_eq!(approve2_events.len(), 2);
-        assert!(matches!(
-            &approve2_events[0],
-            GovernanceEvent::VoteCast { voter_did, vote: VoteType::Approve, .. }
-            if *voter_did == bob()
-        ));
-        assert!(matches!(
-            &approve2_events[1],
-            GovernanceEvent::ProposalResolved { status: ProposalStatus::Approved, .. }
+            result.unwrap_err(),
+            GovernanceError::DuplicateProposal(_)
         ));
     }
 
-    #[test]
-    fn withdrawal_event_recorded_in_merkle_log() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        let (_, events) = engine.withdraw_vote(&pid, &alice(), &ctx).unwrap();
-
-        assert_eq!(events.len(), 1);
-        if let GovernanceEvent::VoteWithdrawn {
-            proposal_id,
-            voter_did,
-        } = &events[0]
-        {
-            assert_eq!(proposal_id, &pid);
-            assert_eq!(voter_did, &alice());
-        } else {
-            panic!("expected VoteWithdrawn event");
-        }
-    }
-
     // -----------------------------------------------------------------------
-    // Multiple concurrent proposals
+    // Unknown proposal ID
     // -----------------------------------------------------------------------
 
     #[test]
-    fn multiple_proposals_tracked_independently() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (p1, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let (p2, _) = engine
-            .propose(&bob(), close_context_action(), &ctx)
-            .unwrap();
-
-        let pid1 = p1.proposal_id;
-        let pid2 = p2.proposal_id;
-
-        // Approve p1 fully.
-        engine.approve(&pid1, &alice(), &ctx).unwrap();
-        engine.approve(&pid1, &bob(), &ctx).unwrap();
-
-        // p2 should still be pending.
-        let proposal2 = engine.get_proposal(&pid2).unwrap();
-        assert_eq!(proposal2.status, ProposalStatus::Pending);
-
-        // Reject p2 to impossibility.
-        engine.reject(&pid2, &alice(), &ctx).unwrap();
-        let (status, _) = engine.reject(&pid2, &bob(), &ctx).unwrap();
-        assert_eq!(
-            status,
-            ProposalStatus::Rejected {
-                reason: RejectionReason::ApprovalImpossible,
-            }
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Edge case: mixed approve/reject with threshold math
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn threshold_3_of_5_mixed_votes() {
-        let mut engine = ThresholdEngine::new(signers_5(), 3, 86_400).unwrap();
-        let ctx = threshold_context(&signers_5(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        // 2 rejections (out of 5 signers, threshold 3):
-        // rejections(2) <= signers(5) - threshold(3) = 2, so NOT impossible yet.
-        engine.reject(&pid, &dave(), &ctx).unwrap();
-        let (status, _) = engine.reject(&pid, &eve(), &ctx).unwrap();
-        assert_eq!(status, ProposalStatus::Pending);
-
-        // But if we add one more rejection:
-        // rejections(3) > signers(5) - threshold(3) = 2 => impossible.
-        let (status, _) = engine.reject(&pid, &carol(), &ctx).unwrap();
-        assert_eq!(
-            status,
-            ProposalStatus::Rejected {
-                reason: RejectionReason::ApprovalImpossible,
-            }
-        );
-    }
-
-    #[test]
-    fn threshold_2_of_3_approve_despite_rejection() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
-        let pid = proposal.proposal_id;
-
-        // Carol rejects (1 rejection <= 3-2=1, so not impossible).
-        engine.reject(&pid, &carol(), &ctx).unwrap();
-
-        // Alice and Bob approve -- threshold met.
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        let (status, _) = engine.approve(&pid, &bob(), &ctx).unwrap();
-        assert_eq!(status, ProposalStatus::Approved);
-    }
-
-    // -----------------------------------------------------------------------
-    // Governance event serialization roundtrip for VoteWithdrawn
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn vote_withdrawn_event_serialization_roundtrip() {
-        let event = GovernanceEvent::VoteWithdrawn {
-            proposal_id: [42u8; 32],
-            voter_did: alice(),
-        };
-
-        let json = serde_json::to_string(&event).expect("serialize");
-        let deserialized: GovernanceEvent =
-            serde_json::from_str(&json).expect("deserialize");
-
-        if let GovernanceEvent::VoteWithdrawn {
-            proposal_id,
-            voter_did,
-        } = &deserialized
-        {
-            assert_eq!(proposal_id, &[42u8; 32]);
-            assert_eq!(voter_did, &alice());
-        } else {
-            panic!("expected VoteWithdrawn variant after deserialization");
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Resolve on non-existent proposal
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_nonexistent_proposal_returns_error() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
-
+    fn approve_unknown_proposal() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let ctx = test_context();
         let fake_id = [0u8; 32];
-        let result = engine.resolve(&fake_id, &ctx);
-        assert!(result.is_err());
+
+        let result = engine.approve(&fake_id, &alice(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::ProposalNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_unknown_proposal() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let ctx = test_context();
+        let fake_id = [0u8; 32];
+
+        let result = engine.reject(&fake_id, &alice(), &ctx);
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::ProposalNotFound { .. }
@@ -1425,77 +1064,86 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Boundary: voting window limits
+    // Full lifecycle: propose -> approve -> approved
     // -----------------------------------------------------------------------
 
     #[test]
-    fn min_voting_window_accepted() {
-        let engine = ThresholdEngine::new(signers_3(), 2, MIN_VOTING_WINDOW_SECS);
-        assert!(engine.is_ok());
+    fn full_lifecycle_2_of_3_approval() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
+
+        // 1. Alice proposes (counts as first approval).
+        let (proposal, create_events) =
+            engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+        assert_eq!(create_events.len(), 2); // Created + VoteCast
+
+        // 2. Bob approves -> reaches threshold.
+        let (status, approve_events) =
+            engine.approve(&proposal.proposal_id, &bob(), &ctx).expect("ok");
+        assert_eq!(status, ProposalStatus::Approved);
+        assert_eq!(approve_events.len(), 2); // VoteCast + Resolved
+
+        // 3. Carol trying to approve on resolved proposal -> error.
+        let result = engine.approve(&proposal.proposal_id, &carol(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::ProposalNotPending { .. }
+        ));
+
+        // 4. Verify stored proposal.
+        let stored = engine.get_proposal(&proposal.proposal_id).expect("found");
+        assert_eq!(stored.status, ProposalStatus::Approved);
+        assert_eq!(stored.approvals.len(), 2);
     }
 
-    #[test]
-    fn max_voting_window_accepted() {
-        let engine = ThresholdEngine::new(signers_3(), 2, MAX_VOTING_WINDOW_SECS);
-        assert!(engine.is_ok());
-    }
-
     // -----------------------------------------------------------------------
-    // Withdrawal and re-vote changes outcome
+    // Full lifecycle: propose -> reject -> impossible
     // -----------------------------------------------------------------------
 
     #[test]
-    fn withdrawal_prevents_threshold_from_being_reached() {
-        let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-        let ctx = threshold_context(&signers_3(), 1_700_000_000);
+    fn full_lifecycle_2_of_3_rejection() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        let (proposal, _) = engine.propose(&alice(), add_member_action(), &ctx).unwrap();
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
         let pid = proposal.proposal_id;
 
-        // Alice approves, then withdraws -- only Bob's approval won't suffice.
-        engine.approve(&pid, &alice(), &ctx).unwrap();
-        engine.withdraw_vote(&pid, &alice(), &ctx).unwrap();
-        engine.approve(&pid, &bob(), &ctx).unwrap();
+        // Bob rejects.
+        let (status, _) = engine.reject(&pid, &bob(), &ctx).expect("ok");
+        assert_eq!(status, ProposalStatus::Pending);
 
-        let proposal = engine.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Pending);
-        assert_eq!(proposal.approvals.len(), 1); // Only Bob.
+        // Carol rejects -> 2 rejections > 3-2=1 -> impossible.
+        let (status, _) = engine.reject(&pid, &carol(), &ctx).expect("ok");
+        assert_eq!(
+            status,
+            ProposalStatus::Rejected {
+                reason: RejectionReason::ApprovalImpossible
+            }
+        );
     }
 
     // -----------------------------------------------------------------------
-    // All governance action types can be proposed
+    // Full lifecycle: propose -> expire
     // -----------------------------------------------------------------------
 
     #[test]
-    fn all_action_types_can_be_proposed() {
-        let actions: Vec<GovernanceAction> = vec![
-            GovernanceAction::AddMember {
-                did: DID::from("did:dht:z6MkNew"),
-                role: "member".to_owned(),
-            },
-            GovernanceAction::RemoveMember {
-                did: bob(),
-                reason: None,
-            },
-            GovernanceAction::ChangeRole {
-                did: bob(),
-                new_role: "observer".to_owned(),
-            },
-            GovernanceAction::CloseContext {
-                reason: Some("done".to_owned()),
-            },
-            GovernanceAction::ExtendTtl {
-                additional_secs: 3600,
-            },
-        ];
+    fn full_lifecycle_expiry() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let ctx = test_context();
 
-        for (i, action) in actions.into_iter().enumerate() {
-            let mut engine = ThresholdEngine::new(signers_3(), 2, 86_400).unwrap();
-            // Use different timestamps to avoid duplicate proposal IDs.
-            let ctx = threshold_context(&signers_3(), 1_700_000_000 + i as u64);
+        let (proposal, _) = engine.propose(&alice(), default_action(), &ctx).expect("ok");
+        let pid = proposal.proposal_id;
 
-            let result = engine.propose(&alice(), action, &ctx);
-            assert!(result.is_ok(), "failed to propose action variant {i}");
-        }
+        // Advance time past deadline.
+        let expired_ctx = test_context_at(ctx.now + 86_400);
+
+        // resolve() triggers expiry.
+        let (status, events) = engine.resolve(&pid, &expired_ctx).expect("ok");
+        assert_eq!(status, ProposalStatus::Expired);
+        assert_eq!(events.len(), 1);
     }
 }

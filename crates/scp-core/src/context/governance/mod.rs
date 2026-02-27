@@ -24,6 +24,7 @@
 //! - [`GovernanceModelConfig`] -- Model selection enum set at context creation.
 //! - [`SingleAdminEngine`] -- Phase 2 baseline: single-admin auto-approve.
 //! - [`GovernanceEvent`] -- Events recorded in the Merkle log for auditability.
+//! - [`multisig::ThresholdEngine`] -- M-of-N threshold governance (ADR-031 §4b).
 //!
 //! # Exit-as-veto
 //!
@@ -36,8 +37,8 @@
 //!
 //! Different governance models implement the same [`GovernanceEngine`] trait.
 //! The trait is object-safe for dynamic dispatch via `Box<dyn GovernanceEngine>`.
-//! Phase 6 adds [`ThresholdEngine`](multisig::ThresholdEngine) (M-of-N),
-//! with `MajorityEngine` and `UnanimityEngine` to follow.
+//! `ThresholdEngine` (Phase 6, ADR-031 §4b) is in [`multisig`].
+//! Phase 6 will add `MajorityEngine` and `UnanimityEngine`.
 //!
 //! See ADR-031 in `.docs/adrs/phase-6.md` for the full specification.
 
@@ -356,6 +357,17 @@ pub enum GovernanceError {
     /// The governance model configuration is invalid.
     #[error("invalid governance config: {0}")]
     InvalidConfig(String),
+
+    /// The voting window has expired for this proposal.
+    #[error("voting window has expired for proposal: {id}")]
+    VotingWindowExpired {
+        /// Hex-encoded proposal ID.
+        id: String,
+    },
+
+    /// The requested operation is not supported by this governance model.
+    #[error("operation not supported: {0}")]
+    OperationNotSupported(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -380,11 +392,6 @@ pub enum GovernanceEvent {
         proposal_id: ProposalId,
         voter_did: DID,
         vote: VoteType,
-    },
-    /// A previously cast vote was withdrawn.
-    VoteWithdrawn {
-        proposal_id: ProposalId,
-        voter_did: DID,
     },
     /// A proposal was resolved (approved, rejected, expired, etc.).
     ProposalResolved {
@@ -459,6 +466,60 @@ pub trait GovernanceEngine: Send + Sync {
         voter: &DID,
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>;
+
+    /// Withdraw a previously cast vote on a pending proposal.
+    ///
+    /// The voter must have already voted on this proposal. The vote is removed,
+    /// allowing the voter to re-vote (change from approve to reject or vice
+    /// versa). Only valid while the proposal is `Pending`.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns [`GovernanceError::OperationNotSupported`] for engines that do
+    /// not support vote withdrawal (e.g., `SingleAdminEngine`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError`] if the proposal is not found, not pending,
+    /// or the voter has not voted.
+    fn withdraw_vote(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        let _ = (proposal_id, voter, context);
+        Err(GovernanceError::OperationNotSupported(
+            "withdraw_vote is not supported by this governance model".to_owned(),
+        ))
+    }
+
+    /// Resolve a pending proposal based on current vote tallies and time.
+    ///
+    /// Checks whether the proposal has reached quorum (approved), become
+    /// impossible to approve (rejected), or expired past the voting deadline.
+    /// Returns the resulting status and any events that should be recorded.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns [`GovernanceError::OperationNotSupported`] for engines that do
+    /// not support explicit resolution (e.g., `SingleAdminEngine` where
+    /// proposals are resolved immediately on creation).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError`] if the proposal is not found or already
+    /// resolved.
+    fn resolve(
+        &mut self,
+        proposal_id: &ProposalId,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        let _ = (proposal_id, context);
+        Err(GovernanceError::OperationNotSupported(
+            "resolve is not supported by this governance model".to_owned(),
+        ))
+    }
 
     /// Return the governance model configuration for metadata publication.
     fn model_config(&self) -> GovernanceModelConfig;
@@ -1400,6 +1461,24 @@ mod tests {
         assert_eq!(
             format!("{}", GovernanceError::AlreadyVoted),
             "voter has already voted on this proposal"
+        );
+
+        assert_eq!(
+            format!(
+                "{}",
+                GovernanceError::VotingWindowExpired {
+                    id: "abcd".to_owned()
+                }
+            ),
+            "voting window has expired for proposal: abcd"
+        );
+
+        assert_eq!(
+            format!(
+                "{}",
+                GovernanceError::OperationNotSupported("test op".to_owned())
+            ),
+            "operation not supported: test op"
         );
     }
 
