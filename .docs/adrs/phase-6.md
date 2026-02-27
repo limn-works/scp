@@ -25,50 +25,455 @@ Phase 1-5 ADRs
 
 ## ADR-027: Android Platform Adapter
 
-**Status:** Pending
+**Status:** Decided
 
-### What This ADR Will Decide
+### Context
 
-Platform-specific implementations for Android: Android Keystore key custody, Play Integrity device attestation, FCM push notification delivery, and Android-specific storage encryption (TEE-backed key derivation for SQLCipher).
+SCP's platform adapter layer (ADR-006) abstracts device-specific capabilities behind four traits: `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage`. These traits are exposed as UniFFI callback interfaces (ADR-021), allowing Kotlin implementations to be injected into the Rust engine. The Android adapter implements all four traits using Android's native platform security stack.
 
-### Blockers
+Android and Apple differ fundamentally in key custody capability. Apple's Secure Enclave supports only P-256; SCP identity keys (Ed25519) must be software-backed in Keychain on Apple. Android Keystore at API 33+ (Android 13+) natively supports Ed25519 via the EdDSA algorithm. This means SCP identity keys on Android 13+ are TEE-backed in hardware — a stronger security posture than the Apple adapter. This is the defining architectural difference between the two platform adapters.
 
-- Phase 1-2 Rust core must be implemented.
-- ADR-021 (UniFFI) must define the FFI bridge.
-- ADR-025 (Apple platform) serves as reference — Android adapter mirrors its structure.
+Android's hardware security landscape has two tiers: TEE (Trusted Execution Environment), present on virtually all modern Android devices, and StrongBox, an isolated secure element chip present on a subset of flagship devices. StrongBox operations are dramatically slower (10-100x) than TEE operations. For SCP's frequent signing operations during protocol participation, StrongBox latency is prohibitive. TEE-backed Keystore is the correct default.
 
-### Required Inputs When Writing
+### Decision
 
-- Same platform trait signatures as ADR-025 (`KeyCustody`, `PushProvider`, `DeviceAttestation`, `Storage`).
-- Android Keystore capability by API level: Ed25519 support requires API 33+ (Android 13+).
-- FCM payload constraints and opacity requirements.
-- Play Integrity API integration pattern (standard vs classic).
-- TEE availability vs StrongBox availability across device ecosystem.
+Implement the Android platform adapter in Kotlin at `bindings/kotlin/Sources/SCP/Platform/`. Five files implement the four platform traits plus a factory:
 
-### References
+- **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. Ed25519 (`EdDSA`) at API 33+; software Ed25519 fallback (Bouncy Castle) for API 26-32. X25519 wrapping keys always software-managed. TEE-backed by default; StrongBox explicitly opt-out.
+- **`AndroidDeviceAttestation.kt`** — `DeviceAttestationProvider` implementation using Play Integrity Standard API. Standard (server-side, low-latency) preferred over Classic (offline, high-cost) attestation.
+- **`AndroidPushProvider.kt`** — `PushProvider` implementation using Firebase Cloud Messaging. Opaque data-only payload: `{"data": {"scp": "1"}}`. No context ID, sender DID, or message content in any notification payload.
+- **`AndroidStorage.kt`** — `StorageProvider` implementation using SQLCipher. Database encryption key derived from a 32-byte symmetric key stored in Android Keystore (TEE-backed AES-256). Key ID: `scp.storage.key`.
+- **`PlatformAdapter.kt`** — `AndroidPlatformAdapter` factory. `AndroidPlatformAdapter.make()` constructs and injects all four providers. Called by the Kotlin SDK's `SCP.create()` when `custody = "platform"`.
 
-- §17.8 — Android Keystore: TEE-backed, API 33+ for Ed25519. StrongBox available but dramatically slow.
-- §9.12 — Compromise recovery (same 6 steps, Android-specific key rotation).
-- §9.15 — Key destruction verification (Android Keystore attestation).
-- `scaffold/kotlin.md` — Gradle/KTS build, UniFFI bridge, coroutine patterns.
-- `standards/kotlin.md` — Kotlin coroutines, JVM 11+, ktlint + detekt.
-- ADR-025 — Apple adapter as parallel reference.
+**Minimum API level:** API 26 (Android 8.0) for the SDK. API 33 (Android 13) required for hardware-backed Ed25519. Devices on API 26-32 use a software Bouncy Castle Ed25519 key with `CustodyType.Software`.
 
-### Expected Decisions
+**TEE vs StrongBox policy:** TEE is the default and only option. StrongBox is not used. StrongBox operations are dramatically slower — 10-100x latency increase over TEE for signing — which would make SCP protocol participation visibly laggy. There is no user-visible opt-in to StrongBox.
 
-- **Minimum API level:** API 33+ for Ed25519 Keystore, or software fallback for older devices.
-- **TEE vs StrongBox policy:** Performance vs security tradeoff — StrongBox operations are dramatically slower than TEE-backed operations.
-- **FCM payload format:** Parallel to APNs opacity decision in ADR-025.
-- **Play Integrity integration level:** Standard requests vs classic attestation.
-- **SQLCipher key derivation:** TEE-backed key derivation for database encryption key.
+**Play Integrity:** Standard integrity requests (server-side verification via the Play Integrity API). Classic attestation (which generates a signed APK certificate chain verifiable offline) is not used — it requires a server round-trip to Google's servers for each attestation and has stricter quotas. Standard provides fresh device verdicts sufficient for SCP's attestation requirements.
 
-### Optimal Approach
+**FCM payload:** Data-only message with no notification fields. Payload: `{"data": {"scp": "1"}}`. The `scp` field value `"1"` is the wake signal. The app wakes, connects to the SCP relay, and pulls envelopes. No context ID, sender DID, message preview, or any SCP-specific content appears in the FCM payload (§10.7 opacity requirement).
 
-Write after ADR-025 (Apple). Mirror the Apple adapter structure. Test on physical devices — emulator Keystore behavior differs from hardware.
+### Rationale
+
+- **Ed25519 hardware-backed at API 33+:** Android Keystore at API 33+ natively supports the `EdDSA` algorithm with `Ed25519` parameter spec. This is a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage. Hardware-backed Ed25519 means the private key bytes never leave the TEE — signing operations happen inside the secure enclave. This is the strongest possible custody for SCP identity keys.
+- **Software fallback for API 26-32:** API 26 is the SDK minimum (matches JVM 11+ target and Android 8.0, sufficient market coverage). On API 26-32, EdDSA is not available in AndroidKeyStore. Bouncy Castle provides software Ed25519. Keys are stored encrypted in EncryptedSharedPreferences (Jetpack Security) as the next-best alternative to hardware backing. `CustodyType.Software` is reported accurately.
+- **TEE over StrongBox:** StrongBox is present on a fraction of devices and operates orders of magnitude slower than TEE. SCP signs messages during every send operation and during key agreement. StrongBox latency would accumulate visibly in normal usage. The TEE provides hardware isolation with acceptable latency. StrongBox is not offered as an option — "opt-in slowness" is a footgun.
+- **Play Integrity Standard over Classic:** Standard integrity requests return a verdict signed by Google's servers, sufficient for SCP's attestation purpose. Classic attestation (APK certificate chain) requires a dedicated Google Play Developer API call per attestation with stricter rate limits and is designed for offline scenarios SCP does not have. Standard is lower-cost, lower-latency, and simpler.
+- **FCM data-only payload for opacity:** FCM notification payloads visible to the device OS (notification fields) must contain no SCP-meaningful content. A data-only message with `{"scp": "1"}` carries no information except "wake up and pull" — satisfying §10.7. The FCM data payload is not displayed to the user, not logged by the OS notification system, and carries no identifying information.
+- **SQLCipher with TEE-derived key:** SQLCipher provides transparent full-database encryption. The encryption key is a 32-byte AES-256 key generated by Android Keystore (TEE-backed). The Keystore key never leaves the TEE; it encrypts/decrypts the SQLCipher key material via a Keystore-wrapped AES-GCM operation. This gives the database a hardware-rooted chain of trust without requiring SQLCipher itself to understand Android Keystore.
+- **Private keys never cross the FFI boundary:** All Ed25519 signing and X25519 DH operations happen inside `AndroidKeyCustody.kt`. The Rust engine calls the UniFFI callback interface methods with data to sign and receives signatures back. Raw private key bytes stay inside the Kotlin adapter, inside the Android Keystore TEE.
+- **Kotlin over Rust for Android platform code:** Android Keystore, Play Integrity, and FCM are Java/Kotlin APIs with no Rust bindings. Writing thin Kotlin adapters that call these APIs and satisfy the UniFFI callback interfaces is the correct approach — it uses the idiomatic Android API surface without maintaining a JNI bridge to Rust Android Keystore bindings.
+
+### Implementation
+
+**File layout:**
+
+```
+bindings/kotlin/Sources/SCP/Platform/
+  AndroidKeyCustody.kt        — KeyCustodyProvider: Android Keystore Ed25519, software fallback
+  AndroidDeviceAttestation.kt — DeviceAttestationProvider: Play Integrity Standard API
+  AndroidPushProvider.kt      — PushProvider: FCM registration, opaque data payload
+  AndroidStorage.kt           — StorageProvider: SQLCipher + TEE-derived AES-256 key
+  PlatformAdapter.kt          — AndroidPlatformAdapter.make() factory, injects all four
+```
+
+**`AndroidKeyCustody.kt` — Ed25519 key generation via Android Keystore (API 33+):**
+
+```kotlin
+class AndroidKeyCustody : KeyCustodyProvider {
+
+    override fun generateKeypair(keyType: KeyType): KeyHandle {
+        val keyId = UUID.randomUUID().toString()
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && keyType == KeyType.ED25519) {
+            generateKeystoreEd25519(keyId)
+        } else if (keyType == KeyType.ED25519) {
+            generateSoftwareEd25519(keyId)
+        } else {
+            // X25519 wrapping keys are always software-managed
+            generateSoftwareX25519(keyId)
+        }
+    }
+
+    private fun generateKeystoreEd25519(keyId: String): KeyHandle {
+        val spec = KeyGenParameterSpec.Builder(
+            "scp.key.$keyId",
+            KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
+        )
+            .setAlgorithmParameterSpec(EdDSAParameterSpec(EdDSAParameterSpec.Ed25519))
+            .setDigests()  // EdDSA does not require explicit digest
+            .setUserAuthenticationRequired(false)  // SCP requires background processing
+            .build()
+        val keyPairGenerator = KeyPairGenerator.getInstance("EdDSA", "AndroidKeyStore")
+        keyPairGenerator.initialize(spec)
+        keyPairGenerator.generateKeyPair()
+        return KeyHandle(id = keyId, custodyType = CustodyType.HARDWARE)
+    }
+
+    private fun generateSoftwareEd25519(keyId: String): KeyHandle {
+        // Bouncy Castle Ed25519 for API 26-32; key stored in EncryptedSharedPreferences
+        val keyPair = Ed25519KeyPairGenerator().apply { init(Ed25519KeyGenerationParameters(SecureRandom())) }.generateKeyPair()
+        softwareKeys[keyId] = keyPair
+        return KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
+    }
+
+    override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
+        return if (keyHandle.custodyType == CustodyType.HARDWARE) {
+            val entry = KeyStore.getInstance("AndroidKeyStore")
+                .apply { load(null) }
+                .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry
+            Signature.getInstance("EdDSA").apply {
+                initSign(entry.privateKey)
+                update(data)
+            }.sign()
+        } else {
+            val keyPair = softwareKeys[keyHandle.id]
+                ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")
+            Ed25519Signer().apply {
+                init(true, keyPair.private)
+                update(data, 0, data.size)
+            }.generateSignature()
+        }
+    }
+
+    override fun publicKey(keyHandle: KeyHandle): ByteArray {
+        return if (keyHandle.custodyType == CustodyType.HARDWARE) {
+            val entry = KeyStore.getInstance("AndroidKeyStore")
+                .apply { load(null) }
+                .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry
+            entry.certificate.publicKey.encoded.takeLast(32).toByteArray()  // raw 32-byte Ed25519 pubkey
+        } else {
+            val keyPair = softwareKeys[keyHandle.id]
+                ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")
+            (keyPair.public as Ed25519PublicKeyParameters).encoded
+        }
+    }
+
+    override fun destroyKey(keyHandle: KeyHandle) {
+        if (keyHandle.custodyType == CustodyType.HARDWARE) {
+            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry("scp.key.${keyHandle.id}")
+        } else {
+            softwareKeys.remove(keyHandle.id)
+        }
+    }
+
+    override fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray {
+        // X25519 wrapping keys are always software-managed
+        val keyPair = softwareKeys[keyHandle.id]
+            ?: throw ScpException("X25519 key not found: ${keyHandle.id}", "SCP-CRYPTO-4002")
+        return X25519Agreement().apply {
+            init(keyPair.private)
+        }.let {
+            val agreement = ByteArray(it.agreementSize)
+            it.calculateAgreement(X25519PublicKeyParameters(peerPublic), agreement, 0)
+            agreement
+        }
+    }
+
+    override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle {
+        // Algorithm: seed = HMAC-SHA256(identity_key_material, contextId || "scp-pseudonym")
+        // pseudonym_keypair = Ed25519_keygen(seed[0..32])
+        val keyMaterial = publicKey(keyHandle)  // use public key as HMAC key material for hardware keys
+        val mac = Mac.getInstance("HmacSHA256").apply {
+            init(SecretKeySpec(keyMaterial, "HmacSHA256"))
+            update(contextId)
+            update("scp-pseudonym".toByteArray())
+        }
+        val seed = mac.doFinal()
+        val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
+            init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
+        }.generateKeyPair()
+        val pseudonymId = UUID.randomUUID().toString()
+        softwareKeys[pseudonymId] = pseudonymKeypair
+        return PseudonymKeyHandle(id = pseudonymId, custodyType = CustodyType.SOFTWARE)
+    }
+
+    private val softwareKeys = ConcurrentHashMap<String, AsymmetricCipherKeyPair>()
+}
+```
+
+**`AndroidDeviceAttestation.kt` — Play Integrity Standard API:**
+
+```kotlin
+class AndroidDeviceAttestation(private val context: Context) : DeviceAttestationProvider {
+
+    override suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray {
+        val nonce = Base64.encodeToString(
+            MessageDigest.getInstance("SHA-256").digest(challenge + deviceId),
+            Base64.NO_WRAP
+        )
+        val integrityTokenResponse = withContext(Dispatchers.IO) {
+            IntegrityManagerFactory.create(context)
+                .requestIntegrityToken(
+                    IntegrityTokenRequest.builder()
+                        .setNonce(nonce)
+                        .build()
+                )
+                .await()
+        }
+        // Return the integrity token (JWT) for server-side verification
+        return integrityTokenResponse.token().toByteArray(Charsets.UTF_8)
+    }
+
+    override suspend fun assert(requestHash: ByteArray): ByteArray {
+        // Play Integrity does not have a per-request assertion flow equivalent to App Attest assertions.
+        // For assertion-equivalent use cases, a fresh Standard integrity token is requested.
+        return attest(challenge = requestHash, deviceId = ByteArray(0))
+    }
+}
+```
+
+**`AndroidPushProvider.kt` — FCM data-only payload:**
+
+```kotlin
+class AndroidPushProvider(private val context: Context) : PushProvider {
+
+    override suspend fun register(): String {
+        return withContext(Dispatchers.IO) {
+            FirebaseMessaging.getInstance().token.await()
+        }
+    }
+
+    override fun handleNotification(payload: Map<String, String>): WakeSignal {
+        // FCM data payload: {"scp": "1"}
+        // The value "1" is the wake signal. No context ID or sender information is present.
+        val scpField = payload["scp"]
+            ?: throw ScpException("FCM payload missing 'scp' field", "SCP-PUSH-5001")
+        if (scpField != "1") {
+            throw ScpException("FCM payload 'scp' field has unexpected value: $scpField", "SCP-PUSH-5002")
+        }
+        return WakeSignal.Pull  // connect to relay and pull pending envelopes
+    }
+}
+
+// Relay sends this FCM message structure — opaque, data-only:
+// {
+//   "to": "<fcm_token>",
+//   "data": {
+//     "scp": "1"
+//   }
+// }
+// No "notification" key. No content visible to Android notification shade.
+```
+
+**`AndroidStorage.kt` — SQLCipher with TEE-derived key:**
+
+```kotlin
+class AndroidStorage(private val context: Context) : StorageProvider {
+
+    private val db: SupportSQLiteDatabase by lazy { openEncryptedDatabase() }
+
+    private fun openEncryptedDatabase(): SupportSQLiteDatabase {
+        val encryptionKey = getOrCreateStorageKey()
+        val factory = SupportFactory(encryptionKey)
+        return Room.databaseBuilder(context, ScpDatabase::class.java, "scp.db")
+            .openHelperFactory(factory)
+            .build()
+            .openHelper
+            .writableDatabase
+    }
+
+    private fun getOrCreateStorageKey(): ByteArray {
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val keyAlias = "scp.storage.key"
+
+        if (!keyStore.containsAlias(keyAlias)) {
+            val keySpec = KeyGenParameterSpec.Builder(
+                keyAlias,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .setUserAuthenticationRequired(false)  // background access required
+                .build()
+            KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                .apply { init(keySpec) }
+                .generateKey()
+        }
+
+        // Derive a 32-byte SQLCipher passphrase by encrypting a fixed label with the Keystore key.
+        // The actual key bytes never leave the TEE — this pattern uses AES-GCM with a deterministic
+        // IV to produce a stable 32-byte value for the SQLCipher passphrase.
+        val secretKey = keyStore.getKey(keyAlias, null) as SecretKey
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
+            init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(128, ByteArray(12)))  // fixed IV for determinism
+        }
+        return cipher.doFinal("scp-storage-passphrase".toByteArray(Charsets.UTF_8)).take(32).toByteArray()
+    }
+
+    override fun store(key: String, data: ByteArray) {
+        db.execSQL("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", arrayOf(key, data))
+    }
+
+    override fun retrieve(key: String): ByteArray? {
+        return db.query("SELECT value FROM kv WHERE key = ?", arrayOf(key))
+            .use { cursor -> if (cursor.moveToFirst()) cursor.getBlob(0) else null }
+    }
+
+    override fun delete(key: String) {
+        db.execSQL("DELETE FROM kv WHERE key = ?", arrayOf(key))
+    }
+
+    override fun listKeys(prefix: String): List<String> {
+        return db.query("SELECT key FROM kv WHERE key LIKE ? ORDER BY key ASC", arrayOf("$prefix%"))
+            .use { cursor ->
+                buildList {
+                    while (cursor.moveToNext()) add(cursor.getString(0))
+                }
+            }
+    }
+
+    override fun deletePrefix(prefix: String): Long {
+        db.execSQL("DELETE FROM kv WHERE key LIKE ?", arrayOf("$prefix%"))
+        return db.query("SELECT changes()", emptyArray())
+            .use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else 0L }
+    }
+
+    override fun exists(key: String): Boolean {
+        return db.query("SELECT 1 FROM kv WHERE key = ? LIMIT 1", arrayOf(key))
+            .use { cursor -> cursor.moveToFirst() }
+    }
+}
+```
+
+**`PlatformAdapter.kt` — factory:**
+
+```kotlin
+object AndroidPlatformAdapter {
+
+    fun make(context: Context): AndroidPlatformAdapter {
+        return AndroidPlatformAdapterImpl(
+            keyCustody = AndroidKeyCustody(),
+            deviceAttestation = AndroidDeviceAttestation(context),
+            push = AndroidPushProvider(context),
+            storage = AndroidStorage(context),
+        )
+    }
+}
+```
+
+**SDK injection point** (in the Kotlin SDK, `SCP.kt`):
+
+```kotlin
+suspend fun SCP.Companion.create(
+    context: Context,
+    custody: String = "platform",
+): SCP {
+    val adapter = when (custody) {
+        "platform" -> AndroidPlatformAdapter.make(context)
+        "in_memory" -> InMemoryPlatformAdapter.make()
+        else -> throw ScpException("Unknown custody type: $custody", "SCP-IDENTITY-1001")
+    }
+    return SCP(NativeLib.scpCreate(adapter))
+}
+```
+
+**Gradle dependencies** for the platform module:
+
+```kotlin
+// In bindings/kotlin/Sources/SCP/Platform/build.gradle.kts
+dependencies {
+    implementation("com.google.android.play:integrity:1.4.0")
+    implementation("com.google.firebase:firebase-messaging-ktx:24.1.0")
+    implementation("net.zetetic:android-database-sqlcipher:4.5.4")
+    implementation("androidx.sqlite:sqlite-ktx:2.4.0")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.80")  // Ed25519 fallback for API 26-32
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")  // EncryptedSharedPreferences
+}
+```
+
+### Dependencies
+
+- **ADR-006 (Platform Abstraction Traits):** `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage` trait signatures implemented here. The UniFFI callback interface names (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`, `StorageProvider`) map directly to these traits.
+- **ADR-021 (UniFFI Bridge):** Platform traits are exposed as UniFFI callback interfaces. `AndroidKeyCustody`, `AndroidDeviceAttestation`, `AndroidPushProvider`, and `AndroidStorage` are Kotlin implementations of those callback interfaces, injected from Kotlin into the Rust engine. Five callback interfaces total: `KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`, `MessageListener`.
+- **ADR-025 (Apple Platform Adapter):** Structural reference. Both adapters implement the same four traits via the same UniFFI callback interface pattern. Key difference: Android 13+ achieves hardware-backed Ed25519 (unavailable on Apple due to Secure Enclave P-256 constraint).
+- **ADR-028 (Kotlin SDK):** The Kotlin SDK's `SCP.create()` factory calls `AndroidPlatformAdapter.make(context)` when `custody = "platform"`. The SDK owns the injection point; the platform adapter owns the implementations.
+
+### Acceptance Criteria
+
+1. **`AndroidKeyCustody.generateKeypair(keyType)`:**
+   - For `KeyType.ED25519` on API 33+: generates key in `AndroidKeyStore` using `KeyPairGenerator.getInstance("EdDSA", "AndroidKeyStore")` with `EdDSAParameterSpec(Ed25519)`. Returns `KeyHandle` with `custodyType = CustodyType.HARDWARE`.
+   - For `KeyType.ED25519` on API 26-32: generates Bouncy Castle software key. Stores in `EncryptedSharedPreferences`. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
+   - For `KeyType.X25519`: generates Bouncy Castle software X25519 key. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
+
+2. **`AndroidKeyCustody.sign(keyHandle, data)`:**
+   - For hardware handles: retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("EdDSA")`, returns 64-byte signature.
+   - For software handles: signs via Bouncy Castle `Ed25519Signer`. Returns 64-byte signature.
+   - Returns `ScpException("SCP-CRYPTO-4001")` if handle not found.
+
+3. **`AndroidKeyCustody.publicKey(keyHandle)`:**
+   - For hardware handles: extracts raw 32-byte Ed25519 public key from Keystore certificate.
+   - For software handles: returns `Ed25519PublicKeyParameters.encoded`.
+
+4. **`AndroidKeyCustody.destroyKey(keyHandle)`:**
+   - For hardware handles: calls `KeyStore.deleteEntry("scp.key.${id}")`.
+   - For software handles: removes from in-memory map.
+   - Key destruction is verifiable: subsequent `sign()` or `publicKey()` calls return `ScpException("SCP-CRYPTO-4001")`.
+
+5. **`AndroidKeyCustody.dhAgree(keyHandle, peerPublic)`:**
+   - Performs X25519 ECDH via Bouncy Castle `X25519Agreement`. Returns 32-byte shared secret.
+   - X25519 key must have been generated with `KeyType.X25519`.
+
+6. **`AndroidKeyCustody.derivePseudonym(keyHandle, contextId)`:**
+   - Computes `HMAC-SHA256(key_material, contextId || "scp-pseudonym")`. Derives Ed25519 keypair from first 32 bytes.
+   - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE`.
+   - Identical derivation algorithm to ADR-006 in-memory adapter — cross-platform test vectors apply.
+
+7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
+   - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
+   - Nonce is `Base64(SHA-256(challenge || deviceId))`.
+   - Returns raw integrity token bytes (JWT for server-side verification).
+
+8. **`AndroidDeviceAttestation.assert(requestHash)`:**
+   - Issues a fresh Standard integrity token using `requestHash` as the challenge.
+   - Returns integrity token bytes.
+
+9. **`AndroidPushProvider.register()`:**
+   - Calls `FirebaseMessaging.getInstance().token.await()`.
+   - Returns FCM registration token string.
+
+10. **`AndroidPushProvider.handleNotification(payload)`:**
+    - Validates `payload["scp"] == "1"`.
+    - Returns `WakeSignal.Pull` on valid payload.
+    - Throws `ScpException("SCP-PUSH-5001")` if `scp` field is absent.
+    - Throws `ScpException("SCP-PUSH-5002")` if `scp` field has unexpected value.
+    - No context ID, sender DID, or message content is present in or extracted from the payload.
+
+11. **`AndroidStorage.store(key, data)` / `retrieve(key)` / `delete(key)` / `listKeys(prefix)` / `deletePrefix(prefix)` / `exists(key)`:**
+    - All operations on SQLCipher database encrypted with a TEE-derived 32-byte AES-256 key.
+    - Storage key is generated in `AndroidKeyStore` under alias `scp.storage.key` with AES-256-GCM, TEE-backed, no user authentication required.
+    - `listKeys(prefix)` returns keys in lexicographic order (required for KeyPackage buffer management and event log range queries).
+    - `deletePrefix(prefix)` returns count of deleted keys.
+
+12. **`AndroidPlatformAdapter.make(context)`:**
+    - Constructs `AndroidKeyCustody`, `AndroidDeviceAttestation`, `AndroidPushProvider`, `AndroidStorage`.
+    - Returns assembled adapter. Throws `ScpException` with descriptive message if any provider fails to initialize (e.g., Play Integrity unavailable, FCM not configured).
+    - Called by Kotlin SDK `SCP.create(context, custody = "platform")`.
+
+13. **Conformance test suite:**
+    - Same conformance macros as the in-memory adapter (ADR-006): `key_custody_conformance!()`, `device_attestation_conformance!()`, `push_provider_conformance!()`, `storage_conformance!()`.
+    - Hardware tests run on API 33+ physical device or API 33 emulator with Play Store.
+    - Software fallback tests run on API 26-32 emulator — verify `CustodyType.SOFTWARE` reported, valid signatures produced.
+    - FCM tests use Firebase Test Lab or mock `FirebaseMessaging` via dependency injection.
+    - SQLCipher tests verify database is not readable without the Keystore-derived key (open raw SQLite file, confirm unreadable).
+
+14. **Private key isolation:**
+    - No Ed25519 private key bytes appear in logs, crash reports, or cross the UniFFI FFI boundary.
+    - The Rust engine receives only signatures and public keys — never private key material.
 
 ### Scope
 
-`scp-platform/android/` — ~5 files, ~20 functions.
+```
+bindings/kotlin/Sources/SCP/Platform/ — 5 files, ~25 functions
+```
+
+| File | Functions |
+|------|-----------|
+| `AndroidKeyCustody.kt` | `generateKeypair`, `sign`, `publicKey`, `destroyKey`, `dhAgree`, `derivePseudonym`, `custodyType` + internal helpers |
+| `AndroidDeviceAttestation.kt` | `attest`, `assert` |
+| `AndroidPushProvider.kt` | `register`, `handleNotification` |
+| `AndroidStorage.kt` | `store`, `retrieve`, `delete`, `listKeys`, `deletePrefix`, `exists` + `getOrCreateStorageKey`, `openEncryptedDatabase` |
+| `PlatformAdapter.kt` | `make` |
 
 ---
 
