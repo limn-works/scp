@@ -107,6 +107,22 @@
 - SingleAdminEngine has duplicate proposal check but placed after construction
 - GovernanceProposal tracks votes with signed votes (DID + signature)
 
+### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- SCP-079 Review (2026-02-26)
+- Bridge-stub architecture: no scp-core dependency, delegates real logic to TypeScript SDK
+- GOOD: No unwrap/expect/panic in source; workspace clippy deny inherited
+- GOOD: CSPRNG context IDs via uuid v4 + getrandom/js (not predictable like UniFFI)
+- GOOD: All extern JS methods use `catch` -- no WASM trap from JS exceptions
+- GOOD: No key material in Rust structs -- keys stay in JS WebCrypto boundary
+- GOOD: No scp-platform/scp-testing dependency (unlike UniFFI CRITICAL finding)
+- GOOD: Stable error codes matching cross-SDK standard
+- HIGH: transport_connect accepts ws:// (plaintext) despite doc requiring wss://
+- MEDIUM: WasmDIDDocument::from_fields performs zero validation on JS-provided strings
+- MEDIUM: context_send claims base64 validation but only checks is_empty()
+- MEDIUM: Panic hook leaks file paths and internal state to browser console
+- MEDIUM: Missing #![forbid(unsafe_code)] -- no architectural need for unsafe
+- MEDIUM: serde_json Error messages may leak struct details when typed deserialization added
+- NOTE: JsMessageCallback on_message/on_complete lack `catch` -- JS throw = WASM trap
+
 ### General Patterns
 - No `unwrap`/`expect` in lib code -- project standard via clippy deny
 - `thiserror` for error types -- consistent across crates

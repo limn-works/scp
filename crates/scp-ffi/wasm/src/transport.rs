@@ -110,10 +110,12 @@ impl WasmTransportStatus {
 #[wasm_bindgen]
 pub fn transport_connect(relay_url: String) -> Promise {
     future_to_promise(async move {
-        // Validate scheme — browser targets must use wss:// for security.
-        if !relay_url.starts_with("wss://") && !relay_url.starts_with("ws://") {
+        // Validate scheme — browser targets MUST use wss:// (TLS-encrypted).
+        // Plain ws:// is not permitted; it allows cleartext interception of
+        // all SCP protocol traffic. See ADR-022 acceptance criterion 1.
+        if !relay_url.starts_with("wss://") {
             return Err(ScpWasmError::Validation(format!(
-                "relay_url must use wss:// or ws:// scheme, got: {relay_url:?}"
+                "relay_url must use wss:// scheme (TLS required), got: {relay_url:?}"
             ))
             .into_js()
             .into());

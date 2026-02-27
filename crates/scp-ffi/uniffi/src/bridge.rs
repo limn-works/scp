@@ -24,12 +24,24 @@
 //!
 //! See ADR-021 in `.docs/adrs/phase-4.md`.
 
+use std::fmt;
 use std::sync::Arc;
 
-use scp_core::identity::{DidDht, DidMethod};
+use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
+use scp_platform::testing::InMemoryKeyCustody;
 use uuid::Uuid;
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
+
+/// Wrapper for [`InMemoryKeyCustody`] that implements [`Debug`] with a
+/// redacted representation, preventing key material from appearing in logs.
+struct OpaqueInMemoryKeyCustody(InMemoryKeyCustody);
+
+impl fmt::Debug for OpaqueInMemoryKeyCustody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InMemoryKeyCustody([redacted])")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ScpError — unified error type (maps to Swift throws / Kotlin exceptions)
@@ -616,8 +628,10 @@ pub struct TrustInput {
 
 /// Opaque handle to an SCP identity.
 ///
-/// Stores the DID string and custody type. Internal key material remains
-/// within the `KeyCustody` boundary and never crosses the FFI surface.
+/// Stores the DID string, custody type, and — for in-memory custody — the
+/// retained [`ScpIdentity`] and [`InMemoryKeyCustody`] so that key material
+/// remains live for the lifetime of the handle. Platform custody paths use
+/// the `KeyCustodyProvider` callback interface instead.
 ///
 /// Generated as `class Identity` in both Swift and Kotlin.
 ///
@@ -628,6 +642,17 @@ pub struct Identity {
     pub(crate) did: String,
     /// The custody method used for this identity.
     pub(crate) custody_type: CustodyMethod,
+    /// Retained `ScpIdentity` for in-memory custody paths.
+    ///
+    /// Holds the `KeyHandle`s into `in_memory_custody`. Must outlive any
+    /// signing or key-rotation operation on this handle.
+    #[allow(dead_code)]
+    pub(crate) scp_identity: Option<ScpIdentity>,
+    /// Retained `InMemoryKeyCustody` for in-memory custody paths.
+    ///
+    /// Key material lives here. Dropping this destroys all private keys.
+    #[allow(dead_code)]
+    pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
 }
 
 #[uniffi::export]
@@ -901,14 +926,22 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                     // Wire to real scp-core using InMemoryKeyCustody.
                     // The `testing` feature is always available in dev/test
                     // builds; production builds use the "platform" custody path.
-                    let key_custody = scp_platform::testing::InMemoryKeyCustody::new();
+                    //
+                    // IMPORTANT: both `scp_identity` and `key_custody` must be
+                    // retained in the handle. `ScpIdentity` holds `KeyHandle`s
+                    // that are indices into `key_custody`'s internal store.
+                    // Dropping `key_custody` destroys all private key material
+                    // and renders those handles dangling.
+                    let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
                     let dht = DidDht::new();
                     let (scp_identity, _document) =
-                        dht.create(&key_custody).await.map_err(ScpError::from)?;
+                        dht.create(&key_custody.0).await.map_err(ScpError::from)?;
 
                     let handle = Arc::new(Identity {
                         did: scp_identity.did.clone(),
                         custody_type: CustodyMethod::InMemory,
+                        scp_identity: Some(scp_identity),
+                        in_memory_custody: Some(key_custody),
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -965,9 +998,13 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                 });
             }
 
+            // identity_load returns a DID-string-only handle. Key operations
+            // require the KeyCustodyProvider callback interface to be wired.
             let handle = Arc::new(Identity {
                 did,
                 custody_type: CustodyMethod::InMemory,
+                scp_identity: None,
+                in_memory_custody: None,
             });
             increment_handle_count();
             Ok(handle)
