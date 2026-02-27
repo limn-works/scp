@@ -11,6 +11,7 @@ members = [
     "crates/scp-ffi",
     "crates/scp-ffi/uniffi",
     "crates/scp-ffi/wasm",
+    "crates/scp-ffi/napi",
 ]
 
 [workspace.package]
