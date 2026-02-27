@@ -389,7 +389,9 @@ pub enum DaysOfflineError {
 ///
 /// The sync provider may be a relay, a peer, or local storage. Implementations
 /// are responsible for transport, authentication, and retry logic. The trait
-/// is object-safe for use with `dyn DeltaSyncEngine`.
+/// Note: uses `async fn in trait` which is NOT object-safe (cannot use
+/// `dyn DeltaSyncEngine`). If dyn-dispatch is needed in the future, convert
+/// to `BoxFuture` return types per the `TransportAdapter` pattern.
 ///
 /// See ADR-029 section 1 (Tier 2 strategy).
 #[allow(async_fn_in_trait)]

@@ -169,7 +169,7 @@ pub struct GovernanceProposalSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// ContextSnapshot
+// ForkSnapshot
 // ---------------------------------------------------------------------------
 
 /// A minimal snapshot of context state at a specific Merkle root.
@@ -177,7 +177,7 @@ pub struct GovernanceProposalSnapshot {
 /// Used as input to `fork_context` when a governance deadlock requires
 /// creating a new context branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextSnapshot {
+pub struct ForkSnapshot {
     /// The context identifier.
     pub context_id: ContextId,
     /// Current members and their roles.
@@ -549,7 +549,7 @@ fn is_mutual_removal(
 /// Returns [`ConflictResolutionError::ForkPointNotFound`] if the provided
 /// Merkle root does not match the snapshot's root (sanity check).
 pub fn fork_context(
-    original: &ContextSnapshot,
+    original: &ForkSnapshot,
     fork_point: &MerkleRoot,
 ) -> Result<ContextFork, ConflictResolutionError> {
     // Sanity check: the fork point must match the snapshot's Merkle root.
@@ -1202,7 +1202,7 @@ mod tests {
     #[test]
     fn fork_context_succeeds_with_matching_root() {
         let root = [42u8; 32];
-        let snapshot = ContextSnapshot {
+        let snapshot = ForkSnapshot {
             context_id: "ctx-original".to_owned(),
             members: vec![
                 (did("did:dht:alice"), "admin".to_owned()),
@@ -1235,7 +1235,7 @@ mod tests {
 
     #[test]
     fn fork_context_fails_with_mismatched_root() {
-        let snapshot = ContextSnapshot {
+        let snapshot = ForkSnapshot {
             context_id: "ctx-original".to_owned(),
             members: vec![],
             governance_config: GovernanceModelConfig::SingleAdmin {
@@ -1256,7 +1256,7 @@ mod tests {
     #[test]
     fn fork_id_is_deterministic() {
         let root = [99u8; 32];
-        let snapshot = ContextSnapshot {
+        let snapshot = ForkSnapshot {
             context_id: "ctx-1".to_owned(),
             members: vec![],
             governance_config: GovernanceModelConfig::SingleAdmin {
