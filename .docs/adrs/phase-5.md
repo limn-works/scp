@@ -375,9 +375,6 @@ This protection class allows Keychain access when the device is locked, as long 
 **Why `NSFileProtectionCompleteUntilFirstUserAuthentication` for the SQLite file:**
 Same rationale as the Keychain protection class: background processing requires file access when the device is locked after first unlock. `NSFileProtectionComplete` (stronger) encrypts the file with the user's passcode key and makes it inaccessible while the device is locked — this breaks background message processing. `NSFileProtectionCompleteUntilFirstUserAuthentication` provides strong encryption while enabling the background operations SCP requires.
 
-**Why reject StrongBox (available on some Apple hardware) for key storage:**
-StrongBox is an Apple Silicon security enclave feature that provides additional isolation but operates dramatically slower than standard Keychain operations for software-backed keys. For SCP, which performs frequent signing operations (inner envelope signatures, UCAN token issuance, pseudonym derivation), StrongBox latency would degrade the user experience. The Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` provides an appropriate security boundary. StrongBox opt-in is left to future consideration if a specific high-security use case justifies the latency.
-
 **Why the adapter is in Swift (not Rust):**
 Apple's Keychain, App Attest, and APNs APIs are Objective-C/Swift frameworks (`Security.framework`, `DeviceCheck.framework`, `UserNotifications.framework`). Calling them from Rust requires either direct FFI or an intermediate Swift layer. UniFFI's callback interface mechanism provides a clean, type-safe boundary: Swift implements the trait, Rust calls it through the generated bridge. This is exactly the pattern ADR-021 established. Implementing the adapter in Swift keeps Apple-specific code in the Swift SDK where it belongs and eliminates a raw Objective-C FFI layer in Rust.
 
@@ -515,11 +512,11 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
    ```swift
    public final class ApplePlatformAdapter {
-       public static func make() -> ApplePlatformAdapter {
+       public static func make() throws -> ApplePlatformAdapter {
            let keyCustody = AppleKeyCustody()
            let attestation = AppleDeviceAttestation()
            let push = ApplePushProvider()
-           let storage = try! AppleStorage.open()
+           let storage = try AppleStorage.open()
            return ApplePlatformAdapter(
                keyCustody: keyCustody,
                attestation: attestation,

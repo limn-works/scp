@@ -659,7 +659,7 @@ Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros
 - **All Phase 1 ADRs (ADR-001 through ADR-007):** The bridge exposes MLS operations, envelope creation, DID identity, transport, sender keys, and platform adapters to Swift and Kotlin.
 - **All Phase 2 ADRs (ADR-008 through ADR-012):** The bridge exposes context lifecycle, role/UCAN enforcement, tool registration/invocation, event log queries, and multi-transport routing to Swift and Kotlin.
 - **ADR-013 (PyO3 Bridge):** Establishes the FFI pattern. The UniFFI bridge mirrors the same logical API surface: same function set, same type categories (opaque vs value), same error hierarchy. ADR-013 is the reference implementation; ADR-021 must expose an equivalent surface.
-- **ADR-006 (Platform Abstraction):** Platform traits (`KeyCustody`, `PushProvider`, `Storage`, `AttestationProvider`) are exposed as callback interfaces. Swift implementations use Secure Enclave/Keychain/APNs; Kotlin implementations use Android Keystore/SharedPreferences/FCM.
+- **ADR-006 (Platform Abstraction):** Platform traits (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) are exposed as callback interfaces. Swift implementations use Keychain/APNs/DCAppAttestService; Kotlin implementations use Android Keystore/SharedPreferences/FCM/Play Integrity.
 
 ### Acceptance Criteria
 
@@ -820,6 +820,14 @@ Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros
         void send_push(string recipient_token, bytes payload);
     };
 
+    callback interface DeviceAttestationProvider {
+        [Throws=ScpError]
+        bytes attest(bytes challenge, bytes device_id);
+
+        [Throws=ScpError]
+        bytes assert(bytes request_hash);
+    };
+
     callback interface MessageListener {
         void on_message(Message message);
         void on_error(ScpError error);
@@ -830,6 +838,7 @@ Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros
     - `KeyCustodyProvider`: Swift implementation wraps Secure Enclave/Keychain; Kotlin implementation wraps Android Keystore.
     - `StorageProvider`: Swift implementation wraps Core Data / UserDefaults / file-based storage; Kotlin implementation wraps Room / SharedPreferences.
     - `PushProvider`: Swift implementation wraps APNs; Kotlin implementation wraps FCM.
+    - `DeviceAttestationProvider`: Swift implementation wraps `DCAppAttestService` (App Attest) on iOS/macOS; Kotlin implementation wraps Play Integrity API on Android. Used by ADR-025 (Apple Platform Adapter) and the Android adapter.
     - `MessageListener`: Callback for incoming message streams. The Swift SDK converts to `AsyncStream<Message>` via `AsyncStream.Continuation`; the Kotlin SDK converts to `Flow<Message>` via `callbackFlow`.
 
 13. **Async bridging:**
@@ -859,9 +868,9 @@ Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros
 | `scp-ffi/uniffi/Cargo.toml` | Crate manifest with `uniffi` dependency and build configuration |
 | `scp-ffi/uniffi/src/lib.rs` | Crate root, `uniffi::setup_scaffolding!()`, tokio runtime init, re-exports of bridge modules |
 | `scp-ffi/uniffi/src/bridge.rs` | All `#[uniffi::export]` function definitions, opaque object `impl` blocks, record/enum derive macros, `ScpError` definition, `From` conversions from scp-core errors |
-| `scp-ffi/uniffi/src/scp.udl` | Supplementary UDL: callback interface definitions (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `MessageListener`), any type mappings that require UDL |
+| `scp-ffi/uniffi/src/scp.udl` | Supplementary UDL: callback interface definitions (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`, `MessageListener`), any type mappings that require UDL |
 
-**Estimated functions:** ~25-30 bridge functions, ~15-20 type definitions (records + enums + objects), ~10-15 conversion helpers, 4 callback interfaces.
+**Estimated functions:** ~25-30 bridge functions, ~15-20 type definitions (records + enums + objects), ~10-15 conversion helpers, 5 callback interfaces.
 
 ---
 
