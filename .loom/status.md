@@ -1,20 +1,21 @@
 # Loom Status
 
-## Iteration: 2026-02-28T01:45Z
+## Iteration: 2026-02-28T03:30Z
 
 ### Failing Tests
-None. All Rust workspace tests pass (2,196 in scp-core, plus integration and doc tests). All 40 TypeScript vitest tests pass. Swift tests cannot run (pre-existing: ScpFFI.xcframework binary target missing — build script now exists via SCP-103 but framework not yet compiled).
+None. All Rust workspace tests pass (2,300 scp-core + 158 scp-transport + 64 scp-mcp + 45 scp-platform + 31 scp-media + others). Swift tests cannot run (pre-existing: ScpFFI.xcframework binary target missing).
 
 ### Uncommitted Changes
 None. Working tree is clean.
 
 ### Fixed This Iteration
-N/A — no pre-existing failures.
+- `scp-testing/test_adapter.rs` — missing `verify_authorization` method on `TestAdapter` (PaymentAdapter trait change from SCP-156 review fix)
 
 ### Tests Added / Updated
-- `crates/scp-core/src/economy/integration.rs` — tests for 9-step action-payment integration (prepare, process, verify, void-on-failure, CostInsufficient, free bypass)
-- `crates/scp-core/src/context/templates.rs` — tests for paid-service and paid-broadcast template creation, validation, serialization
-- `crates/scp-core/src/event_log/pruning.rs` — tests for pruning, proof compaction, configurable retention, storage metrics, behavioral validation post-pruning
+- `crates/scp-core/src/economy/pricing.rs` — 27 tests for pricing formula evaluation (linear, step, cap/floor, EIP-1559 relay pricing, determinism)
+- `crates/scp-core/src/event_log/tiered_storage.rs` — 20 tests for tiered storage (hot/cold migration, proof verification, malicious provider, multi-migration)
+- `crates/scp-core/src/sync/days_offline.rs` — 29 tests for offline state snapshot (snapshot capture, delta compute/apply, MLS rebuild, multi-device, stress tests)
+- `crates/scp-core/src/sync/conflict_resolution.rs` — tests for conflict resolution (metadata LWW, governance Merkle-ordered, deadlock detection, context fork)
 
 ### Tool-Gated Stories
 None. LOOM_CAPABILITIES is unset; no stories were tool-gated.
@@ -22,51 +23,52 @@ None. LOOM_CAPABILITIES is unset; no stories were tool-gated.
 ### Subagent Outcomes
 | Story | Result | Summary |
 |-------|--------|---------|
-| SCP-101 | PASS | 6 Swift wrapper modules (Trust, Tools, EventLog, Transport, Ucan, Mcp). All DTOs nonisolated Sendable structs. Doc comments on all public items. |
-| SCP-103 | PASS | build-xcframework.sh (218 lines). Compiles for 5 Apple targets, lipo fat libs, xcodebuild XCFramework. Package.swift already correct. |
-| SCP-156 | PASS | economy/integration.rs: 9-step action-payment sequence with prepare/process split, adapter.verify, void-on-failure, CostInsufficient. |
-| SCP-161 | PASS | PaidService and PaidBroadcast TemplateId variants. Validation for economic_policy, per_tool_invoke, per_period. Template inheritance. |
-| SCP-126 | PASS | event_log/pruning.rs: PruningConfig, CompactProof, prune_before_checkpoint, verify_compact_proof, storage metrics. |
+| SCP-157 | PASS | economy/pricing.rs: evaluate_formula, ObservableMetrics, EIP-1559 relay pricing, governed formula changes. 27 tests. |
+| SCP-127 | PASS | event_log/tiered_storage.rs: TieredEventLog, ColdTierProvider trait, TierConfig, hot/cold migration, proof verification. 20 tests. |
+| SCP-122 | PASS | sync/days_offline.rs: ContextSnapshot, SnapshotDelta, DeltaSyncEngine trait, MLS rebuild, multi-device divergence detection. 29 tests. |
+| SCP-124 | PASS | sync/conflict_resolution.rs: ConflictType/Resolution enums, Merkle-ordered resolution, deadlock detection, context fork. Tests pass. |
 
 ### Review Outcomes
 | Story | Reviewer | Actions | Learnings |
 |-------|----------|---------|-----------|
-| SCP-156 | security-reviewer | HIGH: Missing adapter.verify() in step 5 — FIXED (restructured API to prepare_paid_action + process_paid_action). MEDIUM: Dummy auth on free paths — FIXED. MEDIUM: IntegrationError type erasure — FIXED. | Stored in vestige: payment verification must happen BEFORE action processing. |
-| SCP-161 | alignment-reviewer | No critical actions. Consistency observations only. | Templates follow spec §19.10 faithfully. Stored in vestige. |
-| SCP-126 | cryptographer | No critical actions. Proof scheme verified sound. | Compact proof reuses existing InclusionProof path verification. Stored in vestige. |
+| SCP-157 | cryptographer | No critical actions. Integer arithmetic verified correct. EIP-1559 stuck price noted (integer truncation when base*max_change < 1000). | Stored: Coefficient::evaluate overflow path, cast_unsigned() Rust 1.87 dependency, step threshold sort independence. |
+| SCP-127 | security-reviewer | HIGH: checkpoint_root invalidated after 2nd migration — FIXED (ghost all_leaf_hashes). HIGH: hot log index reset to 0 — FIXED (global_index_offset). | Stored: multi-migration checkpoint root is a subtle invariant. Lesson doc: `.docs/lessons/tiered-storage-checkpoint-root-invariant.md`. |
+| SCP-122 | architecture-reviewer | No code-level actions (review was architectural). Dual ContextSnapshot naming — FIXED (renamed to ForkSnapshot). DeltaSyncEngine trait not object-safe — FIXED (doc updated). | Stored: GovernanceAction lacks PartialEq, sync module structure, async fn trait object safety. |
+| SCP-124 | architecture-reviewer | Same session as SCP-122. ForkSnapshot rename applied. | See SCP-122 row. |
 
 ### Stories Completed This Iteration
-- SCP-101 (gate-5, P1): Swift Trust/Tools/EventLog/Transport/UCAN/MCP wrappers
-- SCP-103 (gate-5, P1): XCFramework build script and SPM configuration
-- SCP-156 (gate-econ, P1): Action-payment integration sequence (9-step)
-- SCP-161 (gate-econ, P1): Paid-service and paid-broadcast context templates
-- SCP-126 (gate-6, P2): Event log pruning with proof compaction
+- SCP-157 (gate-econ, P1): Dynamic pricing formula evaluation
+- SCP-127 (gate-6, P2): Tiered event log storage with cold proof fetching
+- SCP-122 (gate-6, P2): Days-scale offline state snapshot and delta sync
+- SCP-124 (gate-6, P2): Offline conflict resolution for concurrent governance
 
 ### Commits
-- `5960419` feat(swift): implement Trust/Tools/EventLog/Transport/UCAN/MCP wrappers (SCP-101)
-- `e9cd778` Merge SCP-103 XCFramework build
-- `5977437` Merge SCP-156 payment integration
-- `d6a881a` Merge SCP-161 context templates
-- `129acae` Merge SCP-126 event log pruning
-- `007a3e8` chore(prd): mark SCP-101, SCP-103, SCP-126, SCP-156, SCP-161 as done
-- `7fa70f5` Merge SCP-156 review fix branch
-- `32b060a` fix(economy): address review findings for SCP-156
+- `b48db12` feat(event-log): implement tiered storage with cold proof fetching (SCP-127)
+- `0653697` feat(economy): implement dynamic pricing formula evaluation (SCP-157)
+- `4726e00` feat(sync): implement offline conflict resolution for concurrent governance (SCP-124)
+- `bb529c6` feat(sync): implement days-scale offline state snapshot and delta sync (SCP-122)
+- `06db642` Merge SCP-157 pricing formula
+- `2eb5674` Merge SCP-122 days offline
+- `13492cc` fix(testing): add verify_authorization to TestAdapter
+- `5784a53` chore(prd): mark SCP-122, SCP-124, SCP-127, SCP-157 as done
+- `8a122e9` Merge SCP-127 fix branch
+- `41c5005` fix(event-log): address review findings for SCP-127 — checkpoint root and index offset
+- `b646be2` fix(sync): address review findings for SCP-122/124
+- `e142cc7` chore: commit review learnings from iteration 2
 
 ### Next Iteration Priorities
 Unblocked stories ready for next batch:
-- SCP-102: Swift SDK conformance tests (gate-5, P1 — blocked by SCP-101 now done)
+- SCP-102: Swift SDK conformance tests (gate-5, P1 — requires XCFramework build first)
 - SCP-110: Android Keystore KeyCustody trait (gate-6, P2)
 - SCP-111: Play Integrity DeviceAttestation trait (gate-6, P2)
 - SCP-112: FCM PushProvider trait (gate-6, P2)
-- SCP-122: Days-scale offline state snapshot and delta sync (gate-6, P2)
-- SCP-124: Offline conflict resolution for concurrent governance (gate-6, P2)
 - SCP-139: SDK documentation requirements (gate-6, P2)
-- SCP-157: Dynamic pricing formula evaluation (gate-econ, P1 — blocked by SCP-156 now done)
-- SCP-161 follow-up: verify template inheritance works with SCP-156 integration
+- SCP-158: Spending UCAN minting and validation (gate-econ, P1 — blocked by SCP-157 now done)
+- SCP-159: Anti-spam velocity tracking (gate-econ, P1 — blocked by SCP-157 now done)
 
 ### Notes
-- PRD must be read from worktree path, NOT the external path
-- Swift package cannot compile/test until XCFramework is actually built (SCP-103 created the script, not the artifact)
-- SCP-156 review fix restructured the API: execute_paid_action → prepare_paid_action + process_paid_action. Future code referencing economy integration must use the new API.
-- Worktree review agents may report false file deletions — always verify against merged result on target branch
-- When merging fix branches that change APIs, also checkout caller files from fix branch
+- SCP-127 fix branch had merge conflicts with pruning module declaration — resolved by keeping both modules
+- SCP-122/124 fix subagent couldn't find sync files in its worktree (isolation created from earlier commit) — fixes applied directly
+- TestAdapter needed verify_authorization() added — PaymentAdapter trait gained this method in the SCP-156 review fix last iteration
+- SCP-157 uses cast_unsigned() which requires Rust 1.87+ — verify toolchain compatibility
+- EIP-1559 relay pricing has integer truncation edge case when base_price * max_change_per_mille < 1000
