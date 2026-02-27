@@ -25,6 +25,7 @@ pub mod checkpoint;
 pub mod metrics;
 pub mod proof;
 pub mod pruning;
+pub mod tiered_storage;
 pub mod tree;
 
 use std::collections::BTreeSet;
