@@ -272,4 +272,27 @@ impl EventLog {
     pub const fn sorted_leaves(&self) -> &BTreeSet<([u8; 32], u64)> {
         &self.sorted_leaves
     }
+
+    /// Pushes a pre-computed leaf hash into the log and rebuilds the tree.
+    ///
+    /// This is used by [`checkpoint::TruncatedEventLog`] to reconstruct a
+    /// tail log from existing leaf hashes without re-verifying events.
+    /// It bypasses event verification and signature checking.
+    ///
+    /// **Internal use only.** Not part of the public append API.
+    pub(crate) fn push_leaf_raw(&mut self, leaf_hash: [u8; 32]) {
+        let leaf_index = self.leaves.len() as u64;
+        self.leaves.push(leaf_hash);
+        self.sorted_leaves.insert((leaf_hash, leaf_index));
+        self.rebuild_tree();
+    }
+
+    /// Rebuilds the interior tree from the current leaf layer.
+    ///
+    /// Called after `push_leaf_raw` to maintain tree invariants.
+    /// Delegates to the `tree` module's recompute logic via a full rebuild.
+    fn rebuild_tree(&mut self) {
+        // Use tree::recompute_after_push which handles the full recompute.
+        tree::recompute_raw(self);
+    }
 }
