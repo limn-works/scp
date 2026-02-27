@@ -6900,7 +6900,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/event_log/checkpoint.rs"
       ],
@@ -6949,7 +6949,8 @@
           "§7.3.1 — Verifiable event logs",
           "§17.4 — ProtocolStore event log key convention"
         ]
-      }
+      },
+      "result": "CheckpointManager for periodic checkpoint creation. CheckpointedProof for post-checkpoint verification. TruncatedEventLog for pruned log operations. Cross-checkpoint consistency verification. ~40 tests."
     },
     {
       "id": "SCP-126",
@@ -7225,7 +7226,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/governance/majority.rs"
       ],
@@ -7274,7 +7275,8 @@
           "ADR-008 — Context lifecycle state machine",
           "ADR-016 — UCAN validation"
         ]
-      }
+      },
+      "result": "MajorityVoteEngine implementing GovernanceEngine trait. Configurable quorum, >50% threshold on votes cast, deadline enforcement, vote withdrawal. 34 tests."
     },
     {
       "id": "SCP-132",
@@ -7282,7 +7284,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/governance/unanimity.rs"
       ],
@@ -7334,7 +7336,8 @@
           "ADR-008 — Context lifecycle state machine",
           "ADR-016 — UCAN validation"
         ]
-      }
+      },
+      "result": "UnanimityEngine implementing GovernanceEngine trait. All-must-approve with single-veto, deadline-based deadlock recovery, vote withdrawal. 35 tests."
     },
     {
       "id": "SCP-133",
@@ -7490,7 +7493,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".github/workflows/release.yml",
         ".github/workflows/build-matrix.yml"
@@ -7541,7 +7544,8 @@
         "Distribution channels": "Rust: crates.io. Python: PyPI. TypeScript browser: npm (@scp/sdk). TypeScript Node/Bun: npm (@scp/sdk-node). Swift: SPM. Kotlin: Maven Central. Go: Go modules. C#: NuGet. Java: Maven Central.",
         "Signing requirements": "Rust: crates.io checksums. macOS/iOS: Apple codesigning. Windows: Authenticode. Maven: GPG. PyPI: Trusted Publishers (GitHub Actions OIDC).",
         "Versioning policy": "All SDKs follow SemVer 2.0. Major: breaking API changes. Minor: new features, backwards-compatible. Patch: bug fixes, security patches. All SDK packages share the same major.minor version; patch versions may differ. Rust core version is source of truth. During 0.x, minor bumps may break. API unstable until 1.0."
-      }
+      },
+      "result": "GitHub Actions workflows: build-matrix.yml (cross-platform builds for Linux/macOS/Windows, Python/TypeScript/Swift/Kotlin/Go/C#/Java) and release.yml (7-step release pipeline with conformance gate, signing, and registry publishing)."
     },
     {
       "id": "SCP-137",
@@ -8640,7 +8644,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/economy/receipt.rs",
         "crates/scp-core/src/economy/types.rs",
@@ -8716,7 +8720,8 @@
         "ADR-033 criterion 11": "PaymentReceipt events recorded in context event log with Merkle inclusion proofs.",
         "Adapter-specific proofs": "x402: on-chain tx hash. Lightning: preimage. SPL: tx signature. The adapter_proof field is opaque bytes — each adapter defines its own proof format.",
         "Cost provenance": "When data crosses context boundaries (§7.7), payment receipts are part of the provenance chain. Receiving contexts see what data cost to produce — expensive computations carry economic provenance."
-      }
+      },
+      "result": "PaymentReceipt type, PaidActionType enum, 4 economic event types, DataProvenance payment extension, PaymentVerifier trait, payment_history query. 25 tests."
     },
     {
       "id": "SCP-156",
