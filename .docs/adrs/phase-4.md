@@ -867,46 +867,493 @@ Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros
 
 ## ADR-022: TypeScript SDK (Dual-Target Architecture)
 
-**Status:** Pending
+**Status:** Decided
+
+### Context
+
+The TypeScript SDK is the second most critical language binding for SCP after Python. The web and server-side JavaScript ecosystems are divided across two distinct runtime categories: browsers (Chrome, Firefox, Safari, WebView) and server-side runtimes (Bun, Node.js). These two environments have fundamentally different I/O models, available APIs, and binary addon support. Browsers can execute WebAssembly natively but cannot load native binary addons. Bun and Node.js can load native addons (`.node` files) with near-zero overhead but have no requirement to support WASM-only APIs.
+
+A single TypeScript package (`@scp/sdk`) must serve both environments. Shipping two separate packages would fracture the ecosystem and force application developers to conditionally import different SDKs based on their deployment target — a violation of the builder tenet of simple, clean APIs. The dual-target architecture solves this by maintaining a single public package with unified types and identical method signatures, while dispatching to the correct FFI bridge at runtime.
+
+The ADR-013 PyO3 bridge and ADR-021 UniFFI bridge established the project-wide FFI pattern: flat function surface, opaque types for crypto state, async bridging, unified error hierarchy. The TypeScript SDK follows the same logical pattern adapted for the JavaScript ecosystem (Promises instead of coroutines, `AsyncIterable` instead of generators, `Symbol.asyncDispose` for resource management).
 
 ### What This ADR Will Decide
 
-The TypeScript SDK architecture spanning two runtime targets: browser (WASM via `wasm-bindgen`) and Bun/Node (native addon via `napi-rs`). The ADR covers the internal bridge module that selects the correct backend at runtime, the public API surface, and the build/bundling pipeline.
+- The two FFI bridges (wasm-bindgen for browser, napi-rs for Bun/Node) and their Rust crate structure.
+- Runtime detection logic in `internal/bridge.ts` — how the correct backend is selected at import time without top-level await.
+- The public API surface for the `@scp/sdk` package: `Identity`, `Context`, `Tools`, `EventLog`, `Transport`, `UCAN`, `MCP` modules.
+- Error mapping from Rust `Result<T, E>` to the TypeScript `ScpError` hierarchy.
+- Streaming: `AsyncIterable<Message>` for message receive, `Symbol.asyncDispose` for resource lifecycle.
+- Build pipeline: tsup for ESM/CJS bundles, wasm-pack for browser WASM, napi-rs CLI for native addon.
+- Browser-specific platform adapters: WebCrypto for key operations, wa-sqlite (OPFS) for storage.
+- Package structure and npm publishing: `@scp/sdk` (unified) + `@scp/sdk-napi-{platform}` optional platform dependencies.
 
-### Blockers
+### Decision
 
-- Phase 1-3 Rust crate design must be complete (FFI function signatures derive from public API).
-- ADR-021 (UniFFI) informed by same Rust API — TypeScript follows same types/operations.
-- WASM-specific constraints (no filesystem, no threads in main thread) may require API adjustments.
+Implement the TypeScript SDK as two FFI bridge crates — `scp-ffi/wasm` (wasm-bindgen) and `scp-ffi/napi` (napi-rs) — with a unified TypeScript wrapper package at `bindings/typescript/` published as `@scp/sdk` on npm. The bridge crates are thin translation layers (zero protocol logic); the TypeScript wrapper layer builds the idiomatic API on top. A runtime detection module (`internal/bridge.ts`) selects the correct backend at package import time using synchronous environment checks, with no top-level await, to preserve CJS compatibility.
 
-### Required Inputs When Writing
+Both bridge crates expose the same flat function surface, mirroring the ADR-013 and ADR-021 patterns. All functions that perform I/O are async (Rust `Future` bridged to JS `Promise`). Message streaming uses a callback-to-`AsyncIterable` adapter in the TypeScript wrapper. `Context` and `Identity` implement `AsyncDisposable` via `Symbol.asyncDispose` for automatic resource cleanup.
 
-- Final Rust public API from `scp-core`, `scp-transport`, `scp-platform`.
-- `wasm-bindgen` type limitations (which Rust types can cross WASM boundary).
-- `napi-rs` async bridging patterns (`ThreadsafeFunction`, `AsyncTask`).
-- Browser storage adapter design (wa-sqlite + OPFSCoopSyncVFS from §17.6).
+### Rationale
 
-### References
+- **Two bridges over one:** Browsers cannot load native `.node` addons — only WASM. Bun/Node can load native addons with no WASM overhead. A single WASM-only bridge would impose unnecessary overhead on Bun/Node servers; a native-only bridge would exclude browsers entirely. Two bridges behind a single public API is the only approach that serves both environments without compromise.
+- **wasm-bindgen over Emscripten or manual WASM:** wasm-bindgen generates idiomatic TypeScript/JavaScript bindings with automatic type conversion, Promise integration via `wasm-bindgen-futures`, and zero manual glue code. Emscripten targets C and produces heavier output unsuited to a Rust codebase. Manual WASM bindings require hand-maintaining the entire JS/Rust boundary — maintenance cost grows linearly with the API surface.
+- **napi-rs over node-bindgen or N-API manual bindings:** napi-rs provides macro-driven bindings (`#[napi]`), native async support via `ThreadsafeFunction` and `AsyncTask`, and a build CLI (`napi build`) that handles cross-compilation and binary publishing via optional platform-specific npm packages. node-bindgen is less actively maintained. Manual N-API requires hand-writing C glue. napi-rs is the Rust-Node community standard.
+- **Single `@scp/sdk` package with optional platform dependencies:** Application code imports `@scp/sdk` unconditionally. The package internally detects the runtime environment and loads the appropriate bridge. For Bun/Node, native addon binaries are distributed as `@scp/sdk-napi-{platform}` optional dependencies (following the pattern established by napi-rs community packages like `@napi-rs/canvas`). The WASM bundle is included directly in the main package since it is a pure JS+WASM artifact that works in any bundler.
+- **Flat function surface mirroring ADR-013:** The bridge crates are deliberately flat (no class hierarchies). Each exported function maps to one Rust function. The ergonomic TypeScript API (class methods, `AsyncIterable`, `Symbol.asyncDispose`) is built in the pure TypeScript wrapper layer (`bindings/typescript/src/`), not in the FFI bridge. This keeps the bridges thin and testable, exactly matching the ADR-013 pattern.
+- **Runtime detection without top-level await:** CJS modules cannot use top-level await. Bridge selection must be synchronous at import time. The detection logic uses `typeof window`, `typeof process`, `process.versions.bun`, and `globalThis` checks — all synchronous. The WASM binary is loaded lazily on first use (via `initWasm()` called from the async constructors), so the synchronous import path never blocks.
+- **`Symbol.asyncDispose` for resource management:** TypeScript 5.2+ and Bun natively support ECMAScript Explicit Resource Management. `await using ctx = await Context.create(...)` ensures `ctx.leave()` is called even on exception. This is the idiomatic TypeScript pattern for resources with cleanup obligations, matching the Python SDK's `async with` pattern.
 
-- `scaffold/typescript.md` — dual-target architecture, bridge selection logic, package structure, build configuration.
-- `standards/typescript.md` — strict mode, Biome linter, ECMAScript Resource Management, vitest.
-- `scaffold/shared.md` — cross-language naming, streaming types (`AsyncIterable`), conformance tests.
-- ADR-013/014 — PyO3 bridge pattern (flat functions, opaque types, async bridging).
-- `scaffold/rust.md` — `scp-ffi/wasm/` and `scp-ffi/napi/` crate layouts.
+### Implementation
 
-### Expected Decisions
+**Language:** Rust (wasm-bindgen + napi-rs macros) + TypeScript 5.7+
 
-- Bridge selection logic: how runtime detection works (browser vs Bun vs Node), fallback behavior.
-- Public API surface: Identity, Context, Tools, Trust, EventLog, Transport, UCAN, MCP modules.
-- Error mapping: Rust `Result` -> typed TypeScript exceptions (`ScpError` hierarchy from scaffold).
-- Streaming: `AsyncIterable` for message streams, disposal via `Symbol.asyncDispose`.
-- Build pipeline: tsup config for dual ESM/CJS output, wasm-pack for browser target, napi-rs for Node target.
-- Browser-specific: WebCrypto for key operations, wa-sqlite for storage, IndexedDB fallback.
+**Rust crates:**
 
-### Optimal Approach
+- `crates/scp-ffi/wasm/` — wasm-bindgen bridge, built with `wasm-pack`
+- `crates/scp-ffi/napi/` — napi-rs bridge, built with `napi build`
 
-Write after Phase 3 (Python SDK ships). Python SDK validates the FFI surface; TypeScript mirrors it with browser-specific adaptations. Build the WASM bridge first (narrower API surface due to WASM constraints), then napi bridge (can expose fuller API).
+**TypeScript package:** `bindings/typescript/` published as `@scp/sdk`
+
+**Bridge crate: wasm-bindgen (`crates/scp-ffi/wasm/`)**
+
+```
+crates/scp-ffi/wasm/
+  Cargo.toml          # [lib] crate-type = ["cdylib"], wasm-bindgen + wasm-bindgen-futures deps
+  src/
+    lib.rs            # #[wasm_bindgen] annotated functions, WasmIdentity, WasmContextHandle
+```
+
+- All exported functions use `#[wasm_bindgen]`.
+- Async functions return `js_sys::Promise` via `wasm_bindgen_futures::future_to_promise`.
+- Opaque handles (`WasmIdentity`, `WasmContextHandle`) are annotated `#[wasm_bindgen]` structs holding Rust state behind a `RefCell` or `Arc<Mutex<...>>`.
+- Message streaming uses a JS callback passed into the subscribe function; the TypeScript bridge layer wraps this into an `AsyncIterable<Message>` via an internal queue.
+- Browser key custody uses Web Crypto API (injected as a JS callback into the Rust bridge).
+- Browser storage uses wa-sqlite (OPFS-backed SQLite): the `Storage` platform trait implementation is a JS object passed as a wasm-bindgen closure.
+- `wasm-pack build --target bundler` produces `.wasm` + JS glue consumed by tsup.
+
+**Bridge crate: napi-rs (`crates/scp-ffi/napi/`)**
+
+```
+crates/scp-ffi/napi/
+  Cargo.toml          # [lib] crate-type = ["cdylib"], napi-rs + tokio deps
+  src/
+    lib.rs            # #[napi] annotated functions, NapiIdentity, NapiContextHandle
+```
+
+- All exported functions use `#[napi]` or `#[napi(constructor)]` annotations.
+- Async functions are declared `async fn` and annotated with `#[napi]`. napi-rs generates `ThreadsafeFunction`-backed async bridges automatically, running the Rust future on the tokio runtime and resolving the returned JS `Promise` from any thread.
+- A single tokio `Runtime` is created at module load via `napi::Task` init or a `OnceLock<Runtime>`, shared across all async calls.
+- Opaque handles (`NapiIdentity`, `NapiContextHandle`) are `#[napi]` structs.
+- Message streaming uses a `#[napi(ts_return_type = "AsyncIterable<Message>")]` generator function backed by a `tokio::sync::mpsc` channel converted to an `AsyncIterable` via napi-rs's `Generator` type.
+- Key custody uses the OS keychain (delegated to `scp-platform`'s `KeyCustody` trait implementation).
+- Storage uses `scp-platform`'s `Storage` trait backed by SQLite (bundled-sqlcipher per §17).
+- `napi build --release` produces `scp-sdk.{platform}.node` artifacts distributed as `@scp/sdk-napi-{platform}` optional dependencies.
+
+**TypeScript wrapper layer (`bindings/typescript/src/`)**
+
+```
+src/
+  index.ts              # Re-exports: Identity, Context, ScpError subtypes, types
+  identity.ts           # Identity class — delegates to bridge
+  context.ts            # Context class (AsyncDisposable) — delegates to bridge
+  tools.ts              # ToolDefinition, TestVector interfaces
+  trust.ts              # evaluateTrust(), TrustEvaluation
+  event-log.ts          # EventLog class, Event, Proof, Checkpoint
+  errors.ts             # ScpError hierarchy
+  transport.ts          # TransportConfig, relay connection helpers
+  types.ts              # Message, Provenance, Capability, ContextParams
+  ucan.ts               # validate(), mint(), revoke(), delegate()
+  mcp.ts                # serveMcp(), McpClient
+  internal/
+    native.ts           # napi-rs addon binding (Bun/Node)
+    wasm.ts             # wasm-bindgen binding (browser) + initWasm()
+    bridge.ts           # Runtime detection + unified bridge interface
+```
+
+**Runtime detection (`internal/bridge.ts`)**
+
+Bridge selection is synchronous at import time. The WASM module is initialized lazily on first async call:
+
+```typescript
+// internal/bridge.ts
+
+type Bridge = typeof import("./native.js") | typeof import("./wasm.js");
+
+function detectBridge(): "native" | "wasm" {
+  // Bun exposes process.versions.bun
+  if (typeof process !== "undefined" && process.versions?.bun) return "native";
+  // Node.js exposes process.versions.node but not bun
+  if (typeof process !== "undefined" && process.versions?.node) return "native";
+  // Browser or browser-like environment
+  return "wasm";
+}
+
+export const BRIDGE_TARGET = detectBridge();
+
+// Bridge is loaded lazily — import() at first use
+let _bridge: Bridge | null = null;
+
+export async function getBridge(): Promise<Bridge> {
+  if (_bridge !== null) return _bridge;
+  if (BRIDGE_TARGET === "native") {
+    _bridge = await import("./native.js");
+  } else {
+    const wasm = await import("./wasm.js");
+    await wasm.initWasm(); // one-time WASM initialization
+    _bridge = wasm;
+  }
+  return _bridge;
+}
+```
+
+Application code never imports from `internal/`. The public API classes (`Identity`, `Context`, etc.) call `getBridge()` internally on their async factory methods.
+
+**Public API — `Identity`**
+
+```typescript
+// src/identity.ts
+export class Identity {
+  readonly did: string;
+  readonly custodyType: string;
+
+  private constructor(did: string, custodyType: string, private readonly _handle: unknown) {
+    this.did = did;
+    this.custodyType = custodyType;
+  }
+
+  static async create(options: { custody?: "platform" | "in_memory" } = {}): Promise<Identity> {
+    const bridge = await getBridge();
+    const handle = await bridge.identityCreate(options.custody ?? "platform");
+    return new Identity(handle.did(), handle.custodyType(), handle);
+  }
+
+  static async load(did: string): Promise<Identity> {
+    const bridge = await getBridge();
+    const handle = await bridge.identityLoad(did);
+    return new Identity(handle.did(), handle.custodyType(), handle);
+  }
+
+  static async resolve(did: string): Promise<DIDDocument> {
+    const bridge = await getBridge();
+    return bridge.identityResolve(did);
+  }
+
+  async rotateKey(): Promise<Identity> {
+    const bridge = await getBridge();
+    const handle = await bridge.identityRotateKey(this._handle);
+    return new Identity(handle.did(), handle.custodyType(), handle);
+  }
+}
+```
+
+**Public API — `Context`**
+
+```typescript
+// src/context.ts
+export class Context implements AsyncDisposable {
+  readonly contextId: string;
+
+  private constructor(contextId: string, private readonly _handle: unknown) {
+    this.contextId = contextId;
+  }
+
+  static async create(identity: Identity, params: ContextParams): Promise<Context> {
+    const bridge = await getBridge();
+    const handle = await bridge.contextCreate(identity._handle, params);
+    return new Context(handle.contextId(), handle);
+  }
+
+  static async join(handle: Context, identity: Identity): Promise<void> {
+    const bridge = await getBridge();
+    await bridge.contextJoin(handle._handle, identity._handle);
+  }
+
+  async send(payload: string | Uint8Array): Promise<void> {
+    const bridge = await getBridge();
+    await bridge.contextSend(this._handle, payload);
+  }
+
+  async *receive(): AsyncIterable<Message> {
+    // Internal queue bridging the callback-based bridge to AsyncIterable
+    const queue: Message[] = [];
+    let resolve: (() => void) | null = null;
+    let done = false;
+
+    const bridge = await getBridge();
+    bridge.contextSubscribe(this._handle, {
+      onMessage: (msg: Message) => { queue.push(msg); resolve?.(); resolve = null; },
+      onError: (_err: ScpError) => { done = true; resolve?.(); resolve = null; },
+      onComplete: () => { done = true; resolve?.(); resolve = null; },
+    });
+
+    while (!done || queue.length > 0) {
+      if (queue.length === 0) {
+        await new Promise<void>((r) => { resolve = r; });
+      }
+      const msg = queue.shift();
+      if (msg !== undefined) yield msg;
+    }
+  }
+
+  async leave(): Promise<void> {
+    const bridge = await getBridge();
+    await bridge.contextLeave(this._handle);
+  }
+
+  async close(): Promise<void> {
+    const bridge = await getBridge();
+    await bridge.contextClose(this._handle);
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.leave();
+  }
+}
+```
+
+**Error hierarchy**
+
+```typescript
+// src/errors.ts
+export class ScpError extends Error {
+  constructor(
+    message: string,
+    readonly code: string, // e.g. "SCP-CTX-2001"
+  ) {
+    super(message);
+    this.name = "ScpError";
+  }
+}
+
+export class IdentityError extends ScpError { override name = "IdentityError" as const; }
+export class ContextError extends ScpError { override name = "ContextError" as const; }
+export class PermissionError extends ScpError { override name = "PermissionError" as const; }
+export class CryptoError extends ScpError { override name = "CryptoError" as const; }
+export class TransportError extends ScpError { override name = "TransportError" as const; }
+export class ToolError extends ScpError { override name = "ToolError" as const; }
+export class ValidationError extends ScpError { override name = "ValidationError" as const; }
+```
+
+Rust errors from both bridge crates are mapped to these classes via the bridge layer. Each bridge translates its native error type (wasm-bindgen `JsValue`, napi-rs `napi::Error`) into a structured `{ name, message, code }` object, which `internal/bridge.ts` converts to the appropriate `ScpError` subclass.
+
+**Build pipeline**
+
+1. **WASM bridge:** `wasm-pack build crates/scp-ffi/wasm --target bundler` — produces `pkg/scp_ffi_wasm.js` + `pkg/scp_ffi_wasm_bg.wasm`. The `.wasm` file is inlined or bundled by tsup.
+2. **napi bridge:** `cd crates/scp-ffi/napi && napi build --release --platform` — produces `scp-sdk.{os}-{arch}.node`. Cross-compilation via GitHub Actions matrix produces all platform binaries. Binaries are distributed as `@scp/sdk-napi-linux-x64-gnu`, `@scp/sdk-napi-darwin-arm64`, etc., declared as `optionalDependencies` in `@scp/sdk`'s package.json.
+3. **TypeScript bundle:** `tsup src/index.ts --format esm,cjs --dts` — produces `dist/index.js`, `dist/index.cjs`, `dist/index.d.ts`.
+
+**`package.json` structure**
+
+```json
+{
+  "name": "@scp/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist/", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "lint": "biome check src/ tests/",
+    "format": "biome format --write src/ tests/",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": { "node": ">=22", "bun": ">=1.0" },
+  "optionalDependencies": {
+    "@scp/sdk-napi-linux-x64-gnu": "0.1.0",
+    "@scp/sdk-napi-linux-arm64-gnu": "0.1.0",
+    "@scp/sdk-napi-darwin-x64": "0.1.0",
+    "@scp/sdk-napi-darwin-arm64": "0.1.0",
+    "@scp/sdk-napi-win32-x64-msvc": "0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@biomejs/biome": "latest",
+    "vitest": "latest",
+    "tsup": "latest"
+  }
+}
+```
+
+### Dependencies
+
+- **All Phase 1 ADRs (ADR-001 through ADR-007):** Both FFI bridges expose MLS operations, envelope creation, DID identity, transport, sender keys, and platform adapters to TypeScript.
+- **All Phase 2 ADRs (ADR-008 through ADR-012):** Both bridges expose context lifecycle, role/UCAN enforcement, tool registration/invocation, event log queries, and multi-transport routing to TypeScript.
+- **All Phase 3 ADRs (ADR-013 through ADR-016):** The Python SDK validates the FFI surface and establishes the logical API shape that TypeScript mirrors. ADR-013 (PyO3) is the canonical reference for the flat-function FFI pattern; this ADR follows the same structure.
+- **ADR-021 (UniFFI Bridge):** ADR-021 establishes the same logical API surface for Swift/Kotlin. The TypeScript bridge exposes the same function set, same type categories (opaque handles vs plain data records), and same error hierarchy. ADR-021 is the immediate predecessor ADR; the TypeScript implementation must expose an equivalent surface.
+- **ADR-006 (Platform Abstraction):** Browser-specific platform adapters (WebCrypto for `KeyCustody`, wa-sqlite for `Storage`) are injected into the WASM bridge via wasm-bindgen closures. Node/Bun uses the `scp-platform` in-process implementations via the napi bridge.
+
+### Acceptance Criteria
+
+1. **Runtime detection:**
+   - `BRIDGE_TARGET` is `"native"` in Bun and Node.js 22+ environments.
+   - `BRIDGE_TARGET` is `"wasm"` in browser environments (Chrome, Firefox, Safari).
+   - Bridge detection is synchronous — no top-level await — preserving CJS compatibility.
+   - `getBridge()` returns the same initialized bridge instance on repeated calls (no re-initialization).
+
+2. **Identity API:**
+   ```typescript
+   const identity = await Identity.create({ custody: "in_memory" });
+   expect(identity.did).toMatch(/^did:dht:/);
+   expect(identity.custodyType).toBe("in_memory");
+
+   const loaded = await Identity.load(identity.did);
+   expect(loaded.did).toBe(identity.did);
+
+   const doc = await Identity.resolve(identity.did);
+   expect(doc.did).toBe(identity.did);
+   expect(doc.verificationMethods.length).toBeGreaterThan(0);
+   ```
+   - `Identity.create({ custody: "in_memory" })` returns an `Identity` with a `did:dht:` DID.
+   - `Identity.load(did)` rehydrates an existing identity from storage.
+   - `Identity.resolve(did)` returns a `DIDDocument` with at least one verification method.
+   - `Identity.rotateKey()` returns a new `Identity` with an updated DID document.
+
+3. **Context API:**
+   ```typescript
+   await using ctx = await Context.create(identity, {
+     ceiling: ["messages:read", "messages:write"],
+     memoryScope: "ephemeral",
+   });
+   expect(ctx.contextId).toMatch(/^scp:/);
+   await ctx.send("hello");
+   // Leaving and cleanup happen automatically via Symbol.asyncDispose
+   ```
+   - `Context.create(identity, params)` creates a context and returns a `Context` handle.
+   - `Context.create` with invalid params (e.g., unknown capability in ceiling) throws `ValidationError`.
+   - `ctx.send(payload)` sends a message without throwing.
+   - `ctx.receive()` returns an `AsyncIterable<Message>` that yields incoming messages.
+   - `await using ctx` triggers `ctx.leave()` on scope exit (tests via spy on `leave`).
+   - `ctx.close()` terminates the context; subsequent `ctx.send()` throws `ContextError`.
+
+4. **Tool API:**
+   ```typescript
+   const toolId = await ctx.invokeTool("tool-id", { input: "value" }, identity);
+   ```
+   - `ctx.invokeTool(toolId, input, identity)` invokes a registered tool and returns JSON output.
+   - Invoking a non-existent tool throws `ToolError` with code `SCP-TOOL-6001`.
+   - Tool registration: `await ctx.registerTool(toolDefinition)` returns a tool ID string.
+
+5. **UCAN API:**
+   ```typescript
+   const token = await mintUcan(ctx, memberDid, ["messages:read"]);
+   await validateUcan(ctx, token.encoded, "messages:read"); // does not throw
+   await expect(validateUcan(ctx, token.encoded, "messages:write")).rejects.toThrow(PermissionError);
+   await revokeUcan(ctx, token.id);
+   ```
+   - `mintUcan(ctx, did, capabilities)` returns a `UcanToken` with `.encoded: string` and `.id: string`.
+   - `validateUcan(ctx, token, capability)` resolves on valid token, rejects with `PermissionError` on invalid.
+   - `revokeUcan(ctx, tokenId)` revokes the token; subsequent validation throws `PermissionError`.
+
+6. **EventLog API:**
+   - `eventLog.query(filter)` returns `Event[]` matching the filter.
+   - `eventLog.verify(claim)` returns a `Proof` with `.valid: boolean`.
+   - `eventLog.checkpoint()` returns a `Checkpoint` with `.root: string` (Merkle root hex).
+
+7. **Transport API:**
+   - `transport.connect(relayUrl)` connects to an SCP relay; resolves on success, rejects with `TransportError` on failure.
+   - `transport.status()` returns `{ connected: boolean; relayUrl: string | null }`.
+
+8. **Error mapping:**
+   - Every Rust error category maps to the corresponding TypeScript error subclass.
+   - All thrown errors are instances of `ScpError` (i.e., `err instanceof ScpError` is `true`).
+   - Error `code` follows the `SCP-{CATEGORY}-{NUMBER}` format (sdk-common.md).
+   - Error messages are human-readable and actionable (what failed, why, what to do).
+   - `CryptoError` messages contain no key material or internal crypto state.
+
+9. **Type declarations:**
+   - `dist/index.d.ts` is generated by tsup.
+   - All public APIs have complete TypeScript type signatures.
+   - No `any` types in public API surface (`noExplicitAny` enforced via Biome).
+   - `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess` enabled in tsconfig.
+
+10. **WASM bridge — browser-specific:**
+    - `initWasm()` must be called (internally by `getBridge()`) before any bridge function is invoked.
+    - Key custody in browser uses the Web Crypto API (`SubtleCrypto.generateKey`, `SubtleCrypto.sign`).
+    - Storage in browser uses wa-sqlite backed by the Origin Private File System (OPFS). Falls back to IndexedDB-backed wa-sqlite if OPFS is unavailable (non-secure context or missing browser support).
+    - The WASM binary (`scp_ffi_wasm_bg.wasm`) is fetched relative to the JS module URL; bundlers that inline assets will embed it at build time.
+
+11. **napi bridge — Bun/Node-specific:**
+    - The native addon is loaded via `require('@scp/sdk-napi-{platform}')`, resolved from `optionalDependencies`.
+    - If the platform-specific package is not installed, `getBridge()` throws `TransportError` with code `SCP-TRANS-5001` and an actionable message indicating the missing package.
+    - Async bridge functions run on a multi-threaded tokio runtime. The runtime is created once at addon load time via `OnceLock<Runtime>` and shared across all calls.
+    - The tokio runtime is shut down cleanly when the Node.js process exits (via napi-rs cleanup hook).
+
+12. **Streaming — `AsyncIterable<Message>`:**
+    - `ctx.receive()` is a generator method returning `AsyncIterable<Message>`.
+    - Messages are delivered in sequence order.
+    - Calling `break` on the `for await...of` loop stops message delivery and releases internal queue resources.
+    - Concurrent `for await...of` loops on the same `Context` are each independent iterables (fan-out).
+
+13. **Build and CI:**
+    - `bun run build` produces `dist/index.js`, `dist/index.cjs`, `dist/index.d.ts` without errors.
+    - `wasm-pack build crates/scp-ffi/wasm --target bundler` succeeds without errors.
+    - `napi build --release` in `crates/scp-ffi/napi/` produces a `.node` file for the current platform.
+    - `bunx tsc --noEmit` passes with zero errors.
+    - `bunx biome check src/ tests/` passes with zero errors.
+    - `vitest run` passes: all unit tests and conformance tests green.
+    - CI matrix builds napi artifacts for Linux x64/arm64, macOS arm64/x64, Windows x64.
+
+14. **Conformance:**
+    - `tests/conformance/conformance.test.ts` loads cross-language JSON fixtures from `tests/conformance/` and passes all categories: identity, context, messaging, tools, UCAN, transport, event log, error handling.
+    - Conformance pass rate is 100% in both Bun and Node.js 22 LTS environments.
+
+15. **Publishing:**
+    - `@scp/sdk` is published to npm with ESM + CJS bundles, type declarations, and WASM bundle.
+    - `@scp/sdk-napi-{platform}` packages are published for each supported platform.
+    - `package.json` `engines` field requires `node >= 22` and `bun >= 1.0`.
+    - All packages are version-pinned to `scp-core` version (sdk-common.md §Versioning).
 
 ### Scope
 
-`scp-ffi/wasm/`, `scp-ffi/napi/`, `bindings/typescript/` — ~10 files.
+**Rust crates (~2 files each):**
+
+| File | Purpose |
+|------|---------|
+| `crates/scp-ffi/wasm/Cargo.toml` | Crate manifest: `[lib] crate-type = ["cdylib"]`, wasm-bindgen + wasm-bindgen-futures deps |
+| `crates/scp-ffi/wasm/src/lib.rs` | All `#[wasm_bindgen]` exported functions and structs; `WasmIdentity`, `WasmContextHandle`; message callback types; error mapping from scp-core to `JsValue` |
+| `crates/scp-ffi/napi/Cargo.toml` | Crate manifest: `[lib] crate-type = ["cdylib"]`, napi-rs + tokio deps |
+| `crates/scp-ffi/napi/src/lib.rs` | All `#[napi]` exported functions and structs; `NapiIdentity`, `NapiContextHandle`; `ThreadsafeFunction`/Generator-based streaming; tokio `OnceLock<Runtime>` init; error mapping from scp-core to `napi::Error` |
+
+**TypeScript package (~12 files):**
+
+| File | Purpose |
+|------|---------|
+| `bindings/typescript/package.json` | Package manifest: `@scp/sdk`, exports map, optionalDependencies for napi platform packages |
+| `bindings/typescript/tsconfig.json` | TypeScript config: strict, ESNext target, bundler module resolution, declaration output |
+| `bindings/typescript/biome.json` | Biome linter + formatter config |
+| `bindings/typescript/tsup.config.ts` | tsup bundler config: ESM + CJS output, dts, sourcemap |
+| `bindings/typescript/src/internal/bridge.ts` | Runtime detection (`BRIDGE_TARGET`, `getBridge()`), bridge interface type, error constructor mapping |
+| `bindings/typescript/src/internal/wasm.ts` | wasm-bindgen module import, `initWasm()`, WASM handle wrappers |
+| `bindings/typescript/src/internal/native.ts` | napi-rs addon `require()`, native handle wrappers, platform package resolution |
+| `bindings/typescript/src/identity.ts` | `Identity` class — delegates to bridge; `DIDDocument` type |
+| `bindings/typescript/src/context.ts` | `Context` class (`AsyncDisposable`); `AsyncIterable<Message>` receive generator |
+| `bindings/typescript/src/errors.ts` | `ScpError` hierarchy (7 subclasses) |
+| `bindings/typescript/src/types.ts` | `ContextParams`, `Message`, `Provenance`, `Capability`, `ToolDefinition`, `UcanToken`, shared types |
+| `bindings/typescript/src/index.ts` | Public re-exports |
+
+**Test files (~8 files):**
+
+| File | Purpose |
+|------|---------|
+| `bindings/typescript/tests/identity.test.ts` | Identity create, load, resolve, rotate |
+| `bindings/typescript/tests/context.test.ts` | Context lifecycle, send/receive, disposal |
+| `bindings/typescript/tests/tools.test.ts` | Tool registration and invocation |
+| `bindings/typescript/tests/ucan.test.ts` | UCAN mint, validate, revoke, delegate |
+| `bindings/typescript/tests/transport.test.ts` | Connect, status |
+| `bindings/typescript/tests/event-log.test.ts` | Query, verify, checkpoint |
+| `bindings/typescript/tests/mcp.test.ts` | MCP server and client |
+| `bindings/typescript/tests/conformance/conformance.test.ts` | Cross-language conformance runner |
+
+**Estimated functions:** ~25-30 bridge functions per crate (mirroring ADR-013), ~15 type definitions, ~10 TypeScript wrapper classes/interfaces.
