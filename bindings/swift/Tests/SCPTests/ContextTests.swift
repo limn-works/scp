@@ -3,6 +3,19 @@ import Testing
 
 @testable import SCP
 
+// MARK: - Context Tests
+
+/// Tests for the ``Context`` actor verifying lifecycle state machine, message
+/// streaming, send/receive, leave/close semantics, and bridge delegation.
+///
+/// Uses injected mock bridge functions for testability. The UniFFI bridge
+/// stubs are not exercised here -- Context tests focus on the Swift ergonomics
+/// layer's correct behavior.
+///
+/// See ADR-026 (Swift SDK) and story SCP-102.
+@Suite("Context Tests")
+struct ContextTests {
+
 // MARK: - Mock ContextHandle
 
 /// Mock implementation of ``ContextHandleProtocol`` for testing.
@@ -372,7 +385,7 @@ func closeTransitionsState() async throws {
     #expect(closeCalled.current)
 }
 
-@Test("close is idempotent — calling twice does not throw")
+@Test("close is idempotent -- calling twice does not throw")
 func closeIsIdempotent() async throws {
     let closeCount = Locked<Int>(0)
     let context = makeTestContext(onClose: {
@@ -493,3 +506,5 @@ func contextStateSendable() async {
     let result = await task.value
     #expect(result == .active)
 }
+
+} // end ContextTests
