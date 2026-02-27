@@ -23,3 +23,23 @@ New findings: 13 issues (3 material, 10 minor). Verdict: NEEDS REVISION (3 mater
 - `.docs/specs/` is empty (only .gitkeep) -- no product spec files to cross-reference
 - Trust operations (evaluate, attest) are forward-looking; not in any current ADR but don't contradict
 - Rust streams return OuterEnvelope while other SDKs return Message -- naming table inconsistency
+
+## ADR-022 Review (SCP-060) (2026-02-26)
+ADR-022 (TypeScript SDK Dual-Target Architecture) reviewed and PASSED.
+- All 8 acceptance criteria satisfied.
+- 3 minor issues found: shared.md lists `@scp/sdk-node` but ADR-022 uses per-platform `@scp/sdk-napi-{platform}` (shared.md needs update); trust.ts and mcp.ts listed in wrapper layout but no acceptance criteria; Context.join() is static while other methods are instance (inconsistent surface).
+- 4 non-blocking suggestions: receive() generator needs cleanup on break; asyncDispose should guard on state; CI commands should match standards file exactly; private field access across classes in sketched code.
+
+### ADR review patterns (reusable):
+- Always check the original stub ("What This ADR Will Decide" + "Expected Decisions") against final content
+- Cross-reference scaffold/, standards/, and sdk-common.md for naming/convention consistency
+- Verify package names in shared.md Distribution Channels match actual ADR decisions
+- Check that wrapper file layouts match acceptance criteria coverage (modules listed but not tested = gap)
+- Cross-ADR references can drift: verify callback interfaces, trait names, and type names match between dependent ADRs
+- Force-try/force-unwrap keeps appearing in Swift examples despite builder tenets -- always flag
+
+## ADR-025 Apple Platform Adapter Review (SCP-082) (2026-02-26)
+Verdict: FAIL (2 major, 1 minor).
+- **StrongBox is Android, not Apple** (major): Rationale "Why reject StrongBox" is factually wrong
+- **Force-try contradicts error handling claim** (major): `try!` in make() vs stated PlatformError return
+- **DeviceAttestationProvider missing from ADR-021** (minor): ADR-025 claims 4 callback interfaces but ADR-021 UDL only defines 3

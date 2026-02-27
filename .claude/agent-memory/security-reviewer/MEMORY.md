@@ -64,12 +64,26 @@
 - REMAINING (MEDIUM): Attestation canonical hash uses Debug format for type tag
 - REMAINING (MEDIUM): attestation.claim.to_string() JSON not canonically ordered
 
-### FFI Bridge (`crates/scp-ffi/src/`)
+### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`)
 - OnceLock for tokio runtime singleton -- correct pattern
 - `#![allow(unsafe_code)]` -- correct FFI exception
 - init_runtime NOW uses map_err (no panic across FFI)
 - shutdown_runtime reduced to 100ms (from 5s) but still blocks GIL
 - SHUTDOWN_TIMEOUT const stale (5s) vs actual behavior (100ms)
+
+### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- SCP-077 Review (2026-02-26)
+- CRITICAL: scp-platform testing feature in production deps -- InMemoryKeyCustody ships in cdylib
+- CRITICAL: Bridge functions hardcode InMemoryKeyCustody, bypass KeyCustodyProvider callback interface
+- MAJOR: Predictable context/tool IDs (nanosecond timestamp, not CSPRNG)
+- MAJOR: std::sync::Mutex in async context violates project standards
+- MAJOR: ContextHandle::state() silently defaults to Closed on poisoned mutex
+- MAJOR: eprintln in runtime() violates no-println standard
+- MINOR: rotate_key creates new identity instead of rotating existing one
+- MINOR: Error From impls may leak internal details across FFI
+- GOOD: OnceLock runtime pattern, abort on fatal init, Send+Sync on callbacks
+- GOOD: ScpError enum design with machine-readable codes
+- GOOD: Callback interface definitions (KeyCustodyProvider, StorageProvider, PushProvider)
+- STALE: SHUTDOWN_GRACE const (5s) #[allow(dead_code)] never used
 
 ### TLS (`crates/scp-node/src/tls.rs`)
 - TLS 1.3 enforced via `with_protocol_versions` -- good
