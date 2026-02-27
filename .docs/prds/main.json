@@ -5786,29 +5786,38 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "bindings/swift/build-xcframework.sh",
-        "bindings/swift/Package.swift"
+        "bindings/swift/Package.swift",
+        "crates/scp-ffi/uniffi/Cargo.toml",
+        "crates/scp-ffi/uniffi/src/bin/uniffi-bindgen.rs",
+        "bindings/swift/.gitignore",
+        ".github/workflows/build-matrix.yml"
       ],
-      "description": "Build XCFramework for SPM distribution per `.docs/scaffold/swift.md`. Compile Rust shared library for all Apple targets, create fat libraries, produce XCFramework.\n\nBuild targets:\n- `aarch64-apple-ios` (iOS device)\n- `aarch64-apple-ios-sim` + `x86_64-apple-ios` (iOS simulator fat lib)\n- `aarch64-apple-darwin` + `x86_64-apple-darwin` (macOS fat lib)\n\nXCFramework creation via `xcodebuild -create-xcframework`.\n\nSPM distribution: published as `SCP` Swift Package via GitHub releases with XCFramework binary target and checksum verification.\n\nThis is a stub ADR (ADR-026) — implementation details will be refined when the full ADR is written.",
+      "description": "Build XCFramework and configure SPM distribution per `.docs/scaffold/swift.md`. The first pass created build-xcframework.sh (218 lines) and Package.swift with a binary target, but the pipeline does not work end-to-end.\n\n**What exists:**\n- `bindings/swift/build-xcframework.sh` — 218-line build script (compiles targets, lipo, xcodebuild)\n- `bindings/swift/Package.swift` — SPM manifest with `ScpFFI` binary target\n- `crates/scp-ffi/uniffi/` — FFI crate with proc-macro exports, compiles successfully\n- Host build verified: `cargo build -p scp-ffi-uniffi --release --target aarch64-apple-darwin` produces both `.a` and `.dylib`\n\n**What is missing (pipeline blockers):**\n1. No `uniffi-bindgen` CLI binary — the crate has no `[[bin]]` target and the `uniffi` dependency lacks the `cli` feature\n2. No header generation step in build script — lines 103-134 check for pre-existing headers but never generate them\n3. No `--dev` flag for macOS-only fast local builds\n4. No `.gitignore` in `bindings/swift/` for build artifacts\n5. CI workflow (`.github/workflows/build-matrix.yml` line 315) has incorrect `--` separator for `uniffi-bindgen` invocations\n6. Only `aarch64-apple-darwin` Rust target is installed; 4 others need `rustup target add`\n7. `Sources/SCP/Internal/ScpBindings.swift` contains a placeholder, not real UniFFI-generated bindings",
       "acceptanceCriteria": [
-        "Build script compiles Rust for aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios, aarch64-apple-darwin, x86_64-apple-darwin",
-        "iOS simulator fat library created via lipo (aarch64-apple-ios-sim + x86_64-apple-ios)",
-        "macOS fat library created via lipo (aarch64-apple-darwin + x86_64-apple-darwin)",
-        "XCFramework created via xcodebuild -create-xcframework with all three slices + headers",
-        "Package.swift binary target references ScpFFI.xcframework",
-        "SPM package builds successfully with XCFramework dependency",
-        "Build script is idempotent and handles incremental rebuilds"
+        "`cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- --help` exits 0 (uniffi-bindgen binary exists and runs)",
+        "`build-xcframework.sh` is self-contained: generates headers + bindings without manual prereqs",
+        "`build-xcframework.sh --dev` builds macOS-only XCFramework for fast local testing (skips iOS targets and lipo)",
+        "`ScpFFI.xcframework/` is created with correct slices after running the build script",
+        "`Headers/ScpFFI.h` contains UniFFI-generated C header (not empty or placeholder)",
+        "`Sources/SCP/Internal/ScpBindings.swift` contains real UniFFI-generated bindings (not placeholder)",
+        "`swift build` in `bindings/swift/` resolves the SPM package successfully",
+        "`bindings/swift/.gitignore` excludes `ScpFFI.xcframework/`, `Headers/`, `.build-xcframework/`",
+        "CI workflow has correct `--` separator for `uniffi-bindgen` invocations"
       ],
       "actionItems": [
-        "Create build-xcframework.sh script per scaffold/swift.md XCFramework Build section",
-        "Add cargo build commands for all 5 Apple targets",
-        "Add lipo commands for iOS simulator and macOS fat libraries",
-        "Add xcodebuild -create-xcframework command with headers",
-        "Ensure Package.swift binary target path matches build output",
-        "Test full build pipeline on macOS",
-        "Add checksum generation for release distribution"
+        "Add `[[bin]]` section to `crates/scp-ffi/uniffi/Cargo.toml` — name = \"uniffi-bindgen\", path = \"src/bin/uniffi-bindgen.rs\"",
+        "Add `\"cli\"` to the `uniffi` dependency features in `[dependencies]` (not `[build-dependencies]`)",
+        "Create `crates/scp-ffi/uniffi/src/bin/uniffi-bindgen.rs` with `fn main() { uniffi::uniffi_bindgen_main() }`",
+        "Update `build-xcframework.sh`: replace header prerequisite check (lines 103-134) with generation step — build host dylib, run `cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib --language swift --out-dir <tmpdir>`, copy outputs to correct locations (rename to match project conventions: ScpFFI.h, ScpBindings.swift)",
+        "Add `--dev` flag to `build-xcframework.sh` — when set, skip iOS targets and lipo, create single-slice XCFramework with just `aarch64-apple-darwin`",
+        "Create `bindings/swift/.gitignore` excluding `ScpFFI.xcframework/`, `Headers/`, `.build-xcframework/`",
+        "Fix `--` separator in `.github/workflows/build-matrix.yml` line 315 for `uniffi-bindgen` invocations",
+        "Install missing Rust targets: `rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios x86_64-apple-darwin`",
+        "Run `./build-xcframework.sh --dev` and verify XCFramework creation exits 0",
+        "Run `swift build` in `bindings/swift/` and verify SPM resolution"
       ],
       "blockedBy": [
         "SCP-098",
@@ -5843,9 +5852,24 @@
         ],
         "expectedDecisions": {
           "spmConfig": "Binary framework target with checksum verification"
-        }
+        },
+        "uniffiBindgen": {
+          "version": "0.29",
+          "entrypoint": "uniffi::uniffi_bindgen_main()",
+          "requiredFeature": "cli (must be in [dependencies], not [build-dependencies])",
+          "generateCommand": "cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate --library <dylib> --language swift --out-dir <dir>",
+          "generatedOutputs": [
+            "*.swift (bindings)",
+            "*FFI.h (C header)",
+            "*.modulemap"
+          ],
+          "namingConvention": "With namespace scp {} and crate scp_ffi_uniffi, outputs are named scp_ffi_uniffi.swift, scp_ffi_uniffiFFI.h, etc. Build script must rename to match project conventions (ScpBindings.swift, ScpFFI.h)"
+        },
+        "hostDylib": "target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib",
+        "devFlag": "Skip iOS targets and lipo, create single-slice XCFramework with just aarch64-apple-darwin",
+        "scpBindingsTracked": "ScpBindings.swift stays tracked in git (not gitignored) for SPM consumers without Rust toolchain"
       },
-      "result": "build-xcframework.sh created (218 lines). Compiles for 5 Apple targets, creates fat libs via lipo, produces XCFramework via xcodebuild. Package.swift already had correct binary target. Idempotent with set -euo pipefail."
+      "result": "First pass created build-xcframework.sh (218 lines) and verified Package.swift binary target. However, the pipeline is not functional: uniffi-bindgen binary was never added, headers were never generated, and the XCFramework was never actually built. Reopened for complete implementation."
     },
     {
       "id": "SCP-104",
