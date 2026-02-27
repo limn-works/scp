@@ -1,5 +1,11 @@
 //! Pull-based sender key distribution protocol and block notifications.
 //!
+//! This module is **transport-agnostic** — the same types and protocol apply to
+//! both Encrypted contexts (where epoch advances travel as MLS application
+//! messages) and Broadcast contexts (where they travel as relay messages).
+//! The context/transport layer above determines delivery; this layer handles
+//! key generation, rotation, request/response, and blocking.
+//!
 //! When a sender generates or rotates a key, they publish a lightweight
 //! [`SenderKeyEpochAdvance`] notification. Members request the actual key
 //! material on demand via HPKE-encrypted [`SenderKeyRequest`] /
@@ -9,7 +15,8 @@
 //! when Alice blocks Dave, a signed notification triggers Dave's client to
 //! rotate his sender key excluding Alice.
 //!
-//! See ADR-007 in `.docs/adrs/phase-1.md` for the full protocol design.
+//! See ADR-007 in `.docs/adrs/phase-1.md` for the full protocol design
+//! and §5.14.8 for broadcast-mode blocking specifics.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;

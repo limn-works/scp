@@ -954,6 +954,8 @@ This test proves: pip install works without Rust, the 20-line agent works, async
 
 ## ADR-033: Economic Governance
 
+> **Note:** ADR-033 is numbered non-sequentially because it was added as a cross-cutting concern after the original phase numbering. It lives in the Phase 3 document because its scope (payment adapters, spending UCANs, economic policy) extends the UCAN and context systems specified in ADR-009/ADR-016. See also ADR-032 in phase-2.md.
+
 **Status:** Decided
 
 ### Context

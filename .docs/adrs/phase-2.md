@@ -433,11 +433,7 @@ pub struct RoleDefinition {
    }
    ```
 
-   **Nonce format:** `{unix_millis_timestamp}-{16_random_bytes_hex}`. Example: `1708646400000-a3f2b1c9d4e5f6071829`. The timestamp prefix enables efficient pruning; the random suffix ensures uniqueness. Implementations MUST validate the nonce format on receipt — malformed nonces are rejected.
-
-   **Nonce freshness check:** The timestamp prefix in the nonce MUST be within `now - 5 minutes` to `now + 5 minutes` (matching the clock skew tolerance from spec §9.14). A nonce with a timestamp outside this window is rejected as `UcanError::NonceTooOld` or `UcanError::NonceFuture`.
-
-   **Replay window:** A nonce is retained in the tracker until `max(token_expiry + 5 minutes, first_seen + 24 hours)`. The 5-minute buffer after token expiry accounts for clock skew. The 24-hour floor provides a safety net for tokens with very short expiry.
+   **Nonce format, freshness, and replay:** ADR-016 (Phase 3) is the normative specification for nonce validation. Format: `{unix_millis_timestamp}-{16_random_bytes_hex}`. Freshness: ±5 minutes (§9.14 clock skew tolerance). Replay window: `max(token_expiry + 5 min, first_seen + 24 hours)`. Phase 2 implements the full nonce pipeline from ADR-016 — the validation is built once and is not phased. See ADR-016 criterion 6 for complete specification.
 
    **Pruning:** `prune()` removes entries where `now > max(token_expiry + 300, first_seen + 86400)`. Pruning runs every 1000 `check_and_record` calls or every 10 minutes, whichever comes first.
 
@@ -1009,6 +1005,8 @@ This test proves: context lifecycle works, roles enforce, tools invoke, event lo
 ---
 
 ## ADR-032: Addressability and Deployment
+
+> **Note:** ADR-032 is numbered non-sequentially because it was added as a cross-cutting concern after the original phase numbering was established. It lives in the Phase 2 document because its scope (relay discovery, `.well-known/scp`, URI format) is transport-adjacent and depends on Phase 1–2 ADRs. See also ADR-033 in phase-3.md.
 
 **Status:** Decided
 

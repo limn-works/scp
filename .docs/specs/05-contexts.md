@@ -884,6 +884,10 @@ Blocking is per-author. Author A blocking a subscriber does not affect the subsc
 
 No new capability variants. `messagesWrite` and `messagesRead` apply to both Encrypted and Broadcast modes — the abstract capability to write/read in a context. `ContextMode` determines the processing pipeline.
 
+### 5.14.9.1 Economic Policy in Broadcast Contexts
+
+`EconomicPolicy` (§19.3) applies to broadcast contexts identically to encrypted contexts — it is a property of `ContextParams`, not of `ContextMode`. Authors pay per-message costs; subscribers pay access costs if the context uses a gated template. `SenderVelocity` (§19.7) anti-spam metrics apply per-author in broadcast mode (each author is an independent sender). The `paid-broadcast` template (§19.8) is the canonical example of economic policy applied to broadcast contexts.
+
 ### 5.14.10 Event Log
 
 Reuses existing event types wherever possible. Only one genuinely new type:
