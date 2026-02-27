@@ -6752,7 +6752,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/sync/days_offline.rs"
       ],
@@ -6795,7 +6795,8 @@
           "§10.2 — Device as node design",
           "§9.8.3 — Timestamp model"
         ]
-      }
+      },
+      "result": "days_offline.rs: ContextSnapshot, SnapshotDelta, DeltaSyncEngine trait, MLS rebuild, multi-device divergence detection. 29 tests."
     },
     {
       "id": "SCP-123",
@@ -6854,7 +6855,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/sync/conflict_resolution.rs"
       ],
@@ -6898,7 +6899,8 @@
           "§9.8.3 — Timestamp model (no synchronized clocks)",
           "§9.8.5 — Message gap handling"
         ]
-      }
+      },
+      "result": "conflict_resolution.rs: ConflictType/Resolution enums, Merkle-ordered resolution, deadlock detection, context fork. Tests pass."
     },
     {
       "id": "SCP-125",
@@ -7014,7 +7016,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/event_log/tiered_storage.rs"
       ],
@@ -7054,7 +7056,8 @@
           "ADR-011 — Event log design",
           "§17.4 — ProtocolStore event log key convention"
         ]
-      }
+      },
+      "result": "tiered_storage.rs: TieredEventLog, ColdTierProvider trait, TierConfig, hot/cold migration, proof verification. Tests pass."
     },
     {
       "id": "SCP-128",
@@ -8813,7 +8816,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/economy/pricing.rs",
         "crates/scp-core/src/economy/mod.rs"
@@ -8877,7 +8880,8 @@
         "ADR-033 criterion 8": "PricingFormula evaluation uses Amount(u64) and Coefficient(i64) exclusively — no f64 in any economic calculation path.",
         "Coefficient evaluation": "Value = raw / 1_000_000. Example: 1_500_000 = 1.5, 100 = 0.0001. Evaluation: (coefficient.0 * metric_value) / 1_000_000. Both sides compute the same result.",
         "EIP-1559 analogy": "For relay pricing specifically, a utilization-targeting formula makes sense: Target 50% relay capacity. Below target: price decreases (capped at floor). Above target: price increases (capped at cap). Max change per evaluation period: configurable (e.g., 12.5% like EIP-1559)."
-      }
+      },
+      "result": "pricing.rs: evaluate_formula, ObservableMetrics, EIP-1559 relay pricing, governed formula changes. 27 tests."
     },
     {
       "id": "SCP-158",
