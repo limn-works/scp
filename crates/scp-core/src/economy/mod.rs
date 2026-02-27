@@ -22,6 +22,7 @@
 pub mod adapter;
 pub mod antispam;
 pub mod estimate;
+pub mod integration;
 pub mod policy;
 pub mod receipt;
 pub mod types;
@@ -32,6 +33,10 @@ pub use adapter::{
 };
 pub use antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
 pub use estimate::estimate_cost;
+pub use integration::{
+    ActionOutcome, IntegrationError, PaymentEventData, SpendingAuth, execute_free_action,
+    execute_paid_action, is_free_action, verify_incoming_authorization,
+};
 pub use policy::{
     CostInsufficient, ObservableMetrics, PolicyLockError, auto_accept_blocked_by_economics,
     check_policy_lock, evaluate_cost, evaluate_formula, lookup_cost, policy_requires_payment,
