@@ -4487,7 +4487,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-ffi-napi/src/lib.rs",
         "crates/scp-ffi-napi/Cargo.toml"
@@ -4541,8 +4541,7 @@
           "ThreadsafeFunction",
           "AsyncTask"
         ]
-      },
-      "result": "Clippy/formatting compliance fixes applied to existing napi-rs bridge. All 8 source files updated."
+      }
     },
     {
       "id": "SCP-081",
@@ -5468,7 +5467,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "bindings/swift/Package.swift",
         "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
@@ -5524,8 +5523,7 @@
           "actorIsolation": "@MainActor default, nonisolated DTOs per Swift 6.2",
           "spmConfig": "Binary framework target with checksum verification"
         }
-      },
-      "result": "Already implemented in prior iteration (commit 0d551ed). All 10 acceptance criteria verified."
+      }
     },
     {
       "id": "SCP-099",
@@ -5969,7 +5967,7 @@
       "gate": "gate-5a",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         ".docs/adrs/phase-6.md"
       ],
@@ -6005,8 +6003,7 @@
       "details": {
         "adrCompletionStory": true,
         "note": "This story writes the ADR itself. Implementation stories for Kotlin SDK are blocked by this."
-      },
-      "result": "Already completed in prior iteration (commit 1f5e189). ADR-028 fully specified."
+      }
     },
     {
       "id": "SCP-107",
@@ -7165,7 +7162,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/context/governance/multisig.rs"
       ],
@@ -7216,8 +7213,7 @@
           "ADR-008 — Context lifecycle state machine",
           "ADR-016 — UCAN validation"
         ]
-      },
-      "result": "MultiSigEngine implementing GovernanceEngine trait. M-of-N threshold, configurable voting window, order-independent approvals, withdrawal support, timeout handling. 50 new tests."
+      }
     },
     {
       "id": "SCP-131",
@@ -8557,7 +8553,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/src/economy/policy.rs",
         "crates/scp-core/src/economy/estimate.rs",
@@ -8631,8 +8627,7 @@
         "ADR-033 criterion 9": "CostInsufficient error includes receiver's metric_snapshot so payer can see why costs diverged.",
         "ADR-033 criterion 10": "Auto-accept guard: ContextInvitation with EconomicPolicy requiring payment is never auto-accepted regardless of auto-accept policy configuration.",
         "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with toolInvocation in its ceiling and per_tool_invoke: $0.01 in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
-      },
-      "result": "EconomicPolicy evaluation, CostSchedule lookup, ObservableMetrics, CostInsufficient error, estimate_cost SDK function, policy lock, auto-accept guard all implemented with comprehensive tests."
+      }
     },
     {
       "id": "SCP-155",
