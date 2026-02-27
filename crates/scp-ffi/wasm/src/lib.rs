@@ -1,0 +1,122 @@
+//! `wasm-bindgen` FFI bridge for SCP — the browser-target Rust half of the
+//! TypeScript SDK.
+//!
+//! This crate is compiled to WebAssembly via `wasm-pack` and consumed by the
+//! `@scp/sdk` npm package. It exposes a flat set of `#[wasm_bindgen]` types
+//! and functions that map directly to `scp-core`'s public API surface.
+//!
+//! # Architecture
+//!
+//! The bridge is organized into domain modules that mirror the PyO3 bridge
+//! (`crates/scp-ffi/src/`) at the same logical API surface:
+//!
+//! - [`error`] — Rust `Result` → JS typed exception mapping.
+//! - [`identity`] — Identity lifecycle (`identity_create`, `identity_load`,
+//!   `identity_resolve`).
+//! - [`context`] — Context lifecycle (create, join, leave, close, send,
+//!   subscribe).
+//! - [`tools`] — Tool registration, invocation, and verification.
+//! - [`transport`] — Transport connection and status.
+//! - [`ucan`] — UCAN token management (validate, mint, revoke).
+//! - [`event_log`] — Event log queries and Merkle proofs.
+//! - [`custody`] — JS-injected key custody callback types (WebCrypto).
+//! - [`storage`] — JS-injected storage callback types (OPFS/IndexedDB).
+//!
+//! # Async model
+//!
+//! WASM in browsers runs on a single thread without Tokio. All async bridge
+//! functions use [`wasm_bindgen_futures::future_to_promise`] to return
+//! `Promise<T>` to JavaScript. Futures must be non-blocking (no blocking
+//! I/O inside futures).
+//!
+//! # WASM constraints and scp-core
+//!
+//! `scp-core` depends on `tokio = { features = ["full"] }` which includes the
+//! multi-thread runtime. The `wasm32-unknown-unknown` target cannot compile
+//! tokio's multi-thread runtime. Therefore, this bridge does NOT directly
+//! depend on `scp-core`. Instead:
+//!
+//! 1. Opaque JS handle types ([`WasmIdentity`], [`WasmContextHandle`], etc.)
+//!    establish the stable ABI boundary.
+//! 2. Bridge stub functions return typed errors documenting the JS-side
+//!    implementation pattern (WebCrypto, Fetch API, WebSocket).
+//! 3. JS callback injection types ([`JsKeyCustody`], [`JsStorage`],
+//!    [`JsMessageCallback`]) define the TypeScript wrapper's responsibility.
+//!
+//! When a future story adds WASM-compatible scp-core feature flags (e.g.,
+//! `tokio/current-thread` via `tokio_wasm`), the stubs will be replaced with
+//! direct scp-core calls.
+//!
+//! # JS callback injection
+//!
+//! Browser-native APIs (WebCrypto, wa-sqlite / OPFS, IndexedDB) are not
+//! available as Rust crates — they are JavaScript APIs. The bridge exposes
+//! extern `JsKeyCustody` and `JsStorage` types so the TypeScript wrapper can
+//! inject implementations.
+//!
+//! # Error mapping
+//!
+//! Rust `Result<T, ScpWasmError>` maps to JS `Promise` rejection via
+//! [`wasm_bindgen::JsError`]. Each error variant carries a stable error code
+//! string (`[SCP-IDENT-1000]` through `[SCP-VALID-7000]`) for programmatic
+//! handling in TypeScript.
+//!
+//! See ADR-022 in `.docs/adrs/phase-4.md` for the full specification.
+
+pub mod context;
+pub mod custody;
+pub mod error;
+pub mod event_log;
+pub mod identity;
+pub mod storage;
+pub mod tools;
+pub mod transport;
+pub mod ucan;
+
+use wasm_bindgen::prelude::*;
+
+// ---------------------------------------------------------------------------
+// Module entry point
+// ---------------------------------------------------------------------------
+
+/// Initializes the WASM bridge.
+///
+/// Must be called once after the WASM module is loaded. Sets up the panic
+/// hook so that Rust panics surface as readable browser console errors rather
+/// than opaque WebAssembly traps.
+///
+/// This function is idempotent — calling it more than once is safe (the panic
+/// hook is replaced with the same implementation).
+///
+/// # JS usage
+///
+/// ```js
+/// import init, { scp_init } from '@scp/sdk-wasm';
+/// await init();
+/// scp_init();
+/// ```
+#[wasm_bindgen]
+pub fn scp_init() {
+    // Route Rust panics to the browser console as readable error messages.
+    // std::panic::set_hook replaces any previously installed hook, so this
+    // is idempotent in the sense that calling it again simply replaces the
+    // hook with an identical implementation.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        web_sys::console::error_1(&JsValue::from_str(&msg));
+    }));
+}
+
+/// Returns the version string for the `scp-ffi-wasm` crate.
+///
+/// # JS usage
+///
+/// ```js
+/// import { scp_version } from '@scp/sdk-wasm';
+/// console.log(scp_version()); // "0.1.0"
+/// ```
+#[must_use]
+#[wasm_bindgen]
+pub fn scp_version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
+}
