@@ -67,9 +67,19 @@ Notes:
 - **Missing field separators in canonical hash:** compute_claim_canonical_hash and compute_attestation_canonical_hash concatenate fields without length prefixes or delimiters. Pattern: field boundary ambiguity in hash preimages.
 - **serve() double-bind (pre-existing):** ApplicationNode::serve() binds to relay.bound_addr which is already occupied by the relay server. Pattern: single address field used for two listeners.
 
+### Known Bug Patterns (Feb 2026 — SCP-154 economy/policy.rs review)
+- **Auto-accept bypass via formula-only pricing:** policy_requires_payment only checks CostSchedule fields, ignoring PricingFormula. A policy with empty schedule but base_cost > 0 in PricingFormula evades auto-accept guard. Pattern: partial check of a composite cost model.
+- **Overflow silently zeroes cost in verify_cost_sufficiency:** evaluate_cost returns None on arithmetic overflow, unwrap_or(Amount(0)) makes the action free. Pattern: using unwrap_or(zero) for an error condition where zero is the worst-case value.
+
 ### Known Bug Patterns (Feb 2026 — Swift bindings PR #86 review)
 - **Sync/async mismatch with UniFFI callback interfaces:** Rust `KeyCustodyProvider`, `StorageProvider`, `PushProvider` traits are all synchronous (`fn`). Swift implementations are `async` or actor-isolated. UniFFI-generated protocol will be sync; Swift types cannot conform. Pattern: implementing async methods that need to conform to sync callback interfaces.
 - **@unchecked Sendable standards violation:** `AppleDeviceAttestation` uses `@unchecked Sendable` which is explicitly banned in `.docs/standards/swift.md`. Class has no mutable instance state (storedKeyId comment is stale), so `@unchecked` is unnecessary. Pattern: stale justification comments describing removed state.
 - **TOCTOU in resolveKeyId:** `loadKeyId()` check then `generateAndStoreKey()` with async gap. Two concurrent `attest()` calls can both see nil and generate two different keys. Pattern: check-then-act across async suspension points.
 - **derivePseudonym leaks Keychain items:** Each call creates a new UUID handle and Keychain item, even for identical (keyHandle, contextId) inputs. Documented as "deterministic" but creates orphaned keys. Pattern: deterministic derivation stored under non-deterministic handles.
 - **content-available validation accepts JSON true as 1:** NSNumber bridge conflates boolean true with integer 1. Pattern: NSNumber type erasure in JSONSerialization.
+
+### Known Bug Patterns (Feb 2026 — SCP-130 multisig governance review)
+- **Late votes accepted after deadline:** approve()/reject() don't check voting_deadline before accepting votes. try_resolve_after_vote checks threshold before expiry, so a post-deadline vote that completes threshold wins. Pattern: enforcement of time boundaries only in the resolution check, not at the entry point.
+- **resolve() returns no events:** resolve() transitions proposals to Expired/Rejected but returns only ProposalStatus, not Vec<GovernanceEvent>. Timeout-triggered expiry cannot be recorded in Merkle log. Pattern: method signature designed for status inquiry repurposed for state transition without matching the event contract.
+- **Trait missing spec methods:** GovernanceEngine trait omits withdraw_vote() and resolve() that ADR-031 specifies. These are inherent methods on ThresholdEngine only, making them inaccessible via Box<dyn GovernanceEngine>. Pattern: trait surface reduced from spec during implementation, breaking pluggable dispatch.
+- **compute_proposal_id field separator gap (pre-existing):** Same concatenation-without-length-prefix pattern found in claiming.rs and attestation.rs. Now also in governance proposal IDs.
