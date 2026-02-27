@@ -34,8 +34,8 @@ pub use adapter::{
 pub use antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
 pub use estimate::estimate_cost;
 pub use integration::{
-    ActionOutcome, IntegrationError, PaymentEventData, SpendingAuth, execute_free_action,
-    execute_paid_action, is_free_action, verify_incoming_authorization,
+    ActionEnvelope, IntegrationError, PreparedAction, ProcessedAction, prepare_paid_action,
+    process_paid_action,
 };
 pub use policy::{
     CostInsufficient, ObservableMetrics, PolicyLockError, auto_accept_blocked_by_economics,

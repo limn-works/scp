@@ -78,6 +78,19 @@ pub trait PaymentAdapter: Send + Sync {
         auth: &PaymentAuthorization,
     ) -> impl std::future::Future<Output = Result<(), PaymentError>> + Send;
 
+    /// Verifies a [`PaymentAuthorization`] is authentic and still valid.
+    ///
+    /// The receiving side calls this to confirm the authorization was actually
+    /// issued by the claimed adapter, has not expired, and has not been
+    /// tampered with. This prevents a malicious sender from forging a
+    /// `PaymentAuthorization` struct.
+    ///
+    /// See spec section 19.2.2, step 5.
+    fn verify_authorization(
+        &self,
+        auth: &PaymentAuthorization,
+    ) -> impl std::future::Future<Output = Result<(), PaymentError>> + Send;
+
     /// Verifies a payment receipt against the payment rail.
     ///
     /// Checks the adapter-specific proof (on-chain state, preimage hash,

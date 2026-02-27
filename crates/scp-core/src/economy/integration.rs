@@ -1,30 +1,26 @@
 //! Action-payment integration sequence for SCP economic governance.
 //!
-//! Implements the 9-step action-payment integration sequence described in spec
-//! section 19.2.2 and referenced by ADR-033. The main entry point is
-//! [`execute_paid_action`], which orchestrates cost evaluation, UCAN
-//! verification, authorization, action processing, capture, and event logging.
+//! Implements the 9-step action-payment integration defined in spec section
+//! 19.2.2. The sequence orchestrates cost evaluation, spending UCAN
+//! verification, payment authorization, receiving-side verification, action
+//! processing, capture, receipt recording, and void-on-failure.
 //!
-//! Two primary flow patterns are supported:
+//! Key design decisions:
+//! - Free actions return `None` for the authorization -- no dummy
+//!   `PaymentAuthorization` structs are created.
+//! - The receiving side verifies the authorization via
+//!   `adapter.verify_authorization()` (step 5) BEFORE processing the action,
+//!   preventing forged authorization structs.
+//! - Errors are typed via [`IntegrationError`], not type-erased to strings.
 //!
-//! - **Authorize-then-capture** (x402, Stripe): Funds reserved on authorize,
-//!   moved on capture. Supports void.
-//! - **Invoice-then-preimage** (Lightning): Preimage revelation IS capture.
-//!   `capture()` is a no-op that returns the receipt derived from the preimage.
-//!
-//! Both patterns satisfy the [`PaymentAdapter`] trait and are handled uniformly
-//! by this module.
-//!
-//! # Error handling
-//!
-//! On failure at steps 5-7 (verification, processing, capture), the module
-//! calls `adapter.void(auth)` to release reserved funds before returning the
-//! error. This ensures no funds are held after a failed action.
-//!
-//! See spec section 19.2.2, 19.4, 19.5, and ADR-033.
+//! See spec section 19.2.2 and ADR-033 in `.docs/adrs/phase-3.md`.
 
-use super::adapter::{ContextId, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata, PaymentReceipt};
-use super::policy::{CostInsufficient, ObservableMetrics, evaluate_cost, verify_cost_sufficiency};
+use serde::{Deserialize, Serialize};
+
+use super::adapter::{
+    ContextId, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata, PaymentReceipt,
+};
+use super::policy::{ObservableMetrics, evaluate_cost, verify_cost_sufficiency};
 use super::types::{Amount, EconomicPolicy, PaidActionType};
 use crate::identity::DID;
 
@@ -32,52 +28,75 @@ use crate::identity::DID;
 // IntegrationError
 // ---------------------------------------------------------------------------
 
-/// Errors that can occur during the action-payment integration sequence.
+/// Errors produced by the action-payment integration sequence.
+///
+/// Each variant maps to a specific failure mode in the 9-step sequence.
+/// Preserves typed error information rather than erasing to strings.
 ///
 /// See spec section 19.2.2.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntegrationError {
     /// Step 1: Cost evaluation failed (arithmetic overflow in formula).
-    CostEvaluationFailed,
-    /// Step 2: Spending UCAN does not cover the computed cost.
-    SpendingCapabilityInsufficient {
-        /// The computed cost.
-        required: Amount,
-        /// The spending UCAN's `max_per_action` limit.
-        allowed: Amount,
+    CostEvaluationOverflow,
+    /// Step 3: Payment adapter returned an error during authorization.
+    AuthorizationFailed(PaymentError),
+    /// Step 5: Receiving side cost verification failed -- payer's authorized
+    /// amount is less than receiver's computed cost.
+    CostInsufficient {
+        /// Receiver's computed cost.
+        expected: Amount,
+        /// Payer's authorized amount.
+        provided: Amount,
+        /// Receiver's observed metric values at evaluation time.
+        metric_snapshot: Vec<(super::types::PricingMetric, u64)>,
     },
-    /// Step 5: Receiver's computed cost exceeds the authorized amount.
-    CostInsufficient(CostInsufficient),
-    /// Step 3/5/7: Payment adapter returned an error.
-    PaymentFailed(PaymentError),
-    /// Step 6: Action processing failed. The associated string describes
-    /// the failure. Authorization has been voided.
-    ActionFailed(String),
-    /// Step 9: Void failed after a prior failure. Contains both the original
-    /// error and the void error.
+    /// Step 5: Receiving side authorization verification failed -- the
+    /// authorization could not be verified by the adapter (forged, expired,
+    /// or tampered).
+    AuthorizationVerificationFailed(PaymentError),
+    /// Step 6: Action processing failed. The authorization will be voided.
+    ActionProcessingFailed(String),
+    /// Step 7: Capture failed after successful action processing.
+    CaptureFailed(PaymentError),
+    /// Step 9: Void failed during cleanup after a prior failure.
     VoidFailed {
         /// The original error that triggered the void attempt.
-        original: Box<IntegrationError>,
+        original: Box<Self>,
         /// The error from the void attempt itself.
         void_error: PaymentError,
     },
+    /// No economic policy configured but payment was expected.
+    NoEconomicPolicy,
 }
 
 impl std::fmt::Display for IntegrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CostEvaluationFailed => write!(f, "cost evaluation failed: arithmetic overflow"),
-            Self::SpendingCapabilityInsufficient { required, allowed } => write!(
+            Self::CostEvaluationOverflow => {
+                write!(f, "cost evaluation overflow during formula computation")
+            }
+            Self::AuthorizationFailed(e) => write!(f, "authorization failed: {e}"),
+            Self::CostInsufficient {
+                expected, provided, ..
+            } => write!(
                 f,
-                "spending capability insufficient: required {required}, allowed {allowed}"
+                "cost insufficient: expected {expected}, provided {provided}"
             ),
-            Self::CostInsufficient(ci) => write!(f, "{ci}"),
-            Self::PaymentFailed(pe) => write!(f, "payment failed: {pe}"),
-            Self::ActionFailed(msg) => write!(f, "action failed: {msg}"),
-            Self::VoidFailed { original, void_error } => write!(
+            Self::AuthorizationVerificationFailed(e) => {
+                write!(f, "authorization verification failed: {e}")
+            }
+            Self::ActionProcessingFailed(msg) => {
+                write!(f, "action processing failed: {msg}")
+            }
+            Self::CaptureFailed(e) => write!(f, "capture failed: {e}"),
+            Self::VoidFailed {
+                original,
+                void_error,
+            } => write!(
                 f,
-                "void failed after error ({original}): {void_error}"
+                "void failed during cleanup (original: {original}, void: {void_error})"
             ),
+            Self::NoEconomicPolicy => write!(f, "no economic policy configured"),
         }
     }
 }
@@ -85,254 +104,238 @@ impl std::fmt::Display for IntegrationError {
 impl std::error::Error for IntegrationError {}
 
 // ---------------------------------------------------------------------------
-// SpendingAuthorization — UCAN spending check abstraction
+// ActionEnvelope
 // ---------------------------------------------------------------------------
 
-/// Represents a verified spending UCAN's constraints for a single action.
+/// An action envelope carrying an optional payment authorization.
 ///
-/// The caller provides this after verifying that the payer holds a valid
-/// spending UCAN (spec section 19.5). The integration module checks that the
-/// UCAN's `max_per_action` covers the computed cost.
-///
-/// This struct decouples the integration module from UCAN token parsing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpendingAuth {
-    /// Maximum amount the spending UCAN allows for a single action.
-    pub max_per_action: Amount,
-    /// Allowed payment adapter IDs. Empty means any adapter is allowed.
-    pub allowed_adapters: Vec<String>,
+/// The authorization is `None` for free actions (no economic policy, or zero
+/// cost for this action type). When `Some`, the authorization is attached
+/// inside the encrypted payload -- not visible to relays (spec section
+/// 19.2.2, step 4).
+#[derive(Clone, Debug)]
+pub struct ActionEnvelope {
+    /// The DID of the actor performing the action.
+    pub actor: DID,
+    /// The type of action being performed.
+    pub action_type: PaidActionType,
+    /// The context in which the action is being performed.
+    pub context_id: Option<ContextId>,
+    /// Payment authorization, if this action requires payment.
+    /// `None` for free actions.
+    pub authorization: Option<PaymentAuthorization>,
+    /// Opaque action payload (message content, tool invocation, etc.).
+    pub payload: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
-// ActionOutcome — result of action processing
+// Sender-side: prepare_paid_action (steps 1-4)
 // ---------------------------------------------------------------------------
 
-/// The result of executing the paid action (step 6).
+/// Result of sender-side preparation for a paid action.
 ///
-/// Generic over the action's return type. Contains the action result
-/// plus the payment receipt for event log recording.
-#[derive(Debug)]
-pub struct ActionOutcome<T> {
-    /// The action's return value.
-    pub result: T,
-    /// The payment receipt from capture (step 7).
-    pub receipt: PaymentReceipt,
+/// Contains the action envelope with the optional authorization attached.
+#[derive(Clone, Debug)]
+pub struct PreparedAction {
+    /// The action envelope ready for sending.
+    pub envelope: ActionEnvelope,
+    /// The cost that was evaluated (0 for free actions).
+    pub evaluated_cost: Amount,
 }
 
-// ---------------------------------------------------------------------------
-// execute_paid_action — the 9-step integration sequence
-// ---------------------------------------------------------------------------
-
-/// Executes the full 9-step action-payment integration sequence.
+/// Prepares a paid action on the sender side (steps 1-4).
 ///
-/// This is the main entry point for paid actions. It orchestrates:
+/// 1. Evaluates cost from economic policy + pricing formula + observable metrics.
+/// 2. (Spending UCAN verification is the caller's responsibility -- the
+///    integration module does not access the UCAN store.)
+/// 3. If cost > 0, calls `adapter.authorize()` to reserve payment.
+/// 4. Returns an [`ActionEnvelope`] with the authorization attached (or `None`
+///    for free actions).
 ///
-/// 1. Cost evaluation (economic policy + pricing formula + observable metrics)
-/// 2. Spending UCAN verification (`max_per_action` covers computed cost)
-/// 3. Payment authorization via adapter
-/// 4. Authorization is attached to the action envelope (caller responsibility)
-/// 5. Receiver-side cost verification (re-evaluates formula, checks sufficiency)
-/// 6. Action processing (caller-provided closure)
-/// 7. Payment capture via adapter
-/// 8. Receipt returned for event log recording (caller responsibility)
-/// 9. On failure at steps 5-7: void releases reserved funds
+/// Free actions (no economic policy, or zero cost for this action type) bypass
+/// the payment sequence entirely -- no adapter calls, no authorization.
 ///
-/// # Free action bypass
+/// # Errors
 ///
-/// If no economic policy is present, or the computed cost is zero, the action
-/// is executed directly without any payment sequence. Returns `Ok(None)` to
-/// indicate no payment was made, alongside the action result.
-///
-/// # Type parameters
-///
-/// - `T`: The return type of the action processing closure.
-/// - `A`: The payment adapter implementation.
-/// - `F`: The async action processing closure.
-///
-/// # Arguments
-///
-/// - `policy`: The context's economic policy. `None` means free context.
-/// - `action_type`: The type of paid action being performed.
-/// - `payer`: The DID of the entity paying for the action.
-/// - `sender_metrics`: Observable metrics from the payer's perspective (step 1).
-/// - `receiver_metrics`: Observable metrics from the receiver's perspective (step 5).
-/// - `spending_auth`: Verified spending UCAN constraints. `None` if no spending
-///   UCAN is available (will fail for paid actions).
-/// - `adapter`: The payment adapter to use.
-/// - `metadata`: Payment metadata for the authorization request.
-/// - `process_action`: Async closure that processes the action (step 6).
-///   Receives the [`PaymentAuthorization`] so it can be attached to the
-///   action envelope.
-///
-/// See spec section 19.2.2.
-pub async fn execute_paid_action<T, A, F, Fut>(
-    policy: Option<&EconomicPolicy>,
-    action_type: &PaidActionType,
-    payer: &DID,
-    sender_metrics: &ObservableMetrics,
-    receiver_metrics: &ObservableMetrics,
-    spending_auth: Option<&SpendingAuth>,
+/// Returns [`IntegrationError::CostEvaluationOverflow`] if formula evaluation
+/// overflows. Returns [`IntegrationError::AuthorizationFailed`] if the adapter
+/// rejects the authorization request.
+#[allow(clippy::too_many_arguments)] // Spec-defined 9-step flow requires all parameters.
+pub async fn prepare_paid_action<A: PaymentAdapter>(
     adapter: &A,
+    policy: Option<&EconomicPolicy>,
+    action_type: PaidActionType,
+    actor: &DID,
+    context_id: Option<ContextId>,
+    metrics: &ObservableMetrics,
     metadata: PaymentMetadata,
-    process_action: F,
-) -> Result<(T, Option<ActionOutcome<()>>), IntegrationError>
-where
-    A: PaymentAdapter,
-    F: FnOnce(&PaymentAuthorization) -> Fut,
-    Fut: std::future::Future<Output = Result<T, String>>,
-{
-    // -----------------------------------------------------------------------
-    // Free action bypass: no policy or zero cost => skip payment entirely
-    // -----------------------------------------------------------------------
-    let policy = match policy {
-        Some(p) => p,
-        None => {
-            // No economic policy — free context. Execute action directly.
-            // We create a dummy auth for the closure signature. In practice,
-            // callers should use `execute_free_action` for free contexts, but
-            // this path handles the case gracefully.
-            let dummy_auth = PaymentAuthorization {
-                auth_id: [0u8; 32],
-                payer: payer.clone(),
-                payee: payer.clone(),
-                amount: Amount(0),
-                currency: super::types::CurrencyCode::from(""),
-                adapter_id: String::new(),
-                created_at: 0,
-                expires_at: 0,
-                adapter_state: Vec::new(),
-            };
-            let result = process_action(&dummy_auth)
-                .await
-                .map_err(IntegrationError::ActionFailed)?;
-            return Ok((result, None));
-        }
+    payload: Vec<u8>,
+) -> Result<PreparedAction, IntegrationError> {
+    // Step 1: Evaluate cost.
+    let cost = match policy {
+        Some(p) => evaluate_cost(p, &action_type, metrics)
+            .ok_or(IntegrationError::CostEvaluationOverflow)?,
+        None => Amount(0),
     };
 
-    // Step 1: Evaluate cost using economic policy + pricing formula + metrics
-    let cost = evaluate_cost(policy, action_type, sender_metrics)
-        .ok_or(IntegrationError::CostEvaluationFailed)?;
-
-    // Free action bypass: zero cost
-    if cost == Amount(0) {
-        let dummy_auth = PaymentAuthorization {
-            auth_id: [0u8; 32],
-            payer: payer.clone(),
-            payee: policy.payee.clone(),
-            amount: Amount(0),
-            currency: policy.cost_schedule.currency,
-            adapter_id: String::new(),
-            created_at: 0,
-            expires_at: 0,
-            adapter_state: Vec::new(),
-        };
-        let result = process_action(&dummy_auth)
-            .await
-            .map_err(IntegrationError::ActionFailed)?;
-        return Ok((result, None));
-    }
-
-    // Step 2: Verify spending UCAN covers computed cost
-    let spending = spending_auth.ok_or(IntegrationError::SpendingCapabilityInsufficient {
-        required: cost,
-        allowed: Amount(0),
-    })?;
-
-    if cost > spending.max_per_action {
-        return Err(IntegrationError::SpendingCapabilityInsufficient {
-            required: cost,
-            allowed: spending.max_per_action,
+    // Free action: no payment needed.
+    if cost == Amount(0) || policy.is_none() {
+        return Ok(PreparedAction {
+            envelope: ActionEnvelope {
+                actor: actor.clone(),
+                action_type,
+                context_id,
+                authorization: None,
+                payload,
+            },
+            evaluated_cost: Amount(0),
         });
     }
 
-    // Check adapter compatibility if spending UCAN restricts adapters.
-    if !spending.allowed_adapters.is_empty()
-        && !spending.allowed_adapters.iter().any(|a| a == adapter.adapter_id())
-    {
-        return Err(IntegrationError::PaymentFailed(
-            PaymentError::NoCompatiblePaymentAdapter,
-        ));
-    }
+    // policy is Some and cost > 0 at this point.
+    let policy = policy.ok_or(IntegrationError::NoEconomicPolicy)?;
 
-    // Step 3: Authorize payment via adapter
+    // Step 3: Authorize payment.
     let auth = adapter
         .authorize(
-            payer,
+            actor,
             &policy.payee,
             cost,
             policy.cost_schedule.currency,
             metadata,
         )
         .await
-        .map_err(IntegrationError::PaymentFailed)?;
+        .map_err(IntegrationError::AuthorizationFailed)?;
 
-    // Step 4: PaymentAuthorization is passed to the action closure, which
-    // attaches it to the action envelope (inside encrypted payload).
-
-    // Step 5: Receiver-side cost verification
-    if let Err(ci) = verify_cost_sufficiency(policy, action_type, receiver_metrics, auth.amount) {
-        // Void the authorization before returning error (step 9).
-        void_on_failure(adapter, &auth, IntegrationError::CostInsufficient(ci)).await
-    } else {
-        // Step 6: Process the action
-        let action_result = match process_action(&auth).await {
-            Ok(result) => result,
-            Err(msg) => {
-                // Void on action failure (step 9).
-                return void_on_failure(adapter, &auth, IntegrationError::ActionFailed(msg)).await;
-            }
-        };
-
-        // Step 7: Capture payment
-        match adapter.capture(&auth).await {
-            Ok(receipt) => {
-                // Step 8: Receipt returned for event log recording.
-                Ok((action_result, Some(ActionOutcome { result: (), receipt })))
-            }
-            Err(capture_err) => {
-                // Void on capture failure (step 9).
-                void_on_failure(
-                    adapter,
-                    &auth,
-                    IntegrationError::PaymentFailed(capture_err),
-                )
-                .await
-            }
-        }
-    }
+    // Step 4: Attach authorization to envelope.
+    Ok(PreparedAction {
+        envelope: ActionEnvelope {
+            actor: actor.clone(),
+            action_type,
+            context_id,
+            authorization: Some(auth),
+            payload,
+        },
+        evaluated_cost: cost,
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Receiver-side verification (standalone, for use by receiving contexts)
+// Receiver-side: process_paid_action (steps 5-9)
 // ---------------------------------------------------------------------------
 
-/// Verifies an incoming payment authorization from the receiver's perspective.
+/// Result of receiver-side processing of a paid action.
+#[derive(Clone, Debug)]
+pub struct ProcessedAction {
+    /// The receipt from capturing the payment. `None` for free actions.
+    pub receipt: Option<PaymentReceipt>,
+    /// The result of the action processing (opaque bytes from the callback).
+    pub action_result: Vec<u8>,
+}
+
+/// Processes a paid action on the receiver side (steps 5-9).
 ///
-/// Re-evaluates the cost using the receiver's observable metrics and checks
-/// that the authorized amount covers the computed cost. This corresponds to
-/// step 5 of the integration sequence.
+/// 5. Verifies authorization via `adapter.verify_authorization()` AND
+///    `verify_cost_sufficiency()`.
+/// 6. Calls the `process_action` callback to execute the action.
+/// 7. Captures the payment via `adapter.capture()`.
+/// 8. Returns the receipt for recording in the event log.
+/// 9. On failure at steps 5-7, calls `adapter.void()` to release funds.
+///
+/// Free actions (where `envelope.authorization` is `None`) bypass all payment
+/// verification and capture -- only the action callback is invoked.
 ///
 /// # Errors
 ///
-/// Returns [`CostInsufficient`] if the authorized amount is less than the
-/// receiver's computed cost.
-pub fn verify_incoming_authorization(
-    policy: &EconomicPolicy,
-    action_type: &PaidActionType,
-    receiver_metrics: &ObservableMetrics,
-    auth: &PaymentAuthorization,
-) -> Result<(), CostInsufficient> {
-    verify_cost_sufficiency(policy, action_type, receiver_metrics, auth.amount)
+/// Returns [`IntegrationError`] for any failure in the sequence. When a
+/// failure occurs after authorization, the adapter's `void()` is called
+/// to release reserved funds.
+pub async fn process_paid_action<A, F, Fut>(
+    adapter: &A,
+    policy: Option<&EconomicPolicy>,
+    envelope: &ActionEnvelope,
+    metrics: &ObservableMetrics,
+    process_action: F,
+) -> Result<ProcessedAction, IntegrationError>
+where
+    A: PaymentAdapter,
+    F: FnOnce(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    // Free action path: no authorization means no payment flow.
+    let Some(auth) = &envelope.authorization else {
+        // Free action -- just run the callback.
+        let action_result = process_action(envelope.payload.clone())
+            .await
+            .map_err(IntegrationError::ActionProcessingFailed)?;
+        return Ok(ProcessedAction {
+            receipt: None,
+            action_result,
+        });
+    };
+
+    // Step 5a: Verify authorization via adapter (prevents forged auth structs).
+    if let Err(e) = adapter.verify_authorization(auth).await {
+        return Err(IntegrationError::AuthorizationVerificationFailed(e));
+    }
+
+    // Step 5b: Verify cost sufficiency.
+    if let Some(policy) = policy
+        && let Err(insufficient) =
+            verify_cost_sufficiency(policy, &envelope.action_type, metrics, auth.amount)
+    {
+        // Void the authorization -- payer's funds should not remain locked.
+        return void_on_failure(
+            adapter,
+            auth,
+            IntegrationError::CostInsufficient {
+                expected: insufficient.expected,
+                provided: insufficient.provided,
+                metric_snapshot: insufficient.metric_snapshot,
+            },
+        )
+        .await;
+    }
+
+    // Step 6: Process the action.
+    let action_result = match process_action(envelope.payload.clone()).await {
+        Ok(result) => result,
+        Err(msg) => {
+            return void_on_failure(
+                adapter,
+                auth,
+                IntegrationError::ActionProcessingFailed(msg),
+            )
+            .await;
+        }
+    };
+
+    // Step 7: Capture the payment.
+    let receipt = match adapter.capture(auth).await {
+        Ok(receipt) => receipt,
+        Err(e) => {
+            // Void is not needed after capture failure -- the adapter is
+            // responsible for the authorization state. But we still report
+            // the error.
+            return Err(IntegrationError::CaptureFailed(e));
+        }
+    };
+
+    // Step 8: Return receipt (caller records it in the event log).
+    Ok(ProcessedAction {
+        receipt: Some(receipt),
+        action_result,
+    })
 }
 
 // ---------------------------------------------------------------------------
-// void_on_failure — step 9 helper
+// Step 9: Void on failure
 // ---------------------------------------------------------------------------
 
-/// Attempts to void a payment authorization after a failure at steps 5-7.
+/// Attempts to void a payment authorization after a failure in steps 5-7.
 ///
-/// If the void succeeds, returns the original error. If the void itself fails,
-/// wraps both errors in [`IntegrationError::VoidFailed`].
+/// Always returns `Err` -- either the original error (if void succeeds) or
+/// a [`IntegrationError::VoidFailed`] wrapping both errors (if void fails).
 async fn void_on_failure<T, A: PaymentAdapter>(
     adapter: &A,
     auth: &PaymentAuthorization,
@@ -348,78 +351,6 @@ async fn void_on_failure<T, A: PaymentAdapter>(
 }
 
 // ---------------------------------------------------------------------------
-// execute_free_action — bypass helper
-// ---------------------------------------------------------------------------
-
-/// Executes an action that requires no payment.
-///
-/// This is a convenience wrapper for actions in free contexts or actions with
-/// zero cost. Skips the entire payment sequence.
-///
-/// # Arguments
-///
-/// - `process_action`: Async closure that processes the action.
-///
-/// # Returns
-///
-/// The action result. No payment receipt is generated.
-pub async fn execute_free_action<T, F, Fut>(process_action: F) -> Result<T, IntegrationError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, String>>,
-{
-    process_action()
-        .await
-        .map_err(IntegrationError::ActionFailed)
-}
-
-// ---------------------------------------------------------------------------
-// is_free_action — predicate for routing
-// ---------------------------------------------------------------------------
-
-/// Returns `true` if the given action in the given context is free (no payment
-/// required).
-///
-/// An action is free when:
-/// - No economic policy is present (`None`).
-/// - The computed cost is zero.
-///
-/// Used by [`ContextManager`](crate::context::manager::ContextManager) to
-/// decide whether to route through the payment sequence or bypass it.
-///
-/// See spec section 19.3: "No economic policy = free."
-#[must_use]
-pub fn is_free_action(
-    policy: Option<&EconomicPolicy>,
-    action_type: &PaidActionType,
-    metrics: &ObservableMetrics,
-) -> bool {
-    match policy {
-        None => true,
-        Some(p) => {
-            let cost = evaluate_cost(p, action_type, metrics);
-            matches!(cost, Some(Amount(0)))
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PaymentEventData — for recording in event log
-// ---------------------------------------------------------------------------
-
-/// Data needed to record a `PaymentReceived` event in the context event log.
-///
-/// Extracted from [`ActionOutcome`] for convenience. The caller serializes
-/// this and appends it as a `PaymentReceived` event.
-#[derive(Debug, Clone)]
-pub struct PaymentEventData {
-    /// The payment receipt to record.
-    pub receipt: PaymentReceipt,
-    /// The context in which the payment occurred.
-    pub context_id: Option<ContextId>,
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -428,46 +359,33 @@ pub struct PaymentEventData {
 mod tests {
     use super::*;
     use crate::economy::adapter::{
-        AdapterCapabilities, PaymentMetadata, VerificationResult, RefundConfirmation,
+        AdapterCapabilities, PaymentMetadata, RefundConfirmation, VerificationResult,
     };
-    use crate::economy::types::{
-        Coefficient, CostSchedule, CurrencyCode, PricingFormula, PricingMetric, PricingVariable,
-    };
+    use crate::economy::types::{CostSchedule, CurrencyCode};
 
     // -----------------------------------------------------------------------
-    // TestAdapter — in-memory payment adapter for testing
+    // TestAdapter -- in-memory ledger for testing
     // -----------------------------------------------------------------------
 
-    /// Test payment adapter with configurable behavior.
     struct TestAdapter {
-        /// If `Some`, `authorize` returns this error.
-        authorize_error: Option<PaymentError>,
-        /// If `Some`, `capture` returns this error.
-        capture_error: Option<PaymentError>,
-        /// If `Some`, `void` returns this error.
-        void_error: Option<PaymentError>,
-        /// If `Some`, `verify` returns this result.
-        verify_valid: bool,
+        /// If set, `authorize` will fail with this error.
+        authorize_fail: Option<PaymentError>,
+        /// If set, `verify_authorization` will fail with this error.
+        verify_auth_fail: Option<PaymentError>,
+        /// If set, `capture` will fail with this error.
+        capture_fail: Option<PaymentError>,
+        /// If set, `void` will fail with this error.
+        void_fail: Option<PaymentError>,
     }
 
     impl TestAdapter {
         fn new() -> Self {
             Self {
-                authorize_error: None,
-                capture_error: None,
-                void_error: None,
-                verify_valid: true,
+                authorize_fail: None,
+                verify_auth_fail: None,
+                capture_fail: None,
+                void_fail: None,
             }
-        }
-
-        fn with_capture_error(mut self, err: PaymentError) -> Self {
-            self.capture_error = Some(err);
-            self
-        }
-
-        fn with_void_error(mut self, err: PaymentError) -> Self {
-            self.void_error = Some(err);
-            self
         }
     }
 
@@ -497,49 +415,56 @@ mod tests {
             currency: CurrencyCode,
             _metadata: PaymentMetadata,
         ) -> Result<PaymentAuthorization, PaymentError> {
-            if let Some(ref err) = self.authorize_error {
+            if let Some(ref err) = self.authorize_fail {
                 return Err(err.clone());
             }
             Ok(PaymentAuthorization {
-                auth_id: [0xAA; 32],
+                auth_id: [1u8; 32],
                 payer: payer.clone(),
                 payee: payee.clone(),
                 amount,
                 currency,
-                adapter_id: "test".to_string(),
+                adapter_id: "test".to_owned(),
                 created_at: 1_000_000,
-                expires_at: 1_001_000,
+                expires_at: 2_000_000,
                 adapter_state: vec![],
             })
+        }
+
+        async fn verify_authorization(
+            &self,
+            _auth: &PaymentAuthorization,
+        ) -> Result<(), PaymentError> {
+            if let Some(ref err) = self.verify_auth_fail {
+                return Err(err.clone());
+            }
+            Ok(())
         }
 
         async fn capture(
             &self,
             auth: &PaymentAuthorization,
         ) -> Result<PaymentReceipt, PaymentError> {
-            if let Some(ref err) = self.capture_error {
+            if let Some(ref err) = self.capture_fail {
                 return Err(err.clone());
             }
             Ok(PaymentReceipt {
-                receipt_id: [0xBB; 32],
+                receipt_id: [2u8; 32],
                 payer: auth.payer.clone(),
                 payee: auth.payee.clone(),
                 amount: auth.amount,
                 currency: auth.currency,
                 action_type: PaidActionType::MessageSend,
-                context_id: Some("ctx-test".to_string()),
-                adapter_id: "test".to_string(),
-                adapter_proof: vec![0x01],
+                context_id: None,
+                adapter_id: "test".to_owned(),
+                adapter_proof: vec![0xAB],
                 timestamp: 1_000_001,
-                signature: vec![0xFF; 64],
+                signature: vec![0xCD],
             })
         }
 
-        async fn void(
-            &self,
-            _auth: &PaymentAuthorization,
-        ) -> Result<(), PaymentError> {
-            if let Some(ref err) = self.void_error {
+        async fn void(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
+            if let Some(ref err) = self.void_fail {
                 return Err(err.clone());
             }
             Ok(())
@@ -550,8 +475,8 @@ mod tests {
             _receipt: &PaymentReceipt,
         ) -> Result<VerificationResult, PaymentError> {
             Ok(VerificationResult {
-                valid: self.verify_valid,
-                adapter_id: "test".to_string(),
+                valid: true,
+                adapter_id: "test".to_owned(),
                 verified_amount: Amount(0),
                 verified_currency: CurrencyCode::from("USD"),
                 verification_timestamp: 1_000_002,
@@ -560,15 +485,15 @@ mod tests {
 
         async fn refund(
             &self,
-            receipt: &PaymentReceipt,
-            amount: Option<Amount>,
+            _receipt: &PaymentReceipt,
+            _amount: Option<Amount>,
         ) -> Result<RefundConfirmation, PaymentError> {
             Ok(RefundConfirmation {
-                refund_id: [0xCC; 32],
-                original_receipt_id: receipt.receipt_id,
-                refunded_amount: amount.unwrap_or(receipt.amount),
-                currency: receipt.currency,
-                adapter_proof: vec![0x02],
+                refund_id: [3u8; 32],
+                original_receipt_id: [2u8; 32],
+                refunded_amount: Amount(0),
+                currency: CurrencyCode::from("USD"),
+                adapter_proof: vec![],
             })
         }
     }
@@ -581,60 +506,36 @@ mod tests {
         CurrencyCode::from("USD")
     }
 
-    fn payer_did() -> DID {
+    fn payer() -> DID {
         DID::from("did:dht:z6MkPayer")
     }
 
-    fn payee_did() -> DID {
+    fn payee() -> DID {
         DID::from("did:dht:z6MkPayee")
     }
 
-    fn paid_policy(per_message: u64) -> EconomicPolicy {
+    fn paid_policy() -> EconomicPolicy {
         EconomicPolicy {
             locked: false,
             cost_schedule: CostSchedule {
                 currency: usd(),
-                per_message: Some(Amount(per_message)),
-                per_tool_invoke: None,
+                per_message: Some(Amount(10)),
+                per_tool_invoke: Some(Amount(50)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
             },
-            payment_adapters: vec!["test".to_string()],
+            payment_adapters: vec!["test".to_owned()],
             pricing_formula: None,
-            payee: payee_did(),
-        }
-    }
-
-    fn free_schedule_policy() -> EconomicPolicy {
-        EconomicPolicy {
-            locked: false,
-            cost_schedule: CostSchedule {
-                currency: usd(),
-                per_message: None,
-                per_tool_invoke: None,
-                per_join: None,
-                per_period: None,
-                per_byte_stored: None,
-            },
-            payment_adapters: vec![],
-            pricing_formula: None,
-            payee: payee_did(),
+            payee: payee(),
         }
     }
 
     fn test_metadata() -> PaymentMetadata {
         PaymentMetadata {
             action_type: PaidActionType::MessageSend,
-            context_id: Some("ctx-test".to_string()),
+            context_id: Some("ctx-1".to_owned()),
             idempotency_key: [0u8; 16],
-        }
-    }
-
-    fn spending_auth(max: u64) -> SpendingAuth {
-        SpendingAuth {
-            max_per_action: Amount(max),
-            allowed_adapters: vec![],
         }
     }
 
@@ -642,564 +543,382 @@ mod tests {
         ObservableMetrics::default()
     }
 
-    // =======================================================================
-    // Full 9-step happy path
-    // =======================================================================
+    // -----------------------------------------------------------------------
+    // Tests: Full 9-step sequence
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn full_sequence_happy_path() {
-        let policy = paid_policy(10);
+    async fn full_9_step_sequence_with_test_adapter() {
         let adapter = TestAdapter::new();
-        let spending = spending_auth(100);
+        let policy = paid_policy();
         let metrics = default_metrics();
 
-        let (result, outcome) = execute_paid_action(
+        // Steps 1-4: Sender prepares paid action.
+        let prepared = prepare_paid_action(
+            &adapter,
             Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
+            PaidActionType::MessageSend,
+            &payer(),
+            Some("ctx-1".to_owned()),
             &metrics,
-            &metrics,
-            Some(&spending),
-            &adapter,
             test_metadata(),
-            |_auth| async { Ok("message sent") },
+            b"hello".to_vec(),
         )
         .await
         .unwrap();
 
-        assert_eq!(result, "message sent");
-        let outcome = outcome.expect("should have payment outcome for paid action");
-        assert_eq!(outcome.receipt.amount, Amount(10));
-        assert_eq!(outcome.receipt.payer, payer_did());
-        assert_eq!(outcome.receipt.payee, payee_did());
-    }
+        assert_eq!(prepared.evaluated_cost, Amount(10));
+        assert!(prepared.envelope.authorization.is_some());
 
-    // =======================================================================
-    // Free action bypass: no economic policy
-    // =======================================================================
-
-    #[tokio::test]
-    async fn free_action_bypass_no_policy() {
-        let adapter = TestAdapter::new();
-        let metrics = default_metrics();
-
-        let (result, outcome) = execute_paid_action::<&str, _, _, _>(
-            None,
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &metrics,
-            &metrics,
-            None,
+        // Steps 5-8: Receiver processes paid action.
+        let result = process_paid_action(
             &adapter,
-            test_metadata(),
-            |_auth| async { Ok("free message") },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, "free message");
-        assert!(outcome.is_none(), "no payment outcome for free action");
-    }
-
-    // =======================================================================
-    // Free action bypass: zero cost
-    // =======================================================================
-
-    #[tokio::test]
-    async fn free_action_bypass_zero_cost() {
-        // Policy exists but no cost for the action type.
-        let policy = free_schedule_policy();
-        let adapter = TestAdapter::new();
-        let metrics = default_metrics();
-
-        let (result, outcome) = execute_paid_action::<&str, _, _, _>(
             Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
+            &prepared.envelope,
             &metrics,
-            &metrics,
-            None,
-            &adapter,
-            test_metadata(),
-            |_auth| async { Ok("zero-cost message") },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, "zero-cost message");
-        assert!(outcome.is_none(), "no payment outcome for zero-cost action");
-    }
-
-    // =======================================================================
-    // CostInsufficient: payer amount < receiver computed cost
-    // =======================================================================
-
-    #[tokio::test]
-    async fn cost_insufficient_returns_metric_snapshot() {
-        // Receiver has higher metrics than sender, causing cost divergence.
-        let policy = EconomicPolicy {
-            locked: false,
-            cost_schedule: CostSchedule {
-                currency: usd(),
-                per_message: Some(Amount(5)),
-                per_tool_invoke: None,
-                per_join: None,
-                per_period: None,
-                per_byte_stored: None,
+            |payload| async move {
+                assert_eq!(payload, b"hello".to_vec());
+                Ok(b"ack".to_vec())
             },
-            payment_adapters: vec!["test".to_string()],
-            pricing_formula: Some(PricingFormula {
-                base_cost: Amount(0),
-                variables: vec![PricingVariable::Linear {
-                    metric: PricingMetric::MemberCount,
-                    coefficient: Coefficient(1_000_000), // 1.0
-                }],
-                cap: None,
-                floor: None,
-            }),
-            payee: payee_did(),
-        };
-
-        let adapter = TestAdapter::new();
-        let spending = spending_auth(1000);
-
-        // Sender sees 10 members: cost = 5 + (1.0 * 10) = 15
-        let sender_metrics = ObservableMetrics {
-            member_count: 10,
-            ..default_metrics()
-        };
-
-        // Receiver sees 100 members: cost = 5 + (1.0 * 100) = 105
-        // Authorization amount (15) < receiver cost (105) => CostInsufficient
-        let receiver_metrics = ObservableMetrics {
-            member_count: 100,
-            ..default_metrics()
-        };
-
-        let err = execute_paid_action::<&str, _, _, _>(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &sender_metrics,
-            &receiver_metrics,
-            Some(&spending),
-            &adapter,
-            test_metadata(),
-            |_auth| async { Ok("should not reach here") },
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        match err {
-            IntegrationError::CostInsufficient(ci) => {
-                assert_eq!(ci.provided, Amount(15));
-                assert_eq!(ci.expected, Amount(105));
-                assert_eq!(ci.currency, usd());
-                // Metric snapshot should contain the MemberCount metric.
-                assert!(
-                    ci.metric_snapshot
-                        .iter()
-                        .any(|(m, v)| *m == PricingMetric::MemberCount && *v == 100),
-                    "metric snapshot should contain MemberCount=100"
-                );
-            }
-            other => panic!("expected CostInsufficient, got: {other}"),
-        }
+        assert!(result.receipt.is_some());
+        let receipt = result.receipt.unwrap();
+        assert_eq!(receipt.amount, Amount(10));
+        assert_eq!(result.action_result, b"ack");
     }
 
-    // =======================================================================
-    // Void on verification failure (step 5)
-    // =======================================================================
+    // -----------------------------------------------------------------------
+    // Tests: Free action bypass
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn free_action_no_policy_returns_none_authorization() {
+        let adapter = TestAdapter::new();
+        let metrics = default_metrics();
+
+        let prepared = prepare_paid_action(
+            &adapter,
+            None,
+            PaidActionType::MessageSend,
+            &payer(),
+            None,
+            &metrics,
+            test_metadata(),
+            b"free message".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.evaluated_cost, Amount(0));
+        assert!(prepared.envelope.authorization.is_none());
+    }
+
+    #[tokio::test]
+    async fn free_action_in_paid_context_bypasses_payment() {
+        // Context has a paid policy but no cost for ContextJoin.
+        let adapter = TestAdapter::new();
+        let policy = paid_policy(); // has per_message but not per_join
+        let metrics = default_metrics();
+
+        let prepared = prepare_paid_action(
+            &adapter,
+            Some(&policy),
+            PaidActionType::ContextJoin, // No cost in schedule
+            &payer(),
+            Some("ctx-1".to_owned()),
+            &metrics,
+            test_metadata(),
+            b"join".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.evaluated_cost, Amount(0));
+        assert!(prepared.envelope.authorization.is_none());
+    }
+
+    #[tokio::test]
+    async fn free_action_receiver_processes_without_payment() {
+        let adapter = TestAdapter::new();
+
+        let envelope = ActionEnvelope {
+            actor: payer(),
+            action_type: PaidActionType::MessageSend,
+            context_id: None,
+            authorization: None,
+            payload: b"free".to_vec(),
+        };
+
+        let result = process_paid_action(&adapter, None, &envelope, &default_metrics(), |p| async move {
+            assert_eq!(p, b"free".to_vec());
+            Ok(b"done".to_vec())
+        })
+        .await
+        .unwrap();
+
+        assert!(result.receipt.is_none());
+        assert_eq!(result.action_result, b"done");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: Void on failure
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn void_on_verification_failure() {
-        // Same policy but receiver sees higher cost => CostInsufficient at step 5.
-        // Verify that void is called (adapter does not error => original error returned).
-        let adapter = TestAdapter::new();
-        let spending = spending_auth(100);
-
-        let sender_metrics = default_metrics();
-        // Receiver's policy evaluates to higher cost: we use a different policy
-        // perspective. Actually, since both sides use the same policy object in
-        // our test setup, we need formula divergence. Let's use a formula policy.
-        let formula_policy = EconomicPolicy {
-            locked: false,
-            cost_schedule: CostSchedule {
-                currency: usd(),
-                per_message: Some(Amount(5)),
-                per_tool_invoke: None,
-                per_join: None,
-                per_period: None,
-                per_byte_stored: None,
-            },
-            payment_adapters: vec!["test".to_string()],
-            pricing_formula: Some(PricingFormula {
-                base_cost: Amount(0),
-                variables: vec![PricingVariable::Step {
-                    metric: PricingMetric::SenderVelocity,
-                    thresholds: vec![(5, Amount(50))],
-                }],
-                cap: None,
-                floor: None,
-            }),
-            payee: payee_did(),
+        let adapter = TestAdapter {
+            verify_auth_fail: Some(PaymentError::AdapterError("forged auth".into())),
+            ..TestAdapter::new()
         };
+        let policy = paid_policy();
+        let metrics = default_metrics();
 
-        // Sender: velocity=0 => cost = 5 + 0 = 5
-        // Receiver: velocity=10 => cost = 5 + 50 = 55
-        // Auth amount = 5 < 55 => CostInsufficient, void called
-        let receiver_metrics = ObservableMetrics {
-            sender_velocity: 10,
-            ..default_metrics()
-        };
-
-        let err = execute_paid_action::<&str, _, _, _>(
-            Some(&formula_policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &sender_metrics,
-            &receiver_metrics,
-            Some(&spending),
-            &adapter,
+        // Prepare a valid action on sender side.
+        let valid_adapter = TestAdapter::new();
+        let prepared = prepare_paid_action(
+            &valid_adapter,
+            Some(&policy),
+            PaidActionType::MessageSend,
+            &payer(),
+            Some("ctx-1".to_owned()),
+            &metrics,
             test_metadata(),
-            |_auth| async { Ok("should not reach") },
-        )
-        .await
-        .unwrap_err();
-
-        // Should be CostInsufficient (void succeeded, so original error returned)
-        assert!(matches!(err, IntegrationError::CostInsufficient(_)));
-    }
-
-    // =======================================================================
-    // Void on action processing failure (step 6)
-    // =======================================================================
-
-    #[tokio::test]
-    async fn void_on_action_failure() {
-        let policy = paid_policy(10);
-        let adapter = TestAdapter::new();
-        let spending = spending_auth(100);
-        let metrics = default_metrics();
-
-        let err = execute_paid_action::<&str, _, _, _>(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &metrics,
-            &metrics,
-            Some(&spending),
-            &adapter,
-            test_metadata(),
-            |_auth| async { Err("action processing failed".to_string()) },
-        )
-        .await
-        .unwrap_err();
-
-        match err {
-            IntegrationError::ActionFailed(msg) => {
-                assert_eq!(msg, "action processing failed");
-            }
-            other => panic!("expected ActionFailed, got: {other}"),
-        }
-    }
-
-    // =======================================================================
-    // Void on capture failure (step 7)
-    // =======================================================================
-
-    #[tokio::test]
-    async fn void_on_capture_failure() {
-        let policy = paid_policy(10);
-        let adapter = TestAdapter::new().with_capture_error(
-            PaymentError::AdapterError("capture failed".to_string()),
-        );
-        let spending = spending_auth(100);
-        let metrics = default_metrics();
-
-        let err = execute_paid_action::<&str, _, _, _>(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &metrics,
-            &metrics,
-            Some(&spending),
-            &adapter,
-            test_metadata(),
-            |_auth| async { Ok("action succeeded") },
-        )
-        .await
-        .unwrap_err();
-
-        // Should be PaymentFailed (void succeeded, so original error returned)
-        assert!(matches!(err, IntegrationError::PaymentFailed(_)));
-    }
-
-    // =======================================================================
-    // VoidFailed: both action and void fail
-    // =======================================================================
-
-    #[tokio::test]
-    async fn void_failed_wraps_both_errors() {
-        let policy = paid_policy(10);
-        let adapter = TestAdapter::new()
-            .with_capture_error(PaymentError::AdapterError("capture failed".to_string()))
-            .with_void_error(PaymentError::AdapterError("void also failed".to_string()));
-        let spending = spending_auth(100);
-        let metrics = default_metrics();
-
-        let err = execute_paid_action::<&str, _, _, _>(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &metrics,
-            &metrics,
-            Some(&spending),
-            &adapter,
-            test_metadata(),
-            |_auth| async { Ok("action succeeded") },
-        )
-        .await
-        .unwrap_err();
-
-        match err {
-            IntegrationError::VoidFailed {
-                original,
-                void_error,
-            } => {
-                assert!(matches!(*original, IntegrationError::PaymentFailed(_)));
-                assert!(matches!(void_error, PaymentError::AdapterError(_)));
-            }
-            other => panic!("expected VoidFailed, got: {other}"),
-        }
-    }
-
-    // =======================================================================
-    // Spending capability insufficient
-    // =======================================================================
-
-    #[tokio::test]
-    async fn spending_capability_insufficient() {
-        let policy = paid_policy(100);
-        let adapter = TestAdapter::new();
-        // max_per_action (50) < cost (100)
-        let spending = spending_auth(50);
-        let metrics = default_metrics();
-
-        let err = execute_paid_action::<&str, _, _, _>(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &metrics,
-            &metrics,
-            Some(&spending),
-            &adapter,
-            test_metadata(),
-            |_auth| async { Ok("should not reach") },
-        )
-        .await
-        .unwrap_err();
-
-        match err {
-            IntegrationError::SpendingCapabilityInsufficient { required, allowed } => {
-                assert_eq!(required, Amount(100));
-                assert_eq!(allowed, Amount(50));
-            }
-            other => panic!("expected SpendingCapabilityInsufficient, got: {other}"),
-        }
-    }
-
-    // =======================================================================
-    // No spending UCAN for paid action
-    // =======================================================================
-
-    #[tokio::test]
-    async fn no_spending_ucan_for_paid_action() {
-        let policy = paid_policy(10);
-        let adapter = TestAdapter::new();
-        let metrics = default_metrics();
-
-        let err = execute_paid_action::<&str, _, _, _>(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &metrics,
-            &metrics,
-            None, // no spending UCAN
-            &adapter,
-            test_metadata(),
-            |_auth| async { Ok("should not reach") },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            IntegrationError::SpendingCapabilityInsufficient { .. }
-        ));
-    }
-
-    // =======================================================================
-    // execute_free_action
-    // =======================================================================
-
-    #[tokio::test]
-    async fn execute_free_action_succeeds() {
-        let result = execute_free_action(|| async { Ok::<_, String>("free result") })
-            .await
-            .unwrap();
-        assert_eq!(result, "free result");
-    }
-
-    #[tokio::test]
-    async fn execute_free_action_propagates_error() {
-        let err = execute_free_action(|| async { Err::<(), _>("free failed".to_string()) })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, IntegrationError::ActionFailed(msg) if msg == "free failed"));
-    }
-
-    // =======================================================================
-    // is_free_action
-    // =======================================================================
-
-    #[test]
-    fn is_free_action_no_policy() {
-        assert!(is_free_action(
-            None,
-            &PaidActionType::MessageSend,
-            &default_metrics()
-        ));
-    }
-
-    #[test]
-    fn is_free_action_zero_cost() {
-        let policy = free_schedule_policy();
-        assert!(is_free_action(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &default_metrics()
-        ));
-    }
-
-    #[test]
-    fn is_free_action_nonzero_cost() {
-        let policy = paid_policy(10);
-        assert!(!is_free_action(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &default_metrics()
-        ));
-    }
-
-    // =======================================================================
-    // verify_incoming_authorization
-    // =======================================================================
-
-    #[test]
-    fn verify_incoming_authorization_sufficient() {
-        let policy = paid_policy(10);
-        let metrics = default_metrics();
-        let auth = PaymentAuthorization {
-            auth_id: [0u8; 32],
-            payer: payer_did(),
-            payee: payee_did(),
-            amount: Amount(10),
-            currency: usd(),
-            adapter_id: "test".to_string(),
-            created_at: 0,
-            expires_at: 0,
-            adapter_state: vec![],
-        };
-        assert!(verify_incoming_authorization(&policy, &PaidActionType::MessageSend, &metrics, &auth).is_ok());
-    }
-
-    #[test]
-    fn verify_incoming_authorization_insufficient() {
-        let policy = paid_policy(10);
-        let metrics = default_metrics();
-        let auth = PaymentAuthorization {
-            auth_id: [0u8; 32],
-            payer: payer_did(),
-            payee: payee_did(),
-            amount: Amount(5), // less than required 10
-            currency: usd(),
-            adapter_id: "test".to_string(),
-            created_at: 0,
-            expires_at: 0,
-            adapter_state: vec![],
-        };
-        let err = verify_incoming_authorization(&policy, &PaidActionType::MessageSend, &metrics, &auth)
-            .unwrap_err();
-        assert_eq!(err.expected, Amount(10));
-        assert_eq!(err.provided, Amount(5));
-    }
-
-    // =======================================================================
-    // Adapter compatibility check
-    // =======================================================================
-
-    #[tokio::test]
-    async fn spending_ucan_restricts_adapter() {
-        let policy = paid_policy(10);
-        let adapter = TestAdapter::new();
-        let spending = SpendingAuth {
-            max_per_action: Amount(100),
-            allowed_adapters: vec!["lightning".to_string()], // does not include "test"
-        };
-        let metrics = default_metrics();
-
-        let err = execute_paid_action::<&str, _, _, _>(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &metrics,
-            &metrics,
-            Some(&spending),
-            &adapter,
-            test_metadata(),
-            |_auth| async { Ok("should not reach") },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            IntegrationError::PaymentFailed(PaymentError::NoCompatiblePaymentAdapter)
-        ));
-    }
-
-    // =======================================================================
-    // Authorize-then-capture pattern (already tested in happy path)
-    // Invoice-then-preimage pattern (capture is no-op, adapter returns receipt)
-    // Both patterns are uniform through the PaymentAdapter trait.
-    // =======================================================================
-
-    #[tokio::test]
-    async fn invoice_then_preimage_pattern() {
-        // In Lightning, capture() returns a receipt derived from the preimage.
-        // Our TestAdapter simulates this: capture succeeds and returns a receipt.
-        // The integration sequence treats it identically to authorize-then-capture.
-        let policy = paid_policy(10);
-        let adapter = TestAdapter::new();
-        let spending = spending_auth(100);
-        let metrics = default_metrics();
-
-        let (result, outcome) = execute_paid_action(
-            Some(&policy),
-            &PaidActionType::MessageSend,
-            &payer_did(),
-            &metrics,
-            &metrics,
-            Some(&spending),
-            &adapter,
-            test_metadata(),
-            |_auth| async { Ok("lightning payment") },
+            b"msg".to_vec(),
         )
         .await
         .unwrap();
 
-        assert_eq!(result, "lightning payment");
-        assert!(outcome.is_some());
+        // Receiver's adapter rejects the authorization.
+        let err = process_paid_action(
+            &adapter,
+            Some(&policy),
+            &prepared.envelope,
+            &metrics,
+            |_| async { Ok(b"should not reach".to_vec()) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, IntegrationError::AuthorizationVerificationFailed(_)),
+            "expected AuthorizationVerificationFailed, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn void_on_action_processing_failure() {
+        let adapter = TestAdapter::new();
+        let policy = paid_policy();
+        let metrics = default_metrics();
+
+        let prepared = prepare_paid_action(
+            &adapter,
+            Some(&policy),
+            PaidActionType::MessageSend,
+            &payer(),
+            Some("ctx-1".to_owned()),
+            &metrics,
+            test_metadata(),
+            b"msg".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let err = process_paid_action(
+            &adapter,
+            Some(&policy),
+            &prepared.envelope,
+            &metrics,
+            |_| async { Err("action failed".to_owned()) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, IntegrationError::ActionProcessingFailed(_)),
+            "expected ActionProcessingFailed, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn void_failure_wraps_both_errors() {
+        let adapter = TestAdapter {
+            verify_auth_fail: Some(PaymentError::AdapterError("bad auth".into())),
+            void_fail: Some(PaymentError::AdapterError("void also failed".into())),
+            ..TestAdapter::new()
+        };
+
+        let envelope = ActionEnvelope {
+            actor: payer(),
+            action_type: PaidActionType::MessageSend,
+            context_id: None,
+            authorization: Some(PaymentAuthorization {
+                auth_id: [1u8; 32],
+                payer: payer(),
+                payee: payee(),
+                amount: Amount(10),
+                currency: usd(),
+                adapter_id: "test".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![],
+            }),
+            payload: b"msg".to_vec(),
+        };
+
+        // verify_authorization fails, then void also fails.
+        // Note: verify_authorization failure does NOT trigger void because
+        // the authorization was never verified as authentic -- voiding an
+        // unverified auth is the sender's responsibility.
+        let err = process_paid_action(
+            &adapter,
+            Some(&paid_policy()),
+            &envelope,
+            &default_metrics(),
+            |_| async { Ok(b"".to_vec()) },
+        )
+        .await
+        .unwrap_err();
+
+        // Since verify_authorization failure returns early without void,
+        // we get AuthorizationVerificationFailed directly.
+        assert!(
+            matches!(err, IntegrationError::AuthorizationVerificationFailed(_)),
+            "expected AuthorizationVerificationFailed, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: CostInsufficient with metric_snapshot
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cost_insufficient_returns_metric_snapshot() {
+        let adapter = TestAdapter::new();
+        // Policy requires 10 per message, but we'll craft an auth with amount 5.
+        let policy = paid_policy();
+        let metrics = default_metrics();
+
+        let envelope = ActionEnvelope {
+            actor: payer(),
+            action_type: PaidActionType::MessageSend,
+            context_id: Some("ctx-1".to_owned()),
+            authorization: Some(PaymentAuthorization {
+                auth_id: [1u8; 32],
+                payer: payer(),
+                payee: payee(),
+                amount: Amount(5), // Less than required 10
+                currency: usd(),
+                adapter_id: "test".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![],
+            }),
+            payload: b"msg".to_vec(),
+        };
+
+        let err = process_paid_action(
+            &adapter,
+            Some(&policy),
+            &envelope,
+            &metrics,
+            |_| async { Ok(b"".to_vec()) },
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IntegrationError::CostInsufficient {
+                expected,
+                provided,
+                ..
+            } => {
+                assert_eq!(expected, Amount(10));
+                assert_eq!(provided, Amount(5));
+            }
+            other => panic!("expected CostInsufficient, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: Authorization failure
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn authorization_failure_returns_adapter_error() {
+        let adapter = TestAdapter {
+            authorize_fail: Some(PaymentError::InsufficientBalance {
+                available: Amount(5),
+                requested: Amount(10),
+            }),
+            ..TestAdapter::new()
+        };
+        let policy = paid_policy();
+
+        let err = prepare_paid_action(
+            &adapter,
+            Some(&policy),
+            PaidActionType::MessageSend,
+            &payer(),
+            Some("ctx-1".to_owned()),
+            &default_metrics(),
+            test_metadata(),
+            b"msg".to_vec(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, IntegrationError::AuthorizationFailed(PaymentError::InsufficientBalance { .. })),
+            "expected AuthorizationFailed(InsufficientBalance), got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: Option<PaymentAuthorization> -- no dummy auth
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn no_dummy_authorization_for_free_actions() {
+        let adapter = TestAdapter::new();
+
+        // Case 1: No policy.
+        let prepared = prepare_paid_action(
+            &adapter,
+            None,
+            PaidActionType::MessageSend,
+            &payer(),
+            None,
+            &default_metrics(),
+            test_metadata(),
+            b"free".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            prepared.envelope.authorization.is_none(),
+            "free action should have None authorization, not a dummy"
+        );
+
+        // Case 2: Policy exists but action type has zero cost.
+        let prepared = prepare_paid_action(
+            &adapter,
+            Some(&paid_policy()),
+            PaidActionType::ContextJoin, // No per_join cost in our test policy
+            &payer(),
+            None,
+            &default_metrics(),
+            test_metadata(),
+            b"join".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            prepared.envelope.authorization.is_none(),
+            "zero-cost action should have None authorization, not a dummy"
+        );
     }
 }
