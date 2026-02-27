@@ -8,13 +8,13 @@
 //!
 //! | Prefix | Range | Category |
 //! |--------|-------|----------|
-//! | `SCP-IDENT-` | 1000–1999 | Identity errors |
-//! | `SCP-CTX-` | 2000–2999 | Context errors |
-//! | `SCP-PERM-` | 3000–3999 | UCAN / permission errors |
-//! | `SCP-CRYPTO-` | 4000–4999 | Cryptographic errors |
-//! | `SCP-TRANS-` | 5000–5999 | Transport errors |
-//! | `SCP-TOOL-` | 6000–6999 | Tool errors |
-//! | `SCP-VALID-` | 7000–7999 | Validation errors |
+//! | `SCP-IDENT-` | 1000-1999 | Identity errors |
+//! | `SCP-CTX-` | 2000-2999 | Context errors |
+//! | `SCP-PERM-` | 3000-3999 | UCAN / permission errors |
+//! | `SCP-CRYPTO-` | 4000-4999 | Cryptographic errors |
+//! | `SCP-TRANS-` | 5000-5999 | Transport errors |
+//! | `SCP-TOOL-` | 6000-6999 | Tool errors |
+//! | `SCP-VALID-` | 7000-7999 | Validation errors |
 //!
 //! # napi-rs error model
 //!
@@ -47,39 +47,74 @@ use napi::Status;
 #[derive(Debug, thiserror::Error)]
 pub enum ScpNapiError {
     /// An identity operation failed (DID creation, resolution, key rotation).
-    #[error("[{code}] identity error: {message}", code = .code, message = .message)]
-    Identity { message: String, code: String },
+    #[error("[{code}] identity error: {message}")]
+    Identity {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-IDENT-1001`).
+        code: String,
+    },
 
     /// A context lifecycle operation failed (create, join, leave, close, send).
-    #[error("[{code}] context error: {message}", code = .code, message = .message)]
-    Context { message: String, code: String },
+    #[error("[{code}] context error: {message}")]
+    Context {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-CTX-2001`).
+        code: String,
+    },
 
     /// A capability or governance permission check failed.
-    #[error("[{code}] permission error: {message}", code = .code, message = .message)]
-    Permission { message: String, code: String },
+    #[error("[{code}] permission error: {message}")]
+    Permission {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-PERM-3001`).
+        code: String,
+    },
 
     /// A cryptographic operation failed (MLS, sender keys, encryption).
     ///
     /// Messages never include key material or internal crypto state.
-    #[error("[{code}] crypto error: {message}", code = .code, message = .message)]
-    Crypto { message: String, code: String },
+    #[error("[{code}] crypto error: {message}")]
+    Crypto {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-CRYPTO-4001`).
+        code: String,
+    },
 
     /// A transport operation failed (connection, send, subscription).
-    #[error("[{code}] transport error: {message}", code = .code, message = .message)]
-    Transport { message: String, code: String },
+    #[error("[{code}] transport error: {message}")]
+    Transport {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-TRANS-5001`).
+        code: String,
+    },
 
     /// A tool operation failed (registration, invocation, verification).
-    #[error("[{code}] tool error: {message}", code = .code, message = .message)]
-    Tool { message: String, code: String },
+    #[error("[{code}] tool error: {message}")]
+    Tool {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-TOOL-6001`).
+        code: String,
+    },
 
     /// Input validation failed (malformed data, schema mismatch, constraint violation).
-    #[error("[{code}] validation error: {message}", code = .code, message = .message)]
-    Validation { message: String, code: String },
+    #[error("[{code}] validation error: {message}")]
+    Validation {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-VALID-7001`).
+        code: String,
+    },
 }
 
 impl From<ScpNapiError> for napi::Error {
     fn from(e: ScpNapiError) -> Self {
-        napi::Error::new(Status::GenericFailure, e.to_string())
+        Self::new(Status::GenericFailure, e.to_string())
     }
 }
 
@@ -253,9 +288,7 @@ impl From<scp_core::event_log::EventLogError> for ScpNapiError {
 impl From<scp_core::provenance::ProvenanceError> for ScpNapiError {
     fn from(e: scp_core::provenance::ProvenanceError) -> Self {
         Self::Validation {
-            message: format!(
-                "provenance validation failed: {e} — check cross-context chain depth"
-            ),
+            message: format!("provenance validation failed: {e} — check cross-context chain depth"),
             code: "SCP-VALID-7002".to_owned(),
         }
     }
@@ -337,9 +370,7 @@ impl From<scp_platform::PlatformError> for ScpNapiError {
 impl From<serde_json::Error> for ScpNapiError {
     fn from(e: serde_json::Error) -> Self {
         Self::Validation {
-            message: format!(
-                "JSON serialization/deserialization failed: {e} — check input format"
-            ),
+            message: format!("JSON serialization/deserialization failed: {e} — check input format"),
             code: "SCP-VALID-7006".to_owned(),
         }
     }

@@ -30,6 +30,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::context::MemoryScope;
+use crate::economy::types::Amount;
 
 // ---------------------------------------------------------------------------
 // Type aliases (match event_log/mod.rs pattern)
@@ -173,6 +174,15 @@ pub struct DataProvenance {
     /// Ordered list of intermediary context IDs when `chain_depth > 0`.
     /// Records the full path the data has traversed across contexts.
     pub chain_path: Option<Vec<ContextId>>,
+    /// Cost of producing this data, if any (spec section 19.6).
+    ///
+    /// Receiving contexts see what data cost to produce -- expensive
+    /// computations carry economic provenance.
+    pub payment_amount: Option<Amount>,
+    /// Payment adapter used for the payment, if any (spec section 19.6).
+    pub payment_adapter: Option<String>,
+    /// Receipt ID for verification of the payment, if any (spec section 19.6).
+    pub payment_receipt_id: Option<[u8; 32]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +238,9 @@ mod tests {
             memory_scope: MemoryScope::Full,
             chain_depth: 0,
             chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         };
 
         assert_eq!(provenance.source_context, "ctx-abc-123");
@@ -251,6 +264,9 @@ mod tests {
             memory_scope: MemoryScope::Ephemeral,
             chain_depth: 2,
             chain_path: Some(vec!["ctx-hop-1".to_string(), "ctx-hop-2".to_string()]),
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         };
 
         assert_eq!(provenance.chain_depth, 2);
@@ -271,6 +287,9 @@ mod tests {
             memory_scope: MemoryScope::Summary,
             chain_depth: 0,
             chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         };
 
         assert_eq!(provenance.discovery_method, DiscoveryMethod::None);
@@ -385,6 +404,9 @@ mod tests {
             memory_scope: MemoryScope::Full,
             chain_depth: 1,
             chain_path: Some(vec!["ctx-hop".to_string()]),
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         };
 
         let json = serde_json::to_string(&provenance);
@@ -480,6 +502,9 @@ mod tests {
             memory_scope: MemoryScope::Ephemeral,
             chain_depth: 0,
             chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         };
 
         assert!(provenance.counterparties.is_empty());
@@ -503,6 +528,9 @@ mod tests {
                 "ctx-2".to_string(),
                 "ctx-3".to_string(),
             ]),
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         };
 
         assert_eq!(provenance.chain_depth, 3);

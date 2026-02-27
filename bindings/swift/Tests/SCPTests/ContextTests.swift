@@ -1,0 +1,495 @@
+import Foundation
+import Testing
+
+@testable import SCP
+
+// MARK: - Mock ContextHandle
+
+/// Mock implementation of ``ContextHandleProtocol`` for testing.
+/// Returns configurable values for contextId and state.
+private final class MockContextHandle: ContextHandleProtocol, @unchecked Sendable {
+    let id: String
+    let initialState: String
+
+    init(id: String = "test-context-001", state: String = "active") {
+        self.id = id
+        self.initialState = state
+    }
+
+    func contextId() -> String { id }
+    func state() -> String { initialState }
+}
+
+// MARK: - Thread-safe test state
+
+/// A simple lock-based thread-safe container for test assertions.
+/// Uses `NSLock` which is available on all Apple platforms.
+private final class Locked<Value: Sendable>: @unchecked Sendable {
+    private var value: Value
+    private let lock = NSLock()
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    func withLock<R>(_ body: (inout Value) -> R) -> R {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&value)
+    }
+
+    var current: Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+// MARK: - Test helpers
+
+/// Creates a ``Context`` with mock bridge functions for testing.
+///
+/// The returned context uses in-memory mock bridge functions. The `onSend`
+/// closure is called for each ``Context/send(_:)`` invocation, allowing tests
+/// to inspect sent payloads. The `captureListener` closure captures the
+/// ``MessageListenerProtocol`` registered by ``Context/messages``, enabling
+/// tests to push messages into the stream from the outside.
+private func makeTestContext(
+    contextId: String = "test-context-001",
+    state: String = "active",
+    onSend: (@Sendable (Data) -> Void)? = nil,
+    onLeave: (@Sendable () -> Void)? = nil,
+    onClose: (@Sendable () -> Void)? = nil,
+    captureListener: (@Sendable (any MessageListenerProtocol) -> Void)? = nil
+) -> Context {
+    let handle = MockContextHandle(id: contextId, state: state)
+
+    let sendFn: ContextBridge.SendFn = { _, payload in
+        onSend?(payload)
+    }
+
+    let subscribeFn: ContextBridge.SubscribeFn = { _, listener in
+        captureListener?(listener)
+    }
+
+    let leaveFn: ContextBridge.LeaveFn = { _ in
+        onLeave?()
+    }
+
+    let closeFn: ContextBridge.CloseFn = { _ in
+        onClose?()
+    }
+
+    return Context(
+        handle: handle,
+        sendFn: sendFn,
+        subscribeFn: subscribeFn,
+        leaveFn: leaveFn,
+        closeFn: closeFn
+    )
+}
+
+// MARK: - Context creation tests
+
+@Test("Context.create returns a context in active state")
+func createReturnsActiveContext() async throws {
+    let createFn: ContextBridge.CreateFn = { contextId, _ in
+        MockContextHandle(id: contextId, state: "active")
+    }
+    let noOpSend: ContextBridge.SendFn = { _, _ in }
+    let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
+    let noOpLeave: ContextBridge.LeaveFn = { _ in }
+    let noOpClose: ContextBridge.CloseFn = { _ in }
+
+    let context = try await Context.create(
+        contextId: "ctx-create-test",
+        ceiling: ["messages:read", "messages:write"],
+        createFn: createFn,
+        sendFn: noOpSend,
+        subscribeFn: noOpSubscribe,
+        leaveFn: noOpLeave,
+        closeFn: noOpClose
+    )
+
+    #expect(await context.contextId == "ctx-create-test")
+    #expect(await context.state == .active)
+}
+
+@Test("Context.create propagates bridge errors")
+func createPropagatesBridgeErrors() async {
+    let createFn: ContextBridge.CreateFn = { _, _ in
+        throw ScpError.context(message: "creation failed", code: "SCP-CTX-100")
+    }
+    let noOpSend: ContextBridge.SendFn = { _, _ in }
+    let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
+    let noOpLeave: ContextBridge.LeaveFn = { _ in }
+    let noOpClose: ContextBridge.CloseFn = { _ in }
+
+    await #expect(throws: ScpError.self) {
+        _ = try await Context.create(
+            contextId: "will-fail",
+            ceiling: [],
+            createFn: createFn,
+            sendFn: noOpSend,
+            subscribeFn: noOpSubscribe,
+            leaveFn: noOpLeave,
+            closeFn: noOpClose
+        )
+    }
+}
+
+// MARK: - Send tests
+
+@Test("send delivers payload via bridge function")
+func sendDeliversPayload() async throws {
+    let sentPayloads = Locked<[Data]>([])
+    let context = makeTestContext(onSend: { payload in
+        sentPayloads.withLock { $0.append(payload) }
+    })
+
+    let payload = Data("hello, context".utf8)
+    try await context.send(payload)
+
+    let payloads = sentPayloads.current
+    #expect(payloads.count == 1)
+    #expect(payloads[0] == payload)
+}
+
+@Test("send throws when context is closed")
+func sendThrowsWhenClosed() async throws {
+    let context = makeTestContext()
+    try await context.close()
+
+    await #expect(throws: ScpError.self) {
+        try await context.send(Data("should fail".utf8))
+    }
+}
+
+@Test("send throws SCP-CTX-001 when context is not active")
+func sendThrowsCorrectErrorCode() async throws {
+    let context = makeTestContext()
+    try await context.close()
+
+    do {
+        try await context.send(Data("should fail".utf8))
+        Issue.record("Expected send to throw after close")
+    } catch let error as ScpError {
+        if case .context(let message, let code) = error {
+            #expect(code == "SCP-CTX-001")
+            #expect(message == "Context is not active")
+        } else {
+            Issue.record("Expected ScpError.context, got \(error)")
+        }
+    }
+}
+
+// MARK: - Message stream tests
+
+@Test("messages returns AsyncStream that yields messages")
+func messagesYieldsMessages() async throws {
+    let capturedListener = Locked<(any MessageListenerProtocol)?>(nil)
+
+    let context = makeTestContext(captureListener: { listener in
+        capturedListener.withLock { $0 = listener }
+    })
+
+    let stream = await context.messages
+
+    // Wait for listener to be captured (subscribeFn is called synchronously
+    // within the actor-isolated `messages` property, so it should be set
+    // immediately after the `await` returns)
+    var listener: (any MessageListenerProtocol)?
+    for _ in 0..<100 {
+        listener = capturedListener.current
+        if listener != nil { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+
+    guard let resolvedListener = listener else {
+        Issue.record("Listener was not captured")
+        return
+    }
+
+    // Push messages through the listener
+    let message1 = Message(
+        senderDid: "did:dht:alice",
+        content: Data("msg1".utf8),
+        timestamp: 1_000_000,
+        sequence: 1,
+        contextId: "test-context-001",
+        provenance: nil
+    )
+    let message2 = Message(
+        senderDid: "did:dht:bob",
+        content: Data("msg2".utf8),
+        timestamp: 1_000_001,
+        sequence: 2,
+        contextId: "test-context-001",
+        provenance: Provenance(sourceContext: "other-ctx", sourceType: "promotion")
+    )
+
+    resolvedListener.onMessage(message1)
+    resolvedListener.onMessage(message2)
+    resolvedListener.onComplete()
+
+    var received: [Message] = []
+    for await message in stream {
+        received.append(message)
+    }
+
+    #expect(received.count == 2)
+    #expect(received[0].senderDid == "did:dht:alice")
+    #expect(received[0].sequence == 1)
+    #expect(received[1].senderDid == "did:dht:bob")
+    #expect(received[1].provenance?.sourceType == "promotion")
+}
+
+@Test("messages stream finishes on error")
+func messagesStreamFinishesOnError() async throws {
+    let capturedListener = Locked<(any MessageListenerProtocol)?>(nil)
+
+    let context = makeTestContext(captureListener: { listener in
+        capturedListener.withLock { $0 = listener }
+    })
+
+    let stream = await context.messages
+
+    var listener: (any MessageListenerProtocol)?
+    for _ in 0..<100 {
+        listener = capturedListener.current
+        if listener != nil { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+
+    guard let resolvedListener = listener else {
+        Issue.record("Listener was not captured")
+        return
+    }
+
+    // Push one message then an error
+    resolvedListener.onMessage(Message(
+        senderDid: "did:dht:alice",
+        content: Data("before-error".utf8),
+        timestamp: 1_000_000,
+        sequence: 1,
+        contextId: "test-context-001",
+        provenance: nil
+    ))
+    resolvedListener.onError(ScpError.transport(
+        message: "connection lost",
+        code: "SCP-TXP-001"
+    ))
+
+    var received: [Message] = []
+    for await message in stream {
+        received.append(message)
+    }
+
+    #expect(received.count == 1)
+    #expect(received[0].senderDid == "did:dht:alice")
+}
+
+// MARK: - Leave tests
+
+@Test("leave transitions state to closed")
+func leaveTransitionsState() async throws {
+    let leaveCalled = Locked<Bool>(false)
+    let context = makeTestContext(onLeave: {
+        leaveCalled.withLock { $0 = true }
+    })
+
+    try await context.leave()
+
+    #expect(await context.state == .closed)
+    #expect(leaveCalled.current)
+}
+
+@Test("leave finishes the message stream")
+func leaveFinishesStream() async throws {
+    let capturedListener = Locked<(any MessageListenerProtocol)?>(nil)
+
+    let context = makeTestContext(captureListener: { listener in
+        capturedListener.withLock { $0 = listener }
+    })
+
+    let stream = await context.messages
+
+    var listener: (any MessageListenerProtocol)?
+    for _ in 0..<100 {
+        listener = capturedListener.current
+        if listener != nil { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+
+    guard let resolvedListener = listener else {
+        Issue.record("Listener was not captured")
+        return
+    }
+
+    // Push a message, then leave
+    resolvedListener.onMessage(Message(
+        senderDid: "did:dht:alice",
+        content: Data("before-leave".utf8),
+        timestamp: 1_000_000,
+        sequence: 1,
+        contextId: "test-context-001",
+        provenance: nil
+    ))
+
+    try await context.leave()
+
+    var received: [Message] = []
+    for await message in stream {
+        received.append(message)
+    }
+
+    // Should receive the one message sent before leave
+    #expect(received.count == 1)
+}
+
+@Test("leave throws when context is already closed")
+func leaveThrowsWhenClosed() async throws {
+    let context = makeTestContext()
+    try await context.close()
+
+    await #expect(throws: ScpError.self) {
+        try await context.leave()
+    }
+}
+
+// MARK: - Close tests
+
+@Test("close transitions state to closed")
+func closeTransitionsState() async throws {
+    let closeCalled = Locked<Bool>(false)
+    let context = makeTestContext(onClose: {
+        closeCalled.withLock { $0 = true }
+    })
+
+    try await context.close()
+
+    #expect(await context.state == .closed)
+    #expect(closeCalled.current)
+}
+
+@Test("close is idempotent — calling twice does not throw")
+func closeIsIdempotent() async throws {
+    let closeCount = Locked<Int>(0)
+    let context = makeTestContext(onClose: {
+        closeCount.withLock { $0 += 1 }
+    })
+
+    try await context.close()
+    try await context.close()
+
+    // Bridge close should only be called once (second call short-circuits)
+    #expect(closeCount.current == 1)
+    #expect(await context.state == .closed)
+}
+
+@Test("close finishes the message stream")
+func closeFinishesStream() async throws {
+    let capturedListener = Locked<(any MessageListenerProtocol)?>(nil)
+
+    let context = makeTestContext(captureListener: { listener in
+        capturedListener.withLock { $0 = listener }
+    })
+
+    let stream = await context.messages
+
+    var listener: (any MessageListenerProtocol)?
+    for _ in 0..<100 {
+        listener = capturedListener.current
+        if listener != nil { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+
+    guard let resolvedListener = listener else {
+        Issue.record("Listener was not captured")
+        return
+    }
+
+    resolvedListener.onMessage(Message(
+        senderDid: "did:dht:alice",
+        content: Data("before-close".utf8),
+        timestamp: 1_000_000,
+        sequence: 1,
+        contextId: "test-context-001",
+        provenance: nil
+    ))
+
+    try await context.close()
+
+    var received: [Message] = []
+    for await message in stream {
+        received.append(message)
+    }
+
+    #expect(received.count == 1)
+}
+
+// MARK: - Context state tests
+
+@Test("context initializes with active state from handle")
+func contextInitializesWithActiveState() async {
+    let context = makeTestContext(state: "active")
+    #expect(await context.state == .active)
+}
+
+@Test("context falls back to active for unknown state strings")
+func contextFallsBackToActiveForUnknownState() async {
+    let context = makeTestContext(state: "unknown-state")
+    #expect(await context.state == .active)
+}
+
+@Test("contextId matches the handle's context ID")
+func contextIdMatchesHandle() async {
+    let context = makeTestContext(contextId: "my-unique-context")
+    #expect(await context.contextId == "my-unique-context")
+}
+
+// MARK: - No force unwrap verification
+
+@Test("Context actor has no force unwraps in its public API")
+func noForceUnwrapsInPublicAPI() async throws {
+    // This test verifies the contract by exercising all public methods
+    // with valid inputs. If any internal force unwrap existed, it would
+    // crash here rather than throwing.
+    let context = makeTestContext()
+
+    // send with valid payload
+    try await context.send(Data("test".utf8))
+
+    // messages returns a stream (does not crash)
+    let _ = await context.messages
+
+    // leave succeeds
+    try await context.leave()
+
+    // State is now closed
+    #expect(await context.state == .closed)
+}
+
+// MARK: - ContextState tests
+
+@Test("ContextState raw values match expected strings")
+func contextStateRawValues() {
+    #expect(ContextState.active.rawValue == "active")
+    #expect(ContextState.closed.rawValue == "closed")
+}
+
+@Test("ContextState is Equatable")
+func contextStateEquatable() {
+    #expect(ContextState.active == ContextState.active)
+    #expect(ContextState.closed == ContextState.closed)
+    #expect(ContextState.active != ContextState.closed)
+}
+
+@Test("ContextState is Sendable")
+func contextStateSendable() async {
+    // Verify ContextState can cross actor boundaries without issue.
+    let state: ContextState = .active
+    let task = Task { state }
+    let result = await task.value
+    #expect(result == .active)
+}

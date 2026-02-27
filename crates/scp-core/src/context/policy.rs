@@ -130,7 +130,8 @@ pub fn has_tool_capabilities(params: &ContextParams) -> bool {
 }
 
 /// Returns `true` if the context params have an economic policy that requires
-/// payment (any non-zero cost in the cost schedule).
+/// payment (any non-zero cost in the cost schedule, or a pricing formula that
+/// may produce non-zero costs).
 ///
 /// **Non-overridable hard constraint:** Auto-accept NEVER applies to contexts
 /// with economic policy requiring payment. See
@@ -146,6 +147,7 @@ pub fn requires_payment(params: &ContextParams) -> bool {
         || cs.per_join.is_some()
         || cs.per_period.is_some()
         || cs.per_byte_stored.is_some()
+        || econ.pricing_formula.is_some()
 }
 
 /// Checks whether auto-accept is allowed for the given context params.
@@ -450,6 +452,39 @@ mod tests {
         };
         assert!(!requires_payment(&params));
         assert!(auto_accept_allowed(&params));
+    }
+
+    #[test]
+    fn pricing_formula_only_blocks_auto_accept() {
+        // A context with no CostSchedule costs but a PricingFormula that may
+        // produce non-zero costs must be detected as requiring payment.
+        // Spec invariant §19.14#9.
+        use crate::economy::PricingFormula;
+        let params = ContextParams {
+            ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+            economic_policy: Some(EconomicPolicy {
+                locked: false,
+                cost_schedule: CostSchedule {
+                    currency: CurrencyCode::from("USD"),
+                    per_message: None,
+                    per_tool_invoke: None,
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec!["x402".to_owned()],
+                pricing_formula: Some(PricingFormula {
+                    base_cost: Amount(100),
+                    variables: vec![],
+                    cap: None,
+                    floor: None,
+                }),
+                payee: DID::from("did:dht:z6MkPayee"),
+            }),
+            ..ContextParams::default()
+        };
+        assert!(requires_payment(&params));
+        assert!(!auto_accept_allowed(&params));
     }
 
     // --- Combined hard rules ---

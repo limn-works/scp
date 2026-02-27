@@ -7,7 +7,7 @@
 //!
 //! # Architecture
 //!
-//! The bridge is organized into domain modules that mirror the UniFFI bridge
+//! The bridge is organized into domain modules that mirror the `UniFFI` bridge
 //! (`crates/scp-ffi/uniffi/`) at the same logical API surface:
 //!
 //! - [`error`] — `ScpNapiError` hierarchy and `From<scp-core error>` mappings.
@@ -42,11 +42,11 @@
 //!
 //! [`scp_shutdown`] waits (with a configurable timeout, default 5 seconds)
 //! for [`HANDLE_COUNT`] to reach zero before allowing the tokio runtime to
-//! be dropped. See sdk-common.md §"FFI Async Bridging Risks" rule 4.
+//! be dropped. See `sdk-common.md` "FFI Async Bridging Risks" rule 4.
 //!
-//! # Direct scp-core calls
+//! # Direct `scp-core` calls
 //!
-//! Unlike the WASM bridge (which cannot depend on scp-core due to tokio's
+//! Unlike the WASM bridge (which cannot depend on `scp-core` due to tokio's
 //! multi-thread runtime constraint on `wasm32-unknown-unknown`), this bridge
 //! calls `scp-core` directly. The `"in_memory"` custody path in
 //! [`identity_create`](identity::identity_create) uses a real
@@ -55,8 +55,13 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
+// The `trailing_empty_array` lint fires inside napi-rs macro expansions
+// (generated `NapiRefContainer` structs). This is an napi-rs internal
+// implementation detail — the generated code is correct.
+#![allow(clippy::trailing_empty_array)]
+
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use napi_derive::napi;
@@ -121,7 +126,7 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 // `scp_shutdown` waits until this counter reaches zero (or times out)
 // before allowing the tokio runtime to be dropped.
 //
-// See sdk-common.md §"FFI Async Bridging Risks" rule 4.
+// See `sdk-common.md` "FFI Async Bridging Risks" rule 4.
 // ---------------------------------------------------------------------------
 
 /// Global count of live opaque FFI handle objects.
@@ -154,6 +159,7 @@ pub(crate) fn decrement_handle_count() {
 /// console.log(scpVersion()); // "0.1.0"
 /// ```
 #[napi]
+#[must_use]
 pub fn scp_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
@@ -166,7 +172,7 @@ pub fn scp_version() -> String {
 ///
 /// - All opaque handle objects (`NapiIdentity`, `NapiContextHandle`,
 ///   `NapiUcanToken`, `NapiTransportManager`) have been GC'd / freed, **or**
-/// - The `timeoutSecs` deadline has elapsed.
+/// - The `timeout_secs` deadline has elapsed.
 ///
 /// The default timeout is 5 seconds (per ADR-022 acceptance criterion 7).
 /// Pass `0` to return immediately without waiting.
@@ -188,11 +194,8 @@ pub fn scp_shutdown(timeout_secs: u32) {
     if timeout_secs == 0 {
         return;
     }
-    let deadline =
-        std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs));
-    while HANDLE_COUNT.load(Ordering::Relaxed) > 0
-        && std::time::Instant::now() < deadline
-    {
+    let deadline = std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs));
+    while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -219,7 +222,6 @@ mod tests {
 
     #[test]
     fn handle_count_increments_and_decrements() {
-        use std::sync::atomic::Ordering;
         let baseline = HANDLE_COUNT.load(Ordering::SeqCst);
         increment_handle_count();
         assert_eq!(HANDLE_COUNT.load(Ordering::SeqCst), baseline + 1);

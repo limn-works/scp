@@ -11,7 +11,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 21 event type variants.
+//! - [`EventType`] -- The 25 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //!
@@ -52,7 +52,7 @@ pub type Ed25519Signature = Vec<u8>;
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 21 event type variants for SCP context event logs.
+/// The 25 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the full enumeration.
@@ -100,6 +100,15 @@ pub enum EventType {
     MediaSessionStarted,
     /// A media session ended (ADR-024).
     MediaSessionEnded,
+    /// A payment was received and captured (spec section 19.6.1).
+    PaymentReceived,
+    /// The context's economic policy was changed through governance
+    /// (spec section 19.6.1).
+    EconomicPolicyChanged,
+    /// A spending UCAN was granted to an agent (spec section 19.6.1).
+    SpendingUcanGranted,
+    /// A spending UCAN was revoked (spec section 19.6.1).
+    SpendingUcanRevoked,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,5 +280,28 @@ impl EventLog {
     #[must_use]
     pub const fn sorted_leaves(&self) -> &BTreeSet<([u8; 32], u64)> {
         &self.sorted_leaves
+    }
+
+    /// Pushes a pre-computed leaf hash into the log and rebuilds the tree.
+    ///
+    /// This is used by [`checkpoint::TruncatedEventLog`] to reconstruct a
+    /// tail log from existing leaf hashes without re-verifying events.
+    /// It bypasses event verification and signature checking.
+    ///
+    /// **Internal use only.** Not part of the public append API.
+    pub(crate) fn push_leaf_raw(&mut self, leaf_hash: [u8; 32]) {
+        let leaf_index = self.leaves.len() as u64;
+        self.leaves.push(leaf_hash);
+        self.sorted_leaves.insert((leaf_hash, leaf_index));
+        self.rebuild_tree();
+    }
+
+    /// Rebuilds the interior tree from the current leaf layer.
+    ///
+    /// Called after `push_leaf_raw` to maintain tree invariants.
+    /// Delegates to the `tree` module's recompute logic via a full rebuild.
+    fn rebuild_tree(&mut self) {
+        // Use tree::recompute_after_push which handles the full recompute.
+        tree::recompute_raw(self);
     }
 }

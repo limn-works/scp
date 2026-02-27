@@ -109,6 +109,9 @@ pub fn attach_provenance(
         memory_scope: source.memory_scope,
         chain_depth,
         chain_path,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
     }
 }
 
@@ -212,6 +215,9 @@ mod tests {
             memory_scope: MemoryScope::Full,
             chain_depth: depth,
             chain_path: path.map(|p| p.into_iter().map(String::from).collect()),
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         }
     }
 

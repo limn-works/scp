@@ -44,7 +44,7 @@ pub struct NapiTransportStatus {
 /// Opaque handle to the transport layer.
 ///
 /// Exposes connection status and relay URL. The actual transport (WebSocket,
-/// multi-relay routing) is managed internally and will be wired to scp-core
+/// multi-relay routing) is managed internally and will be wired to `scp-core`
 /// in integration stories.
 ///
 /// # JS usage
@@ -64,6 +64,7 @@ pub struct NapiTransportManager {
 impl NapiTransportManager {
     /// Returns the current transport connection status.
     #[napi(getter)]
+    #[must_use]
     pub fn status(&self) -> NapiTransportStatus {
         self.status
             .lock()
@@ -81,20 +82,16 @@ impl NapiTransportManager {
 
     /// Returns `true` if the transport is currently connected.
     #[napi(getter, js_name = "isConnected")]
+    #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.status
-            .lock()
-            .map(|s| s.connected)
-            .unwrap_or(false)
+        self.status.lock().map(|s| s.connected).unwrap_or(false)
     }
 
     /// Returns the relay URL if connected, `null` otherwise.
     #[napi(getter, js_name = "relayUrl")]
+    #[must_use]
     pub fn relay_url(&self) -> Option<String> {
-        self.status
-            .lock()
-            .ok()
-            .and_then(|s| s.relay_url.clone())
+        self.status.lock().ok().and_then(|s| s.relay_url.clone())
     }
 }
 
@@ -125,10 +122,11 @@ impl Drop for NapiTransportManager {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-VALID-7000` if `relay_url` does not start with `wss://`.
+/// - Rejects with `SCP-VAL-7000` if `relay_url` does not start with `wss://`.
 /// - Rejects with `SCP-TRANS-6001` if the connection fails (unreachable relay,
 ///   protocol mismatch, timeout, authentication failure) in the full runtime.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportManager> {
     if !relay_url.starts_with("wss://") {
         return Err(ScpNapiError::Validation {
@@ -161,7 +159,13 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
 /// # Returns
 ///
 /// A `Promise<NapiTransportStatus>` with the current connection state.
+///
+/// # Errors
+///
+/// This function is infallible — the `Result` return type is required by
+/// the napi-rs bridge pattern.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<NapiTransportStatus> {
     Ok(manager.status())
 }
@@ -180,12 +184,9 @@ pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<Na
 ///
 /// Rejects with `SCP-TRANS-6002` if the manager is not connected.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Result<()> {
-    let connected = manager
-        .status
-        .lock()
-        .map(|s| s.connected)
-        .unwrap_or(false);
+    let connected = manager.status.lock().map(|s| s.connected).unwrap_or(false);
 
     if !connected {
         return Err(ScpNapiError::Transport {

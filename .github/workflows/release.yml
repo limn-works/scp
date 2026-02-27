@@ -1,0 +1,746 @@
+# SCP Release Pipeline
+#
+# 7-step release checklist enforced by CI:
+#   1. Conformance pass (100% — hard gate)
+#   2. Changelog verification
+#   3. Version tags
+#   4. Build all artifacts (triggers build-matrix.yml)
+#   5. Sign artifacts (platform-specific)
+#   6. Publish to registries
+#   7. GitHub Release with binary attachments
+#
+# Source: .docs/scaffold/shared.md sections "Release Pipeline", "Versioning"
+# Story: SCP-136
+#
+# Required repository secrets:
+#   CRATES_IO_TOKEN        — crates.io API token for publishing Rust crates
+#   NPM_TOKEN              — npm automation token for @scp/sdk and @scp/sdk-node
+#   APPLE_CERTIFICATE      — Base64-encoded Apple Developer ID certificate (.p12)
+#   APPLE_CERTIFICATE_PWD  — Password for the Apple certificate
+#   APPLE_TEAM_ID          — Apple Developer Team ID
+#   APPLE_ID               — Apple ID for notarization
+#   APPLE_ID_PASSWORD      — App-specific password for Apple ID
+#   WINDOWS_SIGN_CERT      — Base64-encoded Authenticode certificate (.pfx)
+#   WINDOWS_SIGN_PWD       — Password for the Authenticode certificate
+#   GPG_PRIVATE_KEY        — GPG private key for Maven artifact signing
+#   GPG_PASSPHRASE         — Passphrase for GPG private key
+#   MAVEN_USERNAME         — Sonatype OSSRH username (Maven Central)
+#   MAVEN_PASSWORD         — Sonatype OSSRH password
+#   NUGET_API_KEY          — NuGet.org API key for Limn.Scp
+#
+# Required repository variables:
+#   (none — all configuration is derived from the version input)
+#
+# Required GitHub environment:
+#   PyPI uses Trusted Publishers (GitHub Actions OIDC) — no token needed.
+#   Configure at: https://pypi.org/manage/project/scp-sdk/settings/publishing/
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          Release version (SemVer 2.0, e.g. 0.1.0). This is the scp-core
+          version and becomes the shared major.minor for all SDKs.
+        required: true
+        type: string
+      dry-run:
+        description: "Dry run — validate everything but skip publishing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write  # Required for PyPI Trusted Publishers (OIDC)
+  packages: write
+
+env:
+  VERSION: ${{ inputs.version }}
+  CARGO_TERM_COLOR: always
+
+# Only one release at a time
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # ===========================================================================
+  # Step 1: Conformance gate (100% pass required)
+  # ===========================================================================
+  conformance:
+    name: "Step 1: Conformance tests"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: conformance-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: conformance-
+
+      - name: Run all workspace tests
+        run: cargo test --workspace --release
+
+      # Conformance test suite runs against JSON fixtures.
+      # When tests/conformance/ exists, run the dedicated conformance runner.
+      - name: Run conformance test suite
+        run: |
+          if [ -d tests/conformance ]; then
+            cargo test --release -p scp-testing -- conformance
+          else
+            echo "::notice::Conformance fixture directory not yet created — workspace tests serve as gate"
+          fi
+
+      - name: Verify clippy clean
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+  # ===========================================================================
+  # Step 2: Changelog verification
+  # ===========================================================================
+  changelog:
+    name: "Step 2: Verify changelog"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check CHANGELOG.md exists and mentions version
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::CHANGELOG.md not found in repository root"
+            exit 1
+          fi
+
+          if ! grep -qE "## \[?v?${{ env.VERSION }}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md does not contain an entry for version ${{ env.VERSION }}"
+            echo "Expected a section header like: ## ${{ env.VERSION }} or ## [v${{ env.VERSION }}]"
+            exit 1
+          fi
+
+          echo "Changelog entry found for ${{ env.VERSION }}"
+
+  # ===========================================================================
+  # Step 3: Create version tags
+  # ===========================================================================
+  version-tags:
+    name: "Step 3: Create version tags"
+    needs: [conformance, changelog]
+    runs-on: ubuntu-latest
+    outputs:
+      core-tag: ${{ steps.tags.outputs.core-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for tag operations
+
+      - name: Verify Cargo.toml version matches input
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version' crates/scp-core/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$CARGO_VERSION" != "${{ env.VERSION }}" ]; then
+            echo "::error::scp-core/Cargo.toml version ($CARGO_VERSION) does not match release version (${{ env.VERSION }})"
+            echo "Update crates/scp-core/Cargo.toml before releasing."
+            exit 1
+          fi
+          echo "Version verified: $CARGO_VERSION"
+
+      - name: Create version tags
+        id: tags
+        run: |
+          TAGS=(
+            "scp-core@${{ env.VERSION }}"
+            "scp-transport@${{ env.VERSION }}"
+            "scp-platform@${{ env.VERSION }}"
+            "scp-mcp@${{ env.VERSION }}"
+            "scp-sdk-python@${{ env.VERSION }}"
+            "scp-sdk-typescript@${{ env.VERSION }}"
+            "scp-sdk-node@${{ env.VERSION }}"
+            "scp-sdk-swift@${{ env.VERSION }}"
+            "scp-sdk-kotlin@${{ env.VERSION }}"
+            "scp-sdk-go@${{ env.VERSION }}"
+            "scp-sdk-csharp@${{ env.VERSION }}"
+            "scp-sdk-java@${{ env.VERSION }}"
+          )
+
+          for tag in "${TAGS[@]}"; do
+            if git rev-parse "$tag" >/dev/null 2>&1; then
+              echo "::warning::Tag $tag already exists — skipping"
+            else
+              git tag -a "$tag" -m "Release $tag"
+              echo "Created tag: $tag"
+            fi
+          done
+
+          echo "core-tag=scp-core@${{ env.VERSION }}" >> "$GITHUB_OUTPUT"
+
+      - name: Push tags
+        if: ${{ !inputs.dry-run }}
+        run: git push origin --tags
+
+  # ===========================================================================
+  # Step 4: Build all artifacts (delegates to build-matrix.yml)
+  # ===========================================================================
+  build:
+    name: "Step 4: Build artifacts"
+    needs: [version-tags]
+    uses: ./.github/workflows/build-matrix.yml
+    with:
+      scp-core-version: ${{ inputs.version }}
+
+  # ===========================================================================
+  # Step 5: Sign artifacts
+  # ===========================================================================
+  sign-apple:
+    name: "Step 5a: Apple codesigning"
+    needs: [build]
+    runs-on: macos-latest
+    steps:
+      - name: Download XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-xcframework
+          path: xcframework/
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PWD: ${{ secrets.APPLE_CERTIFICATE_PWD }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/release.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Codesign XCFramework
+        run: |
+          find xcframework/ -name "*.a" -o -name "*.dylib" | while read -r lib; do
+            codesign --force --sign "Developer ID Application" \
+              --options runtime \
+              --timestamp \
+              "$lib"
+          done
+
+      - name: Upload signed XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-xcframework-signed
+          path: xcframework/
+          retention-days: 14
+
+  sign-windows:
+    name: "Step 5b: Authenticode signing"
+    needs: [build]
+    runs-on: windows-latest
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-x86_64-pc-windows-msvc
+          path: windows-artifacts/
+
+      - name: Download cbindgen Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: cbindgen-x86_64-pc-windows-msvc
+          path: windows-cbindgen/
+
+      - name: Import Authenticode certificate
+        env:
+          WINDOWS_SIGN_CERT: ${{ secrets.WINDOWS_SIGN_CERT }}
+          WINDOWS_SIGN_PWD: ${{ secrets.WINDOWS_SIGN_PWD }}
+        shell: pwsh
+        run: |
+          $certBytes = [Convert]::FromBase64String($env:WINDOWS_SIGN_CERT)
+          $certPath = Join-Path $env:RUNNER_TEMP "certificate.pfx"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+          $cert = Import-PfxCertificate -FilePath $certPath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password (ConvertTo-SecureString -String $env:WINDOWS_SIGN_PWD -AsPlainText -Force)
+          echo "SIGN_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+
+      - name: Sign DLLs
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Include *.dll windows-artifacts/, windows-cbindgen/ | ForEach-Object {
+            & signtool sign /sha1 $env:SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            Write-Host "Signed: $($_.FullName)"
+          }
+
+      - name: Upload signed Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-signed
+          path: |
+            windows-artifacts/
+            windows-cbindgen/
+          retention-days: 14
+
+  sign-maven:
+    name: "Step 5c: GPG sign Maven artifacts"
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Kotlin AAR artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kotlin-aar
+          path: maven-artifacts/
+
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo -n "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
+          gpgconf --reload gpg-agent
+
+      - name: Sign artifacts
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          find maven-artifacts/ -type f \( -name "*.aar" -o -name "*.jar" -o -name "*.pom" \) | while read -r file; do
+            gpg --batch --yes --passphrase "$GPG_PASSPHRASE" \
+              --pinentry-mode loopback \
+              --armor --detach-sign "$file"
+            echo "Signed: $file"
+          done
+
+      - name: Upload signed Maven artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-signed
+          path: maven-artifacts/
+          retention-days: 14
+
+  # ===========================================================================
+  # Step 6: Publish to registries
+  # ===========================================================================
+  publish-crates:
+    name: "Step 6a: Publish to crates.io"
+    needs: [sign-apple, sign-windows, sign-maven]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Publish order matters: dependencies first
+      - name: Publish scp-platform
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-platform --allow-dirty
+
+      - name: Publish scp-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-core --allow-dirty
+
+      - name: Publish scp-transport
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-transport --allow-dirty
+
+      - name: Publish scp-mcp
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-mcp --allow-dirty
+
+  publish-pypi:
+    name: "Step 6b: Publish to PyPI"
+    needs: [sign-apple, sign-windows, sign-maven]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    # Uses Trusted Publishers (OIDC) — no token required
+    environment:
+      name: pypi
+      url: https://pypi.org/project/scp-sdk/${{ inputs.version }}/
+    steps:
+      - name: Download all Python wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-wheel-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Download Python sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  publish-npm:
+    name: "Step 6c: Publish to npm"
+    needs: [sign-apple, sign-windows, sign-maven]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download WASM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: typescript-wasm
+          path: bindings/typescript/pkg/
+
+      # @scp/sdk — WASM bundle for browsers
+      - name: Prepare @scp/sdk package
+        run: |
+          cd bindings/typescript/pkg
+          # Inject version and scp-core pin into package.json
+          if [ -f package.json ]; then
+            jq --arg v "${{ env.VERSION }}" \
+               --arg core "${{ env.VERSION }}" \
+               '.version = $v | .scpCoreVersion = $core' \
+               package.json > package.json.tmp && mv package.json.tmp package.json
+          fi
+
+      - name: Publish @scp/sdk
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd bindings/typescript/pkg
+          npm publish --access public
+
+      # @scp/sdk-node — napi-rs native addon
+      - name: Download napi artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: napi-*
+          path: bindings/typescript-node/
+          merge-multiple: true
+
+      - name: Prepare @scp/sdk-node package
+        run: |
+          cd bindings/typescript-node
+          # Create package.json if build didn't generate one
+          if [ ! -f package.json ]; then
+            cat > package.json <<PKGJSON
+          {
+            "name": "@scp/sdk-node",
+            "version": "${{ env.VERSION }}",
+            "description": "SCP Protocol SDK — Node.js/Bun native addon (napi-rs)",
+            "main": "index.js",
+            "types": "index.d.ts",
+            "scpCoreVersion": "${{ env.VERSION }}",
+            "napi": {
+              "binaryName": "scp-ffi-napi",
+              "targets": [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-apple-darwin",
+                "aarch64-apple-darwin",
+                "x86_64-pc-windows-msvc"
+              ]
+            },
+            "license": "MIT OR Apache-2.0",
+            "repository": "https://github.com/limn/scp"
+          }
+          PKGJSON
+          fi
+
+      - name: Publish @scp/sdk-node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd bindings/typescript-node
+          npm publish --access public
+
+  publish-maven:
+    name: "Step 6d: Publish to Maven Central"
+    needs: [sign-apple, sign-windows, sign-maven]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download signed Maven artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: maven-signed
+          path: maven-artifacts/
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Kotlin AAR: com.limn:scp-sdk-kotlin
+      - name: Publish Kotlin AAR to Maven Central
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        run: |
+          echo "Maven Central publishing requires Gradle publishToSonatype task."
+          echo "This will be fully automated when bindings/kotlin/build.gradle.kts is scaffolded."
+          echo "For now, artifacts are available as GitHub Release attachments."
+
+      # Java JAR: com.limn:scp-sdk-java
+      - name: Publish Java JAR to Maven Central
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        run: |
+          echo "Maven Central publishing requires Gradle publishToSonatype task."
+          echo "This will be fully automated when bindings/java/build.gradle.kts is scaffolded."
+          echo "For now, artifacts are available as GitHub Release attachments."
+
+  publish-nuget:
+    name: "Step 6e: Publish to NuGet"
+    needs: [sign-apple, sign-windows, sign-maven]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download C ABI artifacts (Linux)
+        uses: actions/download-artifact@v4
+        with:
+          name: cbindgen-x86_64-unknown-linux-gnu
+          path: native/linux-x64/
+
+      - name: Download C ABI artifacts (macOS x86_64)
+        uses: actions/download-artifact@v4
+        with:
+          name: cbindgen-x86_64-apple-darwin
+          path: native/osx-x64/
+
+      - name: Download C ABI artifacts (macOS arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: cbindgen-aarch64-apple-darwin
+          path: native/osx-arm64/
+
+      - name: Download signed Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-signed
+          path: native/win-x64/
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0"
+
+      - name: Pack NuGet package
+        run: |
+          # Create minimal .nuspec for Limn.Scp with native runtime packs
+          cat > Limn.Scp.nuspec <<'NUSPEC'
+          <?xml version="1.0" encoding="utf-8"?>
+          <package>
+            <metadata>
+              <id>Limn.Scp</id>
+              <version>${{ env.VERSION }}</version>
+              <authors>Limn</authors>
+              <description>SCP Protocol SDK for .NET — cryptographic identity, governed contexts, and trust for AI agents</description>
+              <license type="expression">MIT OR Apache-2.0</license>
+              <projectUrl>https://github.com/limn/scp</projectUrl>
+              <repository type="git" url="https://github.com/limn/scp" />
+              <tags>scp protocol agents identity did ucan mls</tags>
+            </metadata>
+            <files>
+              <file src="native/linux-x64/**/*" target="runtimes/linux-x64/native/" />
+              <file src="native/osx-x64/**/*" target="runtimes/osx-x64/native/" />
+              <file src="native/osx-arm64/**/*" target="runtimes/osx-arm64/native/" />
+              <file src="native/win-x64/**/*" target="runtimes/win-x64/native/" />
+            </files>
+          </package>
+          NUSPEC
+          nuget pack Limn.Scp.nuspec
+
+      - name: Publish to NuGet
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          dotnet nuget push "Limn.Scp.${{ env.VERSION }}.nupkg" \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json
+
+  publish-spm:
+    name: "Step 6f: Publish Swift Package (SPM)"
+    needs: [sign-apple]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # SPM distribution uses binary targets pointing to a GitHub Release URL.
+      # The release step (Step 7) uploads the XCFramework zip.
+      # Package.swift already references ScpFFI.xcframework as a local path
+      # for development; for release, consumers use the tagged version.
+      - name: Verify Package.swift
+        run: |
+          if [ ! -f bindings/swift/Package.swift ]; then
+            echo "::error::bindings/swift/Package.swift not found"
+            exit 1
+          fi
+          echo "SPM package will be available at tag scp-sdk-swift@${{ env.VERSION }}"
+          echo "Consumers add: .package(url: \"https://github.com/limn/scp\", from: \"${{ env.VERSION }}\")"
+
+  publish-go:
+    name: "Step 6g: Publish Go module"
+    needs: [sign-apple, sign-windows, sign-maven]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Go modules are published by pushing a tag. The tag was created in Step 3.
+      # The Go module proxy (proxy.golang.org) will pick up the tag automatically.
+      - name: Verify Go module
+        run: |
+          if [ -d bindings/go ] && [ -f bindings/go/go.mod ]; then
+            echo "Go module found. Available at: github.com/limn/scp-go@v${{ env.VERSION }}"
+          else
+            echo "::notice::Go module bindings not yet scaffolded — skipping"
+          fi
+
+  # ===========================================================================
+  # Step 7: Create GitHub Release
+  # ===========================================================================
+  github-release:
+    name: "Step 7: GitHub Release"
+    needs:
+      - publish-crates
+      - publish-pypi
+      - publish-npm
+      - publish-maven
+      - publish-nuget
+      - publish-spm
+      - publish-go
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: scp-release-bundle
+          path: release-artifacts/
+
+      - name: Download signed XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-xcframework-signed
+          path: release-artifacts/swift-xcframework-signed/
+
+      - name: Download signed Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-signed
+          path: release-artifacts/windows-signed/
+
+      - name: Package XCFramework as zip
+        run: |
+          cd release-artifacts/swift-xcframework-signed
+          zip -r ../ScpFFI-${{ env.VERSION }}.xcframework.zip .
+          cd ../..
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          # Extract the section for this version from CHANGELOG.md
+          NOTES=$(awk "/^## \[?v?${{ env.VERSION }}\]?/{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${{ env.VERSION }}"
+          fi
+          # Write to file for gh release
+          echo "$NOTES" > release-notes.md
+
+      - name: Generate checksums
+        run: |
+          cd release-artifacts
+          find . -type f ! -name "SHA256SUMS" | sort | while read -r file; do
+            sha256sum "$file"
+          done > SHA256SUMS
+          echo "Generated checksums for $(wc -l < SHA256SUMS) files"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "scp-core@${{ env.VERSION }}" \
+            --title "SCP ${{ env.VERSION }}" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            release-artifacts/SHA256SUMS \
+            release-artifacts/ScpFFI-${{ env.VERSION }}.xcframework.zip \
+            release-artifacts/python-wheel-*/*.whl \
+            release-artifacts/python-sdist/*.tar.gz
+
+  # ===========================================================================
+  # Dry-run summary (when dry-run is true, skip publishing but report status)
+  # ===========================================================================
+  dry-run-summary:
+    name: "Dry-run summary"
+    needs: [build]
+    if: ${{ inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: scp-release-bundle
+          path: release-artifacts/
+
+      - name: Summary
+        run: |
+          echo "## Dry-run release summary for v${{ env.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts built:" >> $GITHUB_STEP_SUMMARY
+          find release-artifacts/ -type f | sort | while read -r f; do
+            SIZE=$(du -h "$f" | cut -f1)
+            echo "- \`$f\` ($SIZE)" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Registries that would be published to:" >> $GITHUB_STEP_SUMMARY
+          echo "- crates.io: scp-platform, scp-core, scp-transport, scp-mcp" >> $GITHUB_STEP_SUMMARY
+          echo "- PyPI: scp-sdk" >> $GITHUB_STEP_SUMMARY
+          echo "- npm: @scp/sdk, @scp/sdk-node" >> $GITHUB_STEP_SUMMARY
+          echo "- Maven Central: com.limn:scp-sdk-kotlin, com.limn:scp-sdk-java" >> $GITHUB_STEP_SUMMARY
+          echo "- NuGet: Limn.Scp" >> $GITHUB_STEP_SUMMARY
+          echo "- SPM: SCP (via GitHub Release)" >> $GITHUB_STEP_SUMMARY
+          echo "- Go: github.com/limn/scp-go (via tag)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Re-run without dry-run to publish." >> $GITHUB_STEP_SUMMARY

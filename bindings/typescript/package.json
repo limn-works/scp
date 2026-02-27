@@ -1,0 +1,46 @@
+{
+  "name": "@scp/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "lint": "biome check src/ tests/",
+    "format": "biome format --write src/ tests/",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=22",
+    "bun": ">=1.0"
+  },
+  "optionalDependencies": {
+    "@scp/sdk-napi-linux-x64-gnu": "0.1.0",
+    "@scp/sdk-napi-linux-arm64-gnu": "0.1.0",
+    "@scp/sdk-napi-darwin-x64": "0.1.0",
+    "@scp/sdk-napi-darwin-arm64": "0.1.0",
+    "@scp/sdk-napi-win32-x64-msvc": "0.1.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "@types/node": "^25.3.2",
+    "tsup": "latest",
+    "typescript": "^5.7.0",
+    "vitest": "latest"
+  }
+}

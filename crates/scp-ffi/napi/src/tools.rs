@@ -20,7 +20,7 @@ use crate::error::ScpNapiError;
 
 /// Tool definition for registration in a context.
 ///
-/// See ADR-010 (Tool Registry) and spec §6 (Tools).
+/// See ADR-010 (Tool Registry) and spec section 6 (Tools).
 #[napi(object)]
 pub struct NapiToolDefinition {
     /// Human-readable tool name.
@@ -76,6 +76,7 @@ pub struct NapiToolVerificationResult {
 /// - Rejects with `SCP-TOOL-5001` if registration fails (permission denied,
 ///   schema invalid, duplicate name, etc.) in the full runtime.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn tool_register(
     handle: &NapiContextHandle,
     definition: NapiToolDefinition,
@@ -115,6 +116,8 @@ pub async fn tool_register(
 /// - Rejects with `SCP-TOOL-5002` if invocation fails (tool not found,
 ///   input fails schema validation, invoker lacks capability).
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn tool_invoke(
     handle: &NapiContextHandle,
     tool_id: String,
@@ -152,6 +155,8 @@ pub async fn tool_invoke(
 /// - Rejects with `SCP-TOOL-5007` if the context is not `"active"`.
 /// - Rejects with `SCP-TOOL-5001` if the tool is not found in the context.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn tool_verify(
     handle: &NapiContextHandle,
     tool_id: String,

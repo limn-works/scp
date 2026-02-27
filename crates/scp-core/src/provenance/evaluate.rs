@@ -154,6 +154,9 @@ mod tests {
             memory_scope: MemoryScope::Full,
             chain_depth: 0,
             chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         }
     }
 
@@ -360,6 +363,9 @@ mod tests {
             memory_scope: MemoryScope::Full,
             chain_depth: 2,
             chain_path: Some(vec!["ctx-hop".into()]),
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
         };
 
         update_source_type(&mut prov, &SourceContextState::ClosedEphemeral);

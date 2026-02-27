@@ -26,6 +26,7 @@ pub mod envelope;
 pub mod event_log;
 pub mod identity;
 pub mod provenance;
+pub mod sync;
 pub mod trust;
 pub mod uri;
 pub mod well_known;

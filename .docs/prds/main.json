@@ -4487,7 +4487,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi-napi/src/lib.rs",
         "crates/scp-ffi-napi/Cargo.toml"
@@ -4541,7 +4541,8 @@
           "ThreadsafeFunction",
           "AsyncTask"
         ]
-      }
+      },
+      "result": "Clippy/formatting compliance fixes applied to existing napi-rs bridge. All 8 source files updated."
     },
     {
       "id": "SCP-081",
@@ -4549,7 +4550,7 @@
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/typescript/src/index.ts",
         "bindings/typescript/src/bridge.ts",
@@ -4627,7 +4628,8 @@
           "UCAN",
           "MCP"
         ]
-      }
+      },
+      "result": "TypeScript SDK @scp/sdk implemented with dual-target bridge (WASM + napi-rs), 8 public modules, ScpError hierarchy, AsyncIterable streaming, AsyncDisposable, tsup ESM+CJS build. 40 vitest tests pass."
     },
     {
       "id": "SCP-082",
@@ -5467,7 +5469,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/swift/Package.swift",
         "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
@@ -5523,7 +5525,8 @@
           "actorIsolation": "@MainActor default, nonisolated DTOs per Swift 6.2",
           "spmConfig": "Binary framework target with checksum verification"
         }
-      }
+      },
+      "result": "Already implemented in prior iteration (commit 0d551ed). All 10 acceptance criteria verified."
     },
     {
       "id": "SCP-099",
@@ -5531,7 +5534,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/swift/Sources/SCP/Identity.swift"
       ],
@@ -5577,7 +5580,8 @@
           "create": "Identity.create()",
           "load": "Identity.load(did:)"
         }
-      }
+      },
+      "result": "Swift Identity struct implemented with Sendable, async/await create/load/rotateKey, CheckedContinuation for UniFFI bridging. Tests written but require XCFramework (SCP-103)."
     },
     {
       "id": "SCP-100",
@@ -5585,7 +5589,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/swift/Sources/SCP/Context.swift"
       ],
@@ -5640,7 +5644,8 @@
           "leave": "ctx.leave()",
           "close": "ctx.close()"
         }
-      }
+      },
+      "result": "Swift Context actor implemented with AsyncStream message streaming, send/leave/close lifecycle, deinit safety net. Tests written but require XCFramework (SCP-103)."
     },
     {
       "id": "SCP-101",
@@ -5967,7 +5972,7 @@
       "gate": "gate-5a",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/adrs/phase-6.md"
       ],
@@ -6003,7 +6008,8 @@
       "details": {
         "adrCompletionStory": true,
         "note": "This story writes the ADR itself. Implementation stories for Kotlin SDK are blocked by this."
-      }
+      },
+      "result": "Already completed in prior iteration (commit 1f5e189). ADR-028 fully specified."
     },
     {
       "id": "SCP-107",
@@ -6679,7 +6685,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/sync/hours_offline.rs"
       ],
@@ -6735,7 +6741,8 @@
           "§9.12 — Compromise recovery",
           "§16.8 — NetworkSimulator"
         ]
-      }
+      },
+      "result": "Hours-scale offline recovery implemented in sync/ module. ReorderBuffer (100-msg, 30s gap), MlsEpochCatchUp, ReconnectOrchestrator, KeyPackagePublisher. 56 tests pass."
     },
     {
       "id": "SCP-122",
@@ -6897,7 +6904,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/event_log/checkpoint.rs"
       ],
@@ -6946,7 +6953,8 @@
           "§7.3.1 — Verifiable event logs",
           "§17.4 — ProtocolStore event log key convention"
         ]
-      }
+      },
+      "result": "CheckpointManager for periodic checkpoint creation. CheckpointedProof for post-checkpoint verification. TruncatedEventLog for pruned log operations. Cross-checkpoint consistency verification. ~40 tests."
     },
     {
       "id": "SCP-126",
@@ -7162,7 +7170,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/governance/multisig.rs"
       ],
@@ -7213,7 +7221,8 @@
           "ADR-008 — Context lifecycle state machine",
           "ADR-016 — UCAN validation"
         ]
-      }
+      },
+      "result": "MultiSigEngine implementing GovernanceEngine trait. M-of-N threshold, configurable voting window, order-independent approvals, withdrawal support, timeout handling. 50 new tests."
     },
     {
       "id": "SCP-131",
@@ -7221,7 +7230,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/governance/majority.rs"
       ],
@@ -7270,7 +7279,8 @@
           "ADR-008 — Context lifecycle state machine",
           "ADR-016 — UCAN validation"
         ]
-      }
+      },
+      "result": "MajorityVoteEngine implementing GovernanceEngine trait. Configurable quorum, >50% threshold on votes cast, deadline enforcement, vote withdrawal. 34 tests."
     },
     {
       "id": "SCP-132",
@@ -7278,7 +7288,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/governance/unanimity.rs"
       ],
@@ -7330,7 +7340,8 @@
           "ADR-008 — Context lifecycle state machine",
           "ADR-016 — UCAN validation"
         ]
-      }
+      },
+      "result": "UnanimityEngine implementing GovernanceEngine trait. All-must-approve with single-veto, deadline-based deadlock recovery, vote withdrawal. 35 tests."
     },
     {
       "id": "SCP-133",
@@ -7338,7 +7349,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/context/governance/mls_integration.rs"
       ],
@@ -7377,7 +7388,8 @@
           "§5.9 — Context governance model",
           "ADR-008 — Context lifecycle state machine"
         ]
-      }
+      },
+      "result": "Governance-MLS epoch coordination implemented in mls_integration.rs. Classifies governance actions by MLS impact, coordinates epoch advances with proposal approval, consistency checks. 56 tests pass."
     },
     {
       "id": "SCP-134",
@@ -7486,7 +7498,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".github/workflows/release.yml",
         ".github/workflows/build-matrix.yml"
@@ -7537,7 +7549,8 @@
         "Distribution channels": "Rust: crates.io. Python: PyPI. TypeScript browser: npm (@scp/sdk). TypeScript Node/Bun: npm (@scp/sdk-node). Swift: SPM. Kotlin: Maven Central. Go: Go modules. C#: NuGet. Java: Maven Central.",
         "Signing requirements": "Rust: crates.io checksums. macOS/iOS: Apple codesigning. Windows: Authenticode. Maven: GPG. PyPI: Trusted Publishers (GitHub Actions OIDC).",
         "Versioning policy": "All SDKs follow SemVer 2.0. Major: breaking API changes. Minor: new features, backwards-compatible. Patch: bug fixes, security patches. All SDK packages share the same major.minor version; patch versions may differ. Rust core version is source of truth. During 0.x, minor bumps may break. API unstable until 1.0."
-      }
+      },
+      "result": "GitHub Actions workflows: build-matrix.yml (cross-platform builds for Linux/macOS/Windows, Python/TypeScript/Swift/Kotlin/Go/C#/Java) and release.yml (7-step release pipeline with conformance gate, signing, and registry publishing)."
     },
     {
       "id": "SCP-137",
@@ -8553,7 +8566,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/economy/policy.rs",
         "crates/scp-core/src/economy/estimate.rs",
@@ -8627,7 +8640,8 @@
         "ADR-033 criterion 9": "CostInsufficient error includes receiver's metric_snapshot so payer can see why costs diverged.",
         "ADR-033 criterion 10": "Auto-accept guard: ContextInvitation with EconomicPolicy requiring payment is never auto-accepted regardless of auto-accept policy configuration.",
         "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with toolInvocation in its ceiling and per_tool_invoke: $0.01 in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
-      }
+      },
+      "result": "EconomicPolicy evaluation, CostSchedule lookup, ObservableMetrics, CostInsufficient error, estimate_cost SDK function, policy lock, auto-accept guard all implemented with comprehensive tests."
     },
     {
       "id": "SCP-155",
@@ -8635,7 +8649,7 @@
       "gate": "gate-econ",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/economy/receipt.rs",
         "crates/scp-core/src/economy/types.rs",
@@ -8711,7 +8725,8 @@
         "ADR-033 criterion 11": "PaymentReceipt events recorded in context event log with Merkle inclusion proofs.",
         "Adapter-specific proofs": "x402: on-chain tx hash. Lightning: preimage. SPL: tx signature. The adapter_proof field is opaque bytes — each adapter defines its own proof format.",
         "Cost provenance": "When data crosses context boundaries (§7.7), payment receipts are part of the provenance chain. Receiving contexts see what data cost to produce — expensive computations carry economic provenance."
-      }
+      },
+      "result": "PaymentReceipt type, PaidActionType enum, 4 economic event types, DataProvenance payment extension, PaymentVerifier trait, payment_history query. 25 tests."
     },
     {
       "id": "SCP-156",

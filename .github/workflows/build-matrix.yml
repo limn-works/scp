@@ -1,0 +1,503 @@
+# Build matrix for SCP release artifacts
+#
+# Triggered by tag pushes (scp-*@*) or by the release workflow (workflow_call).
+# Builds platform-specific artifacts for all SDK targets and uploads them as
+# GitHub Actions artifacts for downstream signing and publishing.
+#
+# Source: .docs/scaffold/shared.md section "Build matrix"
+# Story: SCP-136
+
+name: Build Matrix
+
+on:
+  push:
+    tags:
+      - "scp-*@*"
+  workflow_call:
+    inputs:
+      scp-core-version:
+        description: "scp-core version (source of truth for all SDK versions)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+  # Resolved from tag or workflow_call input
+  SCP_CORE_VERSION: ${{ inputs.scp-core-version || github.ref_name }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Rust crates — build and test on all platforms
+  # ---------------------------------------------------------------------------
+  rust:
+    name: Rust (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: rust-${{ matrix.target }}-
+
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build all crates
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests (native targets only)
+        if: >-
+          matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Upload Rust artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/libscp_core*
+            target/${{ matrix.target }}/release/scp_core*
+            target/${{ matrix.target }}/release/libscp_ffi*
+            target/${{ matrix.target }}/release/scp_ffi*
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Python wheels — maturin-built manylinux2014 / macOS / Windows wheels
+  # ---------------------------------------------------------------------------
+  python-wheels:
+    name: Python wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: manylinux2014
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: manylinux2014
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            manylinux: auto
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            manylinux: auto
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            manylinux: auto
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: >-
+            --release
+            --out dist
+            --manifest-path crates/scp-ffi/Cargo.toml
+          working-directory: bindings/python
+
+      - name: Upload Python wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
+          retention-days: 7
+
+  python-sdist:
+    name: Python sdist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: >-
+            --out dist
+            --manifest-path crates/scp-ffi/Cargo.toml
+          working-directory: bindings/python
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: bindings/python/dist/*.tar.gz
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # TypeScript (browser) — wasm-pack WASM bundle for @scp/sdk
+  # ---------------------------------------------------------------------------
+  typescript-wasm:
+    name: TypeScript WASM (@scp/sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM bundle
+        run: |
+          wasm-pack build crates/scp-ffi/wasm \
+            --target bundler \
+            --out-dir ../../../bindings/typescript/pkg \
+            --release
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: typescript-wasm
+          path: bindings/typescript/pkg/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # TypeScript (Node/Bun) — napi-rs native addon for @scp/sdk-node
+  # ---------------------------------------------------------------------------
+  typescript-napi:
+    name: TypeScript napi (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            napi-target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            napi-target: aarch64-unknown-linux-gnu
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            napi-target: x86_64-apple-darwin
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            napi-target: aarch64-apple-darwin
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            napi-target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install napi-cli
+        run: npm install -g @napi-rs/cli
+
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build napi addon
+        run: |
+          cd crates/scp-ffi/napi
+          napi build --release --target ${{ matrix.napi-target }} --output-dir ../../../bindings/typescript-node/
+
+      - name: Upload napi artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-${{ matrix.target }}
+          path: bindings/typescript-node/*.node
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Swift — XCFramework (macOS universal2 + iOS arm64 + iOS Simulator)
+  # ---------------------------------------------------------------------------
+  swift-xcframework:
+    name: Swift XCFramework
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-apple-darwin,
+            x86_64-apple-darwin,
+            aarch64-apple-ios,
+            x86_64-apple-ios,
+            aarch64-apple-ios-sim
+
+      - name: Build for macOS (x86_64)
+        run: cargo build --release --target x86_64-apple-darwin -p scp-ffi-uniffi
+
+      - name: Build for macOS (aarch64)
+        run: cargo build --release --target aarch64-apple-darwin -p scp-ffi-uniffi
+
+      - name: Build for iOS (arm64)
+        run: cargo build --release --target aarch64-apple-ios -p scp-ffi-uniffi
+
+      - name: Build for iOS Simulator (arm64)
+        run: cargo build --release --target aarch64-apple-ios-sim -p scp-ffi-uniffi
+
+      - name: Build for iOS Simulator (x86_64)
+        run: cargo build --release --target x86_64-apple-ios -p scp-ffi-uniffi
+
+      - name: Create universal macOS binary
+        run: |
+          mkdir -p target/universal-macos/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/libscp_ffi_uniffi.a \
+            target/aarch64-apple-darwin/release/libscp_ffi_uniffi.a \
+            -output target/universal-macos/release/libscp_ffi_uniffi.a
+
+      - name: Create universal iOS Simulator binary
+        run: |
+          mkdir -p target/universal-ios-sim/release
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libscp_ffi_uniffi.a \
+            target/x86_64-apple-ios/release/libscp_ffi_uniffi.a \
+            -output target/universal-ios-sim/release/libscp_ffi_uniffi.a
+
+      - name: Generate UniFFI Swift bindings
+        run: |
+          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen generate \
+            --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib \
+            --language swift \
+            --out-dir bindings/swift/Sources/SCP
+
+      - name: Create module map
+        run: |
+          mkdir -p bindings/swift/ScpFFI.xcframework/Headers
+          cat > bindings/swift/ScpFFI.xcframework/Headers/module.modulemap <<'MODULEMAP'
+          framework module ScpFFI {
+            header "scpFFI.h"
+            export *
+          }
+          MODULEMAP
+
+      - name: Build XCFramework
+        run: |
+          xcodebuild -create-xcframework \
+            -library target/universal-macos/release/libscp_ffi_uniffi.a \
+            -headers bindings/swift/ScpFFI.xcframework/Headers \
+            -library target/aarch64-apple-ios/release/libscp_ffi_uniffi.a \
+            -headers bindings/swift/ScpFFI.xcframework/Headers \
+            -library target/universal-ios-sim/release/libscp_ffi_uniffi.a \
+            -headers bindings/swift/ScpFFI.xcframework/Headers \
+            -output bindings/swift/ScpFFI.xcframework
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-xcframework
+          path: bindings/swift/ScpFFI.xcframework/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Kotlin — Android AAR with bundled .so (UniFFI)
+  # ---------------------------------------------------------------------------
+  kotlin-aar:
+    name: Kotlin AAR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android,
+            armv7-linux-androideabi,
+            x86_64-linux-android,
+            i686-linux-android
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.0.12077973"
+
+      - name: Set NDK environment
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> $GITHUB_ENV
+          echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$ANDROID_HOME/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang" >> $GITHUB_ENV
+          echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang" >> $GITHUB_ENV
+          echo "CARGO_TARGET_I686_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android21-clang" >> $GITHUB_ENV
+
+      - name: Build for Android targets
+        run: |
+          for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android; do
+            cargo build --release --target "$target" -p scp-ffi-uniffi
+          done
+
+      - name: Generate Kotlin bindings
+        run: |
+          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen generate \
+            --library target/release/libscp_ffi_uniffi.so \
+            --language kotlin \
+            --out-dir bindings/kotlin/src/main/kotlin
+
+      # NOTE: Gradle-based AAR packaging requires bindings/kotlin/build.gradle.kts
+      # which will be added when the Kotlin binding scaffold is created.
+      - name: Package AAR (placeholder)
+        run: |
+          echo "AAR packaging requires bindings/kotlin/build.gradle.kts scaffold"
+          echo "Uploading raw .so files and generated Kotlin sources instead"
+
+      - name: Upload Kotlin artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-aar
+          path: |
+            target/aarch64-linux-android/release/libscp_ffi_uniffi.so
+            target/armv7-linux-androideabi/release/libscp_ffi_uniffi.so
+            target/x86_64-linux-android/release/libscp_ffi_uniffi.so
+            target/i686-linux-android/release/libscp_ffi_uniffi.so
+            bindings/kotlin/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # C ABI — cbindgen shared library for Go, C#, Java JNA consumers
+  # ---------------------------------------------------------------------------
+  cbindgen:
+    name: C ABI (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            lib-ext: so
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            lib-ext: so
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            lib-ext: dylib
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            lib-ext: dylib
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            lib-ext: dll
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      # cbindgen crate will be added in a future story; for now build the
+      # cdylib from scp-ffi-uniffi which already produces a C-compatible .so
+      - name: Build cdylib
+        run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
+
+      - name: Upload C ABI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cbindgen-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/*scp_ffi_uniffi*.${{ matrix.lib-ext }}
+            target/${{ matrix.target }}/release/*scp_ffi_uniffi*.a
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Aggregate — collect all artifacts into a single summary
+  # ---------------------------------------------------------------------------
+  aggregate:
+    name: Aggregate artifacts
+    runs-on: ubuntu-latest
+    needs:
+      - rust
+      - python-wheels
+      - python-sdist
+      - typescript-wasm
+      - typescript-napi
+      - swift-xcframework
+      - kotlin-aar
+      - cbindgen
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+
+      - name: List artifacts
+        run: find release-artifacts/ -type f | sort
+
+      - name: Upload combined release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: scp-release-bundle
+          path: release-artifacts/
+          retention-days: 14

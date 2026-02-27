@@ -5,11 +5,25 @@
 //! formulas, economic policy, and the payment adapter trait. All monetary types
 //! use integer arithmetic exclusively for cross-party determinism.
 //!
+//! # Modules
+//!
+//! - [`types`] — Core economic types: `Amount`, `CurrencyCode`, `Coefficient`,
+//!   `CostSchedule`, `PricingFormula`, `EconomicPolicy`, etc.
+//! - [`adapter`] — `PaymentAdapter` trait and supporting types.
+//! - [`antispam`] — Sender velocity tracking and cost escalation.
+//! - [`policy`] — Economic policy evaluation, cost schedule lookup, formula
+//!   evaluation, lock enforcement, and auto-accept guard.
+//! - [`estimate`] — SDK-facing `estimate_cost` function.
+//! - [`receipt`] — Payment receipt verification and history queries.
+//!
 //! See spec section 19 (Economic Governance) and ADR-033 in
 //! `.docs/adrs/phase-3.md`.
 
 pub mod adapter;
 pub mod antispam;
+pub mod estimate;
+pub mod policy;
+pub mod receipt;
 pub mod types;
 
 pub use adapter::{
@@ -17,6 +31,13 @@ pub use adapter::{
     PaymentReceipt, RefundConfirmation, VerificationResult,
 };
 pub use antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
+pub use estimate::estimate_cost;
+pub use policy::{
+    CostInsufficient, ObservableMetrics, PolicyLockError, auto_accept_blocked_by_economics,
+    check_policy_lock, evaluate_cost, evaluate_formula, lookup_cost, policy_requires_payment,
+    validate_policy_change, verify_cost_sufficiency,
+};
+pub use receipt::{PaymentVerifier, ReceiptFilter, payment_history};
 pub use types::{
     Amount, COEFFICIENT_SCALE, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy,
     PaidActionType, PaymentAdapterRef, PricingFormula, PricingMetric, PricingVariable,
