@@ -339,7 +339,10 @@ pub const fn validate_policy_change(
 /// Returns `true` if the given [`EconomicPolicy`] requires payment for any
 /// action.
 ///
-/// A policy requires payment if any cost in the [`CostSchedule`] is `Some`.
+/// A policy requires payment if any cost in the [`CostSchedule`] is `Some`
+/// or if a [`PricingFormula`] is present (which may produce non-zero costs
+/// even when the schedule has no fixed costs).
+///
 /// This is the economic component of the auto-accept guard.
 ///
 /// **Hard rule**: Context invitations with economic policy requiring payment
@@ -355,6 +358,7 @@ pub const fn policy_requires_payment(policy: &EconomicPolicy) -> bool {
         || cs.per_join.is_some()
         || cs.per_period.is_some()
         || cs.per_byte_stored.is_some()
+        || policy.pricing_formula.is_some()
 }
 
 /// Checks whether a context invitation should be blocked from auto-accept
@@ -395,7 +399,7 @@ pub fn verify_cost_sufficiency(
     metrics: &ObservableMetrics,
     provided: Amount,
 ) -> Result<(), CostInsufficient> {
-    let expected = evaluate_cost(policy, action, metrics).unwrap_or(Amount(0));
+    let expected = evaluate_cost(policy, action, metrics).unwrap_or(Amount(u64::MAX));
 
     if provided < expected {
         let snapshot = policy
@@ -1283,5 +1287,93 @@ mod tests {
         let err = PolicyLockError;
         let msg = format!("{err}");
         assert!(msg.contains("locked"));
+    }
+
+    // =======================================================================
+    // Bug fix: PricingFormula-only policy requires payment (SCP-154)
+    // =======================================================================
+
+    #[test]
+    fn pricing_formula_only_policy_requires_payment() {
+        // A policy with no CostSchedule costs but a PricingFormula that may
+        // produce non-zero costs MUST be detected as requiring payment.
+        // Spec invariant §19.14#9: auto-accept NEVER applies to contexts
+        // with economic policy requiring payment.
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: usd(),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["x402".to_owned()],
+            pricing_formula: Some(PricingFormula {
+                base_cost: Amount(100),
+                variables: vec![],
+                cap: None,
+                floor: None,
+            }),
+            payee: payee(),
+        };
+        assert!(policy_requires_payment(&policy));
+        assert!(auto_accept_blocked_by_economics(Some(&policy)));
+    }
+
+    // =======================================================================
+    // Bug fix: verify_cost_sufficiency fails closed on overflow (SCP-154)
+    // =======================================================================
+
+    #[test]
+    fn verify_cost_sufficiency_fails_closed_on_overflow() {
+        // When evaluate_cost overflows (returns None), verify_cost_sufficiency
+        // must fail closed (assume maximum cost), not fail open (assume free).
+        // A formula with extreme coefficients triggers overflow.
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: usd(),
+                per_message: Some(Amount(10)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["x402".to_owned()],
+            pricing_formula: Some(PricingFormula {
+                base_cost: Amount(0),
+                variables: vec![PricingVariable::Linear {
+                    metric: PricingMetric::MemberCount,
+                    // i64::MAX coefficient * large metric value -> overflow
+                    coefficient: Coefficient(i64::MAX),
+                }],
+                cap: None,
+                floor: None,
+            }),
+            payee: payee(),
+        };
+        let metrics = ObservableMetrics {
+            member_count: 2, // coefficient.evaluate(2) overflows for i64::MAX
+            ..default_metrics()
+        };
+
+        // With overflow, the action must be rejected (CostInsufficient),
+        // not silently allowed as free.
+        let result = verify_cost_sufficiency(
+            &policy,
+            &PaidActionType::MessageSend,
+            &metrics,
+            Amount(1000),
+        );
+        assert!(result.is_err(), "overflow must fail closed, not open");
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.expected,
+            Amount(u64::MAX),
+            "overflow must assume maximum cost"
+        );
     }
 }
