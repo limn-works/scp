@@ -36,6 +36,18 @@ Sync module stories (SCP-122, 123, 124, 127) each require EventType additions pe
 ### ReJoinExecutor follows DeltaSyncEngine pattern
 `weeks_offline::ReJoinExecutor` mirrors `days_offline::DeltaSyncEngine`: `#[allow(async_fn_in_trait)]`, `Send + Sync` bound, explicit doc comment about NOT being object-safe. Both use module-local error types rather than the parent SyncError.
 
+### UniFFI-generated bindings collide with hand-written Swift wrappers (SCP-103)
+Committing real UniFFI-generated ScpBindings.swift alongside hand-written placeholder wrappers causes "invalid redeclaration" build failures. Key divergences:
+- Generated ScpError uses uppercase cases (.Identity) vs Swift convention (.identity)
+- Generated Message uses `payload: Data` vs hand-written `content: Data`
+- Generated TransportStatus is a struct, hand-written is an enum
+- Generated ContextState has 5 states (creating/active/closing/closed/expired), hand-written has 2
+- Generated UcanToken is a class (object handle with raw pointer), hand-written is a struct
+Any story that replaces placeholder bindings with real generated ones MUST reconcile or remove hand-written types in the same commit. See `.docs/lessons/swift/uniffi-generated-type-conflicts.md`.
+
+### CI and local build scripts must stay synchronized for Swift
+build-xcframework.sh renames `scp_ffi_uniffi.swift` to `ScpBindings.swift` and copies to `Sources/SCP/Internal/`. CI workflow writes to `Sources/SCP/` without renaming. CI module map uses `scpFFI.h` (lowercase), build script uses `ScpFFI.h` (uppercase). Always verify CI mirrors local build layout when reviewing Swift build stories.
+
 ## ADR Reference Quick Map
 - ADR-029: Offline/Sync Strategy -- phase-6.md line 1227+
 - ADR-030: Event Log Pruning -- phase-6.md line 1698+
