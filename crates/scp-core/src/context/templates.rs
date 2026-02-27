@@ -12,7 +12,8 @@
 //! - [`validate_against_template`] -- validates that a [`ContextParams`] matches
 //!   the template definition when `template_id` is present.
 //!
-//! See ADR-008 in `.docs/adrs/phase-2.md` for the full specification.
+//! See ADR-008 in `.docs/adrs/phase-2.md` for the base template specification
+//! and ADR-033 in `.docs/adrs/phase-3.md` for paid templates (§19.10).
 
 use super::params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, GovernanceModel, MemoryScope,
@@ -54,6 +55,23 @@ pub enum TemplateError {
     TtlForbidden {
         /// The template that forbids a TTL.
         template: TemplateId,
+    },
+
+    /// The template requires an economic policy, but none was provided.
+    #[error("template {template:?} requires an economic_policy, but none was provided")]
+    EconomicPolicyRequired {
+        /// The template that requires an economic policy.
+        template: TemplateId,
+    },
+
+    /// The template requires a specific cost field to be set in the economic
+    /// policy, but it was `None`.
+    #[error("template {template:?} requires {field} to be set in economic_policy.cost_schedule")]
+    CostFieldRequired {
+        /// The template that requires the cost field.
+        template: TemplateId,
+        /// The cost field that must be set (e.g., `"per_tool_invoke"`).
+        field: &'static str,
     },
 }
 
@@ -131,14 +149,16 @@ fn messaging_invite_ceiling() -> Vec<Capability> {
 ///
 /// # Template definitions
 ///
-/// | Template | Mode | Ceiling | Ceiling Policy | Promotion | Memory | Governance | TTL |
-/// |----------|------|---------|----------------|-----------|--------|------------|-----|
-/// | `BilateralEphemeral` | Encrypted | messages | Immutable | NoPromotion | Ephemeral | SingleAdmin | Required |
-/// | `BilateralPersistent` | Encrypted | messages | Immutable | NoPromotion | Full | SingleAdmin | Forbidden |
-/// | `Coordination` | Encrypted | messages + invoke | Immutable | NoPromotion | Summary | SingleAdmin | Required |
-/// | `GroupDiscussion` | Encrypted | messages + invite | Immutable | Promotable | Full | SingleAdmin | Optional |
-/// | `PublicBroadcast` | Broadcast | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional |
-/// | `GatedBroadcast` | Broadcast | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional |
+/// | Template | Mode | Ceiling | Ceiling Policy | Promotion | Memory | Governance | TTL | Economic |
+/// |----------|------|---------|----------------|-----------|--------|------------|-----|----------|
+/// | `BilateralEphemeral` | Encrypted | messages | Immutable | NoPromotion | Ephemeral | SingleAdmin | Required | None |
+/// | `BilateralPersistent` | Encrypted | messages | Immutable | NoPromotion | Full | SingleAdmin | Forbidden | None |
+/// | `Coordination` | Encrypted | messages + invoke | Immutable | NoPromotion | Summary | SingleAdmin | Required | None |
+/// | `GroupDiscussion` | Encrypted | messages + invite | Immutable | Promotable | Full | SingleAdmin | Optional | None |
+/// | `PublicBroadcast` | Broadcast | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional | None |
+/// | `GatedBroadcast` | Broadcast | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional | None |
+/// | `PaidService` | Encrypted | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional | Required (per_tool_invoke) |
+/// | `PaidBroadcast` | Broadcast | messages | Immutable | NoPromotion | Full | SingleAdmin | Optional | Required (per_period) |
 #[must_use]
 pub fn template_params(template_id: &TemplateId) -> ContextParams {
     match template_id {
@@ -220,6 +240,36 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             template_id: Some(TemplateId::GatedBroadcast),
             economic_policy: None,
         },
+        // Extends scp:template/tool-interface -- same ceiling and governance,
+        // but economic_policy is caller-provided and validated separately.
+        TemplateId::PaidService => ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: messaging_tools_ceiling(),
+            ceiling_policy: CeilingPolicy::Immutable,
+            promotion_policy: PromotionPolicy::NoPromotion,
+            roles: Vec::new(),
+            tools: Vec::new(),
+            ttl: None,
+            memory_scope: MemoryScope::Full,
+            governance: GovernanceModel::SingleAdmin,
+            template_id: Some(TemplateId::PaidService),
+            economic_policy: None,
+        },
+        // Extends scp:template/gated-broadcast -- broadcast mode with gated
+        // subscriber admission. economic_policy is caller-provided.
+        TemplateId::PaidBroadcast => ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: messaging_ceiling(),
+            ceiling_policy: CeilingPolicy::Immutable,
+            promotion_policy: PromotionPolicy::NoPromotion,
+            roles: Vec::new(),
+            tools: Vec::new(),
+            ttl: None,
+            memory_scope: MemoryScope::Full,
+            governance: GovernanceModel::SingleAdmin,
+            template_id: Some(TemplateId::PaidBroadcast),
+            economic_policy: None,
+        },
     }
 }
 
@@ -260,9 +310,11 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
     match template_id {
         TemplateId::BilateralEphemeral | TemplateId::Coordination => TtlPolicy::Required,
         TemplateId::BilateralPersistent => TtlPolicy::Forbidden,
-        TemplateId::GroupDiscussion | TemplateId::PublicBroadcast | TemplateId::GatedBroadcast => {
-            TtlPolicy::Optional
-        }
+        TemplateId::GroupDiscussion
+        | TemplateId::PublicBroadcast
+        | TemplateId::GatedBroadcast
+        | TemplateId::PaidService
+        | TemplateId::PaidBroadcast => TtlPolicy::Optional,
     }
 }
 
@@ -283,6 +335,10 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
 /// *policy* is enforced: templates that require a TTL reject `None`, and
 /// templates that forbid a TTL reject `Some(_)`.
 ///
+/// For paid templates (`PaidService`, `PaidBroadcast`), the `economic_policy`
+/// field is validated: it must be present and contain the required cost fields.
+/// See spec section 19.10 and ADR-033 criterion 13.
+///
 /// # Errors
 ///
 /// Returns [`TemplateError::Mismatch`] if any non-TTL field does not match
@@ -293,6 +349,12 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
 ///
 /// Returns [`TemplateError::TtlForbidden`] if the template forbids a TTL but
 /// `params.ttl` is `Some(_)`.
+///
+/// Returns [`TemplateError::EconomicPolicyRequired`] if a paid template is
+/// missing `economic_policy`.
+///
+/// Returns [`TemplateError::CostFieldRequired`] if a paid template's
+/// `economic_policy` is missing a required cost field.
 pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateError> {
     let Some(template_id) = &params.template_id else {
         return Ok(());
@@ -399,6 +461,52 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
         TtlPolicy::Optional => { /* TTL may or may not be present */ }
     }
 
+    // Economic policy validation for paid templates.
+    // Paid templates require economic_policy to be present and specific cost
+    // fields to be set. See spec section 19.10 and ADR-033 criterion 13.
+    validate_economic_policy_for_template(*template_id, &params.economic_policy)?;
+
+    Ok(())
+}
+
+/// Validates economic policy requirements for paid templates.
+///
+/// - `PaidService` requires `economic_policy` with `per_tool_invoke` set.
+/// - `PaidBroadcast` requires `economic_policy` with `per_period` set.
+/// - All other templates have no economic policy requirements.
+fn validate_economic_policy_for_template(
+    template_id: TemplateId,
+    economic_policy: &Option<crate::economy::EconomicPolicy>,
+) -> Result<(), TemplateError> {
+    match template_id {
+        TemplateId::PaidService => {
+            let policy = economic_policy.as_ref().ok_or(
+                TemplateError::EconomicPolicyRequired {
+                    template: template_id,
+                },
+            )?;
+            if policy.cost_schedule.per_tool_invoke.is_none() {
+                return Err(TemplateError::CostFieldRequired {
+                    template: template_id,
+                    field: "per_tool_invoke",
+                });
+            }
+        }
+        TemplateId::PaidBroadcast => {
+            let policy = economic_policy.as_ref().ok_or(
+                TemplateError::EconomicPolicyRequired {
+                    template: template_id,
+                },
+            )?;
+            if policy.cost_schedule.per_period.is_none() {
+                return Err(TemplateError::CostFieldRequired {
+                    template: template_id,
+                    field: "per_period",
+                });
+            }
+        }
+        _ => { /* No economic policy requirements for other templates */ }
+    }
     Ok(())
 }
 
@@ -854,6 +962,8 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
+            TemplateId::PaidService,
+            TemplateId::PaidBroadcast,
         ];
         for variant in &variants {
             let params = template_params(variant);
@@ -916,6 +1026,10 @@ mod tests {
             template_params(&TemplateId::GatedBroadcast).mode,
             ContextMode::Broadcast
         );
+        assert_eq!(
+            template_params(&TemplateId::PaidBroadcast).mode,
+            ContextMode::Broadcast
+        );
     }
 
     #[test]
@@ -934,6 +1048,10 @@ mod tests {
         );
         assert_eq!(
             template_params(&TemplateId::GroupDiscussion).mode,
+            ContextMode::Encrypted
+        );
+        assert_eq!(
+            template_params(&TemplateId::PaidService).mode,
             ContextMode::Encrypted
         );
     }
@@ -975,6 +1093,8 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
+            TemplateId::PaidService,
+            TemplateId::PaidBroadcast,
         ];
         for variant in &variants {
             let from_method = ContextParams::from_template(*variant);
@@ -1101,5 +1221,338 @@ mod tests {
         let err = result.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("requires a TTL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Paid template helpers
+    // -----------------------------------------------------------------------
+
+    /// Creates a minimal `EconomicPolicy` with `per_tool_invoke` set.
+    fn paid_service_policy() -> crate::economy::EconomicPolicy {
+        crate::economy::EconomicPolicy {
+            locked: false,
+            cost_schedule: crate::economy::CostSchedule {
+                currency: crate::economy::CurrencyCode::from("USD"),
+                per_message: None,
+                per_tool_invoke: Some(crate::economy::Amount(100)),
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["x402".to_owned()],
+            pricing_formula: None,
+            payee: crate::identity::DID::from("did:dht:z6MkTestPayee"),
+        }
+    }
+
+    /// Creates a minimal `EconomicPolicy` with `per_period` set.
+    fn paid_broadcast_policy() -> crate::economy::EconomicPolicy {
+        crate::economy::EconomicPolicy {
+            locked: false,
+            cost_schedule: crate::economy::CostSchedule {
+                currency: crate::economy::CurrencyCode::from("USD"),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: Some(crate::economy::SubscriptionCost {
+                    amount: crate::economy::Amount(999),
+                    period: crate::economy::SubscriptionPeriod::Monthly,
+                    currency: crate::economy::CurrencyCode::from("USD"),
+                }),
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["x402".to_owned()],
+            pricing_formula: None,
+            payee: crate::identity::DID::from("did:dht:z6MkTestPayee"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PaidService template: template_params correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn paid_service_params_have_correct_fields() {
+        let params = template_params(&TemplateId::PaidService);
+        assert_eq!(params.mode, ContextMode::Encrypted);
+        assert_eq!(params.ceiling.len(), 4);
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_MESSAGES_WRITE)
+        );
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
+        );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
+        assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
+        assert!(params.roles.is_empty());
+        assert!(params.tools.is_empty());
+        assert!(params.ttl.is_none());
+        assert_eq!(params.memory_scope, MemoryScope::Full);
+        assert_eq!(params.governance, GovernanceModel::SingleAdmin);
+        assert_eq!(params.template_id, Some(TemplateId::PaidService));
+        // economic_policy is None in template defaults; caller must supply it.
+        assert!(params.economic_policy.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PaidBroadcast template: template_params correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn paid_broadcast_params_have_correct_fields() {
+        let params = template_params(&TemplateId::PaidBroadcast);
+        assert_eq!(params.mode, ContextMode::Broadcast);
+        assert_eq!(params.ceiling.len(), 2);
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_MESSAGES_WRITE)
+        );
+        assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
+        assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
+        assert!(params.roles.is_empty());
+        assert!(params.tools.is_empty());
+        assert!(params.ttl.is_none());
+        assert_eq!(params.memory_scope, MemoryScope::Full);
+        assert_eq!(params.governance, GovernanceModel::SingleAdmin);
+        assert_eq!(params.template_id, Some(TemplateId::PaidBroadcast));
+        assert!(params.economic_policy.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PaidService: valid creation with economic_policy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_paid_service_with_valid_economic_policy_passes() {
+        let mut params = template_params(&TemplateId::PaidService);
+        params.economic_policy = Some(paid_service_policy());
+        assert!(validate_against_template(&params).is_ok());
+    }
+
+    #[test]
+    fn validate_paid_service_with_ttl_passes() {
+        let mut params = template_params(&TemplateId::PaidService);
+        params.economic_policy = Some(paid_service_policy());
+        params.ttl = Some(Duration::from_secs(3600));
+        assert!(validate_against_template(&params).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // PaidService: missing economic_policy rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_paid_service_without_economic_policy_rejected() {
+        let params = template_params(&TemplateId::PaidService);
+        // economic_policy is None (not supplied)
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(
+            matches!(err, TemplateError::EconomicPolicyRequired { .. }),
+            "expected EconomicPolicyRequired, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PaidService: missing per_tool_invoke rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_paid_service_without_per_tool_invoke_rejected() {
+        let mut params = template_params(&TemplateId::PaidService);
+        let mut policy = paid_service_policy();
+        policy.cost_schedule.per_tool_invoke = None;
+        params.economic_policy = Some(policy);
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TemplateError::CostFieldRequired {
+                    field: "per_tool_invoke",
+                    ..
+                }
+            ),
+            "expected CostFieldRequired(per_tool_invoke), got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PaidBroadcast: valid creation with economic_policy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_paid_broadcast_with_valid_economic_policy_passes() {
+        let mut params = template_params(&TemplateId::PaidBroadcast);
+        params.economic_policy = Some(paid_broadcast_policy());
+        assert!(validate_against_template(&params).is_ok());
+    }
+
+    #[test]
+    fn validate_paid_broadcast_with_ttl_passes() {
+        let mut params = template_params(&TemplateId::PaidBroadcast);
+        params.economic_policy = Some(paid_broadcast_policy());
+        params.ttl = Some(Duration::from_secs(86400));
+        assert!(validate_against_template(&params).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // PaidBroadcast: missing economic_policy rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_paid_broadcast_without_economic_policy_rejected() {
+        let params = template_params(&TemplateId::PaidBroadcast);
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(
+            matches!(err, TemplateError::EconomicPolicyRequired { .. }),
+            "expected EconomicPolicyRequired, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PaidBroadcast: missing per_period rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_paid_broadcast_without_per_period_rejected() {
+        let mut params = template_params(&TemplateId::PaidBroadcast);
+        let mut policy = paid_broadcast_policy();
+        policy.cost_schedule.per_period = None;
+        params.economic_policy = Some(policy);
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TemplateError::CostFieldRequired {
+                    field: "per_period",
+                    ..
+                }
+            ),
+            "expected CostFieldRequired(per_period), got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TemplateId serialization: paid variants use scp:template/ URIs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn template_id_paid_service_serializes_to_uri() {
+        let json = serde_json::to_string(&TemplateId::PaidService).unwrap();
+        assert_eq!(json, r#""scp:template/paid-service""#);
+    }
+
+    #[test]
+    fn template_id_paid_broadcast_serializes_to_uri() {
+        let json = serde_json::to_string(&TemplateId::PaidBroadcast).unwrap();
+        assert_eq!(json, r#""scp:template/paid-broadcast""#);
+    }
+
+    #[test]
+    fn template_id_paid_service_deserializes_from_uri() {
+        let deserialized: TemplateId =
+            serde_json::from_str(r#""scp:template/paid-service""#).unwrap();
+        assert_eq!(deserialized, TemplateId::PaidService);
+    }
+
+    #[test]
+    fn template_id_paid_broadcast_deserializes_from_uri() {
+        let deserialized: TemplateId =
+            serde_json::from_str(r#""scp:template/paid-broadcast""#).unwrap();
+        assert_eq!(deserialized, TemplateId::PaidBroadcast);
+    }
+
+    #[test]
+    fn template_id_paid_service_serde_roundtrip() {
+        let json = serde_json::to_string(&TemplateId::PaidService).unwrap();
+        let deserialized: TemplateId = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, TemplateId::PaidService);
+    }
+
+    #[test]
+    fn template_id_paid_broadcast_serde_roundtrip() {
+        let json = serde_json::to_string(&TemplateId::PaidBroadcast).unwrap();
+        let deserialized: TemplateId = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, TemplateId::PaidBroadcast);
+    }
+
+    // -----------------------------------------------------------------------
+    // TemplateError display messages for economic policy errors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn template_error_economic_policy_required_display() {
+        let err = TemplateError::EconomicPolicyRequired {
+            template: TemplateId::PaidService,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("requires an economic_policy"));
+        assert!(msg.contains("PaidService"));
+    }
+
+    #[test]
+    fn template_error_cost_field_required_display() {
+        let err = TemplateError::CostFieldRequired {
+            template: TemplateId::PaidService,
+            field: "per_tool_invoke",
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("per_tool_invoke"));
+        assert!(msg.contains("PaidService"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Paid templates: from_template convenience constructor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_template_paid_service_produces_valid_params() {
+        let params = ContextParams::from_template(TemplateId::PaidService);
+        assert_eq!(params.mode, ContextMode::Encrypted);
+        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.memory_scope, MemoryScope::Full);
+        assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
+        assert_eq!(params.governance, GovernanceModel::SingleAdmin);
+        assert_eq!(params.template_id, Some(TemplateId::PaidService));
+    }
+
+    #[test]
+    fn from_template_paid_broadcast_produces_valid_params() {
+        let params = ContextParams::from_template(TemplateId::PaidBroadcast);
+        assert_eq!(params.mode, ContextMode::Broadcast);
+        assert_eq!(params.ceiling.len(), 2);
+        assert_eq!(params.memory_scope, MemoryScope::Full);
+        assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
+        assert_eq!(params.governance, GovernanceModel::SingleAdmin);
+        assert_eq!(params.template_id, Some(TemplateId::PaidBroadcast));
+    }
+
+    // -----------------------------------------------------------------------
+    // Paid template economic policy errors convert to ContextError
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn economic_policy_required_error_converts_to_context_error() {
+        use super::super::ContextError;
+
+        let params = template_params(&TemplateId::PaidService);
+        let result: Result<(), ContextError> =
+            validate_against_template(&params).map_err(ContextError::from);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::TemplateMismatch(_)),
+            "expected ContextError::TemplateMismatch, got {err:?}"
+        );
     }
 }

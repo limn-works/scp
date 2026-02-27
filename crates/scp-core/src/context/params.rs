@@ -191,6 +191,18 @@ pub enum TemplateId {
     PublicBroadcast,
     /// Broadcast mode, UCAN-gated subscriber access (spec section 5.14).
     GatedBroadcast,
+    /// Tool invocation context with per-invoke cost. Extends `tool-interface`.
+    /// Requires `economic_policy` with `per_tool_invoke` set at creation.
+    ///
+    /// See spec section 19.10 and ADR-033.
+    #[serde(rename = "scp:template/paid-service")]
+    PaidService,
+    /// Subscription-based broadcast context. Extends `gated-broadcast`.
+    /// Requires `economic_policy` with `per_period` set at creation.
+    ///
+    /// See spec section 19.10 and ADR-033.
+    #[serde(rename = "scp:template/paid-broadcast")]
+    PaidBroadcast,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +402,8 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
+            TemplateId::PaidService,
+            TemplateId::PaidBroadcast,
         ];
         for (i, a) in variants.iter().enumerate() {
             for (j, b) in variants.iter().enumerate() {
