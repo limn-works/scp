@@ -17,9 +17,12 @@
 //!
 //! # Shutdown
 //!
-//! Runtime shutdown is handled on module finalization (Python interpreter exit).
-//! The runtime is dropped, which waits for in-flight tasks to complete with a
-//! 5-second timeout.
+//! Runtime shutdown is handled in two phases:
+//! 1. An `atexit` handler calls `shutdown_runtime()`, which blocks for 100ms
+//!    to let cooperative tasks observe shutdown. Kept short to avoid holding
+//!    the Python GIL.
+//! 2. On process exit, the static `OnceLock` is reclaimed and the tokio
+//!    runtime is dropped (which waits for remaining tasks to complete).
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` for the full specification.
 
@@ -119,8 +122,8 @@ fn version() -> &'static str {
 /// This ordering ensures all Python destructors (`__del__`, weak-ref callbacks)
 /// complete before the tokio runtime is dropped.
 ///
-/// The actual runtime drop (which calls `shutdown_timeout` with
-/// [`SHUTDOWN_TIMEOUT`]) happens when the process exits and the static
+/// The actual runtime drop (which invokes tokio's `shutdown_timeout`)
+/// happens when the process exits and the static
 /// `OnceLock` is reclaimed. This function serves as a coordination point:
 /// it blocks briefly to let in-flight tokio tasks observe that Python is
 /// shutting down.
