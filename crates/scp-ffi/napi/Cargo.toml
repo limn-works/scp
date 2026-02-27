@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "napi-rs FFI bridge for SCP — exposes scp-core to Node.js/Bun via native addon"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

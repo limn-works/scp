@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Platform abstraction traits for SCP (Shareable Context Protocol)"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [features]
 software_platform = [

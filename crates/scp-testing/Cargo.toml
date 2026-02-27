@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Integration tests for SCP (Shareable Context Protocol)"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [features]
 ci-tier2 = []

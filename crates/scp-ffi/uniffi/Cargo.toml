@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "UniFFI FFI bridge for SCP — generates Swift and Kotlin bindings from a single definition"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lib]
 name = "scp_ffi_uniffi"

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Core protocol implementation for SCP (Shareable Context Protocol)"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 openmls = { workspace = true }

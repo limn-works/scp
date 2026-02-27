@@ -2,34 +2,28 @@
 
 **The social layer for an agentic web.**
 
-Software is shifting from something crafted by hand into something manufactured on demand. Agents are building production-ready apps in hours, directed by engineers and consumers alike. Soon, most of the content and interactions on the internet will be delivered via an endlessly rich and diverse range of apps, the code for which will be contained entirely on the device they were generated with. When clients are ephemeral and personal, durable infrastructure for communication and persistence become an necessary counterweight. Tools for implementing this infrastructure need to be natively optimized for agents as both builders and first-class consumers alongside humans.
+SCP is an open protocol that gives agents and apps the connective tissue they're missing: identity, encryption, granular authorization, governance, and provenance. No platform dependency, no central operator, all self-hostable and easily adoptable with a reference implementation and full stack SDKs.
 
-**What’s already in place**
-App generation, distribution, and hosting models. People are buying computers and renting servers exclusively to operate personal agents. App stores have already solved distribution. Content and social graphs already exist on the social networks of today.
+## What SCP Provides
 
-**What’s missing**
-Infrastructure that provides state, data, identity, trust, transport, encryption, governance, provenance — the connective tissue between agents, apps, and the humans behind them. Two chat apps, built by different agents for different people on different devices, need to be able to connect.
+| Capability | How |
+|---|---|
+| **Identity** | DID-based, human-bound, portable across apps and devices |
+| **Encryption** | E2E, MLS group keys per context — relays are untrusted and see nothing |
+| **Authorization** | UCANs — capability tokens verified without a central authority |
+| **Governance** | Per-context rules (roles, tools, capabilities) declared upfront, visible before joining |
+| **Provenance** | Every message, tool output, and data transfer carries verifiable origin |
+| **Transport** | Any — SCP relay, Nostr, Matrix, libp2p, WebSocket, and more |
 
-**What SCP provides**
-SCP is an open, ecosystem-agnostic protocol for this infrastructure layer. It provides trusted identity, end-to-end encryption, granular permissioning, governed interactions, and transparent provenance — without depending on any platform, data source, or central operator.
+## Core Concepts
 
----
+All interaction happens inside **contexts** — encrypted spaces with declared membership, roles, tools, and governance. Contexts are the security boundary. Information only crosses context boundaries through explicit, governed interfaces.
 
-## How It Works
+**Relays are untrusted.** They store and forward encrypted blobs. Membership is enforced by MLS group keys, not by whoever runs the server.
 
-- All interaction happens inside **contexts**: encrypted spaces with declared membership, roles, tools, and governance, all visible before you join
-- Membership is enforced by MLS group keys, not by whoever runs the server — relays store opaque blobs and can’t read any of it
-- Every agent traces to a human DID, and every message carries verifiable provenance
-- All agent actions are scoped to contexts, and agents can’t cross context boundaries freely
-- No central operator required. The protocol runs over any transport
+**Every agent traces to a human.** Identity is cryptographic (DID), and authorization uses capability tokens (UCAN) that are verifiable without calling home to any server.
 
-Contexts are the core primitive. Each one is an encrypted space that declares its governance model, roles, available tools, and capability ceiling upfront — you can inspect all of this before deciding to join. Membership and permissions are enforced by MLS group keys. Relays are untrusted infrastructure; they store and forward encrypted blobs without any ability to read, inspect, or verify the contents.
-
-Each participant operates as a separate agent instance per context. A single human might participate in dozens of contexts, but isolation between them is absolute — information only crosses context boundaries through explicit, opt-in tool interfaces, and every cross-context call is recorded in a verifiable event log.
-
-Identity is DID-based, and authorization uses UCANs — capability tokens that are cryptographically verifiable without a central authority. Together, the protocol can verify who you are and what you’re allowed to do without calling home to any server.
-
-Encryption combines MLS for group forward secrecy with a sender-side AES-256 layer for selective readability within contexts. Each message is signed, encrypted twice, padded, pseudonymized on send, then verified, decrypted, checked for replay, validated against capability tokens, and authenticated on receive. Provenance is structural — every message, tool output, and cross-context data transfer carries verifiable origin metadata.
+**No operator required.** The protocol works without centralized infrastructure. If Limn disappears, SCP works exactly as designed.
 
 ```
   Applications — apps, agent scripts, LLM-built clients
@@ -44,19 +38,9 @@ Encryption combines MLS for group forward secrecy with a sender-side AES-256 lay
   Transport — SCP relay, Nostr, Matrix, libp2p, WebSocket, +more
 ```
 
-## Why This Works
-
-Distributed network protocols have historically remained niche because most people — even the technically inclined — simply do not want to set up and manage a server.
-
-As of 2026, the landscape has changed. All the barriers are disappearing. People still have little interest in the work of self-hosting, but they will become interested in the benefits. Choosing and paying hosting-as-a-service providers will become a mainstream headache the way streaming has, and people will question why they have to subscribe to have a computer to run code they already own, when they’ve got a perfectly good one in their own home.
-
-Most importantly, people no longer need to do any of the work. Nearly anyone generating personal apps already has access to everything needed to provide service. As long as their agents can make use of a PC that’s powered on and has network access, the only missing piece is a protocol for shareable context, and SDKs for implementing it securely.
-
-A whole class of networks that were previously unscalable due to friction are now primed to become the default model for the future of the internet.
-
 ## Where SCP Fits
 
-Three categories of protocol are relevant to agent infrastructure. SCP is the only one that provides the social layer.
+Three categories of protocol are relevant to agent infrastructure. SCP provides the social layer.
 
 |  | Tool protocols | Relay protocols | SCP |
 |---|---|---|---|
@@ -64,30 +48,16 @@ Three categories of protocol are relevant to agent infrastructure. SCP is the on
 | **What it does** | Agent ↔ tools and services | Message delivery and storage | Identity, trust, encryption, governance, provenance |
 | **Identity** | None | Platform accounts or keypairs | Cryptographic (DID), human-bound, portable |
 | **Encryption** | Transport only | Optional or server-side | End-to-end per context (MLS), relays see nothing |
-| **Trust** | Implicit | Follow/block, server moderation | Four-layer model: protocol → behavioral → attestation → contextual |
+| **Trust** | Implicit | Follow/block, server moderation | Protocol → behavioral → attestation → contextual |
 | **Governance** | None | Server operator rules | Per-context, declared upfront, cryptographically enforced |
 | **Provenance** | None | None | Structural — every message carries verifiable origin |
 | **Transport** | Local or HTTP | Own relay network | Any — SCP relay, Nostr, Matrix, libp2p, WebSocket, +more |
 
-**Tool protocols** define how agents use tools. SCP complements them — an SCP agent can expose itself as an MCP server or transact through UCP while SCP provides the identity and trust underneath.
-
-**Relay protocols** move messages. SCP can use them as transport adapters while adding what they lack: verifiable identity, end-to-end encryption where relays are untrusted, governed interaction spaces, and provenance on every piece of data that crosses a boundary.
-
-## Principles
-
-1. **Provenance everywhere.** All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal.
-2. **Human accountability.** Every agent traces to a human DID. Actions have consequences that persist across contexts.
-3. **Context isolation.** All interaction happens within bounded contexts. Cross-context data flow is explicit and governed.
-4. **Encryption-as-access-control.** MLS group keys enforce context membership. Relays are untrusted — the math enforces access.
-5. **Legibility before opt-in.** Every context’s parameters are visible before joining. Informed consent is mechanical, not social.
-6. **No operator required.** Every mechanism works without centralized infrastructure.
-7. **Transport independence.** The protocol drives transport choice, not the reverse.
-8. **Agents are participants, not enforcers.** The same rules apply whether you’re a sophisticated autonomous agent or a simple passthrough.
-9. **Trust is contextual.** A function of identity, capability, context, and behavior — not a binary.
+SCP complements tool protocols — an SCP agent can expose itself as an MCP server while SCP provides identity and trust underneath. SCP can use relay protocols as transport adapters while adding what they lack.
 
 ## Architecture
 
-The protocol engine is written in Rust, with bindings targeting the ecosystems where agents and apps are being built:
+The protocol engine is Rust, with bindings for the ecosystems where agents and apps are being built:
 
 | Binding | Technology | Target |
 |---|---|---|
@@ -97,6 +67,29 @@ The protocol engine is written in Rust, with bindings targeting the ecosystems w
 | Kotlin | UniFFI | Android |
 | Rust | Native | Direct |
 
-The SDK ships as two independent halves. The **Client SDK** handles identity management, context participation, encryption, and transport — everything an application needs to join contexts. The **Server SDK** handles relay operation, message routing, and storage — everything needed to run SCP infrastructure. Any client can connect to any conforming relay; relay operators need no knowledge of client implementations.
+The SDK ships as two independent halves:
 
-Transport is fully abstracted behind an adapter trait. The SCP native relay is the canonical reference implementation, with adapters for Nostr, Matrix, libp2p, Hyperswarm, WebSocket/WebRTC, and more.
+- **Client SDK** — identity management, context participation, encryption, transport. Everything an application needs to join and interact within contexts.
+- **Server SDK** — relay operation, message routing, storage. Everything needed to run SCP infrastructure.
+
+Any client connects to any conforming relay. Transport is fully abstracted behind an adapter trait.
+
+## Why Now
+
+Software is shifting from something crafted by hand into something manufactured on demand. Agents are building production-ready apps in hours — work that would have taken teams weeks. The trajectory points toward a world where most software is ephemeral, personal, and generated on-device. App generation is becoming trivial. What remains hard is the connective tissue between these clients and the humans and agents using them: identity, trust, relationships, and accountability.
+
+Distributed protocols have historically stayed niche because nobody wants to manage a server. That constraint is dissolving. People generating personal apps already have access to everything needed to provide service — a computer that's powered on with network access. Their agents handle the rest. A whole class of networks that were previously unscalable due to friction are now primed to become the default model.
+
+Without a strong, open protocol for shareable context, the result is fragmented apps saved only by monolithic solutions from established platforms. SCP is the open, functional answer — no opinions, easy adoption, collective contribution, and unlimited integration.
+
+## License
+
+SCP uses a split license designed for maximum adoption with infrastructure protection:
+
+- **Protocol specification** — [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). Freely implementable by anyone.
+- **Client SDK and bindings** — [Apache 2.0](LICENSE-APACHE). Use in open or closed source, commercial or not.
+- **Application node** (`scp-node`) — [AGPL v3 only](LICENSE-AGPL). Operators offering relay as a service share source or obtain a [commercial license](https://limn.works/licensing).
+
+If you're building an app or agent, the SDK is Apache 2.0 — no copyleft, no friction. See [LICENSING.md](LICENSING.md) for the full structure, FAQ, and details.
+
+Copyright [Limn](https://limn.works) Works LLC.
