@@ -11,7 +11,7 @@
 //!
 //! # Streaming
 //!
-//! Message streaming uses a callback pattern matching the UniFFI bridge's
+//! Message streaming uses a callback pattern matching the `UniFFI` bridge's
 //! `MessageListener` approach. The TypeScript SDK converts this callback to
 //! an `AsyncIterable<Message>` via an internal queue adapter (see ADR-022).
 //!
@@ -31,10 +31,11 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// Opaque handle to an SCP context.
 ///
 /// Stores context metadata: unique ID, lifecycle state, the DID of the
-/// context creator, and the §5.7 spec fields (mode, ceiling, ceiling_policy,
-/// ttl_seconds, promotion_policy, governance, member_count, economic_policy).
+/// context creator, and the spec section 5.7 fields (`mode`, `ceiling`,
+/// `ceiling_policy`, `ttl_seconds`, `promotion_policy`, `governance`,
+/// `member_count`, `economic_policy`).
 /// The actual context runtime (MLS group, transport connections, event log)
-/// lives in scp-core and will be wired in full integration stories.
+/// lives in `scp-core` and will be wired in full integration stories.
 ///
 /// # JS usage
 ///
@@ -79,14 +80,18 @@ pub struct NapiContextHandle {
     economic_policy: Option<String>,
 }
 
+/// Internal context lifecycle state.
 #[derive(Debug, Clone, Copy)]
 enum ContextState {
+    /// Context is active and accepting operations.
     Active,
+    /// Context has been closed.
     Closed,
 }
 
 impl ContextState {
-    fn as_str(self) -> &'static str {
+    /// Returns the string representation of this state.
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Closed => "closed",
@@ -98,6 +103,7 @@ impl ContextState {
 impl NapiContextHandle {
     /// Returns the context's unique identifier.
     #[napi(getter, js_name = "contextId")]
+    #[must_use]
     pub fn context_id(&self) -> String {
         self.context_id.clone()
     }
@@ -105,6 +111,10 @@ impl NapiContextHandle {
     /// Returns the context's current lifecycle state.
     ///
     /// One of: `"active"`, `"closed"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the internal state lock is poisoned.
     #[napi(getter)]
     pub fn state(&self) -> napi::Result<String> {
         let guard = self.state.lock().map_err(|_| {
@@ -118,30 +128,36 @@ impl NapiContextHandle {
 
     /// Returns the DID of the context creator.
     #[napi(getter, js_name = "creatorDid")]
+    #[must_use]
     pub fn creator_did(&self) -> String {
         self.creator_did.clone()
     }
 
     /// Returns the context mode (`"Encrypted"` or `"Broadcast"`).
     #[napi(getter)]
+    #[must_use]
     pub fn mode(&self) -> String {
         self.mode.clone()
     }
 
     /// Returns the capability ceiling for this context.
     #[napi(getter)]
+    #[must_use]
     pub fn ceiling(&self) -> Vec<String> {
         self.ceiling.clone()
     }
 
     /// Returns the ceiling policy (`"immutable"` or `"governed"`).
     #[napi(getter, js_name = "ceilingPolicy")]
+    #[must_use]
     pub fn ceiling_policy(&self) -> String {
         self.ceiling_policy.clone()
     }
 
     /// Returns the optional TTL in seconds. `None` means the context is persistent.
     #[napi(getter, js_name = "ttlSeconds")]
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
     pub fn ttl_seconds(&self) -> Option<u64> {
         self.ttl_seconds
     }
@@ -151,24 +167,29 @@ impl NapiContextHandle {
     /// One of `"no_promotion"` or `"promotable"`. Only meaningful when
     /// `ttlSeconds` is non-null.
     #[napi(getter, js_name = "promotionPolicy")]
+    #[must_use]
     pub fn promotion_policy(&self) -> Option<String> {
         self.promotion_policy.clone()
     }
 
     /// Returns the governance model string (e.g. `"single_admin"`).
     #[napi(getter)]
+    #[must_use]
     pub fn governance(&self) -> String {
         self.governance.clone()
     }
 
     /// Returns the current member count. Starts at `1` (the creator).
     #[napi(getter, js_name = "memberCount")]
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
     pub fn member_count(&self) -> u64 {
         self.member_count
     }
 
     /// Returns the optional economic policy string.
     #[napi(getter, js_name = "economicPolicy")]
+    #[must_use]
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
@@ -188,11 +209,10 @@ impl NapiContextHandle {
 
     /// Sets the state to Closed.
     pub(crate) fn set_closed(&self) -> Result<(), ScpNapiError> {
-        let mut guard = self.state.lock().map_err(|_| ScpNapiError::Context {
+        *self.state.lock().map_err(|_| ScpNapiError::Context {
             message: "context state lock is poisoned".to_owned(),
             code: "SCP-CTX-2012".to_owned(),
-        })?;
-        *guard = ContextState::Closed;
+        })? = ContextState::Closed;
         Ok(())
     }
 }
@@ -244,19 +264,19 @@ pub struct NapiMessage {
 /// - Rejects with `SCP-VAL-7000` if `params_json` is malformed JSON.
 /// - Rejects with `SCP-CTX-2000` if context creation fails.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn context_create(
     identity_did: String,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
-    let params: serde_json::Value =
-        serde_json::from_str(&params_json).map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: format!(
-                    "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
-                ),
-                code: "SCP-VAL-7000".to_owned(),
-            })
-        })?;
+    let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!(
+                "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
+            ),
+            code: "SCP-VAL-7000".to_owned(),
+        })
+    })?;
 
     let mode = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
     let ceiling = params["ceiling"]
@@ -303,16 +323,13 @@ pub async fn context_create(
 ///
 /// Rejects with `SCP-CTX-2013` if the context is not in `"active"` state.
 #[napi]
-pub async fn context_join(
-    handle: &NapiContextHandle,
-    identity_did: String,
-) -> napi::Result<()> {
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot join context in {state_str:?} state — context must be active"
-            ),
+            message: format!("cannot join context in {state_str:?} state — context must be active"),
             code: "SCP-CTX-2013".to_owned(),
         }
         .into());
@@ -327,10 +344,9 @@ pub async fn context_join(
 ///
 /// Rejects with `SCP-CTX-2015` if the context is not in `"active"` state.
 #[napi]
-pub async fn context_leave(
-    handle: &NapiContextHandle,
-    identity_did: String,
-) -> napi::Result<()> {
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
@@ -353,10 +369,9 @@ pub async fn context_leave(
 ///
 /// Rejects with `SCP-CTX-2017` if the context is not in `"active"` state.
 #[napi]
-pub async fn context_close(
-    handle: &NapiContextHandle,
-    identity_did: String,
-) -> napi::Result<()> {
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
@@ -378,6 +393,8 @@ pub async fn context_close(
 ///
 /// - Rejects with `SCP-CTX-2019` if the context is not `"active"`.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
 pub async fn context_send(
     handle: &NapiContextHandle,
     identity_did: String,
@@ -433,6 +450,7 @@ pub async fn context_send(
 ///
 /// Rejects with `SCP-CTX-2021` if the context is not in `"active"` state.
 #[napi]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub fn context_subscribe(
     handle: &NapiContextHandle,
     identity_did: String,

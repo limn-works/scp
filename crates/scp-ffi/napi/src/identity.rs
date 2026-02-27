@@ -88,6 +88,7 @@ struct NapiIdentityInner {
 /// ```
 #[napi]
 pub struct NapiIdentity {
+    /// Shared inner state.
     inner: Arc<NapiIdentityInner>,
 }
 
@@ -95,6 +96,7 @@ pub struct NapiIdentity {
 impl NapiIdentity {
     /// Returns the DID string for this identity.
     #[napi(getter)]
+    #[must_use]
     pub fn did(&self) -> String {
         self.inner.did.clone()
     }
@@ -103,6 +105,7 @@ impl NapiIdentity {
     ///
     /// One of: `"in_memory"`, `"platform"`, `"software"`.
     #[napi(getter, js_name = "custodyType")]
+    #[must_use]
     pub fn custody_type(&self) -> String {
         self.inner.custody_type.clone()
     }
@@ -119,7 +122,8 @@ impl NapiIdentity {
     /// Platform and software custody paths require a wired
     /// `KeyCustodyProvider` — this will be connected in a future story.
     #[napi]
-    pub async fn rotate_key(&self) -> napi::Result<NapiIdentity> {
+    #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+    pub async fn rotate_key(&self) -> napi::Result<Self> {
         Err(ScpNapiError::Identity {
             message: "key rotation requires a wired platform KeyCustodyProvider — \
                       use the KeyCustodyProvider callback interface to inject \
@@ -180,7 +184,7 @@ pub struct NapiDIDDocument {
 /// handle.
 ///
 /// For `"platform"` and `"software"` custody types, this function returns an
-/// error until the `KeyCustodyProvider` callback interface is wired to scp-core.
+/// error until the `KeyCustodyProvider` callback interface is wired to `scp-core`.
 ///
 /// # Arguments
 ///
@@ -243,17 +247,14 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
             code: "SCP-IDENT-1003".to_owned(),
         }
         .into()),
-        _ => {
-            return Err(ScpNapiError::Identity {
-                code: "SCP-IDENT-1005".to_owned(),
-                message: format!(
-                    "internal: unexpected custody type {:?} passed validate_custody_type — \
-                     this is a bug in the bridge layer",
-                    custody
-                ),
-            }
-            .into())
+        _ => Err(ScpNapiError::Identity {
+            code: "SCP-IDENT-1005".to_owned(),
+            message: format!(
+                "internal: unexpected custody type {custody:?} passed validate_custody_type — \
+                 this is a bug in the bridge layer"
+            ),
         }
+        .into()),
     }
 }
 
@@ -274,12 +275,11 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
 ///
 /// Rejects with `SCP-IDENT-1004` if the DID method is not `"did:dht:"`.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
     if !did.starts_with("did:dht:") {
         return Err(ScpNapiError::Identity {
-            message: format!(
-                "unsupported DID method: {did} — only did:dht is supported"
-            ),
+            message: format!("unsupported DID method: {did} — only did:dht is supported"),
             code: "SCP-IDENT-1004".to_owned(),
         }
         .into());
@@ -319,9 +319,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
 pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
     if !did.starts_with("did:dht:") {
         return Err(ScpNapiError::Identity {
-            message: format!(
-                "unsupported DID method: {did} — only did:dht is supported"
-            ),
+            message: format!("unsupported DID method: {did} — only did:dht is supported"),
             code: "SCP-IDENT-1004".to_owned(),
         }
         .into());

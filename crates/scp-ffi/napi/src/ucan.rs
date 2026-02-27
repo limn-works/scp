@@ -11,8 +11,8 @@
 use napi_derive::napi;
 
 use crate::context::NapiContextHandle;
-use crate::error::ScpNapiError;
 use crate::decrement_handle_count;
+use crate::error::ScpNapiError;
 
 // ---------------------------------------------------------------------------
 // NapiUcanTokenData — UCAN token metadata record
@@ -23,7 +23,7 @@ use crate::decrement_handle_count;
 /// Exposes the token's decoded claims without the raw JWT bytes. The
 /// encoded JWT is held internally for future validation operations.
 ///
-/// See ADR-016 and spec §10 (UCAN).
+/// See ADR-016 and spec section 10 (UCAN).
 #[napi(object)]
 pub struct NapiUcanTokenData {
     /// Unique token identifier (derived from the UCAN nonce).
@@ -67,6 +67,7 @@ pub struct NapiUcanToken {
 impl NapiUcanToken {
     /// Returns the token's metadata record.
     #[napi(getter, js_name = "tokenData")]
+    #[must_use]
     pub fn token_data(&self) -> NapiUcanTokenData {
         NapiUcanTokenData {
             token_id: self.data.token_id.clone(),
@@ -79,30 +80,36 @@ impl NapiUcanToken {
 
     /// Returns the token's unique ID.
     #[napi(getter, js_name = "tokenId")]
+    #[must_use]
     pub fn token_id(&self) -> String {
         self.data.token_id.clone()
     }
 
     /// Returns the issuer DID.
     #[napi(getter)]
+    #[must_use]
     pub fn issuer(&self) -> String {
         self.data.issuer.clone()
     }
 
     /// Returns the audience DID.
     #[napi(getter)]
+    #[must_use]
     pub fn audience(&self) -> String {
         self.data.audience.clone()
     }
 
     /// Returns the list of capability URIs granted by this token.
     #[napi(getter)]
+    #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
         self.data.capabilities.clone()
     }
 
     /// Returns the expiry timestamp (seconds since epoch) or `null` if no expiry.
     #[napi(getter, js_name = "expiresAt")]
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
     pub fn expires_at(&self) -> Option<f64> {
         self.data.expires_at
     }
@@ -133,10 +140,12 @@ impl Drop for NapiUcanToken {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-PERM-4002` if validation fails (malformed token,
+/// - Rejects with `SCP-PRM-4002` if validation fails (malformed token,
 ///   invalid signature, expired, insufficient capabilities, revoked,
 ///   broken delegation chain).
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn ucan_validate(
     handle: &NapiContextHandle,
     token: String,
@@ -168,6 +177,8 @@ pub async fn ucan_validate(
 /// - Rejects with `SCP-PERM-4004` if minting fails (capabilities outside
 ///   the context ceiling, issuer not authorized, etc.).
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
 pub async fn ucan_mint(
     handle: &NapiContextHandle,
     member_did: String,
@@ -175,8 +186,7 @@ pub async fn ucan_mint(
 ) -> napi::Result<NapiUcanToken> {
     let _ = (handle, member_did, capabilities);
     Err(ScpNapiError::Permission {
-        message: "not yet connected to runtime — UCAN minting requires a live context"
-            .to_owned(),
+        message: "not yet connected to runtime — UCAN minting requires a live context".to_owned(),
         code: "SCP-PRM-4004".to_owned(),
     }
     .into())
@@ -198,10 +208,9 @@ pub async fn ucan_mint(
 /// - Rejects with `SCP-PERM-4006` if revocation fails (token not found,
 ///   revoker not authorized — must be the token's issuer or context creator).
 #[napi]
-pub async fn ucan_revoke(
-    handle: &NapiContextHandle,
-    token_id: String,
-) -> napi::Result<()> {
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn ucan_revoke(handle: &NapiContextHandle, token_id: String) -> napi::Result<()> {
     let _ = (handle, token_id);
     Err(ScpNapiError::Permission {
         message: "not yet connected to runtime — UCAN revocation requires a live context"
