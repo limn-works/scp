@@ -34,7 +34,7 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-platform = { path = "../scp-platform", features = ["software_platform"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 

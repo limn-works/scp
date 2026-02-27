@@ -50,6 +50,18 @@ SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure p
 - Protocol-first design; inject through initializers; no singletons
 - APIs: self-evident, one happy path
 
+### Git
+
+- Use worktrees for non trivial changes or when you're not already in one
+- Use topical branch names. Include source ids if available (ticket or issue number/name/source)
+- Write conventional commits and reference artifacts and sources in title and body
+- Write topical PR titles and descriptions. Actually describe the scope and impact of the changes, along with detailed info about the tickets/issuse/stories/artifacts that pertain to the PR. When closing issues, use keywords ("closes #42") so that GitHub auto-updates their status.
+- Always create atomic, revertable commits. Do not bundle unrelated changes into a single commit
+- Keep a clean and linear history
+- When you see unexpected changes, back off. Assume that another human or agent is also working in the repo. Read them to understand what's going on before doing anything. Never discard without doing those steps first
+- Avoid stashing or changing branches unless you are 100% confident in your understanding of the current state, or you were told to
+- Never use destructive git operations unless told to, or if you are 100% confident that they have been integrated upstream
+
 ## Agents
 
 Use agents eagerly for focus, expertise, and parallelization — especially code reviews. See `.claude/agents/README.md` for the full roster.

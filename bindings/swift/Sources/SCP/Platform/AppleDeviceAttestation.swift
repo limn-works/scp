@@ -13,10 +13,10 @@ import Foundation
 // truth until the XCFramework build pipeline is wired (SCP-103).
 //
 // Methods:
-//   attest(challenge:deviceId:) -> Data   — generate hardware (or software)
+//   attest(challenge:deviceId:)  -> Data  — generate hardware (or software)
 //                                           attestation object bound to the
 //                                           supplied challenge and device ID
-//   assert(requestHash:)        -> Data   — generate a per-request assertion
+//   assertRequest(requestHash:)  -> Data  — generate a per-request assertion
 //                                           using the stored App Attest key
 // ---------------------------------------------------------------------------
 
@@ -60,7 +60,7 @@ public protocol DeviceAttestationProvider: Sendable {
     ///   this assertion to.
     /// - Returns: Raw assertion bytes to include in the request to the relay.
     /// - Throws: `AttestationError` on fatal failure.
-    func assert(requestHash: Data) async throws -> Data
+    func assertRequest(requestHash: Data) async throws -> Data
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ private enum StorageKey {
 /// Attestation steps (per ADR-025 §"Device attestation"):
 /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
 /// 2. `attestKey(_:clientDataHash:)` — requests Apple's attestation object
-///    where `clientDataHash = SHA-256(challenge || deviceId)`.
+///    where `clientDataHash = SHA-256(clientDataJSON)`.
 /// 3. `generateAssertion(_:clientData:)` — per-request proof of possession.
 ///
 /// ## Software fallback (simulator / unavailable)
@@ -120,20 +120,24 @@ private enum StorageKey {
 /// ## Thread safety
 ///
 /// `AppleDeviceAttestation` is `final` and conforms to `Sendable`. Internal
-/// mutable state (`storedKeyId`) is protected by `NSLock`. All async methods
-/// use `withCheckedThrowingContinuation` to bridge the completion-handler
-/// APIs to structured concurrency.
+/// mutable state (`generationTask`, `UserDefaults`) is protected by `NSLock`.
+/// All async methods use `withCheckedThrowingContinuation` to bridge the
+/// completion-handler APIs to structured concurrency.
 ///
 /// See ADR-025 and `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
 public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked Sendable {
 
-    // `@unchecked Sendable` is justified: `storedKeyId` is a simple
-    // Optional<String> protected by `lock`. No reference semantics escape.
-    // See ADR-025 and .docs/standards/swift.md §Safety.
+    // `@unchecked Sendable` is required because this class is injected into the
+    // Rust engine via the UniFFI `DeviceAttestationProvider` callback interface,
+    // which requires `Send + Sync` (Rust) → `Sendable` (Swift). Internal mutable
+    // state (`generationTask`, `UserDefaults`) is protected by `lock`; no reference
+    // semantics escape across the FFI boundary. This is the same exception as
+    // `MessageListenerAdapter`. See .docs/standards/swift.md §Sendable — UniFFI exception.
 
     private let service: DCAppAttestService
     private let defaults: UserDefaults
     private let lock: NSLock
+    private var generationTask: Task<String, Error>?
 
     /// Whether this instance is running in hardware-backed mode.
     ///
@@ -171,7 +175,8 @@ public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked
     ///
     /// On a real device with App Attest available:
     /// 1. Retrieves or generates the App Attest key ID.
-    /// 2. Computes `clientDataHash = SHA-256(challenge || deviceId)`.
+    /// 2. Computes `clientDataHash = SHA-256(clientDataJSON)` where
+    ///    `clientDataJSON = {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
     /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)`.
     /// 4. Returns the raw CBOR attestation bytes.
     ///
@@ -222,7 +227,7 @@ public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked
     /// - Throws: `AttestationError.keyNotFound` if no key ID is stored
     ///   (i.e., `attest` was never called).
     ///   `AttestationError.serviceError` if the App Attest service fails.
-    public func assert(requestHash: Data) async throws -> Data {
+    public func assertRequest(requestHash: Data) async throws -> Data {
         guard service.isSupported else {
             return softwareAssertionToken()
         }
@@ -277,18 +282,48 @@ public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked
 
     /// Retrieve the stored App Attest key ID, or generate and store a new one.
     ///
-    /// Key generation is idempotent with respect to `UserDefaults`: if a key
-    /// ID is already stored it is returned immediately without a round-trip to
-    /// the App Attest service.
+    /// Uses a task-coalescing pattern to prevent TOCTOU races: if concurrent
+    /// callers both find no key in `UserDefaults`, only one key generation
+    /// task is started; all callers await the same task result. This prevents
+    /// multiple Secure Enclave keys from being generated on concurrent first
+    /// calls to `attest(challenge:deviceId:)`.
     ///
     /// - Returns: An App Attest key ID string suitable for use in
     ///   `attestKey(_:clientDataHash:)` and `generateAssertion(_:clientData:)`.
     /// - Throws: `AttestationError.serviceError` if `generateKey` fails.
     private func resolveKeyId() async throws -> String {
-        if let existing = loadKeyId() {
-            return existing
+        // Phase 1: synchronous check under lock. Returns either the existing
+        // key ID string, an in-flight Task to await, or nil meaning we must
+        // start a new task.
+        enum Outcome {
+            case existing(String)
+            case coalesce(Task<String, Error>)
+            case startNew
         }
-        return try await generateAndStoreKey()
+        let outcome: Outcome = lock.withLock {
+            if let existing = defaults.string(forKey: StorageKey.appAttestKeyId) {
+                return .existing(existing)
+            }
+            if let ongoing = generationTask {
+                return .coalesce(ongoing)
+            }
+            return .startNew
+        }
+
+        switch outcome {
+        case .existing(let keyId):
+            return keyId
+        case .coalesce(let task):
+            return try await task.value
+        case .startNew:
+            let task = Task<String, Error> { [weak self] in
+                guard let self else { throw AttestationError.internalError("self was deallocated") }
+                return try await self.generateAndStoreKey()
+            }
+            lock.withLock { generationTask = task }
+            defer { lock.withLock { generationTask = nil } }
+            return try await task.value
+        }
     }
 
     /// Generate a new App Attest key and persist its ID.
@@ -316,21 +351,18 @@ public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked
         return keyId
     }
 
-    /// Compute `SHA-256(challenge || deviceId)` for use as `clientDataHash`.
+    /// Compute the client data hash for App Attest.
     ///
-    /// Per ADR-025: `clientDataHash = SHA-256(challenge || deviceId)` where
-    /// `||` is byte concatenation. This binds the attestation to both the
-    /// server-issued challenge (replay prevention) and the device identity
-    /// (device binding).
+    /// Uses structured JSON encoding to prevent length-confusion on naive byte
+    /// concatenation. Per ADR-025 (updated): `clientDataHash = SHA256(clientDataJSON)`
+    /// where `clientDataJSON = {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
+    /// Field order is fixed to ensure cross-platform determinism.
     ///
-    /// - Parameters:
-    ///   - challenge: Server-issued challenge bytes.
-    ///   - deviceId: Device/identity identifier bytes.
-    /// - Returns: 32-byte SHA-256 digest.
+    /// The relay reconstructs this JSON with the same fixed-field-order formula
+    /// to verify the nonce embedded in the App Attest leaf certificate.
     private func computeClientDataHash(challenge: Data, deviceId: Data) -> Data {
-        var combined = challenge
-        combined.append(deviceId)
-        return Data(SHA256.hash(data: combined))
+        let json = "{\"challenge\":\"\(challenge.base64EncodedString())\",\"deviceId\":\"\(deviceId.base64EncodedString())\",\"type\":\"scp-device-attestation-v1\"}"
+        return Data(SHA256.hash(data: Data(json.utf8)))
     }
 
     // MARK: Persistence (UserDefaults)

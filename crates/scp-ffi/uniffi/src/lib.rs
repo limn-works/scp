@@ -265,25 +265,26 @@ pub trait MessageListener: Send + Sync {
 ///
 /// See ADR-006 (Platform Abstraction) and ADR-021 acceptance criterion 12.
 #[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
 pub trait KeyCustodyProvider: Send + Sync {
     /// Sign `message` bytes with the Ed25519 key identified by `key_id`.
     ///
     /// Returns the raw 64-byte Ed25519 signature.
-    fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+    async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Return the Ed25519 public key bytes (32 bytes) for `key_id`.
-    fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError>;
+    async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError>;
 
     /// Destroy key material for `key_id`. Subsequent operations must fail.
-    fn destroy_key(&self, key_id: String) -> Result<(), ScpError>;
+    async fn destroy_key(&self, key_id: String) -> Result<(), ScpError>;
 
     /// Generate a new keypair. `key_type` is `"ed25519"` or `"x25519"`.
     ///
     /// Returns an opaque key identifier string.
-    fn generate_keypair(&self, key_type: String) -> Result<String, ScpError>;
+    async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError>;
 
     /// Return the custody type for `key_id`: `"hardware"`, `"software"`, or
-    /// `"in_memory"`.
+    /// `"in_memory"`. Stays sync — no I/O required.
     fn custody_type(&self, key_id: String) -> String;
 }
 
@@ -305,24 +306,25 @@ pub trait KeyCustodyProvider: Send + Sync {
 ///
 /// See ADR-006 (Platform Abstraction) and ADR-021 acceptance criterion 12.
 #[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
 pub trait StorageProvider: Send + Sync {
     /// Retrieve bytes stored under `key`. Returns `None` if not found.
-    fn get(&self, key: String) -> Result<Option<Vec<u8>>, ScpError>;
+    async fn get(&self, key: String) -> Result<Option<Vec<u8>>, ScpError>;
 
     /// Store `value` bytes under `key`, overwriting any existing value.
-    fn set(&self, key: String, value: Vec<u8>) -> Result<(), ScpError>;
+    async fn set(&self, key: String, value: Vec<u8>) -> Result<(), ScpError>;
 
     /// Delete the value stored under `key`. No-op if absent.
-    fn delete(&self, key: String) -> Result<(), ScpError>;
+    async fn delete(&self, key: String) -> Result<(), ScpError>;
 
     /// List all keys with `prefix` in lexicographic order.
-    fn list_keys(&self, prefix: String) -> Result<Vec<String>, ScpError>;
+    async fn list_keys(&self, prefix: String) -> Result<Vec<String>, ScpError>;
 
     /// Delete all keys with `prefix`. Returns the count deleted.
-    fn delete_prefix(&self, prefix: String) -> Result<u64, ScpError>;
+    async fn delete_prefix(&self, prefix: String) -> Result<u64, ScpError>;
 
     /// Return `true` if `key` exists without reading its value.
-    fn exists(&self, key: String) -> Result<bool, ScpError>;
+    async fn exists(&self, key: String) -> Result<bool, ScpError>;
 }
 
 /// Callback for platform push notification registration and handling.
@@ -342,17 +344,18 @@ pub trait StorageProvider: Send + Sync {
 ///
 /// See ADR-006 (Platform Abstraction) and ADR-021 acceptance criterion 12.
 #[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
 pub trait PushProvider: Send + Sync {
     /// Register for push notifications.
     ///
     /// Returns the platform-specific token bytes (APNs device token, FCM
     /// registration token).
-    fn register(&self) -> Result<Vec<u8>, ScpError>;
+    async fn register(&self) -> Result<Vec<u8>, ScpError>;
 
     /// Handle an incoming push notification `payload`.
     ///
     /// Returns wake signal bytes indicating which context has new messages.
-    fn handle_notification(&self, payload: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+    async fn handle_notification(&self, payload: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 
 /// Callback for platform device attestation.
@@ -372,6 +375,7 @@ pub trait PushProvider: Send + Sync {
 ///
 /// See ADR-025 (Apple Platform Adapter) and ADR-021 acceptance criterion 12.
 #[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
 pub trait DeviceAttestationProvider: Send + Sync {
     /// Generate a cryptographic attestation for this device.
     ///
@@ -381,7 +385,7 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///
     /// Returns the platform attestation object bytes (Apple: CBOR-encoded
     /// attestation; Android: Play Integrity token bytes).
-    fn attest(&self, challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+    async fn attest(&self, challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Generate a per-request assertion proving key possession.
     ///
@@ -389,7 +393,7 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).
-    fn assert_request(&self, request_hash: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+    async fn assert_request(&self, request_hash: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +477,7 @@ mod tests {
     fn scp_error_display_is_descriptive() {
         let identity = ScpError::Identity {
             message: "test".to_owned(),
-            code: "SCP-IDN-1001".to_owned(),
+            code: "SCP-IDENT-1001".to_owned(),
         };
         let context = ScpError::Context {
             message: "test".to_owned(),

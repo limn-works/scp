@@ -160,9 +160,11 @@ public actor AppleStorage {
     ///
     /// Steps:
     /// 1. Attempt to read an existing item from Keychain under `scp.db.key`.
-    /// 2. If found, return those bytes.
-    /// 3. If not found (`errSecItemNotFound`), generate 32 cryptographically
-    ///    random bytes, add them to Keychain, and return them.
+    /// 2. If found and valid (32 bytes), return those bytes.
+    /// 3. If corrupt (wrong size), delete the item and call
+    ///    ``generateFreshEncryptionKey()`` (non-recursive).
+    /// 4. If not found (`errSecItemNotFound`), call
+    ///    ``generateFreshEncryptionKey()`` directly.
     ///
     /// The returned bytes are intended to be passed to SQLCipher as:
     /// ```sql
@@ -185,45 +187,45 @@ public actor AppleStorage {
         switch readStatus {
         case errSecSuccess:
             guard let data = result as? Data, data.count == 32 else {
-                // The stored item is corrupt or wrong size — delete and regenerate.
+                // Corrupt item: delete it, then generate fresh key (non-recursive).
                 let deleteQuery: [String: Any] = [
                     kSecClass as String:           kSecClassGenericPassword,
                     kSecAttrAccount as String:     keychainAccount,
                     kSecAttrAccessGroup as String: keychainAccessGroup,
                 ]
-                SecItemDelete(deleteQuery as CFDictionary)
-                return try generateOrRetrieveEncryptionKey()
+                let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
+                guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+                    throw StorageError.keychainError(deleteStatus)
+                }
+                return try generateFreshEncryptionKey()
             }
             return data
 
         case errSecItemNotFound:
-            // No existing key — generate 32 random bytes.
-            var keyBytes = [UInt8](repeating: 0, count: 32)
-            let rc = SecRandomCopyBytes(kSecRandomDefault, 32, &keyBytes)
-            guard rc == errSecSuccess else {
-                throw StorageError.keychainError(rc)
-            }
-            let keyData = Data(keyBytes)
-
-            // Store in Keychain.
-            let addQuery: [String: Any] = [
-                kSecClass as String:           kSecClassGenericPassword,
-                kSecAttrAccount as String:     keychainAccount,
-                kSecAttrAccessGroup as String: keychainAccessGroup,
-                // AfterFirstUnlock: accessible in background after device has been
-                // unlocked at least once since boot. ThisDeviceOnly: no iCloud sync.
-                kSecAttrAccessible as String:  kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-                kSecValueData as String:       keyData,
-            ]
-            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            guard addStatus == errSecSuccess else {
-                throw StorageError.keychainError(addStatus)
-            }
-            return keyData
+            return try generateFreshEncryptionKey()
 
         default:
             throw StorageError.keychainError(readStatus)
         }
+    }
+
+    /// Generate 32 random bytes and add them to Keychain. Non-recursive.
+    /// Called only when no key exists or the existing key is corrupt and deleted.
+    private static func generateFreshEncryptionKey() throws -> Data {
+        var keyBytes = [UInt8](repeating: 0, count: 32)
+        let rc = SecRandomCopyBytes(kSecRandomDefault, 32, &keyBytes)
+        guard rc == errSecSuccess else { throw StorageError.keychainError(rc) }
+        let keyData = Data(keyBytes)
+        let addQuery: [String: Any] = [
+            kSecClass as String:           kSecClassGenericPassword,
+            kSecAttrAccount as String:     keychainAccount,
+            kSecAttrAccessGroup as String: keychainAccessGroup,
+            kSecAttrAccessible as String:  kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData as String:       keyData,
+        ]
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else { throw StorageError.keychainError(addStatus) }
+        return keyData
     }
 
     // MARK: StorageProvider implementation

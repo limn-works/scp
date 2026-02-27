@@ -27,6 +27,7 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
 
 // ---------------------------------------------------------------------------
@@ -163,7 +164,7 @@ impl WasmProof {
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context whose event log to query.
+/// * `context` — The context handle whose event log to query.
 /// * `filter_json` — An optional JSON string with filter parameters:
 ///   - `"eventType"` (`string`): Filter by event type name.
 ///   - `"actorDid"` (`string`): Filter by actor DID.
@@ -185,7 +186,8 @@ impl WasmProof {
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn event_log_query(context_id: String, filter_json: Option<String>) -> Promise {
+pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         // Validate filter JSON if provided.
         if let Some(ref filter) = filter_json {
@@ -216,7 +218,7 @@ pub fn event_log_query(context_id: String, filter_json: Option<String>) -> Promi
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context whose event log to verify against.
+/// * `context` — The context handle whose event log to verify against.
 /// * `claim_json` — A JSON string describing the claim:
 ///   - `"type"` (`"inclusion" | "absence"`): Proof type.
 ///   - `"leafIndex"` (`number`): For inclusion proofs, the event's position.
@@ -234,7 +236,8 @@ pub fn event_log_query(context_id: String, filter_json: Option<String>) -> Promi
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn event_log_verify(context_id: String, claim_json: String) -> Promise {
+pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         // Validate claim_json.
         let _claim: serde_json::Value = serde_json::from_str(&claim_json)

@@ -93,7 +93,7 @@ impl From<scp_core::identity::IdentityError> for ScpNapiError {
             message: format!(
                 "{e} — check DID format, key custody configuration, or DHT connectivity"
             ),
-            code: "SCP-IDN-1001".to_owned(),
+            code: "SCP-IDENT-1001".to_owned(),
         }
     }
 }
@@ -168,7 +168,7 @@ impl From<scp_core::context::tools::ToolError> for ScpNapiError {
             message: format!(
                 "tool operation failed: {e} — check tool registration, permissions, and input schema"
             ),
-            code: "SCP-TOOL-5001".to_owned(),
+            code: "SCP-TOOL-6001".to_owned(),
         }
     }
 }
@@ -179,7 +179,7 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpNapiError {
             message: format!(
                 "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
             ),
-            code: "SCP-TOOL-5002".to_owned(),
+            code: "SCP-TOOL-6002".to_owned(),
         }
     }
 }
@@ -190,7 +190,7 @@ impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpNapiEr
             message: format!(
                 "schema validation failed: {e} — check input against the tool's JSON Schema"
             ),
-            code: "SCP-VAL-7001".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
         }
     }
 }
@@ -201,7 +201,7 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpNapiError {
             message: format!(
                 "MLS operation failed: {e} — check group state and member key packages"
             ),
-            code: "SCP-CRY-3001".to_owned(),
+            code: "SCP-CRYPTO-4001".to_owned(),
         }
     }
 }
@@ -212,7 +212,7 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpNapiError {
             message: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
             ),
-            code: "SCP-CRY-3002".to_owned(),
+            code: "SCP-CRYPTO-4002".to_owned(),
         }
     }
 }
@@ -223,7 +223,7 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpNapiError {
             message: format!(
                 "{e} — check token format, signatures, time bounds, and capability chain"
             ),
-            code: "SCP-PRM-4001".to_owned(),
+            code: "SCP-PERM-3001".to_owned(),
         }
     }
 }
@@ -234,7 +234,7 @@ impl From<scp_core::envelope::EnvelopeError> for ScpNapiError {
             message: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
             ),
-            code: "SCP-CRY-3003".to_owned(),
+            code: "SCP-CRYPTO-4003".to_owned(),
         }
     }
 }
@@ -256,7 +256,7 @@ impl From<scp_core::provenance::ProvenanceError> for ScpNapiError {
             message: format!(
                 "provenance validation failed: {e} — check cross-context chain depth"
             ),
-            code: "SCP-VAL-7002".to_owned(),
+            code: "SCP-VALID-7002".to_owned(),
         }
     }
 }
@@ -267,7 +267,7 @@ impl From<scp_core::trust::TrustError> for ScpNapiError {
             message: format!(
                 "trust evaluation failed: {e} — check event log data and attestation validity"
             ),
-            code: "SCP-VAL-7003".to_owned(),
+            code: "SCP-VALID-7003".to_owned(),
         }
     }
 }
@@ -276,7 +276,7 @@ impl From<scp_core::uri::ScpUriError> for ScpNapiError {
     fn from(e: scp_core::uri::ScpUriError) -> Self {
         Self::Validation {
             message: format!("invalid SCP URI: {e} — check URI format (scp://relay/context-id)"),
-            code: "SCP-VAL-7004".to_owned(),
+            code: "SCP-VALID-7004".to_owned(),
         }
     }
 }
@@ -285,7 +285,7 @@ impl From<scp_core::well_known::WellKnownValidationError> for ScpNapiError {
     fn from(e: scp_core::well_known::WellKnownValidationError) -> Self {
         Self::Validation {
             message: format!("well-known validation failed: {e} — check relay configuration"),
-            code: "SCP-VAL-7005".to_owned(),
+            code: "SCP-VALID-7005".to_owned(),
         }
     }
 }
@@ -329,7 +329,7 @@ impl From<scp_platform::PlatformError> for ScpNapiError {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
             ),
-            code: "SCP-CRY-3004".to_owned(),
+            code: "SCP-CRYPTO-4004".to_owned(),
         }
     }
 }
@@ -340,7 +340,7 @@ impl From<serde_json::Error> for ScpNapiError {
             message: format!(
                 "JSON serialization/deserialization failed: {e} — check input format"
             ),
-            code: "SCP-VAL-7006".to_owned(),
+            code: "SCP-VALID-7006".to_owned(),
         }
     }
 }
@@ -359,7 +359,7 @@ pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError>
             message: format!(
                 "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
             ),
-            code: "SCP-VAL-7007".to_owned(),
+            code: "SCP-VALID-7007".to_owned(),
         }),
     }
 }

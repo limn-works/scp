@@ -26,6 +26,7 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
 
 // ---------------------------------------------------------------------------
@@ -118,7 +119,7 @@ impl WasmUcanToken {
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context the token is presented in.
+/// * `context` — The context handle the token is presented in.
 /// * `token` — The encoded UCAN token string (JWT format).
 /// * `capability` — The required capability URI (e.g.,
 ///   `"scp:ctx:abc123/messages:write"`).
@@ -135,7 +136,8 @@ impl WasmUcanToken {
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn ucan_validate(context_id: String, token: String, capability: String) -> Promise {
+pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: String) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         let _ = (context_id, token, capability);
 
@@ -157,7 +159,7 @@ pub fn ucan_validate(context_id: String, token: String, capability: String) -> P
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context to mint the token for.
+/// * `context` — The context handle to mint the token for.
 /// * `member_did` — The DID of the member receiving the token.
 /// * `capabilities_json` — A JSON array of capability URI strings to grant
 ///   (e.g., `'["scp:ctx:abc123/messages:write"]'`).
@@ -174,7 +176,8 @@ pub fn ucan_validate(context_id: String, token: String, capability: String) -> P
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn ucan_mint(context_id: String, member_did: String, capabilities_json: String) -> Promise {
+pub fn ucan_mint(context: &WasmContextHandle, member_did: String, capabilities_json: String) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         // Validate that capabilities_json is a valid JSON array.
         let caps: serde_json::Value = serde_json::from_str(&capabilities_json)
@@ -211,7 +214,7 @@ pub fn ucan_mint(context_id: String, member_did: String, capabilities_json: Stri
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context the token belongs to.
+/// * `context` — The context handle the token belongs to.
 /// * `token_id` — The unique ID of the token to revoke.
 ///
 /// # Returns
@@ -225,7 +228,8 @@ pub fn ucan_mint(context_id: String, member_did: String, capabilities_json: Stri
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn ucan_revoke(context_id: String, token_id: String) -> Promise {
+pub fn ucan_revoke(context: &WasmContextHandle, token_id: String) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         let _ = (context_id, token_id);
 

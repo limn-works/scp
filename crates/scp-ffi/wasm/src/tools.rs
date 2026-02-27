@@ -25,6 +25,7 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
 
 // ---------------------------------------------------------------------------
@@ -88,7 +89,7 @@ impl WasmToolVerificationResult {
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context to register the tool in.
+/// * `context` — The context handle to register the tool in.
 /// * `definition_json` — A JSON string containing the tool definition:
 ///   - `"name"` (`string`): Human-readable tool name.
 ///   - `"description"` (`string`): Tool description.
@@ -108,7 +109,8 @@ impl WasmToolVerificationResult {
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn tool_register(context_id: String, definition_json: String) -> Promise {
+pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         // Validate that definition_json is valid JSON.
         let _def: serde_json::Value = serde_json::from_str(&definition_json)
@@ -133,7 +135,7 @@ pub fn tool_register(context_id: String, definition_json: String) -> Promise {
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context containing the tool.
+/// * `context` — The context handle containing the tool.
 /// * `tool_id` — The ID of the tool to invoke.
 /// * `input_json` — A JSON string of input parameters matching the tool's
 ///   input schema.
@@ -153,11 +155,12 @@ pub fn tool_register(context_id: String, definition_json: String) -> Promise {
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
 pub fn tool_invoke(
-    context_id: String,
+    context: &WasmContextHandle,
     tool_id: String,
     input_json: String,
     identity_did: String,
 ) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         // Validate that input_json is valid JSON.
         let _input: serde_json::Value = serde_json::from_str(&input_json)
@@ -182,7 +185,7 @@ pub fn tool_invoke(
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context containing the tool.
+/// * `context` — The context handle containing the tool.
 /// * `tool_id` — The ID of the tool to verify.
 ///
 /// # Returns
@@ -196,7 +199,8 @@ pub fn tool_invoke(
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn tool_verify(context_id: String, tool_id: String) -> Promise {
+pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         let _ = (context_id, tool_id);
 

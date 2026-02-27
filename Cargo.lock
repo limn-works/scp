@@ -3465,6 +3465,7 @@ dependencies = [
 name = "scp-ffi-uniffi"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "scp-core",
  "scp-platform",
  "scp-transport",
@@ -3557,6 +3558,7 @@ dependencies = [
  "tokio",
  "uuid",
  "x25519-dalek 2.0.1",
+ "zeroize",
 ]
 
 [[package]]

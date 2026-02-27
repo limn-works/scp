@@ -197,8 +197,9 @@ class AndroidKeyCustody : KeyCustodyProvider {
 class AndroidDeviceAttestation(private val context: Context) : DeviceAttestationProvider {
 
     override suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray {
+        val clientDataJSON = "{\"challenge\":\"${Base64.encodeToString(challenge, Base64.NO_WRAP)}\",\"deviceId\":\"${Base64.encodeToString(deviceId, Base64.NO_WRAP)}\",\"type\":\"scp-device-attestation-v1\"}"
         val nonce = Base64.encodeToString(
-            MessageDigest.getInstance("SHA-256").digest(challenge + deviceId),
+            MessageDigest.getInstance("SHA-256").digest(clientDataJSON.toByteArray(Charsets.UTF_8)),
             Base64.NO_WRAP
         )
         val integrityTokenResponse = withContext(Dispatchers.IO) {
@@ -421,7 +422,7 @@ dependencies {
 
 7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
    - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
-   - Nonce is `Base64(SHA-256(challenge || deviceId))`.
+   - Nonce is `Base64(SHA-256(clientDataJSON))` where `clientDataJSON = '{"challenge":"<base64(challenge)>","deviceId":"<base64(deviceId)>","type":"scp-device-attestation-v1"}'` (fields in this exact order, RFC 4648 base64 NO_WRAP).
    - Returns raw integrity token bytes (JWT for server-side verification).
 
 8. **`AndroidDeviceAttestation.assert(requestHash)`:**
@@ -688,7 +689,7 @@ class Scp private constructor(private val identityHandle: IdentityHandle) : Auto
  * An SCP identity (DID). Holds the signing key handle — never exposes private key bytes.
  * Constructed by Scp.create(). Use Scp.identity to access.
  */
-class Identity internal constructor(private val handle: IdentityHandle) {
+class Identity internal constructor(internal val handle: IdentityHandle) {
 
     val did: String get() = handle.did()
     val custodyType: String get() = handle.custodyType()
@@ -736,7 +737,7 @@ data class DIDDocument(
  * An active SCP context. Send messages, receive streams, invoke tools.
  * Always call close() when done. Use the use { } block or DisposableEffect in Compose.
  */
-class Context internal constructor(private val handle: ContextHandle) : AutoCloseable {
+class Context internal constructor(internal val handle: ContextHandle) : AutoCloseable {
 
     val contextId: String get() = handle.contextId()
     val state: String get() = handle.state()

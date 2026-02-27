@@ -125,7 +125,7 @@ impl NapiIdentity {
                       use the KeyCustodyProvider callback interface to inject \
                       Secure Enclave (iOS) or Android Keystore (Android) backed custody"
                 .to_owned(),
-            code: "SCP-IDN-1002".to_owned(),
+            code: "SCP-IDENT-1002".to_owned(),
         }
         .into())
     }
@@ -194,9 +194,9 @@ pub struct NapiDIDDocument {
 /// # Errors
 ///
 /// - Rejects with `SCP-VAL-7007` if `custody` is not a recognized value.
-/// - Rejects with `SCP-IDN-1003` for `"platform"` or `"software"` custody
+/// - Rejects with `SCP-IDENT-1003` for `"platform"` or `"software"` custody
 ///   (not yet wired).
-/// - Rejects with `SCP-IDN-1001` if key generation or DID creation fails.
+/// - Rejects with `SCP-IDENT-1001` if key generation or DID creation fails.
 ///
 /// # Security
 ///
@@ -240,10 +240,20 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                  interface to inject Secure Enclave (iOS) or Android \
                  Keystore (Android) backed custody"
             ),
-            code: "SCP-IDN-1003".to_owned(),
+            code: "SCP-IDENT-1003".to_owned(),
         }
         .into()),
-        _ => unreachable!("validate_custody_type guarantees only known values reach here"),
+        _ => {
+            return Err(ScpNapiError::Identity {
+                code: "SCP-IDENT-1005".to_owned(),
+                message: format!(
+                    "internal: unexpected custody type {:?} passed validate_custody_type — \
+                     this is a bug in the bridge layer",
+                    custody
+                ),
+            }
+            .into())
+        }
     }
 }
 
@@ -262,7 +272,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
 ///
 /// # Errors
 ///
-/// Rejects with `SCP-IDN-1004` if the DID method is not `"did:dht:"`.
+/// Rejects with `SCP-IDENT-1004` if the DID method is not `"did:dht:"`.
 #[napi]
 pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
     if !did.starts_with("did:dht:") {
@@ -270,7 +280,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
             message: format!(
                 "unsupported DID method: {did} — only did:dht is supported"
             ),
-            code: "SCP-IDN-1004".to_owned(),
+            code: "SCP-IDENT-1004".to_owned(),
         }
         .into());
     }
@@ -278,7 +288,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
     let handle = NapiIdentity {
         inner: Arc::new(NapiIdentityInner {
             did,
-            custody_type: "in_memory".to_owned(),
+            custody_type: "external".to_owned(),
             scp_identity: None,
             in_memory_custody: None,
         }),
@@ -302,8 +312,8 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-IDN-1004` if the DID format is invalid.
-/// - Rejects with `SCP-IDN-1001` if the DID cannot be resolved (not found
+/// - Rejects with `SCP-IDENT-1004` if the DID format is invalid.
+/// - Rejects with `SCP-IDENT-1001` if the DID cannot be resolved (not found
 ///   on DHT, verification failure, network error).
 #[napi]
 pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
@@ -312,7 +322,7 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
             message: format!(
                 "unsupported DID method: {did} — only did:dht is supported"
             ),
-            code: "SCP-IDN-1004".to_owned(),
+            code: "SCP-IDENT-1004".to_owned(),
         }
         .into());
     }
