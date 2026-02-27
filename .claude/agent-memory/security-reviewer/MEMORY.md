@@ -105,10 +105,18 @@
 - MEDIUM: Dummy PaymentAuthorization (zeroed auth_id) leaked to closures on 3 free paths
 - MEDIUM: IntegrationError erased to ContextError::MembershipFailed(string) in ContextManager
 - GOOD: Fail-closed on arithmetic overflow (unwrap_or(Amount(u64::MAX)))
-- GOOD: VoidFailed preserves both original + void error (Box wrapping)
 - GOOD: Integer-only arithmetic throughout (no f64)
-- GOOD: allowed_adapters check before authorize()
 - Pattern: execute_paid_action combines sender+receiver flows -- needs split for production 2-party use
+
+### Economy Integration Tests (SCP-160 Review, 2026-02-27)
+- 40 tests covering all 9 invariants from spec 19.14, all pass
+- MEDIUM: Invariant 7 test is self-referential (checks hardcoded string, not real encryption path)
+- MEDIUM: TestAdapter::verify() returns Amount(0) not receipt amount -- weakens invariant 4
+- MEDIUM: signed_event helper duplicates EventType-to-tag mapping from tree.rs -- divergence risk
+- TestAdapter::verify_authorization() is no-op -- spec 19.2.2 step 5 not tested
+- GOOD: Tests exercise real production functions (evaluate_cost, auto_accept_blocked_by_economics, etc.)
+- GOOD: Merkle proof integration with signed events and real EventLog
+- Pattern: Test adapter fidelity matters for invariant tests -- echoing values back catches mismatches
 
 ### Context Nesting (`crates/scp-core/src/context/nesting.rs`)
 - content_hash NOW returns Result (no hash collision on serialization error)
@@ -172,3 +180,5 @@
 - `zeroize` crate not yet used anywhere
 - Recurring: `unwrap_or_default()` on clock ops -- systemic pattern
 - Pattern: multi-migration checkpoint root management is a subtle invariant -- always test proof verification across 2+ migration cycles
+- Pattern: Duplicated canonical hash logic in test helpers is a recurring fragility -- always import production functions instead of reimplementing
+- Pattern: Test adapters that return hardcoded success values weaken invariant tests -- echo real values back

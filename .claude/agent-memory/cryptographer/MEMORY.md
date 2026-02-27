@@ -67,6 +67,16 @@
 - EIP-1559 relay pricing: stuck price when current_base_price * max_change_per_mille < 1000 (integer truncation to 0 change)
 - Step thresholds NOT required to be sorted -- doesn't affect correctness due to saturating_add commutativity
 
+### Adapter Credential Management (SCP-162)
+- AdapterCredential stores pre-encrypted credential bytes (caller encrypts before storing)
+- Storage key: identity/{did}/adapter_credentials/{adapter_id} per spec 17.3
+- No zeroization on encrypted_data Vec<u8> (mitigated by data being encrypted)
+- DID key injection risk: DID type has no character validation, used in storage key construction
+- configure_adapter overwrites created_at on rotation (loses original creation time)
+- validate_adapter checks: non-empty id, safe chars [a-zA-Z0-9_-], >= 1 currency
+- 34 tests, all passing; missing proptest for serialization roundtrips
+- ProtocolStore<S: Storage> wraps platform Storage trait for domain methods
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs
@@ -77,3 +87,6 @@
 - `bindings/swift/Sources/SCP/Platform/` -- Apple platform adapters
 - `crates/scp-ffi/wasm/src/custody.rs` -- WASM key custody FFI boundary
 - `crates/scp-ffi/napi/src/identity.rs` -- Node/Bun identity bridge
+- `crates/scp-core/src/economy/credentials.rs` -- adapter credential management
+- `crates/scp-core/src/store/mod.rs` -- ProtocolStore definition
+- `crates/scp-core/src/store/economy.rs` -- adapter credential storage impl

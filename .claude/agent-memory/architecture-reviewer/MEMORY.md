@@ -21,6 +21,7 @@ Contains `f64` field (`Majority::min_participation`), so only `PartialEq` is der
 - `sync/mod.rs` -- shared types (OfflineTier, SyncError, CatchUpStatus, SyncOutcome), constants, tier classification
 - `sync/hours_offline.rs` -- Tier 1 (< 4h): relay buffering, MLS catch-up, reorder buffer, ReconnectionCoordinator
 - `sync/days_offline.rs` -- Tier 2 (4h-7d): ContextSnapshot, SnapshotDelta, DeltaSyncEngine trait, delta compute/apply
+- `sync/weeks_offline.rs` -- Tier 3 (> 7d): OfflineAssessment, ReJoinPlan, ReJoinExecutor trait, StatePreservation, BilateralContextRecovery, MemberResetEvent
 - `sync/conflict_resolution.rs` -- Conflict resolution: metadata LWW, governance Merkle-ordered, deadlock detection, context fork
 
 ### Known issue: dual ContextSnapshot
@@ -28,6 +29,12 @@ Both `days_offline::ContextSnapshot` (12 fields, full snapshot) and `conflict_re
 
 ### async fn in trait is NOT object-safe
 `DeltaSyncEngine` uses `#[allow(async_fn_in_trait)]` with `async fn`. This is NOT object-safe despite doc comments claiming otherwise. Needs `async-trait` or `trait_variant` for `dyn` dispatch.
+
+### Cross-module EventType additions are the #1 completeness gap
+Sync module stories (SCP-122, 123, 124, 127) each require EventType additions per ADR acceptance criteria. These are defined as structs in the sync module but the actual EventType enum in `event_log/mod.rs` must also be updated. Always check `event_log/mod.rs:EventType` when reviewing sync stories.
+
+### ReJoinExecutor follows DeltaSyncEngine pattern
+`weeks_offline::ReJoinExecutor` mirrors `days_offline::DeltaSyncEngine`: `#[allow(async_fn_in_trait)]`, `Send + Sync` bound, explicit doc comment about NOT being object-safe. Both use module-local error types rather than the parent SyncError.
 
 ## ADR Reference Quick Map
 - ADR-029: Offline/Sync Strategy -- phase-6.md line 1227+
