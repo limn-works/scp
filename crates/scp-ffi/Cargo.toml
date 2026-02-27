@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "PyO3 FFI bridge for SCP — exposes scp-core to Python as the _scp_core extension module"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lib]
 name = "_scp_core"

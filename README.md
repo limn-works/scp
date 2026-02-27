@@ -100,3 +100,15 @@ The protocol engine is written in Rust, with bindings targeting the ecosystems w
 The SDK ships as two independent halves. The **Client SDK** handles identity management, context participation, encryption, and transport — everything an application needs to join contexts. The **Server SDK** handles relay operation, message routing, and storage — everything needed to run SCP infrastructure. Any client can connect to any conforming relay; relay operators need no knowledge of client implementations.
 
 Transport is fully abstracted behind an adapter trait. The SCP native relay is the canonical reference implementation, with adapters for Nostr, Matrix, libp2p, Hyperswarm, WebSocket/WebRTC, and more.
+
+## License
+
+SCP uses a split license designed for maximum adoption with infrastructure protection:
+
+- **Protocol specification** — [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). Freely implementable by anyone.
+- **Client SDK and bindings** — [Apache 2.0](LICENSE-APACHE). Use in open or closed source, commercial or not.
+- **Application node** (`scp-node`) — [AGPL v3 only](LICENSE-AGPL). Operators offering relay as a service share source or obtain a [commercial license](https://limn.works/licensing).
+
+If you're building an app or agent, the SDK is Apache 2.0 — no copyleft, no friction. See [LICENSING.md](LICENSING.md) for the full structure, FAQ, and details.
+
+Copyright [Limn](https://limn.works) Works LLC.

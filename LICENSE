@@ -1,0 +1,9 @@
+SCP is distributed under multiple licenses. See LICENSING.md for the full
+structure, FAQ, and rationale.
+
+  Protocol specification (.docs/specs/)    CC-BY 4.0
+  Client SDK and bindings                  Apache License 2.0 (LICENSE-APACHE)
+  Application node (scp-node)              AGPL v3 only (LICENSE-AGPL)
+  Commercial use                           Contact Limn (https://limn.works/licensing)
+
+Copyright Limn Works LLC. All rights reserved.

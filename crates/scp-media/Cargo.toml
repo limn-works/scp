@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Real-time media transport types for SCP (Shareable Context Protocol)"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 serde = { workspace = true }

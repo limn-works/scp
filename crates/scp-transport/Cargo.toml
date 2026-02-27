@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Transport abstraction layer for SCP (Shareable Context Protocol)"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 scp-core = { path = "../scp-core" }

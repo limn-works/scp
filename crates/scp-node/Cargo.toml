@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Application node composing relay, identity, and HTTP server for SCP"
 edition.workspace = true
 repository.workspace = true
+license = "AGPL-3.0-only"
 
 [dependencies]
 scp-core = { path = "../scp-core" }

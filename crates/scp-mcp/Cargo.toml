@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "MCP (Model Context Protocol) adapter for SCP — JSON-RPC 2.0 types and context namespace mapping"
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 scp-core = { path = "../scp-core" }
