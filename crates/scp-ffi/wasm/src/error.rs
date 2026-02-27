@@ -113,12 +113,6 @@ impl ScpWasmError {
 // From implementations for ergonomic conversion
 // ---------------------------------------------------------------------------
 
-impl From<ScpWasmError> for JsError {
-    fn from(e: ScpWasmError) -> Self {
-        e.into_js()
-    }
-}
-
 impl From<serde_json::Error> for ScpWasmError {
     fn from(e: serde_json::Error) -> Self {
         Self::Validation(format!(
