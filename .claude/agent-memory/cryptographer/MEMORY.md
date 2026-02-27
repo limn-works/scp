@@ -46,6 +46,17 @@
 - WASM custody: pure FFI boundary, delegates all crypto to JS WebCrypto
 - NAPI identity: InMemoryKeyCustody with OpaqueInMemoryKeyCustody redacted Debug wrapper
 
+### Pruning & Proof Compaction (SCP-126)
+- CompactProof == PrunedInclusionProof with renamed fields (unnecessary duplication)
+- hash_pair() now duplicated in THREE files: tree.rs, proof.rs, pruning.rs -- critical divergence risk
+- prune_before_checkpoint does NOT verify checkpoint merkle_root against log state
+- prune_before_checkpoint does NOT verify checkpoint signature
+- compute_prune_boundary has structural retention logic error: prunes structural events within retention
+- TruncatedEventLog always prunes at checkpoint.event_count regardless of compute_prune_boundary result
+- ADR-030 invariant 3 (checkpoint events never pruned) NOT enforced
+- Size-based pruning (ADR-030 section 2b) NOT implemented
+- Test checkpoints use fake signatures (vec![0u8; 64]) -- masks missing verification
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs

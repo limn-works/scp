@@ -98,7 +98,17 @@
 - `Amount(u64)` with `saturating_add` -- no overflow risk
 - `PaymentAdapter` trait: authorize/capture two-phase pattern
 - UNFIXED: `SenderVelocityTracker` unbounded HashMap growth
-- UNFIXED: `PaymentReceipt` Debug leaks adapter_proof
+- FIXED: `PaymentReceipt` Debug now redacts adapter_proof and signature to byte-length
+
+### Economy Integration (SCP-156 Review, 2026-02-27)
+- HIGH: Step 5 missing adapter.verify() -- only checks cost sufficiency, not cryptographic auth validity
+- MEDIUM: Dummy PaymentAuthorization (zeroed auth_id) leaked to closures on 3 free paths
+- MEDIUM: IntegrationError erased to ContextError::MembershipFailed(string) in ContextManager
+- GOOD: Fail-closed on arithmetic overflow (unwrap_or(Amount(u64::MAX)))
+- GOOD: VoidFailed preserves both original + void error (Box wrapping)
+- GOOD: Integer-only arithmetic throughout (no f64)
+- GOOD: allowed_adapters check before authorize()
+- Pattern: execute_paid_action combines sender+receiver flows -- needs split for production 2-party use
 
 ### Context Nesting (`crates/scp-core/src/context/nesting.rs`)
 - content_hash NOW returns Result (no hash collision on serialization error)

@@ -51,3 +51,15 @@ Verdict: ALIGNED. ADRs 022, 025, 026, 027, 028, 029, 030, 031 all reviewed.
 All previous major findings resolved. Implementation code matches ADR specs.
 Phase 6 ADRs (029-031) are "Decided" but not yet implemented; no roadmap conflicts.
 Weighted voting deferral in ADR-031 is justified (requires unbuilt token/stake mechanism).
+
+## SCP-161 Review: Paid Context Templates (2026-02-27)
+Verdict: ALIGNED. All 14 acceptance criteria PASS. 71 tests pass.
+2 non-blocking actions:
+1. serde(rename) inconsistency: PaidService/PaidBroadcast have scp:template/ URIs but older variants (BilateralEphemeral etc.) don't -- mixed serialization conventions.
+2. ToolInterface template variant missing from TemplateId enum despite being defined in spec 05-contexts.md:247. PaidService "extends" it conceptually but no structural enforcement.
+
+### Template review patterns (reusable):
+- For "extends" relationships: verify the child's properties are a valid specialization of the parent (ceiling can narrow, not just match)
+- For caller-supplied fields (like economic_policy): validation should be a separate function, not part of the generic field-comparison loop
+- Check serde(rename) consistency across all enum variants -- partial adoption creates wire-format inconsistencies
+- Template inheritance is conceptual in this codebase -- no formal extends mechanism, only comments and matching properties
