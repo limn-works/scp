@@ -105,7 +105,7 @@ impl Default for TierConfig {
 pub struct ColdTierEntry {
     /// The leaf hash of the event (SHA-256 with RFC 6962 domain separation).
     pub leaf_hash: [u8; 32],
-    /// The sequence number of the event in the original log.
+    /// The global sequence number of the event in the original log.
     pub sequence: u64,
     /// The timestamp of the event (Unix seconds).
     pub timestamp: u64,
@@ -217,6 +217,10 @@ pub struct TierMigrationResult {
 /// Device storage is bounded: the hot tier size is controlled by
 /// [`TierConfig`], and cold entries are lightweight (leaf hash + metadata).
 ///
+/// A ghost collection of all leaf hashes (cold + hot) is maintained so that
+/// the checkpoint root always spans the full log. This ensures cold proofs
+/// remain verifiable across multiple migration cycles.
+///
 /// See ADR-030 in `.docs/adrs/phase-6.md`.
 pub struct TieredEventLog {
     /// The hot-tier event log (recent events, full Merkle tree).
@@ -225,12 +229,26 @@ pub struct TieredEventLog {
     cold_entries: Vec<ColdTierEntry>,
     /// Tier migration configuration.
     config: TierConfig,
-    /// The Merkle root of the complete log (hot + cold) at the time of
-    /// the last migration. Used to verify cold proofs.
+    /// The Merkle root of the complete log (all events ever appended,
+    /// spanning both cold and hot tiers). Computed from `all_leaf_hashes`
+    /// at each migration.
+    ///
+    /// This root is authoritative for cold proof verification. It is set
+    /// once at the first migration and recomputed from the full ghost tree
+    /// on each subsequent migration, ensuring it always spans ALL cold
+    /// entries -- not just the most recently migrated batch.
     ///
     /// When no migration has occurred, this is `[0u8; 32]` (the hot tier
     /// root is authoritative).
     checkpoint_root: [u8; 32],
+    /// Ghost collection of ALL leaf hashes in global append order (cold +
+    /// hot). Maintained across migrations so the checkpoint root can always
+    /// be recomputed from the full log state.
+    all_leaf_hashes: Vec<[u8; 32]>,
+    /// The number of events that have been migrated to cold storage. This
+    /// serves as the global index offset for the hot log: hot leaf 0
+    /// corresponds to global index `global_index_offset`.
+    global_index_offset: u64,
     /// Timestamps of events in the hot tier, parallel to hot.leaves().
     /// Used for age-based migration decisions.
     hot_timestamps: Vec<u64>,
@@ -248,6 +266,8 @@ impl TieredEventLog {
             cold_entries: Vec::new(),
             config,
             checkpoint_root: [0u8; 32],
+            all_leaf_hashes: Vec::new(),
+            global_index_offset: 0,
             hot_timestamps: Vec::new(),
             hot_byte_sizes: Vec::new(),
         }
@@ -304,21 +324,38 @@ impl TieredEventLog {
 
     /// Returns the checkpoint root used for cold proof verification.
     ///
-    /// This is the Merkle root of the full log at the time of the last
-    /// migration. If no migration has occurred, returns `[0u8; 32]`.
+    /// This is the Merkle root of the full log (all events across both
+    /// tiers) computed at the time of the most recent migration. If no
+    /// migration has occurred, returns `[0u8; 32]`.
     #[must_use]
     pub const fn checkpoint_root(&self) -> [u8; 32] {
         self.checkpoint_root
+    }
+
+    /// Returns the global index offset for the hot log.
+    ///
+    /// Hot leaf `i` corresponds to global index `global_index_offset + i`.
+    #[must_use]
+    pub const fn global_index_offset(&self) -> u64 {
+        self.global_index_offset
     }
 
     /// Records metadata for a newly appended hot-tier event.
     ///
     /// Call this after successfully appending an event to the hot log
     /// via [`tree::append`]. The timestamp and byte size are used for
-    /// tier migration decisions.
+    /// tier migration decisions. The leaf hash is also recorded in the
+    /// ghost collection for checkpoint root computation.
     pub fn record_hot_event(&mut self, timestamp: u64, byte_size: u64) {
         self.hot_timestamps.push(timestamp);
         self.hot_byte_sizes.push(byte_size);
+
+        // Keep the ghost collection in sync with the hot log.
+        // The most recently appended leaf is the last one in hot.leaves().
+        let hot_leaves = self.hot.leaves();
+        if let Some(&leaf_hash) = hot_leaves.last() {
+            self.all_leaf_hashes.push(leaf_hash);
+        }
     }
 
     /// Returns the estimated total bytes in the hot tier.
@@ -382,9 +419,10 @@ impl TieredEventLog {
 
     /// Migrates eligible events from the hot tier to the cold tier.
     ///
-    /// The Merkle root of the full log is captured before migration as the
-    /// checkpoint root for cold proof verification. Events are moved from
-    /// the beginning of the hot log (oldest first) to cold entries.
+    /// The checkpoint root is computed from the full ghost tree (all leaf
+    /// hashes across both tiers) to ensure it spans ALL cold entries, not
+    /// just the most recently migrated batch. Hot leaf indices are offset
+    /// by `global_index_offset` to maintain correct global addressing.
     ///
     /// # Errors
     ///
@@ -396,8 +434,10 @@ impl TieredEventLog {
             return Err(TieredStorageError::NothingToMigrate);
         }
 
-        // Capture the current root before any changes.
-        self.checkpoint_root = tree::root(&self.hot);
+        // Compute the checkpoint root from the FULL ghost tree (all leaves
+        // ever appended, both cold and hot). This ensures the root is valid
+        // for ALL cold entries across every migration cycle.
+        self.checkpoint_root = compute_root_from_leaves(&self.all_leaf_hashes);
 
         let hot_leaves = self.hot.leaves();
 
@@ -407,20 +447,24 @@ impl TieredEventLog {
         let mut bytes_freed: u64 = 0;
 
         // Move leaf hashes and metadata to cold entries.
+        // Sequence numbers use global indices (offset + local position).
         for i in 0..count_usize {
             let leaf_hash = hot_leaves[i];
-            let sequence = self.cold_entries.len() as u64;
+            let global_sequence = self.global_index_offset + i as u64;
             let timestamp = self.hot_timestamps[i];
             let payload_bytes = self.hot_byte_sizes[i];
             bytes_freed += payload_bytes;
 
             self.cold_entries.push(ColdTierEntry {
                 leaf_hash,
-                sequence,
+                sequence: global_sequence,
                 timestamp,
                 payload_bytes,
             });
         }
+
+        // Update the global index offset to reflect migrated events.
+        self.global_index_offset += count;
 
         // Rebuild the hot log from remaining leaves.
         let remaining_leaves: Vec<[u8; 32]> =
@@ -474,7 +518,8 @@ impl TieredEventLog {
             .find(|e| e.sequence == sequence)
             .ok_or(TieredStorageError::NotInColdTier { sequence })?;
 
-        // Fetch the proof from the relay.
+        // Fetch the proof from the relay using the global sequence as the
+        // leaf index (this is the position in the full log).
         let mut proof = provider.fetch_inclusion_proof(
             self.hot.context_id(),
             entry.sequence,
@@ -504,10 +549,56 @@ impl TieredEventLog {
     /// Returns `true` if the given sequence number is in the hot tier.
     #[must_use]
     pub fn is_hot(&self, sequence: u64) -> bool {
-        let cold_count = self.cold_event_count();
-        let total = self.total_event_count();
-        sequence >= cold_count && sequence < total
+        sequence >= self.global_index_offset
+            && sequence < self.global_index_offset + self.hot_event_count()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Computes the Merkle root from a set of leaf hashes.
+///
+/// Used to compute the checkpoint root from the full ghost tree.
+fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    if leaves.is_empty() {
+        return [0u8; 32];
+    }
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
+
+    let mut current: Vec<[u8; 32]> = leaves.to_vec();
+
+    while current.len() > 1 {
+        let parent_count = current.len().div_ceil(2);
+        let mut parents = Vec::with_capacity(parent_count);
+
+        let mut i = 0;
+        while i < current.len() {
+            if i + 1 < current.len() {
+                let mut hasher = Sha256::new();
+                hasher.update(&[0x01]);
+                hasher.update(&current[i]);
+                hasher.update(&current[i + 1]);
+                parents.push(hasher.finalize().into());
+            } else {
+                let mut hasher = Sha256::new();
+                hasher.update(&[0x01]);
+                hasher.update(&current[i]);
+                hasher.update(&current[i]);
+                parents.push(hasher.finalize().into());
+            }
+            i += 2;
+        }
+
+        current = parents;
+    }
+
+    current[0]
 }
 
 // ---------------------------------------------------------------------------
@@ -681,10 +772,6 @@ mod tests {
                 proofs: std::collections::HashMap::new(),
             }
         }
-
-        fn add_proof(&mut self, leaf_index: u64, proof: InclusionProof) {
-            self.proofs.insert(leaf_index, proof);
-        }
     }
 
     impl ColdTierProvider for MockColdProvider {
@@ -725,6 +812,112 @@ mod tests {
         }
     }
 
+    /// A mock provider that generates valid proofs against the full ghost
+    /// tree. Used to test cold proof verification across multiple migrations.
+    struct GhostTreeProvider {
+        /// All leaf hashes in global order (the ghost tree).
+        all_leaves: Vec<[u8; 32]>,
+    }
+
+    impl GhostTreeProvider {
+        fn new(all_leaves: Vec<[u8; 32]>) -> Self {
+            Self { all_leaves }
+        }
+    }
+
+    impl ColdTierProvider for GhostTreeProvider {
+        fn fetch_inclusion_proof(
+            &self,
+            _context_id: &str,
+            leaf_index: u64,
+            leaf_hash: [u8; 32],
+        ) -> Result<InclusionProof, TieredStorageError> {
+            let idx = leaf_index as usize;
+            if idx >= self.all_leaves.len() {
+                return Err(TieredStorageError::ColdFetchFailed(
+                    "leaf index out of range".into(),
+                ));
+            }
+
+            // Build a proof from the ghost tree.
+            let root = compute_root_from_leaves(&self.all_leaves);
+            let path = build_ghost_proof_path(idx, &self.all_leaves);
+
+            Ok(InclusionProof {
+                leaf_index,
+                leaf_hash,
+                path,
+                root,
+            })
+        }
+    }
+
+    /// Build a Merkle proof path from a leaf to the root using the full
+    /// leaf set (ghost tree).
+    fn build_ghost_proof_path(
+        leaf_idx: usize,
+        leaves: &[[u8; 32]],
+    ) -> Vec<ProofStep> {
+        if leaves.len() <= 1 {
+            return Vec::new();
+        }
+
+        let mut path = Vec::new();
+        let mut idx = leaf_idx;
+        let mut current_layer: Vec<[u8; 32]> = leaves.to_vec();
+
+        loop {
+            if current_layer.len() <= 1 {
+                break;
+            }
+
+            let sibling_idx = idx ^ 1;
+            if sibling_idx < current_layer.len() {
+                let direction = if idx % 2 == 0 {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                };
+                path.push(ProofStep {
+                    sibling_hash: current_layer[sibling_idx],
+                    direction,
+                });
+            } else {
+                // Odd node: sibling is itself (promoted).
+                path.push(ProofStep {
+                    sibling_hash: current_layer[idx],
+                    direction: Direction::Right,
+                });
+            }
+
+            // Compute the next layer.
+            let parent_count = current_layer.len().div_ceil(2);
+            let mut parents = Vec::with_capacity(parent_count);
+            let mut i = 0;
+            while i < current_layer.len() {
+                if i + 1 < current_layer.len() {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&[0x01]);
+                    hasher.update(&current_layer[i]);
+                    hasher.update(&current_layer[i + 1]);
+                    parents.push(hasher.finalize().into());
+                } else {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&[0x01]);
+                    hasher.update(&current_layer[i]);
+                    hasher.update(&current_layer[i]);
+                    parents.push(hasher.finalize().into());
+                }
+                i += 2;
+            }
+
+            idx /= 2;
+            current_layer = parents;
+        }
+
+        path
+    }
+
     // -------------------------------------------------------------------
     // TierConfig defaults
     // -------------------------------------------------------------------
@@ -749,6 +942,7 @@ mod tests {
         assert_eq!(tiered.total_event_count(), 0);
         assert_eq!(tiered.context_id(), "ctx-1");
         assert_eq!(tiered.checkpoint_root(), [0u8; 32]);
+        assert_eq!(tiered.global_index_offset(), 0);
     }
 
     // -------------------------------------------------------------------
@@ -920,23 +1114,16 @@ mod tests {
             prev_hash = leaf_hash_from_event(&event);
         }
 
-        // Generate proofs BEFORE migration (while all events are in hot).
-        let mut mock_provider = MockColdProvider::new();
-        for i in 0..5u64 {
-            let proof = crate::event_log::proof::prove_inclusion(
-                tiered.hot_log(),
-                i,
-            )
-            .unwrap();
-            mock_provider.add_proof(i, proof);
-        }
+        // Create a ghost tree provider with all leaf hashes for valid proofs.
+        let all_leaves = tiered.all_leaf_hashes.clone();
+        let ghost_provider = GhostTreeProvider::new(all_leaves);
 
         // Migrate first 5 events to cold.
         let result = tiered.migrate_to_cold(1_000_000).unwrap();
         assert_eq!(result.events_migrated, 5);
 
         // Fetch and verify cold proof for sequence 0.
-        let proof = tiered.fetch_cold_proof(0, &mock_provider).unwrap();
+        let proof = tiered.fetch_cold_proof(0, &ghost_provider).unwrap();
         assert_eq!(proof.leaf_index, 0);
     }
 
@@ -1116,7 +1303,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Checkpoint root is captured at migration time
+    // Checkpoint root spans all tiers after multiple migrations
     // -------------------------------------------------------------------
 
     #[test]
@@ -1127,19 +1314,134 @@ mod tests {
             max_hot_bytes: None,
         };
 
-        let (mut tiered, _) = build_tiered_log(10, config, 1_000_000, 60);
+        let (mut tiered, leaf_hashes) = build_tiered_log(10, config, 1_000_000, 60);
 
         // Before migration, checkpoint root is zero.
         assert_eq!(tiered.checkpoint_root(), [0u8; 32]);
 
-        // Capture the root before migration.
-        let root_before = tree::root(tiered.hot_log());
+        // The full-log root is the root of all 10 leaf hashes.
+        let full_root = compute_root_from_leaves(&leaf_hashes);
 
         tiered.migrate_to_cold(1_000_000).unwrap();
 
-        // After migration, checkpoint root should be the pre-migration root.
-        assert_eq!(tiered.checkpoint_root(), root_before);
+        // After migration, checkpoint root should be the full-log root.
+        assert_eq!(tiered.checkpoint_root(), full_root);
         assert_ne!(tiered.checkpoint_root(), [0u8; 32]);
+    }
+
+    // -------------------------------------------------------------------
+    // Checkpoint root valid across two migration cycles (regression test
+    // for the "second migration invalidates checkpoint root" bug)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_root_valid_after_two_migrations() {
+        let config = TierConfig {
+            age_threshold_secs: Some(300), // 5 minutes
+            max_hot_events: None,
+            max_hot_bytes: None,
+        };
+
+        // 10 events, 2 minutes apart.
+        let (mut tiered, all_leaf_hashes) = build_tiered_log(10, config, 1_000_000, 120);
+
+        // First migration: migrate event 0.
+        tiered.migrate_to_cold(1_000_420).unwrap();
+        let root_after_first = tiered.checkpoint_root();
+
+        // The root should be the root of ALL 10 leaves.
+        let expected_full_root = compute_root_from_leaves(&all_leaf_hashes);
+        assert_eq!(root_after_first, expected_full_root);
+
+        // Second migration: migrate events 1, 2, 3.
+        tiered.migrate_to_cold(1_000_780).unwrap();
+        let root_after_second = tiered.checkpoint_root();
+
+        // The root should STILL be the root of ALL 10 leaves (unchanged
+        // because no new events were added between migrations).
+        assert_eq!(root_after_second, expected_full_root);
+
+        // Cold proofs from the first migration batch should still verify.
+        let ghost_provider = GhostTreeProvider::new(all_leaf_hashes);
+        let proof = tiered.fetch_cold_proof(0, &ghost_provider).unwrap();
+        assert_eq!(proof.leaf_index, 0);
+
+        // Cold proofs from the second migration batch should also verify.
+        let proof = tiered.fetch_cold_proof(1, &ghost_provider).unwrap();
+        assert_eq!(proof.leaf_index, 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Global index offset maintained after migration
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn global_index_offset_maintained_after_migration() {
+        let config = TierConfig {
+            age_threshold_secs: None,
+            max_hot_events: Some(5),
+            max_hot_bytes: None,
+        };
+
+        let (mut tiered, _) = build_tiered_log(10, config, 1_000_000, 60);
+
+        assert_eq!(tiered.global_index_offset(), 0);
+
+        tiered.migrate_to_cold(1_000_000).unwrap();
+
+        // After migrating 5, offset should be 5.
+        assert_eq!(tiered.global_index_offset(), 5);
+
+        // Cold entries should have global sequences 0..5.
+        for (i, entry) in tiered.cold_entries().iter().enumerate() {
+            assert_eq!(entry.sequence, i as u64);
+        }
+
+        // is_hot should use global addressing.
+        for i in 5..10u64 {
+            assert!(tiered.is_hot(i), "global seq {i} should be hot");
+        }
+        for i in 0..5u64 {
+            assert!(!tiered.is_hot(i), "global seq {i} should not be hot");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Global index offset correct after two migrations
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn global_index_offset_correct_after_two_migrations() {
+        let config = TierConfig {
+            age_threshold_secs: Some(300),
+            max_hot_events: None,
+            max_hot_bytes: None,
+        };
+
+        // 10 events, 2 minutes apart.
+        let (mut tiered, _) = build_tiered_log(10, config, 1_000_000, 120);
+
+        // First migration: migrate 1 event.
+        tiered.migrate_to_cold(1_000_420).unwrap();
+        assert_eq!(tiered.global_index_offset(), 1);
+        assert_eq!(tiered.cold_entries()[0].sequence, 0);
+
+        // Second migration: migrate 3 more events.
+        tiered.migrate_to_cold(1_000_780).unwrap();
+        assert_eq!(tiered.global_index_offset(), 4);
+
+        // Cold entries should have correct global sequences.
+        let cold_seqs: Vec<u64> = tiered.cold_entries().iter().map(|e| e.sequence).collect();
+        assert_eq!(cold_seqs, vec![0, 1, 2, 3]);
+
+        // Hot events should be at global indices 4..10.
+        for i in 4..10u64 {
+            assert!(tiered.is_hot(i), "global seq {i} should be hot");
+        }
+        for i in 0..4u64 {
+            assert!(!tiered.is_hot(i), "global seq {i} should not be hot");
+            assert!(tiered.is_cold(i), "global seq {i} should be cold");
+        }
     }
 
     // -------------------------------------------------------------------
