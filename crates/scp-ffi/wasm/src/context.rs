@@ -76,8 +76,9 @@ extern "C" {
 
 /// Opaque handle to an SCP context.
 ///
-/// Stores context metadata: unique ID, lifecycle state, and the DID of the
-/// context creator. The actual context runtime (MLS group, transport
+/// Stores context metadata required by spec §5.7: unique ID, lifecycle state,
+/// creator DID, and the full set of governance and policy fields visible before
+/// opting in to any context. The actual context runtime (MLS group, transport
 /// connections, event log) lives in scp-core and is connected when the full
 /// runtime is wired. Until then, the handle tracks state locally.
 ///
@@ -85,9 +86,17 @@ extern "C" {
 ///
 /// ```js
 /// const ctx = await context_create(identity.did, paramsJson);
-/// console.log(ctx.contextId);   // "ctx-abc123..."
-/// console.log(ctx.state);       // "active"
-/// console.log(ctx.creatorDid);  // "did:dht:z..."
+/// console.log(ctx.contextId);      // "ctx-abc123..."
+/// console.log(ctx.state);          // "active"
+/// console.log(ctx.creatorDid);     // "did:dht:z..."
+/// console.log(ctx.mode);           // "Encrypted" | "Broadcast"
+/// console.log(ctx.ceiling);        // string[]
+/// console.log(ctx.ceilingPolicy);  // "immutable" | "governed"
+/// console.log(ctx.ttlSeconds);     // number | undefined
+/// console.log(ctx.promotionPolicy); // string | undefined
+/// console.log(ctx.governance);     // "single_admin" | ...
+/// console.log(ctx.memberCount);    // number (starts at 1)
+/// console.log(ctx.economicPolicy); // string | undefined
 /// ```
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
@@ -98,6 +107,28 @@ pub struct WasmContextHandle {
     state: String,
     /// DID of the context creator.
     creator_did: String,
+    /// Context mode: "Encrypted" (MLS group) or "Broadcast" (per-author keys).
+    /// Set at creation and immutable. See spec §5.1 and §5.14.
+    mode: String,
+    /// Capability ceiling: the maximum set of capabilities available in this
+    /// context. See spec §5.3.
+    ceiling: Vec<String>,
+    /// Ceiling policy: "immutable" or "governed". Immutable at creation.
+    /// See spec §5.3.
+    ceiling_policy: String,
+    /// Optional time-to-live in seconds. None means persistent. See spec §5.10.
+    ttl_seconds: Option<u64>,
+    /// Optional promotion policy: "no_promotion" or "promotable". Only
+    /// meaningful when ttl_seconds is Some. See spec §5.10.
+    promotion_policy: Option<String>,
+    /// Governance model string (e.g. "single_admin"). See spec §5.9.
+    governance: String,
+    /// Number of context members. Starts at 1 (creator) at creation.
+    /// See spec §5.6 and §5.7.
+    member_count: u64,
+    /// Optional economic policy. Orthogonal to capability ceiling.
+    /// See spec §5.3 and §19.3.
+    economic_policy: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -121,15 +152,106 @@ impl WasmContextHandle {
     pub fn creator_did(&self) -> String {
         self.creator_did.clone()
     }
+
+    /// Returns the context mode: `"Encrypted"` or `"Broadcast"`.
+    ///
+    /// Set at creation and immutable. `"Encrypted"` uses an MLS group;
+    /// `"Broadcast"` uses per-author broadcast keys. See spec §5.1 and §5.14.
+    #[wasm_bindgen(getter)]
+    pub fn mode(&self) -> String {
+        self.mode.clone()
+    }
+
+    /// Returns the capability ceiling as a JS `Array` of strings.
+    ///
+    /// The ceiling is the maximum set of capabilities available in this context.
+    /// See spec §5.3.
+    #[wasm_bindgen(getter)]
+    pub fn ceiling(&self) -> js_sys::Array {
+        self.ceiling
+            .iter()
+            .map(|s| JsValue::from_str(s))
+            .collect()
+    }
+
+    /// Returns the ceiling policy: `"immutable"` or `"governed"`.
+    ///
+    /// The policy itself is immutable (locked at creation). See spec §5.3.
+    #[wasm_bindgen(getter, js_name = "ceilingPolicy")]
+    pub fn ceiling_policy(&self) -> String {
+        self.ceiling_policy.clone()
+    }
+
+    /// Returns the TTL in seconds, or `undefined` if the context is persistent.
+    ///
+    /// See spec §5.10.
+    #[wasm_bindgen(getter, js_name = "ttlSeconds")]
+    pub fn ttl_seconds(&self) -> Option<u64> {
+        self.ttl_seconds
+    }
+
+    /// Returns the promotion policy, or `undefined` if no TTL is set.
+    ///
+    /// One of `"no_promotion"` | `"promotable"`. Only meaningful when
+    /// `ttlSeconds` is defined. See spec §5.10.
+    #[wasm_bindgen(getter, js_name = "promotionPolicy")]
+    pub fn promotion_policy(&self) -> Option<String> {
+        self.promotion_policy.clone()
+    }
+
+    /// Returns the governance model string (e.g. `"single_admin"`).
+    ///
+    /// See spec §5.9.
+    #[wasm_bindgen(getter)]
+    pub fn governance(&self) -> String {
+        self.governance.clone()
+    }
+
+    /// Returns the current member count.
+    ///
+    /// Starts at `1` (the creator) at creation. See spec §5.6 and §5.7.
+    #[wasm_bindgen(getter, js_name = "memberCount")]
+    pub fn member_count(&self) -> u64 {
+        self.member_count
+    }
+
+    /// Returns the economic policy string, or `undefined` if none is set.
+    ///
+    /// Economic policy governs what actions cost, orthogonal to the capability
+    /// ceiling. See spec §5.3 and §19.3.
+    #[wasm_bindgen(getter, js_name = "economicPolicy")]
+    pub fn economic_policy(&self) -> Option<String> {
+        self.economic_policy.clone()
+    }
 }
 
 impl WasmContextHandle {
-    /// Creates a new handle in the "active" state.
-    fn new_active(context_id: String, creator_did: String) -> Self {
+    /// Creates a new handle in the `"active"` state with all §5.7 metadata
+    /// fields populated.
+    #[allow(clippy::too_many_arguments)]
+    fn new_active(
+        context_id: String,
+        creator_did: String,
+        mode: String,
+        ceiling: Vec<String>,
+        ceiling_policy: String,
+        ttl_seconds: Option<u64>,
+        promotion_policy: Option<String>,
+        governance: String,
+        economic_policy: Option<String>,
+    ) -> Self {
         Self {
             context_id,
             state: "active".to_owned(),
             creator_did,
+            mode,
+            ceiling,
+            ceiling_policy,
+            ttl_seconds,
+            promotion_policy,
+            governance,
+            member_count: 1,
+            economic_policy,
         }
     }
 }
@@ -230,17 +352,52 @@ impl WasmMessage {
 #[wasm_bindgen]
 pub fn context_create(identity_did: String, params_json: String) -> Promise {
     future_to_promise(async move {
-        // Validate that params_json is valid JSON.
-        let _params: serde_json::Value = serde_json::from_str(&params_json)
+        // Parse and validate params_json.
+        let params: serde_json::Value = serde_json::from_str(&params_json)
             .map_err(|e| ScpWasmError::Validation(format!(
                 "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
             ))
             .into_js())?;
 
+        // Extract §5.7 metadata fields with spec-defined defaults.
+        let mode = params["mode"]
+            .as_str()
+            .unwrap_or("Encrypted")
+            .to_owned();
+        let ceiling: Vec<String> = params["ceiling"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        let ceiling_policy = params["ceilingPolicy"]
+            .as_str()
+            .unwrap_or("immutable")
+            .to_owned();
+        let ttl_seconds: Option<u64> = params["ttlSeconds"].as_u64();
+        let promotion_policy: Option<String> = params["promotionPolicy"]
+            .as_str()
+            .map(str::to_owned);
+        let governance = params["governance"]
+            .as_str()
+            .unwrap_or("single_admin")
+            .to_owned();
+        let economic_policy: Option<String> = params["economicPolicy"]
+            .as_str()
+            .map(str::to_owned);
+
         // Generate a context ID using a UUID (CSPRNG-backed via getrandom/js).
         let context_id = format!("ctx-{}", uuid::Uuid::new_v4().as_hyphenated());
 
-        let handle = WasmContextHandle::new_active(context_id, identity_did);
+        let handle = WasmContextHandle::new_active(
+            context_id,
+            identity_did,
+            mode,
+            ceiling,
+            ceiling_policy,
+            ttl_seconds,
+            promotion_policy,
+            governance,
+            economic_policy,
+        );
 
         Ok(JsValue::from(handle))
     })

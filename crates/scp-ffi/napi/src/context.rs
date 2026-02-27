@@ -30,18 +30,27 @@ use crate::{decrement_handle_count, increment_handle_count};
 
 /// Opaque handle to an SCP context.
 ///
-/// Stores context metadata: unique ID, lifecycle state, and the DID of the
-/// context creator. The actual context runtime (MLS group, transport
-/// connections, event log) lives in scp-core and will be wired in full
-/// integration stories.
+/// Stores context metadata: unique ID, lifecycle state, the DID of the
+/// context creator, and the §5.7 spec fields (mode, ceiling, ceiling_policy,
+/// ttl_seconds, promotion_policy, governance, member_count, economic_policy).
+/// The actual context runtime (MLS group, transport connections, event log)
+/// lives in scp-core and will be wired in full integration stories.
 ///
 /// # JS usage
 ///
 /// ```js
 /// const ctx = await contextCreate(identity.did, paramsJson);
-/// console.log(ctx.contextId);   // "ctx-..."
-/// console.log(ctx.state);       // "active"
-/// console.log(ctx.creatorDid);  // "did:dht:z..."
+/// console.log(ctx.contextId);      // "ctx-..."
+/// console.log(ctx.state);          // "active"
+/// console.log(ctx.creatorDid);     // "did:dht:z..."
+/// console.log(ctx.mode);           // "Encrypted"
+/// console.log(ctx.ceiling);        // []
+/// console.log(ctx.ceilingPolicy);  // "immutable"
+/// console.log(ctx.ttlSeconds);     // null | number
+/// console.log(ctx.promotionPolicy); // null | "no_promotion" | "promotable"
+/// console.log(ctx.governance);     // "single_admin"
+/// console.log(ctx.memberCount);    // 1
+/// console.log(ctx.economicPolicy); // null | string
 /// ```
 #[napi]
 pub struct NapiContextHandle {
@@ -51,6 +60,23 @@ pub struct NapiContextHandle {
     state: std::sync::Mutex<ContextState>,
     /// DID of the context creator.
     creator_did: String,
+    /// Context mode — `"Encrypted"` or `"Broadcast"`.
+    mode: String,
+    /// Capability ceiling: list of UCAN capability strings allowed in this context.
+    ceiling: Vec<String>,
+    /// Ceiling policy — `"immutable"` or `"governed"`.
+    ceiling_policy: String,
+    /// Optional TTL in seconds. `None` means the context is persistent.
+    ttl_seconds: Option<u64>,
+    /// Promotion policy — `"no_promotion"` or `"promotable"`. Only meaningful
+    /// when `ttl_seconds` is `Some`.
+    promotion_policy: Option<String>,
+    /// Governance model string (e.g. `"single_admin"`).
+    governance: String,
+    /// Number of members in the context. Starts at 1 (the creator).
+    member_count: u64,
+    /// Optional economic policy string.
+    economic_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +120,57 @@ impl NapiContextHandle {
     #[napi(getter, js_name = "creatorDid")]
     pub fn creator_did(&self) -> String {
         self.creator_did.clone()
+    }
+
+    /// Returns the context mode (`"Encrypted"` or `"Broadcast"`).
+    #[napi(getter)]
+    pub fn mode(&self) -> String {
+        self.mode.clone()
+    }
+
+    /// Returns the capability ceiling for this context.
+    #[napi(getter)]
+    pub fn ceiling(&self) -> Vec<String> {
+        self.ceiling.clone()
+    }
+
+    /// Returns the ceiling policy (`"immutable"` or `"governed"`).
+    #[napi(getter, js_name = "ceilingPolicy")]
+    pub fn ceiling_policy(&self) -> String {
+        self.ceiling_policy.clone()
+    }
+
+    /// Returns the optional TTL in seconds. `None` means the context is persistent.
+    #[napi(getter, js_name = "ttlSeconds")]
+    pub fn ttl_seconds(&self) -> Option<u64> {
+        self.ttl_seconds
+    }
+
+    /// Returns the optional promotion policy.
+    ///
+    /// One of `"no_promotion"` or `"promotable"`. Only meaningful when
+    /// `ttlSeconds` is non-null.
+    #[napi(getter, js_name = "promotionPolicy")]
+    pub fn promotion_policy(&self) -> Option<String> {
+        self.promotion_policy.clone()
+    }
+
+    /// Returns the governance model string (e.g. `"single_admin"`).
+    #[napi(getter)]
+    pub fn governance(&self) -> String {
+        self.governance.clone()
+    }
+
+    /// Returns the current member count. Starts at `1` (the creator).
+    #[napi(getter, js_name = "memberCount")]
+    pub fn member_count(&self) -> u64 {
+        self.member_count
+    }
+
+    /// Returns the optional economic policy string.
+    #[napi(getter, js_name = "economicPolicy")]
+    pub fn economic_policy(&self) -> Option<String> {
+        self.economic_policy.clone()
     }
 }
 
@@ -171,7 +248,7 @@ pub async fn context_create(
     identity_did: String,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
-    let _params: serde_json::Value =
+    let params: serde_json::Value =
         serde_json::from_str(&params_json).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!(
@@ -181,11 +258,40 @@ pub async fn context_create(
             })
         })?;
 
+    let mode = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
+    let ceiling = params["ceiling"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ceiling_policy = params["ceilingPolicy"]
+        .as_str()
+        .unwrap_or("immutable")
+        .to_owned();
+    let ttl_seconds = params["ttlSeconds"].as_u64();
+    let promotion_policy = params["promotionPolicy"].as_str().map(str::to_owned);
+    let governance = params["governance"]
+        .as_str()
+        .unwrap_or("single_admin")
+        .to_owned();
+    let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
+
     let context_id = format!("ctx-{}", Uuid::new_v4());
     let handle = NapiContextHandle {
         context_id,
         state: std::sync::Mutex::new(ContextState::Active),
         creator_did: identity_did,
+        mode,
+        ceiling,
+        ceiling_policy,
+        ttl_seconds,
+        promotion_policy,
+        governance,
+        member_count: 1,
+        economic_policy,
     };
     increment_handle_count();
     Ok(handle)
