@@ -8711,9 +8711,7 @@
         "Re-export from economy/mod.rs"
       ],
       "blockedBy": [
-        "SCP-157",
-        "SCP-064",
-        "SCP-156"
+        "SCP-064"
       ],
       "sources": [
         {

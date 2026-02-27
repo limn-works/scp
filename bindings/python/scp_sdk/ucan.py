@@ -188,6 +188,7 @@ async def delegate(
     delegator: str,
     delegatee: str,
     capabilities: Sequence[str],
+    context: str,
 ) -> UcanToken:
     """Create a delegated UCAN from a parent token.
 
@@ -203,6 +204,7 @@ async def delegate(
         delegatee: DID of the entity receiving the delegation.
         capabilities: Capability URIs to grant (must be a subset of the
             parent token's capabilities).
+        context: The context ID to scope the delegated token to.
 
     Returns:
         A new :class:`UcanToken` representing the delegated token.
@@ -239,7 +241,7 @@ async def delegate(
         issuer=delegator,
         audience=delegatee,
         capabilities=list(capabilities),
-        context=parent_token.token_id,
+        context=context,
     )
 
 

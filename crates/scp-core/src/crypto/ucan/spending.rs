@@ -258,6 +258,15 @@ pub enum SpendingError {
     #[error("spending attenuation violation: {0}")]
     AttenuationViolation(String),
 
+    /// The adapter is not in the allowed adapters list.
+    #[error("adapter {adapter} not in allowed adapters: {allowed:?}")]
+    AdapterNotAllowed {
+        /// The adapter that was used.
+        adapter: String,
+        /// The list of allowed adapters.
+        allowed: Vec<String>,
+    },
+
     /// The spending UCAN scope does not cover the target context.
     #[error("spending UCAN scope {scope} does not cover context {context_id}")]
     ScopeNotCovered {
@@ -447,8 +456,16 @@ pub fn validate_spending_attenuation(
 
     // allowed_adapters must be a subset of parent's.
     // Empty parent means "any adapter" — child can be anything.
-    // Non-empty parent means child must be a subset.
+    // Non-empty parent means child must be a non-empty subset.
+    // A child with empty allowed_adapters (meaning "any") under a parent
+    // with restricted adapters would widen the permission — that's a violation.
     if !parent.allowed_adapters.is_empty() {
+        if child.allowed_adapters.is_empty() {
+            return Err(SpendingError::AttenuationViolation(
+                "child has unrestricted adapters but parent restricts to: {:?}"
+                    .replace("{:?}", &format!("{:?}", parent.allowed_adapters)),
+            ));
+        }
         for adapter in &child.allowed_adapters {
             if !parent.allowed_adapters.contains(adapter) {
                 return Err(SpendingError::AttenuationViolation(format!(
@@ -525,19 +542,23 @@ impl BudgetTracker {
     /// Checks whether a new spend of the given amount is permitted, and if
     /// so, records it.
     ///
-    /// Performs two checks:
+    /// Performs three checks:
     /// 1. Per-action limit: `amount <= max_per_action`
-    /// 2. Total limit: `current_total + amount <= max_total`
+    /// 2. Adapter restriction: `adapter_id` in `allowed_adapters` (if non-empty)
+    /// 3. Total limit: `current_total + amount <= max_total`
     ///
     /// # Arguments
     ///
     /// * `amount` — The cost of the action.
     /// * `currency` — The currency of the action (must match the capability).
     /// * `now_secs` — Current Unix timestamp in seconds.
+    /// * `adapter_id` — The payment adapter being used for this spend.
     ///
     /// # Errors
     ///
     /// Returns [`SpendingError::CurrencyMismatch`] if currencies differ.
+    /// Returns [`SpendingError::AdapterNotAllowed`] if the adapter is not in
+    /// the allowed list.
     /// Returns [`SpendingError::PerActionLimitExceeded`] if `amount > max_per_action`.
     /// Returns [`SpendingError::TotalLimitExceeded`] if cumulative total would
     /// exceed `max_total`.
@@ -546,12 +567,23 @@ impl BudgetTracker {
         amount: Amount,
         currency: CurrencyCode,
         now_secs: u64,
+        adapter_id: &str,
     ) -> Result<(), SpendingError> {
         // Currency must match.
         if currency != self.capability.currency {
             return Err(SpendingError::CurrencyMismatch {
                 expected: self.capability.currency,
                 actual: currency,
+            });
+        }
+
+        // Adapter restriction check.
+        if !self.capability.allowed_adapters.is_empty()
+            && !self.capability.allowed_adapters.iter().any(|a| a == adapter_id)
+        {
+            return Err(SpendingError::AdapterNotAllowed {
+                adapter: adapter_id.to_owned(),
+                allowed: self.capability.allowed_adapters.clone(),
             });
         }
 
@@ -1140,6 +1172,17 @@ mod tests {
     }
 
     #[test]
+    fn attenuation_rejects_unrestricted_child_under_restricted_parent() {
+        let parent = sample_capability(); // has ["x402", "lightning"]
+        let child = SpendingCapability {
+            allowed_adapters: vec![], // unrestricted — would widen parent
+            ..parent.clone()
+        };
+        let err = validate_spending_attenuation(&parent, &child).unwrap_err();
+        assert!(matches!(err, SpendingError::AttenuationViolation(_)));
+    }
+
+    #[test]
     fn attenuation_empty_parent_adapters_allows_any_child() {
         let parent = SpendingCapability {
             allowed_adapters: vec![], // any adapter
@@ -1161,7 +1204,7 @@ mod tests {
         let cap = sample_capability();
         let mut tracker = BudgetTracker::new(cap);
         let now = 1_700_000_000;
-        assert!(tracker.check_and_record(Amount(500), usd(), now).is_ok());
+        assert!(tracker.check_and_record(Amount(500), usd(), now, "x402").is_ok());
     }
 
     #[test]
@@ -1170,7 +1213,7 @@ mod tests {
         let mut tracker = BudgetTracker::new(cap);
         let now = 1_700_000_000;
         let err = tracker
-            .check_and_record(Amount(1500), usd(), now)
+            .check_and_record(Amount(1500), usd(), now, "x402")
             .unwrap_err();
         assert!(matches!(err, SpendingError::PerActionLimitExceeded { .. }));
     }
@@ -1188,10 +1231,10 @@ mod tests {
         let now = 1_700_000_000;
 
         // Spend 6000, then try 5000 more (total would be 11000 > 10000).
-        assert!(tracker.check_and_record(Amount(4000), usd(), now).is_ok());
-        assert!(tracker.check_and_record(Amount(4000), usd(), now).is_ok());
+        assert!(tracker.check_and_record(Amount(4000), usd(), now, "test").is_ok());
+        assert!(tracker.check_and_record(Amount(4000), usd(), now, "test").is_ok());
         let err = tracker
-            .check_and_record(Amount(3000), usd(), now)
+            .check_and_record(Amount(3000), usd(), now, "test")
             .unwrap_err();
         assert!(matches!(err, SpendingError::TotalLimitExceeded { .. }));
     }
@@ -1209,12 +1252,12 @@ mod tests {
 
         // Spend 4000 at t=1000.
         let t1 = 1000;
-        assert!(tracker.check_and_record(Amount(4000), usd(), t1).is_ok());
+        assert!(tracker.check_and_record(Amount(4000), usd(), t1, "test").is_ok());
 
         // At t=5000 (4000 seconds later, well past the 1-hour window),
         // the old record should be pruned.
         let t2 = 5000;
-        assert!(tracker.check_and_record(Amount(4000), usd(), t2).is_ok());
+        assert!(tracker.check_and_record(Amount(4000), usd(), t2, "test").is_ok());
     }
 
     #[test]
@@ -1223,7 +1266,7 @@ mod tests {
         let mut tracker = BudgetTracker::new(cap);
         let btc = CurrencyCode::from_code("BTC").unwrap();
         let err = tracker
-            .check_and_record(Amount(100), btc, 1_700_000_000)
+            .check_and_record(Amount(100), btc, 1_700_000_000, "test")
             .unwrap_err();
         assert!(matches!(err, SpendingError::CurrencyMismatch { .. }));
     }
@@ -1240,9 +1283,9 @@ mod tests {
         let mut tracker = BudgetTracker::new(cap);
 
         // Record at t=100
-        assert!(tracker.check_and_record(Amount(3000), usd(), 100).is_ok());
+        assert!(tracker.check_and_record(Amount(3000), usd(), 100, "test").is_ok());
         // Record at t=150
-        assert!(tracker.check_and_record(Amount(2000), usd(), 150).is_ok());
+        assert!(tracker.check_and_record(Amount(2000), usd(), 150, "test").is_ok());
 
         // At t=250, the first record (t=100) is expired (250-100=150 > window 100).
         assert_eq!(tracker.current_total(250), Amount(2000));
@@ -1528,13 +1571,13 @@ mod tests {
             .as_secs();
 
         // Spend 1000 three times (total 3000 = max_total).
-        assert!(tracker.check_and_record(Amount(1000), usd(), now).is_ok());
-        assert!(tracker.check_and_record(Amount(1000), usd(), now).is_ok());
-        assert!(tracker.check_and_record(Amount(1000), usd(), now).is_ok());
+        assert!(tracker.check_and_record(Amount(1000), usd(), now, "x402").is_ok());
+        assert!(tracker.check_and_record(Amount(1000), usd(), now, "x402").is_ok());
+        assert!(tracker.check_and_record(Amount(1000), usd(), now, "x402").is_ok());
 
         // Fourth spend should fail (total would exceed max_total).
         let err = tracker
-            .check_and_record(Amount(1000), usd(), now)
+            .check_and_record(Amount(1000), usd(), now, "x402")
             .unwrap_err();
         assert!(matches!(err, SpendingError::TotalLimitExceeded { .. }));
     }
@@ -1545,5 +1588,60 @@ mod tests {
         let att = SpendingCapability::to_attenuation(&scope);
         assert_eq!(att.with, "scp:spending:ctx123");
         assert_eq!(att.can, "spend");
+    }
+
+    // -----------------------------------------------------------------------
+    // Adapter restriction enforcement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_and_record_rejects_disallowed_adapter() {
+        let cap = SpendingCapability {
+            max_per_action: Amount(1000),
+            max_total: Amount(10000),
+            currency: CurrencyCode::from_code("USD").unwrap(),
+            time_window: Duration::from_secs(3600),
+            allowed_adapters: vec!["stripe".to_owned()],
+        };
+        let mut tracker = BudgetTracker::new(cap);
+
+        // Allowed adapter succeeds
+        assert!(tracker
+            .check_and_record(Amount(100), CurrencyCode::from_code("USD").unwrap(), 1000, "stripe")
+            .is_ok());
+
+        // Disallowed adapter fails
+        let result = tracker.check_and_record(
+            Amount(100),
+            CurrencyCode::from_code("USD").unwrap(),
+            1001,
+            "lightning",
+        );
+        assert!(matches!(
+            result,
+            Err(SpendingError::AdapterNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn check_and_record_allows_any_adapter_when_list_empty() {
+        let cap = SpendingCapability {
+            max_per_action: Amount(1000),
+            max_total: Amount(10000),
+            currency: CurrencyCode::from_code("USD").unwrap(),
+            time_window: Duration::from_secs(3600),
+            allowed_adapters: vec![],
+        };
+        let mut tracker = BudgetTracker::new(cap);
+
+        // Any adapter should succeed when list is empty
+        assert!(tracker
+            .check_and_record(
+                Amount(100),
+                CurrencyCode::from_code("USD").unwrap(),
+                1000,
+                "anything"
+            )
+            .is_ok());
     }
 }

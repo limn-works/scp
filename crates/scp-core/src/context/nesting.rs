@@ -25,7 +25,7 @@
 //!
 //! See ADR-008 in `.docs/adrs/phase-2.md` and spec section 5.13 for full details.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,7 +72,7 @@ pub enum OnSeverPolicy {
 ///
 /// Used in [`ParentGovernanceConfig::requires_approval_for`].
 /// See spec section 5.13.4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ApprovalRequirement {
     /// Changes to the child's governance model.
     GovernanceChange,
@@ -103,7 +103,7 @@ pub struct ParentGovernanceConfig {
     /// Can this parent further restrict the child's ceiling?
     pub can_restrict_ceiling: bool,
     /// Child operations that require this parent's governance approval.
-    pub requires_approval_for: HashSet<ApprovalRequirement>,
+    pub requires_approval_for: BTreeSet<ApprovalRequirement>,
     /// Action to take when this parent severs (closes or disconnects).
     pub on_sever: OnSeverPolicy,
 }
@@ -114,16 +114,21 @@ impl ParentGovernanceConfig {
     /// Used in the MLS `group_context` extension to make the governance config
     /// tamper-evident. Any discrepancy between the claimed config and the
     /// cryptographically committed hash is detectable.
-    #[must_use]
-    pub fn content_hash(&self) -> [u8; 32] {
+    /// # Errors
+    ///
+    /// Returns [`NestingError::SerializationFailed`] if the governance
+    /// configuration cannot be serialized to JSON.
+    pub fn content_hash(&self) -> Result<[u8; 32], NestingError> {
         // Deterministic serialization via JSON with sorted keys.
-        let json = serde_json::to_string(self).unwrap_or_default();
+        let json = serde_json::to_string(self).map_err(|e| {
+            NestingError::SerializationFailed(e.to_string())
+        })?;
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
         let result = hasher.finalize();
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&result);
-        bytes
+        Ok(bytes)
     }
 }
 
@@ -212,6 +217,14 @@ pub enum NestingError {
     /// The child context has already been closed.
     #[error("child context is already closed")]
     ChildAlreadyClosed,
+
+    /// Serialization failed during content hashing.
+    #[error("serialization failed: {0}")]
+    SerializationFailed(String),
+
+    /// A child context with no TTL cannot be created under parents with finite TTLs.
+    #[error("child has no TTL (infinite) but at least one parent has a finite TTL")]
+    ChildOutlivesParent,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,8 +277,11 @@ impl MlsGroupContextExtension {
     /// Parent IDs are sorted to ensure deterministic ordering. The governance
     /// config hash is computed over the concatenation of individual config
     /// content hashes (sorted by parent context ID).
-    #[must_use]
-    pub fn from_parents(parents: &[ParentRef]) -> Self {
+    /// # Errors
+    ///
+    /// Returns [`NestingError::SerializationFailed`] if any parent's governance
+    /// configuration cannot be serialized.
+    pub fn from_parents(parents: &[ParentRef]) -> Result<Self, NestingError> {
         let mut sorted_parents: Vec<&ParentRef> = parents.iter().collect();
         sorted_parents.sort_by(|a, b| a.context_id.cmp(&b.context_id));
 
@@ -275,16 +291,16 @@ impl MlsGroupContextExtension {
         // Hash concatenation of individual governance config hashes.
         let mut hasher = Sha256::new();
         for parent in &sorted_parents {
-            hasher.update(parent.governance_config.content_hash());
+            hasher.update(parent.governance_config.content_hash()?);
         }
         let result = hasher.finalize();
         let mut governance_config_hash = [0u8; 32];
         governance_config_hash.copy_from_slice(&result);
 
-        Self {
+        Ok(Self {
             parent_context_ids,
             governance_config_hash,
-        }
+        })
     }
 }
 
@@ -569,8 +585,11 @@ impl ContextNesting {
     /// Includes parent context IDs and governance config content hash. This
     /// makes the parent lineage part of the child's cryptographic group
     /// identity.
-    #[must_use]
-    pub fn mls_group_context_extension(&self) -> MlsGroupContextExtension {
+    /// # Errors
+    ///
+    /// Returns [`NestingError::SerializationFailed`] if governance config
+    /// serialization fails.
+    pub fn mls_group_context_extension(&self) -> Result<MlsGroupContextExtension, NestingError> {
         let parent_refs: Vec<&ParentRef> = self.parents.values().collect();
         let refs: Vec<ParentRef> = parent_refs.into_iter().cloned().collect();
         MlsGroupContextExtension::from_parents(&refs)
@@ -624,7 +643,14 @@ pub fn validate_child_ttl(
 ) -> Result<(), NestingError> {
     let child_ttl = match child_ttl {
         Some(ttl) => ttl,
-        None => return Ok(()), // No child TTL means no constraint to violate.
+        None => {
+            // Child has no TTL (infinite). Check that no parent has a finite TTL,
+            // since a child must not outlive its parents.
+            if parent_ttls.iter().any(|t| t.is_some()) {
+                return Err(NestingError::ChildOutlivesParent);
+            }
+            return Ok(());
+        }
     };
 
     // Find the minimum TTL among parents that have TTLs.
@@ -694,7 +720,7 @@ mod tests {
                 can_close_child: false,
                 can_evict_members: false,
                 can_restrict_ceiling: false,
-                requires_approval_for: HashSet::new(),
+                requires_approval_for: BTreeSet::new(),
                 on_sever,
             },
             members: members.iter().cloned().collect(),
@@ -1254,9 +1280,15 @@ mod tests {
     }
 
     #[test]
-    fn no_child_ttl_is_always_valid() {
+    fn no_child_ttl_rejected_when_parent_has_finite_ttl() {
         let result =
             validate_child_ttl(None, &[Some(Duration::from_secs(3600))]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn no_child_ttl_allowed_when_no_parent_has_ttl() {
+        let result = validate_child_ttl(None, &[None, None]);
         assert!(result.is_ok());
     }
 
@@ -1311,7 +1343,7 @@ mod tests {
         )
         .unwrap();
 
-        let ext = nesting.mls_group_context_extension();
+        let ext = nesting.mls_group_context_extension().unwrap();
         assert_eq!(ext.parent_context_ids, vec!["A", "B"]);
     }
 
@@ -1335,7 +1367,7 @@ mod tests {
         )
         .unwrap();
 
-        let ext1 = nesting.mls_group_context_extension();
+        let ext1 = nesting.mls_group_context_extension().unwrap();
 
         // Create another identical nesting to verify hash determinism.
         let nesting2 = ContextNesting::new(
@@ -1348,7 +1380,7 @@ mod tests {
         )
         .unwrap();
 
-        let ext2 = nesting2.mls_group_context_extension();
+        let ext2 = nesting2.mls_group_context_extension().unwrap();
         assert_eq!(ext1.governance_config_hash, ext2.governance_config_hash);
     }
 
@@ -1363,7 +1395,7 @@ mod tests {
                 can_close_child: true,
                 can_evict_members: false,
                 can_restrict_ceiling: false,
-                requires_approval_for: HashSet::new(),
+                requires_approval_for: BTreeSet::new(),
                 on_sever: OnSeverPolicy::CascadeClose,
             },
             members: [alice.clone()].into_iter().collect(),
@@ -1376,14 +1408,14 @@ mod tests {
                 can_close_child: false,
                 can_evict_members: true,
                 can_restrict_ceiling: false,
-                requires_approval_for: HashSet::new(),
+                requires_approval_for: BTreeSet::new(),
                 on_sever: OnSeverPolicy::EvictUniqueMembers,
             },
             members: [alice.clone()].into_iter().collect(),
         };
 
-        let ext1 = MlsGroupContextExtension::from_parents(&[parent_a]);
-        let ext2 = MlsGroupContextExtension::from_parents(&[parent_a_different]);
+        let ext1 = MlsGroupContextExtension::from_parents(&[parent_a]).unwrap();
+        let ext2 = MlsGroupContextExtension::from_parents(&[parent_a_different]).unwrap();
         assert_ne!(ext1.governance_config_hash, ext2.governance_config_hash);
     }
 

@@ -44,8 +44,9 @@ pub mod ucan;
 /// Global tokio runtime, created once at module import.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-/// Shutdown timeout for the tokio runtime when the Python interpreter exits.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Brief drain window for in-flight tokio tasks during Python atexit.
+/// Kept short (100ms) to avoid blocking the Python GIL unnecessarily.
+const SHUTDOWN_DRAIN: Duration = Duration::from_millis(100);
 
 /// Returns a reference to the shared tokio runtime.
 ///
@@ -73,19 +74,28 @@ pub(crate) fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
 ///
 /// # Errors
 ///
-/// Returns `PyRuntimeError` if tokio runtime construction fails.
-#[allow(clippy::expect_used)] // OnceLock::get_or_init requires an infallible closure.
-#[allow(clippy::unnecessary_wraps)] // Returns PyResult for consistency with PyO3 module init.
+/// Returns `PyRuntimeError` if tokio runtime construction fails, which
+/// prevents undefined behavior from panicking across the FFI boundary.
 fn init_runtime() -> PyResult<()> {
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("scp-tokio-worker")
-            .build()
-            // The runtime builder only fails on OS-level resource exhaustion,
-            // which is unrecoverable. This is the sole panic point.
-            .expect("failed to create SCP tokio runtime — OS resource exhaustion")
-    });
+    // If already initialized, return immediately.
+    if RUNTIME.get().is_some() {
+        return Ok(());
+    }
+
+    // Build the runtime, returning an error instead of panicking.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("scp-tokio-worker")
+        .build()
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to create SCP tokio runtime: {e}"
+            ))
+        })?;
+
+    // Store it. If another thread raced us, that's fine — OnceLock
+    // guarantees only one value is stored and our `rt` is simply dropped.
+    let _ = RUNTIME.set(rt);
     Ok(())
 }
 
@@ -119,14 +129,17 @@ fn version() -> &'static str {
 /// shut down (or before it was initialized) is a no-op.
 #[pyfunction]
 fn shutdown_runtime() {
+    // Take no action if the runtime was never initialized.
+    // We cannot take ownership of the OnceLock value, so we signal
+    // graceful shutdown by spawning a brief drain and then returning.
+    // The actual runtime drop happens when the process exits and the
+    // static OnceLock is reclaimed.
     if let Some(rt) = RUNTIME.get() {
-        // Block briefly to allow in-flight tasks to complete. This runs
-        // during atexit, so the Python GIL is held and no new Python
-        // callbacks will be issued. The SHUTDOWN_TIMEOUT constant governs
-        // how long we wait for tasks to drain.
-        let deadline = SHUTDOWN_TIMEOUT;
-        rt.block_on(async move {
-            tokio::time::sleep(deadline).await;
+        // Give in-flight tasks a brief window to complete. 100ms is
+        // sufficient for cooperative tasks to observe shutdown and
+        // finish; anything longer blocks the Python GIL unnecessarily.
+        rt.block_on(async {
+            tokio::time::sleep(SHUTDOWN_DRAIN).await;
         });
     }
 }

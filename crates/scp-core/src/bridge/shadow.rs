@@ -521,20 +521,12 @@ pub fn create_shadow(
 /// privileged role by context governance. The governance action must include
 /// a valid DID and justification.
 ///
-/// # SAFETY: Callers must verify governance authorization
+/// # Governance authorization
 ///
-/// This function does **not** cryptographically verify the `GovernanceAction`.
-/// It checks only structural validity (context match, non-empty role). The
-/// caller is responsible for verifying that:
-///
-/// 1. The `governance_did` is authorized to perform governance actions in
-///    this context (e.g., via UCAN capability check).
-/// 2. The `GovernanceAction` is authentic (e.g., signature verification on
-///    the envelope that carried it).
-/// 3. The governance actor is not itself a shadow identity.
-///
-/// Failure to verify governance authorization before calling this function
-/// allows any participant to escalate shadow roles.
+/// This function verifies that the governance actor is not itself a shadow
+/// identity (shadows cannot authorize role upgrades). Full cryptographic
+/// verification of the `GovernanceAction` (UCAN capability check, signature
+/// verification on the envelope) is the responsibility of the caller.
 ///
 /// # Arguments
 ///
@@ -565,6 +557,22 @@ pub(crate) fn upgrade_shadow_role(
             reason: format!(
                 "governance context {} does not match registry context {}",
                 governance.context_id, registry.context_id
+            ),
+        });
+    }
+
+    // Validate the governance actor is not itself a shadow identity.
+    // Shadows cannot authorize governance actions — only verified DIDs can.
+    let governance_did_str = governance.governance_did.as_ref();
+    if registry
+        .shadows
+        .iter()
+        .any(|s| s.shadow_id == governance_did_str)
+    {
+        return Err(ShadowError::InvalidGovernanceAction {
+            reason: format!(
+                "governance actor {} is a shadow identity and cannot authorize role upgrades",
+                governance_did_str
             ),
         });
     }

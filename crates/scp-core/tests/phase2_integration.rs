@@ -133,7 +133,12 @@ fn sign_event(
 /// Appends an event to a log and returns the resulting leaf hash.
 fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
     tree::append(log, event).expect("append should succeed");
-    Sha256::digest(rmp_serde::to_vec(event).expect("serialize")).into()
+    // RFC 6962 §2.1 leaf domain separation: SHA-256(0x00 || serialized)
+    let serialized = rmp_serde::to_vec(event).expect("serialize");
+    let mut hasher = Sha256::new();
+    hasher.update(&[0x00]);
+    hasher.update(&serialized);
+    hasher.finalize().into()
 }
 
 /// Simple in-memory relay simulation. Each relay is a pair of (sender, receiver)

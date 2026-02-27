@@ -324,9 +324,10 @@ pub fn verify_inclusion(proof: &InclusionProof) -> bool {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Computes `SHA-256(left || right)` for an interior node.
+/// Computes `SHA-256(0x01 || left || right)` for an interior node (RFC 6962 §2.1).
 fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update(&[0x01]);
     hasher.update(left);
     hasher.update(right);
     hasher.finalize().into()
@@ -456,7 +457,12 @@ mod tests {
                 &signing_key,
             );
             tree::append(&mut log, &event).unwrap();
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            // Compute leaf hash with RFC 6962 domain separation (0x00 prefix).
+            let serialized = rmp_serde::to_vec(&event).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(&[0x00]);
+            hasher.update(&serialized);
+            let leaf_hash: [u8; 32] = hasher.finalize().into();
             leaf_hashes.push(leaf_hash);
             prev_hash = leaf_hash;
         }

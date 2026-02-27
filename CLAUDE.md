@@ -77,6 +77,23 @@ Use agents eagerly for focus, expertise, and parallelization — especially code
 
 In addition to permanent context provided by artifacts, you have access to an MCP server for memory called "vestige". Liberally read and write to this memory during all operation modalities, and ensure subagents do the same.
 
+### Agent Reviews
+
+These agents should generally be used:
+
+- @"black-hat (agent)"
+- @"red-hat (agent)"
+- @"white-hat (agent)"
+- @"security-reviewer (agent)"
+- @"cryptographer (agent)"
+- @"bug-catcher (agent)"
+- @"chronicler (agent)"
+- @"alignment-reviewer (agent)"
+- @"api-design-reviewer (agent)"
+- @"simplifier (agent)"
+
+You should use discretion to add or remove agents from this roster based on the review contents.
+
 <!-- loom:begin -->
 ## Loom — Autonomous Development Loop
 

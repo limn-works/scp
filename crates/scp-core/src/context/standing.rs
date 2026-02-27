@@ -141,44 +141,43 @@ impl StandingChannelManager {
         &self,
         peer_did: &DID,
     ) -> Result<ContextHandle, ContextError> {
+        // Hold the lock across the entire get-or-create operation to prevent
+        // TOCTOU races where two concurrent calls could both see "no channel"
+        // and create duplicates.
+        let mut channels = self.channels.lock().await;
+
         // Step 1: Check local state for an existing channel with this peer.
-        {
-            let channels = self.channels.lock().await;
-            if let Some(entry) = channels.get(peer_did.as_ref()) {
-                let state = entry.handle.state().await;
-                match state {
-                    // Step 2: Active -- return immediately, zero network cost.
-                    ContextState::Active => {
-                        return Ok(entry.handle.clone());
-                    }
-                    // Step 4: Peer has left or context ended -- fall through to
-                    // create a new one.
-                    ContextState::Closed | ContextState::Expired | ContextState::Closing => {
-                        // Will create a new channel below.
-                    }
-                    // Creating -- context is still being set up, return it.
-                    ContextState::Creating => {
-                        return Ok(entry.handle.clone());
-                    }
+        if let Some(entry) = channels.get(peer_did.as_ref()) {
+            let state = entry.handle.state().await;
+            match state {
+                // Step 2: Active -- return immediately, zero network cost.
+                ContextState::Active => {
+                    return Ok(entry.handle.clone());
+                }
+                // Step 4: Peer has left or context ended -- fall through to
+                // create a new one.
+                ContextState::Closed | ContextState::Expired | ContextState::Closing => {
+                    // Will create a new channel below.
+                }
+                // Creating -- context is still being set up, return it.
+                ContextState::Creating => {
+                    return Ok(entry.handle.clone());
                 }
             }
         }
-        // Lock dropped before async creation.
 
         // Step 3/4: Create a new bilateral-persistent context.
+        // Lock is held across creation to prevent duplicate channels.
         let handle = self.create_standing_channel(peer_did).await?;
 
         // Register the new channel (replacing any old entry).
-        {
-            let mut channels = self.channels.lock().await;
-            channels.insert(
-                peer_did.to_string(),
-                StandingChannelEntry {
-                    peer_did: peer_did.clone(),
-                    handle: handle.clone(),
-                },
-            );
-        }
+        channels.insert(
+            peer_did.to_string(),
+            StandingChannelEntry {
+                peer_did: peer_did.clone(),
+                handle: handle.clone(),
+            },
+        );
 
         Ok(handle)
     }
@@ -293,18 +292,16 @@ impl StandingChannelManager {
 ///
 /// The ID is derived from both DIDs sorted lexicographically, ensuring the same
 /// channel ID is generated regardless of which peer initiates. Uses a
-/// `standing:` prefix for namespace isolation and includes a timestamp component
-/// for uniqueness when re-creating channels.
+/// `standing:` prefix for namespace isolation and a truncated SHA-256 hash of
+/// the sorted DID pair for the unique portion.
 fn generate_standing_channel_id(local_did: &DID, peer_did: &DID) -> String {
-    // Sort to ensure determinism regardless of direction, but append a
-    // monotonic suffix so re-created channels get unique IDs.
+    // Sort to ensure determinism regardless of direction.
     let (a, b) = if local_did.as_ref() <= peer_did.as_ref() {
         (local_did.as_ref(), peer_did.as_ref())
     } else {
         (peer_did.as_ref(), local_did.as_ref())
     };
-    // Use a simple counter-based approach: hash the sorted DIDs for the stable
-    // part. The timestamp makes re-creation unique.
+    // Hash the sorted DIDs with the standing prefix for a stable, deterministic ID.
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"standing:");

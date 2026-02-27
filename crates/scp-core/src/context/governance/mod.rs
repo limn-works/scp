@@ -346,6 +346,10 @@ pub enum GovernanceError {
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
 
+    /// A proposal with this ID already exists.
+    #[error("duplicate proposal: {0}")]
+    DuplicateProposal(String),
+
     /// The governance model configuration is invalid.
     #[error("invalid governance config: {0}")]
     InvalidConfig(String),
@@ -527,6 +531,11 @@ impl GovernanceEngine for SingleAdminEngine {
             &action_bytes,
             context.now,
         );
+
+        // Reject duplicate proposals before constructing events.
+        if self.proposals.contains_key(&proposal_id) {
+            return Err(GovernanceError::DuplicateProposal(hex_encode(&proposal_id)));
+        }
 
         // In single-admin mode, the proposal is immediately approved.
         let proposal = GovernanceProposal {

@@ -116,11 +116,12 @@ pub trait TrustOracle {
 // RateLimitTracker
 // ---------------------------------------------------------------------------
 
-/// Tracker for per-peer auto-accept rate limiting.
+/// Tracker for global auto-accept rate limiting.
 ///
 /// Maintains timestamps of recent auto-accept events to enforce rate limits.
 /// Each instance tracks accepts for a single identity (the local identity
-/// receiving invitations).
+/// receiving invitations). The rate limit is global across all peers, not
+/// per-peer.
 #[derive(Debug)]
 pub struct RateLimitTracker {
     /// Timestamps of recent auto-accept events, per inviter DID.

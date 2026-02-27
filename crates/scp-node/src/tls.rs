@@ -74,12 +74,21 @@ pub enum TlsError {
 ///
 /// This is the interchange format between ACME provisioning, storage, and
 /// TLS configuration. Both fields are PEM strings.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CertificateData {
     /// PEM-encoded certificate chain (leaf + intermediates).
     pub certificate_chain_pem: String,
     /// PEM-encoded private key.
     pub private_key_pem: String,
+}
+
+impl std::fmt::Debug for CertificateData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertificateData")
+            .field("certificate_chain_pem", &self.certificate_chain_pem)
+            .field("private_key_pem", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl CertificateData {

@@ -582,7 +582,7 @@ mod tests {
             let serialized = rmp_serde::to_vec(&event).unwrap();
             sizes.push(serialized.len() as u64);
             tree::append(&mut log, &event).unwrap();
-            let leaf_hash: [u8; 32] = Sha256::digest(&serialized).into();
+            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&serialized); h.finalize().into() };
             prev_hash = leaf_hash;
         }
 

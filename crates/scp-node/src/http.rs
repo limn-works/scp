@@ -94,7 +94,8 @@ async fn ws_upgrade_handler(
 /// Bridges an axum WebSocket to the internal relay server.
 ///
 /// Connects to the relay at `relay_addr`, then forwards frames in
-/// both directions until either side closes.
+/// both directions until either side closes. Sends explicit WebSocket
+/// close frames on both sides when the bridge terminates.
 async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr) {
     let url = format!("ws://{relay_addr}");
     let relay_conn = tokio_tungstenite::connect_async(&url).await;
@@ -107,11 +108,20 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr) {
         return;
     };
 
-    let (mut relay_sink, mut relay_source) = relay_ws.split();
-    let (mut axum_sink, mut axum_source) = axum_ws.split();
+    let (relay_sink, mut relay_source) = relay_ws.split();
+    let (axum_sink, mut axum_source) = axum_ws.split();
+
+    // Wrap sinks in Arc<Mutex<>> so both forwarding tasks and the cleanup
+    // code can access them. This is the minimal restructuring needed to
+    // send explicit close frames after the select completes.
+    let relay_sink = Arc::new(tokio::sync::Mutex::new(relay_sink));
+    let axum_sink = Arc::new(tokio::sync::Mutex::new(axum_sink));
+
+    let relay_sink_fwd = Arc::clone(&relay_sink);
+    let axum_sink_fwd = Arc::clone(&axum_sink);
 
     // Forward: client (axum) -> relay
-    let client_to_relay = async {
+    let client_to_relay = async move {
         while let Some(Ok(msg)) = StreamExt::next(&mut axum_source).await {
             let relay_msg = match msg {
                 Message::Text(t) => {
@@ -128,14 +138,19 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr) {
                 }
                 Message::Close(_) => return,
             };
-            if SinkExt::send(&mut relay_sink, relay_msg).await.is_err() {
+            if let Err(e) = SinkExt::send(&mut *relay_sink_fwd.lock().await, relay_msg).await {
+                tracing::debug!(
+                    direction = "client->relay",
+                    error = %e,
+                    "bridge forwarding failed"
+                );
                 return;
             }
         }
     };
 
     // Forward: relay -> client (axum)
-    let relay_to_client = async {
+    let relay_to_client = async move {
         while let Some(Ok(msg)) = StreamExt::next(&mut relay_source).await {
             let axum_msg = match msg {
                 tokio_tungstenite::tungstenite::Message::Text(t) => {
@@ -153,17 +168,28 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr) {
                 tokio_tungstenite::tungstenite::Message::Close(_) => return,
                 tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
             };
-            if SinkExt::send(&mut axum_sink, axum_msg).await.is_err() {
+            if let Err(e) = SinkExt::send(&mut *axum_sink_fwd.lock().await, axum_msg).await {
+                tracing::debug!(
+                    direction = "relay->client",
+                    error = %e,
+                    "bridge forwarding failed"
+                );
                 return;
             }
         }
     };
 
-    // Run both directions concurrently; when either side closes, drop both.
+    // Run both directions concurrently; when either side finishes, close both
+    // sinks with explicit WebSocket close frames. SplitSink::drop() does NOT
+    // send close frames in tokio-tungstenite 0.24.
     tokio::select! {
         () = client_to_relay => {}
         () = relay_to_client => {}
     }
+
+    // Send explicit close frames (best-effort, ignore errors on close).
+    let _ = SinkExt::close(&mut *relay_sink.lock().await).await;
+    let _ = SinkExt::close(&mut *axum_sink.lock().await).await;
 }
 
 // ---------------------------------------------------------------------------

@@ -188,12 +188,26 @@ class Identity:
         DID string remains the same -- only the active signing key
         changes (Layer 1 rotation).
 
+        .. warning::
+
+            This is a placeholder implementation that creates a fresh
+            identity rather than performing true key rotation. True
+            rotation (updating the DID document while preserving the
+            DID) will be implemented when the Rust bridge supports it.
+
         Returns:
             An updated :class:`Identity` with the rotated key.
 
         Raises:
             scp_sdk.IdentityError: If key rotation fails.
         """
+        import warnings
+
+        warnings.warn(
+            "rotate_key() currently creates a fresh identity instead of "
+            "performing true key rotation. This is a placeholder.",
+            stacklevel=2,
+        )
         import _scp_core
 
         handle = _scp_core.py_identity_rotate_key(self._handle)

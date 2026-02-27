@@ -426,7 +426,7 @@ mod tests {
                 &signing_key,
             );
             tree::append(&mut log, &event).unwrap();
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event).unwrap()); h.finalize().into() };
             leaf_hashes.push(leaf_hash);
             prev_hash = leaf_hash;
         }
@@ -454,7 +454,7 @@ mod tests {
             );
             tree::append(&mut log_a, &event).unwrap();
             tree::append(&mut log_b, &event).unwrap();
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event).unwrap()); h.finalize().into() };
             prev_hash = leaf_hash;
         }
 
@@ -573,7 +573,7 @@ mod tests {
                 &signing_key_a,
             );
             tree::append(&mut log_a, &event_a).unwrap();
-            let leaf_hash_a: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event_a).unwrap()).into();
+            let leaf_hash_a: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event_a).unwrap()); h.finalize().into() };
             prev_hash_a = leaf_hash_a;
 
             let event_b = sign_event(
@@ -586,7 +586,7 @@ mod tests {
                 &signing_key_b,
             );
             tree::append(&mut log_b, &event_b).unwrap();
-            let leaf_hash_b: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event_b).unwrap()).into();
+            let leaf_hash_b: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event_b).unwrap()); h.finalize().into() };
             prev_hash_b = leaf_hash_b;
         }
 
@@ -638,7 +638,7 @@ mod tests {
             if i < 7 {
                 tree::append(&mut log_partial, &event).unwrap();
             }
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event).unwrap()); h.finalize().into() };
             prev_hash = leaf_hash;
         }
 
@@ -680,7 +680,7 @@ mod tests {
             if i < 4 {
                 tree::append(&mut log_partial, &event).unwrap();
             }
-            let leaf_hash: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event).unwrap()).into();
+            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event).unwrap()); h.finalize().into() };
             prev_hash = leaf_hash;
         }
 
@@ -931,7 +931,7 @@ mod tests {
                 &sk_a,
             );
             tree::append(&mut log_a, &event_a).unwrap();
-            let h_a: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event_a).unwrap()).into();
+            let h_a: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event_a).unwrap()); h.finalize().into() };
             prev_a = h_a;
 
             let event_b = sign_event(
@@ -944,7 +944,7 @@ mod tests {
                 &sk_b,
             );
             tree::append(&mut log_b, &event_b).unwrap();
-            let h_b: [u8; 32] = Sha256::digest(rmp_serde::to_vec(&event_b).unwrap()).into();
+            let h_b: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event_b).unwrap()); h.finalize().into() };
             prev_b = h_b;
         }
 

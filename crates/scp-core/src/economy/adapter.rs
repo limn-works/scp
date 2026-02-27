@@ -10,6 +10,8 @@
 //! See spec section 19.2.1 (adapter trait) and 19.2.6 (conformance testing).
 //! See ADR-033 in `.docs/adrs/phase-3.md`.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::identity::DID;
@@ -193,7 +195,7 @@ pub struct PaymentAuthorization {
 /// rail.
 ///
 /// See spec section 19.6.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentReceipt {
     /// Unique identifier for this receipt.
     pub receipt_id: [u8; 32],
@@ -221,6 +223,24 @@ pub struct PaymentReceipt {
     pub timestamp: u64,
     /// Ed25519 signature by the payer over the receipt data.
     pub signature: Vec<u8>,
+}
+
+impl fmt::Debug for PaymentReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PaymentReceipt")
+            .field("receipt_id", &self.receipt_id)
+            .field("payer", &self.payer)
+            .field("payee", &self.payee)
+            .field("amount", &self.amount)
+            .field("currency", &self.currency)
+            .field("action_type", &self.action_type)
+            .field("context_id", &self.context_id)
+            .field("adapter_id", &self.adapter_id)
+            .field("adapter_proof", &format!("[{} bytes]", self.adapter_proof.len()))
+            .field("timestamp", &self.timestamp)
+            .field("signature", &format!("[{} bytes]", self.signature.len()))
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
