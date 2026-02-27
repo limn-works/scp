@@ -9,6 +9,10 @@ on:
       - 'Cargo.lock'
       - "bindings/**"
 
+concurrency:
+  group: spec-drift-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   spec-drift:
     runs-on: ubuntu-latest
