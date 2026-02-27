@@ -43,9 +43,10 @@
 //! 3. JS callback injection types ([`JsKeyCustody`], [`JsStorage`],
 //!    [`JsMessageCallback`]) define the TypeScript wrapper's responsibility.
 //!
-//! When a future story adds WASM-compatible scp-core feature flags (e.g.,
-//! `tokio/current-thread` via `tokio_wasm`), the stubs will be replaced with
-//! direct scp-core calls.
+//! The JS callback injection pattern is the permanent WASM architecture per
+//! ADR-022: browser-native APIs (WebCrypto, OPFS, WebSocket) are injected from
+//! the TypeScript wrapper layer. The napi-rs bridge (`crates/scp-ffi/napi/`)
+//! is the path that depends on `scp-core` directly, serving Node.js/Bun.
 //!
 //! # JS callback injection
 //!
