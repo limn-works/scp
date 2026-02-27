@@ -1,0 +1,35 @@
+[package]
+name = "scp-ffi-uniffi"
+version = "0.1.0"
+description = "UniFFI FFI bridge for SCP — generates Swift and Kotlin bindings from a single definition"
+edition.workspace = true
+repository.workspace = true
+
+[lib]
+name = "scp_ffi_uniffi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+uniffi = { version = "0.29", features = ["tokio"] }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+scp-core = { path = "../../scp-core" }
+# The `testing` feature enables InMemoryKeyCustody, used by the `"in_memory"`
+# custody path in `identity_create`. This is an intentional bridge-layer
+# dependency: the in-memory custody path is needed for testing, CLI use, and
+# desktop contexts where no hardware security module is available.
+scp-platform = { path = "../../scp-platform", features = ["software_platform"] }
+scp-transport = { path = "../../scp-transport" }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+scp-platform = { path = "../../scp-platform", features = ["software_platform"] }
+
+[build-dependencies]
+uniffi = { version = "0.29", features = ["build", "tokio"] }
+
+[lints]
+workspace = true

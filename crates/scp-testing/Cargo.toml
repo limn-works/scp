@@ -16,7 +16,7 @@ tokio = { workspace = true }
 [dev-dependencies]
 scp-core = { path = "../scp-core" }
 scp-transport = { path = "../scp-transport" }
-scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-platform = { path = "../scp-platform", features = ["software_platform"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 openmls = { workspace = true }

@@ -1,0 +1,16 @@
+// SCP UniFFI Supplementary UDL
+//
+// This is a minimal supplementary UDL file required by UniFFI to anchor the
+// namespace. All type definitions, function exports, callback interfaces, and
+// error mappings are defined via proc-macros (#[uniffi::export],
+// #[derive(uniffi::Record)], #[derive(uniffi::Error)],
+// #[uniffi::export(callback_interface)]) in bridge.rs and lib.rs.
+//
+// UniFFI's proc-macro approach (primary) keeps FFI definitions co-located
+// with the Rust implementation, reducing drift. This UDL file is the minimum
+// required to pair with the proc-macro exports and enable
+// uniffi::include_scaffolding!("scp") in lib.rs.
+//
+// See ADR-021 in .docs/adrs/phase-4.md for the full bridge specification.
+
+namespace scp {};

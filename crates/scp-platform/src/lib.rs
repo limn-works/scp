@@ -34,8 +34,13 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
-#[cfg(feature = "testing")]
+#[cfg(feature = "software_platform")]
 pub mod testing;
+// `software` is an alias for `testing` that matches the feature name. New code
+// should prefer `scp_platform::software::*`; existing `testing::*` paths remain
+// valid for backwards compatibility.
+#[cfg(feature = "software_platform")]
+pub use testing as software;
 pub mod traits;
 
 // Re-export all public types for ergonomic access.

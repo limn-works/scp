@@ -6,7 +6,7 @@ edition.workspace = true
 repository.workspace = true
 
 [features]
-testing = [
+software_platform = [
     "dep:ed25519-dalek",
     "dep:x25519-dalek",
     "dep:rand",
@@ -19,8 +19,9 @@ testing = [
 serde = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
+zeroize = { workspace = true }
 
-# Testing-only dependencies, gated behind the `testing` feature flag.
+# software_platform dependencies, gated behind the `software_platform` feature flag.
 ed25519-dalek = { workspace = true, optional = true }
 x25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }

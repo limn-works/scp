@@ -23,3 +23,31 @@ New findings: 13 issues (3 material, 10 minor). Verdict: NEEDS REVISION (3 mater
 - `.docs/specs/` is empty (only .gitkeep) -- no product spec files to cross-reference
 - Trust operations (evaluate, attest) are forward-looking; not in any current ADR but don't contradict
 - Rust streams return OuterEnvelope while other SDKs return Message -- naming table inconsistency
+
+## ADR-022 Review (SCP-060) (2026-02-26)
+ADR-022 (TypeScript SDK Dual-Target Architecture) reviewed and PASSED.
+- All 8 acceptance criteria satisfied.
+- 3 minor issues found: shared.md lists `@scp/sdk-node` but ADR-022 uses per-platform `@scp/sdk-napi-{platform}` (shared.md needs update); trust.ts and mcp.ts listed in wrapper layout but no acceptance criteria; Context.join() is static while other methods are instance (inconsistent surface).
+- 4 non-blocking suggestions: receive() generator needs cleanup on break; asyncDispose should guard on state; CI commands should match standards file exactly; private field access across classes in sketched code.
+
+### ADR review patterns (reusable):
+- Always check the original stub ("What This ADR Will Decide" + "Expected Decisions") against final content
+- Cross-reference scaffold/, standards/, and sdk-common.md for naming/convention consistency
+- Verify package names in shared.md Distribution Channels match actual ADR decisions
+- Check that wrapper file layouts match acceptance criteria coverage (modules listed but not tested = gap)
+- Cross-ADR references can drift: verify callback interfaces, trait names, and type names match between dependent ADRs
+- Force-try/force-unwrap keeps appearing in Swift examples despite builder tenets -- always flag
+
+## ADR-025 Apple Platform Adapter Review (SCP-082) (2026-02-26)
+Initial review: FAIL (2 major, 1 minor). All 3 findings FIXED in PR #86.
+- StrongBox rationale moved to ADR-027 where it belongs
+- Force-try replaced with proper `throws` in `make()`
+- DeviceAttestationProvider now present in ADR-021 UDL (5 callback interfaces total)
+Remaining: ADR-025 example code (line 419) still has `.data(using: .utf8)!` force-unwrap, but implementation avoids it.
+
+## PR #86 Full Review (2026-02-26)
+Verdict: ALIGNED. ADRs 022, 025, 026, 027, 028, 029, 030, 031 all reviewed.
+3 minor doc issues: ADR-025 example force-unwrap, ADR-022 generator cleanup on break, ADR-028 ucanMint accessing private handle.
+All previous major findings resolved. Implementation code matches ADR specs.
+Phase 6 ADRs (029-031) are "Decided" but not yet implemented; no roadmap conflicts.
+Weighted voting deferral in ADR-031 is justified (requires unbuilt token/stake mechanism).

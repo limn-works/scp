@@ -57,7 +57,19 @@ Notes:
 - **STILL PRESENT:** Python delegate() still passes token_id as context (ucan.py:242). UcanToken has no context field; hasattr always False. The "fix" added hasattr guard but the field doesn't exist on the dataclass.
 - **Pattern:** "Fix" that adds a hasattr/getattr guard for a field that doesn't exist on the type — the guard always takes the fallback path. Must verify the type actually has the field being checked.
 
+### Known Bug Patterns (Feb 2026 — UniFFI bridge SCP-078 review)
+- **Key material discarded on identity_create:** InMemoryKeyCustody + ScpIdentity created then dropped; FFI Identity only keeps DID string. Pattern: extracting an identifier from a resource then discarding the resource.
+- **UcanToken Drop decrements without matching increment:** UcanToken has Drop impl calling decrement_handle_count() but no constructor calls increment_handle_count(). Currently unreachable (ucan_mint returns Err), but will underflow HANDLE_COUNT when wired. Pattern: Drop impl added symmetrically to all types but increment only added to types with live constructors.
+- **scp_shutdown does not actually shut down the runtime:** It waits for handles to drain but RUNTIME is a static dropped only at process exit. No mechanism to prevent new handle creation after scp_shutdown returns.
+
 ### Known Bug Patterns (Feb 2026 — claiming.rs/shadow.rs/http.rs review)
 - **Divergent canonical attestation formats:** bridge/claiming.rs compute_attestation_canonical_hash uses SHA-256 + to_be_bytes, while trust/attestation.rs canonical_attestation_bytes uses raw concat + to_le_bytes. Pattern: independent re-implementations of canonical serialization that drift.
 - **Missing field separators in canonical hash:** compute_claim_canonical_hash and compute_attestation_canonical_hash concatenate fields without length prefixes or delimiters. Pattern: field boundary ambiguity in hash preimages.
 - **serve() double-bind (pre-existing):** ApplicationNode::serve() binds to relay.bound_addr which is already occupied by the relay server. Pattern: single address field used for two listeners.
+
+### Known Bug Patterns (Feb 2026 — Swift bindings PR #86 review)
+- **Sync/async mismatch with UniFFI callback interfaces:** Rust `KeyCustodyProvider`, `StorageProvider`, `PushProvider` traits are all synchronous (`fn`). Swift implementations are `async` or actor-isolated. UniFFI-generated protocol will be sync; Swift types cannot conform. Pattern: implementing async methods that need to conform to sync callback interfaces.
+- **@unchecked Sendable standards violation:** `AppleDeviceAttestation` uses `@unchecked Sendable` which is explicitly banned in `.docs/standards/swift.md`. Class has no mutable instance state (storedKeyId comment is stale), so `@unchecked` is unnecessary. Pattern: stale justification comments describing removed state.
+- **TOCTOU in resolveKeyId:** `loadKeyId()` check then `generateAndStoreKey()` with async gap. Two concurrent `attest()` calls can both see nil and generate two different keys. Pattern: check-then-act across async suspension points.
+- **derivePseudonym leaks Keychain items:** Each call creates a new UUID handle and Keychain item, even for identical (keyHandle, contextId) inputs. Documented as "deterministic" but creates orphaned keys. Pattern: deterministic derivation stored under non-deterministic handles.
+- **content-available validation accepts JSON true as 1:** NSNumber bridge conflates boolean true with integer 1. Pattern: NSNumber type erasure in JSONSerialization.

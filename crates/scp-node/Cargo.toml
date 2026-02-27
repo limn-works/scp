@@ -27,7 +27,7 @@ x509-parser = "0.16"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
-scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-platform = { path = "../scp-platform", features = ["software_platform"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1"

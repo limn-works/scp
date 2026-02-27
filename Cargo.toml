@@ -9,6 +9,9 @@ members = [
     "crates/scp-media",
     "crates/scp-node",
     "crates/scp-ffi",
+    "crates/scp-ffi/uniffi",
+    "crates/scp-ffi/wasm",
+    "crates/scp-ffi/napi",
 ]
 
 [workspace.package]
@@ -17,6 +20,7 @@ repository = "https://github.com/limn/scp"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

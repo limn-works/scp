@@ -13,6 +13,7 @@ use rand::{CryptoRng, RngCore, SeedableRng};
 use sha2::Sha256;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 use crate::traits::{
@@ -168,8 +169,8 @@ impl KeyCustody for InMemoryKeyCustody {
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
         async move {
             let handle = self.next_handle();
-            let mut key_bytes = [0u8; 32];
-            self.rng.lock().await.fill_bytes(&mut key_bytes);
+            let mut key_bytes = Zeroizing::new([0u8; 32]);
+            self.rng.lock().await.fill_bytes(key_bytes.as_mut());
 
             let mut store = self.store.lock().await;
             match key_type {
@@ -179,7 +180,7 @@ impl KeyCustody for InMemoryKeyCustody {
                     store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
                 }
                 KeyType::X25519 => {
-                    let secret = StaticSecret::from(key_bytes);
+                    let secret = StaticSecret::from(*key_bytes);
                     store.x25519_keys.insert(handle.id(), secret);
                     store.key_types.insert(handle.id(), StoredKeyType::X25519);
                 }
@@ -300,7 +301,8 @@ impl KeyCustody for InMemoryKeyCustody {
             let peer_key = X25519PublicKey::from(peer);
             let shared = secret.diffie_hellman(&peer_key);
             drop(store);
-            Ok(SharedSecret::new(shared.to_bytes()))
+            let shared_bytes = Zeroizing::new(shared.to_bytes());
+            Ok(SharedSecret::new(*shared_bytes))
         }
     }
 
@@ -335,7 +337,7 @@ impl KeyCustody for InMemoryKeyCustody {
             let hmac_output = mac.finalize().into_bytes();
 
             // Derive Ed25519 keypair from first 32 bytes of HMAC output.
-            let mut seed = [0u8; 32];
+            let mut seed = Zeroizing::new([0u8; 32]);
             seed.copy_from_slice(&hmac_output[..32]);
             let pseudonym_signing_key = SigningKey::from_bytes(&seed);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
@@ -611,5 +613,69 @@ mod tests {
         assert_ne!(h1.id(), h2.id());
         assert_ne!(h2.id(), h3.id());
         assert_ne!(h1.id(), h3.id());
+    }
+
+    /// Cross-platform golden-value test for pseudonym derivation.
+    ///
+    /// Verifies that `derive_pseudonym` is deterministic and that different
+    /// context IDs produce different pseudonyms. The `expected_seed` value is
+    /// computed from the reference HMAC-SHA256 algorithm defined in ADR-006
+    /// and is kept for future cross-language (Swift, Kotlin, TypeScript)
+    /// verification once those test harnesses are wired.
+    #[tokio::test]
+    async fn derive_pseudonym_cross_platform_golden_vector() {
+        // Known identity key seed: 0x00...01 (31 zeros, then 0x01).
+        // This is a deterministic test key; never use in production.
+        let seed_bytes: [u8; 32] = {
+            let mut s = [0u8; 32];
+            s[31] = 1;
+            s
+        };
+        let context_id = b"test";
+
+        // Compute expected pseudonym seed using the reference algorithm directly:
+        // seed = HMAC-SHA256(sk_bytes, context_id || "scp-pseudonym")
+        let mut mac = Hmac::<Sha256>::new_from_slice(&seed_bytes).unwrap();
+        mac.update(context_id);
+        mac.update(b"scp-pseudonym");
+        let expected_seed: [u8; 32] = mac.finalize().into_bytes().into();
+
+        // Import the known seed as an Ed25519 signing key so derivation is
+        // deterministic regardless of the RNG state.
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.import_ed25519_key(&seed_bytes).await;
+
+        // Verify determinism across two calls with same inputs.
+        let pseudo1 = custody.derive_pseudonym(&handle, context_id).await.unwrap();
+        let pseudo2 = custody.derive_pseudonym(&handle, context_id).await.unwrap();
+        assert_eq!(
+            pseudo1.public_key.as_bytes(),
+            pseudo2.public_key.as_bytes(),
+            "pseudonym derivation must be deterministic for identical inputs"
+        );
+
+        let pseudo_other = custody
+            .derive_pseudonym(&handle, b"other_context")
+            .await
+            .unwrap();
+        assert_ne!(
+            pseudo1.public_key.as_bytes(),
+            pseudo_other.public_key.as_bytes(),
+            "different context_id must produce different pseudonym"
+        );
+
+        // Assert that the implementation matches the reference algorithm.
+        // expected_seed is HMAC-SHA256(sk, context_id || "scp-pseudonym"), so
+        // the expected public key is the verifying key of the Ed25519 signing key
+        // derived from that seed. This is the authoritative golden value —
+        // Swift, Kotlin, and TypeScript implementations MUST produce the same
+        // public key bytes for these inputs.
+        let expected_signing_key = SigningKey::from_bytes(&expected_seed);
+        let expected_pubkey = expected_signing_key.verifying_key();
+        assert_eq!(
+            pseudo1.public_key.as_bytes(),
+            expected_pubkey.as_bytes(),
+            "pseudonym public key must match reference HMAC-SHA256 algorithm output"
+        );
     }
 }

@@ -13,6 +13,7 @@
 //! - [`Storage`] — Persistent key-value byte storage
 
 use serde::{Deserialize, Serialize};
+use zeroize::ZeroizeOnDrop;
 
 use crate::error::PlatformError;
 
@@ -117,11 +118,9 @@ impl Signature {
 /// prevent accidental duplication or serialization of secret material. Callers
 /// should consume the secret and then let it be dropped.
 ///
-/// **Zeroization:** Production implementations should wrap the inner bytes with
-/// the `zeroize` crate's `Zeroizing` type to ensure memory is cleared on drop.
-/// This trait crate does not depend on `zeroize` to keep its dependency
-/// footprint minimal.
-#[derive(Debug, PartialEq, Eq)]
+/// **Zeroization:** The inner bytes are automatically zeroed on drop via
+/// [`ZeroizeOnDrop`], ensuring key material is cleared from memory.
+#[derive(Debug, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct SharedSecret([u8; 32]);
 
 impl SharedSecret {
