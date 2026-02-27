@@ -57,6 +57,16 @@
 - Size-based pruning (ADR-030 section 2b) NOT implemented
 - Test checkpoints use fake signatures (vec![0u8; 64]) -- masks missing verification
 
+### Economy / Dynamic Pricing (SCP-157)
+- evaluate_formula: integer-only, Amount(u64) + Coefficient(i64), no f64
+- Linear: (coefficient.0 * metric_value) / 1_000_000 via Coefficient::evaluate
+- Step: cumulative thresholds, all met thresholds add via saturating_add
+- Floor applied before cap -- cap takes precedence in degenerate (cap < floor) case
+- Overflow in Coefficient::evaluate returns None, propagated up; verify_cost_sufficiency falls back to Amount(u64::MAX) (fail-closed)
+- cast_unsigned() (stabilized Rust 1.87) used for non-negative i64->u64 conversion, guarded by delta >= 0 check
+- EIP-1559 relay pricing: stuck price when current_base_price * max_change_per_mille < 1000 (integer truncation to 0 change)
+- Step thresholds NOT required to be sorted -- doesn't affect correctness due to saturating_add commutativity
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs
