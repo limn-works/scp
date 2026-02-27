@@ -136,6 +136,15 @@ pub const fn event_count(log: &EventLog) -> u64 {
     log.leaves.len() as u64
 }
 
+/// Recomputes the interior tree for an `EventLog` from its current leaves.
+///
+/// This is a `pub(crate)` entry point for use by `EventLog::rebuild_tree()`
+/// after a `push_leaf_raw()` call. It performs the same full-tree recompute
+/// as the internal `recompute_tree()` helper.
+pub(crate) fn recompute_raw(log: &mut EventLog) {
+    recompute_tree(log);
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
