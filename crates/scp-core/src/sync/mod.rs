@@ -10,7 +10,7 @@
 //! - **Tier 2 (Extended offline, 4 hours to 7 days):** State snapshot comparison
 //!   and delta sync with selective epoch reconstruction. See [`days_offline`].
 //! - **Tier 3 (Long offline, > 7 days):** Forced re-join via MLS group state
-//!   reset. (Future.)
+//!   reset. See [`weeks_offline`].
 //!
 //! All tiers use the Merkle event log (ADR-011) as the authoritative state
 //! reconciliation mechanism and the relay's store-and-forward capability
@@ -27,12 +27,16 @@
 //! - [`days_offline`] — Tier 2 days-scale offline recovery: state snapshot
 //!   capture, delta computation and application, MLS group rebuild via
 //!   Welcome-based fast-forward, and multi-device divergence detection.
+//! - [`weeks_offline`] — Tier 3 weeks-scale offline recovery: forced re-join
+//!   with MLS group state reset, state preservation, in-flight message
+//!   handling, and bilateral context recovery (SCP-123).
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
 pub mod conflict_resolution;
 pub mod days_offline;
 pub mod hours_offline;
+pub mod weeks_offline;
 
 use std::time::Duration;
 
