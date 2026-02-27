@@ -40,6 +40,8 @@
 //!
 //! See ADR-031 in `.docs/adrs/phase-6.md` for the full specification.
 
+pub mod mls_integration;
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -64,7 +66,7 @@ pub type ProposalId = [u8; 32];
 ///
 /// Uses SHA-256 over the concatenation of context ID, proposer DID, serialized
 /// action bytes, and timestamp (big-endian u64).
-fn compute_proposal_id(
+pub(crate) fn compute_proposal_id(
     context_id: &str,
     proposer_did: &DID,
     action_bytes: &[u8],
@@ -645,7 +647,7 @@ impl GovernanceEngine for SingleAdminEngine {
 // ---------------------------------------------------------------------------
 
 /// Encode bytes as lowercase hex string for error messages.
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
         let _ = write!(acc, "{b:02x}");
