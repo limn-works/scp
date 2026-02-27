@@ -947,8 +947,8 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                     increment_handle_count();
                     Ok(handle)
                 }
-                CustodyMethod::Platform | CustodyMethod::Software | CustodyMethod::External => {
-                    // Platform, software, and external custody require a wired
+                CustodyMethod::Platform | CustodyMethod::Software => {
+                    // Platform and software custody require a wired
                     // KeyCustodyProvider (ADR-006 platform abstraction).
                     // Full implementation is tracked for the platform
                     // integration story that wires KeyCustodyProvider
@@ -961,6 +961,18 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                              Keystore (Android) backed custody"
                         ),
                         code: "SCP-IDENT-1003".to_owned(),
+                    })
+                }
+                CustodyMethod::External => {
+                    // `parse_custody_method` never produces External — it is only
+                    // constructed internally by `identity_load` for DID-string-only
+                    // handles that have no local key material. Reaching this arm
+                    // in `identity_create` is a bridge-layer bug.
+                    Err(ScpError::Identity {
+                        message: "internal: CustodyMethod::External cannot be used with \
+                                  identity_create — use identity_load for external DID handles"
+                            .to_owned(),
+                        code: "SCP-IDENT-1005".to_owned(),
                     })
                 }
             }

@@ -664,8 +664,18 @@ mod tests {
             "different context_id must produce different pseudonym"
         );
 
-        // expected_seed is the reference value for cross-language verification.
-        // It is used once Swift/Kotlin/TypeScript test infrastructure is wired.
-        let _ = expected_seed;
+        // Assert that the implementation matches the reference algorithm.
+        // expected_seed is HMAC-SHA256(sk, context_id || "scp-pseudonym"), so
+        // the expected public key is the verifying key of the Ed25519 signing key
+        // derived from that seed. This is the authoritative golden value —
+        // Swift, Kotlin, and TypeScript implementations MUST produce the same
+        // public key bytes for these inputs.
+        let expected_signing_key = SigningKey::from_bytes(&expected_seed);
+        let expected_pubkey = expected_signing_key.verifying_key();
+        assert_eq!(
+            pseudo1.public_key.as_bytes(),
+            expected_pubkey.as_bytes(),
+            "pseudonym public key must match reference HMAC-SHA256 algorithm output"
+        );
     }
 }
