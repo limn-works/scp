@@ -3,6 +3,7 @@
 
 # Rust
 target/
+rust_out
 
 # Python
 __pycache__/
