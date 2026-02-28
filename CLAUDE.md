@@ -9,7 +9,7 @@ SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure p
 ### Protocol tenets
 
 - **Provenance everywhere.** All non-private data carries verifiable origin metadata. Every message, tool output, attestation, and cross-context data transfer is traceable to its source. The absence of provenance is itself a signal.
-- **Human accountability.** Every agent traces to a human DID. No anonymous actors. Actions have consequences that persist across contexts.
+- **Human accountability.** Every agent can be traced to a human DID through attestation and delegation chains. The protocol provides the mechanism; contexts decide the requirement. Unattested DIDs are valid participants. Behavioral records are durable — actions have consequences that persist across contexts.
 - **Context isolation.** All interaction happens within bounded contexts. Cross-context data flow is explicit and governed. This is the security boundary.
 - **Encryption-as-access-control.** Context membership is enforced cryptographically through MLS group keys. Relays are untrusted dumb pipes; the math enforces access, not infrastructure.
 - **Legibility before opt-in.** Every context's parameters — capability ceiling, governance, roles, tools, TTL, memory scope — are visible before joining. No hidden terms. Informed consent is mechanical.

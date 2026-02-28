@@ -21,7 +21,7 @@ All interaction happens inside **contexts** — encrypted spaces with declared m
 
 **Relays are untrusted.** They store and forward encrypted blobs. Membership is enforced by MLS group keys, not by whoever runs the server.
 
-**Every agent traces to a human.** Identity is cryptographic (DID), and authorization uses capability tokens (UCAN) that are verifiable without calling home to any server.
+**Every agent can trace to a human.** Identity is cryptographic (DID), and authorization uses capability tokens (UCAN) that are verifiable without calling home to any server. The protocol provides the mechanism for human accountability — contexts decide whether to require it.
 
 **No operator required.** The protocol works without centralized infrastructure. If Limn disappears, SCP works exactly as designed.
 
