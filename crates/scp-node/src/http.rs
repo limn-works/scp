@@ -188,7 +188,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// `application/json` (provided by axum's `Json` extractor).
     ///
     /// See spec section 18.3.
-    #[must_use]
+    #[must_use = "returns the well-known router, which must be mounted into an axum application"]
     pub fn well_known_router(&self) -> Router {
         well_known_router(Arc::clone(&self.state))
     }
@@ -198,7 +198,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// Incoming connections are bridged to the node's internal relay server.
     ///
     /// See spec section 18.6.2.
-    #[must_use]
+    #[must_use = "returns the relay router, which must be mounted into an axum application"]
     pub fn relay_router(&self) -> Router {
         relay_router(Arc::clone(&self.state))
     }

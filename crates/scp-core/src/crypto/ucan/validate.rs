@@ -482,6 +482,7 @@ where
 /// # Errors
 ///
 /// Returns a specific [`UcanError`] variant indicating which step failed.
+#[cfg(test)]
 pub(crate) fn validate_ucan_stateless<D, S>(
     token: &UcanToken,
     required_capability: &CapabilityUri,
@@ -2631,7 +2632,7 @@ mod tests {
         );
     }
 
-    /// MAX_CHAIN_DEPTH guard still terminates excessively long chains.
+    /// `MAX_CHAIN_DEPTH` guard still terminates excessively long chains.
     #[test]
     fn verify_chain_recursive_rejects_excessive_depth() {
         let token = UcanToken {

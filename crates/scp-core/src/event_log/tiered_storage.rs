@@ -249,18 +249,18 @@ pub struct TieredEventLog {
     /// serves as the global index offset for the hot log: hot leaf 0
     /// corresponds to global index `global_index_offset`.
     global_index_offset: u64,
-    /// Timestamps of events in the hot tier, parallel to hot.leaves().
+    /// Timestamps of events in the hot tier, parallel to `hot.leaves()`.
     /// Used for age-based migration decisions.
     hot_timestamps: Vec<u64>,
     /// Estimated byte sizes of events in the hot tier, parallel to
-    /// hot.leaves(). Used for size-based migration decisions.
+    /// `hot.leaves()`. Used for size-based migration decisions.
     hot_byte_sizes: Vec<u64>,
 }
 
 impl TieredEventLog {
     /// Creates a new tiered event log with the given configuration.
     #[must_use]
-    pub fn new(context_id: String, config: TierConfig) -> Self {
+    pub const fn new(context_id: String, config: TierConfig) -> Self {
         Self {
             hot: EventLog::new(context_id),
             cold_entries: Vec::new(),
@@ -288,25 +288,25 @@ impl TieredEventLog {
     /// Returns a mutable reference to the hot-tier event log.
     ///
     /// Used for appending new events to the log.
-    pub fn hot_log_mut(&mut self) -> &mut EventLog {
+    pub const fn hot_log_mut(&mut self) -> &mut EventLog {
         &mut self.hot
     }
 
     /// Returns the number of events in the hot tier.
     #[must_use]
-    pub fn hot_event_count(&self) -> u64 {
+    pub const fn hot_event_count(&self) -> u64 {
         tree::event_count(&self.hot)
     }
 
     /// Returns the number of events in the cold tier.
     #[must_use]
-    pub fn cold_event_count(&self) -> u64 {
+    pub const fn cold_event_count(&self) -> u64 {
         self.cold_entries.len() as u64
     }
 
     /// Returns the total number of events across both tiers.
     #[must_use]
-    pub fn total_event_count(&self) -> u64 {
+    pub const fn total_event_count(&self) -> u64 {
         self.cold_event_count() + self.hot_event_count()
     }
 
@@ -394,12 +394,11 @@ impl TieredEventLog {
         }
 
         // Count-based: if hot exceeds max, migrate the excess.
-        if let Some(max_hot) = self.config.max_hot_events {
-            if hot_count > max_hot {
+        if let Some(max_hot) = self.config.max_hot_events
+            && hot_count > max_hot {
                 let count_excess = hot_count - max_hot;
                 migrate_count = migrate_count.max(count_excess);
             }
-        }
 
         // Size-based: migrate oldest events until under the byte limit.
         if let Some(max_bytes) = self.config.max_hot_bytes {
@@ -458,8 +457,7 @@ impl TieredEventLog {
 
         // Move leaf hashes and metadata to cold entries.
         // Sequence numbers use global indices (offset + local position).
-        for i in 0..count_usize {
-            let leaf_hash = hot_leaves[i];
+        for (i, &leaf_hash) in hot_leaves.iter().enumerate().take(count_usize) {
             let global_sequence = self.global_index_offset + i as u64;
             let timestamp = self.hot_timestamps[i];
             let payload_bytes = self.hot_byte_sizes[i];
@@ -555,7 +553,7 @@ impl TieredEventLog {
 
     /// Returns `true` if the given sequence number is in the hot tier.
     #[must_use]
-    pub fn is_hot(&self, sequence: u64) -> bool {
+    pub const fn is_hot(&self, sequence: u64) -> bool {
         sequence >= self.global_index_offset
             && sequence < self.global_index_offset + self.hot_event_count()
     }
@@ -586,19 +584,15 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
 
         let mut i = 0;
         while i < current.len() {
+            let mut hasher = Sha256::new();
+            hasher.update([0x01]);
+            hasher.update(current[i]);
             if i + 1 < current.len() {
-                let mut hasher = Sha256::new();
-                hasher.update(&[0x01]);
-                hasher.update(&current[i]);
-                hasher.update(&current[i + 1]);
-                parents.push(hasher.finalize().into());
+                hasher.update(current[i + 1]);
             } else {
-                let mut hasher = Sha256::new();
-                hasher.update(&[0x01]);
-                hasher.update(&current[i]);
-                hasher.update(&current[i]);
-                parents.push(hasher.finalize().into());
+                hasher.update(current[i]);
             }
+            parents.push(hasher.finalize().into());
             i += 2;
         }
 
@@ -613,7 +607,13 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::branches_sharing_code,
+    clippy::cast_possible_truncation,
+)]
 mod tests {
     use ed25519_dalek::Signer;
     use sha2::{Digest, Sha256};
@@ -717,7 +717,7 @@ mod tests {
     fn leaf_hash_from_event(event: &Event) -> [u8; 32] {
         let serialized = rmp_serde::to_vec(event).unwrap();
         let mut hasher = Sha256::new();
-        hasher.update(&[0x00]);
+        hasher.update([0x00]);
         hasher.update(&serialized);
         hasher.finalize().into()
     }
@@ -877,7 +877,7 @@ mod tests {
 
             let sibling_idx = idx ^ 1;
             if sibling_idx < current_layer.len() {
-                let direction = if idx % 2 == 0 {
+                let direction = if idx.is_multiple_of(2) {
                     Direction::Right
                 } else {
                     Direction::Left
@@ -901,15 +901,15 @@ mod tests {
             while i < current_layer.len() {
                 if i + 1 < current_layer.len() {
                     let mut hasher = Sha256::new();
-                    hasher.update(&[0x01]);
-                    hasher.update(&current_layer[i]);
-                    hasher.update(&current_layer[i + 1]);
+                    hasher.update([0x01]);
+                    hasher.update(current_layer[i]);
+                    hasher.update(current_layer[i + 1]);
                     parents.push(hasher.finalize().into());
                 } else {
                     let mut hasher = Sha256::new();
-                    hasher.update(&[0x01]);
-                    hasher.update(&current_layer[i]);
-                    hasher.update(&current_layer[i]);
+                    hasher.update([0x01]);
+                    hasher.update(current_layer[i]);
+                    hasher.update(current_layer[i]);
                     parents.push(hasher.finalize().into());
                 }
                 i += 2;
@@ -1264,7 +1264,7 @@ mod tests {
         assert_eq!(tiered.total_event_count(), 20);
 
         // Cold entries are lightweight -- just metadata.
-        let cold_overhead = tiered.cold_entries().len() * std::mem::size_of::<ColdTierEntry>();
+        let cold_overhead = std::mem::size_of_val(tiered.cold_entries());
         // Each ColdTierEntry is ~56 bytes (32 hash + 8 seq + 8 ts + 8 bytes).
         // For 17 entries, that's ~952 bytes -- much less than the original payloads.
         assert!(

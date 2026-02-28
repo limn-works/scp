@@ -27,7 +27,7 @@ pub trait ContactCache {
     /// Searches the local contact cache for entries matching the query.
     ///
     /// Returns matching entries instantly (no network I/O). The returned
-    /// entries include provenance indicating "local_cache" as the source.
+    /// entries include provenance indicating "`local_cache`" as the source.
     fn search_local(&self, query: &DiscoveryQuery) -> Vec<DiscoveryResultEntry>;
 }
 
@@ -88,6 +88,7 @@ pub trait ContextQuerier {
 /// Returns [`DiscoveryError`] if all remote context queries fail and the
 /// local cache is empty. Individual context query failures are tolerated --
 /// results from successful queries are still returned.
+#[allow(clippy::future_not_send)] // async trait methods don't support Send bounds
 pub async fn unified_search<C: ContactCache, Q: ContextQuerier>(
     query: &DiscoveryQuery,
     known_contexts: &[ContextId],
@@ -153,6 +154,7 @@ fn query_to_search_params(query: &DiscoveryQuery) -> AgentSearchParams {
 
 /// Queries multiple discovery contexts in parallel, collecting successful
 /// results. Individual failures are silently tolerated.
+#[allow(clippy::future_not_send)] // async trait methods don't support Send bounds
 async fn query_contexts_parallel<Q: ContextQuerier>(
     context_ids: &[ContextId],
     params: &AgentSearchParams,
@@ -242,20 +244,20 @@ fn compute_relevance(entry: &DiscoveryResultEntry, query: &DiscoveryQuery) -> f6
     let mut factors = 0_u32;
 
     // Factor 1: Capability match ratio.
-    if let Some(ref caps) = query.capability_filter {
-        if !caps.is_empty() {
+    if let Some(ref caps) = query.capability_filter
+        && !caps.is_empty() {
             let matched = caps
                 .iter()
                 .filter(|c| entry.capabilities.iter().any(|ec| ec == *c))
                 .count();
-            score += matched as f64 / caps.len() as f64;
+            #[allow(clippy::cast_precision_loss)] // counts are small; precision loss irrelevant
+            { score += matched as f64 / caps.len() as f64; }
             factors += 1;
         }
-    }
 
     // Factor 2: Keyword match count.
-    if let Some(ref keywords) = query.keywords {
-        if !keywords.is_empty() {
+    if let Some(ref keywords) = query.keywords
+        && !keywords.is_empty() {
             let matched = keywords
                 .iter()
                 .filter(|kw| {
@@ -267,10 +269,10 @@ fn compute_relevance(entry: &DiscoveryResultEntry, query: &DiscoveryQuery) -> f6
                         || entry.did.to_lowercase().contains(&kw_lower)
                 })
                 .count();
-            score += matched as f64 / keywords.len() as f64;
+            #[allow(clippy::cast_precision_loss)] // counts are small; precision loss irrelevant
+            { score += matched as f64 / keywords.len() as f64; }
             factors += 1;
         }
-    }
 
     // No query filters: all entries get a baseline score.
     if factors == 0 {
@@ -331,14 +333,13 @@ mod tests {
                     // Apply capability filter: include entries matching ANY
                     // queried capability. Partial matches rank lower via
                     // compute_relevance.
-                    if let Some(ref caps) = query.capability_filter {
-                        if !caps.iter().any(|c| e.capabilities.contains(c)) {
+                    if let Some(ref caps) = query.capability_filter
+                        && !caps.iter().any(|c| e.capabilities.contains(c)) {
                             return false;
                         }
-                    }
                     // Apply keyword filter.
-                    if let Some(ref keywords) = query.keywords {
-                        if !keywords.iter().any(|kw| {
+                    if let Some(ref keywords) = query.keywords
+                        && !keywords.iter().any(|kw| {
                             let kw_lower = kw.to_lowercase();
                             e.capabilities
                                 .iter()
@@ -346,7 +347,6 @@ mod tests {
                         }) {
                             return false;
                         }
-                    }
                     true
                 })
                 .cloned()
@@ -387,13 +387,12 @@ mod tests {
         ) -> Result<AgentSearchResult, DiscoveryError> {
             if self.failing_contexts.contains(context_id) {
                 return Err(DiscoveryError::DidResolutionFailed(format!(
-                    "context {} unreachable",
-                    context_id
+                    "context {context_id} unreachable"
                 )));
             }
 
             self.responses.get(context_id).cloned().ok_or_else(|| {
-                DiscoveryError::DidResolutionFailed(format!("context {} not found", context_id))
+                DiscoveryError::DidResolutionFailed(format!("context {context_id} not found"))
             })
         }
     }

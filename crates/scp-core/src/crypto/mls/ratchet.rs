@@ -334,14 +334,14 @@ mod tests {
     /// previous epoch key material (via `delete_previous_epoch_keypairs()`),
     /// making old-epoch ciphertexts undecryptable.
     ///
-    /// **Documented finding (SCP-171):** OpenMLS's `merge_staged_commit()`
+    /// **Documented finding (SCP-171):** `OpenMLS`'s `merge_staged_commit()`
     /// and `merge_pending_commit()` automatically call
     /// `delete_previous_epoch_keypairs()`, which removes the previous epoch's
     /// encryption key pairs from the storage provider. Additionally, the
     /// `MlsGroupCreateConfig` default `max_past_epochs` is 0, meaning no
     /// past epoch message secrets are retained in the `MessageSecretsStore`.
     /// Therefore, forward secrecy of cryptographic key material is enforced
-    /// by OpenMLS itself, not by the `EpochGraceStore`. The grace store's
+    /// by `OpenMLS` itself, not by the `EpochGraceStore`. The grace store's
     /// role is to control whether the SCP layer *attempts* decryption for a
     /// given epoch.
     #[test]
@@ -378,7 +378,7 @@ mod tests {
         );
     }
 
-    /// Verify that OpenMLS deletes key material across multiple epoch
+    /// Verify that `OpenMLS` deletes key material across multiple epoch
     /// advances, not just the most recent one. After two epoch advances,
     /// ciphertext from epoch N should be undecryptable at epoch N+2.
     #[test]
@@ -410,7 +410,7 @@ mod tests {
         );
     }
 
-    /// Verify that the epoch expiration callback fires during process_commit
+    /// Verify that the epoch expiration callback fires during `process_commit`
     /// when the grace store is at capacity and must evict old epochs.
     #[test]
     #[allow(clippy::unwrap_used)]

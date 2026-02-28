@@ -1,12 +1,12 @@
 //! JS-injected storage callback types.
 //!
-//! The WASM bridge cannot use native file system storage or SQLite directly.
+//! The WASM bridge cannot use native file system storage or `SQLite` directly.
 //! Instead, the TypeScript wrapper injects a `JsStorage` object backed by
 //! one of two browser storage backends (per §17.6):
 //!
 //! 1. **Primary:** wa-sqlite with `OPFSCoopSyncVFS` (Origin Private File
-//!    System) — full SQLite semantics in the browser.
-//! 2. **Fallback:** IndexedDB — used when OPFS is unavailable (older browsers,
+//!    System) — full `SQLite` semantics in the browser.
+//! 2. **Fallback:** `IndexedDB` — used when OPFS is unavailable (older browsers,
 //!    non-secure contexts).
 //!
 //! The extern "C" block declares the JS interface. The TypeScript SDK is
@@ -23,7 +23,7 @@
 //!
 //! # Key conventions
 //!
-//! Keys follow the ProtocolStore key conventions from `scp-core/store/`:
+//! Keys follow the `ProtocolStore` key conventions from `scp-core/store/`:
 //! - `identity/{did}` — identity state
 //! - `context/{context_id}` — context state
 //! - `key/{key_id}` — key material envelopes
@@ -47,7 +47,7 @@ use wasm_bindgen::prelude::*;
 ///
 /// Declared as an extern type so that any JS object with the matching
 /// method signatures can be passed in. The TypeScript SDK provides either
-/// a wa-sqlite/OPFS implementation or an IndexedDB fallback.
+/// a wa-sqlite/OPFS implementation or an `IndexedDB` fallback.
 ///
 /// All methods use `catch` so that thrown JS exceptions are converted to
 /// `Err(JsValue)` at the Rust boundary.
@@ -56,7 +56,7 @@ extern "C" {
     /// A JS object that implements key-value storage for the WASM bridge.
     ///
     /// Implemented in TypeScript using wa-sqlite (OPFS primary) or
-    /// IndexedDB (fallback). Injected at context and identity creation time.
+    /// `IndexedDB` (fallback). Injected at context and identity creation time.
     pub type JsStorage;
 
     /// Returns the value stored under `key`, or `undefined` (mapped to

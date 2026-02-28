@@ -77,7 +77,7 @@ impl ReliabilityScore {
     /// Creates a new `ReliabilityScore` for a relay with perfect initial
     /// scores (benefit of the doubt).
     #[must_use]
-    pub fn new(relay_url: String) -> Self {
+    pub const fn new(relay_url: String) -> Self {
         Self {
             relay_url,
             delivery_success_rate: 1.0,
@@ -112,7 +112,7 @@ impl ReliabilityScore {
     /// Higher is better. Combines delivery success rate as the primary
     /// factor.
     #[must_use]
-    pub fn composite_score(&self) -> f64 {
+    pub const fn composite_score(&self) -> f64 {
         self.delivery_success_rate
     }
 }
@@ -122,7 +122,7 @@ impl ReliabilityScore {
 // ---------------------------------------------------------------------------
 
 /// The result of a single relay operation, used to update reliability scores.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum DeliveryOutcome {
     /// The relay successfully delivered/accepted the envelope.
     Success {
@@ -157,8 +157,8 @@ pub enum DeliveryOutcome {
 /// * `scores` -- the map of relay URL to `ReliabilityScore`.
 /// * `relay_url` -- the relay whose score should be updated.
 /// * `outcome` -- the delivery outcome to record.
-pub fn update_score(
-    scores: &mut HashMap<String, ReliabilityScore>,
+pub fn update_score<S: ::std::hash::BuildHasher>(
+    scores: &mut HashMap<String, ReliabilityScore, S>,
     relay_url: &str,
     outcome: DeliveryOutcome,
 ) {
@@ -171,11 +171,10 @@ pub fn update_score(
             score.total_sends += 1;
             // EMA for delivery success rate: observation = 1.0 (success).
             score.delivery_success_rate =
-                EMA_ALPHA * 1.0 + (1.0 - EMA_ALPHA) * score.delivery_success_rate;
+                EMA_ALPHA.mul_add(1.0, (1.0 - EMA_ALPHA) * score.delivery_success_rate);
             // EMA for latency.
             #[allow(clippy::cast_precision_loss)]
-            let new_latency = EMA_ALPHA * (latency_ms as f64)
-                + (1.0 - EMA_ALPHA) * (score.average_latency_ms as f64);
+            let new_latency = EMA_ALPHA.mul_add(latency_ms as f64, (1.0 - EMA_ALPHA) * (score.average_latency_ms as f64));
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             {
                 score.average_latency_ms = new_latency as u64;
@@ -186,25 +185,25 @@ pub fn update_score(
             score.total_failures += 1;
             // EMA for delivery success rate: observation = 0.0 (failure).
             score.delivery_success_rate =
-                EMA_ALPHA * 0.0 + (1.0 - EMA_ALPHA) * score.delivery_success_rate;
+                EMA_ALPHA.mul_add(0.0, (1.0 - EMA_ALPHA) * score.delivery_success_rate);
         }
         DeliveryOutcome::DeletionSuccess => {
             // EMA for deletion compliance: observation = 1.0 (complied).
             score.deletion_compliance_rate =
-                EMA_ALPHA * 1.0 + (1.0 - EMA_ALPHA) * score.deletion_compliance_rate;
+                EMA_ALPHA.mul_add(1.0, (1.0 - EMA_ALPHA) * score.deletion_compliance_rate);
         }
         DeliveryOutcome::DeletionFailure => {
             // EMA for deletion compliance: observation = 0.0 (refused).
             score.deletion_compliance_rate =
-                EMA_ALPHA * 0.0 + (1.0 - EMA_ALPHA) * score.deletion_compliance_rate;
+                EMA_ALPHA.mul_add(0.0, (1.0 - EMA_ALPHA) * score.deletion_compliance_rate);
         }
     }
 }
 
 /// Returns the current reliability score for a relay, if it exists.
 #[must_use]
-pub fn get_score<'a>(
-    scores: &'a HashMap<String, ReliabilityScore>,
+pub fn get_score<'a, S: ::std::hash::BuildHasher>(
+    scores: &'a HashMap<String, ReliabilityScore, S>,
     relay_url: &str,
 ) -> Option<&'a ReliabilityScore> {
     scores.get(relay_url)
@@ -227,7 +226,7 @@ pub fn get_score<'a>(
 ///
 /// See ADR-012 acceptance criterion 7 (spec section 9.9.2).
 pub struct SuppressionTracker {
-    /// Per-blob delivery tracking: blob -> (first_seen_ms, set of adapter
+    /// Per-blob delivery tracking: blob -> (`first_seen_ms`, set of adapter
     /// indices that delivered it). LRU-bounded.
     entries: LruCache<BlobId, (u64, HashSet<usize>)>,
     /// The suppression cross-check window duration.
@@ -326,16 +325,19 @@ impl SuppressionTracker {
         now_ms: u64,
         total_relays: usize,
     ) -> Vec<SuppressionWarning> {
+        // Duration::as_millis() returns u128 but our window durations are
+        // always small (seconds). Truncation is safe here.
+        #[allow(clippy::cast_possible_truncation)]
         let window_ms = self.window.as_millis() as u64;
         let mut warnings = Vec::new();
         let mut expired_blobs = Vec::new();
 
         // Iterate over all entries without promoting (peek).
-        for (&blob_id, (first_seen_ms, adapters)) in self.entries.iter() {
+        for (&blob_id, (first_seen_ms, adapters)) in &self.entries {
             let elapsed = now_ms.saturating_sub(*first_seen_ms);
             if elapsed >= window_ms {
                 // Window has elapsed; check delivery count.
-                let threshold = (total_relays + 1) / 2; // ceil(total_relays / 2)
+                let threshold = total_relays.div_ceil(2); // ceil(total_relays / 2)
                 if adapters.len() < threshold {
                     warnings.push(SuppressionWarning {
                         blob_id,

@@ -1,3 +1,11 @@
+#![allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+)]
 //! Phase 5 end-to-end integration test.
 //!
 //! Exercises all four Phase 5 ADRs together with the Phase 1-4 foundation:
@@ -8,13 +16,11 @@
 //!   DTLS-SRTP key export, WebRTC signaling, and session metadata capture.
 //! - **ADR-025**: Platform adapter traits (key custody, device attestation,
 //!   push notifications, key-value storage) via in-memory testing adapters.
-//! - **ADR-026**: Swift SDK wrappers [OUT OF SCOPE -- requires XCFramework
+//! - **ADR-026**: Swift SDK wrappers [OUT OF SCOPE -- requires `XCFramework`
 //!   build (SCP-103)].
 //!
 //! The test verifies that bridge, media, platform, and cross-ADR integration
 //! all function correctly as a cohesive whole.
-
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::time::Duration;
 
@@ -155,7 +161,7 @@ fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
     tree::append(log, event).expect("append should succeed");
     let serialized = rmp_serde::to_vec(event).expect("serialize");
     let mut hasher = Sha256::new();
-    hasher.update(&[0x00]);
+    hasher.update([0x00]);
     hasher.update(&serialized);
     hasher.finalize().into()
 }
@@ -403,7 +409,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
         DataProvenance {
             source_context: context_id.to_string(),
             source_type: SourceType::Persistent,
-            counterparties: vec![claimant_did.clone()],
+            counterparties: vec![claimant_did],
             purpose: Some("post-claim message".to_string()),
             discovery_method: DiscoveryMethod::SharedContext(context_id.to_string()),
             age: Duration::from_secs(5),

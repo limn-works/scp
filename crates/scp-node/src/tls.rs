@@ -157,9 +157,10 @@ impl CertificateData {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| TlsError::Certificate(format!("system time error: {e}")))?
-            .as_secs() as i64;
+            .as_secs()
+            .cast_signed();
 
-        let threshold = i64::from(RENEWAL_THRESHOLD_DAYS) * 24 * 60 * 60;
+        let threshold = RENEWAL_THRESHOLD_DAYS * 24 * 60 * 60;
         Ok(expiry - now < threshold)
     }
 }
@@ -367,7 +368,7 @@ impl<S: Storage> std::fmt::Debug for AcmeProvider<S> {
             .field("domain", &self.domain)
             .field("email", &self.email)
             .field("directory_url", &self.directory_url)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -397,7 +398,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     /// Set a custom ACME directory URL (e.g., staging environment).
     #[must_use]
     pub fn with_directory_url(mut self, url: &str) -> Self {
-        self.directory_url = url.to_owned();
+        url.clone_into(&mut self.directory_url);
         self
     }
 
@@ -538,6 +539,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     ///
     /// The task runs until the returned [`tokio::task::JoinHandle`] is
     /// aborted or the process exits.
+    #[must_use] 
     pub fn start_renewal_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()>
     where
         S: Send + Sync + 'static,
@@ -556,10 +558,10 @@ impl<S: Storage + 'static> AcmeProvider<S> {
                             match self.provision().await {
                                 Ok(new_cert) => {
                                     // Hot-reload if a resolver is configured.
-                                    if let Some(resolver) = &self.cert_resolver {
-                                        if let Ok(certs) = new_cert.certificate_chain_der() {
-                                            if let Ok(key) = new_cert.private_key_der() {
-                                                if let Ok(signing_key) =
+                                    if let Some(resolver) = &self.cert_resolver
+                                        && let Ok(certs) = new_cert.certificate_chain_der()
+                                            && let Ok(key) = new_cert.private_key_der()
+                                                && let Ok(signing_key) =
                                                     rustls::crypto::ring::sign::any_supported_type(
                                                         &key,
                                                     )
@@ -572,9 +574,6 @@ impl<S: Storage + 'static> AcmeProvider<S> {
                                                         "TLS certificate renewed and hot-reloaded"
                                                     );
                                                 }
-                                            }
-                                        }
-                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -631,6 +630,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
 ///
 /// * `challenges` - A shared map from token to key authorization string.
 ///   Typically populated during the ACME provisioning flow.
+#[allow(clippy::implicit_hasher)]
 pub fn acme_challenge_router(
     challenges: Arc<RwLock<std::collections::HashMap<String, String>>>,
 ) -> axum::Router {
@@ -643,10 +643,10 @@ pub fn acme_challenge_router(
         Path(token): Path<String>,
     ) -> impl IntoResponse {
         let map = challenges.read().await;
-        match map.get(&token) {
-            Some(key_auth) => (StatusCode::OK, key_auth.clone()),
-            None => (StatusCode::NOT_FOUND, String::new()),
-        }
+        map.get(&token).map_or_else(
+            || (StatusCode::NOT_FOUND, String::new()),
+            |key_auth| (StatusCode::OK, key_auth.clone()),
+        )
     }
 
     axum::Router::new()
@@ -695,7 +695,14 @@ pub fn generate_self_signed(domain: &str) -> Result<CertificateData, TlsError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names,
+    clippy::cast_possible_wrap,
+    clippy::significant_drop_tightening
+)]
 mod tests {
     use super::*;
     use scp_platform::testing::InMemoryStorage;

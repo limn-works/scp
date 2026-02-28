@@ -73,18 +73,21 @@ pub struct WasmUcanToken {
 #[wasm_bindgen]
 impl WasmUcanToken {
     /// Returns the unique token identifier.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "tokenId")]
     pub fn token_id(&self) -> String {
         self.token_id.clone()
     }
 
     /// Returns the issuer DID.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn issuer(&self) -> String {
         self.issuer.clone()
     }
 
     /// Returns the audience DID.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn audience(&self) -> String {
         self.audience.clone()
@@ -94,6 +97,7 @@ impl WasmUcanToken {
     ///
     /// The TypeScript SDK parses this with `JSON.parse()` to obtain
     /// `string[]`.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "capabilitiesJson")]
     pub fn capabilities_json(&self) -> String {
         self.capabilities_json.clone()
@@ -101,6 +105,7 @@ impl WasmUcanToken {
 
     /// Returns the expiry timestamp in seconds since Unix epoch, or `null`
     /// if the token does not expire.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "expiresAt")]
     pub fn expires_at(&self) -> Option<f64> {
         self.expires_at

@@ -453,10 +453,10 @@ pub fn validate_spending_attenuation(
     // with restricted adapters would widen the permission — that's a violation.
     if !parent.allowed_adapters.is_empty() {
         if child.allowed_adapters.is_empty() {
-            return Err(SpendingError::AttenuationViolation(
-                "child has unrestricted adapters but parent restricts to: {:?}"
-                    .replace("{:?}", &format!("{:?}", parent.allowed_adapters)),
-            ));
+            return Err(SpendingError::AttenuationViolation(format!(
+                "child has unrestricted adapters but parent restricts to: {:?}",
+                parent.allowed_adapters,
+            )));
         }
         for adapter in &child.allowed_adapters {
             if !parent.allowed_adapters.contains(adapter) {
@@ -812,7 +812,12 @@ pub fn validate_spending_ucan(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreadable_literal,
+)]
 mod tests {
     use super::*;
 
@@ -1163,7 +1168,7 @@ mod tests {
         let parent = sample_capability();
         let child = SpendingCapability {
             allowed_adapters: vec!["stripe".to_owned()], // not in parent
-            ..parent.clone()
+            ..parent
         };
         let err = validate_spending_attenuation(&parent, &child).unwrap_err();
         assert!(matches!(err, SpendingError::AttenuationViolation(_)));
@@ -1174,7 +1179,7 @@ mod tests {
         let parent = sample_capability(); // has ["x402", "lightning"]
         let child = SpendingCapability {
             allowed_adapters: vec![], // unrestricted — would widen parent
-            ..parent.clone()
+            ..parent
         };
         let err = validate_spending_attenuation(&parent, &child).unwrap_err();
         assert!(matches!(err, SpendingError::AttenuationViolation(_)));
@@ -1188,7 +1193,7 @@ mod tests {
         };
         let child = SpendingCapability {
             allowed_adapters: vec!["stripe".to_owned(), "x402".to_owned()],
-            ..parent.clone()
+            ..parent
         };
         assert!(validate_spending_attenuation(&parent, &child).is_ok());
     }

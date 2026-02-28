@@ -165,7 +165,7 @@ impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
             .field("relay", &self.relay)
             .field("identity", &self.identity)
             .field("storage", &"<Storage>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1202,7 +1202,7 @@ mod tests {
         use tower::ServiceExt;
 
         /// Builds a node and returns it along with the well-known router
-        /// for direct testing via tower::ServiceExt.
+        /// for direct testing via `tower::ServiceExt`.
         async fn build_test_node() -> ApplicationNode<InMemoryStorage> {
             test_builder()
                 .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))

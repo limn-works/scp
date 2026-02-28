@@ -48,7 +48,7 @@ pub enum StandingChannelError {
 
 impl From<StandingChannelError> for ContextError {
     fn from(err: StandingChannelError) -> Self {
-        ContextError::TransportFailed(err.to_string())
+        Self::TransportFailed(err.to_string())
     }
 }
 
@@ -147,18 +147,14 @@ impl StandingChannelManager {
         if let Some(entry) = channels.get(peer_did.as_ref()) {
             let state = entry.handle.state().await;
             match state {
-                // Step 2: Active -- return immediately, zero network cost.
-                ContextState::Active => {
+                // Step 2: Active or still being set up -- return immediately.
+                ContextState::Active | ContextState::Creating => {
                     return Ok(entry.handle.clone());
                 }
                 // Step 4: Peer has left or context ended -- fall through to
                 // create a new one.
                 ContextState::Closed | ContextState::Expired | ContextState::Closing => {
                     // Will create a new channel below.
-                }
-                // Creating -- context is still being set up, return it.
-                ContextState::Creating => {
-                    return Ok(entry.handle.clone());
                 }
             }
         }
@@ -175,6 +171,7 @@ impl StandingChannelManager {
                 handle: handle.clone(),
             },
         );
+        drop(channels);
 
         Ok(handle)
     }
@@ -198,18 +195,23 @@ impl StandingChannelManager {
     /// fails. Partial reconnection results are still applied -- channels that
     /// succeeded remain connected.
     pub async fn reconnect_all(&self) -> Result<usize, StandingChannelError> {
-        let channels = self.channels.lock().await;
+        // Collect handles under lock, then release before async operations.
+        let entries: Vec<_> = {
+            let channels = self.channels.lock().await;
+            channels.values().map(|e| e.handle.clone()).collect()
+        };
+
         let mut reconnected = 0;
 
-        for entry in channels.values() {
-            let state = entry.handle.state().await;
+        for handle in &entries {
+            let state = handle.state().await;
             if state == ContextState::Active {
-                let context_id = entry.handle.context_id();
+                let context_id = handle.context_id();
                 let context_id_bytes = super::context_id_bytes(context_id);
                 // Reconnect transport by publishing the context (re-subscribing
                 // to the relay for this context's messages).
                 self.transport
-                    .publish_context(&context_id_bytes, entry.handle.params())
+                    .publish_context(&context_id_bytes, handle.params())
                     .map_err(|e| StandingChannelError::ReconnectFailed {
                         context_id: context_id.to_owned(),
                         reason: e.to_string(),
@@ -286,6 +288,8 @@ impl StandingChannelManager {
 /// `standing:` prefix for namespace isolation and a truncated SHA-256 hash of
 /// the sorted DID pair for the unique portion.
 fn generate_standing_channel_id(local_did: &DID, peer_did: &DID) -> String {
+    use sha2::{Digest, Sha256};
+
     // Sort to ensure determinism regardless of direction.
     let (a, b) = if local_did.as_ref() <= peer_did.as_ref() {
         (local_did.as_ref(), peer_did.as_ref())
@@ -293,7 +297,6 @@ fn generate_standing_channel_id(local_did: &DID, peer_did: &DID) -> String {
         (peer_did.as_ref(), local_did.as_ref())
     };
     // Hash the sorted DIDs with the standing prefix for a stable, deterministic ID.
-    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"standing:");
     hasher.update(a.as_bytes());
@@ -305,9 +308,14 @@ fn generate_standing_channel_id(local_did: &DID, peer_did: &DID) -> String {
 
 /// Minimal hex encoding for context ID generation.
 mod hex {
+    use std::fmt::Write;
+
     /// Encodes bytes as a lowercase hex string.
     pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
     }
 }
 
@@ -481,9 +489,9 @@ mod tests {
         let transport = Arc::new(MockTransport::connected());
         let manager = StandingChannelManager::new(
             DID::from("did:dht:z6MkLocalAlice"),
-            Arc::new(MockCrypto::default()),
+            Arc::new(MockCrypto),
             transport.clone(),
-            Arc::new(MockEventLog::default()),
+            Arc::new(MockEventLog),
         );
         (manager, transport)
     }

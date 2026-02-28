@@ -68,7 +68,7 @@ pub struct ProtocolStore<S: Storage> {
 impl<S: Storage> ProtocolStore<S> {
     /// Creates a new `ProtocolStore` wrapping the given storage backend.
     #[must_use]
-    pub fn new(storage: S) -> Self {
+    pub const fn new(storage: S) -> Self {
         Self { storage }
     }
 }

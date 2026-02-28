@@ -522,7 +522,7 @@ pub async fn send_block_notification(
 ///
 /// Returns [`SenderKeyError::StaleBlockNotification`] if the notification
 /// timestamp is outside the freshness window.
-pub fn validate_block_notification_freshness(
+pub const fn validate_block_notification_freshness(
     notification: &BlockNotification,
     now_ms: u64,
 ) -> Result<(), SenderKeyError> {
@@ -618,7 +618,7 @@ pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
 ///
 /// Tracks seen request nonces for up to [`NONCE_EXPIRY_SECS`] seconds and
 /// caps the stored count at [`NONCE_DEDUP_CAPACITY`] entries to prevent
-/// memory exhaustion from DoS attacks.
+/// memory exhaustion from `DoS` attacks.
 ///
 /// Callers should call [`NonceDedup::is_replayed`] before processing a
 /// request, then [`NonceDedup::record`] once the request is accepted.
@@ -630,6 +630,7 @@ pub struct NonceDedup {
 
 impl NonceDedup {
     /// Creates a new, empty dedup cache.
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             seen: HashMap::new(),
@@ -651,11 +652,10 @@ impl NonceDedup {
     /// If at capacity ([`NONCE_DEDUP_CAPACITY`]), the oldest entry is evicted
     /// to make room.
     pub fn record(&mut self, nonce: [u8; REQUEST_NONCE_SIZE], now_secs: u64) {
-        if self.seen.len() >= NONCE_DEDUP_CAPACITY {
-            if let Some(oldest_key) = self.seen.iter().min_by_key(|(_, ts)| *ts).map(|(k, _)| *k) {
+        if self.seen.len() >= NONCE_DEDUP_CAPACITY
+            && let Some(oldest_key) = self.seen.iter().min_by_key(|(_, ts)| *ts).map(|(k, _)| *k) {
                 self.seen.remove(&oldest_key);
             }
-        }
         self.seen.insert(nonce, now_secs);
     }
 }
@@ -1548,7 +1548,7 @@ mod tests {
     #[tokio::test]
     async fn sender_key_response_echoes_request_nonce() {
         let alice_custody = InMemoryKeyCustody::new();
-        let alice_signing_key = alice_custody
+        let _alice_signing_key = alice_custody
             .generate_keypair(KeyType::Ed25519)
             .await
             .unwrap();

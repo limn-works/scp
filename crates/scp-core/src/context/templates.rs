@@ -160,6 +160,7 @@ fn messaging_invite_ceiling() -> Vec<Capability> {
 /// | `PaidService` | Encrypted | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional | Required (per_tool_invoke) |
 /// | `PaidBroadcast` | Broadcast | messages | Immutable | NoPromotion | Full | SingleAdmin | Optional | Required (per_period) |
 #[must_use]
+#[allow(clippy::too_many_lines)] // one arm per template variant; splitting hurts readability
 pub fn template_params(template_id: &TemplateId) -> ContextParams {
     match template_id {
         TemplateId::BilateralEphemeral => ContextParams {
@@ -464,7 +465,7 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
     // Economic policy validation for paid templates.
     // Paid templates require economic_policy to be present and specific cost
     // fields to be set. See spec section 19.10 and ADR-033 criterion 13.
-    validate_economic_policy_for_template(*template_id, &params.economic_policy)?;
+    validate_economic_policy_for_template(*template_id, params.economic_policy.as_ref())?;
 
     Ok(())
 }
@@ -476,12 +477,11 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
 /// - All other templates have no economic policy requirements.
 fn validate_economic_policy_for_template(
     template_id: TemplateId,
-    economic_policy: &Option<crate::economy::EconomicPolicy>,
+    economic_policy: Option<&crate::economy::EconomicPolicy>,
 ) -> Result<(), TemplateError> {
     match template_id {
         TemplateId::PaidService => {
             let policy = economic_policy
-                .as_ref()
                 .ok_or(TemplateError::EconomicPolicyRequired {
                     template: template_id,
                 })?;
@@ -494,7 +494,6 @@ fn validate_economic_policy_for_template(
         }
         TemplateId::PaidBroadcast => {
             let policy = economic_policy
-                .as_ref()
                 .ok_or(TemplateError::EconomicPolicyRequired {
                     template: template_id,
                 })?;

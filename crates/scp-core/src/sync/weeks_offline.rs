@@ -752,7 +752,12 @@ pub fn determine_inflight_handling(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::match_wildcard_for_single_variants,
+)]
 mod tests {
     use super::*;
 
@@ -1266,7 +1271,7 @@ mod tests {
             local_merkle_root: [42u8; 32],
             params_hash: [7u8; 32],
             active_tools: vec!["search".to_owned(), "translate".to_owned()],
-            membership_roster: roster.clone(),
+            membership_roster: roster,
             invalidated_proposals: 2,
         };
         assert_eq!(preservation.membership_roster.len(), 3);

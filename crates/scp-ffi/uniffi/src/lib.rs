@@ -1,6 +1,6 @@
-//! UniFFI FFI bridge for SCP — generates Swift and Kotlin bindings.
+//! `UniFFI` FFI bridge for SCP — generates Swift and Kotlin bindings.
 //!
-//! This crate is the Rust half of the Swift and Kotlin SDKs. It uses UniFFI's
+//! This crate is the Rust half of the Swift and Kotlin SDKs. It uses `UniFFI`'s
 //! proc-macros (`#[uniffi::export]`) as the primary definition approach, with
 //! a minimal supplementary UDL file (`scp.udl`) containing only the namespace
 //! anchor required by `uniffi::include_scaffolding!`.
@@ -26,12 +26,12 @@
 //! `PushProvider`, `DeviceAttestationProvider`) and the message streaming
 //! callback (`MessageListener`)
 //! are defined via `#[uniffi::export(callback_interface)]` in this module.
-//! UniFFI generates the Swift and Kotlin callback wiring from these annotations.
+//! `UniFFI` generates the Swift and Kotlin callback wiring from these annotations.
 //!
 //! # Async runtime
 //!
 //! A single tokio `Runtime` is created at library initialization and stored
-//! in a `OnceLock<Runtime>`. All async bridge functions use UniFFI's native
+//! in a `OnceLock<Runtime>`. All async bridge functions use `UniFFI`'s native
 //! async support, which bridges between the tokio runtime and the caller's
 //! concurrency context (Swift structured concurrency / Kotlin coroutines).
 //!
@@ -253,7 +253,7 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on whatever Rust tokio thread is currently
+/// `UniFFI` callbacks execute on whatever Rust tokio thread is currently
 /// running — NOT on the Swift/Kotlin main thread. Implementations MUST be
 /// thread-safe (`Send + Sync`) and MUST NOT assume main-thread execution.
 /// Any UI or main-thread-only operations MUST be dispatched explicitly:
@@ -283,7 +283,7 @@ pub trait MessageListener: Send + Sync {
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
 /// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
 /// NOT assume main-thread execution. Keychain / Secure Enclave operations are
 /// generally thread-safe; UI updates triggered from within implementations
@@ -319,11 +319,11 @@ pub trait KeyCustodyProvider: Send + Sync {
 /// Callback for platform persistent key-value storage.
 ///
 /// Swift SDK: Core Data / Keychain / file-based storage.
-/// Kotlin SDK: Room / SharedPreferences.
+/// Kotlin SDK: Room / `SharedPreferences`.
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
 /// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
 /// NOT assume main-thread execution. Storage operations are generally
 /// thread-safe (Core Data with proper context management, Room with DAOs).
@@ -362,7 +362,7 @@ pub trait StorageProvider: Send + Sync {
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
 /// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
 /// NOT assume main-thread execution. APNs and FCM APIs are thread-safe;
 /// any UI notification work triggered within an implementation MUST be
@@ -391,14 +391,14 @@ pub trait PushProvider: Send + Sync {
 
 /// Callback for platform device attestation.
 ///
-/// Swift SDK: DCAppAttestService (App Attest on iOS 14+ / macOS 11+).
+/// Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
 /// Kotlin SDK: Play Integrity API on Android.
 ///
 /// Implemented by Swift/Kotlin code and injected into the Rust engine.
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
 /// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
 /// NOT assume main-thread execution.
 ///
@@ -432,6 +432,7 @@ pub trait DeviceAttestationProvider: Send + Sync {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -773,7 +773,12 @@ pub const fn expiry_notification() -> ContextEvent {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::iter_on_single_items,
+)]
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1043,7 +1048,7 @@ mod tests {
         );
     }
 
-    /// SCP-164: Calling finalize_close on a context NOT in Closing state
+    /// SCP-164: Calling `finalize_close` on a context NOT in Closing state
     /// must return an error AND must NOT destroy any key material.
     #[tokio::test]
     async fn finalize_close_on_active_context_returns_error_and_preserves_keys() {
@@ -1078,7 +1083,7 @@ mod tests {
         assert_eq!(handle.state().await, ContextState::Active);
     }
 
-    /// SCP-164: Calling finalize_close on a Closing context must succeed,
+    /// SCP-164: Calling `finalize_close` on a Closing context must succeed,
     /// transition to Closed, and destroy keys in the correct order
     /// (state transition validated before key destruction).
     #[tokio::test]
@@ -1251,7 +1256,7 @@ mod tests {
 
     /// SCP-195: Threshold evaluated against active votes only.
     ///
-    /// Scenario: 3 members, threshold=3 (AllMember). Alice, Bob, Charlie all
+    /// Scenario: 3 members, threshold=3 (`AllMember`). Alice, Bob, Charlie all
     /// vote. Charlie is removed before tally. Only 2 of 3 required consents
     /// remain active, so the proposal is NOT approved.
     #[test]
@@ -1276,7 +1281,7 @@ mod tests {
 
     /// SCP-195: Majority threshold passes with active members.
     ///
-    /// Scenario: 3 active members, required_count=2 (governance-based
+    /// Scenario: 3 active members, `required_count=2` (governance-based
     /// majority). 2 of 3 active members consent => passes.
     #[test]
     fn ttl_extension_majority_threshold_with_active_members() {
@@ -1311,7 +1316,7 @@ mod tests {
         assert_eq!(ext.active_remaining(&active), 2);
     }
 
-    /// SCP-195: TtlExtensionProposal delegates active-member checks correctly.
+    /// SCP-195: `TtlExtensionProposal` delegates active-member checks correctly.
     #[test]
     fn extension_proposal_active_member_validation() {
         let mut proposal = TtlExtensionProposal::new(

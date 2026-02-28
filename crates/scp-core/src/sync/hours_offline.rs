@@ -113,7 +113,7 @@ impl RelayMessageBuffer {
     /// ADR-004 Connection Recovery). Uses `saturating_sub` to handle the case
     /// where `last_stored_at` is very small.
     #[must_use]
-    pub fn subscribe_since(&self) -> u64 {
+    pub const fn subscribe_since(&self) -> u64 {
         self.last_stored_at.saturating_sub(self.overlap_secs)
     }
 
@@ -132,7 +132,7 @@ impl RelayMessageBuffer {
 
     /// Returns the number of unique messages retrieved so far.
     #[must_use]
-    pub fn message_count(&self) -> usize {
+    pub const fn message_count(&self) -> usize {
         self.messages.len()
     }
 
@@ -146,6 +146,7 @@ impl RelayMessageBuffer {
     /// `stored_at` ascending.
     ///
     /// After this call the buffer is empty.
+    #[must_use] 
     pub fn drain_sorted(mut self) -> Vec<BufferedMessage> {
         self.messages.sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
         self.messages
@@ -184,7 +185,7 @@ impl EpochCatchUpState {
     ///
     /// The initial status is [`CatchUpStatus::Processing`].
     #[must_use]
-    pub fn new(context_id: ContextId, local_epoch: u64, target_epoch: u64) -> Self {
+    pub const fn new(context_id: ContextId, local_epoch: u64, target_epoch: u64) -> Self {
         Self {
             context_id,
             local_epoch,
@@ -196,7 +197,7 @@ impl EpochCatchUpState {
 
     /// Returns the number of epochs remaining to catch up.
     #[must_use]
-    pub fn epochs_remaining(&self) -> u64 {
+    pub const fn epochs_remaining(&self) -> u64 {
         self.target_epoch
             .saturating_sub(self.local_epoch.saturating_add(self.commits_processed))
     }
@@ -206,7 +207,7 @@ impl EpochCatchUpState {
     /// When this returns `true`, the SDK should fall back to Welcome-based
     /// fast-forward instead of continuing sequential processing.
     #[must_use]
-    pub fn exceeds_sequential_limit(&self) -> bool {
+    pub const fn exceeds_sequential_limit(&self) -> bool {
         self.target_epoch.saturating_sub(self.local_epoch) > MAX_SEQUENTIAL_COMMITS
     }
 
@@ -336,7 +337,7 @@ impl ReorderBuffer {
     /// * `next_expected` — The first sequence number expected for in-order
     ///   delivery.
     #[must_use]
-    pub fn new(context_id: ContextId, next_expected: u64) -> Self {
+    pub const fn new(context_id: ContextId, next_expected: u64) -> Self {
         Self {
             context_id,
             next_expected,
@@ -350,7 +351,7 @@ impl ReorderBuffer {
     ///
     /// Useful for testing with smaller values.
     #[must_use]
-    pub fn with_config(
+    pub const fn with_config(
         context_id: ContextId,
         next_expected: u64,
         capacity: usize,
@@ -373,7 +374,7 @@ impl ReorderBuffer {
 
     /// Returns the next expected sequence number.
     #[must_use]
-    pub fn next_expected(&self) -> u64 {
+    pub const fn next_expected(&self) -> u64 {
         self.next_expected
     }
 
@@ -451,9 +452,8 @@ impl ReorderBuffer {
 
         // Check if the earliest buffered entry has been waiting too long.
         let gap_timeout_secs = self.gap_timeout.as_secs();
-        let earliest_seq = match self.entries.keys().next().copied() {
-            Some(seq) => seq,
-            None => return Vec::new(),
+        let Some(earliest_seq) = self.entries.keys().next().copied() else {
+            return Vec::new();
         };
 
         // If the earliest entry is at next_expected, just drain consecutive.
@@ -462,9 +462,8 @@ impl ReorderBuffer {
         }
 
         // There's a gap. Check if the earliest buffered entry has timed out.
-        let earliest_entry = match self.entries.get(&earliest_seq) {
-            Some(entry) => entry,
-            None => return Vec::new(),
+        let Some(earliest_entry) = self.entries.get(&earliest_seq) else {
+            return Vec::new();
         };
         let waited = now_secs.saturating_sub(earliest_entry.buffered_at_secs);
         if waited < gap_timeout_secs {
@@ -523,7 +522,7 @@ impl KeyPackagePrePublisher {
     ///
     /// Defaults to maintaining at least 10 published `KeyPackage`s.
     #[must_use]
-    pub fn new(member_did: DID) -> Self {
+    pub const fn new(member_did: DID) -> Self {
         Self {
             member_did,
             published_count: 0,
@@ -535,7 +534,7 @@ impl KeyPackagePrePublisher {
 
     /// Creates a pre-publisher with a custom minimum publication count.
     #[must_use]
-    pub fn with_min_published(member_did: DID, min_published: usize) -> Self {
+    pub const fn with_min_published(member_did: DID, min_published: usize) -> Self {
         Self {
             member_did,
             published_count: 0,
@@ -548,14 +547,14 @@ impl KeyPackagePrePublisher {
     /// Returns `true` if the number of published `KeyPackage`s is below
     /// the minimum threshold and new ones should be generated and published.
     #[must_use]
-    pub fn needs_replenish(&self) -> bool {
+    pub const fn needs_replenish(&self) -> bool {
         self.published_count < self.min_published
     }
 
     /// Returns how many new `KeyPackage`s should be generated to reach the
     /// minimum threshold.
     #[must_use]
-    pub fn replenish_count(&self) -> usize {
+    pub const fn replenish_count(&self) -> usize {
         self.min_published.saturating_sub(self.published_count)
     }
 
@@ -669,7 +668,7 @@ impl ReconnectionCoordinator {
     ///   (persisted in `ProtocolStore` under
     ///   `sync/{context_id}/last_relay_contact`).
     #[must_use]
-    pub fn new(
+    pub const fn new(
         member_did: DID,
         context_ids: Vec<ContextId>,
         last_relay_contacts: std::collections::HashMap<ContextId, u64>,
@@ -684,7 +683,7 @@ impl ReconnectionCoordinator {
 
     /// Returns the member DID.
     #[must_use]
-    pub fn member_did(&self) -> &DID {
+    pub const fn member_did(&self) -> &DID {
         &self.member_did
     }
 
@@ -696,7 +695,7 @@ impl ReconnectionCoordinator {
 
     /// Returns the overall timeout for the reconnection protocol.
     #[must_use]
-    pub fn overall_timeout(&self) -> Duration {
+    pub const fn overall_timeout(&self) -> Duration {
         self.overall_timeout
     }
 
@@ -743,7 +742,7 @@ impl ReconnectionCoordinator {
     ///
     /// Per §9.12, the SDK SHOULD issue an MLS Update after reconnecting.
     /// This method updates the result to reflect that the Update was issued.
-    pub fn record_mls_update(result: &mut ContextSyncResult) {
+    pub const fn record_mls_update(result: &mut ContextSyncResult) {
         result.mls_update_issued = true;
     }
 
@@ -756,7 +755,7 @@ impl ReconnectionCoordinator {
     /// * `messages_discarded` — Total queued messages discarded.
     /// * `total_duration_ms` — Total time spent in the reconnection protocol.
     #[must_use]
-    pub fn build_report(
+    pub const fn build_report(
         results: Vec<ContextSyncResult>,
         messages_drained: u64,
         messages_discarded: u64,
@@ -834,33 +833,33 @@ impl NetworkSimulator {
 
     /// Returns the current simulated time.
     #[must_use]
-    pub fn current_time(&self) -> u64 {
+    pub const fn current_time(&self) -> u64 {
         self.current_time
     }
 
     /// Advances the simulated clock by the given number of seconds.
-    pub fn advance_time(&mut self, seconds: u64) {
+    pub const fn advance_time(&mut self, seconds: u64) {
         self.current_time = self.current_time.saturating_add(seconds);
     }
 
     /// Sets the network condition (relay reachability, latency, drop rate).
-    pub fn set_condition(&mut self, condition: NetworkCondition) {
+    pub const fn set_condition(&mut self, condition: NetworkCondition) {
         self.condition = condition;
     }
 
     /// Simulates a member going offline by making the relay unreachable.
-    pub fn disconnect(&mut self) {
+    pub const fn disconnect(&mut self) {
         self.condition.relay_reachable = false;
     }
 
     /// Simulates a member reconnecting by making the relay reachable again.
-    pub fn reconnect(&mut self) {
+    pub const fn reconnect(&mut self) {
         self.condition.relay_reachable = true;
     }
 
     /// Returns whether the relay is currently reachable.
     #[must_use]
-    pub fn is_connected(&self) -> bool {
+    pub const fn is_connected(&self) -> bool {
         self.condition.relay_reachable
     }
 
@@ -911,9 +910,8 @@ impl NetworkSimulator {
             });
         }
 
-        let buffer = match self.relay_buffers.get(context_id) {
-            Some(buf) => buf,
-            None => return Ok(Vec::new()),
+        let Some(buffer) = self.relay_buffers.get(context_id) else {
+            return Ok(Vec::new());
         };
 
         Ok(buffer

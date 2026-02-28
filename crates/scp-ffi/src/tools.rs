@@ -198,7 +198,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 
     // Build the scp-core ToolRegistration.
     let core_registration = scp_core::context::tools::ToolRegistration {
-        tool_id: tool_id.clone(),
+        tool_id,
         name,
         description,
         schema: scp_core::context::tools::ToolSchema {

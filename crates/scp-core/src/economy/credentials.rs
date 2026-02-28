@@ -37,7 +37,7 @@ use super::adapter::PaymentAdapter;
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
     /// The adapter failed validation (does not properly implement the
-    /// `PaymentAdapter` trait contract -- e.g., returns an empty adapter_id).
+    /// `PaymentAdapter` trait contract -- e.g., returns an empty `adapter_id`).
     #[error("invalid adapter: {0}")]
     InvalidAdapter(String),
 
@@ -120,7 +120,7 @@ impl std::fmt::Debug for AdapterCredential {
 pub trait AdapterCredentialStore: Send + Sync {
     /// Stores an adapter credential for an identity.
     ///
-    /// Overwrites any existing credential for the same (identity, adapter_id)
+    /// Overwrites any existing credential for the same (identity, `adapter_id`)
     /// pair. The credential data must already be encrypted by the caller.
     fn store_adapter_credential(
         &self,
@@ -138,7 +138,7 @@ pub trait AdapterCredentialStore: Send + Sync {
 
     /// Lists all configured adapter IDs for an identity.
     ///
-    /// Returns the adapter_id strings, not the full credentials. This is
+    /// Returns the `adapter_id` strings, not the full credentials. This is
     /// used for adapter discovery (spec section 19.2.4) without exposing
     /// credential material.
     fn list_adapter_credentials(
@@ -276,7 +276,13 @@ pub async fn retrieve_adapter_credential<S: AdapterCredentialStore>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::manual_async_fn,
+    clippy::significant_drop_tightening,
+)]
 mod tests {
     use std::collections::HashMap;
 
@@ -295,7 +301,7 @@ mod tests {
 
     /// In-memory credential store for testing.
     struct InMemoryCredentialStore {
-        /// Key: (identity DID string, adapter_id)
+        /// Key: (identity DID string, `adapter_id`)
         data: Mutex<HashMap<(String, String), AdapterCredential>>,
     }
 
@@ -452,7 +458,7 @@ mod tests {
     struct EmptyIdAdapter;
 
     impl PaymentAdapter for EmptyIdAdapter {
-        fn adapter_id(&self) -> &str {
+        fn adapter_id(&self) -> &'static str {
             ""
         }
 
@@ -528,7 +534,7 @@ mod tests {
     struct NoCurrencyAdapter;
 
     impl PaymentAdapter for NoCurrencyAdapter {
-        fn adapter_id(&self) -> &str {
+        fn adapter_id(&self) -> &'static str {
             "no-currency"
         }
 

@@ -371,7 +371,7 @@ pub fn resolve_metadata_conflict(a: &MetadataOp, b: &MetadataOp) -> ConflictReso
 ///
 /// - The proposal with the lower leaf index (committed first) wins.
 /// - The losing proposal is invalidated with reason "Conflicting proposal
-///   {winner_id} committed first".
+///   {`winner_id`} committed first".
 /// - If two proposals have the same leaf index (simultaneous commit), the
 ///   context enters a governance freeze (ADR-031 section 7).
 ///
@@ -428,7 +428,7 @@ pub fn resolve_governance_conflict(
     if !simultaneous.is_empty() {
         // Deduplicate proposal IDs.
         let mut deduped = simultaneous;
-        deduped.sort();
+        deduped.sort_unstable();
         deduped.dedup();
         return Ok(ConflictResolutionStrategy::GovernanceFreeze {
             conflicting_proposals: deduped,
@@ -585,7 +585,11 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
     hasher.update(b"fork");
     hasher.update(fork_point);
     let hash = hasher.finalize();
-    let hex: String = hash[..16].iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = hash[..16].iter().fold(String::with_capacity(32), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     format!("fork-{hex}")
 }
 
@@ -594,6 +598,11 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+)]
 mod tests {
     use super::*;
 
@@ -1228,8 +1237,7 @@ mod tests {
         assert_eq!(fork.map(|f| f.members.len()), Some(2));
         // Fork ID should start with "fork-".
         assert!(
-            fork.map(|f| f.forked_context_id.starts_with("fork-"))
-                .unwrap_or(false)
+            fork.is_some_and(|f| f.forked_context_id.starts_with("fork-"))
         );
     }
 
@@ -1319,7 +1327,7 @@ mod tests {
         let json = serde_json::to_string(&conflict);
         assert!(json.is_ok());
         let deserialized: Result<OfflineConflict, _> =
-            serde_json::from_str(&json.as_deref().unwrap_or(""));
+            serde_json::from_str(json.as_deref().unwrap_or(""));
         assert!(deserialized.is_ok());
     }
 

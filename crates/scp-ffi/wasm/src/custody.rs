@@ -4,15 +4,15 @@
 //! Android Keystore) or a Rust-side key custody implementation that requires
 //! native OS APIs. Instead, the TypeScript wrapper injects an object that
 //! satisfies the `JsKeyCustody` extern type contract, backed by the browser's
-//! WebCrypto API (`SubtleCrypto`).
+//! `WebCrypto` API (`SubtleCrypto`).
 //!
 //! The extern "C" block declares the JS interface. The TypeScript SDK is
 //! responsible for providing a conforming implementation at the call site.
 //!
-//! # WebCrypto integration pattern
+//! # `WebCrypto` integration pattern
 //!
 //! ```ts
-//! // TypeScript wrapper creates a WebCrypto-backed custody object:
+//! // TypeScript wrapper creates a `WebCrypto`-backed custody object:
 //! const custody = {
 //!     sign(keyId: string, data: Uint8Array): Uint8Array { ... },
 //!     getPublicKey(keyId: string): Uint8Array { ... },
@@ -34,7 +34,7 @@
 use wasm_bindgen::prelude::*;
 
 // ---------------------------------------------------------------------------
-// JsKeyCustody — injected WebCrypto-backed key custody
+// JsKeyCustody — injected `WebCrypto`-backed key custody
 // ---------------------------------------------------------------------------
 
 /// Opaque JS object implementing key custody operations.
@@ -49,7 +49,7 @@ use wasm_bindgen::prelude::*;
 extern "C" {
     /// A JS object that implements key custody for the WASM bridge.
     ///
-    /// Implemented in TypeScript using the browser's WebCrypto API
+    /// Implemented in TypeScript using the browser's `WebCrypto` API
     /// (`SubtleCrypto`). Injected at identity creation time.
     pub type JsKeyCustody;
 

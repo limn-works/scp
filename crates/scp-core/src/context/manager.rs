@@ -516,7 +516,7 @@ impl ContextManager {
             .map(|ctx| {
                 ctx.membership
                     .member_dids()
-                    .map(|d| d.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect()
             })
             .unwrap_or_default()
@@ -798,7 +798,14 @@ const fn _assert_send_sync() {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::needless_collect,
+    clippy::significant_drop_tightening,
+    clippy::match_same_arms,
+)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1321,7 +1328,7 @@ mod tests {
         (manager, handle)
     }
 
-    /// SCP-167: observer calls leave_context with admin's DID — returns
+    /// SCP-167: observer calls `leave_context` with admin's DID — returns
     /// authorization error.
     #[tokio::test]
     async fn leave_observer_cannot_remove_admin() {
@@ -1346,7 +1353,7 @@ mod tests {
         assert!(manager.is_member("auth-ctx", "did:key:creator").await);
     }
 
-    /// SCP-167: admin calls leave_context with observer's DID — succeeds
+    /// SCP-167: admin calls `leave_context` with observer's DID — succeeds
     /// (admin has `MemberRemove` capability).
     #[tokio::test]
     async fn leave_admin_can_remove_observer() {
@@ -1369,7 +1376,7 @@ mod tests {
         assert!(manager.is_member("auth-ctx", "did:key:creator").await);
     }
 
-    /// SCP-167: member calls leave_context with own DID — succeeds
+    /// SCP-167: member calls `leave_context` with own DID — succeeds
     /// (self-removal is always allowed regardless of role).
     #[tokio::test]
     async fn leave_self_removal_always_allowed() {
@@ -1600,7 +1607,6 @@ mod tests {
             join_handles.push(tokio::spawn(async move {
                 mgr.send_message(&h, &"did:key:creator".into(), &[i])
                     .await
-                    .map(|()| ())
             }));
         }
 

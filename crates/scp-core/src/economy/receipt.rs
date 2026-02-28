@@ -75,6 +75,7 @@ pub struct ReceiptFilter {
 ///
 /// Corresponds to the SDK surface `SCP.Economy.paymentHistory(context)`
 /// (spec section 19.11).
+#[must_use] 
 pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<PaymentReceipt> {
     let mut receipts = Vec::new();
 
@@ -91,26 +92,22 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
 
         // Apply optional filter.
         if let Some(f) = filter {
-            if let Some(ref payer) = f.payer {
-                if receipt.payer.as_ref() != payer.as_str() {
+            if let Some(ref payer) = f.payer
+                && receipt.payer.as_ref() != payer.as_str() {
                     continue;
                 }
-            }
-            if let Some(ref payee) = f.payee {
-                if receipt.payee.as_ref() != payee.as_str() {
+            if let Some(ref payee) = f.payee
+                && receipt.payee.as_ref() != payee.as_str() {
                     continue;
                 }
-            }
-            if let Some(after) = f.after_timestamp {
-                if receipt.timestamp < after {
+            if let Some(after) = f.after_timestamp
+                && receipt.timestamp < after {
                     continue;
                 }
-            }
-            if let Some(before) = f.before_timestamp {
-                if receipt.timestamp > before {
+            if let Some(before) = f.before_timestamp
+                && receipt.timestamp > before {
                     continue;
                 }
-            }
         }
 
         receipts.push(receipt);
@@ -124,7 +121,12 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names,
+)]
 mod tests {
     use super::*;
     use crate::economy::types::{Amount, CurrencyCode, PaidActionType};

@@ -4,7 +4,7 @@
 //! before execution. This module provides a configurable allowlist that
 //! restricts subprocess spawning to known MCP server runtimes.
 //!
-//! The allowlist is a process-global singleton. All FFI layers (PyO3, UniFFI,
+//! The allowlist is a process-global singleton. All FFI layers (`PyO3`, `UniFFI`,
 //! wasm-bindgen) delegate to these functions.
 //!
 //! # Default allowed binaries
@@ -122,7 +122,7 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
 /// Uses [`BTreeSet`] so entries are always sorted — no per-query sorting
 /// needed for error messages or state snapshots.
 struct StdioAllowlist {
-    /// Allowed binary basenames (sorted by BTreeSet invariant).
+    /// Allowed binary basenames (sorted by `BTreeSet` invariant).
     allowed: BTreeSet<String>,
     /// If true, bypass the allowlist entirely.
     unrestricted: bool,
@@ -248,10 +248,11 @@ pub fn configure(additional_binaries: &[impl AsRef<str>]) -> Result<(), Allowlis
         validate_entry(name.as_ref())?;
     }
 
-    let mut guard = lock()?;
-
-    for name in additional_binaries {
-        guard.allowed.insert(name.as_ref().to_owned());
+    {
+        let mut guard = lock()?;
+        for name in additional_binaries {
+            guard.allowed.insert(name.as_ref().to_owned());
+        }
     }
 
     Ok(())
@@ -266,8 +267,7 @@ pub fn configure(additional_binaries: &[impl AsRef<str>]) -> Result<(), Allowlis
 ///
 /// Returns [`AllowlistError::LockPoisoned`] if the lock is poisoned.
 pub fn disable_enforcement() -> Result<(), AllowlistError> {
-    let mut guard = lock()?;
-    guard.unrestricted = true;
+    lock()?.unrestricted = true;
     Ok(())
 }
 
@@ -280,8 +280,7 @@ pub fn disable_enforcement() -> Result<(), AllowlistError> {
 ///
 /// Returns [`AllowlistError::LockPoisoned`] if the lock is poisoned.
 pub fn reset() -> Result<(), AllowlistError> {
-    let mut guard = lock()?;
-    *guard = StdioAllowlist::default_list();
+    *lock()? = StdioAllowlist::default_list();
     Ok(())
 }
 
@@ -305,7 +304,7 @@ pub fn get_state() -> Result<AllowlistState, AllowlistError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -314,7 +313,7 @@ mod tests {
     // serializes those tests without adding a crate dependency.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
     fn lock_allowlist() -> std::sync::MutexGuard<'static, ()> {
-        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset().unwrap();
         guard
     }

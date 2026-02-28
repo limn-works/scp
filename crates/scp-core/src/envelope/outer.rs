@@ -303,13 +303,11 @@ fn verify_sender_in_group(group: &ScpMlsGroup, sender_did: &str) -> Result<(), E
         .map_err(|e| EnvelopeError::MlsDecryptionFailed(e.to_string()))?;
 
     for member in &members {
-        if let Ok(basic_cred) = BasicCredential::try_from(member.credential.clone()) {
-            if let Ok(scp_cred) = ScpCredential::from_bytes(basic_cred.identity()) {
-                if scp_cred.did == sender_did {
+        if let Ok(basic_cred) = BasicCredential::try_from(member.credential.clone())
+            && let Ok(scp_cred) = ScpCredential::from_bytes(basic_cred.identity())
+                && scp_cred.did == sender_did {
                     return Ok(());
                 }
-            }
-        }
     }
 
     Err(EnvelopeError::UnknownSender(sender_did.to_owned()))
@@ -740,7 +738,7 @@ mod seal_open_tests {
         );
     }
 
-    /// SCP-177: Verifies that open_envelope rejects an inner envelope signed
+    /// SCP-177: Verifies that `open_envelope` rejects an inner envelope signed
     /// by a key different from the MLS group member's signing key.
     #[tokio::test]
     async fn open_envelope_rejects_wrong_signing_key() {
@@ -917,7 +915,7 @@ mod seal_open_tests {
         assert_eq!(stripped, b"internally resolved key test");
     }
 
-    /// SCP-177 AC: sender_id not in group returns UnknownSender error.
+    /// SCP-177 AC: `sender_id` not in group returns `UnknownSender` error.
     #[tokio::test]
     async fn open_envelope_rejects_unknown_sender_did() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
@@ -976,9 +974,9 @@ mod seal_open_tests {
     // sender key layer tests
     // -----------------------------------------------------------------------
 
-    /// Confirms that ciphertext produced by seal_envelope cannot be opened
+    /// Confirms that ciphertext produced by `seal_envelope` cannot be opened
     /// without the correct sender key, even if MLS decryption succeeds.
-    /// Using the wrong sender key must yield SenderKeyDecryptionFailed.
+    /// Using the wrong sender key must yield `SenderKeyDecryptionFailed`.
     #[tokio::test]
     async fn open_envelope_rejects_wrong_sender_key() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();

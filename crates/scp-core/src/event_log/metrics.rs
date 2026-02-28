@@ -579,7 +579,7 @@ mod tests {
             tree::append(&mut log, &event).unwrap();
             let leaf_hash: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
+                h.update([0x00]);
                 h.update(&serialized);
                 h.finalize().into()
             };

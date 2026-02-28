@@ -119,7 +119,7 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
             let ceiling_strings = ceiling
                 .capabilities
                 .iter()
-                .map(|c| c.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<HashSet<String>>();
             let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
                 .map_err(|e| {

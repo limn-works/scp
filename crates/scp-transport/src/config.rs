@@ -139,6 +139,13 @@ impl TransportConfig {
 /// [`ResolveRelays::resolve`] to ensure the trait is dyn-compatible.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// A boxed async function that takes a `&str` and returns an `Option<String>`.
+///
+/// Used for the `.well-known/scp` fetcher callback in
+/// [`DefaultRelayResolver`]. Extracted as a type alias to satisfy
+/// `clippy::type_complexity`.
+type WellKnownFetcher = Box<dyn Fn(&str) -> BoxFuture<'static, Option<String>> + Send + Sync>;
+
 /// Trait for resolving relay URLs at transport initialization.
 ///
 /// Implementations follow the bootstrap priority chain in spec section 18.5.1.
@@ -207,8 +214,7 @@ pub struct DefaultRelayResolver {
     ///
     /// Receives the bootstrap domain and returns the relay URL extracted
     /// from the `.well-known/scp` JSON document.
-    well_known_fetcher:
-        Option<Box<dyn Fn(&str) -> BoxFuture<'static, Option<String>> + Send + Sync>>,
+    well_known_fetcher: Option<WellKnownFetcher>,
 
     /// Optional callback to discover relays from peers in shared contexts
     /// (level 4).
@@ -252,7 +258,7 @@ impl DefaultRelayResolver {
     #[must_use]
     pub fn with_well_known_fetcher(
         mut self,
-        fetcher: Box<dyn Fn(&str) -> BoxFuture<'static, Option<String>> + Send + Sync>,
+        fetcher: WellKnownFetcher,
     ) -> Self {
         self.well_known_fetcher = Some(fetcher);
         self

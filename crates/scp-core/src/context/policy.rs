@@ -75,7 +75,7 @@ pub struct RateLimit {
 impl RateLimit {
     /// Creates a rate limit of `count` auto-accepts per hour.
     #[must_use]
-    pub fn per_hour(count: u32) -> Self {
+    pub const fn per_hour(count: u32) -> Self {
         Self {
             max_count: count,
             window: Duration::from_secs(3600),
@@ -139,7 +139,7 @@ pub fn has_tool_capabilities(params: &ContextParams) -> bool {
 /// with economic policy requiring payment. See
 /// `.docs/specs/19-economic-governance.md` section 19.3, 19.14.
 #[must_use]
-pub fn requires_payment(params: &ContextParams) -> bool {
+pub const fn requires_payment(params: &ContextParams) -> bool {
     let Some(ref econ) = params.economic_policy else {
         return false;
     };

@@ -151,7 +151,7 @@ mod tests {
         }
     }"#;
 
-    /// JSON with no relay_config at all.
+    /// JSON with no `relay_config` at all.
     const WELL_KNOWN_MINIMAL: &str = r#"{
         "version": 1,
         "did": "did:dht:z6Mk...",

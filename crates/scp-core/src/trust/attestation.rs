@@ -538,7 +538,12 @@ fn compute_independence_score(attestors: &[&AttestorInfo]) -> f64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_arguments,
+)]
 mod tests {
     use std::collections::HashMap;
 

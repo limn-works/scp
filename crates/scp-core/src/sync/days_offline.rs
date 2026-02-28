@@ -327,13 +327,13 @@ pub enum DaysOfflineError {
         actual: ContextId,
     },
 
-    /// The delta cannot be applied because the from_sequence does not match
+    /// The delta cannot be applied because the `from_sequence` does not match
     /// the local snapshot's sequence.
     #[error("delta sequence mismatch: expected from_sequence {expected}, got {actual}")]
     DeltaSequenceMismatch {
-        /// Expected from_sequence (local snapshot sequence).
+        /// Expected `from_sequence` (local snapshot sequence).
         expected: u64,
-        /// Actual from_sequence in the delta.
+        /// Actual `from_sequence` in the delta.
         actual: u64,
     },
 
@@ -404,7 +404,7 @@ pub trait DeltaSyncEngine: Send + Sync {
     ///
     /// The provider computes the delta between `from_sequence` and the
     /// latest snapshot. Returns `None` if the provider cannot compute the
-    /// delta (e.g., the from_sequence snapshot has been pruned).
+    /// delta (e.g., the `from_sequence` snapshot has been pruned).
     async fn fetch_delta(
         &self,
         context_id: &str,
@@ -451,11 +451,10 @@ pub fn compute_delta(
 
     // Members who joined (in new but not in old)
     for did in &new_dids {
-        if !old_dids.contains(did) {
-            if let Some(entry) = new.members.get(*did) {
+        if !old_dids.contains(did)
+            && let Some(entry) = new.members.get(*did) {
                 membership_changes.push(MembershipChange::Joined(entry.clone()));
             }
-        }
     }
 
     // Members who left (in old but not in new)
@@ -469,15 +468,14 @@ pub fn compute_delta(
 
     // Members whose role changed (in both, but different role)
     for did in old_dids.intersection(&new_dids) {
-        if let (Some(old_entry), Some(new_entry)) = (old.members.get(*did), new.members.get(*did)) {
-            if old_entry.role_name != new_entry.role_name {
+        if let (Some(old_entry), Some(new_entry)) = (old.members.get(*did), new.members.get(*did))
+            && old_entry.role_name != new_entry.role_name {
                 membership_changes.push(MembershipChange::RoleChanged {
                     did: DID::from(*did),
                     old_role: old_entry.role_name.clone(),
                     new_role: new_entry.role_name.clone(),
                 });
             }
-        }
     }
 
     // Role definition changes
@@ -588,7 +586,7 @@ pub fn apply_delta(
             }
             MembershipChange::RoleChanged { did, new_role, .. } => {
                 if let Some(entry) = local_state.members.get_mut(&did.0) {
-                    entry.role_name = new_role.clone();
+                    entry.role_name.clone_from(new_role);
                 }
             }
         }
@@ -640,9 +638,8 @@ pub fn apply_delta(
 ///
 /// See ADR-029 section 3 (MLS Epoch Catch-Up).
 #[must_use]
-pub fn determine_mls_recovery(delta: &SnapshotDelta) -> MlsRecoveryAction {
+pub const fn determine_mls_recovery(delta: &SnapshotDelta) -> MlsRecoveryAction {
     match (delta.from_epoch, delta.to_epoch) {
-        (None, None) => MlsRecoveryAction::NoAction,
         (Some(from), Some(to)) if from == to => MlsRecoveryAction::NoAction,
         (Some(from), Some(to)) => {
             let gap = to.saturating_sub(from);
@@ -658,8 +655,8 @@ pub fn determine_mls_recovery(delta: &SnapshotDelta) -> MlsRecoveryAction {
                 }
             }
         }
-        // Mismatched None/Some — one side is broadcast, the other is not.
-        // This is an anomalous state; treat as no action (caller handles).
+        // (None, None) = broadcast context, or mismatched None/Some —
+        // anomalous state; treat as no action (caller handles).
         _ => MlsRecoveryAction::NoAction,
     }
 }

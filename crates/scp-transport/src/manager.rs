@@ -229,7 +229,7 @@ impl TransportManager {
         let relay_indices = self
             .relay_assignments
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(context_id)
             .ok_or_else(|| {
                 TransportError::SendFailed(format!(
@@ -369,7 +369,7 @@ impl TransportManager {
         let relay_indices = self
             .relay_assignments
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(context_id)
             .ok_or_else(|| {
                 TransportError::SubscriptionFailed(format!(
@@ -516,12 +516,12 @@ impl TransportManager {
         let scores = self
             .reliability_scores
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let assignments = self
             .relay_assignments
             .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let costs = self.relay_costs.read().unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let costs = self.relay_costs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut candidates: Vec<(usize, usize, f64, u64)> = (0..adapter_count)
             .map(|idx| {
                 let overlap = assignments
@@ -562,7 +562,7 @@ impl TransportManager {
 
         self.relay_assignments
             .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(context_id.clone(), assigned.clone());
 
         Ok(assigned)
@@ -573,7 +573,7 @@ impl TransportManager {
     pub fn get_relay_set(&self, context_id: &ContextId) -> Option<Vec<usize>> {
         self.relay_assignments
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(context_id)
             .cloned()
     }
@@ -586,7 +586,7 @@ impl TransportManager {
         let scores = self
             .reliability_scores
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         scores.get(&adapter_index.to_string()).cloned()
     }
 
@@ -601,7 +601,7 @@ impl TransportManager {
         let mut scores = self
             .reliability_scores
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         scoring::update_score(&mut scores, relay_url, outcome);
     }
 
@@ -613,7 +613,7 @@ impl TransportManager {
         let scores = self
             .reliability_scores
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         scores.get(relay_url).cloned()
     }
 
@@ -638,7 +638,7 @@ impl TransportManager {
     ///
     /// A cost of 0 or absence of a cost entry means the relay is free.
     pub fn set_relay_cost(&self, adapter_index: usize, cost: u64) {
-        let mut costs = self.relay_costs.write().unwrap_or_else(|e| e.into_inner());
+        let mut costs = self.relay_costs.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         costs.insert(adapter_index, cost);
     }
 
@@ -647,7 +647,7 @@ impl TransportManager {
     /// Returns `0` if no cost has been set (free relay).
     #[must_use]
     pub fn get_relay_cost(&self, adapter_index: usize) -> u64 {
-        let costs = self.relay_costs.read().unwrap_or_else(|e| e.into_inner());
+        let costs = self.relay_costs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         costs.get(&adapter_index).copied().unwrap_or(0)
     }
 }
@@ -1621,13 +1621,17 @@ mod tests {
         // We can't peek directly into the LRU, but we can verify via check_suppressions:
         // 2 out of 2 relays delivered => no warning.
         drop(tracker);
-        let mut tracker = manager.suppression_tracker.lock().unwrap();
+        #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64 until year 584556
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
             + 31_000; // simulate 31 seconds later
-        let warnings = tracker.check_suppressions(now_ms, 2);
+        let warnings = manager
+            .suppression_tracker
+            .lock()
+            .unwrap()
+            .check_suppressions(now_ms, 2);
         assert!(
             warnings.is_empty(),
             "no suppression warning expected when both adapters delivered; got {warnings:?}"
@@ -1689,13 +1693,17 @@ mod tests {
         // The suppression tracker should have 1 delivery from adapter 0 only.
         // With 4 total relays, threshold = ceil(4/2) = 2. Only 1 delivered
         // => 1 < 2 => warning should be emitted.
-        let mut tracker = manager.suppression_tracker.lock().unwrap();
+        #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64 until year 584556
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
             + 31_000;
-        let warnings = tracker.check_suppressions(now_ms, 4);
+        let warnings = manager
+            .suppression_tracker
+            .lock()
+            .unwrap()
+            .check_suppressions(now_ms, 4);
         assert_eq!(
             warnings.len(),
             1,

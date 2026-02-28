@@ -150,7 +150,7 @@ impl std::fmt::Display for OfflineTier {
 ///
 /// See ADR-029 section 1.
 #[must_use]
-pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTier {
+pub const fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTier {
     let duration_secs = now.saturating_sub(last_relay_contact);
     match duration_secs {
         0..=14_400 => OfflineTier::Short,

@@ -351,7 +351,13 @@ async fn void_on_failure<T, A: PaymentAdapter>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::struct_field_names,
+    clippy::similar_names,
+)]
 mod tests {
     use super::*;
     use crate::economy::adapter::{
@@ -386,7 +392,7 @@ mod tests {
     }
 
     impl PaymentAdapter for TestAdapter {
-        fn adapter_id(&self) -> &str {
+        fn adapter_id(&self) -> &'static str {
             "test"
         }
 

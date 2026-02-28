@@ -170,8 +170,7 @@ pub fn verify_sender_attribution(
     envelope_sender_did: &str,
 ) -> Result<(), SignalingError> {
     let claimed = match msg {
-        SignalingMessage::Offer(desc) => &desc.sender_did,
-        SignalingMessage::Answer(desc) => &desc.sender_did,
+        SignalingMessage::Offer(desc) | SignalingMessage::Answer(desc) => &desc.sender_did,
         SignalingMessage::IceCandidate(c) => &c.sender_did,
         // SessionEnd carries no sender DID -- nothing to verify.
         SignalingMessage::SessionEnd => return Ok(()),

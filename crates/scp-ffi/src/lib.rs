@@ -194,6 +194,7 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -208,9 +209,9 @@ mod tests {
     fn init_runtime_is_idempotent() {
         // Multiple calls should not panic or replace the runtime.
         init_runtime().ok();
-        let first = RUNTIME.get().map(|rt| rt as *const _);
+        let first = RUNTIME.get().map(std::ptr::from_ref);
         init_runtime().ok();
-        let second = RUNTIME.get().map(|rt| rt as *const _);
+        let second = RUNTIME.get().map(std::ptr::from_ref);
         assert_eq!(first, second);
     }
 

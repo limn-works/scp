@@ -527,7 +527,8 @@ pub fn claim_shadow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::single_char_pattern
+    clippy::single_char_pattern,
+    clippy::similar_names,
 )]
 mod tests {
     use std::time::Duration;

@@ -143,12 +143,10 @@ pub fn adjust_relay_price(
     // Clamp to [floor, cap].
     let clamped = new_price.max(config.floor.0).min(config.cap.0);
 
-    let direction = if clamped > current.0 {
-        PriceDirection::Increased
-    } else if clamped < current.0 {
-        PriceDirection::Decreased
-    } else {
-        PriceDirection::Unchanged
+    let direction = match clamped.cmp(&current.0) {
+        std::cmp::Ordering::Greater => PriceDirection::Increased,
+        std::cmp::Ordering::Less => PriceDirection::Decreased,
+        std::cmp::Ordering::Equal => PriceDirection::Unchanged,
     };
 
     RelayPriceAdjustment {

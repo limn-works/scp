@@ -182,10 +182,13 @@ pub fn py_event_log_query(
     let summary_event = PyEvent {
         event_type: "LogSummary".to_owned(),
         actor_did: String::new(),
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| ScpPyError::ContextError(format!("system clock error: {e}")))?
-            .as_secs() as f64,
+        #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
+        timestamp: {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| ScpPyError::ContextError(format!("system clock error: {e}")))?
+                .as_secs() as f64
+        },
         payload,
         sequence: event_count.saturating_sub(1),
     };
@@ -228,6 +231,7 @@ pub fn py_event_log_query(
 /// See ADR-013 §7: `py_event_log_verify(handle, claim) -> PyProof`.
 #[pyfunction]
 #[pyo3(name = "event_log_verify")]
+#[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
 pub fn py_event_log_verify(
     py: Python<'_>,
     context_id: &str,
@@ -251,7 +255,7 @@ pub fn py_event_log_verify(
         "inclusion" => {
             let leaf_index = claim_json
                 .get("leaf_index")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| {
                     ScpPyError::ValidationError(
                         "inclusion claim must include 'leaf_index' (integer)".to_owned(),

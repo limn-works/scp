@@ -21,7 +21,7 @@
 //! 1. Provides the correct opaque types ([`WasmIdentity`], [`WasmDIDDocument`])
 //!    that the TypeScript SDK wrapper consumes.
 //! 2. Returns typed errors signalling which operations require JS-side
-//!    implementation (WebCrypto for key ops, DHT HTTP gateway for resolution).
+//!    implementation (`WebCrypto` for key ops, DHT HTTP gateway for resolution).
 //! 3. Acts as the stable ABI boundary — the TypeScript wrapper implements the
 //!    actual protocol operations and stores results in these opaque handles.
 //!
@@ -75,6 +75,7 @@ pub struct WasmIdentity {
 #[wasm_bindgen]
 impl WasmIdentity {
     /// Returns the DID string for this identity.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn did(&self) -> String {
         self.did.clone()
@@ -83,6 +84,7 @@ impl WasmIdentity {
     /// Returns the custody type string for this identity.
     ///
     /// Always `"js_custody"` for browser targets.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "custodyType")]
     pub fn custody_type(&self) -> String {
         self.custody_type.clone()
@@ -91,7 +93,7 @@ impl WasmIdentity {
     /// Constructs a `WasmIdentity` from a DID string.
     ///
     /// Called by the TypeScript SDK after performing identity creation
-    /// operations via WebCrypto. The SDK is responsible for:
+    /// operations via `WebCrypto`. The SDK is responsible for:
     /// 1. Generating the Ed25519 keypairs via `SubtleCrypto.generateKey`.
     /// 2. Computing the `did:dht` string from the identity key public bytes.
     /// 3. Publishing the DID document to the DHT via HTTP gateway.
@@ -101,14 +103,14 @@ impl WasmIdentity {
     ///
     /// Returns `[SCP-IDENT-1000]` if the DID prefix is not `did:dht:`.
     #[wasm_bindgen(js_name = "fromDid")]
-    pub fn from_did(did: String) -> Result<WasmIdentity, JsError> {
+    pub fn from_did(did: String) -> Result<Self, JsError> {
         if !did.starts_with("did:dht:") {
             return Err(ScpWasmError::Identity(format!(
                 "unsupported DID method in {did:?} — only did:dht is supported"
             ))
             .into_js());
         }
-        Ok(WasmIdentity {
+        Ok(Self {
             did,
             custody_type: "js_custody".to_owned(),
         })
@@ -155,6 +157,7 @@ pub struct WasmDIDDocument {
 #[wasm_bindgen]
 impl WasmDIDDocument {
     /// Returns the DID string this document describes.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn id(&self) -> String {
         self.id.clone()
@@ -163,6 +166,7 @@ impl WasmDIDDocument {
     /// Returns the verification methods as a JSON string.
     ///
     /// Each object has `id`, `type`, `controller`, and `publicKeyMultibase`.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "verificationMethodsJson")]
     pub fn verification_methods_json(&self) -> String {
         self.verification_methods_json.clone()
@@ -171,24 +175,28 @@ impl WasmDIDDocument {
     /// Returns the service entries as a JSON string.
     ///
     /// Each object has `id`, `type`, and `serviceEndpoint`.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "servicesJson")]
     pub fn services_json(&self) -> String {
         self.services_json.clone()
     }
 
     /// Returns the `alsoKnownAs` entries as a JSON string.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "alsoKnownAsJson")]
     pub fn also_known_as_json(&self) -> String {
         self.also_known_as_json.clone()
     }
 
     /// Returns the authentication method references as a JSON string.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "authenticationJson")]
     pub fn authentication_json(&self) -> String {
         self.authentication_json.clone()
     }
 
     /// Returns the assertion method references as a JSON string.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "assertionMethodsJson")]
     pub fn assertion_methods_json(&self) -> String {
         self.assertion_methods_json.clone()
@@ -202,6 +210,7 @@ impl WasmDIDDocument {
     ///
     /// All parameters must be valid JSON strings. Validation is performed by
     /// the TypeScript SDK before calling this constructor.
+    #[must_use]
     #[allow(clippy::too_many_arguments)]
     #[wasm_bindgen(js_name = "fromFields")]
     pub fn from_fields(
@@ -211,8 +220,8 @@ impl WasmDIDDocument {
         also_known_as_json: String,
         authentication_json: String,
         assertion_methods_json: String,
-    ) -> WasmDIDDocument {
-        WasmDIDDocument {
+    ) -> Self {
+        Self {
             id,
             verification_methods_json,
             services_json,

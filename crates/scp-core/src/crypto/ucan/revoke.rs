@@ -368,7 +368,7 @@ pub fn revoke_ucan(
     authorizer.authorize_revocation(&token_cid, revoker_did)?;
 
     // Step 3: Mark as RevocationPending (fail-closed).
-    revocation_list.mark_pending(token_cid.to_owned());
+    revocation_list.mark_pending(token_cid.clone());
 
     // Step 4: Distribute via MLS. On failure, roll back.
     let context_id = revocation_list.context_id().to_owned();

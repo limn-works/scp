@@ -28,6 +28,7 @@ use crate::error::ScpPyError;
 ///
 /// Used across the bridge for Merkle roots, token CIDs, nonces, and proof
 /// details. Centralised here to avoid duplicating the fold pattern.
+#[must_use] 
 pub fn encode_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

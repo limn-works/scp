@@ -2,9 +2,9 @@
 //!
 //! Tests the four scenarios specified in section 18.7, 18.8, and ADR-032:
 //!
-//! 1. ApplicationNode starts -> DID published -> .well-known/scp reachable -> relay accepts connections
+//! 1. `ApplicationNode` starts -> DID published -> .well-known/scp reachable -> relay accepts connections
 //! 2. Client discovers relay via .well-known/scp -> connects -> subscribes
-//! 3. Client discovers operator DID -> finds SCPRelay service entry -> connects
+//! 3. Client discovers operator DID -> finds `SCPRelay` service entry -> connects
 //! 4. scp:// URI roundtrip through creation and parsing
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

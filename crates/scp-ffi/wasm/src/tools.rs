@@ -60,12 +60,14 @@ pub struct WasmToolVerificationResult {
 #[wasm_bindgen]
 impl WasmToolVerificationResult {
     /// Returns the verified tool's ID.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "toolId")]
     pub fn tool_id(&self) -> String {
         self.tool_id.clone()
     }
 
     /// Returns `true` if all test vectors passed.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn passed(&self) -> bool {
         self.passed
@@ -75,6 +77,7 @@ impl WasmToolVerificationResult {
     ///
     /// The TypeScript SDK parses this with `JSON.parse()` to obtain
     /// `string[]`.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "failuresJson")]
     pub fn failures_json(&self) -> String {
         self.failures_json.clone()

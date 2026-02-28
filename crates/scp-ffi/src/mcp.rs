@@ -161,6 +161,7 @@ impl McpTransport for StdioClientTransport {
             .reader
             .read_line(&mut line)
             .map_err(|e| format!("failed to read from subprocess stdout: {e}"))?;
+        drop(inner);
 
         if bytes_read == 0 {
             return Err("subprocess closed stdout (EOF)".to_owned());
@@ -189,6 +190,7 @@ impl McpTransport for StdioClientTransport {
             .writer
             .flush()
             .map_err(|e| format!("failed to flush notification: {e}"))?;
+        drop(inner);
 
         Ok(())
     }
@@ -346,7 +348,13 @@ impl SseClientTransport {
     }
 }
 
+/// Maximum number of SSE events to scan for a matching JSON-RPC response.
+/// If exceeded, the request fails. The TCP read timeout (30s) handles
+/// individual read stalls; this bounds total non-matching events tolerated.
+const MAX_SSE_EVENTS: usize = 1000;
+
 impl McpTransport for SseClientTransport {
+    #[allow(clippy::significant_drop_tightening)] // sse_reader MutexGuard is borrowed by reader across the entire loop.
     fn send_request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, String> {
         // Parse the POST URL.
         let (host, port, path) = parse_http_url(&self.post_url)?;
@@ -395,10 +403,6 @@ impl McpTransport for SseClientTransport {
         let reader = sse_reader.as_mut().ok_or("SSE connection is closed")?;
 
         // Read SSE events until we find a `message` event with our response.
-        // Bounded to prevent a misbehaving server from consuming resources
-        // indefinitely. The TCP read timeout (30s) handles individual reads;
-        // this bounds the total number of non-matching events we'll tolerate.
-        const MAX_SSE_EVENTS: usize = 1000;
         for _ in 0..MAX_SSE_EVENTS {
             let mut line = String::new();
             let n = reader
@@ -512,6 +516,10 @@ impl McpTransport for ClientTransport {
     fn send_request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, String> {
         match self {
             Self::Stdio(t) => t.send_request(request),
+            // Each variant dispatches to its own McpTransport impl with distinct
+            // I/O behavior (subprocess stdio vs. HTTP SSE). Arms look identical
+            // syntactically but resolve to different concrete implementations.
+            #[allow(clippy::match_same_arms)]
             Self::Sse(t) => t.send_request(request),
         }
     }
@@ -519,6 +527,7 @@ impl McpTransport for ClientTransport {
     fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
         match self {
             Self::Stdio(t) => t.send_notification(notification),
+            #[allow(clippy::match_same_arms)]
             Self::Sse(t) => t.send_notification(notification),
         }
     }
@@ -748,6 +757,8 @@ fn generate_handle_id(prefix: &str) -> String {
 /// See ADR-015: MCP server with context namespace mapping.
 #[pyfunction]
 #[pyo3(name = "py_mcp_serve")]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
+#[allow(clippy::too_many_lines)] // MCP server startup with stdio/SSE transport dispatch is inherently verbose.
 pub fn py_mcp_serve(
     identity_did: &str,
     context_ids: Vec<String>,
@@ -796,7 +807,9 @@ pub fn py_mcp_serve(
                     _ = shutdown_rx => {
                         // Shutdown signal received -- exit cleanly.
                     }
-                    _ = async {
+                    () = async {
+                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
                         // The real `run_stdio` takes &mut McpServer by value.
                         // We need to run it with our Arc<Mutex> server.
                         // Since `run_stdio` processes stdin line by line, we
@@ -806,14 +819,11 @@ pub fn py_mcp_serve(
                         let mut reader = tokio::io::BufReader::new(stdin);
                         let mut line = String::new();
 
-                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
                         loop {
                             line.clear();
                             match reader.read_line(&mut line).await {
-                                Ok(0) => break, // EOF
+                                Ok(0) | Err(_) => break, // EOF or read error
                                 Ok(_) => {}
-                                Err(_) => break,
                             }
 
                             let trimmed = line.trim();
@@ -827,11 +837,9 @@ pub fn py_mcp_serve(
                                     serde_json::from_str(trimmed);
                                 match request {
                                     Ok(req) => {
-                                        if let Ok(mut srv) = server_clone.lock() {
-                                            srv.handle_request(&req)
-                                        } else {
-                                            None
-                                        }
+                                        server_clone
+                                            .lock()
+                                            .map_or(None, |mut srv| srv.handle_request(&req))
                                     }
                                     Err(e) => {
                                         Some(scp_mcp::protocol::JsonRpcResponse::error(
@@ -846,13 +854,12 @@ pub fn py_mcp_serve(
                                 }
                             };
 
-                            if let Some(resp) = response {
-                                if let Ok(json) = serde_json::to_string(&resp) {
+                            if let Some(resp) = response
+                                && let Ok(json) = serde_json::to_string(&resp) {
                                     let _ = stdout.write_all(json.as_bytes()).await;
                                     let _ = stdout.write_all(b"\n").await;
                                     let _ = stdout.flush().await;
                                 }
-                            }
                         }
                     } => {}
                 }
@@ -934,6 +941,7 @@ pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
     if let Some(tx) = entry.shutdown_tx.take() {
         let _ = tx.send(());
     }
+    drop(entry);
 
     Ok(())
 }
@@ -1005,6 +1013,7 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 /// MCP initialize handshake fails.
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_connect_stdio")]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
 pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
     if command.is_empty() {
         return Err(
@@ -1263,7 +1272,7 @@ pub fn py_mcp_client_invoke(
 /// Raises `TransportError` if the relay query fails.
 #[pyfunction]
 #[pyo3(name = "py_mcp_load_contexts")]
-pub fn py_mcp_load_contexts(_identity_did: &str, _relay_url: &str) -> PyResult<Vec<PyObject>> {
+pub const fn py_mcp_load_contexts(_identity_did: &str, _relay_url: &str) -> PyResult<Vec<PyObject>> {
     // Context discovery requires a live relay connection which is wired via
     // the transport layer (scp-transport). Since relay connections are managed
     // separately from MCP, this function returns an empty list when no relay
@@ -1281,6 +1290,7 @@ pub fn py_mcp_load_contexts(_identity_did: &str, _relay_url: &str) -> PyResult<V
 /// Input-validation errors map to `ValidationError`. Runtime/policy errors
 /// map to `TransportError`. Exhaustive match ensures new variants produce
 /// a compile error instead of silently falling through.
+#[allow(clippy::needless_pass_by_value)] // match on e consumes variants carrying String data.
 fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
     use scp_mcp::allowlist::AllowlistError;
     let msg = e.to_string();
@@ -1316,6 +1326,7 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
 /// Raises `TransportError` if the allowlist lock is poisoned.
 #[pyfunction]
 #[pyo3(name = "py_mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![]))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
 pub fn py_mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> PyResult<()> {
     allowlist::configure(&additional_binaries).map_err(allowlist_err)?;
     Ok(())

@@ -235,7 +235,7 @@ impl CheckpointManager {
     /// Creates a new checkpoint manager with the given policy and initial
     /// timestamp.
     #[must_use]
-    pub fn new(policy: CheckpointPolicy, initial_timestamp: u64) -> Self {
+    pub const fn new(policy: CheckpointPolicy, initial_timestamp: u64) -> Self {
         Self {
             policy,
             events_since_last: 0,
@@ -269,7 +269,7 @@ impl CheckpointManager {
     }
 
     /// Records that an event was appended to the log.
-    pub fn record_event(&mut self) {
+    pub const fn record_event(&mut self) {
         self.events_since_last += 1;
     }
 
@@ -284,7 +284,7 @@ impl CheckpointManager {
     /// interval overrides the minimum event threshold to ensure checkpoints
     /// are created even in very low-activity contexts.
     #[must_use]
-    pub fn is_checkpoint_due(&self, current_timestamp: u64) -> bool {
+    pub const fn is_checkpoint_due(&self, current_timestamp: u64) -> bool {
         let elapsed = current_timestamp.saturating_sub(self.last_checkpoint_timestamp);
         let time_due = elapsed >= self.policy.time_interval_secs;
         let event_due = self.events_since_last >= self.policy.event_interval;
@@ -449,7 +449,7 @@ pub struct CheckpointedProof {
 pub struct TruncatedEventLog {
     /// The checkpoint that serves as the pruning boundary.
     checkpoint: ConsistencyCheckpoint,
-    /// Leaf hashes for events 0..checkpoint.event_count (pruned region).
+    /// Leaf hashes for events `0..checkpoint.event_count` (pruned region).
     /// These are retained so proof paths can still be computed.
     pruned_leaf_hashes: Vec<[u8; 32]>,
     /// Interior tree layers for the pruned region. Retained for proof
@@ -458,7 +458,7 @@ pub struct TruncatedEventLog {
     /// The live event log containing only post-checkpoint events.
     /// This is a full `EventLog` with its own Merkle tree.
     tail_log: EventLog,
-    /// The number of events in the pruned region (== checkpoint.event_count).
+    /// The number of events in the pruned region (== `checkpoint.event_count`).
     pruned_event_count: u64,
 }
 
@@ -521,7 +521,7 @@ impl TruncatedEventLog {
 
     /// Returns the total event count (pruned + tail).
     #[must_use]
-    pub fn total_event_count(&self) -> u64 {
+    pub const fn total_event_count(&self) -> u64 {
         self.pruned_event_count + tree::event_count(&self.tail_log)
     }
 
@@ -533,7 +533,7 @@ impl TruncatedEventLog {
 
     /// Returns the number of live (post-checkpoint) events.
     #[must_use]
-    pub fn tail_event_count(&self) -> u64 {
+    pub const fn tail_event_count(&self) -> u64 {
         tree::event_count(&self.tail_log)
     }
 
@@ -1027,11 +1027,10 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     }
 
     let layers = recompute_tree_from_leaves(leaves);
-    if let Some(top) = layers.last() {
-        if top.len() == 1 {
+    if let Some(top) = layers.last()
+        && top.len() == 1 {
             return top[0];
         }
-    }
 
     [0u8; 32]
 }
@@ -1041,7 +1040,7 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
 /// RFC 6962 Section 2.1 interior node hash function with domain separation.
 fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(&[0x01]);
+    hasher.update([0x01]);
     hasher.update(left);
     hasher.update(right);
     hasher.finalize().into()
@@ -1099,7 +1098,12 @@ fn current_timestamp() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::needless_range_loop,
+)]
 mod tests {
     use ed25519_dalek::{Signer, Verifier};
     use sha2::{Digest, Sha256};
@@ -1229,8 +1233,8 @@ mod tests {
             tree::append(&mut log, &event).unwrap();
             let leaf_hash: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
-                h.update(&rmp_serde::to_vec(&event).unwrap());
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event).unwrap());
                 h.finalize().into()
             };
             leaf_hashes.push(leaf_hash);
@@ -1262,8 +1266,8 @@ mod tests {
             tree::append(&mut log_b, &event).unwrap();
             let leaf_hash: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
-                h.update(&rmp_serde::to_vec(&event).unwrap());
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event).unwrap());
                 h.finalize().into()
             };
             prev_hash = leaf_hash;
@@ -1386,8 +1390,8 @@ mod tests {
             tree::append(&mut log_a, &event_a).unwrap();
             let leaf_hash_a: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
-                h.update(&rmp_serde::to_vec(&event_a).unwrap());
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event_a).unwrap());
                 h.finalize().into()
             };
             prev_hash_a = leaf_hash_a;
@@ -1404,8 +1408,8 @@ mod tests {
             tree::append(&mut log_b, &event_b).unwrap();
             let leaf_hash_b: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
-                h.update(&rmp_serde::to_vec(&event_b).unwrap());
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event_b).unwrap());
                 h.finalize().into()
             };
             prev_hash_b = leaf_hash_b;
@@ -1458,8 +1462,8 @@ mod tests {
             }
             let leaf_hash: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
-                h.update(&rmp_serde::to_vec(&event).unwrap());
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event).unwrap());
                 h.finalize().into()
             };
             prev_hash = leaf_hash;
@@ -1505,8 +1509,8 @@ mod tests {
             }
             let leaf_hash: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
-                h.update(&rmp_serde::to_vec(&event).unwrap());
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event).unwrap());
                 h.finalize().into()
             };
             prev_hash = leaf_hash;
@@ -1724,8 +1728,8 @@ mod tests {
             tree::append(&mut log_a, &event_a).unwrap();
             let h_a: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
-                h.update(&rmp_serde::to_vec(&event_a).unwrap());
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event_a).unwrap());
                 h.finalize().into()
             };
             prev_a = h_a;
@@ -1742,8 +1746,8 @@ mod tests {
             tree::append(&mut log_b, &event_b).unwrap();
             let h_b: [u8; 32] = {
                 let mut h = Sha256::new();
-                h.update(&[0x00]);
-                h.update(&rmp_serde::to_vec(&event_b).unwrap());
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event_b).unwrap());
                 h.finalize().into()
             };
             prev_b = h_b;

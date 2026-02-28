@@ -505,7 +505,12 @@ impl PaymentAdapter for TestAdapter {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names
+)]
 mod tests {
     use super::*;
     use scp_core::economy::{
@@ -808,7 +813,7 @@ mod tests {
         let adapter = TestAdapter::new();
         adapter.seed_balance(payer_did(), Amount::new(500), CurrencyCode::from("USD"));
 
-        let clone = adapter.clone();
+        let clone = adapter;
         assert_eq!(
             clone.available_balance(&payer_did(), &CurrencyCode::from("USD")),
             Amount::new(500)

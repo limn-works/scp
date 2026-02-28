@@ -161,24 +161,23 @@ impl UnanimityEngine {
             return Ok((proposal.status.clone(), Vec::new()));
         }
 
-        match self.evaluate_resolution(proposal, now) {
-            Some(new_status) => {
-                // Transition the proposal.
-                let proposal_mut = self.proposals.get_mut(proposal_id).expect("just looked up");
-                proposal_mut.status = new_status.clone();
+        let Some(new_status) = self.evaluate_resolution(proposal, now) else {
+            // Still pending, no events.
+            return Ok((ProposalStatus::Pending, Vec::new()));
+        };
 
-                let events = vec![GovernanceEvent::ProposalResolved {
-                    proposal_id: *proposal_id,
-                    status: new_status.clone(),
-                }];
-
-                Ok((new_status, events))
-            }
-            None => {
-                // Still pending, no events.
-                Ok((ProposalStatus::Pending, Vec::new()))
-            }
+        // Transition the proposal. Key is guaranteed present because we
+        // just looked it up via `get()` above and hold `&mut self`.
+        if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
+            proposal_mut.status = new_status.clone();
         }
+
+        let events = vec![GovernanceEvent::ProposalResolved {
+            proposal_id: *proposal_id,
+            status: new_status.clone(),
+        }];
+
+        Ok((new_status, events))
     }
 }
 
@@ -255,12 +254,13 @@ impl GovernanceEngine for UnanimityEngine {
         let (status, resolve_events) = self.resolve_proposal(&proposal_id, context.now)?;
         events.extend(resolve_events);
 
-        // Re-fetch proposal after possible status change.
-        let proposal = self
-            .proposals
-            .get(&proposal_id)
-            .expect("just inserted")
-            .clone();
+        // Re-fetch proposal after possible status change. Key is guaranteed
+        // present because we inserted it above and hold `&mut self`.
+        let Some(proposal) = self.proposals.get(&proposal_id).cloned() else {
+            return Err(GovernanceError::ProposalNotFound {
+                id: hex_encode(&proposal_id),
+            });
+        };
 
         debug_assert!(
             proposal.status == status,
@@ -317,8 +317,10 @@ impl GovernanceEngine for UnanimityEngine {
             signature: Vec::new(),
         };
 
-        let proposal_mut = self.proposals.get_mut(proposal_id).expect("just looked up");
-        proposal_mut.approvals.push(vote);
+        // Key is guaranteed present because we just looked it up via `get()` above.
+        if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
+            proposal_mut.approvals.push(vote);
+        }
 
         let mut events = vec![GovernanceEvent::VoteCast {
             proposal_id: *proposal_id,
@@ -380,8 +382,10 @@ impl GovernanceEngine for UnanimityEngine {
             signature: Vec::new(),
         };
 
-        let proposal_mut = self.proposals.get_mut(proposal_id).expect("just looked up");
-        proposal_mut.rejections.push(vote);
+        // Key is guaranteed present because we just looked it up via `get()` above.
+        if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
+            proposal_mut.rejections.push(vote);
+        }
 
         let mut events = vec![GovernanceEvent::VoteCast {
             proposal_id: *proposal_id,
@@ -437,10 +441,12 @@ impl GovernanceEngine for UnanimityEngine {
             ));
         }
 
-        // Remove the vote from whichever list it's in.
-        let proposal_mut = self.proposals.get_mut(proposal_id).expect("just looked up");
-        proposal_mut.approvals.retain(|v| v.voter_did != *voter);
-        proposal_mut.rejections.retain(|v| v.voter_did != *voter);
+        // Remove the vote from whichever list it's in. Key is guaranteed
+        // present because we just looked it up via `get()` above.
+        if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
+            proposal_mut.approvals.retain(|v| v.voter_did != *voter);
+            proposal_mut.rejections.retain(|v| v.voter_did != *voter);
+        }
 
         // Withdrawal does not trigger resolution -- voter may re-vote.
         Ok((ProposalStatus::Pending, Vec::new()))

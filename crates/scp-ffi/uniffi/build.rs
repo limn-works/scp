@@ -1,6 +1,6 @@
 //! Build script for `scp-ffi-uniffi`.
 //!
-//! Generates UniFFI scaffolding from the supplementary UDL file (`src/scp.udl`).
+//! Generates `UniFFI` scaffolding from the supplementary UDL file (`src/scp.udl`).
 //! The UDL defines the namespace anchor; all type exports are proc-macro-driven
 //! in `bridge.rs` and `lib.rs`.
 //!

@@ -80,7 +80,7 @@ pub enum MlsImpact {
 /// assert_eq!(classify_action(&close), MlsImpact::NoMlsChange);
 /// ```
 #[must_use]
-pub fn classify_action(action: &GovernanceAction) -> MlsImpact {
+pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
     match action {
         GovernanceAction::AddMember { .. } | GovernanceAction::RemoveMember { .. } => {
             MlsImpact::MembershipChange
@@ -209,7 +209,7 @@ pub struct CoordinationRecord {
 impl EpochCoordinator {
     /// Creates a new, empty coordinator.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             records: Vec::new(),
         }
@@ -263,7 +263,7 @@ impl EpochCoordinator {
 
     /// Returns the number of coordination records.
     #[must_use]
-    pub fn record_count(&self) -> usize {
+    pub const fn record_count(&self) -> usize {
         self.records.len()
     }
 }
@@ -347,11 +347,10 @@ pub fn check_consistency(
     }
 
     // Check epoch consistency if both are known.
-    if let (Some(expected), Some(actual)) = (expected_epoch, actual_epoch) {
-        if expected != actual {
+    if let (Some(expected), Some(actual)) = (expected_epoch, actual_epoch)
+        && expected != actual {
             issues.push(ConsistencyCheck::EpochMismatch { expected, actual });
         }
-    }
 
     issues
 }
@@ -392,7 +391,7 @@ pub fn proposals_invalidated_by_reset(
         .filter(|p| {
             p.status == ProposalStatus::Pending
                 && p.created_at_epoch
-                    .map_or(true, |epoch| epoch <= reset_epoch)
+                    .is_none_or(|epoch| epoch <= reset_epoch)
         })
         .map(|p| p.proposal_id)
         .collect()
@@ -409,7 +408,7 @@ pub fn proposals_invalidated_by_reset(
 /// full reset (epoch dropped below the proposal's creation epoch), which
 /// should not happen under normal operation.
 #[must_use]
-pub fn is_proposal_epoch_valid(proposal: &GovernanceProposal, context: &GovernanceContext) -> bool {
+pub const fn is_proposal_epoch_valid(proposal: &GovernanceProposal, context: &GovernanceContext) -> bool {
     match (proposal.created_at_epoch, context.current_epoch) {
         // Both epochs known: proposal is valid if current >= created.
         (Some(created), Some(current)) => current >= created,

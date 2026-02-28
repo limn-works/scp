@@ -81,7 +81,7 @@ impl<S: Storage> ProtocolStore<S> {
 
     /// Lists all configured adapter IDs for an identity.
     ///
-    /// Returns adapter_id strings extracted from the stored keys.
+    /// Returns `adapter_id` strings extracted from the stored keys.
     ///
     /// # Errors
     ///
@@ -163,7 +163,7 @@ impl<S: Storage> AdapterCredentialStore for ProtocolStore<S> {
     ) -> impl std::future::Future<Output = Result<Vec<String>, CredentialError>> + Send {
         let identity = identity.clone();
         async move {
-            ProtocolStore::list_adapter_credentials(self, &identity)
+            Self::list_adapter_credentials(self, &identity)
                 .await
                 .map_err(|e| CredentialError::StorageError(e.to_string()))
         }

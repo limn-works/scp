@@ -1,3 +1,10 @@
+#![allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::unused_async,
+    clippy::redundant_field_names,
+)]
 //! Phase 2 end-to-end integration test.
 //!
 //! Exercises all 5 Phase 2 ADRs together with the Phase 1 crypto stack:
@@ -140,7 +147,7 @@ fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
     // RFC 6962 §2.1 leaf domain separation: SHA-256(0x00 || serialized)
     let serialized = rmp_serde::to_vec(event).expect("serialize");
     let mut hasher = Sha256::new();
-    hasher.update(&[0x00]);
+    hasher.update([0x00]);
     hasher.update(&serialized);
     hasher.finalize().into()
 }

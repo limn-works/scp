@@ -240,6 +240,7 @@ impl<C: scp_core::identity::cache::Clock> NonceTrackerTrait for BridgeNonceTrack
 #[pyfunction]
 #[pyo3(name = "ucan_validate")]
 #[pyo3(signature = (context_id, token, capability, presenting_agent_did=None, proof_tokens=None))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for #[pyfunction] arguments.
 pub fn py_ucan_validate(
     context_id: &str,
     token: &str,
@@ -315,6 +316,7 @@ pub fn py_ucan_validate(
 /// See ADR-013 §6: `py_ucan_mint(handle, member_did, capabilities) -> PyUcanToken`.
 #[pyfunction]
 #[pyo3(name = "ucan_mint")]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
 pub fn py_ucan_mint(
     context_id: &str,
     member_did: &str,
@@ -350,6 +352,7 @@ pub fn py_ucan_mint(
         issuer: creator_did,
         audience: member_did.to_owned(),
         capabilities: capability_uris,
+        #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
         expires_at: Some(exp as f64),
     })
 }
@@ -417,7 +420,7 @@ fn generate_nonce() -> Result<String, ScpPyError> {
 
 /// Decodes a hex string to bytes.
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(format!("hex string has odd length: {}", hex.len()));
     }
 
@@ -496,7 +499,13 @@ pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // and nonce tracker adapter implementations.
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::iter_on_single_items,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
 
