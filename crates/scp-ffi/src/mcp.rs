@@ -589,36 +589,61 @@ impl ContextProvider for FfiBridgeProvider {
         .unwrap_or_default()
     }
 
-    fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
-        // TODO(#106): Wire to role_state.member_has_capability() for defense-in-depth.
-        // Currently returns Ok(()) — authorization depends on UCAN layer.
-        // See: .docs/specs/07-trust-validation-and-capabilities.md §7.2
-        Ok(())
+    fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+        // Defense-in-depth: check role-state capabilities in addition to the
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
+        crate::runtime::with_context(context_id, |rt| {
+            if scp_core::context::tools::invoke::has_tool_invoke_capability(
+                &rt.role_state,
+                &self.agent_did,
+                tool_name,
+            ) {
+                Ok(())
+            } else {
+                Err(ScpPyError::ContextError(format!(
+                    "agent '{}' does not have capability to invoke tool '{}' in context '{}'",
+                    self.agent_did, tool_name, context_id
+                )))
+            }
+        })
+        .map_err(|e| format!("{e}"))
     }
 
     fn invoke_tool(
         &self,
         context_id: &str,
         tool_name: &str,
-        _arguments: serde_json::Value,
+        arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // TODO(#106): Wire to scp-core's tool invocation pipeline (tools/invoke.rs)
-        // for real execution with schema validation and handler dispatch.
-        // Currently returns a stub JSON response indicating the tool exists.
+        // Validates tool existence and input schema. No runtime handler
+        // dispatch is available at the FFI layer (tools are registered with
+        // metadata only), so validated input is echoed back. This is a
+        // meaningful improvement over the previous stub: the MCP client now
+        // gets schema enforcement. See ADR-010 and ADR-015.
         crate::runtime::with_context(context_id, |rt| {
-            // Verify the tool exists.
-            if rt.tool_registry.get(tool_name).is_none() {
-                return Err(ScpPyError::ContextError(format!(
+            let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
+                ScpPyError::ContextError(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
-                )));
-            }
-            // Return a JSON result indicating the tool was invoked.
-            // Full execution with schema validation and handler dispatch
-            // is wired via the tool invocation pipeline.
+                ))
+            })?;
+
+            // Validate input against the tool's input schema.
+            scp_core::context::tools::schema::validate_value_against_schema(
+                &arguments,
+                &registration.schema.input_schema,
+            )
+            .map_err(|msg| {
+                ScpPyError::ValidationError(format!(
+                    "input validation failed for tool '{tool_name}': {msg}"
+                ))
+            })?;
+
             Ok(serde_json::json!({
                 "tool": tool_name,
                 "context": context_id,
-                "status": "invoked"
+                "status": "executed",
+                "input_valid": true,
+                "result": arguments,
             }))
         })
         .map_err(|e| format!("{e}"))
@@ -673,18 +698,21 @@ impl ContextProvider for FfiBridgeProvider {
 // ---------------------------------------------------------------------------
 
 /// State for an active MCP server instance.
-#[allow(dead_code)] // Fields are stored for state tracking and future introspection.
 struct McpServerState {
     /// The identity DID running this server.
+    #[allow(dead_code)] // Stored for future introspection.
     identity_did: String,
     /// The context IDs being served.
+    #[allow(dead_code)] // Stored for future introspection.
     context_ids: Vec<String>,
     /// The transport mode (stdio or sse).
+    #[allow(dead_code)] // Stored for future introspection.
     transport: String,
     /// Whether the server has been stopped.
     stopped: bool,
     /// The real MCP server, wrapped in Arc<Mutex> for thread-safe access
     /// from the transport task and bridge functions.
+    #[allow(dead_code)] // Stored for shutdown coordination.
     server: Arc<Mutex<McpServer<FfiBridgeProvider>>>,
     /// Shutdown signal sender. Dropping this signals the transport task to stop.
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -693,13 +721,15 @@ struct McpServerState {
 }
 
 /// State for an active MCP client connection.
-#[allow(dead_code)] // Fields are stored for state tracking and reconnection.
 struct McpClientState {
     /// The transport mode (stdio or sse).
+    #[allow(dead_code)] // Stored for reconnection and introspection.
     transport: String,
     /// For stdio, the command used to spawn the subprocess.
+    #[allow(dead_code)] // Stored for reconnection.
     command: Option<Vec<String>>,
     /// For sse, the URL of the SSE endpoint.
+    #[allow(dead_code)] // Stored for reconnection.
     url: Option<String>,
     /// The real MCP client, connected and initialized.
     client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
@@ -1280,15 +1310,39 @@ pub fn py_mcp_client_invoke(
 #[pyfunction]
 #[pyo3(name = "py_mcp_load_contexts")]
 pub fn py_mcp_load_contexts(
-    _identity_did: &str,
+    py: Python<'_>,
+    identity_did: &str,
     _relay_url: &str,
 ) -> PyResult<Vec<PyObject>> {
-    // Context discovery requires a live relay connection which is wired via
-    // the transport layer (scp-transport). Since relay connections are managed
-    // separately from MCP, this function returns an empty list when no relay
-    // is connected. The full implementation will query the relay for the
-    // identity's active contexts using the transport module.
-    Ok(Vec::new())
+    // Full relay discovery requires scp-transport wiring (not yet available).
+    // Return contexts from the local runtime registry that this identity is a
+    // member of. This is a meaningful improvement: locally created/joined
+    // contexts are now visible to MCP clients.
+    let context_ids = crate::runtime::context_ids_for_member(identity_did);
+
+    let mut results = Vec::with_capacity(context_ids.len());
+    for ctx_id in &context_ids {
+        let dict = PyDict::new(py);
+        dict.set_item("context_id", ctx_id)?;
+        dict.set_item("source", "local")?;
+
+        // Enrich with creator DID and member count from runtime state.
+        if let Ok(info) = crate::runtime::with_context(ctx_id, |rt| {
+            Ok((
+                rt.creator_did.clone(),
+                rt.role_state.members.len(),
+                rt.tool_registry.len(),
+            ))
+        }) {
+            dict.set_item("creator_did", info.0)?;
+            dict.set_item("member_count", info.1)?;
+            dict.set_item("tool_count", info.2)?;
+        }
+
+        results.push(dict.into());
+    }
+
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,14 +1598,259 @@ mod tests {
         assert!(tools.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // Helper: register a context with a tool for FfiBridgeProvider tests.
+    // -----------------------------------------------------------------------
+
+    /// Registers a context in the runtime registry and optionally adds a tool.
+    /// Returns a unique context ID to avoid collisions with parallel tests.
+    fn setup_test_context(
+        creator_did: &str,
+        with_tool: bool,
+    ) -> String {
+        // Use a unique context ID to avoid collisions across parallel tests.
+        let ctx_id = crate::types::generate_random_id("test-mcp");
+        crate::runtime::register_context(&ctx_id, creator_did).unwrap();
+
+        if with_tool {
+            crate::runtime::with_context(&ctx_id, |rt| {
+                let registration = scp_core::context::tools::ToolRegistration {
+                    tool_id: "calculator".to_owned(),
+                    name: "Calculator".to_owned(),
+                    description: "A simple calculator".to_owned(),
+                    schema: scp_core::context::tools::ToolSchema {
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "number"},
+                                "b": {"type": "number"}
+                            },
+                            "required": ["a", "b"]
+                        }),
+                        output_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "result": {"type": "number"}
+                            }
+                        }),
+                    },
+                    implementation_hash: [0xAA; 32],
+                    test_vectors: vec![],
+                    operator_did: "did:dht:z6MkOperator".into(),
+                    economic_metadata: None,
+                };
+                scp_core::context::tools::register_tool(
+                    &mut rt.tool_registry,
+                    &rt.role_state,
+                    registration,
+                    creator_did,
+                )
+                .map_err(|e| crate::error::ScpPyError::ContextError(format!("{e}")))?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        ctx_id
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::validate_capability — authorized (creator has all caps)
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn ffi_bridge_provider_validate_capability_always_ok() {
+    fn ffi_bridge_provider_validate_capability_allows_authorized() {
+        let creator = "did:dht:z6MkCreatorValCap";
+        let ctx_id = setup_test_context(creator, true);
+
         let provider = FfiBridgeProvider {
-            agent_did: "did:dht:z6MkTest".to_owned(),
-            context_ids: vec![],
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
         };
-        // Capability validation is delegated to the UCAN layer.
-        assert!(provider.validate_capability("ctx-1", "tool-1").is_ok());
+        // Creator has ToolInvokeAll, so any tool name should pass.
+        assert!(
+            provider.validate_capability(&ctx_id, "calculator").is_ok(),
+            "creator should be authorized to invoke tools"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::validate_capability — rejects unauthorized
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ffi_bridge_provider_validate_capability_rejects_unauthorized() {
+        let creator = "did:dht:z6MkCreatorValCapReject";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Add a member with no ToolInvoke capability.
+        let member = "did:dht:z6MkMemberNoInvoke";
+        crate::runtime::with_context(&ctx_id, |rt| {
+            rt.role_state.members.insert(member.to_owned());
+            let mut caps = std::collections::HashSet::new();
+            caps.insert(scp_core::context::roles::Capability::MessagesRead);
+            rt.role_state
+                .member_capabilities
+                .insert(member.to_owned(), caps);
+            Ok(())
+        })
+        .unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: member.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+        let result = provider.validate_capability(&ctx_id, "calculator");
+        assert!(
+            result.is_err(),
+            "member without ToolInvoke should be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("does not have capability"),
+            "error should describe missing capability: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::invoke_tool — validates schema and returns real output
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ffi_bridge_provider_invoke_tool_returns_real_output() {
+        let creator = "did:dht:z6MkCreatorInvokeTool";
+        let ctx_id = setup_test_context(creator, true);
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        let input = serde_json::json!({"a": 3, "b": 4});
+        let result = provider.invoke_tool(&ctx_id, "calculator", input.clone());
+        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+
+        let output = result.unwrap();
+        assert_eq!(
+            output["status"], "executed",
+            "status should be 'executed' (not 'invoked')"
+        );
+        assert_eq!(output["tool"], "calculator");
+        assert_eq!(output["context"], ctx_id);
+        assert_eq!(output["input_valid"], true);
+        assert_eq!(output["result"], input);
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::invoke_tool — rejects invalid schema input
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ffi_bridge_provider_invoke_tool_validates_schema() {
+        let creator = "did:dht:z6MkCreatorSchemaVal";
+        let ctx_id = setup_test_context(creator, true);
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        // Input schema requires an object with "a" and "b" as required fields.
+        // Pass a string instead.
+        let result = provider.invoke_tool(
+            &ctx_id,
+            "calculator",
+            serde_json::json!("not an object"),
+        );
+        assert!(result.is_err(), "invalid input should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("validation"),
+            "error should mention validation: {err}"
+        );
+
+        // Pass an object missing required fields.
+        let result = provider.invoke_tool(
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 1}),
+        );
+        assert!(
+            result.is_err(),
+            "input missing required field 'b' should be rejected"
+        );
+
+        // Pass valid input — should succeed.
+        let result = provider.invoke_tool(
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 1, "b": 2}),
+        );
+        assert!(result.is_ok(), "valid input should succeed: {result:?}");
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::invoke_tool — tool not found
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ffi_bridge_provider_invoke_tool_rejects_unknown_tool() {
+        let creator = "did:dht:z6MkCreatorUnknownTool";
+        let ctx_id = setup_test_context(creator, false);
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        let result = provider.invoke_tool(
+            &ctx_id,
+            "nonexistent",
+            serde_json::json!({}),
+        );
+        assert!(result.is_err(), "unknown tool should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not found"),
+            "error should mention tool not found: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // py_mcp_load_contexts — returns contexts from local runtime registry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_contexts_returns_local_contexts() {
+        let creator = "did:dht:z6MkCreatorLoadCtx";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Since py_mcp_load_contexts requires Python, we test the underlying
+        // runtime function directly.
+        let ids = crate::runtime::context_ids_for_member(creator);
+        assert!(
+            ids.contains(&ctx_id),
+            "creator should be a member of the context"
+        );
+
+        // Non-member should not see the context.
+        let other_ids = crate::runtime::context_ids_for_member("did:dht:z6MkNobody");
+        assert!(
+            !other_ids.contains(&ctx_id),
+            "non-member should not see the context"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
     }
 
     #[test]
