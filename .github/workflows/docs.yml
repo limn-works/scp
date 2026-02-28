@@ -105,6 +105,7 @@ jobs:
   # ---- Swift (DocC) ----
   swift-docs:
     name: "Swift API docs (DocC)"
+    # Pinned: Package.swift requires swift-tools-version 6.2; macos-latest (macOS 15) only ships 6.1
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
