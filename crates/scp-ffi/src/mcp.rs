@@ -5,11 +5,13 @@
 //! - [`py_mcp_serve`] -- Start an MCP server exposing SCP context tools.
 //! - [`py_mcp_server_stop`] -- Stop a running MCP server.
 //! - [`py_mcp_server_wait`] -- Block until the MCP server exits.
+//! - [`py_mcp_server_info`] -- Return metadata about a running MCP server.
 //! - [`py_mcp_client_connect_stdio`] -- Connect to an external MCP server via
 //!   stdio.
 //! - [`py_mcp_client_connect_sse`] -- Connect to an external MCP server via
 //!   SSE.
 //! - [`py_mcp_client_disconnect`] -- Disconnect from an external MCP server.
+//! - [`py_mcp_client_info`] -- Return metadata about an active MCP client.
 //! - [`py_mcp_client_list_tools`] -- List tools from an external MCP server.
 //! - [`py_mcp_client_invoke`] -- Invoke an external MCP tool with provenance.
 //! - [`py_mcp_load_contexts`] -- Load active contexts for a DID from a relay.
@@ -708,19 +710,18 @@ impl ContextProvider for FfiBridgeProvider {
 /// State for an active MCP server instance.
 struct McpServerState {
     /// The identity DID running this server.
-    #[allow(dead_code)] // Stored for future introspection.
     identity_did: String,
     /// The context IDs being served.
-    #[allow(dead_code)] // Stored for future introspection.
     context_ids: Vec<String>,
     /// The transport mode (stdio or sse).
-    #[allow(dead_code)] // Stored for future introspection.
     transport: String,
     /// Whether the server has been stopped.
     stopped: bool,
     /// The real MCP server, wrapped in Arc<Mutex> for thread-safe access
-    /// from the transport task and bridge functions.
-    #[allow(dead_code)] // Stored for shutdown coordination.
+    /// from the transport task and bridge functions. Never read directly —
+    /// kept alive as an ownership anchor (the transport task closure holds
+    /// a clone of this Arc).
+    #[allow(dead_code)] // Ownership anchor — dropping this Arc would stop the server.
     server: Arc<Mutex<McpServer<FfiBridgeProvider>>>,
     /// Shutdown signal sender. Dropping this signals the transport task to stop.
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -731,13 +732,10 @@ struct McpServerState {
 /// State for an active MCP client connection.
 struct McpClientState {
     /// The transport mode (stdio or sse).
-    #[allow(dead_code)] // Stored for reconnection and introspection.
     transport: String,
     /// For stdio, the command used to spawn the subprocess.
-    #[allow(dead_code)] // Stored for reconnection.
     command: Option<Vec<String>>,
     /// For sse, the URL of the SSE endpoint.
-    #[allow(dead_code)] // Stored for reconnection.
     url: Option<String>,
     /// The real MCP client, connected and initialized.
     client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
@@ -1026,6 +1024,61 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
     }
 
     Ok(())
+}
+
+/// Returns metadata about a running MCP server.
+///
+/// # Arguments
+///
+/// * `handle` -- The server handle returned by `py_mcp_serve`.
+///
+/// # Returns
+///
+/// A dict with keys: `identity_did`, `context_ids`, `transport`, `stopped`.
+///
+/// # Errors
+///
+/// Raises `TransportError` if the server handle is not found.
+#[pyfunction]
+#[pyo3(name = "py_mcp_server_info")]
+pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+    let entry = server_registry().get(handle).ok_or_else(|| {
+        ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
+    })?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("identity_did", &entry.identity_did)?;
+    dict.set_item("context_ids", &entry.context_ids)?;
+    dict.set_item("transport", &entry.transport)?;
+    dict.set_item("stopped", entry.stopped)?;
+    Ok(dict.into())
+}
+
+/// Returns metadata about an active MCP client connection.
+///
+/// # Arguments
+///
+/// * `handle` -- The client handle returned by `py_mcp_client_connect_*`.
+///
+/// # Returns
+///
+/// A dict with keys: `transport`, `command` (nullable), `url` (nullable).
+///
+/// # Errors
+///
+/// Raises `TransportError` if the client handle is not found.
+#[pyfunction]
+#[pyo3(name = "py_mcp_client_info")]
+pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+    let entry = client_registry().get(handle).ok_or_else(|| {
+        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
+    })?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("transport", &entry.transport)?;
+    dict.set_item("command", &entry.command)?;
+    dict.set_item("url", &entry.url)?;
+    Ok(dict.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,9 +1524,11 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_mcp_serve, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_server_stop, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_server_wait, m)?)?;
+    m.add_function(wrap_pyfunction!(py_mcp_server_info, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_client_connect_stdio, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_client_connect_sse, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_client_disconnect, m)?)?;
+    m.add_function(wrap_pyfunction!(py_mcp_client_info, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_client_list_tools, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_client_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_load_contexts, m)?)?;
