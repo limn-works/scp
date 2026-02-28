@@ -86,7 +86,7 @@ if $CHECK_MODE; then
   echo ""
 
   # Verify key tools are installed
-  for tool in java bun python kotlin rust; do
+  for tool in java bun python kotlin gradle rust; do
     if mise ls --installed "$tool" &>/dev/null && [[ -n "$(mise ls --installed "$tool" 2>/dev/null)" ]]; then
       ok "$tool $(mise current "$tool" 2>/dev/null || echo '?')"
     else
@@ -113,7 +113,7 @@ else
   ok "mise install complete"
 
   # Verify key tools
-  for tool in java bun python kotlin rust; do
+  for tool in java bun python kotlin gradle rust; do
     if mise current "$tool" &>/dev/null; then
       ok "$tool $(mise current "$tool" 2>/dev/null)"
     else
@@ -223,6 +223,7 @@ info "java:    $(mise current java 2>/dev/null || echo 'not found')"
 info "bun:     $(mise current bun 2>/dev/null || echo 'not found')"
 info "python:  $(mise current python 2>/dev/null || echo 'not found')"
 info "kotlin:  $(mise current kotlin 2>/dev/null || echo 'not found')"
+info "gradle:  $(mise current gradle 2>/dev/null || echo 'not found')"
 info "rustc:   $(rustc --version 2>/dev/null || echo 'not found')"
 info "cargo:   $(cargo --version 2>/dev/null || echo 'not found')"
 
