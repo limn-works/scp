@@ -228,9 +228,9 @@ info "cargo:   $(cargo --version 2>/dev/null || echo 'not found')"
 
 echo ""
 bold "Environment setup:"
-info "Add to your shell profile (~/.zshrc):"
+info "Add to ~/.zshenv (ensures availability in all shells, including non-interactive):"
 info ""
-info "  eval \"\$(mise activate zsh)\""
+info "  eval \"\$(mise activate zsh --shims)\""
 info ""
 
 if [[ "$ERRORS" -gt 0 ]]; then

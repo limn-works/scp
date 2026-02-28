@@ -92,10 +92,10 @@ Install these manually (one-time):
 2. **mise** — `brew install mise` ([mise.jdx.dev](https://mise.jdx.dev))
 3. **Xcode Command Line Tools** — `xcode-select --install`
 
-Then activate mise in your shell profile (`~/.zshrc`):
+Then activate mise in `~/.zshenv` (ensures availability in all shells, including non-interactive):
 
 ```sh
-eval "$(mise activate zsh)"
+eval "$(mise activate zsh --shims)"
 ```
 
 mise automatically manages environment variables (`JAVA_HOME`, `ANDROID_HOME`, `ANDROID_NDK_HOME`, `CARGO_TARGET_*_LINKER`) — no manual sourcing needed.
