@@ -82,6 +82,46 @@ Distributed protocols have historically stayed niche because nobody wants to man
 
 Without a strong, open protocol for shareable context, the result is fragmented apps saved only by monolithic solutions from established platforms. SCP is the open, functional answer — no opinions, easy adoption, collective contribution, and unlimited integration.
 
+## Development
+
+### Prerequisites
+
+Install these manually first (one-time):
+
+- [Homebrew](https://brew.sh)
+- [asdf](https://asdf-vm.com) — `brew install asdf`
+- [rustup](https://rustup.rs)
+- Xcode Command Line Tools — `xcode-select --install`
+
+### Quick start
+
+```sh
+./scripts/setup-toolchain.sh
+```
+
+This installs and configures:
+- **Java 17** (Zulu), **Bun 1.3**, **Python 3.12**, **Kotlin 2.3** via asdf
+- Rust cross-compilation targets (WASM, iOS, Android, macOS universal)
+- Cargo tools (nextest, wasm-pack, maturin, cargo-deny)
+- Android SDK + NDK 27.2
+
+### Environment
+
+Source the generated env file in your shell profile:
+
+```sh
+# Add to ~/.zshrc or ~/.bashrc
+source /path/to/scp/scripts/env.sh
+```
+
+This sets `ANDROID_HOME`, `ANDROID_NDK_HOME`, `JAVA_HOME`, and Cargo linker vars for Android cross-compilation.
+
+### Verify
+
+```sh
+./scripts/setup-toolchain.sh --check
+```
+
 ## License
 
 SCP uses a split license designed for maximum adoption with infrastructure protection:
