@@ -25,6 +25,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
@@ -456,7 +457,7 @@ class ContextBridge internal constructor(
                 }
 
             awaitClose {
-                withContext(bridge.ioDispatcher) {
+                runBlocking(bridge.ioDispatcher) {
                     bindings.contextUnsubscribe(subscriptionHandle)
                 }
             }
