@@ -185,7 +185,7 @@ pub fn py_event_log_query(
         actor_did: String::new(),
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|e| ScpPyError::ContextError(format!("system clock error: {e}")))?
             .as_secs() as f64,
         payload,
         sequence: event_count.saturating_sub(1),

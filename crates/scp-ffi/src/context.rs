@@ -454,7 +454,7 @@ fn py_context_create(
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("system clock before Unix epoch")
             .as_nanos()
     });
 
