@@ -176,7 +176,7 @@ No SDK release proceeds without 100% conformance test pass rate. Conformance tes
 Every SDK ships with:
 
 1. **README.md** — Quick start (install, create identity, create context, send message) in under 30 lines
-2. **API reference** — Generated from source (rustdoc, pydoc, typedoc, DocC, KDoc, godoc, xmldoc, javadoc)
+2. **API reference** — Generated from source (rustdoc, pydoc, typedoc, DocC, KDoc, godoc, xmldoc, javadoc). Note: Swift DocC requires the `ScpFFI.xcframework` binary target and runs as a post-step of the XCFramework build in `build-matrix.yml`, not in the standalone `docs.yml` workflow.
 3. **Type stubs / declarations** — For IDE autocompletion and static analysis (`.pyi`, `.d.ts`, etc.)
 4. **Examples directory** — Runnable examples covering: basic messaging, tool invocation, MCP integration, multi-agent coordination
 

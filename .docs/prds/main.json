@@ -7735,7 +7735,7 @@
       "details": {
         "Documentation deliverables": "1. README.md — Quick start in <30 lines.\n2. API reference — Generated from source (rustdoc, pydoc, typedoc, DocC, KDoc, godoc, xmldoc, javadoc).\n3. Type stubs — .pyi, .d.ts, etc.\n4. Examples directory — basic messaging, tool invocation, MCP integration, multi-agent coordination."
       },
-      "result": "SDK documentation for all 7 language bindings: README.md with <30-line quick start, examples/ directory with 4 runnable examples each, TypeScript .d.ts type declarations, Python py.typed marker, sphinx docs config, typedoc config, and CI docs.yml workflow for API reference generation on release."
+      "result": "SDK documentation for all 7 language bindings: README.md with <30-line quick start, examples/ directory with 4 runnable examples each, TypeScript .d.ts type declarations, Python py.typed marker, sphinx docs config, typedoc config, and CI docs.yml workflow for API reference generation on release. Swift DocC generation moved from docs.yml to build-matrix.yml (swift-xcframework job) because DocC requires the compiled ScpFFI.xcframework binary target."
     },
     {
       "id": "SCP-140",

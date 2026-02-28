@@ -225,7 +225,7 @@ Set up `cargo doc` generation and hosting:
 4. Host on GitHub Pages or similar
 5. For TypeScript: generate with typedoc from WASM/NAPI bindings
 6. For Python: generate from type stubs + docstrings
-7. For Swift: generate with DocC from UniFFI output
+7. For Swift: generate with DocC from UniFFI output. DocC requires the compiled `ScpFFI.xcframework` binary target, so it runs as a post-step of the `swift-xcframework` job in `build-matrix.yml` (not in `docs.yml`). The `docs-swift` artifact is uploaded from that workflow.
 
 ## 21.11 P2: Implementation Guides
 
