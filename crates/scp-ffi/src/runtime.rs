@@ -93,32 +93,40 @@ fn default_ceiling() -> CapabilityCeiling {
 /// Returns `ScpPyError::ContextError` if the context ID is already registered
 /// or if role state creation fails.
 pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPyError> {
+    use dashmap::mapref::entry::Entry;
+
     let map = registry();
 
-    if map.contains_key(context_id) {
-        return Err(ScpPyError::ContextError(format!(
-            "context '{context_id}' is already registered"
-        )));
+    match map.entry(context_id.to_owned()) {
+        Entry::Occupied(_) => {
+            return Err(ScpPyError::ContextError(format!(
+                "context '{context_id}' is already registered"
+            )));
+        }
+        Entry::Vacant(vacant) => {
+            let tool_registry = ToolRegistry::new();
+            let event_log = EventLog::new(context_id.to_owned());
+            let role_state =
+                ContextRoleState::new(context_id, creator_did, default_ceiling(), vec![])
+                    .map_err(|e| {
+                        ScpPyError::ContextError(format!(
+                            "failed to create role state: {e}"
+                        ))
+                    })?;
+            let revocation_list = RevocationList::new(context_id.to_owned());
+
+            let runtime = ContextRuntime {
+                tool_registry,
+                event_log,
+                role_state,
+                revocation_list,
+                creator_did: creator_did.to_owned(),
+            };
+
+            vacant.insert(runtime);
+        }
     }
 
-    let tool_registry = ToolRegistry::new();
-    let event_log = EventLog::new(context_id.to_owned());
-    let role_state =
-        ContextRoleState::new(context_id, creator_did, default_ceiling(), vec![])
-            .map_err(|e| {
-                ScpPyError::ContextError(format!("failed to create role state: {e}"))
-            })?;
-    let revocation_list = RevocationList::new(context_id.to_owned());
-
-    let runtime = ContextRuntime {
-        tool_registry,
-        event_log,
-        role_state,
-        revocation_list,
-        creator_did: creator_did.to_owned(),
-    };
-
-    map.insert(context_id.to_owned(), runtime);
     Ok(())
 }
 

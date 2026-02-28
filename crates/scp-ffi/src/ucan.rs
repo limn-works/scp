@@ -250,7 +250,7 @@ pub fn py_ucan_mint(
     })?;
 
     // Generate a unique nonce for the token ID.
-    let nonce = generate_nonce();
+    let nonce = generate_nonce()?;
 
     // Build capability attestations scoped to the context.
     let capability_uris: Vec<String> = capabilities
@@ -325,19 +325,19 @@ pub fn py_ucan_revoke(
 ///
 /// Uses cryptographic randomness via `rand::thread_rng()` (backed by `OsRng`)
 /// to produce unpredictable nonces as required by ADR-016 §7.2.
-fn generate_nonce() -> String {
+fn generate_nonce() -> Result<String, ScpPyError> {
     use rand::Rng;
 
     let now_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
+        .map_err(|e| ScpPyError::UcanError(format!("system clock error: {e}")))?
         .as_millis();
 
     let mut random_bytes = [0u8; 16];
     rand::thread_rng().fill(&mut random_bytes);
 
     let hex = encode_hex(&random_bytes);
-    format!("{now_millis}-{hex}")
+    Ok(format!("{now_millis}-{hex}"))
 }
 
 /// Computes a simple content identifier for a token string.
