@@ -86,41 +86,56 @@ Without a strong, open protocol for shareable context, the result is fragmented 
 
 ### Prerequisites
 
-Install these manually first (one-time):
+Install these manually (one-time):
 
-- [Homebrew](https://brew.sh)
-- [asdf](https://asdf-vm.com) — `brew install asdf`
-- [rustup](https://rustup.rs)
-- Xcode Command Line Tools — `xcode-select --install`
+1. **Homebrew** — https://brew.sh
+2. **asdf** — `brew install asdf` ([asdf-vm.com](https://asdf-vm.com))
+3. **rustup** — https://rustup.rs
+4. **Xcode Command Line Tools** — `xcode-select --install`
 
-### Quick start
+### Setup
 
 ```sh
 ./scripts/setup-toolchain.sh
 ```
 
-This installs and configures:
-- **Java 17** (Zulu), **Bun 1.3**, **Python 3.12**, **Kotlin 2.3** via asdf
-- Rust cross-compilation targets (WASM, iOS, Android, macOS universal)
-- Cargo tools (nextest, wasm-pack, maturin, cargo-deny)
-- Android SDK + NDK 27.2
+The script is idempotent — safe to re-run at any time. It installs and configures:
+
+| Category | What | Manager |
+|---|---|---|
+| Languages | Java 17 (Zulu), Bun 1.3, Python 3.12, Kotlin 2.3 | asdf (pinned in `.tool-versions`) |
+| Rust targets | WASM, iOS, iOS Simulator, Android (4 arch), macOS universal | rustup |
+| Cargo tools | cargo-nextest, wasm-pack, maturin, cargo-deny | cargo |
+| Bun globals | @napi-rs/cli | bun |
+| Android | SDK command-line tools, NDK 27.2 | sdkmanager (via Homebrew) |
+
+Rust and Swift are **not** managed by asdf — they use their own canonical tooling (rustup and Xcode, respectively).
+
+If Homebrew-installed Kotlin or OpenJDK are detected, the script warns but does not remove them. asdf takes precedence within the repo via `.tool-versions`.
 
 ### Environment
 
-Source the generated env file in your shell profile:
+Add this to your shell profile (`~/.zshrc` or `~/.bashrc`):
 
 ```sh
-# Add to ~/.zshrc or ~/.bashrc
 source /path/to/scp/scripts/env.sh
 ```
 
-This sets `ANDROID_HOME`, `ANDROID_NDK_HOME`, `JAVA_HOME`, and Cargo linker vars for Android cross-compilation.
+This sets:
+- `ANDROID_HOME` — auto-detected from `~/Library/Android/sdk` or `~/Android/Sdk`
+- `ANDROID_NDK_HOME` — pinned NDK version under `ANDROID_HOME`
+- `JAVA_HOME` — resolved from asdf
+- `CARGO_TARGET_*_LINKER` — NDK clang linkers for all 4 Android architectures, so `cargo build --target aarch64-linux-android` works without extra flags
+
+CI (`build-matrix.yml`) pins the same NDK version so local and CI builds match.
 
 ### Verify
 
 ```sh
 ./scripts/setup-toolchain.sh --check
 ```
+
+Reports the state of every tool without making changes. Exit code 0 = all good, 1 = something missing.
 
 ## License
 
