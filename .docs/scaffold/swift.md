@@ -210,6 +210,18 @@ public struct ToolDefinition: Sendable {
 }
 ```
 
+## Documentation
+
+Swift API reference is generated with DocC. Because DocC requires a resolved SPM package (which depends on the `ScpFFI.xcframework` binary target), documentation generation runs as a post-step of the `swift-xcframework` job in `.github/workflows/build-matrix.yml`, not in the standalone `docs.yml` workflow.
+
+```bash
+# Generate DocC (requires ScpFFI.xcframework to be present)
+cd bindings/swift
+swift package generate-documentation --target SCP --output-path docs
+```
+
+The CI step uploads the output as a `docs-swift` artifact, which the `publish-docs` job in `docs.yml` collects by pattern when publishing to GitHub Pages on release tags.
+
 ## SPM Distribution
 
 Published as `SCP` Swift Package via GitHub releases with XCFramework binary target.

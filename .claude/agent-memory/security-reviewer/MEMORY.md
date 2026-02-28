@@ -98,7 +98,25 @@
 - `Amount(u64)` with `saturating_add` -- no overflow risk
 - `PaymentAdapter` trait: authorize/capture two-phase pattern
 - UNFIXED: `SenderVelocityTracker` unbounded HashMap growth
-- UNFIXED: `PaymentReceipt` Debug leaks adapter_proof
+- FIXED: `PaymentReceipt` Debug now redacts adapter_proof and signature to byte-length
+
+### Economy Integration (SCP-156 Review, 2026-02-27)
+- HIGH: Step 5 missing adapter.verify() -- only checks cost sufficiency, not cryptographic auth validity
+- MEDIUM: Dummy PaymentAuthorization (zeroed auth_id) leaked to closures on 3 free paths
+- MEDIUM: IntegrationError erased to ContextError::MembershipFailed(string) in ContextManager
+- GOOD: Fail-closed on arithmetic overflow (unwrap_or(Amount(u64::MAX)))
+- GOOD: Integer-only arithmetic throughout (no f64)
+- Pattern: execute_paid_action combines sender+receiver flows -- needs split for production 2-party use
+
+### Economy Integration Tests (SCP-160 Review, 2026-02-27)
+- 40 tests covering all 9 invariants from spec 19.14, all pass
+- MEDIUM: Invariant 7 test is self-referential (checks hardcoded string, not real encryption path)
+- MEDIUM: TestAdapter::verify() returns Amount(0) not receipt amount -- weakens invariant 4
+- MEDIUM: signed_event helper duplicates EventType-to-tag mapping from tree.rs -- divergence risk
+- TestAdapter::verify_authorization() is no-op -- spec 19.2.2 step 5 not tested
+- GOOD: Tests exercise real production functions (evaluate_cost, auto_accept_blocked_by_economics, etc.)
+- GOOD: Merkle proof integration with signed events and real EventLog
+- Pattern: Test adapter fidelity matters for invariant tests -- echoing values back catches mismatches
 
 ### Context Nesting (`crates/scp-core/src/context/nesting.rs`)
 - content_hash NOW returns Result (no hash collision on serialization error)
@@ -140,9 +158,27 @@
 - GOOD: Handle ref counting with Drop for shutdown ordering
 - GOOD: thiserror + machine-readable error codes
 
+### Tiered Storage (`crates/scp-core/src/event_log/tiered_storage.rs`) -- SCP-127 Review (2026-02-27)
+- HIGH: checkpoint_root invalidated after second migration -- overwrites with partial hot root
+- HIGH: Hot log rebuild resets indices to 0-based, breaking global sequence mapping
+- MEDIUM: cold_entries linear scan O(n) -- should binary search by sequence
+- MEDIUM: No defense-in-depth checks on relay-returned proof (leaf_hash, leaf_index not asserted)
+- MEDIUM: leaf_hash sent to untrusted relay in fetch -- info leak
+- MEDIUM: hot_log_mut() allows bypassing record_hot_event -- metadata desync
+- MEDIUM: Unbounded cold_entries Vec growth
+- MEDIUM: now parameter caller-supplied with no validation
+- GOOD: Relay root overridden with local checkpoint_root before verification
+- GOOD: MaliciousProvider test for forged proof rejection
+- GOOD: thiserror for TieredStorageError, no unwrap/expect in lib code
+- GOOD: OR semantics for migration thresholds (age, count, bytes)
+- GOOD: ColdTierProvider trait is injectable and object-safe
+
 ### General Patterns
 - No `unwrap`/`expect` in lib code -- project standard via clippy deny
 - `thiserror` for error types -- consistent across crates
 - Rust edition 2024, `#![forbid(unsafe_code)]` on all crates except scp-ffi
 - `zeroize` crate not yet used anywhere
 - Recurring: `unwrap_or_default()` on clock ops -- systemic pattern
+- Pattern: multi-migration checkpoint root management is a subtle invariant -- always test proof verification across 2+ migration cycles
+- Pattern: Duplicated canonical hash logic in test helpers is a recurring fragility -- always import production functions instead of reimplementing
+- Pattern: Test adapters that return hardcoded success values weaken invariant tests -- echo real values back

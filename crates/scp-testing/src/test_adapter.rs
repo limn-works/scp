@@ -20,7 +20,7 @@ use scp_core::identity::DID;
 // ---------------------------------------------------------------------------
 
 /// State of an authorization hold.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum AuthState {
     /// Funds are held but not yet captured or voided.
     Pending,
@@ -391,6 +391,29 @@ impl PaymentAdapter for TestAdapter {
             .or_insert(0) += hold.amount.value();
 
         Ok(())
+    }
+
+    async fn verify_authorization(
+        &self,
+        auth: &PaymentAuthorization,
+    ) -> Result<(), PaymentError> {
+        let ledger = lock_ledger(&self.inner)?;
+
+        // Check if we issued this authorization and it's still pending.
+        match ledger.holds.get(&auth.auth_id) {
+            Some(hold) if hold.state == AuthState::Pending => Ok(()),
+            Some(hold) if hold.state == AuthState::Voided => {
+                Err(PaymentError::AlreadyVoided {
+                    auth_id: auth.auth_id,
+                })
+            }
+            Some(_) => Err(PaymentError::AlreadyCaptured {
+                auth_id: auth.auth_id,
+            }),
+            None => Err(PaymentError::InvalidReceipt(
+                "unknown authorization".to_owned(),
+            )),
+        }
     }
 
     async fn verify(

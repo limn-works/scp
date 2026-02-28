@@ -350,7 +350,10 @@ pub trait PushProvider: Send + Sync {
     ///
     /// Returns the platform-specific token bytes (APNs device token, FCM
     /// registration token).
-    async fn register(&self) -> Result<Vec<u8>, ScpError>;
+    ///
+    /// Named `register_push` (not `register`) to avoid collision with the
+    /// C keyword `register` in the UniFFI-generated callback vtable header.
+    async fn register_push(&self) -> Result<Vec<u8>, ScpError>;
 
     /// Handle an incoming push notification `payload`.
     ///

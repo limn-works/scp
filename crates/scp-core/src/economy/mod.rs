@@ -14,15 +14,22 @@
 //! - [`policy`] — Economic policy evaluation, cost schedule lookup, formula
 //!   evaluation, lock enforcement, and auto-accept guard.
 //! - [`estimate`] — SDK-facing `estimate_cost` function.
+//! - [`pricing`] — Dynamic pricing: EIP-1559-style relay pricing and governed
+//!   formula changes.
 //! - [`receipt`] — Payment receipt verification and history queries.
+//! - [`credentials`] — Adapter credential management: storage, validation,
+//!   and the `configureAdapter` SDK function.
 //!
 //! See spec section 19 (Economic Governance) and ADR-033 in
 //! `.docs/adrs/phase-3.md`.
 
 pub mod adapter;
 pub mod antispam;
+pub mod credentials;
 pub mod estimate;
+pub mod integration;
 pub mod policy;
+pub mod pricing;
 pub mod receipt;
 pub mod types;
 
@@ -32,10 +39,22 @@ pub use adapter::{
 };
 pub use antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
 pub use estimate::estimate_cost;
+pub use integration::{
+    ActionEnvelope, IntegrationError, PreparedAction, ProcessedAction, prepare_paid_action,
+    process_paid_action,
+};
 pub use policy::{
     CostInsufficient, ObservableMetrics, PolicyLockError, auto_accept_blocked_by_economics,
     check_policy_lock, evaluate_cost, evaluate_formula, lookup_cost, policy_requires_payment,
     validate_policy_change, verify_cost_sufficiency,
+};
+pub use pricing::{
+    FormulaChange, FormulaChangeStatus, PriceDirection, RelayPriceAdjustment, RelayPricingConfig,
+    adjust_relay_price,
+};
+pub use credentials::{
+    AdapterCredential, AdapterCredentialStore, CredentialError, configure_adapter,
+    retrieve_adapter_credential, validate_adapter,
 };
 pub use receipt::{PaymentVerifier, ReceiptFilter, payment_history};
 pub use types::{

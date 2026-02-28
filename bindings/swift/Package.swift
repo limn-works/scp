@@ -10,6 +10,9 @@ let package = Package(
     products: [
         .library(name: "SCP", targets: ["SCP"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3"),
+    ],
     targets: [
         .binaryTarget(
             name: "ScpFFI",
@@ -20,13 +23,22 @@ let package = Package(
             dependencies: ["ScpFFI"],
             path: "Sources/SCP",
             swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency"),
+                // Swift 6.2's default language mode enables strict concurrency
+                // checking that produces errors in UniFFI-generated code (the
+                // `sending` parameter pattern in uniffiTraitInterfaceCallAsync).
+                // Use Swift 5 language mode to downgrade these to warnings until
+                // UniFFI updates its Swift codegen for Swift 6 compatibility.
+                .swiftLanguageMode(.v5),
             ]
         ),
         .testTarget(
             name: "SCPTests",
             dependencies: ["SCP"],
-            path: "Tests/SCPTests"
+            path: "Tests/SCPTests",
+            swiftSettings: [
+                // Match the SCP target's language mode for consistency.
+                .swiftLanguageMode(.v5),
+            ]
         ),
     ]
 )
