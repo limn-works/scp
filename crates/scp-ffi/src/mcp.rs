@@ -222,6 +222,13 @@ impl SseClientTransport {
     ///
     /// Returns an error if the connection or handshake fails.
     fn connect(url: &str) -> Result<Self, String> {
+        if url.starts_with("https://") {
+            return Err(
+                "SSE transport does not support TLS; use http:// or add rustls dependency for HTTPS"
+                    .to_owned(),
+            );
+        }
+
         // Parse the URL to extract host, port, and path.
         let (host, port, path) = parse_http_url(url)?;
         let addr = format!("{host}:{port}");
@@ -294,6 +301,12 @@ impl SseClientTransport {
 
         if post_path.is_empty() {
             return Err("SSE endpoint event did not contain a POST path".to_owned());
+        }
+
+        if post_path.bytes().any(|b| b < 0x20) {
+            return Err(
+                "SSE endpoint path contains invalid control characters".to_owned(),
+            );
         }
 
         // Build the full POST URL.
@@ -422,6 +435,11 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
         return Err(format!("unsupported URL scheme in '{url}'"));
     };
 
+    // Reject control characters (CRLF injection defense).
+    if rest.bytes().any(|b| b < 0x20) {
+        return Err("URL contains invalid control characters".to_owned());
+    }
+
     let default_port: u16 = if scheme == "https" { 443 } else { 80 };
 
     let (host_port, path) = rest
@@ -532,9 +550,9 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
-        // Capability validation is handled by the UCAN layer. For the bridge,
-        // we permit all tool invocations and let the UCAN validation in the
-        // tool invocation path handle authorization.
+        // TODO(#106): Wire to role_state.member_has_capability() for defense-in-depth.
+        // Currently returns Ok(()) — authorization depends on UCAN layer.
+        // See: .docs/specs/07-trust-validation-and-capabilities.md §7.2
         Ok(())
     }
 
@@ -916,7 +934,7 @@ pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
 /// Raises `TransportError` if the server handle is not found.
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_wait")]
-pub fn py_mcp_server_wait(handle: &str) -> PyResult<()> {
+pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
     // Extract the task handle if available.
     let task_handle = {
         let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
@@ -933,8 +951,10 @@ pub fn py_mcp_server_wait(handle: &str) -> PyResult<()> {
     // Block on the task handle if we have one.
     if let Some(task) = task_handle {
         let rt = crate::runtime()?;
-        rt.block_on(async {
-            let _ = task.await;
+        py.allow_threads(|| {
+            rt.block_on(async {
+                let _ = task.await;
+            });
         });
     }
 
