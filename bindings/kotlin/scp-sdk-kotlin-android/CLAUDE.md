@@ -22,13 +22,11 @@ Each platform trait is a Kotlin class that implements a UniFFI-generated callbac
 
 The Rust `DeviceAttestationProvider` trait has `assert_request(request_hash)`. UniFFI generates Kotlin with camelCase: `assertRequest(requestHash)`. The ADR-027 code sample uses `assert()` which is **incorrect** — always check the UniFFI Rust trait definition in `crates/scp-ffi/uniffi/src/lib.rs` for authoritative method signatures.
 
-### Placeholder types until UniFFI bindings exist
+### Shared types live in Types.kt
 
-`AndroidDeviceAttestation.kt` defines local `DeviceAttestationProvider` interface and `ScpException` class because the UniFFI-generated bindings and shared `Errors.kt` don't exist yet. When those are implemented:
-1. Remove the local `DeviceAttestationProvider` interface — import the UniFFI-generated one
-2. Remove the local `ScpException` class — import from shared `com.limn.scp.Errors`
+All shared types (`ScpException`, `WakeSignal`, `KeyType`, `CustodyType`, `KeyHandle`, `PseudonymKeyHandle`, `DestructionAttestation`, `DestructionMethod`) and trait interfaces (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`) are defined in `Types.kt`. Do NOT define these types locally in adapter files. When UniFFI-generated bindings are available, replace `Types.kt` with the generated types.
 
-The local definitions match the scaffold spec in `.docs/scaffold/kotlin.md`.
+`ScpException` uses the property name `code` (not `errorCode`). `WakeSignal` entries use UPPER_CASE (`PULL`, not `Pull`).
 
 ### android.util.Base64 in unit tests
 
