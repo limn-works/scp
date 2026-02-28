@@ -209,9 +209,7 @@ pub enum SpendingError {
     InvalidResourceUri(String),
 
     /// A single action's cost exceeds `max_per_action`.
-    #[error(
-        "action cost {cost} exceeds max_per_action {max} (currency: {currency})"
-    )]
+    #[error("action cost {cost} exceeds max_per_action {max} (currency: {currency})")]
     PerActionLimitExceeded {
         /// The action's cost.
         cost: Amount,
@@ -299,15 +297,9 @@ impl SpendingCapability {
     /// Returns [`SpendingError::SpendingCapabilityRequired`] if the token has
     /// no facts or the fact key is missing.
     pub fn from_ucan_token(token: &UcanToken) -> Result<Self, SpendingError> {
-        let fct = token
-            .payload
-            .fct
-            .as_ref()
-            .ok_or_else(|| {
-                SpendingError::SpendingCapabilityRequired(
-                    "UCAN token has no facts field".to_owned(),
-                )
-            })?;
+        let fct = token.payload.fct.as_ref().ok_or_else(|| {
+            SpendingError::SpendingCapabilityRequired("UCAN token has no facts field".to_owned())
+        })?;
 
         let cap_value = fct.get(SPENDING_CAPABILITY_FACT_KEY).ok_or_else(|| {
             SpendingError::SpendingCapabilityRequired(
@@ -579,7 +571,11 @@ impl BudgetTracker {
 
         // Adapter restriction check.
         if !self.capability.allowed_adapters.is_empty()
-            && !self.capability.allowed_adapters.iter().any(|a| a == adapter_id)
+            && !self
+                .capability
+                .allowed_adapters
+                .iter()
+                .any(|a| a == adapter_id)
         {
             return Err(SpendingError::AdapterNotAllowed {
                 adapter: adapter_id.to_owned(),
@@ -664,7 +660,9 @@ pub struct MintSpendingParams<'a> {
 /// hours.
 ///
 /// See spec section 19.5 and SDK surface `SCP.Identity.grantSpending`.
-pub fn mint_spending_ucan_payload(params: &MintSpendingParams<'_>) -> Result<UcanPayload, SpendingError> {
+pub fn mint_spending_ucan_payload(
+    params: &MintSpendingParams<'_>,
+) -> Result<UcanPayload, SpendingError> {
     // Enforce 24-hour maximum expiry.
     if params.lifetime_secs > MAX_EXPIRY_SECS {
         return Err(SpendingError::ExpiryTooLong {
@@ -1051,20 +1049,15 @@ mod tests {
     fn and_composition_both_present_paid_action() {
         let action = dummy_token();
         let spending = dummy_token();
-        let result = check_and_composition(
-            Some(&action),
-            Some(&spending),
-            Amount(100),
-            "send message",
-        );
+        let result =
+            check_and_composition(Some(&action), Some(&spending), Amount(100), "send message");
         assert!(result.is_ok());
     }
 
     #[test]
     fn and_composition_free_action_no_spending() {
         let action = dummy_token();
-        let result =
-            check_and_composition(Some(&action), None, Amount::ZERO, "send free message");
+        let result = check_and_composition(Some(&action), None, Amount::ZERO, "send free message");
         assert!(result.is_ok());
     }
 
@@ -1079,17 +1072,22 @@ mod tests {
     #[test]
     fn and_composition_no_action_ucan() {
         let spending = dummy_token();
-        let result =
-            check_and_composition(None, Some(&spending), Amount(100), "send message");
+        let result = check_and_composition(None, Some(&spending), Amount(100), "send message");
         let err = result.unwrap_err();
-        assert!(matches!(err, SpendingError::Ucan(UcanError::CapabilityNotGranted(_))));
+        assert!(matches!(
+            err,
+            SpendingError::Ucan(UcanError::CapabilityNotGranted(_))
+        ));
     }
 
     #[test]
     fn and_composition_no_action_no_spending() {
         let result = check_and_composition(None, None, Amount(100), "send message");
         let err = result.unwrap_err();
-        assert!(matches!(err, SpendingError::Ucan(UcanError::CapabilityNotGranted(_))));
+        assert!(matches!(
+            err,
+            SpendingError::Ucan(UcanError::CapabilityNotGranted(_))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1204,7 +1202,11 @@ mod tests {
         let cap = sample_capability();
         let mut tracker = BudgetTracker::new(cap);
         let now = 1_700_000_000;
-        assert!(tracker.check_and_record(Amount(500), usd(), now, "x402").is_ok());
+        assert!(
+            tracker
+                .check_and_record(Amount(500), usd(), now, "x402")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1231,8 +1233,16 @@ mod tests {
         let now = 1_700_000_000;
 
         // Spend 6000, then try 5000 more (total would be 11000 > 10000).
-        assert!(tracker.check_and_record(Amount(4000), usd(), now, "test").is_ok());
-        assert!(tracker.check_and_record(Amount(4000), usd(), now, "test").is_ok());
+        assert!(
+            tracker
+                .check_and_record(Amount(4000), usd(), now, "test")
+                .is_ok()
+        );
+        assert!(
+            tracker
+                .check_and_record(Amount(4000), usd(), now, "test")
+                .is_ok()
+        );
         let err = tracker
             .check_and_record(Amount(3000), usd(), now, "test")
             .unwrap_err();
@@ -1252,12 +1262,20 @@ mod tests {
 
         // Spend 4000 at t=1000.
         let t1 = 1000;
-        assert!(tracker.check_and_record(Amount(4000), usd(), t1, "test").is_ok());
+        assert!(
+            tracker
+                .check_and_record(Amount(4000), usd(), t1, "test")
+                .is_ok()
+        );
 
         // At t=5000 (4000 seconds later, well past the 1-hour window),
         // the old record should be pruned.
         let t2 = 5000;
-        assert!(tracker.check_and_record(Amount(4000), usd(), t2, "test").is_ok());
+        assert!(
+            tracker
+                .check_and_record(Amount(4000), usd(), t2, "test")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1283,9 +1301,17 @@ mod tests {
         let mut tracker = BudgetTracker::new(cap);
 
         // Record at t=100
-        assert!(tracker.check_and_record(Amount(3000), usd(), 100, "test").is_ok());
+        assert!(
+            tracker
+                .check_and_record(Amount(3000), usd(), 100, "test")
+                .is_ok()
+        );
         // Record at t=150
-        assert!(tracker.check_and_record(Amount(2000), usd(), 150, "test").is_ok());
+        assert!(
+            tracker
+                .check_and_record(Amount(2000), usd(), 150, "test")
+                .is_ok()
+        );
 
         // At t=250, the first record (t=100) is expired (250-100=150 > window 100).
         assert_eq!(tracker.current_total(250), Amount(2000));
@@ -1571,9 +1597,21 @@ mod tests {
             .as_secs();
 
         // Spend 1000 three times (total 3000 = max_total).
-        assert!(tracker.check_and_record(Amount(1000), usd(), now, "x402").is_ok());
-        assert!(tracker.check_and_record(Amount(1000), usd(), now, "x402").is_ok());
-        assert!(tracker.check_and_record(Amount(1000), usd(), now, "x402").is_ok());
+        assert!(
+            tracker
+                .check_and_record(Amount(1000), usd(), now, "x402")
+                .is_ok()
+        );
+        assert!(
+            tracker
+                .check_and_record(Amount(1000), usd(), now, "x402")
+                .is_ok()
+        );
+        assert!(
+            tracker
+                .check_and_record(Amount(1000), usd(), now, "x402")
+                .is_ok()
+        );
 
         // Fourth spend should fail (total would exceed max_total).
         let err = tracker
@@ -1606,9 +1644,16 @@ mod tests {
         let mut tracker = BudgetTracker::new(cap);
 
         // Allowed adapter succeeds
-        assert!(tracker
-            .check_and_record(Amount(100), CurrencyCode::from_code("USD").unwrap(), 1000, "stripe")
-            .is_ok());
+        assert!(
+            tracker
+                .check_and_record(
+                    Amount(100),
+                    CurrencyCode::from_code("USD").unwrap(),
+                    1000,
+                    "stripe"
+                )
+                .is_ok()
+        );
 
         // Disallowed adapter fails
         let result = tracker.check_and_record(
@@ -1635,13 +1680,15 @@ mod tests {
         let mut tracker = BudgetTracker::new(cap);
 
         // Any adapter should succeed when list is empty
-        assert!(tracker
-            .check_and_record(
-                Amount(100),
-                CurrencyCode::from_code("USD").unwrap(),
-                1000,
-                "anything"
-            )
-            .is_ok());
+        assert!(
+            tracker
+                .check_and_record(
+                    Amount(100),
+                    CurrencyCode::from_code("USD").unwrap(),
+                    1000,
+                    "anything"
+                )
+                .is_ok()
+        );
     }
 }

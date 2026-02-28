@@ -32,8 +32,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DID;
 use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome, TIER_2_THRESHOLD_SECS};
+use crate::identity::DID;
 
 /// Safely compare a `u64` against a `usize` without truncation.
 ///
@@ -111,12 +111,18 @@ pub enum ResetReason {
 impl std::fmt::Display for ResetReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ExtendedOffline { offline_duration_secs } => {
+            Self::ExtendedOffline {
+                offline_duration_secs,
+            } => {
                 let days = offline_duration_secs / 86_400;
                 write!(f, "extended offline ({days} days)")
             }
             Self::CatchUpFailed { attempted_sources } => {
-                write!(f, "catch-up failed (tried: {})", attempted_sources.join(", "))
+                write!(
+                    f,
+                    "catch-up failed (tried: {})",
+                    attempted_sources.join(", ")
+                )
             }
             Self::GovernanceAction { proposal_id } => {
                 write!(f, "governance action (proposal: {proposal_id})")
@@ -497,10 +503,7 @@ pub trait ReJoinExecutor: Send + Sync {
     ///
     /// The request is sent as plaintext (not MLS-encrypted) since the member
     /// may not be able to encrypt at the current epoch.
-    async fn publish_reset_request(
-        &self,
-        request: &ResetRequest,
-    ) -> Result<(), WeeksOfflineError>;
+    async fn publish_reset_request(&self, request: &ResetRequest) -> Result<(), WeeksOfflineError>;
 
     /// Processes a reset request on the admin side: removes the stale member
     /// and re-adds them with a fresh `KeyPackage`.
@@ -560,9 +563,7 @@ pub enum WeeksOfflineError {
     },
 
     /// The admin lacks required capabilities (`MemberRemove` + `MemberInvite`).
-    #[error(
-        "admin {admin_did} lacks reset capabilities for context {context_id}"
-    )]
+    #[error("admin {admin_did} lacks reset capabilities for context {context_id}")]
     InsufficientCapabilities {
         /// The context where the capability check failed.
         context_id: ContextId,
@@ -571,9 +572,7 @@ pub enum WeeksOfflineError {
     },
 
     /// State preservation failed — the member's role could not be restored.
-    #[error(
-        "role restoration failed for {member_did} in context {context_id}: {reason}"
-    )]
+    #[error("role restoration failed for {member_did} in context {context_id}: {reason}")]
     RoleRestorationFailed {
         /// The context where restoration failed.
         context_id: ContextId,
@@ -584,9 +583,7 @@ pub enum WeeksOfflineError {
     },
 
     /// The bilateral context recovery failed.
-    #[error(
-        "bilateral recovery failed for context {context_id}: {reason}"
-    )]
+    #[error("bilateral recovery failed for context {context_id}: {reason}")]
     BilateralRecoveryFailed {
         /// The bilateral context.
         context_id: ContextId,
@@ -655,9 +652,7 @@ pub fn create_rejoin_plan(params: &ReJoinPlanParams<'_>) -> ReJoinPlan {
     } else if u64_exceeds_usize(queued_message_count, MAX_INFLIGHT_QUEUE_SIZE) {
         InFlightMessageHandling::Discard {
             discarded_count: queued_message_count,
-            reason: format!(
-                "queue overflow: {queued_message_count} > {MAX_INFLIGHT_QUEUE_SIZE}"
-            ),
+            reason: format!("queue overflow: {queued_message_count} > {MAX_INFLIGHT_QUEUE_SIZE}"),
         }
     } else {
         InFlightMessageHandling::QueueAndResend {
@@ -741,9 +736,7 @@ pub fn determine_inflight_handling(
     {
         return InFlightMessageHandling::Discard {
             discarded_count: queued_count,
-            reason: format!(
-                "messages older than blob TTL ({oldest_message_age_secs}s > {ttl}s)"
-            ),
+            reason: format!("messages older than blob TTL ({oldest_message_age_secs}s > {ttl}s)"),
         };
     }
 
@@ -882,12 +875,8 @@ mod tests {
     #[test]
     fn assess_broadcast_context_no_epoch_trigger() {
         // Broadcast context (no MLS) — only offline duration matters.
-        let result = assess_offline_state(
-            BASE_TIMESTAMP,
-            BASE_TIMESTAMP + EIGHT_DAYS_SECS,
-            None,
-            None,
-        );
+        let result =
+            assess_offline_state(BASE_TIMESTAMP, BASE_TIMESTAMP + EIGHT_DAYS_SECS, None, None);
         match result {
             OfflineAssessment::ForceReJoinRequired { triggers } => {
                 assert_eq!(triggers.len(), 1);
@@ -974,7 +963,10 @@ mod tests {
         assert_eq!(plan.state_preservation.membership_roster.len(), 2);
         assert!(matches!(
             plan.inflight_handling,
-            InFlightMessageHandling::Discard { discarded_count: 0, .. }
+            InFlightMessageHandling::Discard {
+                discarded_count: 0,
+                ..
+            }
         ));
     }
 
@@ -1055,7 +1047,10 @@ mod tests {
         let result = determine_inflight_handling(0, 500, Some(604_800), 0);
         assert!(matches!(
             result,
-            InFlightMessageHandling::Discard { discarded_count: 0, .. }
+            InFlightMessageHandling::Discard {
+                discarded_count: 0,
+                ..
+            }
         ));
     }
 
@@ -1455,7 +1450,10 @@ mod tests {
         assert_eq!(plan.state_preservation.local_event_count, 50_000);
         assert!(matches!(
             plan.inflight_handling,
-            InFlightMessageHandling::QueueAndResend { queued_count: 250, .. }
+            InFlightMessageHandling::QueueAndResend {
+                queued_count: 250,
+                ..
+            }
         ));
     }
 

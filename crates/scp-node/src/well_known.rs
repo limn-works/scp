@@ -25,9 +25,7 @@ use crate::http::NodeState;
 /// 18.6.4: "dynamically generated from node state").
 ///
 /// Returns `application/json` with the `WellKnownScp` payload.
-pub(crate) async fn well_known_handler(
-    State(state): State<Arc<NodeState>>,
-) -> impl IntoResponse {
+pub(crate) async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
     let contexts = {
         let guard = state.broadcast_contexts.read().await;
         if guard.is_empty() {

@@ -86,10 +86,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage list fails.
-    pub async fn list_adapter_credentials(
-        &self,
-        did: &DID,
-    ) -> Result<Vec<String>, StoreError> {
+    pub async fn list_adapter_credentials(&self, did: &DID) -> Result<Vec<String>, StoreError> {
         let prefix = adapter_credentials_prefix(did);
         let keys = self.storage.list_keys(&prefix).await?;
         let adapter_ids: Vec<String> = keys
@@ -128,16 +125,11 @@ impl<S: Storage> AdapterCredentialStore for ProtocolStore<S> {
     ) -> impl std::future::Future<Output = Result<(), CredentialError>> + Send {
         let credential = credential.clone();
         async move {
-            let data = rmp_serde::to_vec(&credential).map_err(|e| {
-                CredentialError::SerializationFailed(e.to_string())
-            })?;
-            self.store_adapter_credentials(
-                &credential.identity,
-                &credential.adapter_id,
-                &data,
-            )
-            .await
-            .map_err(|e| CredentialError::StorageError(e.to_string()))
+            let data = rmp_serde::to_vec(&credential)
+                .map_err(|e| CredentialError::SerializationFailed(e.to_string()))?;
+            self.store_adapter_credentials(&credential.identity, &credential.adapter_id, &data)
+                .await
+                .map_err(|e| CredentialError::StorageError(e.to_string()))
         }
     }
 
@@ -145,8 +137,7 @@ impl<S: Storage> AdapterCredentialStore for ProtocolStore<S> {
         &self,
         identity: &DID,
         adapter_id: &str,
-    ) -> impl std::future::Future<Output = Result<Option<AdapterCredential>, CredentialError>>
-           + Send
+    ) -> impl std::future::Future<Output = Result<Option<AdapterCredential>, CredentialError>> + Send
     {
         let identity = identity.clone();
         let adapter_id = adapter_id.to_owned();
@@ -157,10 +148,8 @@ impl<S: Storage> AdapterCredentialStore for ProtocolStore<S> {
                 .map_err(|e| CredentialError::StorageError(e.to_string()))?;
             match data {
                 Some(bytes) => {
-                    let credential: AdapterCredential =
-                        rmp_serde::from_slice(&bytes).map_err(|e| {
-                            CredentialError::DeserializationFailed(e.to_string())
-                        })?;
+                    let credential: AdapterCredential = rmp_serde::from_slice(&bytes)
+                        .map_err(|e| CredentialError::DeserializationFailed(e.to_string()))?;
                     Ok(Some(credential))
                 }
                 None => Ok(None),
@@ -233,10 +222,7 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = store
-            .load_adapter_credentials(&did, "x402")
-            .await
-            .unwrap();
+        let loaded = store.load_adapter_credentials(&did, "x402").await.unwrap();
         assert_eq!(loaded, Some(data));
     }
 
@@ -285,10 +271,7 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = store
-            .load_adapter_credentials(&did, "x402")
-            .await
-            .unwrap();
+        let loaded = store.load_adapter_credentials(&did, "x402").await.unwrap();
         assert!(loaded.is_none());
     }
 
@@ -313,10 +296,9 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded =
-            AdapterCredentialStore::load_adapter_credential(&store, &did, "x402")
-                .await
-                .unwrap();
+        let loaded = AdapterCredentialStore::load_adapter_credential(&store, &did, "x402")
+            .await
+            .unwrap();
         assert_eq!(loaded, Some(credential));
     }
 
@@ -338,10 +320,9 @@ mod tests {
                 .unwrap();
         }
 
-        let mut ids =
-            AdapterCredentialStore::list_adapter_credentials(&store, &did)
-                .await
-                .unwrap();
+        let mut ids = AdapterCredentialStore::list_adapter_credentials(&store, &did)
+            .await
+            .unwrap();
         ids.sort();
         assert_eq!(ids, vec!["spl", "x402"]);
     }
@@ -375,16 +356,14 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded_a =
-            AdapterCredentialStore::load_adapter_credential(&store, &did_a, "x402")
-                .await
-                .unwrap()
-                .unwrap();
-        let loaded_b =
-            AdapterCredentialStore::load_adapter_credential(&store, &did_b, "x402")
-                .await
-                .unwrap()
-                .unwrap();
+        let loaded_a = AdapterCredentialStore::load_adapter_credential(&store, &did_a, "x402")
+            .await
+            .unwrap()
+            .unwrap();
+        let loaded_b = AdapterCredentialStore::load_adapter_credential(&store, &did_b, "x402")
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(loaded_a.encrypted_data, vec![0xAA]);
         assert_eq!(loaded_b.encrypted_data, vec![0xBB]);
@@ -410,10 +389,9 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded =
-            AdapterCredentialStore::load_adapter_credential(&store, &did, "x402")
-                .await
-                .unwrap();
+        let loaded = AdapterCredentialStore::load_adapter_credential(&store, &did, "x402")
+            .await
+            .unwrap();
         assert!(loaded.is_none());
     }
 
@@ -432,9 +410,6 @@ mod tests {
     fn adapter_credentials_prefix_follows_convention() {
         let did = DID::from("did:dht:z6MkTest");
         let prefix = adapter_credentials_prefix(&did);
-        assert_eq!(
-            prefix,
-            "identity/did:dht:z6MkTest/adapter_credentials/"
-        );
+        assert_eq!(prefix, "identity/did:dht:z6MkTest/adapter_credentials/");
     }
 }

@@ -67,9 +67,7 @@ struct Ledger {
 // ---------------------------------------------------------------------------
 
 /// Acquires the ledger lock, mapping poison errors to [`PaymentError`].
-fn lock_ledger(
-    mutex: &Mutex<Ledger>,
-) -> Result<MutexGuard<'_, Ledger>, PaymentError> {
+fn lock_ledger(mutex: &Mutex<Ledger>) -> Result<MutexGuard<'_, Ledger>, PaymentError> {
     mutex
         .lock()
         .map_err(|_: PoisonError<_>| PaymentError::AdapterError("ledger lock poisoned".to_owned()))
@@ -282,10 +280,7 @@ impl PaymentAdapter for TestAdapter {
         })
     }
 
-    async fn capture(
-        &self,
-        auth: &PaymentAuthorization,
-    ) -> Result<PaymentReceipt, PaymentError> {
+    async fn capture(&self, auth: &PaymentAuthorization) -> Result<PaymentReceipt, PaymentError> {
         let mut ledger = lock_ledger(&self.inner)?;
 
         let hold = ledger
@@ -353,10 +348,7 @@ impl PaymentAdapter for TestAdapter {
         Ok(receipt)
     }
 
-    async fn void(
-        &self,
-        auth: &PaymentAuthorization,
-    ) -> Result<(), PaymentError> {
+    async fn void(&self, auth: &PaymentAuthorization) -> Result<(), PaymentError> {
         let mut ledger = lock_ledger(&self.inner)?;
 
         let hold = ledger
@@ -393,20 +385,15 @@ impl PaymentAdapter for TestAdapter {
         Ok(())
     }
 
-    async fn verify_authorization(
-        &self,
-        auth: &PaymentAuthorization,
-    ) -> Result<(), PaymentError> {
+    async fn verify_authorization(&self, auth: &PaymentAuthorization) -> Result<(), PaymentError> {
         let ledger = lock_ledger(&self.inner)?;
 
         // Check if we issued this authorization and it's still pending.
         match ledger.holds.get(&auth.auth_id) {
             Some(hold) if hold.state == AuthState::Pending => Ok(()),
-            Some(hold) if hold.state == AuthState::Voided => {
-                Err(PaymentError::AlreadyVoided {
-                    auth_id: auth.auth_id,
-                })
-            }
+            Some(hold) if hold.state == AuthState::Voided => Err(PaymentError::AlreadyVoided {
+                auth_id: auth.auth_id,
+            }),
             Some(_) => Err(PaymentError::AlreadyCaptured {
                 auth_id: auth.auth_id,
             }),
@@ -416,10 +403,7 @@ impl PaymentAdapter for TestAdapter {
         }
     }
 
-    async fn verify(
-        &self,
-        receipt: &PaymentReceipt,
-    ) -> Result<VerificationResult, PaymentError> {
+    async fn verify(&self, receipt: &PaymentReceipt) -> Result<VerificationResult, PaymentError> {
         let ledger = lock_ledger(&self.inner)?;
 
         // Check if we have this receipt on record.
@@ -524,7 +508,9 @@ impl PaymentAdapter for TestAdapter {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use scp_core::economy::{Amount, CurrencyCode, PaidActionType, PaymentAdapter, PaymentMetadata};
+    use scp_core::economy::{
+        Amount, CurrencyCode, PaidActionType, PaymentAdapter, PaymentMetadata,
+    };
 
     use crate::conformance::payment::test_helpers::{payee_did, payer_did};
 

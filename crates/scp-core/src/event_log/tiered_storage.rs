@@ -477,12 +477,9 @@ impl TieredEventLog {
         self.global_index_offset += count;
 
         // Rebuild the hot log from remaining leaves.
-        let remaining_leaves: Vec<[u8; 32]> =
-            hot_leaves[count_usize..].to_vec();
-        let remaining_timestamps: Vec<u64> =
-            self.hot_timestamps[count_usize..].to_vec();
-        let remaining_byte_sizes: Vec<u64> =
-            self.hot_byte_sizes[count_usize..].to_vec();
+        let remaining_leaves: Vec<[u8; 32]> = hot_leaves[count_usize..].to_vec();
+        let remaining_timestamps: Vec<u64> = self.hot_timestamps[count_usize..].to_vec();
+        let remaining_byte_sizes: Vec<u64> = self.hot_byte_sizes[count_usize..].to_vec();
 
         let context_id = self.hot.context_id().to_owned();
         self.hot = EventLog::new(context_id);
@@ -864,10 +861,7 @@ mod tests {
 
     /// Build a Merkle proof path from a leaf to the root using the full
     /// leaf set (ghost tree).
-    fn build_ghost_proof_path(
-        leaf_idx: usize,
-        leaves: &[[u8; 32]],
-    ) -> Vec<ProofStep> {
+    fn build_ghost_proof_path(leaf_idx: usize, leaves: &[[u8; 32]]) -> Vec<ProofStep> {
         if leaves.len() <= 1 {
             return Vec::new();
         }

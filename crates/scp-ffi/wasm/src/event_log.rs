@@ -191,11 +191,9 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
     future_to_promise(async move {
         // Validate filter JSON if provided.
         if let Some(ref filter) = filter_json {
-            let _f: serde_json::Value = serde_json::from_str(filter)
-                .map_err(|e| ScpWasmError::Validation(format!(
-                    "filter_json is not valid JSON: {e}"
-                ))
-                .into_js())?;
+            let _f: serde_json::Value = serde_json::from_str(filter).map_err(|e| {
+                ScpWasmError::Validation(format!("filter_json is not valid JSON: {e}")).into_js()
+            })?;
         }
 
         let _ = context_id;
@@ -240,11 +238,9 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
     let context_id = context.context_id();
     future_to_promise(async move {
         // Validate claim_json.
-        let _claim: serde_json::Value = serde_json::from_str(&claim_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
-                "claim_json is not valid JSON: {e}"
-            ))
-            .into_js())?;
+        let _claim: serde_json::Value = serde_json::from_str(&claim_json).map_err(|e| {
+            ScpWasmError::Validation(format!("claim_json is not valid JSON: {e}")).into_js()
+        })?;
 
         let _ = context_id;
 

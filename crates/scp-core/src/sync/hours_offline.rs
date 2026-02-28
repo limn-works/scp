@@ -28,11 +28,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DID;
 use super::{
-    CatchUpStatus, ContextId, Ed25519Signature, OfflineTier, SyncError, SyncOutcome,
-    GAP_TIMEOUT, MAX_SEQUENTIAL_COMMITS, REORDER_BUFFER_CAPACITY,
+    CatchUpStatus, ContextId, Ed25519Signature, GAP_TIMEOUT, MAX_SEQUENTIAL_COMMITS, OfflineTier,
+    REORDER_BUFFER_CAPACITY, SyncError, SyncOutcome,
 };
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // RelayMessageBuffer
@@ -147,8 +147,7 @@ impl RelayMessageBuffer {
     ///
     /// After this call the buffer is empty.
     pub fn drain_sorted(mut self) -> Vec<BufferedMessage> {
-        self.messages
-            .sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
+        self.messages.sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
         self.messages
     }
 }
@@ -198,9 +197,8 @@ impl EpochCatchUpState {
     /// Returns the number of epochs remaining to catch up.
     #[must_use]
     pub fn epochs_remaining(&self) -> u64 {
-        self.target_epoch.saturating_sub(
-            self.local_epoch.saturating_add(self.commits_processed),
-        )
+        self.target_epoch
+            .saturating_sub(self.local_epoch.saturating_add(self.commits_processed))
     }
 
     /// Returns `true` if the epoch gap exceeds the sequential processing limit.
@@ -225,8 +223,7 @@ impl EpochCatchUpState {
 
     /// Transitions to fast-forward status, recording the skipped epoch range.
     pub fn transition_to_fast_forward(&mut self) {
-        let current =
-            self.local_epoch.saturating_add(self.commits_processed);
+        let current = self.local_epoch.saturating_add(self.commits_processed);
         self.status = CatchUpStatus::FastForwarded {
             skipped_from: current,
             skipped_to: self.target_epoch,
@@ -404,19 +401,14 @@ impl ReorderBuffer {
     /// capacity and the message cannot be inserted without exceeding it.
     /// In this case the caller should call [`force_drain`](Self::force_drain)
     /// first.
-    pub fn insert(
-        &mut self,
-        entry: ReorderEntry,
-    ) -> Result<Vec<ReorderEntry>, SyncError> {
+    pub fn insert(&mut self, entry: ReorderEntry) -> Result<Vec<ReorderEntry>, SyncError> {
         // Discard messages with sequence numbers below what we've already delivered.
         if entry.sequence < self.next_expected {
             return Ok(Vec::new());
         }
 
         // Check capacity before inserting.
-        if self.entries.len() >= self.capacity
-            && !self.entries.contains_key(&entry.sequence)
-        {
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&entry.sequence) {
             return Err(SyncError::ReorderBufferOverflow {
                 context_id: self.context_id.clone(),
                 buffered: self.entries.len(),
@@ -490,11 +482,7 @@ impl ReorderBuffer {
     /// are delivered regardless of gaps. `next_expected` advances past the
     /// highest delivered sequence number.
     pub fn force_drain(&mut self) -> Vec<ReorderEntry> {
-        let mut delivered: Vec<ReorderEntry> = self
-            .entries
-            .values()
-            .cloned()
-            .collect();
+        let mut delivered: Vec<ReorderEntry> = self.entries.values().cloned().collect();
         delivered.sort_by_key(|e| e.sequence);
         if let Some(last) = delivered.last() {
             self.next_expected = last.sequence.saturating_add(1);
@@ -887,10 +875,7 @@ impl NetworkSimulator {
         payload: Vec<u8>,
         epoch: Option<u64>,
     ) {
-        let buffer = self
-            .relay_buffers
-            .entry(context_id.to_owned())
-            .or_default();
+        let buffer = self.relay_buffers.entry(context_id.to_owned()).or_default();
 
         // Enforce relay buffer capacity.
         if buffer.len() >= self.condition.relay_buffer_capacity {
@@ -941,9 +926,7 @@ impl NetworkSimulator {
     /// Returns the number of messages buffered for a context.
     #[must_use]
     pub fn buffered_count(&self, context_id: &str) -> usize {
-        self.relay_buffers
-            .get(context_id)
-            .map_or(0, Vec::len)
+        self.relay_buffers.get(context_id).map_or(0, Vec::len)
     }
 }
 
@@ -1219,8 +1202,7 @@ mod tests {
 
     #[test]
     fn reorder_buffer_overflow_returns_error() {
-        let mut buf =
-            ReorderBuffer::with_config("ctx-1".to_owned(), 0, 3, GAP_TIMEOUT);
+        let mut buf = ReorderBuffer::with_config("ctx-1".to_owned(), 0, 3, GAP_TIMEOUT);
 
         // Fill to capacity (seq 1, 2, 3 — gap at 0).
         let _ = buf.insert(ReorderEntry {
@@ -1291,11 +1273,7 @@ mod tests {
     fn key_package_pre_publisher_records_publication() {
         let mut pp = KeyPackagePrePublisher::new(DID::from("did:dht:z6MkAlice"));
         pp.record_published(
-            vec![
-                "kp-1".to_owned(),
-                "kp-2".to_owned(),
-                "kp-3".to_owned(),
-            ],
+            vec!["kp-1".to_owned(), "kp-2".to_owned(), "kp-3".to_owned()],
             1000,
         );
         assert_eq!(pp.published_count, 3);
@@ -1306,8 +1284,7 @@ mod tests {
 
     #[test]
     fn key_package_pre_publisher_records_consumption() {
-        let mut pp =
-            KeyPackagePrePublisher::with_min_published(DID::from("did:dht:z6MkBob"), 2);
+        let mut pp = KeyPackagePrePublisher::with_min_published(DID::from("did:dht:z6MkBob"), 2);
         pp.record_published(vec!["kp-1".to_owned(), "kp-2".to_owned()], 1000);
         assert!(!pp.needs_replenish());
 
@@ -1413,8 +1390,7 @@ mod tests {
             mls_update_issued: true,
             outcome: SyncOutcome::FullyCaughtUp,
         }];
-        let report =
-            ReconnectionCoordinator::build_report(results, 15, 3, 2500);
+        let report = ReconnectionCoordinator::build_report(results, 15, 3, 2500);
         assert_eq!(report.contexts_synced.len(), 1);
         assert_eq!(report.messages_drained, 15);
         assert_eq!(report.messages_discarded, 3);
@@ -1501,8 +1477,7 @@ mod tests {
         );
 
         // Feed into a RelayMessageBuffer for dedup.
-        let mut relay_buf =
-            RelayMessageBuffer::new("ctx-1".to_owned(), 1_000_000);
+        let mut relay_buf = RelayMessageBuffer::new("ctx-1".to_owned(), 1_000_000);
         for msg in &messages {
             relay_buf.ingest(msg.clone());
         }
@@ -1540,8 +1515,7 @@ mod tests {
     #[test]
     fn network_simulator_epoch_catch_up_within_limit() {
         // Simulate an offline period with 50 epoch advances.
-        let mut catch_up =
-            EpochCatchUpState::new("ctx-1".to_owned(), 10, 60);
+        let mut catch_up = EpochCatchUpState::new("ctx-1".to_owned(), 10, 60);
         assert!(!catch_up.exceeds_sequential_limit());
         assert_eq!(catch_up.epochs_remaining(), 50);
 
@@ -1558,8 +1532,7 @@ mod tests {
     #[test]
     fn network_simulator_epoch_catch_up_exceeds_limit_falls_back() {
         // Simulate an offline period with 150 epoch advances.
-        let mut catch_up =
-            EpochCatchUpState::new("ctx-1".to_owned(), 10, 160);
+        let mut catch_up = EpochCatchUpState::new("ctx-1".to_owned(), 10, 160);
         assert!(catch_up.exceeds_sequential_limit());
 
         // Process up to the limit.
@@ -1637,29 +1610,22 @@ mod tests {
         assert_eq!(tier, OfflineTier::Short);
 
         // Retrieve buffered messages.
-        let relay_buf_start =
-            last_contact.saturating_sub(5); // 5-second overlap
+        let relay_buf_start = last_contact.saturating_sub(5); // 5-second overlap
         let messages = sim
             .retrieve_messages("ctx-1", relay_buf_start)
             .unwrap_or_default();
         assert!(!messages.is_empty());
 
         // Feed into relay message buffer for dedup.
-        let mut relay_buf =
-            RelayMessageBuffer::new("ctx-1".to_owned(), last_contact);
+        let mut relay_buf = RelayMessageBuffer::new("ctx-1".to_owned(), last_contact);
         for msg in &messages {
             relay_buf.ingest(msg.clone());
         }
         assert_eq!(relay_buf.message_count(), messages.len());
 
         // Epoch catch-up (max epoch in messages).
-        let max_epoch = messages
-            .iter()
-            .filter_map(|m| m.epoch)
-            .max()
-            .unwrap_or(1);
-        let mut catch_up =
-            EpochCatchUpState::new("ctx-1".to_owned(), 1, max_epoch);
+        let max_epoch = messages.iter().filter_map(|m| m.epoch).max().unwrap_or(1);
+        let mut catch_up = EpochCatchUpState::new("ctx-1".to_owned(), 1, max_epoch);
         assert!(!catch_up.exceeds_sequential_limit());
 
         // Process epochs.
@@ -1697,12 +1663,7 @@ mod tests {
         assert!(sync_result.mls_update_issued);
 
         // Build report.
-        let report = ReconnectionCoordinator::build_report(
-            vec![sync_result],
-            0,
-            0,
-            150,
-        );
+        let report = ReconnectionCoordinator::build_report(vec![sync_result], 0, 0, 150);
         assert_eq!(report.contexts_synced.len(), 1);
         assert_eq!(
             report.contexts_synced[0].outcome,
@@ -1795,18 +1756,14 @@ mod tests {
 
     #[test]
     fn key_package_pre_publisher_full_lifecycle() {
-        let mut pp =
-            KeyPackagePrePublisher::with_min_published(DID::from("did:dht:z6MkCarol"), 5);
+        let mut pp = KeyPackagePrePublisher::with_min_published(DID::from("did:dht:z6MkCarol"), 5);
 
         // Initially needs replenish.
         assert!(pp.needs_replenish());
         assert_eq!(pp.replenish_count(), 5);
 
         // Publish 5 KeyPackages.
-        pp.record_published(
-            (0..5).map(|i| format!("kp-{i}")).collect(),
-            1000,
-        );
+        pp.record_published((0..5).map(|i| format!("kp-{i}")).collect(), 1000);
         assert!(!pp.needs_replenish());
         assert_eq!(pp.published_count, 5);
 

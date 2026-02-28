@@ -117,10 +117,7 @@ impl PaymentAdapter for TestAdapter {
         })
     }
 
-    async fn capture(
-        &self,
-        auth: &PaymentAuthorization,
-    ) -> Result<PaymentReceipt, PaymentError> {
+    async fn capture(&self, auth: &PaymentAuthorization) -> Result<PaymentReceipt, PaymentError> {
         if let Some(ref err) = self.capture_fail {
             return Err(err.clone());
         }
@@ -146,10 +143,7 @@ impl PaymentAdapter for TestAdapter {
         Ok(())
     }
 
-    async fn verify(
-        &self,
-        _receipt: &PaymentReceipt,
-    ) -> Result<VerificationResult, PaymentError> {
+    async fn verify(&self, _receipt: &PaymentReceipt) -> Result<VerificationResult, PaymentError> {
         Ok(VerificationResult {
             valid: true,
             adapter_id: self.id.to_owned(),
@@ -159,10 +153,7 @@ impl PaymentAdapter for TestAdapter {
         })
     }
 
-    async fn verify_authorization(
-        &self,
-        _auth: &PaymentAuthorization,
-    ) -> Result<(), PaymentError> {
+    async fn verify_authorization(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
         Ok(())
     }
 
@@ -290,9 +281,7 @@ fn make_payment_event(receipt: &PaymentReceipt, sequence: u64) -> Event {
         actor_did: receipt.payer.clone(),
         timestamp: receipt.timestamp,
         sequence,
-        payload: EventPayload {
-            data: payload_data,
-        },
+        payload: EventPayload { data: payload_data },
         prev_hash: [0u8; 32],
         signature: vec![0xFF; 64],
     }
@@ -698,7 +687,11 @@ fn invariant_3_estimate_cost_zero_without_policy() {
         PaidActionType::ByteStored,
     ] {
         let cost = estimate_cost(None, action, &metrics);
-        assert_eq!(cost, Some(Amount(0)), "action {action:?} should be free without policy");
+        assert_eq!(
+            cost,
+            Some(Amount(0)),
+            "action {action:?} should be free without policy"
+        );
     }
 }
 
@@ -1028,7 +1021,7 @@ fn invariant_6_unlocked_policy_update_succeeds() {
         locked: false,
         cost_schedule: CostSchedule {
             currency: usd(),
-            per_message: Some(Amount(20)), // Updated cost.
+            per_message: Some(Amount(20)),      // Updated cost.
             per_tool_invoke: Some(Amount(100)), // New cost.
             per_join: None,
             per_period: None,
@@ -1233,16 +1226,25 @@ fn invariant_8_bootstrap_list_has_free_relay() {
 
     // Validate: list with free relay passes.
     let relays = vec![&free_relay, &paid_relay];
-    let has_free = relays
-        .iter()
-        .any(|r| r.relay_config.as_ref().and_then(|rc| rc.economic.as_ref()).is_none());
-    assert!(has_free, "bootstrap list must include at least one free relay");
+    let has_free = relays.iter().any(|r| {
+        r.relay_config
+            .as_ref()
+            .and_then(|rc| rc.economic.as_ref())
+            .is_none()
+    });
+    assert!(
+        has_free,
+        "bootstrap list must include at least one free relay"
+    );
 
     // Validate: list with only paid relays fails.
     let paid_only = vec![&paid_relay];
-    let has_free_in_paid_only = paid_only
-        .iter()
-        .any(|r| r.relay_config.as_ref().and_then(|rc| rc.economic.as_ref()).is_none());
+    let has_free_in_paid_only = paid_only.iter().any(|r| {
+        r.relay_config
+            .as_ref()
+            .and_then(|rc| rc.economic.as_ref())
+            .is_none()
+    });
     assert!(
         !has_free_in_paid_only,
         "list of only paid relays should NOT have a free relay"
@@ -1265,7 +1267,10 @@ fn invariant_8_no_relay_config_is_free() {
         .as_ref()
         .and_then(|rc| rc.economic.as_ref())
         .is_none();
-    assert!(is_free, "relay without relay_config should be treated as free");
+    assert!(
+        is_free,
+        "relay without relay_config should be treated as free"
+    );
 }
 
 // ===========================================================================
@@ -1553,25 +1558,17 @@ fn integration_anti_spam_with_cap() {
     let tracker = SenderVelocityTracker::new(60);
     let sender = DID::from("did:dht:z6MkSpammer");
     let config = EscalationConfig {
-        thresholds: vec![
-            EscalationThreshold {
-                velocity_threshold: 1,
-                additional_cost: Amount(1000),
-            },
-        ],
+        thresholds: vec![EscalationThreshold {
+            velocity_threshold: 1,
+            additional_cost: Amount(1000),
+        }],
     };
 
     tracker.record_message(&sender, 100);
 
     // Cap at 500.
-    let cost = tracker.compute_escalated_cost(
-        &sender,
-        100,
-        Amount(100),
-        &config,
-        None,
-        Some(Amount(500)),
-    );
+    let cost =
+        tracker.compute_escalated_cost(&sender, 100, Amount(100), &config, None, Some(Amount(500)));
     assert_eq!(cost, Amount(500), "cost should be clamped to cap");
 }
 
@@ -1593,11 +1590,7 @@ fn integration_anti_spam_via_pricing_formula() {
             base_cost: Amount(0),
             variables: vec![PricingVariable::Step {
                 metric: PricingMetric::SenderVelocity,
-                thresholds: vec![
-                    (10, Amount(1)),
-                    (50, Amount(10)),
-                    (200, Amount(100)),
-                ],
+                thresholds: vec![(10, Amount(1)), (50, Amount(10)), (200, Amount(100))],
             }],
             cap: Some(Amount(1000)),
             floor: None,
@@ -1711,7 +1704,10 @@ fn integration_budget_tracker_per_action_limit() {
     );
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), SpendingError::PerActionLimitExceeded { .. }),
+        matches!(
+            result.unwrap_err(),
+            SpendingError::PerActionLimitExceeded { .. }
+        ),
         "expected PerActionLimitExceeded"
     );
 }
@@ -1808,7 +1804,10 @@ fn integration_merkle_tree_with_economic_events() {
     // Every leaf has a valid inclusion proof.
     for i in 0..3 {
         let proof = prove_inclusion(&log, i).unwrap();
-        assert!(verify_inclusion(&proof), "inclusion proof for leaf {i} should verify");
+        assert!(
+            verify_inclusion(&proof),
+            "inclusion proof for leaf {i} should verify"
+        );
     }
 
     // Root hash is consistent.

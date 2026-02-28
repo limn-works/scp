@@ -84,11 +84,10 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
         }
 
         // Attempt to deserialize the receipt from the event payload.
-        let receipt: PaymentReceipt =
-            match serde_json::from_slice(&event.payload.data) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+        let receipt: PaymentReceipt = match serde_json::from_slice(&event.payload.data) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
 
         // Apply optional filter.
         if let Some(f) = filter {
@@ -133,12 +132,7 @@ mod tests {
     use crate::identity::DID;
 
     /// Creates a test `PaymentReceipt`.
-    fn make_receipt(
-        payer: &str,
-        payee: &str,
-        amount: u64,
-        timestamp: u64,
-    ) -> PaymentReceipt {
+    fn make_receipt(payer: &str, payee: &str, amount: u64, timestamp: u64) -> PaymentReceipt {
         PaymentReceipt {
             receipt_id: [0xAA; 32],
             payer: DID::from(payer),
@@ -163,9 +157,7 @@ mod tests {
             actor_did: receipt.payer.clone(),
             timestamp: receipt.timestamp,
             sequence,
-            payload: EventPayload {
-                data: payload_data,
-            },
+            payload: EventPayload { data: payload_data },
             prev_hash: [0u8; 32],
             signature: vec![0xFF; 64],
         }
@@ -378,10 +370,7 @@ mod tests {
             signature: vec![0xFF; 64],
         };
 
-        let events = vec![
-            bad_event,
-            make_payment_event(&good_receipt, 1),
-        ];
+        let events = vec![bad_event, make_payment_event(&good_receipt, 1)];
 
         let history = payment_history(&events, None);
         assert_eq!(history.len(), 1);
@@ -460,9 +449,18 @@ mod tests {
         assert_ne!(EventType::PaymentReceived, EventType::EconomicPolicyChanged);
         assert_ne!(EventType::PaymentReceived, EventType::SpendingUcanGranted);
         assert_ne!(EventType::PaymentReceived, EventType::SpendingUcanRevoked);
-        assert_ne!(EventType::EconomicPolicyChanged, EventType::SpendingUcanGranted);
-        assert_ne!(EventType::EconomicPolicyChanged, EventType::SpendingUcanRevoked);
-        assert_ne!(EventType::SpendingUcanGranted, EventType::SpendingUcanRevoked);
+        assert_ne!(
+            EventType::EconomicPolicyChanged,
+            EventType::SpendingUcanGranted
+        );
+        assert_ne!(
+            EventType::EconomicPolicyChanged,
+            EventType::SpendingUcanRevoked
+        );
+        assert_ne!(
+            EventType::SpendingUcanGranted,
+            EventType::SpendingUcanRevoked
+        );
     }
 
     // -------------------------------------------------------------------

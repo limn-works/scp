@@ -176,15 +176,17 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn ucan_mint(context: &WasmContextHandle, member_did: String, capabilities_json: String) -> Promise {
+pub fn ucan_mint(
+    context: &WasmContextHandle,
+    member_did: String,
+    capabilities_json: String,
+) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
         // Validate that capabilities_json is a valid JSON array.
-        let caps: serde_json::Value = serde_json::from_str(&capabilities_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
-                "capabilities_json is not valid JSON: {e}"
-            ))
-            .into_js())?;
+        let caps: serde_json::Value = serde_json::from_str(&capabilities_json).map_err(|e| {
+            ScpWasmError::Validation(format!("capabilities_json is not valid JSON: {e}")).into_js()
+        })?;
 
         if !caps.is_array() {
             return Err(ScpWasmError::Validation(

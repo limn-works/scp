@@ -47,7 +47,9 @@ pub enum InvitationError {
 
     /// No compatible payment adapter is configured for this context's
     /// accepted adapters.
-    #[error("no compatible payment adapter: context accepts {accepted:?}, configured {configured:?}")]
+    #[error(
+        "no compatible payment adapter: context accepts {accepted:?}, configured {configured:?}"
+    )]
     NoCompatibleAdapter {
         /// Adapters accepted by the context's economic policy.
         accepted: Vec<String>,
@@ -737,14 +739,8 @@ mod tests {
         let mut tracker = RateLimitTracker::new();
 
         // Bob invites, but only Alice is in the explicit list.
-        let result = evaluate_invitation(
-            &params,
-            &bob(),
-            Some(&policy),
-            None,
-            &oracle,
-            &mut tracker,
-        );
+        let result =
+            evaluate_invitation(&params, &bob(), Some(&policy), None, &oracle, &mut tracker);
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
 
         // Alice invites -- should auto-accept.

@@ -97,14 +97,18 @@ impl CertificateData {
     /// # Errors
     ///
     /// Returns [`TlsError::Certificate`] if the PEM data cannot be parsed.
-    pub fn certificate_chain_der(&self) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
+    pub fn certificate_chain_der(
+        &self,
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
         let mut reader = std::io::BufReader::new(self.certificate_chain_pem.as_bytes());
         let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| TlsError::Certificate(format!("failed to parse PEM certificates: {e}")))?;
 
         if certs.is_empty() {
-            return Err(TlsError::Certificate("no certificates found in PEM data".to_owned()));
+            return Err(TlsError::Certificate(
+                "no certificates found in PEM data".to_owned(),
+            ));
         }
 
         Ok(certs)
@@ -136,8 +140,9 @@ impl CertificateData {
             .first()
             .ok_or_else(|| TlsError::Certificate("empty certificate chain".to_owned()))?;
 
-        let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref())
-            .map_err(|e| TlsError::Certificate(format!("failed to parse X.509 certificate: {e}")))?;
+        let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).map_err(|e| {
+            TlsError::Certificate(format!("failed to parse X.509 certificate: {e}"))
+        })?;
 
         Ok(cert.validity().not_after.timestamp())
     }
@@ -315,10 +320,7 @@ impl CertResolver {
 }
 
 impl ResolvesServerCert for CertResolver {
-    fn resolve(
-        &self,
-        _client_hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<CertifiedKey>> {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // `try_read()` is non-blocking and appropriate for the synchronous
         // `resolve` callback. If a write is in progress (certificate update),
         // this returns `None` and rustls will reject the handshake — the next
@@ -423,9 +425,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     /// Returns [`TlsError::Acme`] if any ACME protocol step fails.
     /// Returns [`TlsError::Storage`] if certificate storage fails.
     pub async fn provision(&self) -> Result<CertificateData, TlsError> {
-        use instant_acme::{
-            Account, Identifier, NewAccount, NewOrder,
-        };
+        use instant_acme::{Account, Identifier, NewAccount, NewOrder};
 
         // 1. Create ACME account.
         let contacts: Vec<String> = self
@@ -713,7 +713,11 @@ mod tests {
     fn certificate_chain_der_parses_pem() {
         let cert = generate_self_signed("test.example.com").unwrap();
         let der_certs = cert.certificate_chain_der().unwrap();
-        assert_eq!(der_certs.len(), 1, "self-signed should have exactly one cert");
+        assert_eq!(
+            der_certs.len(),
+            1,
+            "self-signed should have exactly one cert"
+        );
     }
 
     #[test]

@@ -228,10 +228,7 @@ mod tests {
         let provenance = DataProvenance {
             source_context: "ctx-abc-123".to_string(),
             source_type: SourceType::Persistent,
-            counterparties: vec![
-                "did:dht:z6MkAlice".into(),
-                "did:dht:z6MkBob".into(),
-            ],
+            counterparties: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
             purpose: Some("recipe sharing".to_string()),
             discovery_method: DiscoveryMethod::SharedContext("ctx-shared".to_string()),
             age: Duration::from_secs(300),

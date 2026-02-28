@@ -18,10 +18,10 @@ use super::builder::{
     create_context as builder_create_context,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
-use crate::identity::DID;
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
 use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use super::{ContextError, ContextHandle, ContextParams, ContextState};
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // PerContextState -- internal per-context tracking
@@ -53,7 +53,9 @@ struct PerContextState {
 /// guaranteeing that no concurrent `close_context` or `handle_ttl_expiry` can
 /// interleave between the check and the mutation.
 fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
-    let state = handle.try_read_state().ok_or(ContextError::ContextNotActive)?;
+    let state = handle
+        .try_read_state()
+        .ok_or(ContextError::ContextNotActive)?;
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
     }
@@ -511,7 +513,12 @@ impl ContextManager {
             .lock()
             .await
             .get(context_id)
-            .map(|ctx| ctx.membership.member_dids().map(|d| d.to_string()).collect())
+            .map(|ctx| {
+                ctx.membership
+                    .member_dids()
+                    .map(|d| d.to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -858,11 +865,7 @@ mod tests {
             Ok(())
         }
 
-        fn add_member(
-            &self,
-            _context_id: &[u8; 32],
-            member_did: &str,
-        ) -> Result<(), ContextError> {
+        fn add_member(&self, _context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
             self.members_added
                 .lock()
                 .unwrap()
@@ -1196,7 +1199,11 @@ mod tests {
 
         // Remove the only member (creator -- self-removal).
         let result = manager
-            .leave_context(&handle, &"did:key:creator".into(), &"did:key:creator".into())
+            .leave_context(
+                &handle,
+                &"did:key:creator".into(),
+                &"did:key:creator".into(),
+            )
             .await;
         assert!(result.is_ok());
 
@@ -1246,7 +1253,11 @@ mod tests {
         handle.transition_to(&ContextState::Closing).await.unwrap();
 
         let result = manager
-            .leave_context(&handle, &"did:key:creator".into(), &"did:key:creator".into())
+            .leave_context(
+                &handle,
+                &"did:key:creator".into(),
+                &"did:key:creator".into(),
+            )
             .await;
         assert!(result.is_err());
         assert!(matches!(

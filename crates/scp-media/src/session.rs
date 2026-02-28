@@ -156,8 +156,7 @@ impl SessionMetadata {
     ///
     /// Returns [`MediaError::MetadataSerializationFailed`] if serialization fails.
     pub fn to_payload_bytes(&self) -> Result<Vec<u8>, MediaError> {
-        serde_json::to_vec(self)
-            .map_err(|e| MediaError::MetadataSerializationFailed(e.to_string()))
+        serde_json::to_vec(self).map_err(|e| MediaError::MetadataSerializationFailed(e.to_string()))
     }
 }
 
@@ -471,7 +470,9 @@ mod tests {
     fn check_capability_video_missing_from_voice_ceiling_fails() {
         let ceiling = voice_ceiling();
         let err = check_media_capability(&ceiling, &MediaCapability::Video).unwrap_err();
-        assert!(matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media.video"));
+        assert!(
+            matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media.video")
+        );
     }
 
     #[test]
@@ -530,7 +531,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media.video"));
+        assert!(
+            matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media.video")
+        );
     }
 
     #[test]
@@ -598,7 +601,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(s1.session_id, s2.session_id, "same inputs must produce same session ID");
+        assert_eq!(
+            s1.session_id, s2.session_id,
+            "same inputs must produce same session ID"
+        );
     }
 
     #[test]
@@ -621,7 +627,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_ne!(s1.session_id, s2.session_id, "different participants must produce different IDs");
+        assert_ne!(
+            s1.session_id, s2.session_id,
+            "different participants must produce different IDs"
+        );
     }
 
     // ── activate_session ───────────────────────────────────────────────
@@ -726,7 +735,11 @@ mod tests {
         activate_session(&mut session).unwrap();
 
         join_media_session(&mut session, ALICE.into()).unwrap();
-        assert_eq!(session.participants.len(), 1, "duplicate DID should not be added");
+        assert_eq!(
+            session.participants.len(),
+            1,
+            "duplicate DID should not be added"
+        );
     }
 
     #[test]

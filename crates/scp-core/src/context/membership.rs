@@ -313,9 +313,7 @@ impl ReceiveBuffer {
             self.dropped_since_last_consume += 1;
 
             // Update the existing overflow marker's count in place.
-            if let Some(ContextEvent::BufferOverflow { dropped_count }) =
-                self.events.back_mut()
-            {
+            if let Some(ContextEvent::BufferOverflow { dropped_count }) = self.events.back_mut() {
                 *dropped_count = self.dropped_since_last_consume;
             }
 

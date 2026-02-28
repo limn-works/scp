@@ -112,9 +112,9 @@ pub use memory_scope::{
 
 // Re-export nesting types (SCP-134, spec section 5.13).
 pub use nesting::{
-    ApprovalRequirement, ContextNesting, MlsGroupContextExtension, NestingError, OnSeverPolicy,
-    ParentGovernanceConfig, ParentRef, SeverAction, compute_ceiling_intersection,
-    validate_child_ttl, validate_nesting_depth, MAX_NESTING_DEPTH,
+    ApprovalRequirement, ContextNesting, MAX_NESTING_DEPTH, MlsGroupContextExtension, NestingError,
+    OnSeverPolicy, ParentGovernanceConfig, ParentRef, SeverAction, compute_ceiling_intersection,
+    validate_child_ttl, validate_nesting_depth,
 };
 
 // Re-export auto-accept policy types (SCP-135).
@@ -137,8 +137,7 @@ pub use standing::{StandingChannelError, StandingChannelManager};
 pub use governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    SignedVote, SingleAdminEngine, VoteType,
-    majority::MajorityVoteEngine,
+    SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).

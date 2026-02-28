@@ -480,11 +480,11 @@ fn validate_economic_policy_for_template(
 ) -> Result<(), TemplateError> {
     match template_id {
         TemplateId::PaidService => {
-            let policy = economic_policy.as_ref().ok_or(
-                TemplateError::EconomicPolicyRequired {
+            let policy = economic_policy
+                .as_ref()
+                .ok_or(TemplateError::EconomicPolicyRequired {
                     template: template_id,
-                },
-            )?;
+                })?;
             if policy.cost_schedule.per_tool_invoke.is_none() {
                 return Err(TemplateError::CostFieldRequired {
                     template: template_id,
@@ -493,11 +493,11 @@ fn validate_economic_policy_for_template(
             }
         }
         TemplateId::PaidBroadcast => {
-            let policy = economic_policy.as_ref().ok_or(
-                TemplateError::EconomicPolicyRequired {
+            let policy = economic_policy
+                .as_ref()
+                .ok_or(TemplateError::EconomicPolicyRequired {
                     template: template_id,
-                },
-            )?;
+                })?;
             if policy.cost_schedule.per_period.is_none() {
                 return Err(TemplateError::CostFieldRequired {
                     template: template_id,

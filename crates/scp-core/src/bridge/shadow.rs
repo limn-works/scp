@@ -431,9 +431,7 @@ pub fn create_shadow(
     // member's DID, enabling message forgery.
     if context_member_dids.iter().any(|did| *did == shadow_id) {
         return Err(ShadowError::ShadowIdentityCollision {
-            reason: format!(
-                "shadow ID {shadow_id} collides with existing context member DID"
-            ),
+            reason: format!("shadow ID {shadow_id} collides with existing context member DID"),
         });
     }
 

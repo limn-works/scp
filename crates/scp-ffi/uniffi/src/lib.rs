@@ -60,15 +60,46 @@ pub mod bridge;
 
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
-    CustodyMethod, ContextHandle, ContextParams, ContextState, DIDDocument, DataProvenance,
-    Event, GovernanceModel, Identity, MemoryScope, Message, Proof, ScpError, ToolDefinition,
-    ToolVerificationResult, TransportManager, TransportStatus, TrustInput, UcanToken,
+    ContextHandle,
+    ContextParams,
+    ContextState,
+    CustodyMethod,
+    DIDDocument,
+    DataProvenance,
+    Event,
+    GovernanceModel,
+    Identity,
+    MemoryScope,
+    Message,
+    Proof,
+    ScpError,
+    ToolDefinition,
+    ToolVerificationResult,
+    TransportManager,
+    TransportStatus,
+    TrustInput,
+    UcanToken,
     UcanTokenData,
     // Free functions
-    context_close, context_create, context_join, context_leave, context_send,
-    context_subscribe, event_log_query, event_log_verify, identity_create, identity_load,
-    identity_resolve, tool_invoke, tool_register, tool_verify, transport_connect,
-    transport_status, ucan_mint, ucan_revoke, ucan_validate,
+    context_close,
+    context_create,
+    context_join,
+    context_leave,
+    context_send,
+    context_subscribe,
+    event_log_query,
+    event_log_verify,
+    identity_create,
+    identity_load,
+    identity_resolve,
+    tool_invoke,
+    tool_register,
+    tool_verify,
+    transport_connect,
+    transport_status,
+    ucan_mint,
+    ucan_revoke,
+    ucan_validate,
 };
 // Re-export shutdown function defined in this module.
 // (scp_shutdown is defined here and exported via #[uniffi::export] above.)
@@ -163,11 +194,8 @@ pub fn scp_shutdown(timeout_secs: u64) {
     if timeout_secs == 0 {
         return;
     }
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while HANDLE_COUNT.load(Ordering::Relaxed) > 0
-        && std::time::Instant::now() < deadline
-    {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     // The tokio runtime (`RUNTIME`) is a static and will be dropped on

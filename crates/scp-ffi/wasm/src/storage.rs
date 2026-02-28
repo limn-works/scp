@@ -64,47 +64,31 @@ extern "C" {
     ///
     /// Throws on storage access failure.
     #[wasm_bindgen(method, catch, js_name = "get")]
-    pub fn get(
-        this: &JsStorage,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, JsValue>;
+    pub fn get(this: &JsStorage, key: &str) -> Result<Option<Vec<u8>>, JsValue>;
 
     /// Stores `value` under `key`, replacing any existing value.
     ///
     /// Throws on storage access failure or quota exceeded.
     #[wasm_bindgen(method, catch, js_name = "set")]
-    pub fn set(
-        this: &JsStorage,
-        key: &str,
-        value: &[u8],
-    ) -> Result<(), JsValue>;
+    pub fn set(this: &JsStorage, key: &str, value: &[u8]) -> Result<(), JsValue>;
 
     /// Removes the value stored under `key`.
     ///
     /// Idempotent — removing a non-existent key is a no-op.
     /// Throws on storage access failure.
     #[wasm_bindgen(method, catch, js_name = "delete")]
-    pub fn delete(
-        this: &JsStorage,
-        key: &str,
-    ) -> Result<(), JsValue>;
+    pub fn delete(this: &JsStorage, key: &str) -> Result<(), JsValue>;
 
     /// Returns all keys that start with `prefix`.
     ///
     /// Returns an empty array if no keys match.
     /// Throws on storage access failure.
     #[wasm_bindgen(method, catch, js_name = "listKeys")]
-    pub fn list_keys(
-        this: &JsStorage,
-        prefix: &str,
-    ) -> Result<Vec<String>, JsValue>;
+    pub fn list_keys(this: &JsStorage, prefix: &str) -> Result<Vec<String>, JsValue>;
 
     /// Returns `true` if a value is stored under `key`.
     ///
     /// Throws on storage access failure.
     #[wasm_bindgen(method, catch, js_name = "exists")]
-    pub fn exists(
-        this: &JsStorage,
-        key: &str,
-    ) -> Result<bool, JsValue>;
+    pub fn exists(this: &JsStorage, key: &str) -> Result<bool, JsValue>;
 }

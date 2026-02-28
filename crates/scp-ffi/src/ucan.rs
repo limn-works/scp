@@ -124,9 +124,7 @@ impl DidResolver for BridgeDidResolver {
         // did:dht:z{z-base-32-encoded-pubkey}
         if let Some(suffix) = did.strip_prefix("did:dht:z") {
             let decoded = zbase32::decode(suffix).map_err(|_| {
-                CoreUcanError::MalformedToken(format!(
-                    "z-base-32 decode failed for DID: {did}"
-                ))
+                CoreUcanError::MalformedToken(format!("z-base-32 decode failed for DID: {did}"))
             })?;
             let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
                 CoreUcanError::MalformedToken(format!(
@@ -140,9 +138,7 @@ impl DidResolver for BridgeDidResolver {
         // did:key:{hex-encoded-pubkey} (testing format)
         if let Some(hex_str) = did.strip_prefix("did:key:") {
             let bytes = decode_hex(hex_str).map_err(|e| {
-                CoreUcanError::MalformedToken(format!(
-                    "hex decode failed for did:key DID: {e}"
-                ))
+                CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
             })?;
             let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
                 CoreUcanError::MalformedToken(format!(
@@ -256,9 +252,7 @@ pub fn py_ucan_validate(
 
     // Parse the required capability URI.
     let required_cap: CapabilityUri = capability.parse().map_err(|e: CoreUcanError| {
-        ScpPyError::UcanError(format!(
-            "invalid capability URI '{capability}': {e}"
-        ))
+        ScpPyError::UcanError(format!("invalid capability URI '{capability}': {e}"))
     })?;
 
     // Determine the presenting agent DID: explicit parameter or token audience.
@@ -327,9 +321,7 @@ pub fn py_ucan_mint(
     capabilities: Vec<String>,
 ) -> PyResult<PyUcanToken> {
     // Look up the context to get the creator DID (issuer).
-    let creator_did = crate::runtime::with_context(context_id, |rt| {
-        Ok(rt.creator_did.clone())
-    })?;
+    let creator_did = crate::runtime::with_context(context_id, |rt| Ok(rt.creator_did.clone()))?;
 
     // Generate a unique nonce for the token ID.
     let nonce = generate_nonce()?;
@@ -386,10 +378,7 @@ pub fn py_ucan_mint(
 /// See ADR-013 §6: `py_ucan_revoke(handle, token) -> None`.
 #[pyfunction]
 #[pyo3(name = "ucan_revoke")]
-pub fn py_ucan_revoke(
-    context_id: &str,
-    token: &str,
-) -> PyResult<()> {
+pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
     // Parse the token to extract its payload for CID computation.
     let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
 
@@ -435,8 +424,8 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {
         let byte_str = &hex[i..i + 2];
-        let byte = u8::from_str_radix(byte_str, 16)
-            .map_err(|e| format!("hex decode error: {e}"))?;
+        let byte =
+            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
         bytes.push(byte);
     }
     Ok(bytes)
@@ -519,10 +508,9 @@ mod tests {
     fn bridge_did_resolver_resolves_did_dht() {
         // Generate a known public key and encode it as did:dht:z{zbase32}.
         let pk_bytes: [u8; 32] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
         ];
         let did = format!("did:dht:z{}", zbase32::encode(&pk_bytes));
 
@@ -628,10 +616,8 @@ mod tests {
     fn bridge_nonce_tracker_delegates_to_inner() {
         use scp_core::identity::cache::SystemClock;
 
-        let mut tracker = scp_core::crypto::ucan::nonce::NonceTracker::new(
-            "ctx-test".to_owned(),
-            SystemClock,
-        );
+        let mut tracker =
+            scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-test".to_owned(), SystemClock);
 
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

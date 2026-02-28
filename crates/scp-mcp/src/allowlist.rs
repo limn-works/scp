@@ -103,20 +103,13 @@ pub struct AllowlistState {
 /// Well-known MCP server launchers allowed by default.
 pub const DEFAULT_ALLOWLIST: &[&str] = &[
     // Package runners
-    "uvx",    // Python (uv tool runner)
-    "npx",    // Node.js (npm package runner)
-    "bunx",   // Bun (JavaScript runtime)
-    "pipx",   // Python (pip package runner)
+    "uvx",  // Python (uv tool runner)
+    "npx",  // Node.js (npm package runner)
+    "bunx", // Bun (JavaScript runtime)
+    "pipx", // Python (pip package runner)
     // Direct interpreters
-    "python",
-    "python3",
-    "node",
-    "bun",
-    "deno",
-    // Containerized execution
-    "docker",
-    "podman",
-    // SCP's own CLI
+    "python", "python3", "node", "bun", "deno", // Containerized execution
+    "docker", "podman", // SCP's own CLI
     "scp-mcp",
 ];
 
@@ -138,10 +131,7 @@ struct StdioAllowlist {
 impl StdioAllowlist {
     fn default_list() -> Self {
         Self {
-            allowed: DEFAULT_ALLOWLIST
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
+            allowed: DEFAULT_ALLOWLIST.iter().map(|s| (*s).to_owned()).collect(),
             unrestricted: false,
         }
     }

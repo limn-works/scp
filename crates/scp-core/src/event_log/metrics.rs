@@ -203,12 +203,7 @@ impl EventLogMetrics {
     /// `timestamp_secs` is the Unix timestamp when the event was appended.
     /// `tree_node_count` is the current number of interior tree nodes after
     /// the append (used for storage tracking).
-    pub fn record_event(
-        &mut self,
-        event_bytes: u64,
-        timestamp_secs: u64,
-        tree_node_count: u64,
-    ) {
+    pub fn record_event(&mut self, event_bytes: u64, timestamp_secs: u64, tree_node_count: u64) {
         self.event_count += 1;
         self.bytes_total += event_bytes;
         self.tree_node_count = tree_node_count;
@@ -229,18 +224,14 @@ impl EventLogMetrics {
 
     /// Records a proof generation operation with its timing.
     pub fn record_proof_generation(&mut self, duration: Duration, log_size: u64) {
-        self.proof_gen_profiles.push(ProofProfile {
-            duration,
-            log_size,
-        });
+        self.proof_gen_profiles
+            .push(ProofProfile { duration, log_size });
     }
 
     /// Records a proof verification operation with its timing.
     pub fn record_proof_verification(&mut self, duration: Duration, log_size: u64) {
-        self.proof_verify_profiles.push(ProofProfile {
-            duration,
-            log_size,
-        });
+        self.proof_verify_profiles
+            .push(ProofProfile { duration, log_size });
     }
 
     /// Computes the event log growth rate over the full snapshot window.
@@ -343,12 +334,12 @@ pub struct BenchmarkResult {
 /// Panics if `log` is empty or `iterations` is zero. This function is intended
 /// for benchmarking only, not production use.
 #[must_use]
-pub fn bench_proof_generation(
-    log: &super::EventLog,
-    iterations: u64,
-) -> BenchmarkResult {
+pub fn bench_proof_generation(log: &super::EventLog, iterations: u64) -> BenchmarkResult {
     let log_size = super::tree::event_count(log);
-    assert!(log_size > 0, "bench_proof_generation requires a non-empty log");
+    assert!(
+        log_size > 0,
+        "bench_proof_generation requires a non-empty log"
+    );
     assert!(iterations > 0, "iterations must be > 0");
 
     #[allow(clippy::cast_possible_truncation)] // benchmark iteration counts are small
@@ -376,12 +367,12 @@ pub fn bench_proof_generation(
 /// Panics if `log` is empty or `iterations` is zero. This function is intended
 /// for benchmarking only, not production use.
 #[must_use]
-pub fn bench_proof_verification(
-    log: &super::EventLog,
-    iterations: u64,
-) -> BenchmarkResult {
+pub fn bench_proof_verification(log: &super::EventLog, iterations: u64) -> BenchmarkResult {
     let log_size = super::tree::event_count(log);
-    assert!(log_size > 0, "bench_proof_verification requires a non-empty log");
+    assert!(
+        log_size > 0,
+        "bench_proof_verification requires a non-empty log"
+    );
     assert!(iterations > 0, "iterations must be > 0");
 
     #[allow(clippy::cast_possible_truncation)] // benchmark iteration counts are small
@@ -586,7 +577,12 @@ mod tests {
             let serialized = rmp_serde::to_vec(&event).unwrap();
             sizes.push(serialized.len() as u64);
             tree::append(&mut log, &event).unwrap();
-            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&serialized); h.finalize().into() };
+            let leaf_hash: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&serialized);
+                h.finalize().into()
+            };
             prev_hash = leaf_hash;
         }
 
@@ -890,11 +886,7 @@ mod tests {
         let mut m = EventLogMetrics::new("ctx-metrics-test".to_owned());
 
         for (i, &size) in sizes.iter().enumerate() {
-            let tree_nodes = if i == 0 {
-                0
-            } else {
-                count_tree_nodes(&log)
-            };
+            let tree_nodes = if i == 0 { 0 } else { count_tree_nodes(&log) };
             m.record_event(size, 1_000_000 + i as u64 * 3600, tree_nodes);
         }
 

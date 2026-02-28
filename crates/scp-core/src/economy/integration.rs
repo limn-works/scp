@@ -301,12 +301,8 @@ where
     let action_result = match process_action(envelope.payload.clone()).await {
         Ok(result) => result,
         Err(msg) => {
-            return void_on_failure(
-                adapter,
-                auth,
-                IntegrationError::ActionProcessingFailed(msg),
-            )
-            .await;
+            return void_on_failure(adapter, auth, IntegrationError::ActionProcessingFailed(msg))
+                .await;
         }
     };
 
@@ -652,10 +648,16 @@ mod tests {
             payload: b"free".to_vec(),
         };
 
-        let result = process_paid_action(&adapter, None, &envelope, &default_metrics(), |p| async move {
-            assert_eq!(p, b"free".to_vec());
-            Ok(b"done".to_vec())
-        })
+        let result = process_paid_action(
+            &adapter,
+            None,
+            &envelope,
+            &default_metrics(),
+            |p| async move {
+                assert_eq!(p, b"free".to_vec());
+                Ok(b"done".to_vec())
+            },
+        )
         .await
         .unwrap();
 
@@ -820,21 +822,15 @@ mod tests {
             payload: b"msg".to_vec(),
         };
 
-        let err = process_paid_action(
-            &adapter,
-            Some(&policy),
-            &envelope,
-            &metrics,
-            |_| async { Ok(b"".to_vec()) },
-        )
+        let err = process_paid_action(&adapter, Some(&policy), &envelope, &metrics, |_| async {
+            Ok(b"".to_vec())
+        })
         .await
         .unwrap_err();
 
         match err {
             IntegrationError::CostInsufficient {
-                expected,
-                provided,
-                ..
+                expected, provided, ..
             } => {
                 assert_eq!(expected, Amount(10));
                 assert_eq!(provided, Amount(5));
@@ -872,7 +868,10 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, IntegrationError::AuthorizationFailed(PaymentError::InsufficientBalance { .. })),
+            matches!(
+                err,
+                IntegrationError::AuthorizationFailed(PaymentError::InsufficientBalance { .. })
+            ),
             "expected AuthorizationFailed(InsufficientBalance), got: {err:?}"
         );
     }

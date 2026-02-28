@@ -168,10 +168,7 @@ impl WasmContextHandle {
     /// See spec §5.3.
     #[wasm_bindgen(getter)]
     pub fn ceiling(&self) -> js_sys::Array {
-        self.ceiling
-            .iter()
-            .map(|s| JsValue::from_str(s))
-            .collect()
+        self.ceiling.iter().map(|s| JsValue::from_str(s)).collect()
     }
 
     /// Returns the ceiling policy: `"immutable"` or `"governed"`.
@@ -353,36 +350,35 @@ impl WasmMessage {
 pub fn context_create(identity_did: String, params_json: String) -> Promise {
     future_to_promise(async move {
         // Parse and validate params_json.
-        let params: serde_json::Value = serde_json::from_str(&params_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
+        let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
+            ScpWasmError::Validation(format!(
                 "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
             ))
-            .into_js())?;
+            .into_js()
+        })?;
 
         // Extract §5.7 metadata fields with spec-defined defaults.
-        let mode = params["mode"]
-            .as_str()
-            .unwrap_or("Encrypted")
-            .to_owned();
+        let mode = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
         let ceiling: Vec<String> = params["ceiling"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default();
         let ceiling_policy = params["ceilingPolicy"]
             .as_str()
             .unwrap_or("immutable")
             .to_owned();
         let ttl_seconds: Option<u64> = params["ttlSeconds"].as_u64();
-        let promotion_policy: Option<String> = params["promotionPolicy"]
-            .as_str()
-            .map(str::to_owned);
+        let promotion_policy: Option<String> =
+            params["promotionPolicy"].as_str().map(str::to_owned);
         let governance = params["governance"]
             .as_str()
             .unwrap_or("single_admin")
             .to_owned();
-        let economic_policy: Option<String> = params["economicPolicy"]
-            .as_str()
-            .map(str::to_owned);
+        let economic_policy: Option<String> = params["economicPolicy"].as_str().map(str::to_owned);
 
         // Generate a context ID using a UUID (CSPRNG-backed via getrandom/js).
         let context_id = format!("ctx-{}", uuid::Uuid::new_v4().as_hyphenated());

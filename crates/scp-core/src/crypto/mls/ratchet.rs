@@ -129,11 +129,7 @@ pub fn propose_update(group: &mut ScpMlsGroup) -> Result<MlsMessageOut, MlsError
     // Commit (and optionally a Welcome if there were pending Add proposals).
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let bundle = g
-        .self_update(
-            &group.provider,
-            signer,
-            LeafNodeParameters::default(),
-        )
+        .self_update(&group.provider, signer, LeafNodeParameters::default())
         .map_err(|e| MlsError::UpdateFailed(e.to_string()))?;
 
     // Extract the Commit message.
@@ -351,7 +347,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn forward_secrecy_old_epoch_ciphertext_undecryptable_after_advance() {
-        use crate::crypto::mls::encrypt::{encrypt, decrypt, serialize_ciphertext};
+        use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
@@ -388,7 +384,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn forward_secrecy_survives_multiple_epoch_advances() {
-        use crate::crypto::mls::encrypt::{encrypt, decrypt, serialize_ciphertext};
+        use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();

@@ -120,9 +120,8 @@ impl ParentGovernanceConfig {
     /// configuration cannot be serialized to JSON.
     pub fn content_hash(&self) -> Result<[u8; 32], NestingError> {
         // Deterministic serialization via JSON with sorted keys.
-        let json = serde_json::to_string(self).map_err(|e| {
-            NestingError::SerializationFailed(e.to_string())
-        })?;
+        let json = serde_json::to_string(self)
+            .map_err(|e| NestingError::SerializationFailed(e.to_string()))?;
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
         let result = hasher.finalize();
@@ -161,7 +160,9 @@ pub struct ParentRef {
 pub enum NestingError {
     /// The child's ceiling contains capabilities not in the intersection of
     /// all parent ceilings.
-    #[error("child ceiling is not a subset of parent ceiling intersection: {0:?} not in intersection")]
+    #[error(
+        "child ceiling is not a subset of parent ceiling intersection: {0:?} not in intersection"
+    )]
     CeilingNotSubset(Vec<Capability>),
 
     /// No parents were provided for child context creation.
@@ -285,8 +286,10 @@ impl MlsGroupContextExtension {
         let mut sorted_parents: Vec<&ParentRef> = parents.iter().collect();
         sorted_parents.sort_by(|a, b| a.context_id.cmp(&b.context_id));
 
-        let parent_context_ids: Vec<ContextId> =
-            sorted_parents.iter().map(|p| p.context_id.clone()).collect();
+        let parent_context_ids: Vec<ContextId> = sorted_parents
+            .iter()
+            .map(|p| p.context_id.clone())
+            .collect();
 
         // Hash concatenation of individual governance config hashes.
         let mut hasher = Sha256::new();
@@ -379,8 +382,7 @@ impl ContextNesting {
 
         // 4. Creator must have ChildContextCreate in at least one parent.
         let creator_has_capability = parents.iter().any(|p| {
-            p.ceiling.contains(&Capability::ChildContextCreate)
-                && p.members.contains(creator)
+            p.ceiling.contains(&Capability::ChildContextCreate) && p.members.contains(creator)
         });
         if !creator_has_capability {
             return Err(NestingError::CreatorLacksCapability {
@@ -529,11 +531,7 @@ impl ContextNesting {
     /// child members who lost eligibility.
     ///
     /// Convenience method for the common case of a single member removal.
-    pub fn remove_member_from_parent(
-        &mut self,
-        parent_id: &str,
-        member: &DID,
-    ) -> Vec<DID> {
+    pub fn remove_member_from_parent(&mut self, parent_id: &str, member: &DID) -> Vec<DID> {
         if let Some(parent) = self.parents.get_mut(parent_id) {
             parent.members.remove(member);
         }
@@ -654,11 +652,7 @@ pub fn validate_child_ttl(
     };
 
     // Find the minimum TTL among parents that have TTLs.
-    let min_parent_ttl = parent_ttls
-        .iter()
-        .filter_map(|t| t.as_ref())
-        .min()
-        .copied();
+    let min_parent_ttl = parent_ttls.iter().filter_map(|t| t.as_ref()).min().copied();
 
     if let Some(min_ttl) = min_parent_ttl {
         if child_ttl > min_ttl {
@@ -787,10 +781,7 @@ mod tests {
         );
         let parent_b = make_parent(
             "B",
-            &[
-                Capability::MessagesRead,
-                Capability::ChildContextCreate,
-            ],
+            &[Capability::MessagesRead, Capability::ChildContextCreate],
             &[alice.clone()],
             OnSeverPolicy::EvictUniqueMembers,
         );
@@ -836,7 +827,11 @@ mod tests {
             Capability::ChildContextCreate,
         ];
         let parent = make_parent("A", &caps, &[alice.clone()], OnSeverPolicy::CascadeClose);
-        let child_ceiling = make_ceiling(&[Capability::MessagesRead, Capability::MessagesWrite, Capability::ChildContextCreate]);
+        let child_ceiling = make_ceiling(&[
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ChildContextCreate,
+        ]);
 
         let result = ContextNesting::new(
             "child-1".to_owned(),
@@ -1042,7 +1037,10 @@ mod tests {
         // Bob is only in parent A. Remove Bob from parent A.
         let ineligible = nesting.remove_member_from_parent("A", &bob);
         assert!(ineligible.contains(&bob), "Bob should lose eligibility");
-        assert!(!ineligible.contains(&alice), "Alice is still in both parents");
+        assert!(
+            !ineligible.contains(&alice),
+            "Alice is still in both parents"
+        );
     }
 
     #[test]
@@ -1076,7 +1074,10 @@ mod tests {
 
         // Remove Alice from parent A, but she's still in parent B.
         let ineligible = nesting.remove_member_from_parent("A", &alice);
-        assert!(ineligible.is_empty(), "Alice should retain eligibility through B");
+        assert!(
+            ineligible.is_empty(),
+            "Alice should retain eligibility through B"
+        );
     }
 
     #[test]
@@ -1281,8 +1282,7 @@ mod tests {
 
     #[test]
     fn no_child_ttl_rejected_when_parent_has_finite_ttl() {
-        let result =
-            validate_child_ttl(None, &[Some(Duration::from_secs(3600))]);
+        let result = validate_child_ttl(None, &[Some(Duration::from_secs(3600))]);
         assert!(result.is_err());
     }
 
@@ -1444,8 +1444,14 @@ mod tests {
 
     #[test]
     fn on_sever_policy_variants_are_distinct() {
-        assert_ne!(OnSeverPolicy::EvictUniqueMembers, OnSeverPolicy::CascadeClose);
-        assert_ne!(OnSeverPolicy::CascadeClose, OnSeverPolicy::PreserveMembership);
+        assert_ne!(
+            OnSeverPolicy::EvictUniqueMembers,
+            OnSeverPolicy::CascadeClose
+        );
+        assert_ne!(
+            OnSeverPolicy::CascadeClose,
+            OnSeverPolicy::PreserveMembership
+        );
         assert_ne!(
             OnSeverPolicy::EvictUniqueMembers,
             OnSeverPolicy::PreserveMembership
@@ -1517,7 +1523,10 @@ mod tests {
         nesting.close();
         let result = nesting.add_member(&alice);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), NestingError::ChildAlreadyClosed));
+        assert!(matches!(
+            result.unwrap_err(),
+            NestingError::ChildAlreadyClosed
+        ));
     }
 
     // -----------------------------------------------------------------------

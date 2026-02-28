@@ -26,9 +26,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::ContextId;
 use crate::context::governance::{GovernanceAction, GovernanceModelConfig, ProposalId};
 use crate::identity::DID;
-use super::ContextId;
 
 // ---------------------------------------------------------------------------
 // MerkleRoot type alias
@@ -293,7 +293,9 @@ pub fn actions_conflict(
 
         // Remove + role change for the same DID.
         (
-            GovernanceAction::RemoveMember { did: remove_did, .. },
+            GovernanceAction::RemoveMember {
+                did: remove_did, ..
+            },
             GovernanceAction::ChangeRole {
                 did: change_did, ..
             },
@@ -302,7 +304,9 @@ pub fn actions_conflict(
             GovernanceAction::ChangeRole {
                 did: change_did, ..
             },
-            GovernanceAction::RemoveMember { did: remove_did, .. },
+            GovernanceAction::RemoveMember {
+                did: remove_did, ..
+            },
         ) => remove_did == change_did,
 
         // Mutual removal: each proposer removes the other.
@@ -418,9 +422,7 @@ pub fn resolve_governance_conflict(
     let simultaneous: Vec<ProposalId> = conflicting_pairs
         .iter()
         .filter(|(i, j)| proposals[*i].leaf_index == proposals[*j].leaf_index)
-        .flat_map(|(i, j)| {
-            vec![proposals[*i].proposal_id, proposals[*j].proposal_id]
-        })
+        .flat_map(|(i, j)| vec![proposals[*i].proposal_id, proposals[*j].proposal_id])
         .collect();
 
     if !simultaneous.is_empty() {
@@ -583,10 +585,7 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
     hasher.update(b"fork");
     hasher.update(fork_point);
     let hash = hasher.finalize();
-    let hex: String = hash[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hex: String = hash[..16].iter().map(|b| format!("{b:02x}")).collect();
     format!("fork-{hex}")
 }
 
@@ -1228,9 +1227,10 @@ mod tests {
         assert_eq!(fork.map(|f| f.fork_event_count), Some(100));
         assert_eq!(fork.map(|f| f.members.len()), Some(2));
         // Fork ID should start with "fork-".
-        assert!(fork
-            .map(|f| f.forked_context_id.starts_with("fork-"))
-            .unwrap_or(false));
+        assert!(
+            fork.map(|f| f.forked_context_id.starts_with("fork-"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -1331,10 +1331,8 @@ mod tests {
     fn resolution_uses_leaf_index_not_timestamp() {
         // Two metadata ops where the "later" timestamp has the lower leaf index.
         // The lower leaf index should still win, proving no clock dependency.
-        let early_clock_late_log =
-            metadata_op("did:dht:alice", "title", b"early-clock", 10);
-        let late_clock_early_log =
-            metadata_op("did:dht:bob", "title", b"late-clock", 2);
+        let early_clock_late_log = metadata_op("did:dht:alice", "title", b"early-clock", 10);
+        let late_clock_early_log = metadata_op("did:dht:bob", "title", b"late-clock", 2);
 
         let result = resolve_metadata_conflict(&early_clock_late_log, &late_clock_early_log);
         assert_eq!(

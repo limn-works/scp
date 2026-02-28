@@ -302,11 +302,7 @@ impl<D: DhtClient + 'static> MigrationRepublisher<D> {
         let dht_client = Arc::clone(&self.dht_client);
         let interval_secs = self.interval_secs;
 
-        let join_handle = tokio::spawn(migration_republish_loop(
-            dht_client,
-            entry,
-            interval_secs,
-        ));
+        let join_handle = tokio::spawn(migration_republish_loop(dht_client, entry, interval_secs));
 
         MigrationHandle {
             abort_handle: join_handle.abort_handle(),
@@ -475,7 +471,10 @@ mod tests {
         let dht = Arc::new(InMemoryDhtClient::new());
         // Use default interval — verify it's configurable.
         let default_republisher = MigrationRepublisher::new(Arc::clone(&dht));
-        assert_eq!(default_republisher.interval_secs, MIGRATION_REPUBLISH_INTERVAL_SECS);
+        assert_eq!(
+            default_republisher.interval_secs,
+            MIGRATION_REPUBLISH_INTERVAL_SECS
+        );
 
         // Use custom interval.
         let custom_republisher = MigrationRepublisher::with_interval(Arc::clone(&dht), 42);

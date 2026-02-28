@@ -137,10 +137,7 @@ impl StandingChannelManager {
     /// # Errors
     ///
     /// Returns [`ContextError`] if context creation fails.
-    pub async fn standing_channel(
-        &self,
-        peer_did: &DID,
-    ) -> Result<ContextHandle, ContextError> {
+    pub async fn standing_channel(&self, peer_did: &DID) -> Result<ContextHandle, ContextError> {
         // Hold the lock across the entire get-or-create operation to prevent
         // TOCTOU races where two concurrent calls could both see "no channel"
         // and create duplicates.
@@ -242,10 +239,7 @@ impl StandingChannelManager {
         let mut channels = self.channels.lock().await;
         channels.insert(
             peer_did.to_string(),
-            StandingChannelEntry {
-                peer_did,
-                handle,
-            },
+            StandingChannelEntry { peer_did, handle },
         );
     }
 
@@ -257,10 +251,7 @@ impl StandingChannelManager {
     ///
     /// Uses the two-phase commit creation flow via the builder, then
     /// transitions the context to Active.
-    async fn create_standing_channel(
-        &self,
-        peer_did: &DID,
-    ) -> Result<ContextHandle, ContextError> {
+    async fn create_standing_channel(&self, peer_did: &DID) -> Result<ContextHandle, ContextError> {
         let context_id = generate_standing_channel_id(&self.local_did, peer_did);
         let params = template_params(&TemplateId::BilateralPersistent);
 
@@ -473,11 +464,7 @@ mod tests {
             Ok(())
         }
 
-        fn append_event(
-            &self,
-            _id: &[u8; 32],
-            _event: &str,
-        ) -> Result<(), ContextCreationError> {
+        fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
@@ -567,10 +554,7 @@ mod tests {
         assert_eq!(handle1.state().await, ContextState::Active);
 
         // Simulate peer leaving: transition to Closing -> Closed.
-        handle1
-            .transition_to(&ContextState::Closing)
-            .await
-            .unwrap();
+        handle1.transition_to(&ContextState::Closing).await.unwrap();
         handle1.transition_to(&ContextState::Closed).await.unwrap();
 
         // Calling standing_channel again should create a new context.
@@ -606,10 +590,7 @@ mod tests {
         assert_eq!(handle1.state().await, ContextState::Active);
 
         // Simulate expiry.
-        handle1
-            .transition_to(&ContextState::Expired)
-            .await
-            .unwrap();
+        handle1.transition_to(&ContextState::Expired).await.unwrap();
 
         // Calling standing_channel should create a new one.
         let handle2 = manager.standing_channel(&eve).await.unwrap();
@@ -634,14 +615,8 @@ mod tests {
         let _h_dave = manager.standing_channel(&dave).await.unwrap();
 
         // Close Carol's channel (simulating peer left).
-        h_carol
-            .transition_to(&ContextState::Closing)
-            .await
-            .unwrap();
-        h_carol
-            .transition_to(&ContextState::Closed)
-            .await
-            .unwrap();
+        h_carol.transition_to(&ContextState::Closing).await.unwrap();
+        h_carol.transition_to(&ContextState::Closed).await.unwrap();
 
         // Record current publish count (creation publishes context too).
         let publishes_before = transport.publish_count();
@@ -702,7 +677,9 @@ mod tests {
         let handle = ContextHandle::new("existing-ctx".to_owned(), params);
         handle.transition_to(&ContextState::Active).await.unwrap();
 
-        manager.register_existing(grace.clone(), handle.clone()).await;
+        manager
+            .register_existing(grace.clone(), handle.clone())
+            .await;
 
         // standing_channel should return the pre-registered handle.
         let publishes_before = transport.publish_count();

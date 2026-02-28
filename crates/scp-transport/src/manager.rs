@@ -521,10 +521,7 @@ impl TransportManager {
             .relay_assignments
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let costs = self
-            .relay_costs
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let costs = self.relay_costs.read().unwrap_or_else(|e| e.into_inner());
         let mut candidates: Vec<(usize, usize, f64, u64)> = (0..adapter_count)
             .map(|idx| {
                 let overlap = assignments
@@ -641,10 +638,7 @@ impl TransportManager {
     ///
     /// A cost of 0 or absence of a cost entry means the relay is free.
     pub fn set_relay_cost(&self, adapter_index: usize, cost: u64) {
-        let mut costs = self
-            .relay_costs
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut costs = self.relay_costs.write().unwrap_or_else(|e| e.into_inner());
         costs.insert(adapter_index, cost);
     }
 
@@ -653,10 +647,7 @@ impl TransportManager {
     /// Returns `0` if no cost has been set (free relay).
     #[must_use]
     pub fn get_relay_cost(&self, adapter_index: usize) -> u64 {
-        let costs = self
-            .relay_costs
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let costs = self.relay_costs.read().unwrap_or_else(|e| e.into_inner());
         costs.get(&adapter_index).copied().unwrap_or(0)
     }
 }

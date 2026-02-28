@@ -35,14 +35,11 @@ type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 ///
 /// Returns both so the DHT client can be shared with a second resolver
 /// for client-side DID resolution tests.
-fn make_shared_dht(
-    custody: &Arc<InMemoryKeyCustody>,
-) -> (Arc<InMemoryDhtClient>, TestDidDht) {
+fn make_shared_dht(custody: &Arc<InMemoryKeyCustody>) -> (Arc<InMemoryDhtClient>, TestDidDht) {
     let dht_client = Arc::new(InMemoryDhtClient::new());
     let cache = Arc::new(DidCache::new());
     let sign_fn = TestDidDht::make_sign_fn(Arc::clone(custody));
-    let did_dht =
-        DidDht::with_client_and_signer(Arc::clone(&dht_client), cache, sign_fn);
+    let did_dht = DidDht::with_client_and_signer(Arc::clone(&dht_client), cache, sign_fn);
     (dht_client, did_dht)
 }
 
@@ -158,17 +155,17 @@ async fn scenario2_client_discovers_relay_via_well_known_and_subscribes() {
         since: None,
     };
     let subscribe_bytes = subscribe_msg.to_bytes().unwrap();
-    ws_sink.send(Message::Binary(subscribe_bytes)).await.unwrap();
+    ws_sink
+        .send(Message::Binary(subscribe_bytes))
+        .await
+        .unwrap();
 
     // --- Step 4: Relay responds with OK ---
-    let response_frame = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ws_source.next(),
-    )
-    .await
-    .expect("should receive response within timeout")
-    .expect("stream should not end")
-    .expect("frame should be valid");
+    let response_frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws_source.next())
+        .await
+        .expect("should receive response within timeout")
+        .expect("stream should not end")
+        .expect("frame should be valid");
 
     let response_bytes = match response_frame {
         Message::Binary(b) => b,
@@ -199,20 +196,15 @@ async fn scenario2_client_discovers_relay_via_well_known_and_subscribes() {
         blob: blob_content.clone(),
     };
     let publish_bytes = publish_msg.to_bytes().unwrap();
-    pub_sink
-        .send(Message::Binary(publish_bytes))
-        .await
-        .unwrap();
+    pub_sink.send(Message::Binary(publish_bytes)).await.unwrap();
 
     // Wait for PUBLISH OK on the publisher connection.
-    let pub_response_frame = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        pub_source.next(),
-    )
-    .await
-    .expect("publisher should get OK response")
-    .expect("stream should not end")
-    .expect("frame should be valid");
+    let pub_response_frame =
+        tokio::time::timeout(std::time::Duration::from_secs(5), pub_source.next())
+            .await
+            .expect("publisher should get OK response")
+            .expect("stream should not end")
+            .expect("frame should be valid");
 
     let pub_response_bytes = match pub_response_frame {
         Message::Binary(b) => b,
@@ -225,14 +217,11 @@ async fn scenario2_client_discovers_relay_via_well_known_and_subscribes() {
     );
 
     // --- Step 6: Subscriber receives the BLOB ---
-    let blob_frame = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ws_source.next(),
-    )
-    .await
-    .expect("subscriber should receive blob within timeout")
-    .expect("stream should not end")
-    .expect("frame should be valid");
+    let blob_frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws_source.next())
+        .await
+        .expect("subscriber should receive blob within timeout")
+        .expect("stream should not end")
+        .expect("frame should be valid");
 
     let blob_bytes = match blob_frame {
         Message::Binary(b) => b,
@@ -266,8 +255,7 @@ async fn scenario3_client_discovers_relay_via_did_resolution() {
     // --- Step 1: Client resolves the operator DID via the shared DHT ---
     // The client uses a resolve-only DidDht (no signing) with the same
     // in-memory DHT backend, simulating DHT network access.
-    let client_resolver: DidDht<InMemoryDhtClient, SystemClock> =
-        DidDht::with_client(dht_client);
+    let client_resolver: DidDht<InMemoryDhtClient, SystemClock> = DidDht::with_client(dht_client);
 
     let resolved_doc = client_resolver
         .resolve(&operator_did)
@@ -325,9 +313,7 @@ async fn scenario4_scp_uri_roundtrip() {
     };
 
     let serialized = uri_broadcast.to_string();
-    let parsed: ScpUri = serialized
-        .parse()
-        .expect("broadcast URI should parse back");
+    let parsed: ScpUri = serialized.parse().expect("broadcast URI should parse back");
     assert_eq!(uri_broadcast, parsed);
     assert_eq!(parsed.context_id(), "deadbeef0123");
     assert_eq!(parsed.relays().len(), 2);
@@ -343,14 +329,11 @@ async fn scenario4_scp_uri_roundtrip() {
     };
 
     let serialized = uri_minimal.to_string();
-    let parsed: ScpUri = serialized
-        .parse()
-        .expect("minimal URI should parse back");
+    let parsed: ScpUri = serialized.parse().expect("minimal URI should parse back");
     assert_eq!(uri_minimal, parsed);
 
     // --- Legacy broadcast alias normalizes to universal format ---
-    let legacy_input =
-        "scp://broadcast/a1b2c3d4?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1";
+    let legacy_input = "scp://broadcast/a1b2c3d4?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1";
     let parsed_legacy: ScpUri = legacy_input
         .parse()
         .expect("legacy broadcast alias should parse");

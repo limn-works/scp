@@ -117,7 +117,6 @@ impl StdioClientTransport {
             }),
         })
     }
-
 }
 
 /// Kills the subprocess and waits for it to exit on drop.
@@ -167,8 +166,7 @@ impl McpTransport for StdioClientTransport {
             return Err("subprocess closed stdout (EOF)".to_owned());
         }
 
-        serde_json::from_str(line.trim())
-            .map_err(|e| format!("failed to parse response JSON: {e}"))
+        serde_json::from_str(line.trim()).map_err(|e| format!("failed to parse response JSON: {e}"))
     }
 
     fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
@@ -334,9 +332,7 @@ impl SseClientTransport {
         }
 
         if post_path.bytes().any(|b| b < 0x20) {
-            return Err(
-                "SSE endpoint path contains invalid control characters".to_owned(),
-            );
+            return Err("SSE endpoint path contains invalid control characters".to_owned());
         }
 
         // Build the full POST URL. Always http — HTTPS is rejected at entry.
@@ -396,9 +392,7 @@ impl McpTransport for SseClientTransport {
             .lock()
             .map_err(|e| format!("SSE reader lock poisoned: {e}"))?;
 
-        let reader = sse_reader
-            .as_mut()
-            .ok_or("SSE connection is closed")?;
+        let reader = sse_reader.as_mut().ok_or("SSE connection is closed")?;
 
         // Read SSE events until we find a `message` event with our response.
         // Bounded to prevent a misbehaving server from consuming resources
@@ -415,10 +409,7 @@ impl McpTransport for SseClientTransport {
             }
             let trimmed = line.trim();
             if trimmed.starts_with("data:") {
-                let data = trimmed
-                    .strip_prefix("data:")
-                    .unwrap_or("")
-                    .trim();
+                let data = trimmed.strip_prefix("data:").unwrap_or("").trim();
                 // Try to parse as a JSON-RPC response.
                 if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(data) {
                     return Ok(response);
@@ -877,9 +868,8 @@ pub fn py_mcp_serve(
                     context_ids: sse_context_ids,
                 };
                 let sse_server = McpServer::new(provider);
-                let config = scp_mcp::sse::SseConfig::new(
-                    std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                );
+                let config =
+                    scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
 
                 tokio::select! {
                     _ = shutdown_rx => {}
@@ -1017,22 +1007,20 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 #[pyo3(name = "py_mcp_client_connect_stdio")]
 pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
     if command.is_empty() {
-        return Err(ScpPyError::ValidationError(
-            "command must be a non-empty list".to_owned(),
-        )
-        .into());
+        return Err(
+            ScpPyError::ValidationError("command must be a non-empty list".to_owned()).into(),
+        );
     }
 
     // Spawn the subprocess and create the transport.
-    let transport = StdioClientTransport::spawn(&command).map_err(|e| {
-        ScpPyError::TransportError(format!("failed to connect stdio client: {e}"))
-    })?;
+    let transport = StdioClientTransport::spawn(&command)
+        .map_err(|e| ScpPyError::TransportError(format!("failed to connect stdio client: {e}")))?;
 
     // Create the MCP client and perform the initialize handshake.
     let mut client = McpClient::new(ClientTransport::Stdio(transport));
-    client.initialize().map_err(|e| {
-        ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}"))
-    })?;
+    client
+        .initialize()
+        .map_err(|e| ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}")))?;
 
     let handle = generate_handle_id("mcp-client");
     let state = McpClientState {
@@ -1069,22 +1057,20 @@ pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
 #[pyo3(name = "py_mcp_client_connect_sse")]
 pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
     if url.is_empty() {
-        return Err(ScpPyError::ValidationError(
-            "url must be a non-empty string".to_owned(),
-        )
-        .into());
+        return Err(
+            ScpPyError::ValidationError("url must be a non-empty string".to_owned()).into(),
+        );
     }
 
     // Connect to the SSE endpoint.
-    let transport = SseClientTransport::connect(url).map_err(|e| {
-        ScpPyError::TransportError(format!("failed to connect SSE client: {e}"))
-    })?;
+    let transport = SseClientTransport::connect(url)
+        .map_err(|e| ScpPyError::TransportError(format!("failed to connect SSE client: {e}")))?;
 
     // Create the MCP client and perform the initialize handshake.
     let mut client = McpClient::new(ClientTransport::Sse(transport));
-    client.initialize().map_err(|e| {
-        ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}"))
-    })?;
+    client
+        .initialize()
+        .map_err(|e| ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}")))?;
 
     let handle = generate_handle_id("mcp-client");
     let state = McpClientState {
@@ -1160,12 +1146,12 @@ pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObje
     drop(entry); // Release the DashMap guard before blocking.
 
     let tools = {
-        let client_guard = client.lock().map_err(|e| {
-            ScpPyError::TransportError(format!("client lock poisoned: {e}"))
-        })?;
-        client_guard.list_tools().map_err(|e| {
-            ScpPyError::TransportError(format!("tools/list failed: {e}"))
-        })?
+        let client_guard = client
+            .lock()
+            .map_err(|e| ScpPyError::TransportError(format!("client lock poisoned: {e}")))?;
+        client_guard
+            .list_tools()
+            .map_err(|e| ScpPyError::TransportError(format!("tools/list failed: {e}")))?
     };
 
     // Convert tool definitions to JSON array for Python.
@@ -1227,14 +1213,12 @@ pub fn py_mcp_client_invoke(
 
     // Send the real tools/call request via the MCP client.
     let result = {
-        let client_guard = client.lock().map_err(|e| {
-            ScpPyError::TransportError(format!("client lock poisoned: {e}"))
-        })?;
+        let client_guard = client
+            .lock()
+            .map_err(|e| ScpPyError::TransportError(format!("client lock poisoned: {e}")))?;
         client_guard
             .invoke(tool_name, input_json, context_id, identity_did)
-            .map_err(|e| {
-                ScpPyError::TransportError(format!("tools/call failed: {e}"))
-            })?
+            .map_err(|e| ScpPyError::TransportError(format!("tools/call failed: {e}")))?
     };
 
     // Convert the McpToolResult to a Python dict.
@@ -1279,10 +1263,7 @@ pub fn py_mcp_client_invoke(
 /// Raises `TransportError` if the relay query fails.
 #[pyfunction]
 #[pyo3(name = "py_mcp_load_contexts")]
-pub fn py_mcp_load_contexts(
-    _identity_did: &str,
-    _relay_url: &str,
-) -> PyResult<Vec<PyObject>> {
+pub fn py_mcp_load_contexts(_identity_did: &str, _relay_url: &str) -> PyResult<Vec<PyObject>> {
     // Context discovery requires a live relay connection which is wired via
     // the transport layer (scp-transport). Since relay connections are managed
     // separately from MCP, this function returns an empty list when no relay
@@ -1335,9 +1316,7 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
 /// Raises `TransportError` if the allowlist lock is poisoned.
 #[pyfunction]
 #[pyo3(name = "py_mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![]))]
-pub fn py_mcp_configure_stdio_allowlist(
-    additional_binaries: Vec<String>,
-) -> PyResult<()> {
+pub fn py_mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> PyResult<()> {
     allowlist::configure(&additional_binaries).map_err(allowlist_err)?;
     Ok(())
 }
@@ -1478,9 +1457,7 @@ mod tests {
         let result = parse_http_url("http://evil.com\r\nX-Injected: bad/path");
         assert!(result.is_err());
         assert!(
-            result
-                .unwrap_err()
-                .contains("control characters"),
+            result.unwrap_err().contains("control characters"),
             "should mention control characters in error"
         );
     }
@@ -1574,7 +1551,10 @@ mod tests {
             "nonexistent_command_that_does_not_exist_12345".to_owned(),
         ]);
         match result {
-            Err(msg) => assert!(msg.contains("allowlist"), "error should mention allowlist: {msg}"),
+            Err(msg) => assert!(
+                msg.contains("allowlist"),
+                "error should mention allowlist: {msg}"
+            ),
             Ok(_) => panic!("expected rejection for unlisted command"),
         }
     }

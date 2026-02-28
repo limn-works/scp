@@ -253,9 +253,8 @@ pub fn open_envelope(
     sender_key: &SenderKey,
 ) -> Result<InnerEnvelope, EnvelopeError> {
     // 1. MLS decrypt and extract sender's signature key from MLS tree.
-    let (mls_plaintext, sender_public_key) =
-        decrypt_with_sender_key(group, &outer.encrypted_blob)
-            .map_err(|e| EnvelopeError::MlsDecryptionFailed(e.to_string()))?;
+    let (mls_plaintext, sender_public_key) = decrypt_with_sender_key(group, &outer.encrypted_blob)
+        .map_err(|e| EnvelopeError::MlsDecryptionFailed(e.to_string()))?;
 
     // 2. Decrypt sender key layer (AES-256-GCM).
     let plaintext = decrypt_sender_layer(sender_key, &mls_plaintext)
@@ -455,10 +454,8 @@ mod seal_open_tests {
             .iter()
             .find(|m| m.index == own_index)
             .expect("must find own member");
-        let basic_cred =
-            BasicCredential::try_from(own_member.credential.clone()).unwrap();
-        let scp_cred =
-            ScpCredential::from_bytes(basic_cred.identity()).unwrap();
+        let basic_cred = BasicCredential::try_from(own_member.credential.clone()).unwrap();
+        let scp_cred = ScpCredential::from_bytes(basic_cred.identity()).unwrap();
 
         // Import the MLS signer's private key into an InMemoryKeyCustody.
         let custody = InMemoryKeyCustody::new();
@@ -482,10 +479,7 @@ mod seal_open_tests {
 
     /// Creates an inner envelope signed by a random key (not the MLS group
     /// member's key). Used to test signature mismatch detection.
-    async fn create_test_inner_with_random_key(
-        payload: &[u8],
-        sender_did: &str,
-    ) -> InnerEnvelope {
+    async fn create_test_inner_with_random_key(payload: &[u8], sender_did: &str) -> InnerEnvelope {
         let custody = InMemoryKeyCustody::new();
         let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
@@ -623,9 +617,12 @@ mod seal_open_tests {
             source: "test-tool".into(),
             upstream_hash: Some("abc123".into()),
         };
-        let inner =
-            create_test_inner(&alice_group, b"payload with provenance", Some(provenance.clone()))
-                .await;
+        let inner = create_test_inner(
+            &alice_group,
+            b"payload with provenance",
+            Some(provenance.clone()),
+        )
+        .await;
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
@@ -686,18 +683,13 @@ mod seal_open_tests {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
 
         // Extract Alice's MLS signer key to create a properly signed inner.
-        let signer = alice_group
-            .signer
-            .as_ref()
-            .expect("group must have signer");
+        let signer = alice_group.signer.as_ref().expect("group must have signer");
         let private_key_bytes: [u8; 32] = signer.private().try_into().unwrap();
         let members = alice_group.members().unwrap();
         let own_index = alice_group.own_leaf_index().unwrap();
         let own_member = members.iter().find(|m| m.index == own_index).unwrap();
-        let basic_cred =
-            BasicCredential::try_from(own_member.credential.clone()).unwrap();
-        let scp_cred =
-            ScpCredential::from_bytes(basic_cred.identity()).unwrap();
+        let basic_cred = BasicCredential::try_from(own_member.credential.clone()).unwrap();
+        let scp_cred = ScpCredential::from_bytes(basic_cred.identity()).unwrap();
 
         let custody = InMemoryKeyCustody::new();
         let signing_key = custody.import_ed25519_key(&private_key_bytes).await;
@@ -760,13 +752,10 @@ mod seal_open_tests {
         let members = alice_group.members().unwrap();
         let own_index = alice_group.own_leaf_index().unwrap();
         let own_member = members.iter().find(|m| m.index == own_index).unwrap();
-        let basic_cred =
-            BasicCredential::try_from(own_member.credential.clone()).unwrap();
-        let scp_cred =
-            ScpCredential::from_bytes(basic_cred.identity()).unwrap();
+        let basic_cred = BasicCredential::try_from(own_member.credential.clone()).unwrap();
+        let scp_cred = ScpCredential::from_bytes(basic_cred.identity()).unwrap();
 
-        let inner =
-            create_test_inner_with_random_key(b"signed by wrong key", &scp_cred.did).await;
+        let inner = create_test_inner_with_random_key(b"signed by wrong key", &scp_cred.did).await;
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
@@ -908,8 +897,7 @@ mod seal_open_tests {
     #[tokio::test]
     async fn open_envelope_resolves_sender_key_from_group() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
-        let inner =
-            create_test_inner(&alice_group, b"internally resolved key test", None).await;
+        let inner = create_test_inner(&alice_group, b"internally resolved key test", None).await;
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
@@ -937,10 +925,7 @@ mod seal_open_tests {
         // Create an inner envelope with a DID that is NOT in the group.
         // Sign with Alice's MLS signer key so signature verification would
         // pass, but the DID check should fail first.
-        let signer = alice_group
-            .signer
-            .as_ref()
-            .expect("group must have signer");
+        let signer = alice_group.signer.as_ref().expect("group must have signer");
         let private_key_bytes: [u8; 32] = signer.private().try_into().unwrap();
 
         let custody = InMemoryKeyCustody::new();

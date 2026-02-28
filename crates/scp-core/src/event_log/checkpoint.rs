@@ -486,8 +486,7 @@ impl TruncatedEventLog {
         // Extract leaf hashes for the pruned region.
         let all_leaves = log.leaves();
         #[allow(clippy::cast_possible_truncation)]
-        let pruned_leaves: Vec<[u8; 32]> =
-            all_leaves[..checkpoint_count as usize].to_vec();
+        let pruned_leaves: Vec<[u8; 32]> = all_leaves[..checkpoint_count as usize].to_vec();
 
         // Recompute the pruned region's interior tree.
         let pruned_tree = recompute_tree_from_leaves(&pruned_leaves);
@@ -574,11 +573,7 @@ impl TruncatedEventLog {
         let leaf_hash = self.pruned_leaf_hashes[idx];
 
         // Build proof path from the pruned tree.
-        let path = build_proof_path(
-            idx,
-            &self.pruned_leaf_hashes,
-            &self.pruned_tree_layers,
-        );
+        let path = build_proof_path(idx, &self.pruned_leaf_hashes, &self.pruned_tree_layers);
 
         Ok(PrunedInclusionProof {
             leaf_hash,
@@ -598,10 +593,7 @@ impl TruncatedEventLog {
     ///
     /// Returns [`EventLogError::LeafIndexOutOfBounds`] if the index is out
     /// of range for the tail log.
-    pub fn prove_tail_inclusion(
-        &self,
-        tail_index: u64,
-    ) -> Result<InclusionProof, EventLogError> {
+    pub fn prove_tail_inclusion(&self, tail_index: u64) -> Result<InclusionProof, EventLogError> {
         proof::prove_inclusion(&self.tail_log, tail_index)
     }
 
@@ -614,10 +606,7 @@ impl TruncatedEventLog {
     ///
     /// Returns [`EventLogError::LeafIndexOutOfBounds`] if the index is
     /// outside the pruned region.
-    pub fn prove_checkpointed(
-        &self,
-        leaf_index: u64,
-    ) -> Result<CheckpointedProof, EventLogError> {
+    pub fn prove_checkpointed(&self, leaf_index: u64) -> Result<CheckpointedProof, EventLogError> {
         let pruned_proof = self.prove_pruned_inclusion(leaf_index)?;
         Ok(CheckpointedProof {
             pruned_proof,
@@ -1119,9 +1108,9 @@ mod tests {
     use scp_platform::traits::KeyType;
 
     use super::*;
-    use crate::identity::DID;
     use crate::event_log::tree::{self, GENESIS_PREV_HASH};
     use crate::event_log::{Event, EventLog, EventPayload, EventType};
+    use crate::identity::DID;
 
     // -------------------------------------------------------------------
     // Test helpers
@@ -1238,7 +1227,12 @@ mod tests {
                 &signing_key,
             );
             tree::append(&mut log, &event).unwrap();
-            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event).unwrap()); h.finalize().into() };
+            let leaf_hash: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&rmp_serde::to_vec(&event).unwrap());
+                h.finalize().into()
+            };
             leaf_hashes.push(leaf_hash);
             prev_hash = leaf_hash;
         }
@@ -1266,7 +1260,12 @@ mod tests {
             );
             tree::append(&mut log_a, &event).unwrap();
             tree::append(&mut log_b, &event).unwrap();
-            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event).unwrap()); h.finalize().into() };
+            let leaf_hash: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&rmp_serde::to_vec(&event).unwrap());
+                h.finalize().into()
+            };
             prev_hash = leaf_hash;
         }
 
@@ -1385,7 +1384,12 @@ mod tests {
                 &signing_key_a,
             );
             tree::append(&mut log_a, &event_a).unwrap();
-            let leaf_hash_a: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event_a).unwrap()); h.finalize().into() };
+            let leaf_hash_a: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&rmp_serde::to_vec(&event_a).unwrap());
+                h.finalize().into()
+            };
             prev_hash_a = leaf_hash_a;
 
             let event_b = sign_event(
@@ -1398,7 +1402,12 @@ mod tests {
                 &signing_key_b,
             );
             tree::append(&mut log_b, &event_b).unwrap();
-            let leaf_hash_b: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event_b).unwrap()); h.finalize().into() };
+            let leaf_hash_b: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&rmp_serde::to_vec(&event_b).unwrap());
+                h.finalize().into()
+            };
             prev_hash_b = leaf_hash_b;
         }
 
@@ -1447,7 +1456,12 @@ mod tests {
             if i < 7 {
                 tree::append(&mut log_partial, &event).unwrap();
             }
-            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event).unwrap()); h.finalize().into() };
+            let leaf_hash: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&rmp_serde::to_vec(&event).unwrap());
+                h.finalize().into()
+            };
             prev_hash = leaf_hash;
         }
 
@@ -1489,7 +1503,12 @@ mod tests {
             if i < 4 {
                 tree::append(&mut log_partial, &event).unwrap();
             }
-            let leaf_hash: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event).unwrap()); h.finalize().into() };
+            let leaf_hash: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&rmp_serde::to_vec(&event).unwrap());
+                h.finalize().into()
+            };
             prev_hash = leaf_hash;
         }
 
@@ -1579,10 +1598,20 @@ mod tests {
     #[test]
     fn checkpoint_canonical_hash_is_deterministic() {
         let hash1 = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:abc", 10, &[0xAA; 32], Some(5), 1_000_000,
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
         );
         let hash2 = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:abc", 10, &[0xAA; 32], Some(5), 1_000_000,
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
         );
         assert_eq!(hash1, hash2);
     }
@@ -1590,41 +1619,81 @@ mod tests {
     #[test]
     fn checkpoint_canonical_hash_changes_with_different_inputs() {
         let base = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:abc", 10, &[0xAA; 32], Some(5), 1_000_000,
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
         );
 
         let different_ctx = compute_checkpoint_canonical_hash(
-            "ctx-2", "did:key:abc", 10, &[0xAA; 32], Some(5), 1_000_000,
+            "ctx-2",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
         );
         assert_ne!(base, different_ctx);
 
         let different_did = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:xyz", 10, &[0xAA; 32], Some(5), 1_000_000,
+            "ctx-1",
+            "did:key:xyz",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
         );
         assert_ne!(base, different_did);
 
         let different_count = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:abc", 11, &[0xAA; 32], Some(5), 1_000_000,
+            "ctx-1",
+            "did:key:abc",
+            11,
+            &[0xAA; 32],
+            Some(5),
+            1_000_000,
         );
         assert_ne!(base, different_count);
 
         let different_root = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:abc", 10, &[0xBB; 32], Some(5), 1_000_000,
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xBB; 32],
+            Some(5),
+            1_000_000,
         );
         assert_ne!(base, different_root);
 
         let different_epoch = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:abc", 10, &[0xAA; 32], Some(6), 1_000_000,
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(6),
+            1_000_000,
         );
         assert_ne!(base, different_epoch);
 
         let no_epoch = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:abc", 10, &[0xAA; 32], None, 1_000_000,
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            None,
+            1_000_000,
         );
         assert_ne!(base, no_epoch);
 
         let different_ts = compute_checkpoint_canonical_hash(
-            "ctx-1", "did:key:abc", 10, &[0xAA; 32], Some(5), 2_000_000,
+            "ctx-1",
+            "did:key:abc",
+            10,
+            &[0xAA; 32],
+            Some(5),
+            2_000_000,
         );
         assert_ne!(base, different_ts);
     }
@@ -1644,19 +1713,39 @@ mod tests {
 
         for i in 0..5u64 {
             let event_a = sign_event(
-                EventType::MessageSent, &did_a, 1_000_000 + i, i,
-                format!("alice-{i}").into_bytes(), prev_a, &sk_a,
+                EventType::MessageSent,
+                &did_a,
+                1_000_000 + i,
+                i,
+                format!("alice-{i}").into_bytes(),
+                prev_a,
+                &sk_a,
             );
             tree::append(&mut log_a, &event_a).unwrap();
-            let h_a: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event_a).unwrap()); h.finalize().into() };
+            let h_a: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&rmp_serde::to_vec(&event_a).unwrap());
+                h.finalize().into()
+            };
             prev_a = h_a;
 
             let event_b = sign_event(
-                EventType::MessageSent, &did_b, 1_000_000 + i, i,
-                format!("bob-{i}").into_bytes(), prev_b, &sk_b,
+                EventType::MessageSent,
+                &did_b,
+                1_000_000 + i,
+                i,
+                format!("bob-{i}").into_bytes(),
+                prev_b,
+                &sk_b,
             );
             tree::append(&mut log_b, &event_b).unwrap();
-            let h_b: [u8; 32] = { let mut h = Sha256::new(); h.update(&[0x00]); h.update(&rmp_serde::to_vec(&event_b).unwrap()); h.finalize().into() };
+            let h_b: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(&[0x00]);
+                h.update(&rmp_serde::to_vec(&event_b).unwrap());
+                h.finalize().into()
+            };
             prev_b = h_b;
         }
 
@@ -1941,8 +2030,7 @@ mod tests {
             .await
             .unwrap();
 
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
-            .unwrap();
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         // All pruned events should have valid proofs.
         for i in 0..10 {
@@ -1968,8 +2056,7 @@ mod tests {
             .await
             .unwrap();
 
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
-            .unwrap();
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         let mut proof = truncated.prove_pruned_inclusion(3).unwrap();
         proof.leaf_hash = [0xFF; 32]; // Tamper.
@@ -1990,8 +2077,7 @@ mod tests {
             .await
             .unwrap();
 
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
-            .unwrap();
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         let result = truncated.prove_pruned_inclusion(5);
         assert!(result.is_err());
@@ -2015,8 +2101,7 @@ mod tests {
             .await
             .unwrap();
 
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
-            .unwrap();
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         let proof = truncated.prove_checkpointed(4).unwrap();
         assert!(verify_checkpointed_proof(&proof));
@@ -2036,8 +2121,7 @@ mod tests {
             .await
             .unwrap();
 
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
-            .unwrap();
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         let mut proof = truncated.prove_checkpointed(4).unwrap();
         // Tamper with the checkpoint's Merkle root.
@@ -2067,14 +2151,11 @@ mod tests {
             partial_log.push_leaf_raw(leaves[i]);
         }
 
-        let checkpoint = generate_checkpoint_at(
-            &partial_log, &did, 1, 1_000_010, &custody, &key,
-        )
-        .await
-        .unwrap();
-
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
+        let checkpoint = generate_checkpoint_at(&partial_log, &did, 1, 1_000_010, &custody, &key)
+            .await
             .unwrap();
+
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         assert_eq!(truncated.pruned_event_count(), 10);
         assert_eq!(truncated.tail_event_count(), 10);
@@ -2098,14 +2179,11 @@ mod tests {
             partial_log.push_leaf_raw(leaves[i]);
         }
 
-        let checkpoint = generate_checkpoint_at(
-            &partial_log, &did, 1, 1_000_008, &custody, &key,
-        )
-        .await
-        .unwrap();
-
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
+        let checkpoint = generate_checkpoint_at(&partial_log, &did, 1, 1_000_008, &custody, &key)
+            .await
             .unwrap();
+
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         // Verify tail proofs (post-checkpoint events, 0-indexed in tail).
         for i in 0..7 {
@@ -2131,8 +2209,7 @@ mod tests {
             .await
             .unwrap();
 
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
-            .unwrap();
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         let pruned = truncated.pruned_leaf_hashes();
         assert_eq!(pruned.len(), 10);
@@ -2156,8 +2233,7 @@ mod tests {
             .await
             .unwrap();
 
-        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint)
-            .unwrap();
+        let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
         assert_eq!(truncated.pruned_event_count(), 5);
         assert_eq!(truncated.tail_event_count(), 0);
@@ -2184,18 +2260,14 @@ mod tests {
         for i in 0..10 {
             log_10.push_leaf_raw(leaves[i]);
         }
-        let cp_10 = generate_checkpoint_at(
-            &log_10, &did, 1, 1_000_010, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_10 = generate_checkpoint_at(&log_10, &did, 1, 1_000_010, &custody, &key)
+            .await
+            .unwrap();
 
         // Checkpoint at 20 events.
-        let cp_20 = generate_checkpoint_at(
-            &log, &did, 2, 1_000_020, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_20 = generate_checkpoint_at(&log, &did, 2, 1_000_020, &custody, &key)
+            .await
+            .unwrap();
 
         // Structural check: plausibly consistent.
         let result = cross_checkpoint_verify(&cp_10, &cp_20);
@@ -2221,17 +2293,13 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
-        let cp_a = generate_checkpoint_at(
-            &log_a, &did_a, 1, 1_000_010, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_a = generate_checkpoint_at(&log_a, &did_a, 1, 1_000_010, &custody, &key)
+            .await
+            .unwrap();
 
-        let cp_b = generate_checkpoint_at(
-            &log_b, &did_a, 1, 1_000_010, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_b = generate_checkpoint_at(&log_b, &did_a, 1, 1_000_010, &custody, &key)
+            .await
+            .unwrap();
 
         // Same event count, different roots.
         let result = cross_checkpoint_verify(&cp_a, &cp_b);
@@ -2251,17 +2319,13 @@ mod tests {
         let log_a = EventLog::new("ctx-a".to_owned());
         let log_b = EventLog::new("ctx-b".to_owned());
 
-        let cp_a = generate_checkpoint_at(
-            &log_a, &did, 0, 1_000_000, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_a = generate_checkpoint_at(&log_a, &did, 0, 1_000_000, &custody, &key)
+            .await
+            .unwrap();
 
-        let cp_b = generate_checkpoint_at(
-            &log_b, &did, 0, 1_000_000, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_b = generate_checkpoint_at(&log_b, &did, 0, 1_000_000, &custody, &key)
+            .await
+            .unwrap();
 
         let result = cross_checkpoint_verify(&cp_a, &cp_b);
         assert_eq!(result, CrossCheckpointResult::ContextMismatch);
@@ -2283,17 +2347,13 @@ mod tests {
             log_10.push_leaf_raw(leaves[i]);
         }
 
-        let cp_10 = generate_checkpoint_at(
-            &log_10, &did, 1, 1_000_010, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_10 = generate_checkpoint_at(&log_10, &did, 1, 1_000_010, &custody, &key)
+            .await
+            .unwrap();
 
-        let cp_20 = generate_checkpoint_at(
-            &log, &did, 2, 1_000_020, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_20 = generate_checkpoint_at(&log, &did, 2, 1_000_020, &custody, &key)
+            .await
+            .unwrap();
 
         // Pass in wrong order.
         let result = cross_checkpoint_verify(&cp_20, &cp_10);
@@ -2312,18 +2372,14 @@ mod tests {
         let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         // Checkpoint from log_a at 10.
-        let cp_a = generate_checkpoint_at(
-            &log_a, &did, 1, 1_000_010, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_a = generate_checkpoint_at(&log_a, &did, 1, 1_000_010, &custody, &key)
+            .await
+            .unwrap();
 
         // Checkpoint from log_b at 20 (different history).
-        let cp_b = generate_checkpoint_at(
-            &log_b, &did, 2, 1_000_020, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp_b = generate_checkpoint_at(&log_b, &did, 2, 1_000_020, &custody, &key)
+            .await
+            .unwrap();
 
         // log_b leaves won't match log_a's checkpoint root.
         let b_leaves: Vec<[u8; 32]> = log_b.leaves().to_vec();
@@ -2341,11 +2397,9 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
-        let cp = generate_checkpoint_at(
-            &log, &did, 1, 1_000_010, &custody, &key,
-        )
-        .await
-        .unwrap();
+        let cp = generate_checkpoint_at(&log, &did, 1, 1_000_010, &custody, &key)
+            .await
+            .unwrap();
 
         let result = cross_checkpoint_verify(&cp, &cp.clone());
         assert_eq!(result, CrossCheckpointResult::Consistent);
@@ -2366,16 +2420,11 @@ mod tests {
 
         for size in [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17] {
             let (log, _, did) = build_log(size);
-            let checkpoint = generate_checkpoint_at(
-                &log, &did, 1, 1_000_000, &custody, &key,
-            )
-            .await
-            .unwrap();
+            let checkpoint = generate_checkpoint_at(&log, &did, 1, 1_000_000, &custody, &key)
+                .await
+                .unwrap();
 
-            let truncated = TruncatedEventLog::from_log_and_checkpoint(
-                &log, checkpoint,
-            )
-            .unwrap();
+            let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
             for i in 0..size {
                 let proof = truncated.prove_pruned_inclusion(i).unwrap();
@@ -2445,29 +2494,19 @@ mod tests {
         let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let (log_16, _, did) = build_log(16);
-        let cp_16 = generate_checkpoint_at(
-            &log_16, &did, 1, 1_000_000, &custody, &key,
-        )
-        .await
-        .unwrap();
-        let truncated_16 = TruncatedEventLog::from_log_and_checkpoint(
-            &log_16, cp_16,
-        )
-        .unwrap();
+        let cp_16 = generate_checkpoint_at(&log_16, &did, 1, 1_000_000, &custody, &key)
+            .await
+            .unwrap();
+        let truncated_16 = TruncatedEventLog::from_log_and_checkpoint(&log_16, cp_16).unwrap();
         let proof_16 = truncated_16.prove_pruned_inclusion(0).unwrap();
         // 16 leaves => log2(16) = 4 steps.
         assert_eq!(proof_16.path.len(), 4);
 
         let (log_8, _, did2) = build_log(8);
-        let cp_8 = generate_checkpoint_at(
-            &log_8, &did2, 1, 1_000_000, &custody, &key,
-        )
-        .await
-        .unwrap();
-        let truncated_8 = TruncatedEventLog::from_log_and_checkpoint(
-            &log_8, cp_8,
-        )
-        .unwrap();
+        let cp_8 = generate_checkpoint_at(&log_8, &did2, 1, 1_000_000, &custody, &key)
+            .await
+            .unwrap();
+        let truncated_8 = TruncatedEventLog::from_log_and_checkpoint(&log_8, cp_8).unwrap();
         let proof_8 = truncated_8.prove_pruned_inclusion(0).unwrap();
         // 8 leaves => log2(8) = 3 steps.
         assert_eq!(proof_8.path.len(), 3);

@@ -151,7 +151,10 @@ impl SenderVelocityTracker {
     /// Panics if the internal mutex is poisoned (indicates a prior panic
     /// while holding the lock — an unrecoverable state).
     pub fn record_message(&self, sender: &DID, timestamp: u64) {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.entry(sender.clone()).or_default().push(timestamp);
     }
 
@@ -167,7 +170,10 @@ impl SenderVelocityTracker {
     /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn get_velocity(&self, sender: &DID, now: u64) -> u64 {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cutoff = now.saturating_sub(self.window_secs);
 
         state.get_mut(sender).map_or(0, |timestamps| {
@@ -470,14 +476,8 @@ mod tests {
 
         // Base cost 0, floor 5
         assert_eq!(
-            tracker.compute_escalated_cost(
-                &sender,
-                100,
-                Amount(0),
-                &config,
-                Some(Amount(5)),
-                None,
-            ),
+            tracker
+                .compute_escalated_cost(&sender, 100, Amount(0), &config, Some(Amount(5)), None,),
             Amount(5),
         );
     }

@@ -660,8 +660,13 @@ fn verify_chain_recursive(
         verify_signature(&parent, did_resolver)?;
 
         // Recurse to find the root.
-        let found_root =
-            verify_chain_recursive(&parent, did_resolver, proof_resolver, depth + 1, seen_issuers)?;
+        let found_root = verify_chain_recursive(
+            &parent,
+            did_resolver,
+            proof_resolver,
+            depth + 1,
+            seen_issuers,
+        )?;
 
         // All proof chains must converge to the same root issuer.
         if let Some(ref existing_root) = root_issuer {

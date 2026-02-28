@@ -855,7 +855,8 @@ mod tests {
         let mut ctx = new_ctx();
         // Fill to MAX_WRITERS (1 already exists: the creator).
         for i in 1..MAX_WRITERS {
-            ctx.add_writer(format!("did:dht:z6MkWriter{i}").into()).unwrap();
+            ctx.add_writer(format!("did:dht:z6MkWriter{i}").into())
+                .unwrap();
         }
         assert_eq!(ctx.writers().len(), MAX_WRITERS);
 
@@ -895,7 +896,8 @@ mod tests {
         let mut ctx = new_ctx();
         // Add more readers than the writer limit.
         for i in 0..(MAX_WRITERS + 100) {
-            ctx.add_reader(format!("did:dht:z6MkReader{i}").into()).unwrap();
+            ctx.add_reader(format!("did:dht:z6MkReader{i}").into())
+                .unwrap();
         }
         assert_eq!(ctx.readers().len(), MAX_WRITERS + 100);
     }
@@ -1462,9 +1464,7 @@ mod tests {
         let err = DiscoveryContextError::WriterTierFull;
         assert!(err.to_string().contains("500"));
 
-        let err = DiscoveryContextError::DidNotAuthenticated {
-            did: "bad".into(),
-        };
+        let err = DiscoveryContextError::DidNotAuthenticated { did: "bad".into() };
         assert!(err.to_string().contains("bad"));
 
         let err = DiscoveryContextError::AlreadyRegistered {

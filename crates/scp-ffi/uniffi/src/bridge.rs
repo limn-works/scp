@@ -260,9 +260,7 @@ impl From<scp_core::event_log::EventLogError> for ScpError {
 impl From<scp_core::provenance::ProvenanceError> for ScpError {
     fn from(e: scp_core::provenance::ProvenanceError) -> Self {
         Self::Validation {
-            message: format!(
-                "provenance validation failed: {e} — check cross-context chain depth"
-            ),
+            message: format!("provenance validation failed: {e} — check cross-context chain depth"),
             code: "SCP-VALID-7002".to_owned(),
         }
     }
@@ -355,9 +353,7 @@ impl From<scp_platform::PlatformError> for ScpError {
 impl From<serde_json::Error> for ScpError {
     fn from(e: serde_json::Error) -> Self {
         Self::Validation {
-            message: format!(
-                "JSON serialization/deserialization failed: {e} — check input format"
-            ),
+            message: format!("JSON serialization/deserialization failed: {e} — check input format"),
             code: "SCP-VALID-7006".to_owned(),
         }
     }
@@ -866,10 +862,7 @@ impl TransportManager {
 
     /// Returns `true` if the transport is currently connected.
     pub fn is_connected(&self) -> bool {
-        self.status
-            .lock()
-            .map(|s| s.connected)
-            .unwrap_or(false)
+        self.status.lock().map(|s| s.connected).unwrap_or(false)
     }
 }
 
@@ -1004,9 +997,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
         .spawn(async move {
             if !did.starts_with("did:dht:") {
                 return Err(ScpError::Identity {
-                    message: format!(
-                        "unsupported DID method: {did} — only did:dht is supported"
-                    ),
+                    message: format!("unsupported DID method: {did} — only did:dht is supported"),
                     code: "SCP-IDENT-1004".to_owned(),
                 });
             }
@@ -1638,10 +1629,7 @@ pub async fn ucan_mint(
 /// Returns `ScpError::Permission` if revocation fails (token not found,
 /// revoker not authorized — must be the token's issuer or context creator).
 #[uniffi::export]
-pub async fn ucan_revoke(
-    handle: Arc<ContextHandle>,
-    token_id: String,
-) -> Result<(), ScpError> {
+pub async fn ucan_revoke(handle: Arc<ContextHandle>, token_id: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
             let _ = (handle, token_id);
@@ -1731,8 +1719,9 @@ pub async fn event_log_verify(
         .spawn(async move {
             let _ = (handle, claim_json);
             Err(ScpError::Context {
-                message: "not yet connected to runtime — event log verification requires a live context"
-                    .to_owned(),
+                message:
+                    "not yet connected to runtime — event log verification requires a live context"
+                        .to_owned(),
                 code: "SCP-CTX-2025".to_owned(),
             })
         })

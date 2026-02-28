@@ -60,20 +60,13 @@ extern "C" {
     ///
     /// `key_id` is an opaque string issued by [`generate_keypair`].
     #[wasm_bindgen(method, catch, js_name = "sign")]
-    pub fn sign(
-        this: &JsKeyCustody,
-        key_id: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, JsValue>;
+    pub fn sign(this: &JsKeyCustody, key_id: &str, data: &[u8]) -> Result<Vec<u8>, JsValue>;
 
     /// Returns the raw public key bytes for the key identified by `key_id`.
     ///
     /// Returns a `Uint8Array` on the JS side. Throws if the key is not found.
     #[wasm_bindgen(method, catch, js_name = "getPublicKey")]
-    pub fn get_public_key(
-        this: &JsKeyCustody,
-        key_id: &str,
-    ) -> Result<Vec<u8>, JsValue>;
+    pub fn get_public_key(this: &JsKeyCustody, key_id: &str) -> Result<Vec<u8>, JsValue>;
 
     /// Generates a new keypair of type `key_type` and returns its `key_id`.
     ///
@@ -81,20 +74,14 @@ extern "C" {
     /// ID that identifies the generated keypair. Throws on key generation
     /// failure.
     #[wasm_bindgen(method, catch, js_name = "generateKeypair")]
-    pub fn generate_keypair(
-        this: &JsKeyCustody,
-        key_type: &str,
-    ) -> Result<String, JsValue>;
+    pub fn generate_keypair(this: &JsKeyCustody, key_type: &str) -> Result<String, JsValue>;
 
     /// Destroys the key identified by `key_id`, zeroing all key material.
     ///
     /// Idempotent — calling on a key that does not exist is a no-op.
     /// Throws on unexpected internal errors.
     #[wasm_bindgen(method, catch, js_name = "destroyKey")]
-    pub fn destroy_key(
-        this: &JsKeyCustody,
-        key_id: &str,
-    ) -> Result<(), JsValue>;
+    pub fn destroy_key(this: &JsKeyCustody, key_id: &str) -> Result<(), JsValue>;
 
     /// Perform X25519 DH key agreement.
     /// peer_public: 32-byte peer X25519 public key as Uint8Array.

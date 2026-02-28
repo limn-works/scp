@@ -42,10 +42,7 @@ mod serde_signature_64 {
     {
         let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
         v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!(
-                "expected 64-byte signature, got {} bytes",
-                v.len()
-            ))
+            serde::de::Error::custom(format!("expected 64-byte signature, got {} bytes", v.len()))
         })
     }
 }

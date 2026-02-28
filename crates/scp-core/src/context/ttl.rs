@@ -47,10 +47,10 @@ use tokio::task::JoinHandle;
 
 use super::builder::{ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider};
 use super::membership::ContextEvent;
-use crate::identity::DID;
 use super::params::GovernanceModel;
 use super::roles::{self, ContextRoleState};
 use super::{ContextError, ContextHandle, ContextState, MemoryScope};
+use crate::identity::DID;
 use crate::identity::cache::Clock;
 
 // ---------------------------------------------------------------------------
@@ -1226,10 +1226,9 @@ mod tests {
         ext.add_consent("did:key:alice".into());
         ext.add_consent("did:key:bob".into());
 
-        let active: HashSet<DID> =
-            ["did:key:alice".into(), "did:key:bob".into()]
-                .into_iter()
-                .collect();
+        let active: HashSet<DID> = ["did:key:alice".into(), "did:key:bob".into()]
+            .into_iter()
+            .collect();
 
         assert_eq!(ext.active_consent_count(&active), 2);
         assert!(ext.is_unanimous_active(&active));
@@ -1266,12 +1265,9 @@ mod tests {
         assert!(ext.is_unanimous());
 
         // Charlie removed -- only Alice and Bob are active.
-        let active: HashSet<DID> = [
-            "did:key:alice".into(),
-            "did:key:bob".into(),
-        ]
-        .into_iter()
-        .collect();
+        let active: HashSet<DID> = ["did:key:alice".into(), "did:key:bob".into()]
+            .into_iter()
+            .collect();
 
         // Active tally: 2 of 3 required -- not enough.
         assert_eq!(ext.active_consent_count(&active), 2);
@@ -1328,10 +1324,9 @@ mod tests {
         proposal.record_consent("did:key:bob".into());
 
         // Both active -- approved.
-        let both_active: HashSet<DID> =
-            ["did:key:alice".into(), "did:key:bob".into()]
-                .into_iter()
-                .collect();
+        let both_active: HashSet<DID> = ["did:key:alice".into(), "did:key:bob".into()]
+            .into_iter()
+            .collect();
         assert!(proposal.is_approved_active(&both_active));
         assert_eq!(proposal.active_consent_count(&both_active), 2);
         assert_eq!(proposal.active_remaining(&both_active), 0);

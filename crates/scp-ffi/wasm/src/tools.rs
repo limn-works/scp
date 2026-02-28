@@ -113,11 +113,9 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
     let context_id = context.context_id();
     future_to_promise(async move {
         // Validate that definition_json is valid JSON.
-        let _def: serde_json::Value = serde_json::from_str(&definition_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
-                "definition_json is not valid JSON: {e}"
-            ))
-            .into_js())?;
+        let _def: serde_json::Value = serde_json::from_str(&definition_json).map_err(|e| {
+            ScpWasmError::Validation(format!("definition_json is not valid JSON: {e}")).into_js()
+        })?;
 
         let _ = context_id;
 
@@ -163,11 +161,9 @@ pub fn tool_invoke(
     let context_id = context.context_id();
     future_to_promise(async move {
         // Validate that input_json is valid JSON.
-        let _input: serde_json::Value = serde_json::from_str(&input_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
-                "input_json is not valid JSON: {e}"
-            ))
-            .into_js())?;
+        let _input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+            ScpWasmError::Validation(format!("input_json is not valid JSON: {e}")).into_js()
+        })?;
 
         let _ = (context_id, tool_id, identity_did);
 

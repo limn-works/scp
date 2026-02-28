@@ -264,4 +264,3 @@ pub fn identity_load(did: String) -> Promise {
         }))
     })
 }
-

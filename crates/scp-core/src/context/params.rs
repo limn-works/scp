@@ -451,8 +451,8 @@ mod tests {
     #[test]
     fn context_params_with_economic_policy_serde_roundtrip() {
         use crate::economy::{
-            Amount, CostSchedule, CurrencyCode, EconomicPolicy, PricingFormula, PricingMetric,
-            PricingVariable, Coefficient,
+            Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PricingFormula,
+            PricingMetric, PricingVariable,
         };
         use crate::identity::DID;
 

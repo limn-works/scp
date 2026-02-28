@@ -197,9 +197,7 @@ pub enum SyncError {
     },
 
     /// Sender key re-acquisition timed out (Phase 4 of reconnection protocol).
-    #[error(
-        "sender key timeout for sender {sender_did} in context {context_id}"
-    )]
+    #[error("sender key timeout for sender {sender_did} in context {context_id}")]
     SenderKeyTimeout {
         /// The context where the timeout occurred.
         context_id: ContextId,
@@ -242,9 +240,7 @@ pub enum SyncError {
     },
 
     /// A Commit in the catch-up sequence was corrupted or failed to process.
-    #[error(
-        "commit processing failed at epoch {epoch} in context {context_id}: {reason}"
-    )]
+    #[error("commit processing failed at epoch {epoch} in context {context_id}: {reason}")]
     CommitProcessingFailed {
         /// The context where processing failed.
         context_id: ContextId,
