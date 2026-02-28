@@ -79,7 +79,13 @@
 - FIXED (PR#112): eprintln replaced with tracing::error for SSE server errors
 - FIXED (PR#112): SSE endpoint path validated for control characters
 - HIGH: expect() panic across FFI in py_context_create (line 457) -- unguarded clock call
-- HIGH (SCP-165): subprocess command injection -- arbitrary exec via py_mcp_client_connect_stdio
+- FIXED (SCP-165): subprocess command injection -- allowlist added in PR#112, reviewed 2026-02-28
+- FIXED: validate_stdio_command now rejects paths (bare basenames only, OS resolves via PATH)
+- FIXED: py_mcp_configure_stdio_allowlist validates entries (rejects paths, NUL, empty)
+- FIXED: configure/disable/reset/get split into separate functions with proper ceremony
+- FIXED: Python SDK pre-validates in connect() before FFI, raises ValidationError with actionable messages
+- REMAINING (MEDIUM): docker/podman in default allowlist -- permissive for defense-in-depth
+- RESOLVED (MEDIUM): Python DEFAULT_STDIO_ALLOWLIST duplicates Rust list -- Python SDK already queries runtime via get_stdio_allowlist(); constant is documentation only
 - TRACKED (TODO #106): validate_capability always Ok(()) -- defense-in-depth gap
 - TRACKED (TODO #106): invoke_tool returns stub JSON, not real tool execution
 - TRACKED: registries unbounded (#108), recursion depth (#110), clock drift (#107)

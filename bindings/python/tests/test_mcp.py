@@ -26,6 +26,7 @@ import pytest
 
 from scp_sdk.errors import TransportError, ValidationError
 from scp_sdk.mcp import (
+    DEFAULT_STDIO_ALLOWLIST,
     McpClient,
     McpProvenance,
     McpServer,
@@ -33,6 +34,10 @@ from scp_sdk.mcp import (
     McpToolResult,
     _VALID_TRANSPORTS,
     cli_main,
+    configure_stdio_allowlist,
+    disable_stdio_allowlist,
+    get_stdio_allowlist,
+    reset_stdio_allowlist,
     serve_mcp,
 )
 
@@ -479,12 +484,17 @@ class TestModuleAll:
         from scp_sdk import mcp
 
         expected = {
+            "DEFAULT_STDIO_ALLOWLIST",
             "McpClient",
             "McpProvenance",
             "McpServer",
             "McpToolDefinition",
             "McpToolResult",
             "cli_main",
+            "configure_stdio_allowlist",
+            "disable_stdio_allowlist",
+            "get_stdio_allowlist",
+            "reset_stdio_allowlist",
             "serve_mcp",
         }
         assert set(mcp.__all__) == expected
@@ -494,3 +504,136 @@ class TestModuleAll:
 
         for name in mcp.__all__:
             assert hasattr(mcp, name), f"{name} in __all__ but not importable"
+
+
+# -----------------------------------------------------------------------
+# DEFAULT_STDIO_ALLOWLIST tests
+# -----------------------------------------------------------------------
+
+
+class TestDefaultStdioAllowlist:
+    """Tests for the DEFAULT_STDIO_ALLOWLIST constant."""
+
+    def test_is_frozenset(self) -> None:
+        assert isinstance(DEFAULT_STDIO_ALLOWLIST, frozenset)
+
+    def test_contains_known_binaries(self) -> None:
+        for name in ("uvx", "npx", "node", "python3", "docker", "scp-mcp"):
+            assert name in DEFAULT_STDIO_ALLOWLIST
+
+    def test_does_not_contain_shells(self) -> None:
+        for name in ("sh", "bash", "zsh", "fish", "cmd", "powershell"):
+            assert name not in DEFAULT_STDIO_ALLOWLIST
+
+    def test_no_paths_in_entries(self) -> None:
+        """All entries must be bare basenames, no path separators."""
+        for name in DEFAULT_STDIO_ALLOWLIST:
+            assert "/" not in name, f"path separator in allowlist entry: {name}"
+            assert "\\" not in name, f"backslash in allowlist entry: {name}"
+
+
+# -----------------------------------------------------------------------
+# Stdio allowlist API tests (pure Python validation, no bridge required)
+# -----------------------------------------------------------------------
+
+
+class TestStdioAllowlistApi:
+    """Tests for the module-level allowlist functions (Python-side validation)."""
+
+    def test_configure_with_no_binaries_is_noop(self) -> None:
+        """Calling with no binaries should not error."""
+        # This returns early before calling the bridge, so no bridge needed.
+        configure_stdio_allowlist()
+
+    def test_disable_requires_confirmation(self) -> None:
+        """disable_stdio_allowlist must receive i_trust_all_commands=True."""
+        with pytest.raises(ValidationError, match="i_trust_all_commands"):
+            disable_stdio_allowlist()
+
+    def test_disable_rejects_false_confirmation(self) -> None:
+        with pytest.raises(ValidationError, match="i_trust_all_commands"):
+            disable_stdio_allowlist(i_trust_all_commands=False)
+
+
+# -----------------------------------------------------------------------
+# McpClient.connect allowlist pre-validation tests (no bridge required)
+# -----------------------------------------------------------------------
+
+
+class TestMcpClientAllowlistPreValidation:
+    """Tests that connect() rejects paths before calling the bridge."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_absolute_path(self) -> None:
+        with pytest.raises(ValidationError, match="bare binary name"):
+            await McpClient.connect("stdio", command=["/usr/bin/node"])
+
+    @pytest.mark.asyncio
+    async def test_rejects_relative_path(self) -> None:
+        with pytest.raises(ValidationError, match="bare binary name"):
+            await McpClient.connect("stdio", command=["./node"])
+
+    @pytest.mark.asyncio
+    async def test_rejects_path_traversal(self) -> None:
+        with pytest.raises(ValidationError, match="bare binary name"):
+            await McpClient.connect("stdio", command=["../../bin/node"])
+
+    @pytest.mark.asyncio
+    async def test_path_rejection_error_code(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            await McpClient.connect("stdio", command=["/tmp/evil/node"])
+        assert exc_info.value.code == "SCP-MCP-8006"
+
+    @pytest.mark.asyncio
+    async def test_unlisted_binary_rejected_with_actionable_message(self) -> None:
+        """An unlisted bare binary should produce a message with configure instructions."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_mcp_get_stdio_allowlist.return_value = {
+            "allowed": list(DEFAULT_STDIO_ALLOWLIST),
+            "unrestricted": False,
+        }
+        with patch("scp_sdk.mcp._bridge", return_value=mock_bridge):
+            with pytest.raises(ValidationError, match="configure_stdio_allowlist"):
+                await McpClient.connect("stdio", command=["my-custom-server"])
+
+    @pytest.mark.asyncio
+    async def test_unrestricted_skips_basename_check(self) -> None:
+        """When unrestricted, any bare binary should be allowed (passes to bridge)."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_mcp_get_stdio_allowlist.return_value = {
+            "allowed": [],
+            "unrestricted": True,
+        }
+        mock_bridge.py_mcp_client_connect_stdio.return_value = "handle-123"
+        with patch("scp_sdk.mcp._bridge", return_value=mock_bridge):
+            client = await McpClient.connect("stdio", command=["any-binary"])
+            assert client._transport == "stdio"
+
+
+# -----------------------------------------------------------------------
+# Package re-export tests (updated)
+# -----------------------------------------------------------------------
+
+
+class TestPackageReExportsAllowlist:
+    """Tests that allowlist functions are re-exported from top-level."""
+
+    def test_configure_accessible(self) -> None:
+        import scp_sdk
+
+        assert scp_sdk.configure_stdio_allowlist is configure_stdio_allowlist
+
+    def test_disable_accessible(self) -> None:
+        import scp_sdk
+
+        assert scp_sdk.disable_stdio_allowlist is disable_stdio_allowlist
+
+    def test_reset_accessible(self) -> None:
+        import scp_sdk
+
+        assert scp_sdk.reset_stdio_allowlist is reset_stdio_allowlist
+
+    def test_get_accessible(self) -> None:
+        import scp_sdk
+
+        assert scp_sdk.get_stdio_allowlist is get_stdio_allowlist

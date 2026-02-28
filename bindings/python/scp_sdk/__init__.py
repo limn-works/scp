@@ -53,7 +53,18 @@ from scp_sdk.types import (
     ProvenanceQuality,
     SourceType,
 )
-from scp_sdk.mcp import McpClient, McpProvenance, McpServer, McpToolDefinition, McpToolResult, serve_mcp
+from scp_sdk.mcp import (
+    McpClient,
+    McpProvenance,
+    McpServer,
+    McpToolDefinition,
+    McpToolResult,
+    configure_stdio_allowlist,
+    disable_stdio_allowlist,
+    get_stdio_allowlist,
+    reset_stdio_allowlist,
+    serve_mcp,
+)
 from scp_sdk.ucan import UcanToken, delegate, mint, revoke, validate
 
 __version__ = "0.1.0"
@@ -114,6 +125,10 @@ __all__ = [
     "McpServer",
     "McpToolDefinition",
     "McpToolResult",
+    "configure_stdio_allowlist",
+    "disable_stdio_allowlist",
+    "get_stdio_allowlist",
+    "reset_stdio_allowlist",
     "serve_mcp",
     # UCAN
     "UcanToken",

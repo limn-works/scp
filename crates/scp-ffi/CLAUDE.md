@@ -82,5 +82,10 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - `FfiBridgeProvider::validate_capability` always returns `Ok(())` (TODO #106) — authorization depends on UCAN layer. `invoke_tool` returns stub JSON (TODO #106), not real tool execution.
 - `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
 - SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
-- **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Basename is extracted (neutralizes path traversal). Extend via `py_mcp_configure_stdio_allowlist()` or set `unrestricted=True` to bypass. Per MCP Security Best Practices.
+- **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Only bare binary names are accepted — paths (absolute or relative) are rejected to prevent basename-spoofing bypasses. The OS resolves the binary via `PATH`. Per MCP Security Best Practices.
+  - `py_mcp_configure_stdio_allowlist(additional_binaries)` — add entries (validated: no paths, no NUL, no empty).
+  - `py_mcp_disable_stdio_allowlist()` — enter unrestricted mode (separate function for ceremony).
+  - `py_mcp_reset_stdio_allowlist()` — restore defaults and re-enable enforcement.
+  - `py_mcp_get_stdio_allowlist()` — introspect current state (`{"allowed": [...], "unrestricted": bool}`).
+  - Python SDK exposes these as module-level functions: `configure_stdio_allowlist()`, `disable_stdio_allowlist(i_trust_all_commands=True)`, `reset_stdio_allowlist()`, `get_stdio_allowlist()`. Pre-validation in `McpClient.connect()` catches path and allowlist issues before crossing FFI, raising `ValidationError` with actionable messages.
 - `py_mcp_load_contexts` always returns an empty list — requires relay transport layer (scp-transport) not yet wired.

@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod allowlist;
 pub mod client;
 pub mod namespace;
 pub mod protocol;

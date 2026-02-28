@@ -35,7 +35,6 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full MCP adapter design.
 
-use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -43,98 +42,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport, SystemTimestamp};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use scp_mcp::server::{ContextProvider, ContextToolInfo, McpServer, MemberInfo};
 
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
-
-// ---------------------------------------------------------------------------
-// Stdio command allowlist (defense-in-depth)
-// ---------------------------------------------------------------------------
-
-/// Well-known MCP server launchers allowed by default.
-///
-/// Per MCP Security Best Practices, stdio transport must validate commands
-/// before execution. This allowlist restricts subprocess spawning to known
-/// MCP server runtimes. Use [`py_mcp_configure_stdio_allowlist`] to extend
-/// or disable.
-const DEFAULT_STDIO_ALLOWLIST: &[&str] = &[
-    // Package runners
-    "uvx",    // Python (uv tool runner)
-    "npx",    // Node.js (npm package runner)
-    "bunx",   // Bun (JavaScript runtime)
-    "pipx",   // Python (pip package runner)
-    // Direct interpreters
-    "python",
-    "python3",
-    "node",
-    "bun",
-    "deno",
-    // Containerized execution
-    "docker",
-    "podman",
-    // SCP's own CLI
-    "scp-mcp",
-];
-
-/// Runtime-configurable allowlist for stdio subprocess commands.
-struct StdioAllowlist {
-    /// Allowed binary basenames.
-    allowed: HashSet<String>,
-    /// If true, bypass the allowlist entirely (logs a warning).
-    unrestricted: bool,
-}
-
-impl StdioAllowlist {
-    fn default_list() -> Self {
-        Self {
-            allowed: DEFAULT_STDIO_ALLOWLIST
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            unrestricted: false,
-        }
-    }
-}
-
-/// Global singleton for the stdio allowlist.
-fn stdio_allowlist() -> &'static Mutex<StdioAllowlist> {
-    static INSTANCE: OnceLock<Mutex<StdioAllowlist>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(StdioAllowlist::default_list()))
-}
-
-/// Validates a command against the stdio allowlist.
-///
-/// Extracts the basename from the command path and checks it against the
-/// allowlist. Returns `Ok(basename)` if allowed, `Err(message)` if denied.
-fn validate_stdio_command(cmd: &str) -> Result<String, String> {
-    let basename = std::path::Path::new(cmd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("invalid command path: '{cmd}'"))?
-        .to_owned();
-
-    let guard = stdio_allowlist()
-        .lock()
-        .map_err(|_| "stdio allowlist lock poisoned".to_owned())?;
-
-    if guard.unrestricted {
-        return Ok(basename);
-    }
-
-    if guard.allowed.contains(&basename) {
-        Ok(basename)
-    } else {
-        let mut sorted: Vec<&str> = guard.allowed.iter().map(String::as_str).collect();
-        sorted.sort_unstable();
-        Err(format!(
-            "command '{basename}' is not in the MCP stdio allowlist. \
-             Allowed: {sorted:?}. Use py_mcp_configure_stdio_allowlist() to extend."
-        ))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Stdio client transport
@@ -153,9 +67,8 @@ struct StdioClientTransport {
 
 /// Interior state for [`StdioClientTransport`], protected by a mutex.
 struct StdioTransportInner {
-    /// The spawned subprocess. Kept alive for the transport lifetime;
-    /// dropped when the transport is dropped, which kills the subprocess.
-    #[allow(dead_code)]
+    /// The spawned subprocess. Kept alive for the transport lifetime.
+    /// Killed and reaped when the transport is dropped via [`Drop`].
     child: Child,
     /// Buffered writer to the subprocess's stdin.
     writer: std::io::BufWriter<std::process::ChildStdin>,
@@ -173,15 +86,16 @@ impl StdioClientTransport {
         let (cmd, args) = command.split_first().ok_or("command list is empty")?;
 
         // Validate the command against the stdio allowlist (defense-in-depth).
-        let _basename = validate_stdio_command(cmd)?;
+        // Uses the validated basename for Command::new to prevent path bypass.
+        let basename = allowlist::validate_command(cmd).map_err(|e| e.to_string())?;
 
-        let mut child = Command::new(cmd)
+        let mut child = Command::new(&basename)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("failed to spawn '{cmd}': {e}"))?;
+            .map_err(|e| format!("failed to spawn '{basename}': {e}"))?;
 
         let stdin = child
             .stdin
@@ -204,9 +118,14 @@ impl StdioClientTransport {
         })
     }
 
-    /// Kills the subprocess if it is still running.
-    #[allow(dead_code)] // Available for explicit cleanup; subprocess is also killed on Drop.
-    fn kill(&self) {
+}
+
+/// Kills the subprocess and waits for it to exit on drop.
+///
+/// `std::process::Child::drop` does NOT kill the subprocess — it only closes
+/// handles. Without this impl, dropped transports leak running subprocesses.
+impl Drop for StdioClientTransport {
+    fn drop(&mut self) {
         if let Ok(mut inner) = self.inner.lock() {
             let _ = inner.child.kill();
             let _ = inner.child.wait();
@@ -783,8 +702,6 @@ struct McpClientState {
     command: Option<Vec<String>>,
     /// For sse, the URL of the SSE endpoint.
     url: Option<String>,
-    /// Whether the client has been disconnected.
-    disconnected: bool,
     /// The real MCP client, connected and initialized.
     client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
 }
@@ -1123,7 +1040,7 @@ pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
         transport: "stdio".to_owned(),
         command: Some(command),
         url: None,
-        disconnected: false,
+
         client: Arc::new(Mutex::new(client)),
     };
 
@@ -1175,7 +1092,7 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
         transport: "sse".to_owned(),
         command: None,
         url: Some(url.to_owned()),
-        disconnected: false,
+
         client: Arc::new(Mutex::new(client)),
     };
 
@@ -1186,9 +1103,9 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 
 /// Disconnects from an external MCP server.
 ///
-/// Marks the client as disconnected and cleans up the transport connection.
-/// For stdio clients, kills the subprocess. For SSE clients, closes the
-/// TCP connection.
+/// Removes the client from the registry and drops the transport connection.
+/// For stdio clients, the subprocess is killed via `StdioClientTransport::drop`.
+/// For SSE clients, the TCP connection is closed.
 ///
 /// # Arguments
 ///
@@ -1196,37 +1113,20 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the client is not found or already
-/// disconnected.
+/// Raises `TransportError` if the client handle is not found (e.g. already
+/// disconnected or never connected).
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_disconnect")]
 pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
-    let mut entry = client_registry().get_mut(handle).ok_or_else(|| {
+    let (_, state) = client_registry().remove(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
 
-    if entry.disconnected {
-        return Err(ScpPyError::TransportError(format!(
-            "MCP client '{handle}' is already disconnected"
-        ))
-        .into());
-    }
-
-    entry.disconnected = true;
-
-    // Kill the subprocess if this is a stdio transport.
-    if let Ok(client) = entry.client.lock() {
-        // Access the transport to kill it. Since McpClient doesn't expose
-        // its transport directly, we rely on the Drop implementation or
-        // manual cleanup. For stdio, the subprocess will be killed when
-        // the transport is dropped. We force it now by accessing the
-        // transport through a known mechanism.
-        //
-        // Since we marked disconnected=true, subsequent operations will
-        // fail with TransportError, and the transport resources will be
-        // cleaned up when the McpClientState is dropped.
-        drop(client);
-    }
+    // Dropping `state` drops the Arc<Mutex<McpClient>>, which drops the
+    // McpClient, which drops the ClientTransport. For stdio transports,
+    // the Drop impl on StdioClientTransport kills and waits on the
+    // subprocess, preventing resource leaks.
+    drop(state);
 
     Ok(())
 }
@@ -1255,13 +1155,6 @@ pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObje
     let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
-
-    if entry.disconnected {
-        return Err(ScpPyError::TransportError(format!(
-            "MCP client '{handle}' is disconnected"
-        ))
-        .into());
-    }
 
     // Send the real tools/list request via the MCP client.
     let client = Arc::clone(&entry.client);
@@ -1326,13 +1219,6 @@ pub fn py_mcp_client_invoke(
     let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
-
-    if entry.disconnected {
-        return Err(ScpPyError::TransportError(format!(
-            "MCP client '{handle}' is disconnected"
-        ))
-        .into());
-    }
 
     let client = Arc::clone(&entry.client);
     drop(entry); // Release the DashMap guard before Python object access.
@@ -1407,44 +1293,106 @@ pub fn py_mcp_load_contexts(
 }
 
 // ---------------------------------------------------------------------------
+// Stdio allowlist error mapping
+// ---------------------------------------------------------------------------
+
+/// Maps [`AllowlistError`] to the appropriate [`ScpPyError`] variant.
+///
+/// Input-validation errors map to `ValidationError`. Runtime/policy errors
+/// map to `TransportError`. Exhaustive match ensures new variants produce
+/// a compile error instead of silently falling through.
+fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
+    use scp_mcp::allowlist::AllowlistError;
+    let msg = e.to_string();
+    match e {
+        AllowlistError::EmptyEntry
+        | AllowlistError::PathInEntry(_)
+        | AllowlistError::NulInEntry(_)
+        | AllowlistError::ControlCharInEntry(_)
+        | AllowlistError::PathInCommand(_)
+        | AllowlistError::InvalidCommand(_) => ScpPyError::ValidationError(msg),
+        AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
+            ScpPyError::TransportError(msg)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stdio allowlist configuration (PyO3)
 // ---------------------------------------------------------------------------
 
 /// Configures the MCP stdio subprocess allowlist.
 ///
 /// By default, only well-known MCP server launchers are permitted (e.g.
-/// `uvx`, `npx`, `node`, `python3`). Use this function to extend the list
-/// or bypass it entirely for advanced use cases.
+/// `uvx`, `npx`, `node`, `python3`). Use this function to extend the list.
 ///
 /// # Arguments
 ///
 /// * `additional_binaries` -- Binary basenames to add to the default allowlist.
-/// * `unrestricted` -- If `true`, disables the allowlist entirely. Logs a
-///   warning. Use only when the command source is fully trusted.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if any entry is invalid (path, NUL, empty).
+/// Raises `TransportError` if the allowlist lock is poisoned.
+#[pyfunction]
+#[pyo3(name = "py_mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![]))]
+pub fn py_mcp_configure_stdio_allowlist(
+    additional_binaries: Vec<String>,
+) -> PyResult<()> {
+    allowlist::configure(&additional_binaries).map_err(allowlist_err)?;
+    Ok(())
+}
+
+/// Disable the stdio allowlist entirely (unrestricted mode).
+///
+/// # Safety
+///
+/// This allows **any** binary to be spawned as a subprocess. Only use when
+/// the command source is fully trusted.
 ///
 /// # Errors
 ///
 /// Raises `TransportError` if the allowlist lock is poisoned.
 #[pyfunction]
-#[pyo3(name = "py_mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![], unrestricted=false))]
-pub fn py_mcp_configure_stdio_allowlist(
-    additional_binaries: Vec<String>,
-    unrestricted: bool,
-) -> PyResult<()> {
-    let mut guard = stdio_allowlist().lock().map_err(|e| {
-        ScpPyError::TransportError(format!("stdio allowlist lock poisoned: {e}"))
-    })?;
-
-    if unrestricted {
-        guard.unrestricted = true;
-    } else {
-        guard.unrestricted = false;
-        for name in additional_binaries {
-            guard.allowed.insert(name);
-        }
-    }
-
+#[pyo3(name = "py_mcp_disable_stdio_allowlist")]
+pub fn py_mcp_disable_stdio_allowlist() -> PyResult<()> {
+    allowlist::disable_enforcement().map_err(allowlist_err)?;
     Ok(())
+}
+
+/// Reset the stdio allowlist to its default state.
+///
+/// Restores the default binaries and re-enables allowlist enforcement
+/// (clears unrestricted mode).
+///
+/// # Errors
+///
+/// Raises `TransportError` if the allowlist lock is poisoned.
+#[pyfunction]
+#[pyo3(name = "py_mcp_reset_stdio_allowlist")]
+pub fn py_mcp_reset_stdio_allowlist() -> PyResult<()> {
+    allowlist::reset().map_err(allowlist_err)?;
+    Ok(())
+}
+
+/// Return the current stdio allowlist state.
+///
+/// Returns a Python dict with keys:
+/// - `"allowed"`: sorted list of allowed binary names
+/// - `"unrestricted"`: bool indicating whether the allowlist is bypassed
+///
+/// # Errors
+///
+/// Raises `TransportError` if the allowlist lock is poisoned.
+#[pyfunction]
+#[pyo3(name = "py_mcp_get_stdio_allowlist")]
+pub fn py_mcp_get_stdio_allowlist(py: Python<'_>) -> PyResult<PyObject> {
+    let state = allowlist::get_state().map_err(allowlist_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("allowed", state.allowed)?;
+    dict.set_item("unrestricted", state.unrestricted)?;
+    Ok(dict.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,6 +1417,9 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_mcp_client_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_load_contexts, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_configure_stdio_allowlist, m)?)?;
+    m.add_function(wrap_pyfunction!(py_mcp_disable_stdio_allowlist, m)?)?;
+    m.add_function(wrap_pyfunction!(py_mcp_reset_stdio_allowlist, m)?)?;
+    m.add_function(wrap_pyfunction!(py_mcp_get_stdio_allowlist, m)?)?;
     Ok(())
 }
 
@@ -1614,60 +1565,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Stdio allowlist
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn validate_stdio_command_allows_default_binaries() {
-        for bin in DEFAULT_STDIO_ALLOWLIST {
-            assert!(
-                validate_stdio_command(bin).is_ok(),
-                "default binary '{bin}' should be allowed"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_stdio_command_extracts_basename_from_path() {
-        // Absolute path to an allowed binary should pass.
-        let result = validate_stdio_command("/usr/bin/node");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "node");
-    }
-
-    #[test]
-    fn validate_stdio_command_rejects_path_traversal() {
-        // Path traversal to an unknown binary should be rejected.
-        match validate_stdio_command("../../bin/sh") {
-            Err(msg) => assert!(msg.contains("allowlist"), "error should mention allowlist: {msg}"),
-            Ok(_) => panic!("expected rejection for path traversal to non-allowed binary"),
-        }
-    }
-
-    #[test]
-    fn validate_stdio_command_rejects_unknown_binary() {
-        match validate_stdio_command("curl") {
-            Err(msg) => assert!(msg.contains("allowlist"), "error should mention allowlist: {msg}"),
-            Ok(_) => panic!("expected rejection for unknown binary"),
-        }
-    }
-
-    #[test]
-    fn validate_stdio_command_rejects_shell() {
-        for shell in &["sh", "bash", "zsh", "fish", "cmd", "powershell"] {
-            assert!(
-                validate_stdio_command(shell).is_err(),
-                "shell '{shell}' should NOT be in the allowlist"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // StdioClientTransport
     // -----------------------------------------------------------------------
 
     #[test]
     fn stdio_client_transport_spawn_rejects_unlisted_command() {
+        allowlist::reset().unwrap();
         let result = StdioClientTransport::spawn(&[
             "nonexistent_command_that_does_not_exist_12345".to_owned(),
         ]);
@@ -1682,26 +1585,4 @@ mod tests {
         let result = StdioClientTransport::spawn(&[]);
         assert!(result.is_err());
     }
-
-    // -----------------------------------------------------------------------
-    // Server/client lifecycle (integration-style tests)
-    // -----------------------------------------------------------------------
-
-    // Note: Full lifecycle tests (start server, connect client, list tools,
-    // invoke, disconnect, stop) require either:
-    //   1. A real MCP server subprocess (tested via pytest)
-    //   2. An in-process mock (tested below with the mock transport from
-    //      scp-mcp::client)
-    //
-    // Since scp-ffi has test=false (requires Python dev headers), these
-    // tests serve as documentation of expected behavior and are verified
-    // via maturin develop + pytest.
-
-    // -----------------------------------------------------------------------
-    // Disconnected client error
-    // -----------------------------------------------------------------------
-
-    // Verified in the bridge functions: when `disconnected` is true,
-    // list_tools and invoke return TransportError. This is tested via
-    // pytest since the bridge functions require PyO3.
 }
