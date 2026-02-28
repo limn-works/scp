@@ -165,7 +165,8 @@ impl TimestampProvider for SystemTimestamp {
     fn now_millis(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok())
             .unwrap_or(0)
     }
 }
@@ -213,7 +214,7 @@ impl<T: McpTransport> McpClient<T, SystemTimestamp> {
     /// Uses the system clock for timestamps. Call [`initialize`](Self::initialize)
     /// before listing or invoking tools.
     #[must_use]
-    pub fn new(transport: T) -> Self {
+    pub const fn new(transport: T) -> Self {
         Self {
             transport,
             initialized: false,
@@ -229,7 +230,7 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
     ///
     /// Useful for testing with deterministic timestamps.
     #[must_use]
-    pub fn with_clock(transport: T, clock: C) -> Self {
+    pub const fn with_clock(transport: T, clock: C) -> Self {
         Self {
             transport,
             initialized: false,
@@ -247,7 +248,7 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
 
     /// Returns the server info received during initialization, if available.
     #[must_use]
-    pub fn server_info(&self) -> Option<&InitializeResult> {
+    pub const fn server_info(&self) -> Option<&InitializeResult> {
         self.server_info.as_ref()
     }
 
@@ -336,9 +337,9 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
             .map_err(McpClientError::Transport)?;
 
         // Safety: we just set server_info to Some above.
-        Ok(self.server_info.as_ref().ok_or_else(|| {
+        self.server_info.as_ref().ok_or_else(|| {
             McpClientError::InvalidResponse("server_info unexpectedly None".to_owned())
-        })?)
+        })
     }
 
     // -----------------------------------------------------------------------

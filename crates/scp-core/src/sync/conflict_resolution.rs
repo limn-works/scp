@@ -26,9 +26,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::ContextId;
 use crate::context::governance::{GovernanceAction, GovernanceModelConfig, ProposalId};
 use crate::identity::DID;
-use super::ContextId;
 
 // ---------------------------------------------------------------------------
 // MerkleRoot type alias
@@ -293,7 +293,9 @@ pub fn actions_conflict(
 
         // Remove + role change for the same DID.
         (
-            GovernanceAction::RemoveMember { did: remove_did, .. },
+            GovernanceAction::RemoveMember {
+                did: remove_did, ..
+            },
             GovernanceAction::ChangeRole {
                 did: change_did, ..
             },
@@ -302,7 +304,9 @@ pub fn actions_conflict(
             GovernanceAction::ChangeRole {
                 did: change_did, ..
             },
-            GovernanceAction::RemoveMember { did: remove_did, .. },
+            GovernanceAction::RemoveMember {
+                did: remove_did, ..
+            },
         ) => remove_did == change_did,
 
         // Mutual removal: each proposer removes the other.
@@ -367,7 +371,7 @@ pub fn resolve_metadata_conflict(a: &MetadataOp, b: &MetadataOp) -> ConflictReso
 ///
 /// - The proposal with the lower leaf index (committed first) wins.
 /// - The losing proposal is invalidated with reason "Conflicting proposal
-///   {winner_id} committed first".
+///   {`winner_id`} committed first".
 /// - If two proposals have the same leaf index (simultaneous commit), the
 ///   context enters a governance freeze (ADR-031 section 7).
 ///
@@ -418,15 +422,13 @@ pub fn resolve_governance_conflict(
     let simultaneous: Vec<ProposalId> = conflicting_pairs
         .iter()
         .filter(|(i, j)| proposals[*i].leaf_index == proposals[*j].leaf_index)
-        .flat_map(|(i, j)| {
-            vec![proposals[*i].proposal_id, proposals[*j].proposal_id]
-        })
+        .flat_map(|(i, j)| vec![proposals[*i].proposal_id, proposals[*j].proposal_id])
         .collect();
 
     if !simultaneous.is_empty() {
         // Deduplicate proposal IDs.
         let mut deduped = simultaneous;
-        deduped.sort();
+        deduped.sort_unstable();
         deduped.dedup();
         return Ok(ConflictResolutionStrategy::GovernanceFreeze {
             conflicting_proposals: deduped,
@@ -585,8 +587,11 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
     let hash = hasher.finalize();
     let hex: String = hash[..16]
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+        .fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
     format!("fork-{hex}")
 }
 
@@ -595,6 +600,7 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1228,9 +1234,7 @@ mod tests {
         assert_eq!(fork.map(|f| f.fork_event_count), Some(100));
         assert_eq!(fork.map(|f| f.members.len()), Some(2));
         // Fork ID should start with "fork-".
-        assert!(fork
-            .map(|f| f.forked_context_id.starts_with("fork-"))
-            .unwrap_or(false));
+        assert!(fork.is_some_and(|f| f.forked_context_id.starts_with("fork-")));
     }
 
     #[test]
@@ -1319,7 +1323,7 @@ mod tests {
         let json = serde_json::to_string(&conflict);
         assert!(json.is_ok());
         let deserialized: Result<OfflineConflict, _> =
-            serde_json::from_str(&json.as_deref().unwrap_or(""));
+            serde_json::from_str(json.as_deref().unwrap_or(""));
         assert!(deserialized.is_ok());
     }
 
@@ -1331,10 +1335,8 @@ mod tests {
     fn resolution_uses_leaf_index_not_timestamp() {
         // Two metadata ops where the "later" timestamp has the lower leaf index.
         // The lower leaf index should still win, proving no clock dependency.
-        let early_clock_late_log =
-            metadata_op("did:dht:alice", "title", b"early-clock", 10);
-        let late_clock_early_log =
-            metadata_op("did:dht:bob", "title", b"late-clock", 2);
+        let early_clock_late_log = metadata_op("did:dht:alice", "title", b"early-clock", 10);
+        let late_clock_early_log = metadata_op("did:dht:bob", "title", b"late-clock", 2);
 
         let result = resolve_metadata_conflict(&early_clock_late_log, &late_clock_early_log);
         assert_eq!(

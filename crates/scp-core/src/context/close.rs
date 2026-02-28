@@ -454,7 +454,12 @@ pub enum CloseAction {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::manual_let_else
+)]
 mod tests {
     use super::*;
     use crate::context::ContextError;

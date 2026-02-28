@@ -39,8 +39,8 @@ use sha2::{Digest, Sha256};
 
 use super::{ContextId, DID, ShadowProvenanceStatus};
 use crate::event_log::Ed25519Signature;
-use crate::trust::attestation::{Attestation, RevocationStatus};
 use crate::trust::AttestationType;
+use crate::trust::attestation::{Attestation, RevocationStatus};
 
 use super::shadow::ShadowRegistry;
 
@@ -266,10 +266,8 @@ fn compute_claim_canonical_hash(request: &ClaimRequest) -> Vec<u8> {
 /// Extracts the public key from `request.claimant_did`, computes the
 /// canonical hash of the request content, and verifies `request.signature`.
 fn verify_claim_signature(request: &ClaimRequest) -> Result<(), ClaimError> {
-    let public_key_bytes =
-        extract_public_key_from_did(&request.claimant_did).map_err(|reason| {
-            ClaimError::InvalidClaimSignature { reason }
-        })?;
+    let public_key_bytes = extract_public_key_from_did(&request.claimant_did)
+        .map_err(|reason| ClaimError::InvalidClaimSignature { reason })?;
 
     let verifying_key =
         ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
@@ -307,10 +305,8 @@ fn verify_claim_signature(request: &ClaimRequest) -> Result<(), ClaimError> {
 /// canonical hash of the attestation content, and verifies
 /// `attestation.signature`.
 fn verify_attestation_signature(attestation: &Attestation) -> Result<(), ClaimError> {
-    let public_key_bytes =
-        extract_public_key_from_did(&attestation.issuer).map_err(|reason| {
-            ClaimError::InvalidAttestationSignature { reason }
-        })?;
+    let public_key_bytes = extract_public_key_from_did(&attestation.issuer)
+        .map_err(|reason| ClaimError::InvalidAttestationSignature { reason })?;
 
     let verifying_key =
         ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
@@ -319,21 +315,18 @@ fn verify_attestation_signature(attestation: &Attestation) -> Result<(), ClaimEr
             }
         })?;
 
-    let sig_bytes: [u8; 64] = attestation
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| ClaimError::InvalidAttestationSignature {
+    let sig_bytes: [u8; 64] = attestation.signature.as_slice().try_into().map_err(|_| {
+        ClaimError::InvalidAttestationSignature {
             reason: format!(
                 "signature must be 64 bytes, got {}",
                 attestation.signature.len()
             ),
-        })?;
+        }
+    })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
-    let canonical_bytes =
-        crate::trust::attestation::canonical_attestation_bytes(attestation);
+    let canonical_bytes = crate::trust::attestation::canonical_attestation_bytes(attestation);
 
     verifying_key
         .verify(&canonical_bytes, &signature)
@@ -534,7 +527,8 @@ pub fn claim_shadow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::single_char_pattern
+    clippy::single_char_pattern,
+    clippy::similar_names
 )]
 mod tests {
     use std::time::Duration;
@@ -542,7 +536,7 @@ mod tests {
     use ed25519_dalek::Signer;
 
     use super::*;
-    use crate::bridge::shadow::{create_shadow, ShadowRegistry};
+    use crate::bridge::shadow::{ShadowRegistry, create_shadow};
     use crate::bridge::{BridgeMode, ShadowProvenanceStatus};
     use crate::trust::attestation::AttestationEvidence;
 
@@ -629,8 +623,7 @@ mod tests {
 
         // Sign the attestation with the issuer's key using the canonical
         // bytes from the trust module (the single source of truth).
-        let canonical_bytes =
-            crate::trust::attestation::canonical_attestation_bytes(&attestation);
+        let canonical_bytes = crate::trust::attestation::canonical_attestation_bytes(&attestation);
         let sig = signing_key.sign(&canonical_bytes);
         attestation.signature = sig.to_bytes().to_vec();
 
@@ -867,13 +860,8 @@ mod tests {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
         let attestation = make_identity_attestation(&did, "@wrong_handle", &signing_key);
-        let request = make_claim_request(
-            SHADOW_ID,
-            &did,
-            "@wrong_handle",
-            attestation,
-            &signing_key,
-        );
+        let request =
+            make_claim_request(SHADOW_ID, &did, "@wrong_handle", attestation, &signing_key);
         let (result, event) = claim_shadow(&mut registry, &request);
 
         assert!(event.is_none());
@@ -949,13 +937,8 @@ mod tests {
         let claimant_did = did_from_pubkey(&claimant_vk);
 
         let attestation = make_identity_attestation(&other_did, HANDLE, &other_sk);
-        let request = make_claim_request(
-            SHADOW_ID,
-            &claimant_did,
-            HANDLE,
-            attestation,
-            &claimant_sk,
-        );
+        let request =
+            make_claim_request(SHADOW_ID, &claimant_did, HANDLE, attestation, &claimant_sk);
         let (result, event) = claim_shadow(&mut registry, &request);
 
         assert!(event.is_none());
@@ -1107,8 +1090,7 @@ mod tests {
 
         // Sign the claim request with a different key.
         let (_wrong_vk, wrong_sk) = test_keypair();
-        let mut request =
-            make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
+        let mut request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
 
         // Override the signature with one from the wrong key.
         let canonical_hash = compute_claim_canonical_hash(&request);

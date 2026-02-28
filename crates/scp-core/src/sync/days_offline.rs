@@ -36,11 +36,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::{ContextId, Ed25519Signature, MAX_SEQUENTIAL_COMMITS, SyncError, SyncOutcome};
 use crate::identity::DID;
-use super::{
-    ContextId, Ed25519Signature, SyncError, SyncOutcome,
-    MAX_SEQUENTIAL_COMMITS,
-};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -330,15 +327,13 @@ pub enum DaysOfflineError {
         actual: ContextId,
     },
 
-    /// The delta cannot be applied because the from_sequence does not match
+    /// The delta cannot be applied because the `from_sequence` does not match
     /// the local snapshot's sequence.
-    #[error(
-        "delta sequence mismatch: expected from_sequence {expected}, got {actual}"
-    )]
+    #[error("delta sequence mismatch: expected from_sequence {expected}, got {actual}")]
     DeltaSequenceMismatch {
-        /// Expected from_sequence (local snapshot sequence).
+        /// Expected `from_sequence` (local snapshot sequence).
         expected: u64,
-        /// Actual from_sequence in the delta.
+        /// Actual `from_sequence` in the delta.
         actual: u64,
     },
 
@@ -409,7 +404,7 @@ pub trait DeltaSyncEngine: Send + Sync {
     ///
     /// The provider computes the delta between `from_sequence` and the
     /// latest snapshot. Returns `None` if the provider cannot compute the
-    /// delta (e.g., the from_sequence snapshot has been pruned).
+    /// delta (e.g., the `from_sequence` snapshot has been pruned).
     async fn fetch_delta(
         &self,
         context_id: &str,
@@ -420,10 +415,7 @@ pub trait DeltaSyncEngine: Send + Sync {
     ///
     /// Called after local snapshot creation so other members and devices can
     /// retrieve it for delta computation.
-    async fn publish_snapshot(
-        &self,
-        snapshot: &ContextSnapshot,
-    ) -> Result<(), DaysOfflineError>;
+    async fn publish_snapshot(&self, snapshot: &ContextSnapshot) -> Result<(), DaysOfflineError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -459,10 +451,10 @@ pub fn compute_delta(
 
     // Members who joined (in new but not in old)
     for did in &new_dids {
-        if !old_dids.contains(did) {
-            if let Some(entry) = new.members.get(*did) {
-                membership_changes.push(MembershipChange::Joined(entry.clone()));
-            }
+        if !old_dids.contains(did)
+            && let Some(entry) = new.members.get(*did)
+        {
+            membership_changes.push(MembershipChange::Joined(entry.clone()));
         }
     }
 
@@ -477,16 +469,14 @@ pub fn compute_delta(
 
     // Members whose role changed (in both, but different role)
     for did in old_dids.intersection(&new_dids) {
-        if let (Some(old_entry), Some(new_entry)) =
-            (old.members.get(*did), new.members.get(*did))
+        if let (Some(old_entry), Some(new_entry)) = (old.members.get(*did), new.members.get(*did))
+            && old_entry.role_name != new_entry.role_name
         {
-            if old_entry.role_name != new_entry.role_name {
-                membership_changes.push(MembershipChange::RoleChanged {
-                    did: DID::from(*did),
-                    old_role: old_entry.role_name.clone(),
-                    new_role: new_entry.role_name.clone(),
-                });
-            }
+            membership_changes.push(MembershipChange::RoleChanged {
+                did: DID::from(*did),
+                old_role: old_entry.role_name.clone(),
+                new_role: new_entry.role_name.clone(),
+            });
         }
     }
 
@@ -596,11 +586,9 @@ pub fn apply_delta(
             MembershipChange::Left { did } => {
                 local_state.members.remove(&did.0);
             }
-            MembershipChange::RoleChanged {
-                did, new_role, ..
-            } => {
+            MembershipChange::RoleChanged { did, new_role, .. } => {
                 if let Some(entry) = local_state.members.get_mut(&did.0) {
-                    entry.role_name = new_role.clone();
+                    entry.role_name.clone_from(new_role);
                 }
             }
         }
@@ -617,8 +605,7 @@ pub fn apply_delta(
     }
 
     // Apply tool changes
-    let mut tools: HashSet<String> =
-        local_state.tool_names.drain(..).collect();
+    let mut tools: HashSet<String> = local_state.tool_names.drain(..).collect();
     for name in &delta.added_tools {
         tools.insert(name.clone());
     }
@@ -653,9 +640,8 @@ pub fn apply_delta(
 ///
 /// See ADR-029 section 3 (MLS Epoch Catch-Up).
 #[must_use]
-pub fn determine_mls_recovery(delta: &SnapshotDelta) -> MlsRecoveryAction {
+pub const fn determine_mls_recovery(delta: &SnapshotDelta) -> MlsRecoveryAction {
     match (delta.from_epoch, delta.to_epoch) {
-        (None, None) => MlsRecoveryAction::NoAction,
         (Some(from), Some(to)) if from == to => MlsRecoveryAction::NoAction,
         (Some(from), Some(to)) => {
             let gap = to.saturating_sub(from);
@@ -671,8 +657,8 @@ pub fn determine_mls_recovery(delta: &SnapshotDelta) -> MlsRecoveryAction {
                 }
             }
         }
-        // Mismatched None/Some — one side is broadcast, the other is not.
-        // This is an anomalous state; treat as no action (caller handles).
+        // (None, None) = broadcast context, or mismatched None/Some —
+        // anomalous state; treat as no action (caller handles).
         _ => MlsRecoveryAction::NoAction,
     }
 }
@@ -828,7 +814,14 @@ mod tests {
     #[test]
     fn compute_delta_identical_snapshots() {
         let root = [1u8; 32];
-        let old = make_snapshot("ctx-1", 1, Some(10), 100, root, vec![("did:alice", "admin")]);
+        let old = make_snapshot(
+            "ctx-1",
+            1,
+            Some(10),
+            100,
+            root,
+            vec![("did:alice", "admin")],
+        );
         let new = old.clone();
 
         let delta = compute_delta(&old, &new).unwrap();
@@ -862,11 +855,19 @@ mod tests {
     #[test]
     fn compute_delta_member_joined() {
         let old = make_snapshot(
-            "ctx-1", 1, Some(10), 100, [1u8; 32],
+            "ctx-1",
+            1,
+            Some(10),
+            100,
+            [1u8; 32],
             vec![("did:alice", "admin")],
         );
         let new = make_snapshot(
-            "ctx-1", 2, Some(15), 150, [2u8; 32],
+            "ctx-1",
+            2,
+            Some(15),
+            150,
+            [2u8; 32],
             vec![("did:alice", "admin"), ("did:bob", "member")],
         );
 
@@ -886,11 +887,19 @@ mod tests {
     #[test]
     fn compute_delta_member_left() {
         let old = make_snapshot(
-            "ctx-1", 1, Some(10), 100, [1u8; 32],
+            "ctx-1",
+            1,
+            Some(10),
+            100,
+            [1u8; 32],
             vec![("did:alice", "admin"), ("did:bob", "member")],
         );
         let new = make_snapshot(
-            "ctx-1", 2, Some(15), 150, [2u8; 32],
+            "ctx-1",
+            2,
+            Some(15),
+            150,
+            [2u8; 32],
             vec![("did:alice", "admin")],
         );
 
@@ -908,11 +917,19 @@ mod tests {
     #[test]
     fn compute_delta_member_role_changed() {
         let old = make_snapshot(
-            "ctx-1", 1, Some(10), 100, [1u8; 32],
+            "ctx-1",
+            1,
+            Some(10),
+            100,
+            [1u8; 32],
             vec![("did:bob", "member")],
         );
         let new = make_snapshot(
-            "ctx-1", 2, Some(15), 150, [2u8; 32],
+            "ctx-1",
+            2,
+            Some(15),
+            150,
+            [2u8; 32],
             vec![("did:bob", "admin")],
         );
 
@@ -985,7 +1002,11 @@ mod tests {
 
         assert!(delta.role_definition_changes.contains_key("editor"));
         assert!(delta.role_definition_changes.contains_key("moderator"));
-        assert!(delta.removed_role_definitions.contains(&"viewer".to_owned()));
+        assert!(
+            delta
+                .removed_role_definitions
+                .contains(&"viewer".to_owned())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -995,11 +1016,19 @@ mod tests {
     #[test]
     fn apply_delta_updates_membership() {
         let mut local = make_snapshot(
-            "ctx-1", 1, Some(10), 100, [1u8; 32],
+            "ctx-1",
+            1,
+            Some(10),
+            100,
+            [1u8; 32],
             vec![("did:alice", "admin")],
         );
         let remote = make_snapshot(
-            "ctx-1", 2, Some(15), 150, [2u8; 32],
+            "ctx-1",
+            2,
+            Some(15),
+            150,
+            [2u8; 32],
             vec![("did:alice", "admin"), ("did:bob", "member")],
         );
 
@@ -1060,13 +1089,20 @@ mod tests {
         };
 
         let err = apply_delta(&mut local, &delta).unwrap_err();
-        assert!(matches!(err, DaysOfflineError::DeltaSequenceMismatch { .. }));
+        assert!(matches!(
+            err,
+            DaysOfflineError::DeltaSequenceMismatch { .. }
+        ));
     }
 
     #[test]
     fn apply_delta_removes_member_and_tools() {
         let mut local = make_snapshot(
-            "ctx-1", 1, Some(10), 100, [1u8; 32],
+            "ctx-1",
+            1,
+            Some(10),
+            100,
+            [1u8; 32],
             vec![("did:alice", "admin"), ("did:bob", "member")],
         );
         local.tool_names = vec!["search".to_owned(), "translate".to_owned()];
@@ -1329,7 +1365,11 @@ mod tests {
     #[test]
     fn context_snapshot_serialization_roundtrip() {
         let snapshot = make_snapshot(
-            "ctx-1", 3, Some(25), 500, [42u8; 32],
+            "ctx-1",
+            3,
+            Some(25),
+            500,
+            [42u8; 32],
             vec![("did:alice", "admin"), ("did:bob", "member")],
         );
 
@@ -1388,17 +1428,15 @@ mod tests {
         // multi-day offline period.
         let mut old_members: Vec<(&str, &str)> = Vec::new();
         let original_members = [
-            "did:m001", "did:m002", "did:m003", "did:m004", "did:m005",
-            "did:m006", "did:m007", "did:m008", "did:m009", "did:m010",
+            "did:m001", "did:m002", "did:m003", "did:m004", "did:m005", "did:m006", "did:m007",
+            "did:m008", "did:m009", "did:m010",
         ];
         for did in &original_members {
             old_members.push((did, "member"));
         }
         old_members.push(("did:admin", "admin"));
 
-        let old = make_snapshot(
-            "ctx-stress", 1, Some(10), 1000, [1u8; 32], old_members,
-        );
+        let old = make_snapshot("ctx-stress", 1, Some(10), 1000, [1u8; 32], old_members);
 
         // New state: half the original members left, 15 new members joined,
         // and the admin's role didn't change. 200 epochs advanced.
@@ -1409,17 +1447,15 @@ mod tests {
         }
         // 15 new members
         let new_member_dids = [
-            "did:n001", "did:n002", "did:n003", "did:n004", "did:n005",
-            "did:n006", "did:n007", "did:n008", "did:n009", "did:n010",
-            "did:n011", "did:n012", "did:n013", "did:n014", "did:n015",
+            "did:n001", "did:n002", "did:n003", "did:n004", "did:n005", "did:n006", "did:n007",
+            "did:n008", "did:n009", "did:n010", "did:n011", "did:n012", "did:n013", "did:n014",
+            "did:n015",
         ];
         for did in &new_member_dids {
             new_members.push((did, "member"));
         }
 
-        let new = make_snapshot(
-            "ctx-stress", 10, Some(210), 5000, [2u8; 32], new_members,
-        );
+        let new = make_snapshot("ctx-stress", 10, Some(210), 5000, [2u8; 32], new_members);
 
         let delta = compute_delta(&old, &new).unwrap();
 
@@ -1451,14 +1487,23 @@ mod tests {
 
         // Apply delta and verify final state
         let mut local = make_snapshot(
-            "ctx-stress", 1, Some(10), 1000, [1u8; 32],
+            "ctx-stress",
+            1,
+            Some(10),
+            1000,
+            [1u8; 32],
             vec![
                 ("did:admin", "admin"),
-                ("did:m001", "member"), ("did:m002", "member"),
-                ("did:m003", "member"), ("did:m004", "member"),
-                ("did:m005", "member"), ("did:m006", "member"),
-                ("did:m007", "member"), ("did:m008", "member"),
-                ("did:m009", "member"), ("did:m010", "member"),
+                ("did:m001", "member"),
+                ("did:m002", "member"),
+                ("did:m003", "member"),
+                ("did:m004", "member"),
+                ("did:m005", "member"),
+                ("did:m006", "member"),
+                ("did:m007", "member"),
+                ("did:m008", "member"),
+                ("did:m009", "member"),
+                ("did:m010", "member"),
             ],
         );
 
@@ -1479,7 +1524,11 @@ mod tests {
         // Simulate a 5-day offline period: 300 epoch advances, role changes,
         // tools added/removed, params changed.
         let mut old = make_snapshot(
-            "ctx-days", 1, Some(100), 2000, [10u8; 32],
+            "ctx-days",
+            1,
+            Some(100),
+            2000,
+            [10u8; 32],
             vec![
                 ("did:alice", "admin"),
                 ("did:bob", "member"),
@@ -1493,11 +1542,15 @@ mod tests {
         );
 
         let mut new = make_snapshot(
-            "ctx-days", 20, Some(400), 8000, [20u8; 32],
+            "ctx-days",
+            20,
+            Some(400),
+            8000,
+            [20u8; 32],
             vec![
                 ("did:alice", "admin"),
-                ("did:bob", "admin"),     // promoted
-                ("did:dave", "member"),   // new
+                ("did:bob", "admin"),   // promoted
+                ("did:dave", "member"), // new
             ],
         );
         new.tool_names = vec![
@@ -1507,10 +1560,8 @@ mod tests {
         ];
         new.params_hash = [99u8; 32]; // params changed
         // "moderator" role removed, "reviewer" added
-        new.role_definitions.insert(
-            "reviewer".to_owned(),
-            vec!["messages:read".to_owned()],
-        );
+        new.role_definitions
+            .insert("reviewer".to_owned(), vec!["messages:read".to_owned()]);
 
         let delta = compute_delta(&old, &new).unwrap();
 
@@ -1524,7 +1575,11 @@ mod tests {
         assert_eq!(delta.removed_tools.len(), 1);
 
         // Roles: "moderator" removed, "reviewer" added
-        assert!(delta.removed_role_definitions.contains(&"moderator".to_owned()));
+        assert!(
+            delta
+                .removed_role_definitions
+                .contains(&"moderator".to_owned())
+        );
         assert!(delta.role_definition_changes.contains_key("reviewer"));
 
         // MLS: gap = 300 > 100 -> fast-forward
@@ -1605,7 +1660,11 @@ mod tests {
         // Simulate applying multiple sequential deltas (as would happen if
         // the member reconnects and catches up incrementally).
         let mut local = make_snapshot(
-            "ctx-seq", 1, Some(10), 100, [1u8; 32],
+            "ctx-seq",
+            1,
+            Some(10),
+            100,
+            [1u8; 32],
             vec![("did:alice", "admin")],
         );
 
@@ -1688,8 +1747,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&result).unwrap();
-        let deserialized: DaysOfflineSyncResult =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: DaysOfflineSyncResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, deserialized);
     }
 }

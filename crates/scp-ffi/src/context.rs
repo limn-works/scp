@@ -69,9 +69,10 @@ impl PyContextHandle {
     /// One of: "creating", "active", "closing", "closed", "expired".
     #[getter]
     fn state(&self) -> PyResult<String> {
-        let guard = self.state.lock().map_err(|_| {
-            PyRuntimeError::new_err("context state lock is poisoned")
-        })?;
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
         Ok(guard.clone())
     }
 
@@ -82,9 +83,10 @@ impl PyContextHandle {
     }
 
     fn __repr__(&self) -> PyResult<String> {
-        let state = self.state.lock().map_err(|_| {
-            PyRuntimeError::new_err("context state lock is poisoned")
-        })?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
         let repr = format!(
             "PyContextHandle(context_id='{}', state='{}', creator_did='{}')",
             self.context_id, *state, self.creator_did
@@ -190,8 +192,7 @@ impl PyContextParams {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, tools={:?}, ttl={:?}, \
              memory_scope='{}', governance='{}')",
-            self.ceiling, self.roles, self.tools, self.ttl,
-            self.memory_scope, self.governance
+            self.ceiling, self.roles, self.tools, self.ttl, self.memory_scope, self.governance
         )
     }
 }
@@ -385,9 +386,10 @@ impl PyMessageReceiver {
     /// `PyO3` translates `Ok(None)` into `StopAsyncIteration` for the Python
     /// async iterator protocol.
     fn __anext__(&self) -> PyResult<Option<PyMessage>> {
-        let mut guard = self.rx.lock().map_err(|_| {
-            PyRuntimeError::new_err("message receiver lock is poisoned")
-        })?;
+        let mut guard = self
+            .rx
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("message receiver lock is poisoned"))?;
 
         // Use try_recv for non-blocking receive. When the transport layer is
         // wired in, this will be replaced with proper async receive driven by
@@ -397,10 +399,9 @@ impl PyMessageReceiver {
             // Channel empty (sender alive) or disconnected (sender dropped)
             // -- both return None. Empty means "no message yet" and
             // Disconnected means "iteration complete".
-            Err(
-                mpsc::error::TryRecvError::Empty
-                | mpsc::error::TryRecvError::Disconnected,
-            ) => Ok(None),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                Ok(None)
+            }
         };
         drop(guard);
         result
@@ -440,10 +441,7 @@ impl PyMessageReceiver {
 /// fails.
 #[pyfunction]
 #[pyo3(signature = (identity_did, params))]
-fn py_context_create(
-    identity_did: &str,
-    params: &Bound<'_, PyDict>,
-) -> PyResult<PyContextHandle> {
+fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult<PyContextHandle> {
     // Validate params eagerly (before any async work).
     let _parsed = PyContextParams::from_py_dict(params)?;
 
@@ -464,9 +462,10 @@ fn py_context_create(
     // Transition to "active" -- in the full runtime this happens after MLS
     // group formation and parameter validation complete.
     {
-        let mut guard = handle.state.lock().map_err(|_| {
-            PyRuntimeError::new_err("context state lock is poisoned")
-        })?;
+        let mut guard = handle
+            .state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
         "active".clone_into(&mut guard);
     }
 
@@ -486,9 +485,10 @@ fn py_context_create(
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
-    let state = handle.state.lock().map_err(|_| {
-        PyRuntimeError::new_err("context state lock is poisoned")
-    })?;
+    let state = handle
+        .state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
 
     if *state != "active" {
         return Err(PyRuntimeError::new_err(format!(
@@ -519,9 +519,10 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
-    let state = handle.state.lock().map_err(|_| {
-        PyRuntimeError::new_err("context state lock is poisoned")
-    })?;
+    let state = handle
+        .state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
 
     if *state != "active" {
         return Err(PyRuntimeError::new_err(format!(
@@ -557,9 +558,10 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
-    let mut state = handle.state.lock().map_err(|_| {
-        PyRuntimeError::new_err("context state lock is poisoned")
-    })?;
+    let mut state = handle
+        .state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
 
     if *state != "active" {
         return Err(PyRuntimeError::new_err(format!(
@@ -604,9 +606,10 @@ fn py_context_send(
     identity_did: &str,
     payload: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
-    let state = handle.state.lock().map_err(|_| {
-        PyRuntimeError::new_err("context state lock is poisoned")
-    })?;
+    let state = handle
+        .state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
 
     if *state != "active" {
         return Err(PyRuntimeError::new_err(format!(
@@ -649,9 +652,10 @@ fn py_context_send(
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
-    let state = handle.state.lock().map_err(|_| {
-        PyRuntimeError::new_err("context state lock is poisoned")
-    })?;
+    let state = handle
+        .state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
 
     if *state != "active" {
         return Err(PyRuntimeError::new_err(format!(

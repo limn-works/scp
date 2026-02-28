@@ -37,7 +37,7 @@ use super::adapter::PaymentAdapter;
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
     /// The adapter failed validation (does not properly implement the
-    /// `PaymentAdapter` trait contract -- e.g., returns an empty adapter_id).
+    /// `PaymentAdapter` trait contract -- e.g., returns an empty `adapter_id`).
     #[error("invalid adapter: {0}")]
     InvalidAdapter(String),
 
@@ -120,7 +120,7 @@ impl std::fmt::Debug for AdapterCredential {
 pub trait AdapterCredentialStore: Send + Sync {
     /// Stores an adapter credential for an identity.
     ///
-    /// Overwrites any existing credential for the same (identity, adapter_id)
+    /// Overwrites any existing credential for the same (identity, `adapter_id`)
     /// pair. The credential data must already be encrypted by the caller.
     fn store_adapter_credential(
         &self,
@@ -134,12 +134,11 @@ pub trait AdapterCredentialStore: Send + Sync {
         &self,
         identity: &DID,
         adapter_id: &str,
-    ) -> impl std::future::Future<Output = Result<Option<AdapterCredential>, CredentialError>>
-           + Send;
+    ) -> impl std::future::Future<Output = Result<Option<AdapterCredential>, CredentialError>> + Send;
 
     /// Lists all configured adapter IDs for an identity.
     ///
-    /// Returns the adapter_id strings, not the full credentials. This is
+    /// Returns the `adapter_id` strings, not the full credentials. This is
     /// used for adapter discovery (spec section 19.2.4) without exposing
     /// credential material.
     fn list_adapter_credentials(
@@ -277,7 +276,13 @@ pub async fn retrieve_adapter_credential<S: AdapterCredentialStore>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::manual_async_fn,
+    clippy::significant_drop_tightening
+)]
 mod tests {
     use std::collections::HashMap;
 
@@ -296,7 +301,7 @@ mod tests {
 
     /// In-memory credential store for testing.
     struct InMemoryCredentialStore {
-        /// Key: (identity DID string, adapter_id)
+        /// Key: (identity DID string, `adapter_id`)
         data: Mutex<HashMap<(String, String), AdapterCredential>>,
     }
 
@@ -325,8 +330,7 @@ mod tests {
             &self,
             identity: &DID,
             adapter_id: &str,
-        ) -> impl std::future::Future<Output = Result<Option<AdapterCredential>, CredentialError>>
-               + Send
+        ) -> impl std::future::Future<Output = Result<Option<AdapterCredential>, CredentialError>> + Send
         {
             let key = (identity.0.clone(), adapter_id.to_owned());
             async move { Ok(self.data.lock().await.get(&key).cloned()) }
@@ -373,9 +377,7 @@ mod tests {
 
     impl TestPaymentAdapter {
         fn new(id: &str) -> Self {
-            Self {
-                id: id.to_owned(),
-            }
+            Self { id: id.to_owned() }
         }
     }
 
@@ -456,7 +458,7 @@ mod tests {
     struct EmptyIdAdapter;
 
     impl PaymentAdapter for EmptyIdAdapter {
-        fn adapter_id(&self) -> &str {
+        fn adapter_id(&self) -> &'static str {
             ""
         }
 
@@ -532,7 +534,7 @@ mod tests {
     struct NoCurrencyAdapter;
 
     impl PaymentAdapter for NoCurrencyAdapter {
-        fn adapter_id(&self) -> &str {
+        fn adapter_id(&self) -> &'static str {
             "no-currency"
         }
 
@@ -811,10 +813,7 @@ mod tests {
 
         // But a different identity cannot access it
         let other = other_did();
-        let loaded = store
-            .load_adapter_credential(&other, "x402")
-            .await
-            .unwrap();
+        let loaded = store.load_adapter_credential(&other, "x402").await.unwrap();
         assert!(loaded.is_none());
     }
 
@@ -838,10 +837,7 @@ mod tests {
             store.store_adapter_credential(&credential).await.unwrap();
         }
 
-        let mut ids = store
-            .list_adapter_credentials(&identity)
-            .await
-            .unwrap();
+        let mut ids = store.list_adapter_credentials(&identity).await.unwrap();
         ids.sort();
 
         assert_eq!(ids, vec!["lightning", "spl", "x402"]);
@@ -852,10 +848,7 @@ mod tests {
         let store = InMemoryCredentialStore::new();
         let identity = test_did();
 
-        let ids = store
-            .list_adapter_credentials(&identity)
-            .await
-            .unwrap();
+        let ids = store.list_adapter_credentials(&identity).await.unwrap();
         assert!(ids.is_empty());
     }
 
@@ -884,14 +877,8 @@ mod tests {
         store.store_adapter_credential(&cred_a).await.unwrap();
         store.store_adapter_credential(&cred_b).await.unwrap();
 
-        let ids_a = store
-            .list_adapter_credentials(&identity_a)
-            .await
-            .unwrap();
-        let ids_b = store
-            .list_adapter_credentials(&identity_b)
-            .await
-            .unwrap();
+        let ids_a = store.list_adapter_credentials(&identity_a).await.unwrap();
+        let ids_b = store.list_adapter_credentials(&identity_b).await.unwrap();
 
         assert_eq!(ids_a, vec!["x402"]);
         assert_eq!(ids_b, vec!["lightning"]);
@@ -915,21 +902,25 @@ mod tests {
         };
 
         store.store_adapter_credential(&credential).await.unwrap();
-        assert!(store
-            .load_adapter_credential(&identity, "x402")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .load_adapter_credential(&identity, "x402")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         store
             .remove_adapter_credential(&identity, "x402")
             .await
             .unwrap();
-        assert!(store
-            .load_adapter_credential(&identity, "x402")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .load_adapter_credential(&identity, "x402")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1018,10 +1009,7 @@ mod tests {
             assert_eq!(cred.encrypted_data, *expected_data);
         }
 
-        let ids = store
-            .list_adapter_credentials(&identity)
-            .await
-            .unwrap();
+        let ids = store.list_adapter_credentials(&identity).await.unwrap();
         assert_eq!(ids.len(), 4);
     }
 

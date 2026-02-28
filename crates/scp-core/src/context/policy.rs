@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::params::{Capability, ContextParams, TemplateId};
 use crate::identity::DID;
-use scp_platform::traits::Storage;
 use scp_platform::PlatformError;
+use scp_platform::traits::Storage;
 
 // ---------------------------------------------------------------------------
 // Storage key convention
@@ -75,7 +75,7 @@ pub struct RateLimit {
 impl RateLimit {
     /// Creates a rate limit of `count` auto-accepts per hour.
     #[must_use]
-    pub fn per_hour(count: u32) -> Self {
+    pub const fn per_hour(count: u32) -> Self {
         Self {
             max_count: count,
             window: Duration::from_secs(3600),
@@ -123,10 +123,12 @@ pub struct AutoAcceptPolicy {
 /// `.docs/standards/sdk-common.md`.
 #[must_use]
 pub fn has_tool_capabilities(params: &ContextParams) -> bool {
-    params.ceiling.iter().any(|cap| matches!(
-        cap,
-        Capability::ToolInvokeAll | Capability::ToolInvoke(_) | Capability::ToolRegister
-    ))
+    params.ceiling.iter().any(|cap| {
+        matches!(
+            cap,
+            Capability::ToolInvokeAll | Capability::ToolInvoke(_) | Capability::ToolRegister
+        )
+    })
 }
 
 /// Returns `true` if the context params have an economic policy that requires
@@ -137,7 +139,7 @@ pub fn has_tool_capabilities(params: &ContextParams) -> bool {
 /// with economic policy requiring payment. See
 /// `.docs/specs/19-economic-governance.md` section 19.3, 19.14.
 #[must_use]
-pub fn requires_payment(params: &ContextParams) -> bool {
+pub const fn requires_payment(params: &ContextParams) -> bool {
     let Some(ref econ) = params.economic_policy else {
         return false;
     };
@@ -202,8 +204,8 @@ pub async fn set_auto_accept_policy(
     policy: &AutoAcceptPolicy,
 ) -> Result<(), PolicyStorageError> {
     let key = storage_key(identity);
-    let data = serde_json::to_vec(policy)
-        .map_err(|e| PolicyStorageError::Serialization(e.to_string()))?;
+    let data =
+        serde_json::to_vec(policy).map_err(|e| PolicyStorageError::Serialization(e.to_string()))?;
     storage.store(&key, &data).await?;
     Ok(())
 }
@@ -272,7 +274,9 @@ mod tests {
             rate_limit: Some(RateLimit::per_hour(5)),
         };
 
-        set_auto_accept_policy(&storage, &identity, &policy).await.unwrap();
+        set_auto_accept_policy(&storage, &identity, &policy)
+            .await
+            .unwrap();
         let retrieved = get_auto_accept_policy(&storage, &identity).await.unwrap();
         assert_eq!(retrieved, Some(policy));
     }
@@ -295,7 +299,9 @@ mod tests {
         };
 
         // "First initialization" — set the policy.
-        set_auto_accept_policy(&storage, &identity, &policy).await.unwrap();
+        set_auto_accept_policy(&storage, &identity, &policy)
+            .await
+            .unwrap();
 
         // "Second initialization" — read from same storage (simulates restart
         // where the storage backend persists).
@@ -326,8 +332,12 @@ mod tests {
             rate_limit: None,
         };
 
-        set_auto_accept_policy(&storage, &identity, &policy).await.unwrap();
-        delete_auto_accept_policy(&storage, &identity).await.unwrap();
+        set_auto_accept_policy(&storage, &identity, &policy)
+            .await
+            .unwrap();
+        delete_auto_accept_policy(&storage, &identity)
+            .await
+            .unwrap();
         let retrieved = get_auto_accept_policy(&storage, &identity).await.unwrap();
         assert_eq!(retrieved, None);
     }
@@ -337,7 +347,9 @@ mod tests {
         let storage = InMemoryStorage::new();
         let identity = DID::from("did:dht:z6MkNobody");
         // Should not error.
-        delete_auto_accept_policy(&storage, &identity).await.unwrap();
+        delete_auto_accept_policy(&storage, &identity)
+            .await
+            .unwrap();
     }
 
     // --- Hard rule: tool capabilities ---
@@ -372,10 +384,7 @@ mod tests {
     #[test]
     fn tool_register_blocks_auto_accept() {
         let params = ContextParams {
-            ceiling: vec![
-                Capability::MessagesRead,
-                Capability::ToolRegister,
-            ],
+            ceiling: vec![Capability::MessagesRead, Capability::ToolRegister],
             ..ContextParams::default()
         };
         assert!(has_tool_capabilities(&params));
@@ -578,8 +587,12 @@ mod tests {
             rate_limit: Some(RateLimit::per_hour(10)),
         };
 
-        set_auto_accept_policy(&storage, &alice, &alice_policy).await.unwrap();
-        set_auto_accept_policy(&storage, &bob, &bob_policy).await.unwrap();
+        set_auto_accept_policy(&storage, &alice, &alice_policy)
+            .await
+            .unwrap();
+        set_auto_accept_policy(&storage, &bob, &bob_policy)
+            .await
+            .unwrap();
 
         let retrieved_alice = get_auto_accept_policy(&storage, &alice).await.unwrap();
         let retrieved_bob = get_auto_accept_policy(&storage, &bob).await.unwrap();
@@ -608,8 +621,12 @@ mod tests {
             rate_limit: Some(RateLimit::per_hour(3)),
         };
 
-        set_auto_accept_policy(&storage, &identity, &policy_v1).await.unwrap();
-        set_auto_accept_policy(&storage, &identity, &policy_v2).await.unwrap();
+        set_auto_accept_policy(&storage, &identity, &policy_v1)
+            .await
+            .unwrap();
+        set_auto_accept_policy(&storage, &identity, &policy_v2)
+            .await
+            .unwrap();
 
         let retrieved = get_auto_accept_policy(&storage, &identity).await.unwrap();
         assert_eq!(retrieved, Some(policy_v2));

@@ -352,7 +352,7 @@ fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
 /// implementation silently created a *new* identity with a different DID,
 /// which is incorrect.
 ///
-/// NAPI and UniFFI bindings also return explicit errors for this operation.
+/// NAPI and `UniFFI` bindings also return explicit errors for this operation.
 ///
 /// Tracked: full key rotation will be wired when persistent key storage
 /// lands (see SCP-164 and ADR-013 acceptance criterion 2).

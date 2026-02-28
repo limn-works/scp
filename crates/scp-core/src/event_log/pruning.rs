@@ -212,9 +212,9 @@ pub fn select_pruning_checkpoint<'a>(
             .retain_last_n_checkpoints
             .is_some_and(|n| i >= checkpoints.len().saturating_sub(n));
 
-        let keep_by_time = config.effective_retention_secs().is_some_and(|secs| {
-            cp.timestamp > now.saturating_sub(secs)
-        });
+        let keep_by_time = config
+            .effective_retention_secs()
+            .is_some_and(|secs| cp.timestamp > now.saturating_sub(secs));
 
         // If neither retention policy keeps this checkpoint, it's prunable.
         // We want the *latest* prunable checkpoint (highest event_count).
@@ -264,27 +264,23 @@ pub fn prune_before_checkpoint(
     }
 
     // Determine which events to actually prune based on config.
-    let prune_boundary = compute_prune_boundary(
-        events,
-        checkpoint.event_count,
-        config,
-        now,
-    );
+    let prune_boundary = compute_prune_boundary(events, checkpoint.event_count, config, now);
 
     if prune_boundary == 0 {
         return Err(PruningError::NothingToPrune);
     }
 
     // Calculate storage reclaimed from pruned event payloads.
+    #[allow(clippy::cast_possible_truncation)] // event counts fit in usize
+    let prune_count = prune_boundary as usize;
     let bytes_reclaimed: u64 = events
         .iter()
-        .take(prune_boundary as usize)
-        .map(|e| estimated_event_size(e))
+        .take(prune_count)
+        .map(estimated_event_size)
         .sum();
 
     // Create the truncated log.
-    let truncated =
-        TruncatedEventLog::from_log_and_checkpoint(log, checkpoint.clone())?;
+    let truncated = TruncatedEventLog::from_log_and_checkpoint(log, checkpoint.clone())?;
 
     let result = PruningResult {
         events_pruned: prune_boundary,
@@ -400,15 +396,22 @@ fn compute_prune_boundary(
 ) -> u64 {
     let max_boundary = checkpoint_event_count;
 
-    match config.effective_retention_secs() {
-        Some(retention_secs) => {
+    config
+        .effective_retention_secs()
+        .map_or(max_boundary, |retention_secs| {
             // Find the latest event that is outside the retention window,
             // considering structural event multiplier.
             let mut boundary: u64 = 0;
 
-            for event in events.iter().take(max_boundary as usize) {
+            #[allow(clippy::cast_possible_truncation)] // event counts fit in usize
+            let take_count = max_boundary as usize;
+            for event in events.iter().take(take_count) {
                 let effective_retention = if is_structural_event(&event.event_type) {
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    #[allow(
+                        clippy::cast_sign_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_precision_loss
+                    )]
                     let multiplied =
                         (retention_secs as f64 * config.structural_retention_multiplier) as u64;
                     multiplied
@@ -426,12 +429,7 @@ fn compute_prune_boundary(
 
             // Cannot prune beyond the checkpoint boundary.
             boundary.min(max_boundary)
-        }
-        None => {
-            // No time-based retention: prune everything up to checkpoint.
-            max_boundary
-        }
-    }
+        })
 }
 
 /// Estimates the serialized size of an event for storage reclamation metrics.
@@ -447,7 +445,7 @@ fn estimated_event_size(event: &Event) -> u64 {
 /// Computes `SHA-256(0x01 || left || right)` for an interior node (RFC 6962 section 2.1).
 fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(&[0x01]);
+    hasher.update([0x01]);
     hasher.update(left);
     hasher.update(right);
     hasher.finalize().into()
@@ -458,7 +456,12 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use ed25519_dalek::Signer;
     use sha2::{Digest, Sha256};
@@ -593,7 +596,7 @@ mod tests {
 
             let serialized = rmp_serde::to_vec(&event).unwrap();
             let mut hasher = Sha256::new();
-            hasher.update(&[0x00]);
+            hasher.update([0x00]);
             hasher.update(&serialized);
             let leaf_hash: [u8; 32] = hasher.finalize().into();
 
@@ -685,7 +688,7 @@ mod tests {
         let cp2 = make_checkpoint(&log, 20, 1_002_000);
         let cp3 = make_checkpoint(&log, 25, 1_002_500);
 
-        let checkpoints = [cp1.clone(), cp2.clone(), cp3.clone()];
+        let checkpoints = [cp1.clone(), cp2, cp3];
 
         // Retain last 2: cp2 and cp3 are retained, cp1 is prunable.
         let config = PruningConfig {
@@ -1086,7 +1089,7 @@ mod tests {
         tree::append(&mut log, &e0).unwrap();
         let serialized = rmp_serde::to_vec(&e0).unwrap();
         let mut h = Sha256::new();
-        h.update(&[0x00]);
+        h.update([0x00]);
         h.update(&serialized);
         prev_hash = h.finalize().into();
         events.push(e0);
@@ -1104,7 +1107,7 @@ mod tests {
         tree::append(&mut log, &e1).unwrap();
         let serialized = rmp_serde::to_vec(&e1).unwrap();
         let mut h = Sha256::new();
-        h.update(&[0x00]);
+        h.update([0x00]);
         h.update(&serialized);
         prev_hash = h.finalize().into();
         events.push(e1);
@@ -1199,7 +1202,7 @@ mod tests {
             tree::append(&mut log, &event).unwrap();
             let serialized = rmp_serde::to_vec(&event).unwrap();
             let mut h = Sha256::new();
-            h.update(&[0x00]);
+            h.update([0x00]);
             h.update(&serialized);
             prev_hash = h.finalize().into();
             all_events.push(event);
@@ -1225,7 +1228,7 @@ mod tests {
             tree::append(&mut log, &event).unwrap();
             let serialized = rmp_serde::to_vec(&event).unwrap();
             let mut h = Sha256::new();
-            h.update(&[0x00]);
+            h.update([0x00]);
             h.update(&serialized);
             prev_hash = h.finalize().into();
             all_events.push(event);
@@ -1239,14 +1242,8 @@ mod tests {
             structural_retention_multiplier: 1.0,
         };
 
-        let (truncated, result) = prune_before_checkpoint(
-            &log,
-            &checkpoint,
-            &all_events,
-            &config,
-            2_000_000,
-        )
-        .unwrap();
+        let (truncated, result) =
+            prune_before_checkpoint(&log, &checkpoint, &all_events, &config, 2_000_000).unwrap();
 
         assert_eq!(result.events_pruned, 10);
 
@@ -1275,14 +1272,9 @@ mod tests {
         let merkle_root = tree::root(&log);
 
         let actor_did = &events[0].actor_did;
-        let record = compute_behavioral_record(
-            &events,
-            actor_did,
-            "ctx-prune-test",
-            merkle_root,
-            2_000_000,
-        )
-        .unwrap();
+        let record =
+            compute_behavioral_record(&events, actor_did, "ctx-prune-test", merkle_root, 2_000_000)
+                .unwrap();
 
         assert_eq!(record.participation_count, 10);
     }
@@ -1298,7 +1290,7 @@ mod tests {
         let cp1 = make_checkpoint(&log, 10, 1_001_000);
         let cp2 = make_checkpoint(&log, 20, 1_002_000);
 
-        let checkpoints = [cp1.clone(), cp2.clone()];
+        let checkpoints = [cp1.clone(), cp2];
 
         let config = PruningConfig {
             retain_last_n_checkpoints: Some(1),
@@ -1389,7 +1381,7 @@ mod tests {
         let cp3 = make_checkpoint(&log, 30, 1_003_000);
         let cp4 = make_checkpoint(&log, 40, 1_004_000);
 
-        let checkpoints = [cp1.clone(), cp2.clone(), cp3.clone(), cp4.clone()];
+        let checkpoints = [cp1, cp2.clone(), cp3, cp4];
 
         // Retain last 2: cp3 and cp4 retained. cp1 and cp2 prunable.
         // We select the latest prunable checkpoint (cp2).

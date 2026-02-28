@@ -135,7 +135,7 @@ impl<C: Clock> NonceTracker<C> {
 
     /// Returns the maximum capacity of this tracker.
     #[must_use]
-    pub fn max_capacity(&self) -> usize {
+    pub const fn max_capacity(&self) -> usize {
         self.max_capacity
     }
 

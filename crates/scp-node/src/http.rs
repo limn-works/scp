@@ -124,18 +124,10 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr) {
     let client_to_relay = async move {
         while let Some(Ok(msg)) = StreamExt::next(&mut axum_source).await {
             let relay_msg = match msg {
-                Message::Text(t) => {
-                    tokio_tungstenite::tungstenite::Message::Text(t.to_string())
-                }
-                Message::Binary(b) => {
-                    tokio_tungstenite::tungstenite::Message::Binary(b.to_vec())
-                }
-                Message::Ping(p) => {
-                    tokio_tungstenite::tungstenite::Message::Ping(p.to_vec())
-                }
-                Message::Pong(p) => {
-                    tokio_tungstenite::tungstenite::Message::Pong(p.to_vec())
-                }
+                Message::Text(t) => tokio_tungstenite::tungstenite::Message::Text(t.to_string()),
+                Message::Binary(b) => tokio_tungstenite::tungstenite::Message::Binary(b.to_vec()),
+                Message::Ping(p) => tokio_tungstenite::tungstenite::Message::Ping(p.to_vec()),
+                Message::Pong(p) => tokio_tungstenite::tungstenite::Message::Pong(p.to_vec()),
                 Message::Close(_) => return,
             };
             if let Err(e) = SinkExt::send(&mut *relay_sink_fwd.lock().await, relay_msg).await {
@@ -153,18 +145,10 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr) {
     let relay_to_client = async move {
         while let Some(Ok(msg)) = StreamExt::next(&mut relay_source).await {
             let axum_msg = match msg {
-                tokio_tungstenite::tungstenite::Message::Text(t) => {
-                    Message::Text(t.into())
-                }
-                tokio_tungstenite::tungstenite::Message::Binary(b) => {
-                    Message::Binary(b.into())
-                }
-                tokio_tungstenite::tungstenite::Message::Ping(p) => {
-                    Message::Ping(p.into())
-                }
-                tokio_tungstenite::tungstenite::Message::Pong(p) => {
-                    Message::Pong(p.into())
-                }
+                tokio_tungstenite::tungstenite::Message::Text(t) => Message::Text(t.into()),
+                tokio_tungstenite::tungstenite::Message::Binary(b) => Message::Binary(b.into()),
+                tokio_tungstenite::tungstenite::Message::Ping(p) => Message::Ping(p.into()),
+                tokio_tungstenite::tungstenite::Message::Pong(p) => Message::Pong(p.into()),
                 tokio_tungstenite::tungstenite::Message::Close(_) => return,
                 tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
             };
@@ -204,7 +188,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// `application/json` (provided by axum's `Json` extractor).
     ///
     /// See spec section 18.3.
-    #[must_use]
+    #[must_use = "returns the well-known router, which must be mounted into an axum application"]
     pub fn well_known_router(&self) -> Router {
         well_known_router(Arc::clone(&self.state))
     }
@@ -214,7 +198,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// Incoming connections are bridged to the node's internal relay server.
     ///
     /// See spec section 18.6.2.
-    #[must_use]
+    #[must_use = "returns the relay router, which must be mounted into an axum application"]
     pub fn relay_router(&self) -> Router {
         relay_router(Arc::clone(&self.state))
     }

@@ -60,12 +60,14 @@ pub struct WasmToolVerificationResult {
 #[wasm_bindgen]
 impl WasmToolVerificationResult {
     /// Returns the verified tool's ID.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "toolId")]
     pub fn tool_id(&self) -> String {
         self.tool_id.clone()
     }
 
     /// Returns `true` if all test vectors passed.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn passed(&self) -> bool {
         self.passed
@@ -75,6 +77,7 @@ impl WasmToolVerificationResult {
     ///
     /// The TypeScript SDK parses this with `JSON.parse()` to obtain
     /// `string[]`.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "failuresJson")]
     pub fn failures_json(&self) -> String {
         self.failures_json.clone()
@@ -113,11 +116,9 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
     let context_id = context.context_id();
     future_to_promise(async move {
         // Validate that definition_json is valid JSON.
-        let _def: serde_json::Value = serde_json::from_str(&definition_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
-                "definition_json is not valid JSON: {e}"
-            ))
-            .into_js())?;
+        let _def: serde_json::Value = serde_json::from_str(&definition_json).map_err(|e| {
+            ScpWasmError::Validation(format!("definition_json is not valid JSON: {e}")).into_js()
+        })?;
 
         let _ = context_id;
 
@@ -163,11 +164,9 @@ pub fn tool_invoke(
     let context_id = context.context_id();
     future_to_promise(async move {
         // Validate that input_json is valid JSON.
-        let _input: serde_json::Value = serde_json::from_str(&input_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
-                "input_json is not valid JSON: {e}"
-            ))
-            .into_js())?;
+        let _input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+            ScpWasmError::Validation(format!("input_json is not valid JSON: {e}")).into_js()
+        })?;
 
         let _ = (context_id, tool_id, identity_did);
 

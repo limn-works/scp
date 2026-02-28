@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ScpError, ToolError, TransportError, ValidationError
+from scp_sdk.errors import TransportError, ValidationError
 
 if TYPE_CHECKING:
     from scp_sdk.context import Context
@@ -39,11 +39,22 @@ _VALID_TRANSPORTS: frozenset[str] = frozenset({"stdio", "sse"})
 #: Matches the Rust-side ``DEFAULT_ALLOWLIST`` in ``scp-mcp/src/allowlist.rs``.
 #: The Rust layer is the single source of truth; use
 #: :func:`get_stdio_allowlist` to query the live state at runtime.
-DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset({
-    "uvx", "npx", "bunx", "pipx",
-    "python", "python3", "node", "bun", "deno",
-    "docker", "podman", "scp-mcp",
-})
+DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "uvx",
+        "npx",
+        "bunx",
+        "pipx",
+        "python",
+        "python3",
+        "node",
+        "bun",
+        "deno",
+        "docker",
+        "podman",
+        "scp-mcp",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Lazy bridge import
@@ -143,7 +154,7 @@ class McpServer:
     ``read_messages``, and ``list_members``.
     """
 
-    __slots__ = ("_handle", "_identity", "_contexts", "_transport")
+    __slots__ = ("_contexts", "_handle", "_identity", "_transport")
 
     def __init__(
         self,
@@ -180,10 +191,7 @@ class McpServer:
 
     def __repr__(self) -> str:
         ctx_ids = [c.context_id for c in self._contexts]
-        return (
-            f"McpServer(transport={self._transport!r}, "
-            f"contexts={ctx_ids!r})"
-        )
+        return f"McpServer(transport={self._transport!r}, contexts={ctx_ids!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +413,7 @@ class McpClient:
         )
     """
 
-    __slots__ = ("_handle", "_transport", "_command")
+    __slots__ = ("_command", "_handle", "_transport")
 
     def __init__(self, handle: Any, transport: str, command: list[str] | None) -> None:
         self._handle = handle
@@ -589,10 +597,7 @@ class McpClient:
         logger.debug("MCP client disconnected")
 
     def __repr__(self) -> str:
-        return (
-            f"McpClient(transport={self._transport!r}, "
-            f"command={self._command!r})"
-        )
+        return f"McpClient(transport={self._transport!r}, command={self._command!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +674,7 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
     )
 
     # Step 1: Load the identity.
-    identity = await Identity.load(did)
+    await Identity.load(did)
 
     # Step 2: Connect to the relay.
     await connect_relay(relay_url)

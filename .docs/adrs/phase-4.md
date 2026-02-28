@@ -1183,8 +1183,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
     "check": "tsc --noEmit",
     "lint": "biome check src/ tests/",
     "format": "biome format --write src/ tests/",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "bun test"
   },
   "engines": { "node": ">=22", "bun": ">=1.0" },
   "optionalDependencies": {
@@ -1197,7 +1196,6 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
   "devDependencies": {
     "typescript": "^5.7.0",
     "@biomejs/biome": "latest",
-    "vitest": "latest",
     "tsup": "latest"
   }
 }
@@ -1319,7 +1317,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
     - `napi build --release` in `crates/scp-ffi/napi/` produces a `.node` file for the current platform.
     - `bunx tsc --noEmit` passes with zero errors.
     - `bunx biome check src/ tests/` passes with zero errors.
-    - `vitest run` passes: all unit tests and conformance tests green.
+    - `bun test` passes: all unit tests and conformance tests green.
     - CI matrix builds napi artifacts for Linux x64/arm64, macOS arm64/x64, Windows x64.
 
 14. **Conformance:**

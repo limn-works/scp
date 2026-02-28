@@ -115,10 +115,7 @@ pub fn adjust_relay_price(
 
     // Compute the maximum allowed change for this period.
     // max_change = current_base_price * max_change_per_mille / 1000
-    let max_change = current
-        .0
-        .saturating_mul(config.max_change_per_mille)
-        / 1000;
+    let max_change = current.0.saturating_mul(config.max_change_per_mille) / 1000;
 
     // Compute the proportional change based on utilization delta.
     // delta_pct is the absolute difference between actual and target.
@@ -146,12 +143,10 @@ pub fn adjust_relay_price(
     // Clamp to [floor, cap].
     let clamped = new_price.max(config.floor.0).min(config.cap.0);
 
-    let direction = if clamped > current.0 {
-        PriceDirection::Increased
-    } else if clamped < current.0 {
-        PriceDirection::Decreased
-    } else {
-        PriceDirection::Unchanged
+    let direction = match clamped.cmp(&current.0) {
+        std::cmp::Ordering::Greater => PriceDirection::Increased,
+        std::cmp::Ordering::Less => PriceDirection::Decreased,
+        std::cmp::Ordering::Equal => PriceDirection::Unchanged,
     };
 
     RelayPriceAdjustment {
@@ -235,7 +230,7 @@ impl FormulaChange {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::economy::policy::{evaluate_formula, ObservableMetrics};
+    use crate::economy::policy::{ObservableMetrics, evaluate_formula};
     use crate::economy::types::{Coefficient, PricingFormula, PricingMetric, PricingVariable};
 
     // =======================================================================
@@ -440,7 +435,7 @@ mod tests {
         let formula = PricingFormula {
             base_cost: Amount(50),
             variables: vec![],
-            cap: Some(Amount(10)),   // cap < floor
+            cap: Some(Amount(10)),    // cap < floor
             floor: Some(Amount(100)), // degenerate: floor > cap
         };
         let metrics = ObservableMetrics::default();
@@ -457,11 +452,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<Coefficient>(), 8);
 
         // Verify no f64 fields in PricingFormula.
-        assert_eq!(
-            std::mem::size_of::<f64>(),
-            8,
-            "sanity: f64 is 8 bytes"
-        );
+        assert_eq!(std::mem::size_of::<f64>(), 8, "sanity: f64 is 8 bytes");
         // PricingFormula contains Amount(u64), Vec, Option<Amount> -- no f64.
         // This is a structural guarantee enforced by the type system.
     }

@@ -4,7 +4,7 @@
  * See ADR-010 (Tool Registry) and `.docs/scaffold/typescript.md`.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { ValidationError } from "../src/errors.js";
 import { defineToolDefinition } from "../src/tools.js";
 

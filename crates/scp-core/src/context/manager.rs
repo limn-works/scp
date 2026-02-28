@@ -18,10 +18,10 @@ use super::builder::{
     create_context as builder_create_context,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
-use crate::identity::DID;
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
 use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use super::{ContextError, ContextHandle, ContextParams, ContextState};
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // PerContextState -- internal per-context tracking
@@ -53,7 +53,9 @@ struct PerContextState {
 /// guaranteeing that no concurrent `close_context` or `handle_ttl_expiry` can
 /// interleave between the check and the mutation.
 fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
-    let state = handle.try_read_state().ok_or(ContextError::ContextNotActive)?;
+    let state = handle
+        .try_read_state()
+        .ok_or(ContextError::ContextNotActive)?;
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
     }
@@ -511,7 +513,12 @@ impl ContextManager {
             .lock()
             .await
             .get(context_id)
-            .map(|ctx| ctx.membership.member_dids().map(|d| d.to_string()).collect())
+            .map(|ctx| {
+                ctx.membership
+                    .member_dids()
+                    .map(std::string::ToString::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -791,7 +798,14 @@ const fn _assert_send_sync() {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::needless_collect,
+    clippy::significant_drop_tightening,
+    clippy::match_same_arms
+)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -858,11 +872,7 @@ mod tests {
             Ok(())
         }
 
-        fn add_member(
-            &self,
-            _context_id: &[u8; 32],
-            member_did: &str,
-        ) -> Result<(), ContextError> {
+        fn add_member(&self, _context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
             self.members_added
                 .lock()
                 .unwrap()
@@ -1196,7 +1206,11 @@ mod tests {
 
         // Remove the only member (creator -- self-removal).
         let result = manager
-            .leave_context(&handle, &"did:key:creator".into(), &"did:key:creator".into())
+            .leave_context(
+                &handle,
+                &"did:key:creator".into(),
+                &"did:key:creator".into(),
+            )
             .await;
         assert!(result.is_ok());
 
@@ -1246,7 +1260,11 @@ mod tests {
         handle.transition_to(&ContextState::Closing).await.unwrap();
 
         let result = manager
-            .leave_context(&handle, &"did:key:creator".into(), &"did:key:creator".into())
+            .leave_context(
+                &handle,
+                &"did:key:creator".into(),
+                &"did:key:creator".into(),
+            )
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -1310,7 +1328,7 @@ mod tests {
         (manager, handle)
     }
 
-    /// SCP-167: observer calls leave_context with admin's DID — returns
+    /// SCP-167: observer calls `leave_context` with admin's DID — returns
     /// authorization error.
     #[tokio::test]
     async fn leave_observer_cannot_remove_admin() {
@@ -1335,7 +1353,7 @@ mod tests {
         assert!(manager.is_member("auth-ctx", "did:key:creator").await);
     }
 
-    /// SCP-167: admin calls leave_context with observer's DID — succeeds
+    /// SCP-167: admin calls `leave_context` with observer's DID — succeeds
     /// (admin has `MemberRemove` capability).
     #[tokio::test]
     async fn leave_admin_can_remove_observer() {
@@ -1358,7 +1376,7 @@ mod tests {
         assert!(manager.is_member("auth-ctx", "did:key:creator").await);
     }
 
-    /// SCP-167: member calls leave_context with own DID — succeeds
+    /// SCP-167: member calls `leave_context` with own DID — succeeds
     /// (self-removal is always allowed regardless of role).
     #[tokio::test]
     async fn leave_self_removal_always_allowed() {
@@ -1587,9 +1605,7 @@ mod tests {
             let mgr = std::sync::Arc::clone(&manager);
             let h = std::sync::Arc::clone(&handle);
             join_handles.push(tokio::spawn(async move {
-                mgr.send_message(&h, &"did:key:creator".into(), &[i])
-                    .await
-                    .map(|()| ())
+                mgr.send_message(&h, &"did:key:creator".into(), &[i]).await
             }));
         }
 

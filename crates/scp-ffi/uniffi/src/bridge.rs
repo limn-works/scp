@@ -1,9 +1,9 @@
-//! UniFFI bridge: exported functions, opaque objects, records, enums, and
+//! `UniFFI` bridge: exported functions, opaque objects, records, enums, and
 //! error conversions.
 //!
 //! All proc-macro exports live here. The supplementary UDL file
 //! (`scp.udl`) defines only callback interfaces (which proc-macros cannot
-//! express). Both are required by UniFFI to generate the full Swift and
+//! express). Both are required by `UniFFI` to generate the full Swift and
 //! Kotlin bindings.
 //!
 //! # Type categories (ADR-021)
@@ -17,10 +17,10 @@
 //!
 //! # Async bridging (ADR-021)
 //!
-//! All I/O-bound bridge functions are `async fn`. UniFFI generates Swift
+//! All I/O-bound bridge functions are `async fn`. `UniFFI` generates Swift
 //! `async` functions (via `CheckedContinuation`) and Kotlin `suspend`
 //! functions (via coroutine integration). The tokio runtime executes the
-//! future; UniFFI's async scaffolding resumes the caller on completion.
+//! future; `UniFFI`'s async scaffolding resumes the caller on completion.
 //!
 //! See ADR-021 in `.docs/adrs/phase-4.md`.
 
@@ -35,7 +35,7 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 
 /// Wrapper for [`InMemoryKeyCustody`] that implements [`Debug`] with a
 /// redacted representation, preventing key material from appearing in logs.
-struct OpaqueInMemoryKeyCustody(InMemoryKeyCustody);
+pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) InMemoryKeyCustody);
 
 impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -52,7 +52,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 // See ADR-021 acceptance criterion 8.
 // ---------------------------------------------------------------------------
 
-/// Unified error type for the UniFFI bridge.
+/// Unified error type for the `UniFFI` bridge.
 ///
 /// Maps to Swift `ScpError` (an `enum` conforming to `Error`) and Kotlin
 /// `ScpException` (a sealed exception hierarchy). Every function that can
@@ -260,9 +260,7 @@ impl From<scp_core::event_log::EventLogError> for ScpError {
 impl From<scp_core::provenance::ProvenanceError> for ScpError {
     fn from(e: scp_core::provenance::ProvenanceError) -> Self {
         Self::Validation {
-            message: format!(
-                "provenance validation failed: {e} — check cross-context chain depth"
-            ),
+            message: format!("provenance validation failed: {e} — check cross-context chain depth"),
             code: "SCP-VALID-7002".to_owned(),
         }
     }
@@ -355,9 +353,7 @@ impl From<scp_platform::PlatformError> for ScpError {
 impl From<serde_json::Error> for ScpError {
     fn from(e: serde_json::Error) -> Self {
         Self::Validation {
-            message: format!(
-                "JSON serialization/deserialization failed: {e} — check input format"
-            ),
+            message: format!("JSON serialization/deserialization failed: {e} — check input format"),
             code: "SCP-VALID-7006".to_owned(),
         }
     }
@@ -652,7 +648,7 @@ pub struct Identity {
     /// Holds the `KeyHandle`s into `in_memory_custody`. Must outlive any
     /// signing or key-rotation operation on this handle.
     #[allow(dead_code)]
-    pub(crate) scp_identity: Option<ScpIdentity>,
+    pub(crate) core_id: Option<ScpIdentity>,
     /// Retained `InMemoryKeyCustody` for in-memory custody paths.
     ///
     /// Key material lives here. Dropping this destroys all private keys.
@@ -663,6 +659,7 @@ pub struct Identity {
 #[uniffi::export]
 impl Identity {
     /// Returns the DID string for this identity.
+    #[must_use]
     pub fn did(&self) -> String {
         self.did.clone()
     }
@@ -670,6 +667,7 @@ impl Identity {
     /// Returns the custody method string for this identity.
     ///
     /// One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
+    #[must_use]
     pub fn custody_type(&self) -> String {
         match self.custody_type {
             CustodyMethod::InMemory => "in_memory".to_owned(),
@@ -688,7 +686,9 @@ impl Identity {
     /// # Errors
     ///
     /// Returns `ScpError::Identity` if key rotation or DID document publish fails.
-    pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Identity>, ScpError> {
+    // async required by UniFFI export interface even though current stub has no await
+    #[allow(clippy::unused_async)]
+    pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
         // Key rotation requires a wired KeyCustodyProvider (ADR-006 platform
         // abstraction). InMemoryKeyCustody is not acceptable in production —
         // it stores private key material in unprotected heap memory on mobile
@@ -800,32 +800,38 @@ pub struct UcanToken {
 #[uniffi::export]
 impl UcanToken {
     /// Returns the token's stable metadata record.
+    #[must_use]
     pub fn token_data(&self) -> UcanTokenData {
         self.data.clone()
     }
 
     /// Returns the token's unique ID.
+    #[must_use]
     pub fn token_id(&self) -> String {
         self.data.token_id.clone()
     }
 
     /// Returns the issuer DID.
+    #[must_use]
     pub fn issuer(&self) -> String {
         self.data.issuer.clone()
     }
 
     /// Returns the audience DID.
+    #[must_use]
     pub fn audience(&self) -> String {
         self.data.audience.clone()
     }
 
     /// Returns the list of capability URIs granted by this token.
+    #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
         self.data.capabilities.clone()
     }
 
     /// Returns the expiry timestamp (seconds since epoch) or `None` if no expiry.
-    pub fn expires_at(&self) -> Option<u64> {
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<u64> {
         self.data.expires_at
     }
 }
@@ -866,10 +872,7 @@ impl TransportManager {
 
     /// Returns `true` if the transport is currently connected.
     pub fn is_connected(&self) -> bool {
-        self.status
-            .lock()
-            .map(|s| s.connected)
-            .unwrap_or(false)
+        self.status.lock().map(|s| s.connected).unwrap_or(false)
     }
 }
 
@@ -928,20 +931,20 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                     // The `testing` feature is always available in dev/test
                     // builds; production builds use the "platform" custody path.
                     //
-                    // IMPORTANT: both `scp_identity` and `key_custody` must be
+                    // IMPORTANT: both `core_identity` and `key_custody` must be
                     // retained in the handle. `ScpIdentity` holds `KeyHandle`s
                     // that are indices into `key_custody`'s internal store.
                     // Dropping `key_custody` destroys all private key material
                     // and renders those handles dangling.
                     let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
                     let dht = DidDht::new();
-                    let (scp_identity, _document) =
+                    let (identity, _document) =
                         dht.create(&key_custody.0).await.map_err(ScpError::from)?;
 
                     let handle = Arc::new(Identity {
-                        did: scp_identity.did.clone(),
+                        did: identity.did.clone(),
                         custody_type: CustodyMethod::InMemory,
-                        scp_identity: Some(scp_identity),
+                        core_id: Some(identity),
                         in_memory_custody: Some(key_custody),
                     });
                     increment_handle_count();
@@ -1004,9 +1007,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
         .spawn(async move {
             if !did.starts_with("did:dht:") {
                 return Err(ScpError::Identity {
-                    message: format!(
-                        "unsupported DID method: {did} — only did:dht is supported"
-                    ),
+                    message: format!("unsupported DID method: {did} — only did:dht is supported"),
                     code: "SCP-IDENT-1004".to_owned(),
                 });
             }
@@ -1016,7 +1017,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
             let handle = Arc::new(Identity {
                 did,
                 custody_type: CustodyMethod::External,
-                scp_identity: None,
+                core_id: None,
                 in_memory_custody: None,
             });
             increment_handle_count();
@@ -1094,10 +1095,11 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
 #[uniffi::export]
 pub async fn context_create(
     identity: Arc<Identity>,
-    _params: ContextParams,
+    params: ContextParams,
 ) -> Result<Arc<ContextHandle>, ScpError> {
     runtime()
         .spawn(async move {
+            let _ = params;
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
             let handle = Arc::new(ContextHandle {
@@ -1200,7 +1202,7 @@ pub async fn context_leave(
 /// Closes an SCP context.
 ///
 /// Initiates the cooperative closing window: notifies members, generates
-/// summaries (if memory_scope == Summary), and destroys keys per memory scope.
+/// summaries (if `memory_scope` == Summary), and destroys keys per memory scope.
 ///
 /// # Arguments
 ///
@@ -1299,7 +1301,7 @@ pub async fn context_send(
 ///
 /// * `handle` — The context to subscribe to.
 /// * `listener` — A `MessageListener` callback implementation (passed as Box
-///   per UniFFI callback interface convention).
+///   per `UniFFI` callback interface convention).
 ///
 /// # Errors
 ///
@@ -1501,9 +1503,8 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
     if !relay_url.starts_with("wss://") {
         return Err(ScpError::Transport {
             message: format!(
-                "relay URL must use wss:// scheme, got: {:?} — \
-                 plain-text ws:// is not permitted; use TLS",
-                relay_url
+                "relay URL must use wss:// scheme, got: {relay_url:?} — \
+                 plain-text ws:// is not permitted; use TLS"
             ),
             code: "SCP-TRANS-5001".to_owned(),
         });
@@ -1603,12 +1604,12 @@ pub async fn ucan_validate(
 #[uniffi::export]
 pub async fn ucan_mint(
     handle: Arc<ContextHandle>,
-    _member_did: String,
+    member_did: String,
     capabilities: Vec<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, capabilities);
+            let _ = (handle, member_did, capabilities);
             Err(ScpError::Permission {
                 message: "not yet connected to runtime — UCAN minting requires a live context"
                     .to_owned(),
@@ -1638,10 +1639,7 @@ pub async fn ucan_mint(
 /// Returns `ScpError::Permission` if revocation fails (token not found,
 /// revoker not authorized — must be the token's issuer or context creator).
 #[uniffi::export]
-pub async fn ucan_revoke(
-    handle: Arc<ContextHandle>,
-    token_id: String,
-) -> Result<(), ScpError> {
+pub async fn ucan_revoke(handle: Arc<ContextHandle>, token_id: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
             let _ = (handle, token_id);
@@ -1731,8 +1729,9 @@ pub async fn event_log_verify(
         .spawn(async move {
             let _ = (handle, claim_json);
             Err(ScpError::Context {
-                message: "not yet connected to runtime — event log verification requires a live context"
-                    .to_owned(),
+                message:
+                    "not yet connected to runtime — event log verification requires a live context"
+                        .to_owned(),
                 code: "SCP-CTX-2025".to_owned(),
             })
         })

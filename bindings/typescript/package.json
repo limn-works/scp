@@ -22,8 +22,7 @@
     "check": "tsc --noEmit",
     "lint": "biome check src/ tests/",
     "format": "biome format --write src/ tests/",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "bun test"
   },
   "engines": {
     "node": ">=22",
@@ -40,7 +39,6 @@
     "@biomejs/biome": "latest",
     "@types/node": "^25.3.2",
     "tsup": "latest",
-    "typescript": "^5.7.0",
-    "vitest": "latest"
+    "typescript": "^5.7.0"
   }
 }

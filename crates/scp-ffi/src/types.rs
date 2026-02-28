@@ -28,6 +28,7 @@ use crate::error::ScpPyError;
 ///
 /// Used across the bridge for Merkle roots, token CIDs, nonces, and proof
 /// details. Centralised here to avoid duplicating the fold pattern.
+#[must_use]
 pub fn encode_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -89,11 +90,11 @@ pub fn py_dict_to_json(dict: &Bound<'_, PyDict>) -> Result<Value, ScpPyError> {
     let mut map = serde_json::Map::new();
     for (key, value) in dict.iter() {
         let key_str: String = key.extract().map_err(|e| {
-            let type_name = key.get_type().name()
+            let type_name = key
+                .get_type()
+                .name()
                 .map_or_else(|_| "<unknown>".to_owned(), |n| n.to_string());
-            ScpPyError::ValidationError(format!(
-                "dict key must be a string, got {type_name}: {e}",
-            ))
+            ScpPyError::ValidationError(format!("dict key must be a string, got {type_name}: {e}",))
         })?;
         let json_value = py_any_to_json(&value)?;
         map.insert(key_str, json_value);
@@ -108,9 +109,9 @@ pub fn py_dict_to_json(dict: &Bound<'_, PyDict>) -> Result<Value, ScpPyError> {
 fn py_any_to_json(obj: &Bound<'_, PyAny>) -> Result<Value, ScpPyError> {
     // Check bool BEFORE int — in Python, `bool` is a subclass of `int`.
     if obj.is_instance_of::<PyBool>() {
-        let b: bool = obj.extract().map_err(|e| {
-            ScpPyError::ValidationError(format!("failed to extract bool: {e}"))
-        })?;
+        let b: bool = obj
+            .extract()
+            .map_err(|e| ScpPyError::ValidationError(format!("failed to extract bool: {e}")))?;
         return Ok(Value::Bool(b));
     }
 
@@ -119,16 +120,16 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>) -> Result<Value, ScpPyError> {
     }
 
     if obj.is_instance_of::<PyString>() {
-        let s: String = obj.extract().map_err(|e| {
-            ScpPyError::ValidationError(format!("failed to extract string: {e}"))
-        })?;
+        let s: String = obj
+            .extract()
+            .map_err(|e| ScpPyError::ValidationError(format!("failed to extract string: {e}")))?;
         return Ok(Value::String(s));
     }
 
     if obj.is_instance_of::<PyFloat>() {
-        let f: f64 = obj.extract().map_err(|e| {
-            ScpPyError::ValidationError(format!("failed to extract float: {e}"))
-        })?;
+        let f: f64 = obj
+            .extract()
+            .map_err(|e| ScpPyError::ValidationError(format!("failed to extract float: {e}")))?;
         return serde_json::Number::from_f64(f)
             .map(Value::Number)
             .ok_or_else(|| {
@@ -145,16 +146,16 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>) -> Result<Value, ScpPyError> {
     }
 
     if obj.is_instance_of::<PyDict>() {
-        let dict = obj.downcast::<PyDict>().map_err(|e| {
-            ScpPyError::ValidationError(format!("failed to downcast to dict: {e}"))
-        })?;
+        let dict = obj
+            .downcast::<PyDict>()
+            .map_err(|e| ScpPyError::ValidationError(format!("failed to downcast to dict: {e}")))?;
         return py_dict_to_json(dict);
     }
 
     if obj.is_instance_of::<PyList>() {
-        let list = obj.downcast::<PyList>().map_err(|e| {
-            ScpPyError::ValidationError(format!("failed to downcast to list: {e}"))
-        })?;
+        let list = obj
+            .downcast::<PyList>()
+            .map_err(|e| ScpPyError::ValidationError(format!("failed to downcast to list: {e}")))?;
         let mut arr = Vec::with_capacity(list.len());
         for item in list.iter() {
             arr.push(py_any_to_json(&item)?);
@@ -162,7 +163,9 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>) -> Result<Value, ScpPyError> {
         return Ok(Value::Array(arr));
     }
 
-    let type_name = obj.get_type().name()
+    let type_name = obj
+        .get_type()
+        .name()
         .map_or_else(|_| "<unknown>".to_owned(), |n| n.to_string());
     Err(ScpPyError::ValidationError(format!(
         "unsupported Python type for JSON conversion: {type_name} — \

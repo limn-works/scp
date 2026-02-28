@@ -47,7 +47,9 @@ pub enum InvitationError {
 
     /// No compatible payment adapter is configured for this context's
     /// accepted adapters.
-    #[error("no compatible payment adapter: context accepts {accepted:?}, configured {configured:?}")]
+    #[error(
+        "no compatible payment adapter: context accepts {accepted:?}, configured {configured:?}"
+    )]
     NoCompatibleAdapter {
         /// Adapters accepted by the context's economic policy.
         accepted: Vec<String>,
@@ -131,7 +133,7 @@ pub struct RateLimitTracker {
 impl RateLimitTracker {
     /// Creates a new empty rate limit tracker.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             accepts: Vec::new(),
         }
@@ -171,7 +173,7 @@ impl RateLimitTracker {
             // if `now < t` (should not happen in practice), so use
             // checked_duration_since to be safe.
             now.checked_duration_since(t)
-                .map_or(true, |elapsed| elapsed < window)
+                .is_none_or(|elapsed| elapsed < window)
         });
     }
 }
@@ -249,13 +251,13 @@ pub fn evaluate_invitation(
             }
 
             // Check balance covers at least the per_join cost (if any).
-            if let Some(ref per_join) = econ.cost_schedule.per_join {
-                if ctx.available_balance < per_join.value() {
-                    return Err(InvitationError::InsufficientBalance {
-                        estimated: per_join.value(),
-                        available: ctx.available_balance,
-                    });
-                }
+            if let Some(ref per_join) = econ.cost_schedule.per_join
+                && ctx.available_balance < per_join.value()
+            {
+                return Err(InvitationError::InsufficientBalance {
+                    estimated: per_join.value(),
+                    available: ctx.available_balance,
+                });
             }
         }
 
@@ -265,40 +267,35 @@ pub fn evaluate_invitation(
 
     // Step 3: Auto-accept check.
     // Only if a policy is provided AND hard constraints pass.
-    if let Some(policy) = policy {
-        if auto_accept_allowed(params) {
-            // 3a. Template match: policy must match the invitation's template.
-            let template_matches = params
-                .template_id
-                .map_or(false, |tid| tid == policy.template);
+    if let Some(policy) = policy
+        && auto_accept_allowed(params)
+    {
+        // 3a. Template match: policy must match the invitation's template.
+        let template_matches = params.template_id == Some(policy.template);
 
-            if template_matches {
-                // 3b. Trust requirement.
-                if trust_oracle.satisfies_trust(inviter, &policy.from) {
-                    // 3c. TTL cap.
-                    let ttl_ok = match (&policy.max_ttl, &params.ttl) {
-                        (Some(max), Some(actual)) => actual <= max,
-                        (Some(_), None) => true, // No TTL = unlimited, but
-                        // policy has a cap. This is
-                        // context-dependent; a
-                        // persistent context with no
-                        // TTL is fine if the policy
-                        // allows it (max_ttl is a
-                        // cap, not a requirement).
-                        (None, _) => true, // No cap = any TTL OK.
-                    };
+        if template_matches {
+            // 3b. Trust requirement.
+            if trust_oracle.satisfies_trust(inviter, &policy.from) {
+                // 3c. TTL cap.
+                let ttl_ok = match (&policy.max_ttl, &params.ttl) {
+                    (Some(max), Some(actual)) => actual <= max,
+                    // No TTL = unlimited but policy has a cap. This is
+                    // context-dependent; a persistent context with no
+                    // TTL is fine if the policy allows it (max_ttl is a
+                    // cap, not a requirement). No cap = any TTL OK.
+                    (Some(_), None) | (None, _) => true,
+                };
 
-                    if ttl_ok {
-                        // 3d. Rate limit.
-                        let rate_ok = match &policy.rate_limit {
-                            Some(limit) => rate_tracker.is_allowed(limit),
-                            None => true,
-                        };
+                if ttl_ok {
+                    // 3d. Rate limit.
+                    let rate_ok = policy
+                        .rate_limit
+                        .as_ref()
+                        .is_none_or(|limit| rate_tracker.is_allowed(limit));
 
-                        if rate_ok {
-                            rate_tracker.record_accept();
-                            return Ok(EvaluationDecision::AutoAccept);
-                        }
+                    if rate_ok {
+                        rate_tracker.record_accept();
+                        return Ok(EvaluationDecision::AutoAccept);
                     }
                 }
             }
@@ -737,14 +734,8 @@ mod tests {
         let mut tracker = RateLimitTracker::new();
 
         // Bob invites, but only Alice is in the explicit list.
-        let result = evaluate_invitation(
-            &params,
-            &bob(),
-            Some(&policy),
-            None,
-            &oracle,
-            &mut tracker,
-        );
+        let result =
+            evaluate_invitation(&params, &bob(), Some(&policy), None, &oracle, &mut tracker);
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
 
         // Alice invites -- should auto-accept.

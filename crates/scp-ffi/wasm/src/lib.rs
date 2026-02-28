@@ -1,3 +1,9 @@
+// wasm-bindgen does not support `const fn` on exported methods, so we suppress
+// the lint crate-wide. Similarly, wasm-bindgen requires owned `String` for
+// function parameters (not `&str`), making `needless_pass_by_value` a false
+// positive on all `#[wasm_bindgen]` bridge functions.
+#![allow(clippy::missing_const_for_fn, clippy::needless_pass_by_value)]
+
 //! `wasm-bindgen` FFI bridge for SCP — the browser-target Rust half of the
 //! TypeScript SDK.
 //!
@@ -7,7 +13,7 @@
 //!
 //! # Architecture
 //!
-//! The bridge is organized into domain modules that mirror the PyO3 bridge
+//! The bridge is organized into domain modules that mirror the `PyO3` bridge
 //! (`crates/scp-ffi/src/`) at the same logical API surface:
 //!
 //! - [`error`] — Rust `Result` → JS typed exception mapping.
@@ -19,8 +25,8 @@
 //! - [`transport`] — Transport connection and status.
 //! - [`ucan`] — UCAN token management (validate, mint, revoke).
 //! - [`event_log`] — Event log queries and Merkle proofs.
-//! - [`custody`] — JS-injected key custody callback types (WebCrypto).
-//! - [`storage`] — JS-injected storage callback types (OPFS/IndexedDB).
+//! - [`custody`] — JS-injected key custody callback types (`WebCrypto`).
+//! - [`storage`] — JS-injected storage callback types (OPFS/`IndexedDB`).
 //!
 //! # Async model
 //!
@@ -39,18 +45,18 @@
 //! 1. Opaque JS handle types ([`WasmIdentity`], [`WasmContextHandle`], etc.)
 //!    establish the stable ABI boundary.
 //! 2. Bridge stub functions return typed errors documenting the JS-side
-//!    implementation pattern (WebCrypto, Fetch API, WebSocket).
+//!    implementation pattern (`WebCrypto`, Fetch API, WebSocket).
 //! 3. JS callback injection types ([`JsKeyCustody`], [`JsStorage`],
 //!    [`JsMessageCallback`]) define the TypeScript wrapper's responsibility.
 //!
 //! The JS callback injection pattern is the permanent WASM architecture per
-//! ADR-022: browser-native APIs (WebCrypto, OPFS, WebSocket) are injected from
+//! ADR-022: browser-native APIs (`WebCrypto`, OPFS, WebSocket) are injected from
 //! the TypeScript wrapper layer. The napi-rs bridge (`crates/scp-ffi/napi/`)
 //! is the path that depends on `scp-core` directly, serving Node.js/Bun.
 //!
 //! # JS callback injection
 //!
-//! Browser-native APIs (WebCrypto, wa-sqlite / OPFS, IndexedDB) are not
+//! Browser-native APIs (`WebCrypto`, wa-sqlite / OPFS, `IndexedDB`) are not
 //! available as Rust crates — they are JavaScript APIs. The bridge exposes
 //! extern `JsKeyCustody` and `JsStorage` types so the TypeScript wrapper can
 //! inject implementations.

@@ -81,9 +81,7 @@ impl RelayEntry {
 ///
 /// Returns [`TransportError::ProtocolError`] if no free relay exists
 /// in the provided list.
-pub fn validate_bootstrap_has_free_relay(
-    relays: &[RelayEntry],
-) -> Result<(), TransportError> {
+pub fn validate_bootstrap_has_free_relay(relays: &[RelayEntry]) -> Result<(), TransportError> {
     let has_free = relays.iter().any(RelayEntry::is_free);
     if has_free {
         Ok(())
@@ -107,9 +105,8 @@ pub fn validate_bootstrap_has_free_relay(
 /// Returns [`TransportError::ProtocolError`] if the JSON is malformed
 /// or does not match the `.well-known/scp` schema.
 pub fn parse_well_known(json: &str) -> Result<WellKnownScp, TransportError> {
-    serde_json::from_str(json).map_err(|e| {
-        TransportError::ProtocolError(format!("failed to parse .well-known/scp: {e}"))
-    })
+    serde_json::from_str(json)
+        .map_err(|e| TransportError::ProtocolError(format!("failed to parse .well-known/scp: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +151,7 @@ mod tests {
         }
     }"#;
 
-    /// JSON with no relay_config at all.
+    /// JSON with no `relay_config` at all.
     const WELL_KNOWN_MINIMAL: &str = r#"{
         "version": 1,
         "did": "did:dht:z6Mk...",
@@ -168,8 +165,7 @@ mod tests {
         let doc = parse_well_known(WELL_KNOWN_WITH_ECONOMIC)
             .expect("should parse .well-known/scp with economic field");
 
-        let economic = relay_economic_config(&doc)
-            .expect("economic config should be present");
+        let economic = relay_economic_config(&doc).expect("economic config should be present");
 
         assert_eq!(economic.currency, CurrencyCode::from("USD"));
         assert_eq!(economic.per_publish, Some(Amount::new(10)));
@@ -189,8 +185,8 @@ mod tests {
 
     #[test]
     fn parse_well_known_minimal_treated_as_free() {
-        let doc = parse_well_known(WELL_KNOWN_MINIMAL)
-            .expect("should parse minimal .well-known/scp");
+        let doc =
+            parse_well_known(WELL_KNOWN_MINIMAL).expect("should parse minimal .well-known/scp");
 
         assert!(relay_economic_config(&doc).is_none());
         assert!(is_free_relay_doc(&doc));
@@ -319,8 +315,7 @@ mod tests {
         // An empty list has no relays at all -- this is technically
         // a different validation concern. The free relay check should
         // fail because there are no free relays.
-        let err = validate_bootstrap_has_free_relay(&[])
-            .expect_err("should reject empty list");
+        let err = validate_bootstrap_has_free_relay(&[]).expect_err("should reject empty list");
         assert!(matches!(err, TransportError::ProtocolError(_)));
     }
 

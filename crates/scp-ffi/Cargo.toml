@@ -8,13 +8,18 @@ license.workspace = true
 
 [lib]
 name = "_scp_core"
-crate-type = ["cdylib"]
-# Test harness disabled: PyO3 extension-module cdylib cannot link a test
-# binary without Python dev headers (libpython). Run tests via maturin/pytest.
-test = false
+crate-type = ["cdylib", "rlib"]
+# rlib allows cargo test to link against this crate. The cdylib is only
+# used by maturin when building the Python extension module.
+
+[features]
+# extension-module suppresses Python symbol linking — required for cdylib
+# but incompatible with test binaries. Maturin passes this explicitly.
+# cargo test runs WITHOUT it, so auto-initialize can embed Python.
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module", "experimental-async"] }
+pyo3 = { version = "0.23", features = ["experimental-async"] }
 tokio = { workspace = true }
 scp-core = { path = "../scp-core" }
 scp-mcp = { path = "../scp-mcp" }

@@ -97,14 +97,18 @@ impl CertificateData {
     /// # Errors
     ///
     /// Returns [`TlsError::Certificate`] if the PEM data cannot be parsed.
-    pub fn certificate_chain_der(&self) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
+    pub fn certificate_chain_der(
+        &self,
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
         let mut reader = std::io::BufReader::new(self.certificate_chain_pem.as_bytes());
         let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| TlsError::Certificate(format!("failed to parse PEM certificates: {e}")))?;
 
         if certs.is_empty() {
-            return Err(TlsError::Certificate("no certificates found in PEM data".to_owned()));
+            return Err(TlsError::Certificate(
+                "no certificates found in PEM data".to_owned(),
+            ));
         }
 
         Ok(certs)
@@ -136,8 +140,9 @@ impl CertificateData {
             .first()
             .ok_or_else(|| TlsError::Certificate("empty certificate chain".to_owned()))?;
 
-        let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref())
-            .map_err(|e| TlsError::Certificate(format!("failed to parse X.509 certificate: {e}")))?;
+        let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).map_err(|e| {
+            TlsError::Certificate(format!("failed to parse X.509 certificate: {e}"))
+        })?;
 
         Ok(cert.validity().not_after.timestamp())
     }
@@ -152,9 +157,10 @@ impl CertificateData {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| TlsError::Certificate(format!("system time error: {e}")))?
-            .as_secs() as i64;
+            .as_secs()
+            .cast_signed();
 
-        let threshold = i64::from(RENEWAL_THRESHOLD_DAYS) * 24 * 60 * 60;
+        let threshold = RENEWAL_THRESHOLD_DAYS * 24 * 60 * 60;
         Ok(expiry - now < threshold)
     }
 }
@@ -315,10 +321,7 @@ impl CertResolver {
 }
 
 impl ResolvesServerCert for CertResolver {
-    fn resolve(
-        &self,
-        _client_hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<CertifiedKey>> {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // `try_read()` is non-blocking and appropriate for the synchronous
         // `resolve` callback. If a write is in progress (certificate update),
         // this returns `None` and rustls will reject the handshake — the next
@@ -365,7 +368,7 @@ impl<S: Storage> std::fmt::Debug for AcmeProvider<S> {
             .field("domain", &self.domain)
             .field("email", &self.email)
             .field("directory_url", &self.directory_url)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -395,7 +398,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     /// Set a custom ACME directory URL (e.g., staging environment).
     #[must_use]
     pub fn with_directory_url(mut self, url: &str) -> Self {
-        self.directory_url = url.to_owned();
+        url.clone_into(&mut self.directory_url);
         self
     }
 
@@ -423,9 +426,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     /// Returns [`TlsError::Acme`] if any ACME protocol step fails.
     /// Returns [`TlsError::Storage`] if certificate storage fails.
     pub async fn provision(&self) -> Result<CertificateData, TlsError> {
-        use instant_acme::{
-            Account, Identifier, NewAccount, NewOrder,
-        };
+        use instant_acme::{Account, Identifier, NewAccount, NewOrder};
 
         // 1. Create ACME account.
         let contacts: Vec<String> = self
@@ -538,6 +539,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     ///
     /// The task runs until the returned [`tokio::task::JoinHandle`] is
     /// aborted or the process exits.
+    #[must_use]
     pub fn start_renewal_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()>
     where
         S: Send + Sync + 'static,
@@ -556,24 +558,18 @@ impl<S: Storage + 'static> AcmeProvider<S> {
                             match self.provision().await {
                                 Ok(new_cert) => {
                                     // Hot-reload if a resolver is configured.
-                                    if let Some(resolver) = &self.cert_resolver {
-                                        if let Ok(certs) = new_cert.certificate_chain_der() {
-                                            if let Ok(key) = new_cert.private_key_der() {
-                                                if let Ok(signing_key) =
-                                                    rustls::crypto::ring::sign::any_supported_type(
-                                                        &key,
-                                                    )
-                                                {
-                                                    let certified =
-                                                        CertifiedKey::new(certs, signing_key);
-                                                    resolver.update(certified).await;
-                                                    tracing::info!(
-                                                        domain = %self.domain,
-                                                        "TLS certificate renewed and hot-reloaded"
-                                                    );
-                                                }
-                                            }
-                                        }
+                                    if let Some(resolver) = &self.cert_resolver
+                                        && let Ok(certs) = new_cert.certificate_chain_der()
+                                        && let Ok(key) = new_cert.private_key_der()
+                                        && let Ok(signing_key) =
+                                            rustls::crypto::ring::sign::any_supported_type(&key)
+                                    {
+                                        let certified = CertifiedKey::new(certs, signing_key);
+                                        resolver.update(certified).await;
+                                        tracing::info!(
+                                            domain = %self.domain,
+                                            "TLS certificate renewed and hot-reloaded"
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -631,6 +627,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
 ///
 /// * `challenges` - A shared map from token to key authorization string.
 ///   Typically populated during the ACME provisioning flow.
+#[allow(clippy::implicit_hasher)]
 pub fn acme_challenge_router(
     challenges: Arc<RwLock<std::collections::HashMap<String, String>>>,
 ) -> axum::Router {
@@ -643,10 +640,10 @@ pub fn acme_challenge_router(
         Path(token): Path<String>,
     ) -> impl IntoResponse {
         let map = challenges.read().await;
-        match map.get(&token) {
-            Some(key_auth) => (StatusCode::OK, key_auth.clone()),
-            None => (StatusCode::NOT_FOUND, String::new()),
-        }
+        map.get(&token).map_or_else(
+            || (StatusCode::NOT_FOUND, String::new()),
+            |key_auth| (StatusCode::OK, key_auth.clone()),
+        )
     }
 
     axum::Router::new()
@@ -695,7 +692,14 @@ pub fn generate_self_signed(domain: &str) -> Result<CertificateData, TlsError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names,
+    clippy::cast_possible_wrap,
+    clippy::significant_drop_tightening
+)]
 mod tests {
     use super::*;
     use scp_platform::testing::InMemoryStorage;
@@ -713,7 +717,11 @@ mod tests {
     fn certificate_chain_der_parses_pem() {
         let cert = generate_self_signed("test.example.com").unwrap();
         let der_certs = cert.certificate_chain_der().unwrap();
-        assert_eq!(der_certs.len(), 1, "self-signed should have exactly one cert");
+        assert_eq!(
+            der_certs.len(),
+            1,
+            "self-signed should have exactly one cert"
+        );
     }
 
     #[test]

@@ -522,7 +522,7 @@ pub async fn send_block_notification(
 ///
 /// Returns [`SenderKeyError::StaleBlockNotification`] if the notification
 /// timestamp is outside the freshness window.
-pub fn validate_block_notification_freshness(
+pub const fn validate_block_notification_freshness(
     notification: &BlockNotification,
     now_ms: u64,
 ) -> Result<(), SenderKeyError> {
@@ -618,7 +618,7 @@ pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
 ///
 /// Tracks seen request nonces for up to [`NONCE_EXPIRY_SECS`] seconds and
 /// caps the stored count at [`NONCE_DEDUP_CAPACITY`] entries to prevent
-/// memory exhaustion from DoS attacks.
+/// memory exhaustion from `DoS` attacks.
 ///
 /// Callers should call [`NonceDedup::is_replayed`] before processing a
 /// request, then [`NonceDedup::record`] once the request is accepted.
@@ -630,6 +630,7 @@ pub struct NonceDedup {
 
 impl NonceDedup {
     /// Creates a new, empty dedup cache.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             seen: HashMap::new(),
@@ -651,15 +652,10 @@ impl NonceDedup {
     /// If at capacity ([`NONCE_DEDUP_CAPACITY`]), the oldest entry is evicted
     /// to make room.
     pub fn record(&mut self, nonce: [u8; REQUEST_NONCE_SIZE], now_secs: u64) {
-        if self.seen.len() >= NONCE_DEDUP_CAPACITY {
-            if let Some(oldest_key) = self
-                .seen
-                .iter()
-                .min_by_key(|(_, ts)| *ts)
-                .map(|(k, _)| *k)
-            {
-                self.seen.remove(&oldest_key);
-            }
+        if self.seen.len() >= NONCE_DEDUP_CAPACITY
+            && let Some(oldest_key) = self.seen.iter().min_by_key(|(_, ts)| *ts).map(|(k, _)| *k)
+        {
+            self.seen.remove(&oldest_key);
         }
         self.seen.insert(nonce, now_secs);
     }
@@ -1432,7 +1428,10 @@ mod tests {
         let mut dedup = NonceDedup::new();
         let nonce = [1u8; REQUEST_NONCE_SIZE];
         let now = 1_700_000_000u64;
-        assert!(!dedup.is_replayed(&nonce, now), "fresh nonce should not be replayed");
+        assert!(
+            !dedup.is_replayed(&nonce, now),
+            "fresh nonce should not be replayed"
+        );
     }
 
     #[test]
@@ -1468,7 +1467,10 @@ mod tests {
         let nonce_b = [20u8; REQUEST_NONCE_SIZE];
         let now = 1_700_000_000u64;
         dedup.record(nonce_a, now);
-        assert!(!dedup.is_replayed(&nonce_b, now), "different nonce should not be replayed");
+        assert!(
+            !dedup.is_replayed(&nonce_b, now),
+            "different nonce should not be replayed"
+        );
     }
 
     #[test]
@@ -1515,7 +1517,10 @@ mod tests {
         let notification: BlockNotification = serde_json::from_slice(&msg).unwrap();
         let now_ms = current_timestamp_ms();
         let result = validate_block_notification_freshness(&notification, now_ms);
-        assert!(result.is_ok(), "fresh notification should pass freshness check");
+        assert!(
+            result.is_ok(),
+            "fresh notification should pass freshness check"
+        );
     }
 
     #[tokio::test]
@@ -1544,13 +1549,21 @@ mod tests {
     #[tokio::test]
     async fn sender_key_response_echoes_request_nonce() {
         let alice_custody = InMemoryKeyCustody::new();
-        let alice_signing_key = alice_custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let _alice_signing_key = alice_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
 
         let requester_custody = InMemoryKeyCustody::new();
-        let requester_signing_key =
-            requester_custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let requester_signing_key = requester_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
         // The requester's *public* key is used by the responder to verify the request signature.
-        let requester_pubkey = requester_custody.public_key(&requester_signing_key).await.unwrap();
+        let requester_pubkey = requester_custody
+            .public_key(&requester_signing_key)
+            .await
+            .unwrap();
 
         let sender_key = generate_sender_key();
         let block_list: HashSet<String> = HashSet::new();
@@ -1565,8 +1578,7 @@ mod tests {
         .await
         .unwrap();
 
-        let request: SenderKeyRequest =
-            serde_json::from_slice(&result.request_message).unwrap();
+        let request: SenderKeyRequest = serde_json::from_slice(&result.request_message).unwrap();
         let original_nonce = request.nonce;
 
         let response_bytes = handle_sender_key_request(

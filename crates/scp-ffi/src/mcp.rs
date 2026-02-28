@@ -117,7 +117,6 @@ impl StdioClientTransport {
             }),
         })
     }
-
 }
 
 /// Kills the subprocess and waits for it to exit on drop.
@@ -162,13 +161,13 @@ impl McpTransport for StdioClientTransport {
             .reader
             .read_line(&mut line)
             .map_err(|e| format!("failed to read from subprocess stdout: {e}"))?;
+        drop(inner);
 
         if bytes_read == 0 {
             return Err("subprocess closed stdout (EOF)".to_owned());
         }
 
-        serde_json::from_str(line.trim())
-            .map_err(|e| format!("failed to parse response JSON: {e}"))
+        serde_json::from_str(line.trim()).map_err(|e| format!("failed to parse response JSON: {e}"))
     }
 
     fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
@@ -191,6 +190,7 @@ impl McpTransport for StdioClientTransport {
             .writer
             .flush()
             .map_err(|e| format!("failed to flush notification: {e}"))?;
+        drop(inner);
 
         Ok(())
     }
@@ -334,9 +334,7 @@ impl SseClientTransport {
         }
 
         if post_path.bytes().any(|b| b < 0x20) {
-            return Err(
-                "SSE endpoint path contains invalid control characters".to_owned(),
-            );
+            return Err("SSE endpoint path contains invalid control characters".to_owned());
         }
 
         // Build the full POST URL. Always http — HTTPS is rejected at entry.
@@ -350,7 +348,13 @@ impl SseClientTransport {
     }
 }
 
+/// Maximum number of SSE events to scan for a matching JSON-RPC response.
+/// If exceeded, the request fails. The TCP read timeout (30s) handles
+/// individual read stalls; this bounds total non-matching events tolerated.
+const MAX_SSE_EVENTS: usize = 1000;
+
 impl McpTransport for SseClientTransport {
+    #[allow(clippy::significant_drop_tightening)] // sse_reader MutexGuard is borrowed by reader across the entire loop.
     fn send_request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, String> {
         // Parse the POST URL.
         let (host, port, path) = parse_http_url(&self.post_url)?;
@@ -396,15 +400,9 @@ impl McpTransport for SseClientTransport {
             .lock()
             .map_err(|e| format!("SSE reader lock poisoned: {e}"))?;
 
-        let reader = sse_reader
-            .as_mut()
-            .ok_or("SSE connection is closed")?;
+        let reader = sse_reader.as_mut().ok_or("SSE connection is closed")?;
 
         // Read SSE events until we find a `message` event with our response.
-        // Bounded to prevent a misbehaving server from consuming resources
-        // indefinitely. The TCP read timeout (30s) handles individual reads;
-        // this bounds the total number of non-matching events we'll tolerate.
-        const MAX_SSE_EVENTS: usize = 1000;
         for _ in 0..MAX_SSE_EVENTS {
             let mut line = String::new();
             let n = reader
@@ -415,10 +413,7 @@ impl McpTransport for SseClientTransport {
             }
             let trimmed = line.trim();
             if trimmed.starts_with("data:") {
-                let data = trimmed
-                    .strip_prefix("data:")
-                    .unwrap_or("")
-                    .trim();
+                let data = trimmed.strip_prefix("data:").unwrap_or("").trim();
                 // Try to parse as a JSON-RPC response.
                 if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(data) {
                     return Ok(response);
@@ -521,6 +516,10 @@ impl McpTransport for ClientTransport {
     fn send_request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, String> {
         match self {
             Self::Stdio(t) => t.send_request(request),
+            // Each variant dispatches to its own McpTransport impl with distinct
+            // I/O behavior (subprocess stdio vs. HTTP SSE). Arms look identical
+            // syntactically but resolve to different concrete implementations.
+            #[allow(clippy::match_same_arms)]
             Self::Sse(t) => t.send_request(request),
         }
     }
@@ -528,6 +527,7 @@ impl McpTransport for ClientTransport {
     fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
         match self {
             Self::Stdio(t) => t.send_notification(notification),
+            #[allow(clippy::match_same_arms)]
             Self::Sse(t) => t.send_notification(notification),
         }
     }
@@ -757,6 +757,8 @@ fn generate_handle_id(prefix: &str) -> String {
 /// See ADR-015: MCP server with context namespace mapping.
 #[pyfunction]
 #[pyo3(name = "py_mcp_serve")]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
+#[allow(clippy::too_many_lines)] // MCP server startup with stdio/SSE transport dispatch is inherently verbose.
 pub fn py_mcp_serve(
     identity_did: &str,
     context_ids: Vec<String>,
@@ -805,7 +807,9 @@ pub fn py_mcp_serve(
                     _ = shutdown_rx => {
                         // Shutdown signal received -- exit cleanly.
                     }
-                    _ = async {
+                    () = async {
+                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
                         // The real `run_stdio` takes &mut McpServer by value.
                         // We need to run it with our Arc<Mutex> server.
                         // Since `run_stdio` processes stdin line by line, we
@@ -815,14 +819,11 @@ pub fn py_mcp_serve(
                         let mut reader = tokio::io::BufReader::new(stdin);
                         let mut line = String::new();
 
-                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
                         loop {
                             line.clear();
                             match reader.read_line(&mut line).await {
-                                Ok(0) => break, // EOF
+                                Ok(0) | Err(_) => break, // EOF or read error
                                 Ok(_) => {}
-                                Err(_) => break,
                             }
 
                             let trimmed = line.trim();
@@ -836,11 +837,9 @@ pub fn py_mcp_serve(
                                     serde_json::from_str(trimmed);
                                 match request {
                                     Ok(req) => {
-                                        if let Ok(mut srv) = server_clone.lock() {
-                                            srv.handle_request(&req)
-                                        } else {
-                                            None
-                                        }
+                                        server_clone
+                                            .lock()
+                                            .map_or(None, |mut srv| srv.handle_request(&req))
                                     }
                                     Err(e) => {
                                         Some(scp_mcp::protocol::JsonRpcResponse::error(
@@ -855,13 +854,12 @@ pub fn py_mcp_serve(
                                 }
                             };
 
-                            if let Some(resp) = response {
-                                if let Ok(json) = serde_json::to_string(&resp) {
+                            if let Some(resp) = response
+                                && let Ok(json) = serde_json::to_string(&resp) {
                                     let _ = stdout.write_all(json.as_bytes()).await;
                                     let _ = stdout.write_all(b"\n").await;
                                     let _ = stdout.flush().await;
                                 }
-                            }
                         }
                     } => {}
                 }
@@ -877,9 +875,8 @@ pub fn py_mcp_serve(
                     context_ids: sse_context_ids,
                 };
                 let sse_server = McpServer::new(provider);
-                let config = scp_mcp::sse::SseConfig::new(
-                    std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                );
+                let config =
+                    scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
 
                 tokio::select! {
                     _ = shutdown_rx => {}
@@ -944,6 +941,7 @@ pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
     if let Some(tx) = entry.shutdown_tx.take() {
         let _ = tx.send(());
     }
+    drop(entry);
 
     Ok(())
 }
@@ -1015,24 +1013,23 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 /// MCP initialize handshake fails.
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_connect_stdio")]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
 pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
     if command.is_empty() {
-        return Err(ScpPyError::ValidationError(
-            "command must be a non-empty list".to_owned(),
-        )
-        .into());
+        return Err(
+            ScpPyError::ValidationError("command must be a non-empty list".to_owned()).into(),
+        );
     }
 
     // Spawn the subprocess and create the transport.
-    let transport = StdioClientTransport::spawn(&command).map_err(|e| {
-        ScpPyError::TransportError(format!("failed to connect stdio client: {e}"))
-    })?;
+    let transport = StdioClientTransport::spawn(&command)
+        .map_err(|e| ScpPyError::TransportError(format!("failed to connect stdio client: {e}")))?;
 
     // Create the MCP client and perform the initialize handshake.
     let mut client = McpClient::new(ClientTransport::Stdio(transport));
-    client.initialize().map_err(|e| {
-        ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}"))
-    })?;
+    client
+        .initialize()
+        .map_err(|e| ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}")))?;
 
     let handle = generate_handle_id("mcp-client");
     let state = McpClientState {
@@ -1069,22 +1066,20 @@ pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
 #[pyo3(name = "py_mcp_client_connect_sse")]
 pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
     if url.is_empty() {
-        return Err(ScpPyError::ValidationError(
-            "url must be a non-empty string".to_owned(),
-        )
-        .into());
+        return Err(
+            ScpPyError::ValidationError("url must be a non-empty string".to_owned()).into(),
+        );
     }
 
     // Connect to the SSE endpoint.
-    let transport = SseClientTransport::connect(url).map_err(|e| {
-        ScpPyError::TransportError(format!("failed to connect SSE client: {e}"))
-    })?;
+    let transport = SseClientTransport::connect(url)
+        .map_err(|e| ScpPyError::TransportError(format!("failed to connect SSE client: {e}")))?;
 
     // Create the MCP client and perform the initialize handshake.
     let mut client = McpClient::new(ClientTransport::Sse(transport));
-    client.initialize().map_err(|e| {
-        ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}"))
-    })?;
+    client
+        .initialize()
+        .map_err(|e| ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}")))?;
 
     let handle = generate_handle_id("mcp-client");
     let state = McpClientState {
@@ -1160,12 +1155,12 @@ pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObje
     drop(entry); // Release the DashMap guard before blocking.
 
     let tools = {
-        let client_guard = client.lock().map_err(|e| {
-            ScpPyError::TransportError(format!("client lock poisoned: {e}"))
-        })?;
-        client_guard.list_tools().map_err(|e| {
-            ScpPyError::TransportError(format!("tools/list failed: {e}"))
-        })?
+        let client_guard = client
+            .lock()
+            .map_err(|e| ScpPyError::TransportError(format!("client lock poisoned: {e}")))?;
+        client_guard
+            .list_tools()
+            .map_err(|e| ScpPyError::TransportError(format!("tools/list failed: {e}")))?
     };
 
     // Convert tool definitions to JSON array for Python.
@@ -1227,14 +1222,12 @@ pub fn py_mcp_client_invoke(
 
     // Send the real tools/call request via the MCP client.
     let result = {
-        let client_guard = client.lock().map_err(|e| {
-            ScpPyError::TransportError(format!("client lock poisoned: {e}"))
-        })?;
+        let client_guard = client
+            .lock()
+            .map_err(|e| ScpPyError::TransportError(format!("client lock poisoned: {e}")))?;
         client_guard
             .invoke(tool_name, input_json, context_id, identity_did)
-            .map_err(|e| {
-                ScpPyError::TransportError(format!("tools/call failed: {e}"))
-            })?
+            .map_err(|e| ScpPyError::TransportError(format!("tools/call failed: {e}")))?
     };
 
     // Convert the McpToolResult to a Python dict.
@@ -1279,7 +1272,7 @@ pub fn py_mcp_client_invoke(
 /// Raises `TransportError` if the relay query fails.
 #[pyfunction]
 #[pyo3(name = "py_mcp_load_contexts")]
-pub fn py_mcp_load_contexts(
+pub const fn py_mcp_load_contexts(
     _identity_did: &str,
     _relay_url: &str,
 ) -> PyResult<Vec<PyObject>> {
@@ -1300,6 +1293,7 @@ pub fn py_mcp_load_contexts(
 /// Input-validation errors map to `ValidationError`. Runtime/policy errors
 /// map to `TransportError`. Exhaustive match ensures new variants produce
 /// a compile error instead of silently falling through.
+#[allow(clippy::needless_pass_by_value)] // match on e consumes variants carrying String data.
 fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
     use scp_mcp::allowlist::AllowlistError;
     let msg = e.to_string();
@@ -1335,9 +1329,8 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
 /// Raises `TransportError` if the allowlist lock is poisoned.
 #[pyfunction]
 #[pyo3(name = "py_mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![]))]
-pub fn py_mcp_configure_stdio_allowlist(
-    additional_binaries: Vec<String>,
-) -> PyResult<()> {
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
+pub fn py_mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> PyResult<()> {
     allowlist::configure(&additional_binaries).map_err(allowlist_err)?;
     Ok(())
 }
@@ -1478,9 +1471,7 @@ mod tests {
         let result = parse_http_url("http://evil.com\r\nX-Injected: bad/path");
         assert!(result.is_err());
         assert!(
-            result
-                .unwrap_err()
-                .contains("control characters"),
+            result.unwrap_err().contains("control characters"),
             "should mention control characters in error"
         );
     }
@@ -1574,7 +1565,10 @@ mod tests {
             "nonexistent_command_that_does_not_exist_12345".to_owned(),
         ]);
         match result {
-            Err(msg) => assert!(msg.contains("allowlist"), "error should mention allowlist: {msg}"),
+            Err(msg) => assert!(
+                msg.contains("allowlist"),
+                "error should mention allowlist: {msg}"
+            ),
             Ok(_) => panic!("expected rejection for unlisted command"),
         }
     }

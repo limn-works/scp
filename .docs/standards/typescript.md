@@ -11,7 +11,7 @@ TypeScript coding standards, toolchain, and CI for the SCP TypeScript SDK. Refer
 | Node.js | 22 LTS | Secondary runtime (compatibility target) |
 | tsc | (bundled) | Type checker |
 | Biome | latest | Linter + formatter (replaces ESLint + Prettier) |
-| vitest | latest | Test framework |
+| bun:test | (built-in) | Test framework (Bun's built-in runner) |
 | tsup | latest | Bundler (ESM + CJS output) |
 | wasm-pack | latest | WASM build tool (browser target) |
 
@@ -86,11 +86,11 @@ async *receive(): AsyncIterable<Message>;
 
 ## Testing
 
-### vitest
+### bun:test
 
 ```typescript
 // tests/identity.test.ts
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { Identity } from "../src/index.js";
 
 describe("Identity", () => {
@@ -114,7 +114,7 @@ Format: `{action} {condition or expected result}` in natural English.
 
 ```typescript
 // tests/conformance/conformance.test.ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "bun:test";
 import fixtures from "../../../tests/conformance/identity.json";
 
 describe("conformance", () => {

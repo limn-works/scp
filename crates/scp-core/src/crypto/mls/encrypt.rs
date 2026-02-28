@@ -193,13 +193,10 @@ pub fn decrypt_with_sender_key(
     // Extract the sender's leaf index from the ProcessedMessage before
     // consuming it with into_content().
     let sender = processed.sender().clone();
-    let sender_leaf_index = match sender {
-        Sender::Member(idx) => idx,
-        _ => {
-            return Err(MlsError::DecryptionFailed(
-                "sender is not a group member".to_string(),
-            ));
-        }
+    let Sender::Member(sender_leaf_index) = sender else {
+        return Err(MlsError::DecryptionFailed(
+            "sender is not a group member".to_string(),
+        ));
     };
 
     // Look up the sender's signature key from the group member list.
@@ -207,7 +204,7 @@ pub fn decrypt_with_sender_key(
     let sender_signature_key = g
         .members()
         .find(|m| m.index == sender_leaf_index)
-        .map(|m| m.signature_key.clone())
+        .map(|m| m.signature_key)
         .ok_or_else(|| {
             MlsError::DecryptionFailed(format!(
                 "sender leaf index {sender_leaf_index:?} not found in group members"

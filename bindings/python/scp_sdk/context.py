@@ -414,7 +414,10 @@ class Context:
 
         invoker_did = identity.did if identity is not None else self._creator_did
         result = _scp_core.tool_invoke(
-            self.context_id, tool, input, invoker_did,
+            self.context_id,
+            tool,
+            input,
+            invoker_did,
         )
         return result
 
@@ -464,10 +467,7 @@ class Context:
     # -- Representation -----------------------------------------------------
 
     def __repr__(self) -> str:
-        return (
-            f"Context(context_id={self.context_id!r}, "
-            f"state={self.state!r})"
-        )
+        return f"Context(context_id={self.context_id!r}, state={self.state!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -478,10 +478,7 @@ class Context:
 def _validate_buffer_size(size: int) -> None:
     """Raise :class:`ValueError` if *size* is outside the valid range."""
     if not (_MIN_BUFFER_SIZE <= size <= _MAX_BUFFER_SIZE):
-        msg = (
-            f"buffer_size must be between {_MIN_BUFFER_SIZE} and "
-            f"{_MAX_BUFFER_SIZE}, got {size}"
-        )
+        msg = f"buffer_size must be between {_MIN_BUFFER_SIZE} and {_MAX_BUFFER_SIZE}, got {size}"
         raise ValueError(msg)
 
 

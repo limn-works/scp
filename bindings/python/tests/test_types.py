@@ -35,7 +35,6 @@ from scp_sdk.types import (
     SourceType,
 )
 
-
 # -----------------------------------------------------------------------
 # Exception hierarchy tests
 # -----------------------------------------------------------------------
@@ -405,9 +404,16 @@ class TestProvenanceQuality:
     """Tests for the ProvenanceQuality enum."""
 
     def test_ordering_by_value(self) -> None:
-        assert ProvenanceQuality.NO_PROVENANCE.value < ProvenanceQuality.EPHEMERAL_KNOWN_PARTIES.value
-        assert ProvenanceQuality.EPHEMERAL_KNOWN_PARTIES.value < ProvenanceQuality.SUMMARY_VERIFIED.value
-        assert ProvenanceQuality.SUMMARY_VERIFIED.value < ProvenanceQuality.PERSISTENT_VERIFIABLE.value
+        assert (
+            ProvenanceQuality.NO_PROVENANCE.value < ProvenanceQuality.EPHEMERAL_KNOWN_PARTIES.value
+        )
+        assert (
+            ProvenanceQuality.EPHEMERAL_KNOWN_PARTIES.value
+            < ProvenanceQuality.SUMMARY_VERIFIED.value
+        )
+        assert (
+            ProvenanceQuality.SUMMARY_VERIFIED.value < ProvenanceQuality.PERSISTENT_VERIFIABLE.value
+        )
 
     def test_variant_count(self) -> None:
         assert len(ProvenanceQuality) == 4

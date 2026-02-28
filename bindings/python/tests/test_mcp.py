@@ -20,19 +20,19 @@ for conventions.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from scp_sdk.errors import TransportError, ValidationError
 from scp_sdk.mcp import (
+    _VALID_TRANSPORTS,
     DEFAULT_STDIO_ALLOWLIST,
     McpClient,
     McpProvenance,
     McpServer,
     McpToolDefinition,
     McpToolResult,
-    _VALID_TRANSPORTS,
     cli_main,
     configure_stdio_allowlist,
     disable_stdio_allowlist,
@@ -40,7 +40,6 @@ from scp_sdk.mcp import (
     reset_stdio_allowlist,
     serve_mcp,
 )
-
 
 # -----------------------------------------------------------------------
 # McpToolDefinition tests
@@ -407,9 +406,12 @@ class TestCliMain:
                 [
                     "scp-mcp",
                     "serve",
-                    "--identity", "did:dht:z6MkTest",
-                    "--relay", "wss://relay.test",
-                    "--transport", "websocket",
+                    "--identity",
+                    "did:dht:z6MkTest",
+                    "--relay",
+                    "wss://relay.test",
+                    "--transport",
+                    "websocket",
                 ],
             ):
                 cli_main()
@@ -431,10 +433,13 @@ class TestBridgeImportError:
         mock_context = MagicMock()
         mock_context.context_id = "ctx-1"
 
-        with patch("scp_sdk.mcp._bridge", side_effect=TransportError(
-            "The _scp_core extension module is not installed.",
-            code="SCP-MCP-8001",
-        )):
+        with patch(
+            "scp_sdk.mcp._bridge",
+            side_effect=TransportError(
+                "The _scp_core extension module is not installed.",
+                code="SCP-MCP-8001",
+            ),
+        ):
             with pytest.raises(TransportError, match="_scp_core"):
                 await serve_mcp(
                     identity=mock_identity,
@@ -445,10 +450,13 @@ class TestBridgeImportError:
     @pytest.mark.asyncio
     async def test_client_connect_raises_on_missing_bridge(self) -> None:
         """McpClient.connect raises TransportError when _scp_core is not available."""
-        with patch("scp_sdk.mcp._bridge", side_effect=TransportError(
-            "The _scp_core extension module is not installed.",
-            code="SCP-MCP-8001",
-        )):
+        with patch(
+            "scp_sdk.mcp._bridge",
+            side_effect=TransportError(
+                "The _scp_core extension module is not installed.",
+                code="SCP-MCP-8001",
+            ),
+        ):
             with pytest.raises(TransportError, match="_scp_core"):
                 await McpClient.connect("stdio", command=["echo"])
 

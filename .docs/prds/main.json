@@ -4591,7 +4591,7 @@
         "Implement Symbol.asyncDispose for resource cleanup",
         "Implement typed ScpError hierarchy per scaffold/typescript.md",
         "Configure Biome linter per standards/typescript.md",
-        "Write conformance tests per scaffold/shared.md using vitest",
+        "Write conformance tests per scaffold/shared.md using bun:test",
         "Write unit tests for bridge selection logic across runtimes"
       ],
       "blockedBy": [
@@ -4617,7 +4617,7 @@
         "packageName": "@scp/sdk",
         "buildTool": "tsup",
         "linter": "Biome",
-        "testFramework": "vitest",
+        "testFramework": "bun:test",
         "outputFormats": [
           "ESM",
           "CJS"
@@ -4633,7 +4633,7 @@
           "MCP"
         ]
       },
-      "result": "TypeScript SDK @scp/sdk implemented with dual-target bridge (WASM + napi-rs), 8 public modules, ScpError hierarchy, AsyncIterable streaming, AsyncDisposable, tsup ESM+CJS build. 40 vitest tests pass."
+      "result": "TypeScript SDK @scp/sdk implemented with dual-target bridge (WASM + napi-rs), 8 public modules, ScpError hierarchy, AsyncIterable streaming, AsyncDisposable, tsup ESM+CJS build. 40 bun:test tests pass."
     },
     {
       "id": "SCP-082",

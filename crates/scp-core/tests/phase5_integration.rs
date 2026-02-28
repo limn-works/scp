@@ -1,3 +1,11 @@
+#![allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 //! Phase 5 end-to-end integration test.
 //!
 //! Exercises all four Phase 5 ADRs together with the Phase 1-4 foundation:
@@ -8,13 +16,11 @@
 //!   DTLS-SRTP key export, WebRTC signaling, and session metadata capture.
 //! - **ADR-025**: Platform adapter traits (key custody, device attestation,
 //!   push notifications, key-value storage) via in-memory testing adapters.
-//! - **ADR-026**: Swift SDK wrappers [OUT OF SCOPE -- requires XCFramework
+//! - **ADR-026**: Swift SDK wrappers [OUT OF SCOPE -- requires `XCFramework`
 //!   build (SCP-103)].
 //!
 //! The test verifies that bridge, media, platform, and cross-ADR integration
 //! all function correctly as a cohesive whole.
-
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::time::Duration;
 
@@ -155,7 +161,7 @@ fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
     tree::append(log, event).expect("append should succeed");
     let serialized = rmp_serde::to_vec(event).expect("serialize");
     let mut hasher = Sha256::new();
-    hasher.update(&[0x00]);
+    hasher.update([0x00]);
     hasher.update(&serialized);
     hasher.finalize().into()
 }
@@ -172,10 +178,7 @@ fn compute_claim_hash(request: &ClaimRequest) -> Vec<u8> {
     length_prefix(&mut hasher, request.shadow_id.as_bytes());
     length_prefix(&mut hasher, request.claimant_did.as_bytes());
     length_prefix(&mut hasher, request.platform_handle.as_bytes());
-    length_prefix(
-        &mut hasher,
-        request.identity_attestation.id.as_bytes(),
-    );
+    length_prefix(&mut hasher, request.identity_attestation.id.as_bytes());
     hasher.update(request.timestamp.to_be_bytes());
     hasher.finalize().to_vec()
 }
@@ -348,7 +351,10 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
     let bridge_provenance = mark_bridge_provenance(base_provenance, &connector, &shadow);
 
     // Before claiming: trust level should be ShadowBridged (weakest).
-    assert_eq!(bridge_provenance.shadow_status, ShadowProvenanceStatus::Shadow);
+    assert_eq!(
+        bridge_provenance.shadow_status,
+        ShadowProvenanceStatus::Shadow
+    );
     assert_eq!(bridge_provenance.originating_platform, "discord");
     assert_eq!(bridge_provenance.bridge_connector_id, "bridge-phase5-001");
     assert_eq!(bridge_provenance.operator_did, operator_did);
@@ -361,11 +367,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
     let (claimant_vk, claimant_sk) = test_keypair();
     let claimant_did = did_from_pubkey(&claimant_vk);
 
-    let attestation = make_identity_attestation(
-        &claimant_did,
-        platform_handle,
-        &claimant_sk,
-    );
+    let attestation = make_identity_attestation(&claimant_did, platform_handle, &claimant_sk);
     let claim_request = make_claim_request(
         shadow_id,
         &claimant_did,
@@ -407,7 +409,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
         DataProvenance {
             source_context: context_id.to_string(),
             source_type: SourceType::Persistent,
-            counterparties: vec![claimant_did.clone()],
+            counterparties: vec![claimant_did],
             purpose: Some("post-claim message".to_string()),
             discovery_method: DiscoveryMethod::SharedContext(context_id.to_string()),
             age: Duration::from_secs(5),
@@ -428,7 +430,10 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
     );
     let post_claim_trust = evaluate_bridge_trust_level(&post_claim_provenance);
     assert_eq!(post_claim_trust, BridgeTrustLevel::ClaimedBridged);
-    assert!(post_claim_trust > trust_level, "ClaimedBridged > ShadowBridged");
+    assert!(
+        post_claim_trust > trust_level,
+        "ClaimedBridged > ShadowBridged"
+    );
 }
 
 // ===========================================================================
@@ -566,21 +571,18 @@ fn media_session_mls_key_derivation() {
     let mut alice_group = create_group(&alice_cred).expect("create group");
 
     // -- Step 2: Add Bob to the group --
-    let bob_cred =
-        ScpCredential::new("did:dht:z6MkBob".to_owned(), None).expect("bob credential");
+    let bob_cred = ScpCredential::new("did:dht:z6MkBob".to_owned(), None).expect("bob credential");
     let (bob_kp_bundle, bob_signer, bob_provider) =
         generate_key_package(&bob_cred).expect("bob key package");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
     let add_result = add_member(&mut alice_group, bob_kp).expect("add bob");
 
-    let bob_group =
-        join_group(&add_result.welcome, bob_provider, bob_signer).expect("bob joins");
+    let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).expect("bob joins");
 
     // -- Step 3: Export DTLS-SRTP key material from both members --
     let alice_keys =
         export_media_keys(&alice_group, b"ctx-phase5-media", 32).expect("alice key export");
-    let bob_keys =
-        export_media_keys(&bob_group, b"ctx-phase5-media", 32).expect("bob key export");
+    let bob_keys = export_media_keys(&bob_group, b"ctx-phase5-media", 32).expect("bob key export");
 
     // Both members must derive identical keys from the same MLS epoch.
     assert_eq!(
@@ -594,8 +596,8 @@ fn media_session_mls_key_derivation() {
     assert_ne!(*alice_keys.dtls_srtp_keys, vec![0u8; 32]);
 
     // Different context bytes produce different keys.
-    let alt_keys = export_media_keys(&alice_group, b"ctx-different", 32)
-        .expect("alt context key export");
+    let alt_keys =
+        export_media_keys(&alice_group, b"ctx-different", 32).expect("alt context key export");
     assert_ne!(
         *alice_keys.dtls_srtp_keys, *alt_keys.dtls_srtp_keys,
         "different contexts must produce different keys"
@@ -624,23 +626,14 @@ async fn platform_key_custody_sign_and_verify() {
 
     // -- Sign data and verify via ed25519-dalek --
     let message = b"phase5 integration test data";
-    let signature = custody
-        .sign(&ed_handle, message)
-        .await
-        .expect("sign data");
+    let signature = custody.sign(&ed_handle, message).await.expect("sign data");
 
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
-        ed_pubkey
-            .as_bytes()
-            .try_into()
-            .expect("32-byte public key"),
+        ed_pubkey.as_bytes().try_into().expect("32-byte public key"),
     )
     .expect("valid verifying key");
 
-    let sig_bytes: [u8; 64] = signature
-        .as_bytes()
-        .try_into()
-        .expect("64-byte signature");
+    let sig_bytes: [u8; 64] = signature.as_bytes().try_into().expect("64-byte signature");
     let ed_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
     use ed25519_dalek::Verifier;
@@ -711,10 +704,7 @@ async fn platform_storage_operations() {
         .store("phase5-key", b"phase5-value")
         .await
         .expect("store");
-    let retrieved = storage
-        .retrieve("phase5-key")
-        .await
-        .expect("retrieve");
+    let retrieved = storage.retrieve("phase5-key").await.expect("retrieve");
     assert_eq!(retrieved, Some(b"phase5-value".to_vec()));
 
     // -- Key existence --
@@ -820,14 +810,10 @@ async fn cross_adr_platform_key_custody_signs_claim_request() {
         .public_key(&key_handle)
         .await
         .expect("get public key");
-    let pubkey_bytes: [u8; 32] = pubkey
-        .as_bytes()
-        .try_into()
-        .expect("32 byte pubkey");
+    let pubkey_bytes: [u8; 32] = pubkey.as_bytes().try_into().expect("32 byte pubkey");
 
     // Construct DID from the public key.
-    let verifying_key =
-        ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).expect("valid key");
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).expect("valid key");
     let _claimant_did = did_from_pubkey(&verifying_key);
 
     // For signing we need the ed25519_dalek signing key, which the InMemory
@@ -860,9 +846,7 @@ async fn cross_adr_platform_key_custody_signs_claim_request() {
     let sig = custody.sign(&key_handle, test_data).await.expect("sign");
 
     // Verify the signature using ed25519-dalek directly.
-    let ed_sig = ed25519_dalek::Signature::from_bytes(
-        sig.as_bytes().try_into().expect("64 bytes"),
-    );
+    let ed_sig = ed25519_dalek::Signature::from_bytes(sig.as_bytes().try_into().expect("64 bytes"));
     use ed25519_dalek::Verifier;
     assert!(verifying_key.verify(test_data, &ed_sig).is_ok());
 
@@ -1001,28 +985,27 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
 fn media_session_keys_derived_from_mls_group_state() {
     // Media + MLS: verify media session key material is correctly derived
     // from MLS export secrets, and both group members get the same keys.
-    let alice_cred =
-        ScpCredential::new("did:dht:z6MkAlice".to_owned(), None).expect("alice cred");
+    let alice_cred = ScpCredential::new("did:dht:z6MkAlice".to_owned(), None).expect("alice cred");
     let mut alice_group = create_group(&alice_cred).expect("alice group");
 
-    let bob_cred =
-        ScpCredential::new("did:dht:z6MkBob".to_owned(), None).expect("bob cred");
+    let bob_cred = ScpCredential::new("did:dht:z6MkBob".to_owned(), None).expect("bob cred");
     let (bob_kp_bundle, bob_signer, bob_provider) =
         generate_key_package(&bob_cred).expect("bob kp");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
     let add_result = add_member(&mut alice_group, bob_kp).expect("add bob");
-    let bob_group =
-        join_group(&add_result.welcome, bob_provider, bob_signer).expect("bob join");
+    let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).expect("bob join");
 
     // Export keys at 32 bytes (standard DTLS-SRTP keying material length).
     let context_bytes = b"ctx-mls-media-integration";
     let alice_media_keys =
         export_media_keys(&alice_group, context_bytes, 32).expect("alice export");
-    let bob_media_keys =
-        export_media_keys(&bob_group, context_bytes, 32).expect("bob export");
+    let bob_media_keys = export_media_keys(&bob_group, context_bytes, 32).expect("bob export");
 
     // Both members derive identical key material.
-    assert_eq!(*alice_media_keys.dtls_srtp_keys, *bob_media_keys.dtls_srtp_keys);
+    assert_eq!(
+        *alice_media_keys.dtls_srtp_keys,
+        *bob_media_keys.dtls_srtp_keys
+    );
     assert_eq!(alice_media_keys.epoch, bob_media_keys.epoch);
     assert_eq!(alice_media_keys.dtls_srtp_keys.len(), 32);
 

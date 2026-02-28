@@ -4,15 +4,15 @@
 //! Android Keystore) or a Rust-side key custody implementation that requires
 //! native OS APIs. Instead, the TypeScript wrapper injects an object that
 //! satisfies the `JsKeyCustody` extern type contract, backed by the browser's
-//! WebCrypto API (`SubtleCrypto`).
+//! `WebCrypto` API (`SubtleCrypto`).
 //!
 //! The extern "C" block declares the JS interface. The TypeScript SDK is
 //! responsible for providing a conforming implementation at the call site.
 //!
-//! # WebCrypto integration pattern
+//! # `WebCrypto` integration pattern
 //!
 //! ```ts
-//! // TypeScript wrapper creates a WebCrypto-backed custody object:
+//! // TypeScript wrapper creates a `WebCrypto`-backed custody object:
 //! const custody = {
 //!     sign(keyId: string, data: Uint8Array): Uint8Array { ... },
 //!     getPublicKey(keyId: string): Uint8Array { ... },
@@ -34,7 +34,7 @@
 use wasm_bindgen::prelude::*;
 
 // ---------------------------------------------------------------------------
-// JsKeyCustody — injected WebCrypto-backed key custody
+// JsKeyCustody — injected `WebCrypto`-backed key custody
 // ---------------------------------------------------------------------------
 
 /// Opaque JS object implementing key custody operations.
@@ -49,7 +49,7 @@ use wasm_bindgen::prelude::*;
 extern "C" {
     /// A JS object that implements key custody for the WASM bridge.
     ///
-    /// Implemented in TypeScript using the browser's WebCrypto API
+    /// Implemented in TypeScript using the browser's `WebCrypto` API
     /// (`SubtleCrypto`). Injected at identity creation time.
     pub type JsKeyCustody;
 
@@ -60,20 +60,13 @@ extern "C" {
     ///
     /// `key_id` is an opaque string issued by [`generate_keypair`].
     #[wasm_bindgen(method, catch, js_name = "sign")]
-    pub fn sign(
-        this: &JsKeyCustody,
-        key_id: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, JsValue>;
+    pub fn sign(this: &JsKeyCustody, key_id: &str, data: &[u8]) -> Result<Vec<u8>, JsValue>;
 
     /// Returns the raw public key bytes for the key identified by `key_id`.
     ///
     /// Returns a `Uint8Array` on the JS side. Throws if the key is not found.
     #[wasm_bindgen(method, catch, js_name = "getPublicKey")]
-    pub fn get_public_key(
-        this: &JsKeyCustody,
-        key_id: &str,
-    ) -> Result<Vec<u8>, JsValue>;
+    pub fn get_public_key(this: &JsKeyCustody, key_id: &str) -> Result<Vec<u8>, JsValue>;
 
     /// Generates a new keypair of type `key_type` and returns its `key_id`.
     ///
@@ -81,20 +74,14 @@ extern "C" {
     /// ID that identifies the generated keypair. Throws on key generation
     /// failure.
     #[wasm_bindgen(method, catch, js_name = "generateKeypair")]
-    pub fn generate_keypair(
-        this: &JsKeyCustody,
-        key_type: &str,
-    ) -> Result<String, JsValue>;
+    pub fn generate_keypair(this: &JsKeyCustody, key_type: &str) -> Result<String, JsValue>;
 
     /// Destroys the key identified by `key_id`, zeroing all key material.
     ///
     /// Idempotent — calling on a key that does not exist is a no-op.
     /// Throws on unexpected internal errors.
     #[wasm_bindgen(method, catch, js_name = "destroyKey")]
-    pub fn destroy_key(
-        this: &JsKeyCustody,
-        key_id: &str,
-    ) -> Result<(), JsValue>;
+    pub fn destroy_key(this: &JsKeyCustody, key_id: &str) -> Result<(), JsValue>;
 
     /// Perform X25519 DH key agreement.
     /// peer_public: 32-byte peer X25519 public key as Uint8Array.

@@ -162,22 +162,13 @@ export declare class Context {
   readonly contextId: string;
   readonly state: string;
 
-  static create(
-    identity: Identity,
-    params: ContextParams,
-  ): Promise<Context>;
+  static create(identity: Identity, params: ContextParams): Promise<Context>;
 
-  static join(
-    identity: Identity,
-    contextId: string,
-  ): Promise<Context>;
+  static join(identity: Identity, contextId: string): Promise<Context>;
 
   send(payload: Uint8Array | string): Promise<void>;
   receive(): AsyncIterable<Message>;
-  invokeTool(
-    toolId: string,
-    input: Record<string, unknown>,
-  ): Promise<ToolResult>;
+  invokeTool(toolId: string, input: Record<string, unknown>): Promise<ToolResult>;
   leave(): Promise<void>;
   close(): Promise<void>;
 }
@@ -197,10 +188,7 @@ export declare function validate(
   capability: string,
 ): Promise<void>;
 
-export declare function revoke(
-  contextId: string,
-  tokenId: string,
-): Promise<void>;
+export declare function revoke(contextId: string, tokenId: string): Promise<void>;
 
 export declare function delegate(options: {
   issuer: Identity;
@@ -227,11 +215,7 @@ export declare class EventLog {
     limit?: number;
   }): Promise<EventLogEvent[]>;
 
-  verify(claim: {
-    type: string;
-    leafIndex: number;
-    eventHash: string;
-  }): Promise<EventLogProof>;
+  verify(claim: { type: string; leafIndex: number; eventHash: string }): Promise<EventLogProof>;
 }
 
 // -- Transport ----------------------------------------------------------------
@@ -252,9 +236,6 @@ export declare class McpServer {
 export declare class McpClient {
   static connect(url: string): Promise<McpClient>;
   listTools(): Promise<ToolDefinition[]>;
-  callTool(
-    name: string,
-    input: Record<string, unknown>,
-  ): Promise<Record<string, unknown>>;
+  callTool(name: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
   close(): Promise<void>;
 }

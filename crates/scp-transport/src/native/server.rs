@@ -219,6 +219,7 @@ impl<S: BlobStorage + 'static> RelayServer<S> {
                     continue;
                 }
                 let ip_count = tracker.get(&ip).copied().unwrap_or(0);
+                drop(tracker);
                 if ip_count >= self.config.max_connections_per_ip {
                     tracing::warn!(
                         ip = %ip,
@@ -336,6 +337,7 @@ impl<S: BlobStorage + 'static> RelayServer<S> {
                         continue;
                     }
                     let ip_count = tracker.get(&ip).copied().unwrap_or(0);
+                    drop(tracker);
                     if ip_count >= config.max_connections_per_ip {
                         tracing::warn!(
                             ip = %ip,
@@ -437,15 +439,19 @@ async fn check_publish_rate_limit(
 
     // Refill tokens based on elapsed time.
     let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-    bucket.tokens = (bucket.tokens + elapsed * f64::from(rate)).min(f64::from(rate));
+    bucket.tokens = elapsed
+        .mul_add(f64::from(rate), bucket.tokens)
+        .min(f64::from(rate));
     bucket.last_refill = now;
 
-    if bucket.tokens >= 1.0 {
+    let allowed = if bucket.tokens >= 1.0 {
         bucket.tokens -= 1.0;
         true
     } else {
         false
-    }
+    };
+    drop(limiter);
+    allowed
 }
 
 /// Handles a single WebSocket connection.
@@ -1953,14 +1959,10 @@ mod tests {
         .await;
 
         // Either connection refused or timeout — both indicate the server stopped.
-        match post {
-            Ok(Ok(_stream)) => {
-                // Connection succeeded, but the server might have a buffered accept.
-                // This is acceptable — the key invariant is that the accept loop
-                // eventually stops.
-            }
-            Ok(Err(_)) => {} // Connection refused — expected.
-            Err(_) => {}     // Timeout — expected.
+        // Connection may succeed if the server has a buffered accept — that is
+        // acceptable; the key invariant is that the accept loop eventually stops.
+        if let Ok(Ok(_stream)) = post {
+            // Buffered accept — tolerable.
         }
     }
 

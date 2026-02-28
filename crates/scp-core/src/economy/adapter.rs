@@ -249,7 +249,10 @@ impl fmt::Debug for PaymentReceipt {
             .field("action_type", &self.action_type)
             .field("context_id", &self.context_id)
             .field("adapter_id", &self.adapter_id)
-            .field("adapter_proof", &format!("[{} bytes]", self.adapter_proof.len()))
+            .field(
+                "adapter_proof",
+                &format!("[{} bytes]", self.adapter_proof.len()),
+            )
             .field("timestamp", &self.timestamp)
             .field("signature", &format!("[{} bytes]", self.signature.len()))
             .finish()
