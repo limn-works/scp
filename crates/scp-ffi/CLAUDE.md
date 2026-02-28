@@ -16,6 +16,7 @@ A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live ru
 - `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9)
 - `ceiling_strings: HashSet<String>` — capability ceiling as `{resource}:{action}` strings (ADR-016 step 8)
 - `creator_did` — the DID of the context creator
+- `tool_handlers: HashMap<String, ToolHandler>` — registered tool handler closures keyed by tool ID (SCP-212)
 
 DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpPyError>` with typed errors.
 
@@ -30,7 +31,7 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 | `tools.rs` | scp-core tools | `py_tool_register`, `py_tool_invoke`, `py_tool_verify` |
 | `ucan.rs` | scp-core UCAN | `py_ucan_validate`, `py_ucan_mint`, `py_ucan_revoke` |
 | `event_log.rs` | scp-core event_log | `py_event_log_query`, `py_event_log_verify` |
-| `mcp.rs` | scp-mcp | `py_mcp_serve`, `py_mcp_client_connect_stdio/sse`, `py_mcp_client_disconnect`, `py_mcp_client_list_tools`, `py_mcp_client_invoke`, `py_mcp_server_stop/wait`, `py_mcp_server_register/deregister_tool`, `py_mcp_server_list_contexts` |
+| `mcp.rs` | scp-mcp | `py_mcp_serve`, `py_mcp_client_connect_stdio/sse`, `py_mcp_client_disconnect`, `py_mcp_client_list_tools`, `py_mcp_client_invoke`, `py_mcp_server_stop/wait`, `py_mcp_server_register/deregister_tool`, `py_mcp_server_list_contexts`, `py_register_tool_handler` |
 | `transport.rs` | scp-transport | `py_transport_connect`, `py_transport_disconnect` |
 
 ### Build
@@ -81,7 +82,8 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. The `context_events` provider method returns event count and Merkle root, not raw events.
 - `ToolRegistry::registrations()` returns an iterator, not a Vec. There is no `invoke()` method — tool invocation checks tool existence and returns a JSON status response.
 - `SseClientTransport` uses raw `TcpStream` — `https://` URLs are explicitly rejected (no TLS). Only `http://` is supported; add `rustls` dependency for HTTPS.
-- `FfiBridgeProvider::validate_capability` performs real capability checking via `has_tool_invoke_capability` against the context's role state (SCP-210). Defense-in-depth alongside the UCAN layer. `invoke_tool` validates input against the tool's JSON schema and returns a response with `"status": "validated"` (no runtime handler dispatch at the FFI layer — tools are registered with metadata only).
+- `FfiBridgeProvider::validate_capability` performs real capability checking via `has_tool_invoke_capability` against the context's role state (SCP-210). Defense-in-depth alongside the UCAN layer. `invoke_tool` validates input against the tool's JSON schema and dispatches to a registered handler if one exists (SCP-212). If no handler is registered, falls back to echo mode with `"status": "validated"`. Handler output is also validated against the tool's output schema (defense-in-depth).
+- **Tool handler registration (SCP-212)**: `py_register_tool_handler(context_id, tool_name, handler)` wraps a Python callable in a Rust closure and stores it in `ContextRuntime::tool_handlers`. The handler is called by `FfiBridgeProvider::invoke_tool` when the tool is invoked via MCP. The tool must be registered in the `ToolRegistry` first. `ContextProvider::invoke_tool` is sync, and Python handlers are GIL-bound (inherently sync), so no async boundary crossing is needed at the FFI layer.
 - `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
 - SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
 - **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Only bare binary names are accepted — paths (absolute or relative) are rejected to prevent basename-spoofing bypasses. The OS resolves the binary via `PATH`. Per MCP Security Best Practices.

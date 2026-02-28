@@ -27,8 +27,8 @@
 //!
 //! See SCP-163 for the wiring story.
 
-use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_core::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
@@ -39,6 +39,16 @@ use scp_core::event_log::EventLog;
 use scp_core::identity::cache::SystemClock;
 
 use crate::error::ScpPyError;
+
+/// A sync tool handler function that takes JSON input and returns JSON output.
+///
+/// Stored in the runtime registry when Python callers register tool handlers
+/// via [`register_tool_handler`]. The FFI bridge dispatches tool invocations
+/// through these handlers instead of echoing validated input.
+///
+/// See SCP-212 and ADR-010 for the handler registration design.
+pub type ToolHandler =
+    Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 /// Global registry of per-context runtime state.
 static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::new();
@@ -70,6 +80,16 @@ pub struct ContextRuntime {
     pub ceiling_strings: HashSet<String>,
     /// The DID of the context creator.
     pub creator_did: String,
+    /// Registered tool handlers keyed by tool ID.
+    ///
+    /// Python callers register callable handlers via
+    /// [`register_tool_handler`]. When a tool is invoked through
+    /// `FfiBridgeProvider::invoke_tool`, the handler is looked up here and
+    /// called with the validated JSON input. If no handler is registered,
+    /// the invocation falls back to echoing the validated input.
+    ///
+    /// See SCP-212 for the handler registration design.
+    pub tool_handlers: HashMap<String, ToolHandler>,
 }
 
 /// Default capability ceiling for new contexts.
@@ -136,6 +156,7 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
                 nonce_tracker,
                 ceiling_strings,
                 creator_did: creator_did.to_owned(),
+                tool_handlers: HashMap::new(),
             };
 
             vacant.insert(runtime);
@@ -183,6 +204,36 @@ pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
         .filter(|entry| entry.value().role_state.members.contains(member_did))
         .map(|entry| entry.key().clone())
         .collect()
+}
+
+/// Registers a tool handler for a specific tool in a context.
+///
+/// The handler is a sync closure that takes JSON input and returns JSON
+/// output. It is called by `FfiBridgeProvider::invoke_tool` when the
+/// tool is invoked via MCP. The handler must already have a corresponding
+/// tool registration in the context's `ToolRegistry` (registered via
+/// `py_tool_register`).
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context is not found or the
+/// tool is not registered in the context's `ToolRegistry`.
+pub fn register_tool_handler(
+    context_id: &str,
+    tool_id: &str,
+    handler: ToolHandler,
+) -> Result<(), ScpPyError> {
+    with_context(context_id, |rt| {
+        // Verify the tool exists in the registry before accepting a handler.
+        if rt.tool_registry.get(tool_id).is_none() {
+            return Err(ScpPyError::ContextError(format!(
+                "tool '{tool_id}' not found in context '{context_id}' \
+                 -- register the tool before adding a handler"
+            )));
+        }
+        rt.tool_handlers.insert(tool_id.to_owned(), handler);
+        Ok(())
+    })
 }
 
 /// Removes a context from the global runtime registry.

@@ -625,11 +625,14 @@ impl ContextProvider for FfiBridgeProvider {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // Validates tool existence and input schema. No runtime handler
-        // dispatch is available at the FFI layer (tools are registered with
-        // metadata only), so validated input is echoed back. This is a
-        // meaningful improvement over the previous stub: the MCP client now
-        // gets schema enforcement. See ADR-010 and ADR-015.
+        // Validates tool existence and input schema, then dispatches to a
+        // registered handler if one exists. If no handler is registered, falls
+        // back to echoing the validated input with metadata (schema-only mode).
+        //
+        // The handler dispatch is sync because ContextProvider::invoke_tool is
+        // sync and Python handlers are GIL-bound (inherently sync). The async
+        // invoke_tool in scp-core is for contexts where Rust itself executes
+        // tools. See SCP-212, ADR-010, ADR-015.
         crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::ContextError(format!(
@@ -648,6 +651,33 @@ impl ContextProvider for FfiBridgeProvider {
                 ))
             })?;
 
+            // Dispatch to registered handler if available.
+            if let Some(handler) = rt.tool_handlers.get(tool_name) {
+                let handler = handler.clone();
+                // Call the handler with validated input. The handler is a sync
+                // closure wrapping a Python callable (acquired via GIL).
+                let output = handler(arguments)
+                    .map_err(|e| ScpPyError::ContextError(format!(
+                        "tool handler for '{tool_name}' failed: {e}"
+                    )))?;
+
+                // Validate output against the tool's output schema (defense-in-depth).
+                if let Some(reg) = rt.tool_registry.get(tool_name) {
+                    scp_core::context::tools::schema::validate_value_against_schema(
+                        &output,
+                        &reg.schema.output_schema,
+                    )
+                    .map_err(|msg| {
+                        ScpPyError::ValidationError(format!(
+                            "output validation failed for tool '{tool_name}': {msg}"
+                        ))
+                    })?;
+                }
+
+                return Ok(output);
+            }
+
+            // No handler registered -- fall back to echo mode.
             Ok(serde_json::json!({
                 "tool": tool_name,
                 "context": context_id,
@@ -1505,6 +1535,76 @@ pub fn py_mcp_get_stdio_allowlist(py: Python<'_>) -> PyResult<PyObject> {
 }
 
 // ---------------------------------------------------------------------------
+// Tool handler registration
+// ---------------------------------------------------------------------------
+
+/// Registers a Python callable as the handler for a tool in a context.
+///
+/// The handler is called when the tool is invoked via MCP
+/// (`FfiBridgeProvider::invoke_tool`). It receives the tool's validated
+/// JSON input as a Python dict and must return a Python dict representing
+/// the JSON output.
+///
+/// The tool must already be registered in the context's tool registry
+/// (via `py_tool_register`) before a handler can be attached.
+///
+/// # Arguments
+///
+/// * `context_id` -- The context containing the tool.
+/// * `tool_name` -- The tool ID to attach the handler to.
+/// * `handler` -- A Python callable `(dict) -> dict`.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the context or tool is not found.
+///
+/// See SCP-212 and ADR-010 for the handler registration design.
+#[pyfunction]
+#[pyo3(name = "mcp_register_tool_handler")]
+#[allow(clippy::needless_pass_by_value)] // PyObject must be owned to clone_ref into the closure.
+pub fn py_register_tool_handler(
+    py: Python<'_>,
+    context_id: &str,
+    tool_name: &str,
+    handler: PyObject,
+) -> PyResult<()> {
+    // Verify the handler is callable before storing it.
+    if !handler.bind(py).is_callable() {
+        return Err(ScpPyError::ValidationError(
+            "handler must be callable".to_owned(),
+        )
+        .into());
+    }
+
+    // Wrap the Python callable in a Rust closure that acquires the GIL,
+    // converts JSON -> Python dict, calls the handler, and converts back.
+    let handler_ref = handler.clone_ref(py);
+    let rust_handler: crate::runtime::ToolHandler =
+        std::sync::Arc::new(move |input: serde_json::Value| {
+            Python::with_gil(|py| {
+                // Convert serde_json::Value -> Python dict.
+                let py_input = crate::types::json_to_py_dict(py, &input)
+                    .map_err(|e| format!("failed to convert input to Python dict: {e}"))?;
+
+                // Call the Python handler.
+                let py_result = handler_ref
+                    .call1(py, (py_input,))
+                    .map_err(|e| format!("Python handler raised an exception: {e}"))?;
+
+                // Convert Python result back to serde_json::Value.
+                let result_dict = py_result.downcast_bound::<PyDict>(py).map_err(|_| {
+                    "tool handler must return a dict".to_owned()
+                })?;
+                crate::types::py_dict_to_json(result_dict)
+                    .map_err(|e| format!("failed to convert handler output to JSON: {e}"))
+            })
+        });
+
+    crate::runtime::register_tool_handler(context_id, tool_name, rust_handler)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1531,6 +1631,7 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_mcp_disable_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_reset_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_get_stdio_allowlist, m)?)?;
+    m.add_function(wrap_pyfunction!(py_register_tool_handler, m)?)?;
     Ok(())
 }
 
@@ -1770,11 +1871,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_tool — validates schema and returns real output
+    // FfiBridgeProvider::invoke_tool — echo fallback when no handler
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ffi_bridge_provider_invoke_tool_returns_real_output() {
+    fn ffi_bridge_provider_invoke_tool_echo_fallback_without_handler() {
         let creator = "did:dht:z6MkCreatorInvokeTool";
         let ctx_id = setup_test_context(creator, true);
 
@@ -1790,7 +1891,7 @@ mod tests {
         let output = result.unwrap();
         assert_eq!(
             output["status"], "validated",
-            "status should be 'validated' (schema-only, no handler dispatch)"
+            "without handler, status should be 'validated' (echo mode)"
         );
         assert_eq!(output["tool"], "calculator");
         assert_eq!(output["context"], ctx_id);
@@ -1899,6 +2000,135 @@ mod tests {
             context_ids: vec![],
         };
         assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool handler registration and dispatch (SCP-212)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_tool_handler_and_invoke_dispatches_through_handler() {
+        let creator = "did:dht:z6MkCreatorHandler";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a Rust handler that adds two numbers (simulates a Python handler).
+        let handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|input: serde_json::Value| {
+                let a = input
+                    .get("a")
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| "missing 'a'".to_owned())?;
+                let b = input
+                    .get("b")
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| "missing 'b'".to_owned())?;
+                Ok(serde_json::json!({"result": a + b}))
+            });
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        let input = serde_json::json!({"a": 3, "b": 4});
+        let result = provider.invoke_tool(&ctx_id, "calculator", input);
+        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+
+        let output = result.unwrap();
+        // Handler returns computed output, not echoed input.
+        assert_eq!(
+            output,
+            serde_json::json!({"result": 7.0}),
+            "handler should compute a + b = 7"
+        );
+        // Should NOT have the echo-mode "status" field.
+        assert!(
+            output.get("status").is_none(),
+            "handler output should not contain echo-mode 'status' field"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn register_tool_handler_rejects_unregistered_tool() {
+        let creator = "did:dht:z6MkCreatorHandlerReject";
+        let ctx_id = setup_test_context(creator, false); // No tool registered.
+
+        let handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|_input| Ok(serde_json::json!({})));
+
+        let result = crate::runtime::register_tool_handler(&ctx_id, "nonexistent", handler);
+        assert!(result.is_err(), "should reject handler for unregistered tool");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("not found"),
+            "error should mention tool not found: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_with_handler_validates_output_schema() {
+        let creator = "did:dht:z6MkCreatorOutVal";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a handler that returns a string instead of an object
+        // (violates the output schema which requires an object).
+        let bad_handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|_input| Ok(serde_json::json!("not an object")));
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", bad_handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        assert!(
+            result.is_err(),
+            "handler returning invalid output should be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("output validation"),
+            "error should mention output validation: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_handler_error_is_propagated() {
+        let creator = "did:dht:z6MkCreatorHandlerErr";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a handler that always fails.
+        let failing_handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|_input| Err("computation exploded".to_owned()));
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", failing_handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        assert!(result.is_err(), "failing handler should propagate error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("computation exploded"),
+            "error should contain handler error message: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
     }
 
     // -----------------------------------------------------------------------
