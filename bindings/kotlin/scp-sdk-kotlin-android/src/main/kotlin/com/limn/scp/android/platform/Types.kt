@@ -109,11 +109,11 @@ enum class DestructionMethod {
  * - `SCP-CRYPTO-4004`: Key destruction failed
  * - `SCP-CRYPTO-4005`: Cryptographic operation failed
  *
- * @property errorCode Structured SCP error code.
+ * @property code Structured SCP error code.
  */
-class ScpException(
+open class ScpException(
     message: String,
-    val errorCode: String,
+    val code: String,
 ) : Exception(message)
 
 /**
@@ -125,6 +125,66 @@ class ScpException(
 enum class WakeSignal {
     /** Connect to the relay and pull pending envelopes. */
     PULL,
+}
+
+/**
+ * Platform trait for device attestation.
+ *
+ * Abstracts device-level attestation token generation behind a uniform interface.
+ * The Android implementation uses the Play Integrity Standard API.
+ *
+ * This interface mirrors the Rust `DeviceAttestation` trait in `scp-platform/src/traits.rs`.
+ *
+ * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
+ */
+interface DeviceAttestationProvider {
+    /**
+     * Generate an attestation token for the given challenge and device ID.
+     *
+     * @param challenge Server-issued random challenge bytes.
+     * @param deviceId Stable device/identity identifier bytes.
+     * @return Platform-specific attestation token bytes.
+     * @throws ScpException if attestation fails.
+     */
+    suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray
+
+    /**
+     * Generate a per-request assertion.
+     *
+     * @param requestHash SHA-256 hash of the request data being asserted.
+     * @return Platform-specific assertion token bytes.
+     * @throws ScpException if assertion fails.
+     */
+    suspend fun assertRequest(requestHash: ByteArray): ByteArray
+}
+
+/**
+ * Platform trait for push notification registration and handling.
+ *
+ * Abstracts platform-specific push notification registration and notification
+ * handling. The Android implementation uses Firebase Cloud Messaging (FCM).
+ *
+ * This interface mirrors the Rust `Push` trait in `scp-platform/src/traits.rs`.
+ *
+ * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
+ */
+interface PushProvider {
+    /**
+     * Register for push notifications and return the platform-specific token.
+     *
+     * @return The push notification registration token string.
+     * @throws ScpException if token retrieval fails.
+     */
+    suspend fun register(): String
+
+    /**
+     * Handle an incoming push notification payload and produce a wake signal.
+     *
+     * @param payload The push notification data payload as a key-value map.
+     * @return [WakeSignal] indicating the action the engine should take.
+     * @throws ScpException if the payload is invalid.
+     */
+    fun handleNotification(payload: Map<String, String>): WakeSignal
 }
 
 /**

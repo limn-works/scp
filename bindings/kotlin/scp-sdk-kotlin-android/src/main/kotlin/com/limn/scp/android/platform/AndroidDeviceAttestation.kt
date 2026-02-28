@@ -9,39 +9,6 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 
-// ---------------------------------------------------------------------------
-// DeviceAttestationProvider interface
-// ---------------------------------------------------------------------------
-
-// UniFFI generates this callback interface from the Rust trait in
-// crates/scp-ffi/uniffi/src/lib.rs. When UniFFI-generated bindings are
-// available, this local definition should be removed and the generated
-// interface imported instead. The method signatures match the Rust trait:
-//   attest(challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>
-//   assert_request(request_hash: Vec<u8>) -> Result<Vec<u8>, ScpError>
-// UniFFI maps snake_case to camelCase and Vec<u8> to ByteArray.
-// Result<T, E> maps to a throwing suspend function.
-interface DeviceAttestationProvider {
-    suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray
-    suspend fun assertRequest(requestHash: ByteArray): ByteArray
-}
-
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-// Mirrors the ScpException hierarchy from .docs/scaffold/kotlin.md.
-// When the shared Errors.kt is implemented, this local definition should
-// be removed and the shared type imported instead.
-open class ScpException(
-    message: String,
-    val code: String,
-) : Exception(message)
-
-// ---------------------------------------------------------------------------
-// AndroidDeviceAttestation
-// ---------------------------------------------------------------------------
-
 /**
  * Android implementation of [DeviceAttestationProvider] using the Play Integrity
  * Standard API.

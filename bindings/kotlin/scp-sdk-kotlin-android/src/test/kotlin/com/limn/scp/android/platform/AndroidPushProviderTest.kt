@@ -44,7 +44,7 @@ class AndroidPushProviderTest {
                 "SCP-PUSH-5002"
             )
         }
-        return WakeSignal.Pull
+        return WakeSignal.PULL
     }
 
     // -----------------------------------------------------------------------
@@ -55,7 +55,7 @@ class AndroidPushProviderTest {
     fun `valid scp payload returns WakeSignal Pull`() {
         val payload = mapOf("scp" to "1")
         val signal = handleNotification(payload)
-        assertEquals(WakeSignal.Pull, signal)
+        assertEquals(WakeSignal.PULL, signal)
     }
 
     @Test
@@ -63,7 +63,7 @@ class AndroidPushProviderTest {
         // The opaque payload format: {"scp": "1"} — exactly one field.
         val payload = mapOf("scp" to "1")
         val signal = handleNotification(payload)
-        assertEquals(WakeSignal.Pull, signal)
+        assertEquals(WakeSignal.PULL, signal)
     }
 
     // -----------------------------------------------------------------------
@@ -160,7 +160,7 @@ class AndroidPushProviderTest {
         // §10.7: opaque push payloads carry no context information.
         // The only valid response is Pull (fetch all pending envelopes).
         assertEquals(1, WakeSignal.entries.size)
-        assertEquals(WakeSignal.Pull, WakeSignal.entries.first())
+        assertEquals(WakeSignal.PULL, WakeSignal.entries.first())
     }
 
     @Test
@@ -188,6 +188,6 @@ class AndroidPushProviderTest {
         // validates only the wake signal field.
         val payload = mapOf("scp" to "1", "extra" to "ignored")
         val signal = handleNotification(payload)
-        assertEquals(WakeSignal.Pull, signal)
+        assertEquals(WakeSignal.PULL, signal)
     }
 }

@@ -154,7 +154,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.sign(fakeHandle, "data".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
 
         @Test
@@ -163,7 +163,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.sign(handle, "data".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4003", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4003", exception.code)
         }
     }
 
@@ -211,7 +211,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.publicKey(fakeHandle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
     }
 
@@ -250,7 +250,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.sign(handle, "data".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
 
         @Test
@@ -261,7 +261,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.publicKey(handle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
 
         @Test
@@ -272,7 +272,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.destroyKey(handle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
 
         @Test
@@ -281,7 +281,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.destroyKey(fakeHandle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
     }
 
@@ -339,7 +339,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.dhAgree(fakeHandle, ByteArray(32))
             }
-            assertEquals("SCP-CRYPTO-4002", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4002", exception.code)
         }
     }
 
@@ -444,7 +444,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.derivePseudonym(fakeHandle, "ctx".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
 
         @Test
@@ -453,7 +453,7 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.derivePseudonym(x25519Handle, "ctx".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4003", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4003", exception.code)
         }
 
         @Test
@@ -480,7 +480,7 @@ class AndroidKeyCustodyTest {
         @Test
         fun `ScpException carries correct error code`() {
             val exception = ScpException("test message", "SCP-CRYPTO-4001")
-            assertEquals("SCP-CRYPTO-4001", exception.errorCode)
+            assertEquals("SCP-CRYPTO-4001", exception.code)
             assertEquals("test message", exception.message)
         }
 

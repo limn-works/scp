@@ -43,78 +43,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
-// ---------------------------------------------------------------------------
-// Supporting types — defined locally until UniFFI-generated shared types are
-// available from the scp-sdk-kotlin module. These mirror the Rust-side
-// WakeSignal enum and ScpError exception hierarchy (ADR-021).
-// ---------------------------------------------------------------------------
-
-/**
- * Wake signal returned by [PushProvider.handleNotification] indicating what
- * action the SCP engine should take upon receiving a push notification.
- *
- * See ADR-006 (Platform Abstraction) and ADR-027 (Android Platform Adapter).
- */
-enum class WakeSignal {
-    /**
-     * Connect to the relay and pull all pending encrypted envelopes.
-     *
-     * This is the only valid wake signal for opaque push payloads (§10.7).
-     * The payload carries no information about which context has new messages;
-     * the engine must pull from all active relay connections.
-     */
-    Pull
-}
-
-/**
- * SCP exception with a machine-readable error [code] following the
- * `SCP-{CATEGORY}-{NUMBER}` convention (ADR-021 acceptance criterion 8).
- *
- * Maps to the Rust `ScpError` type. UniFFI generates this as a sealed exception
- * hierarchy in the shared Kotlin SDK; this local definition provides the same
- * shape until the generated types are available.
- *
- * @property message Human-readable error description.
- * @property code Machine-readable error code (e.g., `SCP-PUSH-5001`).
- */
-class ScpException(
-    override val message: String,
-    val code: String
-) : Exception(message)
-
-/**
- * Platform push notification provider interface.
- *
- * Abstracts platform-specific push notification registration and notification
- * handling. Implemented by [AndroidPushProvider] for Android (FCM) and by the
- * corresponding `ApplePushProvider` for Apple platforms (APNs).
- *
- * See ADR-006 (Platform Abstraction) and ADR-027 (Android Platform Adapter).
- */
-interface PushProvider {
-    /**
-     * Register for push notifications and return the platform-specific token.
-     *
-     * @return The FCM registration token string.
-     * @throws ScpException if token retrieval fails.
-     */
-    suspend fun register(): String
-
-    /**
-     * Handle an incoming push notification payload and produce a wake signal.
-     *
-     * @param payload The FCM data payload as a key-value map. Expected format:
-     *   `{"scp": "1"}`.
-     * @return [WakeSignal] indicating the action the engine should take.
-     * @throws ScpException if the payload is invalid or violates §10.7 opacity.
-     */
-    fun handleNotification(payload: Map<String, String>): WakeSignal
-}
-
-// ---------------------------------------------------------------------------
-// AndroidPushProvider implementation
-// ---------------------------------------------------------------------------
-
 /**
  * [PushProvider] implementation for Android using Firebase Cloud Messaging.
  *
@@ -135,7 +63,7 @@ interface PushProvider {
  *
  * // In FirebaseMessagingService.onMessageReceived:
  * val signal = pushProvider.handleNotification(remoteMessage.data)
- * // signal == WakeSignal.Pull → connect to relay and pull envelopes
+ * // signal == WakeSignal.PULL → connect to relay and pull envelopes
  * ```
  *
  * See ADR-027 (Android Platform Adapter).
@@ -169,7 +97,7 @@ class AndroidPushProvider(
      *
      * @param payload The FCM data payload as a key-value map (from
      *   `RemoteMessage.getData()`). Expected: `{"scp": "1"}`.
-     * @return [WakeSignal.Pull] — instructs the engine to connect to the relay
+     * @return [WakeSignal.PULL] — instructs the engine to connect to the relay
      *   and pull all pending encrypted envelopes.
      * @throws ScpException with code `SCP-PUSH-5001` if the `scp` field is missing.
      * @throws ScpException with code `SCP-PUSH-5002` if the `scp` field has an
@@ -189,7 +117,7 @@ class AndroidPushProvider(
                 "SCP-PUSH-5002"
             )
         }
-        return WakeSignal.Pull // connect to relay and pull pending envelopes
+        return WakeSignal.PULL // connect to relay and pull pending envelopes
     }
 }
 
