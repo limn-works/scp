@@ -3485,6 +3485,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "pyo3",
+ "rand 0.8.5",
  "scp-core",
  "scp-mcp",
  "scp-platform",
