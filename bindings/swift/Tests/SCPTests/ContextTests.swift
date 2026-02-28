@@ -19,18 +19,26 @@ struct ContextTests {
 // MARK: - Mock ContextHandle
 
 /// Mock implementation of ``ContextHandleProtocol`` for testing.
-/// Returns configurable values for contextId and state.
+/// Returns configurable values for contextId, creatorDid, and state.
+///
+/// UniFFI's ContextHandleProtocol requires:
+///   - contextId() -> String
+///   - creatorDid() -> String
+///   - state() throws -> String
 private final class MockContextHandle: ContextHandleProtocol, @unchecked Sendable {
     let id: String
+    let creator: String
     let initialState: String
 
-    init(id: String = "test-context-001", state: String = "active") {
+    init(id: String = "test-context-001", creator: String = "did:dht:z6MkCreator", state: String = "active") {
         self.id = id
+        self.creator = creator
         self.initialState = state
     }
 
     func contextId() -> String { id }
-    func state() -> String { initialState }
+    func creatorDid() -> String { creator }
+    func state() throws -> String { initialState }
 }
 
 // MARK: - Thread-safe test state
@@ -65,7 +73,7 @@ private final class Locked<Value: Sendable>: @unchecked Sendable {
 /// The returned context uses in-memory mock bridge functions. The `onSend`
 /// closure is called for each ``Context/send(_:)`` invocation, allowing tests
 /// to inspect sent payloads. The `captureListener` closure captures the
-/// ``MessageListenerProtocol`` registered by ``Context/messages``, enabling
+/// ``MessageListener`` registered by ``Context/messages``, enabling
 /// tests to push messages into the stream from the outside.
 private func makeTestContext(
     contextId: String = "test-context-001",
@@ -73,7 +81,7 @@ private func makeTestContext(
     onSend: (@Sendable (Data) -> Void)? = nil,
     onLeave: (@Sendable () -> Void)? = nil,
     onClose: (@Sendable () -> Void)? = nil,
-    captureListener: (@Sendable (any MessageListenerProtocol) -> Void)? = nil
+    captureListener: (@Sendable (any MessageListener) -> Void)? = nil
 ) -> Context {
     let handle = MockContextHandle(id: contextId, state: state)
 
@@ -131,7 +139,7 @@ func createReturnsActiveContext() async throws {
 @Test("Context.create propagates bridge errors")
 func createPropagatesBridgeErrors() async {
     let createFn: ContextBridge.CreateFn = { _, _ in
-        throw ScpError.context(message: "creation failed", code: "SCP-CTX-100")
+        throw ScpError.Context(message: "creation failed", code: "SCP-CTX-100")
     }
     let noOpSend: ContextBridge.SendFn = { _, _ in }
     let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
@@ -187,11 +195,11 @@ func sendThrowsCorrectErrorCode() async throws {
         try await context.send(Data("should fail".utf8))
         Issue.record("Expected send to throw after close")
     } catch let error as ScpError {
-        if case .context(let message, let code) = error {
+        if case .Context(let message, let code) = error {
             #expect(code == "SCP-CTX-001")
             #expect(message == "Context is not active")
         } else {
-            Issue.record("Expected ScpError.context, got \(error)")
+            Issue.record("Expected ScpError.Context, got \(error)")
         }
     }
 }
@@ -200,7 +208,7 @@ func sendThrowsCorrectErrorCode() async throws {
 
 @Test("messages returns AsyncStream that yields messages")
 func messagesYieldsMessages() async throws {
-    let capturedListener = Locked<(any MessageListenerProtocol)?>(nil)
+    let capturedListener = Locked<(any MessageListener)?>(nil)
 
     let context = makeTestContext(captureListener: { listener in
         capturedListener.withLock { $0 = listener }
@@ -211,7 +219,7 @@ func messagesYieldsMessages() async throws {
     // Wait for listener to be captured (subscribeFn is called synchronously
     // within the actor-isolated `messages` property, so it should be set
     // immediately after the `await` returns)
-    var listener: (any MessageListenerProtocol)?
+    var listener: (any MessageListener)?
     for _ in 0..<100 {
         listener = capturedListener.current
         if listener != nil { break }
@@ -223,10 +231,10 @@ func messagesYieldsMessages() async throws {
         return
     }
 
-    // Push messages through the listener
+    // Push messages through the listener — using UniFFI Message (payload, not content)
     let message1 = Message(
         senderDid: "did:dht:alice",
-        content: Data("msg1".utf8),
+        payload: Data("msg1".utf8),
         timestamp: 1_000_000,
         sequence: 1,
         contextId: "test-context-001",
@@ -234,15 +242,20 @@ func messagesYieldsMessages() async throws {
     )
     let message2 = Message(
         senderDid: "did:dht:bob",
-        content: Data("msg2".utf8),
+        payload: Data("msg2".utf8),
         timestamp: 1_000_001,
         sequence: 2,
         contextId: "test-context-001",
-        provenance: Provenance(sourceContext: "other-ctx", sourceType: "promotion")
+        provenance: DataProvenance(
+            sourceDid: "did:dht:bob",
+            originContextId: "other-ctx",
+            chainDepth: 1,
+            signature: Data(repeating: 0x00, count: 64)
+        )
     )
 
-    resolvedListener.onMessage(message1)
-    resolvedListener.onMessage(message2)
+    resolvedListener.onMessage(message: message1)
+    resolvedListener.onMessage(message: message2)
     resolvedListener.onComplete()
 
     var received: [Message] = []
@@ -254,12 +267,12 @@ func messagesYieldsMessages() async throws {
     #expect(received[0].senderDid == "did:dht:alice")
     #expect(received[0].sequence == 1)
     #expect(received[1].senderDid == "did:dht:bob")
-    #expect(received[1].provenance?.sourceType == "promotion")
+    #expect(received[1].provenance?.originContextId == "other-ctx")
 }
 
 @Test("messages stream finishes on error")
 func messagesStreamFinishesOnError() async throws {
-    let capturedListener = Locked<(any MessageListenerProtocol)?>(nil)
+    let capturedListener = Locked<(any MessageListener)?>(nil)
 
     let context = makeTestContext(captureListener: { listener in
         capturedListener.withLock { $0 = listener }
@@ -267,7 +280,7 @@ func messagesStreamFinishesOnError() async throws {
 
     let stream = await context.messages
 
-    var listener: (any MessageListenerProtocol)?
+    var listener: (any MessageListener)?
     for _ in 0..<100 {
         listener = capturedListener.current
         if listener != nil { break }
@@ -280,15 +293,15 @@ func messagesStreamFinishesOnError() async throws {
     }
 
     // Push one message then an error
-    resolvedListener.onMessage(Message(
+    resolvedListener.onMessage(message: Message(
         senderDid: "did:dht:alice",
-        content: Data("before-error".utf8),
+        payload: Data("before-error".utf8),
         timestamp: 1_000_000,
         sequence: 1,
         contextId: "test-context-001",
         provenance: nil
     ))
-    resolvedListener.onError(ScpError.transport(
+    resolvedListener.onError(error: ScpError.Transport(
         message: "connection lost",
         code: "SCP-TXP-001"
     ))
@@ -319,7 +332,7 @@ func leaveTransitionsState() async throws {
 
 @Test("leave finishes the message stream")
 func leaveFinishesStream() async throws {
-    let capturedListener = Locked<(any MessageListenerProtocol)?>(nil)
+    let capturedListener = Locked<(any MessageListener)?>(nil)
 
     let context = makeTestContext(captureListener: { listener in
         capturedListener.withLock { $0 = listener }
@@ -327,7 +340,7 @@ func leaveFinishesStream() async throws {
 
     let stream = await context.messages
 
-    var listener: (any MessageListenerProtocol)?
+    var listener: (any MessageListener)?
     for _ in 0..<100 {
         listener = capturedListener.current
         if listener != nil { break }
@@ -340,9 +353,9 @@ func leaveFinishesStream() async throws {
     }
 
     // Push a message, then leave
-    resolvedListener.onMessage(Message(
+    resolvedListener.onMessage(message: Message(
         senderDid: "did:dht:alice",
-        content: Data("before-leave".utf8),
+        payload: Data("before-leave".utf8),
         timestamp: 1_000_000,
         sequence: 1,
         contextId: "test-context-001",
@@ -402,7 +415,7 @@ func closeIsIdempotent() async throws {
 
 @Test("close finishes the message stream")
 func closeFinishesStream() async throws {
-    let capturedListener = Locked<(any MessageListenerProtocol)?>(nil)
+    let capturedListener = Locked<(any MessageListener)?>(nil)
 
     let context = makeTestContext(captureListener: { listener in
         capturedListener.withLock { $0 = listener }
@@ -410,7 +423,7 @@ func closeFinishesStream() async throws {
 
     let stream = await context.messages
 
-    var listener: (any MessageListenerProtocol)?
+    var listener: (any MessageListener)?
     for _ in 0..<100 {
         listener = capturedListener.current
         if listener != nil { break }
@@ -422,9 +435,9 @@ func closeFinishesStream() async throws {
         return
     }
 
-    resolvedListener.onMessage(Message(
+    resolvedListener.onMessage(message: Message(
         senderDid: "did:dht:alice",
-        content: Data("before-close".utf8),
+        payload: Data("before-close".utf8),
         timestamp: 1_000_000,
         sequence: 1,
         contextId: "test-context-001",
@@ -485,10 +498,11 @@ func noForceUnwrapsInPublicAPI() async throws {
 
 // MARK: - ContextState tests
 
-@Test("ContextState raw values match expected strings")
-func contextStateRawValues() {
-    #expect(ContextState.active.rawValue == "active")
-    #expect(ContextState.closed.rawValue == "closed")
+@Test("ContextState enum cases exist")
+func contextStateCases() {
+    // UniFFI-generated ContextState is not RawRepresentable; verify cases exist.
+    let states: [ContextState] = [.creating, .active, .closing, .closed, .expired]
+    #expect(states.count == 5)
 }
 
 @Test("ContextState is Equatable")

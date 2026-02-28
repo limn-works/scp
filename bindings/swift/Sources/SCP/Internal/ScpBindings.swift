@@ -4085,7 +4085,7 @@ fileprivate struct UniffiCallbackInterfacePushProvider {
     // This creates 1-element array, since this seems to be the only way to construct a const
     // pointer that we can pass to the Rust code.
     static let vtable: [UniffiVTableCallbackInterfacePushProvider] = [UniffiVTableCallbackInterfacePushProvider(
-        register: { (
+        register_: { (
             uniffiHandle: UInt64,
             uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
             uniffiCallbackData: UInt64,

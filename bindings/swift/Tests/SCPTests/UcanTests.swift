@@ -7,68 +7,98 @@ import Testing
 
 /// Tests for UCAN token operations: validate, mint, revoke, and delegation.
 ///
-/// These tests validate the Swift ergonomics layer and type shapes for UCAN
-/// authorization. The UniFFI bridge stubs return placeholder errors until
-/// SCP-103 ships.
+/// UniFFI generates UcanToken as an open class with methods:
+///   - issuer() -> String
+///   - audience() -> String
+///   - expiresAt() -> UInt64?
+///   - tokenId() -> String
+///   - capabilities() -> [String]
+///   - tokenData() -> UcanTokenData
+///
+/// Tests that need mock UcanToken instances use subclasses with `noPointer:`.
+/// Tests that exercise bridge stubs verify error propagation through
+/// CheckedContinuation.
 ///
 /// See ADR-016 (UCAN), ADR-026 (Swift SDK), and story SCP-102.
 @Suite("UCAN Tests")
 struct UcanTests {
 
-    // MARK: - UcanToken type shape
+    // MARK: - Mock UcanToken subclass
 
-    @Test("UcanToken stores all fields correctly")
-    func ucanTokenFields() {
-        let capabilities = [
-            UcanCapability(resource: "scp:ctx:abc/messages:write", action: "invoke"),
-        ]
-        let token = UcanToken(
-            issuer: "did:dht:z6MkIssuer",
-            audience: "did:dht:z6MkAudience",
-            expiry: 1_700_086_400,
-            notBefore: 1_700_000_000,
-            nonce: "nonce-abc-123",
-            capabilities: capabilities,
-            proofs: ["parent-token-encoded"],
-            encoded: "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.payload.sig"
-        )
+    /// Mock subclass of the UniFFI-generated `UcanToken` class for testing.
+    private final class MockUcanToken: UcanToken, @unchecked Sendable {
+        let mockIssuer: String
+        let mockAudience: String
+        let mockExpiry: UInt64?
+        let mockTokenId: String
+        let mockCapabilities: [String]
 
-        #expect(token.issuer == "did:dht:z6MkIssuer")
-        #expect(token.audience == "did:dht:z6MkAudience")
-        #expect(token.expiry == 1_700_086_400)
-        #expect(token.notBefore == 1_700_000_000)
-        #expect(token.nonce == "nonce-abc-123")
-        #expect(token.capabilities.count == 1)
-        #expect(token.proofs.count == 1)
-        #expect(token.encoded.contains("eyJ"))
+        init(
+            issuer: String,
+            audience: String,
+            expiry: UInt64?,
+            tokenId: String = "token-\(UUID().uuidString)",
+            capabilities: [String] = []
+        ) {
+            self.mockIssuer = issuer
+            self.mockAudience = audience
+            self.mockExpiry = expiry
+            self.mockTokenId = tokenId
+            self.mockCapabilities = capabilities
+            super.init(noPointer: .init())
+        }
+
+        required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+            self.mockIssuer = ""
+            self.mockAudience = ""
+            self.mockExpiry = nil
+            self.mockTokenId = ""
+            self.mockCapabilities = []
+            super.init(unsafeFromRawPointer: pointer)
+        }
+
+        override func issuer() -> String { mockIssuer }
+        override func audience() -> String { mockAudience }
+        override func expiresAt() -> UInt64? { mockExpiry }
+        override func tokenId() -> String { mockTokenId }
+        override func capabilities() -> [String] { mockCapabilities }
     }
 
-    @Test("UcanToken with nil notBefore")
-    func ucanTokenNilNotBefore() {
-        let token = UcanToken(
+    // MARK: - UcanToken type shape
+
+    @Test("UcanToken mock stores all fields correctly")
+    func ucanTokenFields() {
+        let token = MockUcanToken(
             issuer: "did:dht:z6MkIssuer",
             audience: "did:dht:z6MkAudience",
             expiry: 1_700_086_400,
-            notBefore: nil,
-            nonce: "nonce-001",
-            capabilities: [],
-            proofs: [],
-            encoded: "encoded-token"
+            tokenId: "token-abc-123",
+            capabilities: ["scp:ctx:abc/messages:write"]
         )
-        #expect(token.notBefore == nil)
+
+        #expect(token.issuer() == "did:dht:z6MkIssuer")
+        #expect(token.audience() == "did:dht:z6MkAudience")
+        #expect(token.expiresAt() == 1_700_086_400)
+        #expect(token.tokenId() == "token-abc-123")
+        #expect(token.capabilities().count == 1)
+    }
+
+    @Test("UcanToken with nil expiry")
+    func ucanTokenNilExpiry() {
+        let token = MockUcanToken(
+            issuer: "did:dht:z6MkIssuer",
+            audience: "did:dht:z6MkAudience",
+            expiry: nil
+        )
+        #expect(token.expiresAt() == nil)
     }
 
     @Test("UcanToken is Sendable")
     func ucanTokenIsSendable() async {
-        let token: any Sendable = UcanToken(
+        let token: any Sendable = MockUcanToken(
             issuer: "did:dht:z6MkIssuer",
             audience: "did:dht:z6MkAudience",
-            expiry: 1_700_086_400,
-            notBefore: nil,
-            nonce: "nonce-001",
-            capabilities: [],
-            proofs: [],
-            encoded: "encoded"
+            expiry: 1_700_086_400
         )
         #expect(token is UcanToken)
     }
@@ -104,15 +134,10 @@ struct UcanTests {
 
     @Test("UcanValidationResult valid result stores token")
     func validationResultValid() {
-        let token = UcanToken(
+        let token = MockUcanToken(
             issuer: "did:dht:z6MkIssuer",
             audience: "did:dht:z6MkAudience",
-            expiry: 1_700_086_400,
-            notBefore: nil,
-            nonce: "nonce-001",
-            capabilities: [],
-            proofs: [],
-            encoded: "encoded"
+            expiry: 1_700_086_400
         )
         let result = UcanValidationResult(
             isValid: true,
@@ -148,10 +173,10 @@ struct UcanTests {
             )
             Issue.record("Expected validate to throw")
         } catch let error as ScpError {
-            if case .permission(_, let code) = error {
+            if case .Permission(_, let code) = error {
                 #expect(code == "SCP-UCAN-001")
             } else {
-                Issue.record("Expected ScpError.permission, got \(error)")
+                Issue.record("Expected ScpError.Permission, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -174,10 +199,10 @@ struct UcanTests {
             )
             Issue.record("Expected mint to throw")
         } catch let error as ScpError {
-            if case .permission(_, let code) = error {
+            if case .Permission(_, let code) = error {
                 #expect(code == "SCP-UCAN-002")
             } else {
-                Issue.record("Expected ScpError.permission, got \(error)")
+                Issue.record("Expected ScpError.Permission, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -195,11 +220,11 @@ struct UcanTests {
             )
             Issue.record("Expected mint to throw")
         } catch let error as ScpError {
-            // The bridge stub error is expected — we're verifying default params work.
-            if case .permission(_, let code) = error {
+            // The bridge stub error is expected -- we're verifying default params work.
+            if case .Permission(_, let code) = error {
                 #expect(code == "SCP-UCAN-002")
             } else {
-                Issue.record("Expected ScpError.permission, got \(error)")
+                Issue.record("Expected ScpError.Permission, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -217,52 +242,14 @@ struct UcanTests {
             )
             Issue.record("Expected revoke to throw")
         } catch let error as ScpError {
-            if case .permission(_, let code) = error {
+            if case .Permission(_, let code) = error {
                 #expect(code == "SCP-UCAN-003")
             } else {
-                Issue.record("Expected ScpError.permission, got \(error)")
+                Issue.record("Expected ScpError.Permission, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
-    }
-
-    // MARK: - Delegation chain
-
-    @Test("UcanToken delegation chain carries parent proofs")
-    func delegationChainCarriesProofs() {
-        // Simulate a delegation chain: root -> delegate1 -> delegate2
-        let rootToken = UcanToken(
-            issuer: "did:dht:z6MkRoot",
-            audience: "did:dht:z6MkDelegate1",
-            expiry: 1_700_086_400,
-            notBefore: nil,
-            nonce: "nonce-root",
-            capabilities: [
-                UcanCapability(resource: "scp:ctx:test/messages:write", action: "invoke"),
-            ],
-            proofs: [],
-            encoded: "root-encoded"
-        )
-
-        let delegatedToken = UcanToken(
-            issuer: "did:dht:z6MkDelegate1",
-            audience: "did:dht:z6MkDelegate2",
-            expiry: 1_700_086_400,
-            notBefore: nil,
-            nonce: "nonce-delegated",
-            capabilities: [
-                UcanCapability(resource: "scp:ctx:test/messages:write", action: "invoke"),
-            ],
-            proofs: [rootToken.encoded],
-            encoded: "delegated-encoded"
-        )
-
-        #expect(rootToken.proofs.isEmpty)
-        #expect(delegatedToken.proofs.count == 1)
-        #expect(delegatedToken.proofs[0] == rootToken.encoded)
-        // Delegation can only attenuate (narrow) capabilities
-        #expect(delegatedToken.capabilities.count <= rootToken.capabilities.count)
     }
 
 } // end UcanTests

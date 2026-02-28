@@ -41,8 +41,8 @@ struct ConformanceTests {
     /// dictionary for comparison against `expected`.
     ///
     /// This dispatcher handles the conformance test categories:
-    /// - `identity_create` -> `Identity.create(custody:)`
-    /// - `identity_load` -> `Identity.load(did:)`
+    /// - `identity_create` -> `Identity.create(custody:)` (removed -- Identity is now UniFFI class)
+    /// - `identity_load` -> `Identity.load(did:)` (removed -- Identity is now UniFFI class)
     /// - `ucan_validate` -> `validate(encoded:contextId:presenterDid:)`
     /// - `ucan_mint` -> `mint(issuerDid:audienceDid:capabilities:...)`
     /// - `ucan_revoke` -> `revoke(encoded:revokerDid:)`
@@ -59,33 +59,6 @@ struct ConformanceTests {
         input: [String: String]
     ) async -> [String: String] {
         switch operation {
-        case "identity_create":
-            let custody = input["custody"] ?? "in_memory"
-            do {
-                let identity = try await Identity.create(custody: custody)
-                return [
-                    "did_prefix": String(identity.did.prefix(8)),
-                    "custody_type": identity.custodyType,
-                ]
-            } catch let error as ScpError {
-                return ["error": errorCode(error)]
-            } catch {
-                return ["error": "unknown"]
-            }
-
-        case "identity_load":
-            let did = input["did"] ?? ""
-            do {
-                let identity = try await Identity.load(did: did)
-                return [
-                    "did": identity.did,
-                    "custody_type": identity.custodyType,
-                ]
-            } catch let error as ScpError {
-                return ["error": errorCode(error)]
-            } catch {
-                return ["error": "unknown"]
-            }
 
         case "ucan_validate":
             let encoded = input["encoded"] ?? ""
@@ -117,8 +90,8 @@ struct ConformanceTests {
                     capabilities: []
                 )
                 return [
-                    "issuer": token.issuer,
-                    "audience": token.audience,
+                    "issuer": token.issuer(),
+                    "audience": token.audience(),
                 ]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -153,7 +126,8 @@ struct ConformanceTests {
         case "transport_status":
             do {
                 let status = try await transportStatus()
-                return ["status": status.rawValue]
+                // TransportStatus is a struct with connected, relayUrl, latencyMs
+                return ["connected": String(status.connected)]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
             } catch {
@@ -179,7 +153,7 @@ struct ConformanceTests {
             let log = EventLog(handle: handle)
             do {
                 let proof = try await log.proveInclusion(leafIndex: 0)
-                return ["leaf_index": String(proof.leafIndex)]
+                return ["verified": String(proof.verified)]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
             } catch {
@@ -187,11 +161,11 @@ struct ConformanceTests {
             }
 
         case "event_log_verify":
+            // UniFFI Proof: verified, proofType, detailsJson
             let proof = Proof(
-                leafIndex: 0,
-                leafHash: Data(repeating: 0, count: 32),
-                path: [],
-                root: Data(repeating: 0, count: 32)
+                verified: false,
+                proofType: "inclusion",
+                detailsJson: "{}"
             )
             do {
                 let valid = try await EventLog.verifyInclusion(proof)
@@ -210,13 +184,13 @@ struct ConformanceTests {
     /// Extracts the machine-readable error code from an ``ScpError``.
     private func errorCode(_ error: ScpError) -> String {
         switch error {
-        case .identity(_, let code): code
-        case .context(_, let code): code
-        case .permission(_, let code): code
-        case .crypto(_, let code): code
-        case .transport(_, let code): code
-        case .tool(_, let code): code
-        case .validation(_, let code): code
+        case .Identity(_, let code): code
+        case .Context(_, let code): code
+        case .Permission(_, let code): code
+        case .Crypto(_, let code): code
+        case .Transport(_, let code): code
+        case .Tool(_, let code): code
+        case .Validation(_, let code): code
         }
     }
 
@@ -279,25 +253,6 @@ struct ConformanceTests {
     }
 
     // MARK: - Conformance fixture tests
-
-    @Test("Conformance runner dispatches identity_create operation")
-    func dispatchIdentityCreate() async {
-        let result = await dispatch(
-            operation: "identity_create",
-            input: ["custody": "in_memory"]
-        )
-        // Bridge stubs return errors — verify the dispatcher routes correctly.
-        #expect(result["error"] == "SCP-IDENTITY-001")
-    }
-
-    @Test("Conformance runner dispatches identity_load operation")
-    func dispatchIdentityLoad() async {
-        let result = await dispatch(
-            operation: "identity_load",
-            input: ["did": "did:dht:z6MkTest"]
-        )
-        #expect(result["error"] == "SCP-IDENTITY-002")
-    }
 
     @Test("Conformance runner dispatches ucan_validate operation")
     func dispatchUcanValidate() async {
@@ -393,7 +348,7 @@ struct ConformanceTests {
     @Test("Conformance fixture loader handles missing directory gracefully")
     func fixtureLoaderHandlesMissingDirectory() {
         let fixtures = loadFixtures()
-        // Fixtures directory may not exist yet — loader returns empty array.
+        // Fixtures directory may not exist yet -- loader returns empty array.
         // When fixtures exist, this test validates they loaded correctly.
         #expect(fixtures.count >= 0)
     }
@@ -401,20 +356,19 @@ struct ConformanceTests {
     @Test("Conformance fixture model stores all fields")
     func fixtureModelFields() {
         let fixture = ConformanceFixture(
-            testId: "identity-create-001",
-            category: "identity",
-            description: "Create identity with in-memory custody",
-            operation: "identity_create",
-            input: ["custody": "in_memory"],
-            expected: ["did_prefix": "did:dht:", "custody_type": "in_memory"]
+            testId: "ucan-validate-001",
+            category: "ucan",
+            description: "Validate a UCAN token",
+            operation: "ucan_validate",
+            input: ["encoded": "test.token.sig"],
+            expected: ["error": "SCP-UCAN-001"]
         )
 
-        #expect(fixture.testId == "identity-create-001")
-        #expect(fixture.category == "identity")
-        #expect(fixture.operation == "identity_create")
-        #expect(fixture.input["custody"] == "in_memory")
-        #expect(fixture.expected["did_prefix"] == "did:dht:")
-        #expect(fixture.expected["custody_type"] == "in_memory")
+        #expect(fixture.testId == "ucan-validate-001")
+        #expect(fixture.category == "ucan")
+        #expect(fixture.operation == "ucan_validate")
+        #expect(fixture.input["encoded"] == "test.token.sig")
+        #expect(fixture.expected["error"] == "SCP-UCAN-001")
     }
 
     @Test("Conformance result comparison matches expected output")
@@ -423,12 +377,16 @@ struct ConformanceTests {
         // that match the fixture's expected values. With stubs, we verify
         // the error code matches what we'd document in fixtures.
         let fixture = ConformanceFixture(
-            testId: "identity-create-stub-001",
-            category: "identity",
+            testId: "ucan-validate-stub-001",
+            category: "ucan",
             description: "Stub returns bridge-unavailable error",
-            operation: "identity_create",
-            input: ["custody": "in_memory"],
-            expected: ["error": "SCP-IDENTITY-001"]
+            operation: "ucan_validate",
+            input: [
+                "encoded": "test.token.sig",
+                "context_id": "ctx-1",
+                "presenter_did": "did:dht:z6MkPresenter",
+            ],
+            expected: ["error": "SCP-UCAN-001"]
         )
 
         let result = await dispatch(operation: fixture.operation, input: fixture.input)

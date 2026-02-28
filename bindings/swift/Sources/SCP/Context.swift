@@ -1,55 +1,10 @@
 import Foundation
 
-// MARK: - ContextState
-
-/// The lifecycle state of an SCP context.
-///
-/// Contexts transition from ``active`` to ``closed`` via ``Context/leave()``
-/// or ``Context/close()``. Once closed, all operations except state inspection
-/// throw ``ScpError/context(message:code:)``.
-///
-/// See ADR-026 for the Swift SDK lifecycle design and ADR-018 for context state
-/// transitions in the Rust core.
-public nonisolated enum ContextState: String, Sendable, Equatable {
-    /// The context is active and can send/receive messages.
-    case active
-    /// The context has been closed. No further operations are permitted.
-    case closed
-}
-
-// MARK: - ContextHandle (UniFFI bridge type)
-
-/// Opaque handle to the Rust context state managed by the UniFFI bridge.
-///
-/// This protocol defines the contract that the auto-generated ``ScpBindings``
-/// will satisfy. When the XCFramework build pipeline produces real bindings
-/// (SCP-103), the generated `ContextHandle` class will conform to this protocol
-/// and the stubs below will be removed.
-///
-/// See ADR-021 for the UniFFI bridge design and ADR-026 for the Swift SDK
-/// wrapping layer.
-internal protocol ContextHandleProtocol: AnyObject, Sendable {
-    /// The unique identifier of this context.
-    func contextId() -> String
-    /// The current state of the context as a raw string.
-    func state() -> String
-}
-
-/// Callback interface for receiving messages from a context subscription.
-///
-/// The UniFFI code generator produces a Swift protocol from the Rust
-/// `MessageListener` callback interface. ``MessageListenerAdapter`` bridges
-/// this callback into an ``AsyncStream<Message>.Continuation``.
-///
-/// See ADR-026 §Async bridging pattern for the stream design.
-internal protocol MessageListenerProtocol: AnyObject, Sendable {
-    /// Called when a new message arrives in the context.
-    func onMessage(_ message: Message)
-    /// Called when the subscription encounters an unrecoverable error.
-    func onError(_ error: ScpError)
-    /// Called when the subscription completes (context closed or left).
-    func onComplete()
-}
+// ContextState and ContextHandleProtocol are now defined by UniFFI in ScpBindings.swift.
+//
+// UniFFI ContextState: .creating, .active, .closing, .closed, .expired
+// UniFFI ContextHandleProtocol: contextId() -> String, creatorDid() -> String, state() throws -> String
+// UniFFI MessageListener: onMessage(message:), onError(error:), onComplete()
 
 // MARK: - ContextBridge (UniFFI function stubs)
 
@@ -75,7 +30,7 @@ internal enum ContextBridge {
     /// The closure type for subscribing to messages. Injected for testability.
     internal typealias SubscribeFn = @Sendable (
         _ handle: any ContextHandleProtocol,
-        _ listener: any MessageListenerProtocol
+        _ listener: any MessageListener
     ) -> Void
 
     /// The closure type for leaving a context. Injected for testability.
@@ -91,7 +46,7 @@ internal enum ContextBridge {
 
 // MARK: - MessageListenerAdapter
 
-/// Adapts the UniFFI ``MessageListenerProtocol`` callback interface to an
+/// Adapts the UniFFI ``MessageListener`` callback interface to an
 /// ``AsyncStream<Message>.Continuation``.
 ///
 /// Each incoming message from the Rust subscription is yielded into the stream.
@@ -105,18 +60,18 @@ internal enum ContextBridge {
 /// for the UniFFI callback exception to the `@unchecked Sendable` prohibition.
 ///
 /// See ADR-026 §`MessageListenerAdapter` for the design.
-private final class MessageListenerAdapter: MessageListenerProtocol, @unchecked Sendable {
+private final class MessageListenerAdapter: MessageListener, @unchecked Sendable {
     private let continuation: AsyncStream<Message>.Continuation
 
     init(continuation: AsyncStream<Message>.Continuation) {
         self.continuation = continuation
     }
 
-    func onMessage(_ message: Message) {
+    func onMessage(message: Message) {
         continuation.yield(message)
     }
 
-    func onError(_ error: ScpError) {
+    func onError(error: ScpError) {
         // Finish the stream on error. Consumers detect end-of-stream via
         // the `for await` loop terminating. The specific error is not
         // propagated through AsyncStream (which has no error channel);
@@ -209,7 +164,16 @@ public actor Context {
     ) {
         self.handle = handle
         self.contextId = handle.contextId()
-        self.state = ContextState(rawValue: handle.state()) ?? .active
+        // UniFFI ContextHandleProtocol.state() throws, so use try? with a fallback.
+        let stateString = (try? handle.state()) ?? "active"
+        switch stateString {
+        case "creating": self.state = .creating
+        case "active": self.state = .active
+        case "closing": self.state = .closing
+        case "closed": self.state = .closed
+        case "expired": self.state = .expired
+        default: self.state = .active
+        }
         self.sendFn = sendFn
         self.subscribeFn = subscribeFn
         self.leaveFn = leaveFn
@@ -250,8 +214,8 @@ public actor Context {
     ///   - leaveFn: Bridge function for leaving the context.
     ///   - closeFn: Bridge function for closing the context.
     /// - Returns: A new `Context` in the ``ContextState/active`` state.
-    /// - Throws: ``ScpError/context(message:code:)`` if context creation fails.
-    public static func create(
+    /// - Throws: ``ScpError/Context(message:code:)`` if context creation fails.
+    internal static func create(
         contextId: String,
         ceiling: [String],
         createFn: ContextBridge.CreateFn,
@@ -279,11 +243,11 @@ public actor Context {
     /// sequencing, and transport.
     ///
     /// - Parameter payload: The raw message data to send.
-    /// - Throws: ``ScpError/context(message:code:)`` with code `"SCP-CTX-001"`
+    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-001"`
     ///   if the context is not active, or if the bridge send operation fails.
     public func send(_ payload: Data) async throws {
         guard state == .active else {
-            throw ScpError.context(
+            throw ScpError.Context(
                 message: "Context is not active",
                 code: "SCP-CTX-001"
             )
@@ -300,7 +264,7 @@ public actor Context {
     /// Usage:
     /// ```swift
     /// for await message in await context.messages {
-    ///     print(message.senderDid, message.content)
+    ///     print(message.senderDid, message.payload)
     /// }
     /// ```
     ///
@@ -321,11 +285,11 @@ public actor Context {
     /// notified. After leaving, the context transitions to ``ContextState/closed``
     /// and the message stream finishes.
     ///
-    /// - Throws: ``ScpError/context(message:code:)`` if the context is not
+    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
     ///   active or the bridge leave operation fails.
     public func leave() async throws {
         guard state == .active else {
-            throw ScpError.context(
+            throw ScpError.Context(
                 message: "Context is not active",
                 code: "SCP-CTX-001"
             )
@@ -346,7 +310,7 @@ public actor Context {
     /// Always call `close()` when done with a context. `deinit` provides a
     /// safety net but should not be relied upon for timely cleanup.
     ///
-    /// - Throws: ``ScpError/context(message:code:)`` if the bridge close
+    /// - Throws: ``ScpError/Context(message:code:)`` if the bridge close
     ///   operation fails.
     public func close() async throws {
         guard state == .active else {
