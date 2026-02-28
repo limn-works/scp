@@ -6219,6 +6219,10 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-027: Android Platform Adapter"
+        },
+        {
+          "file": "https://github.com/limn-works/scp/issues/88",
+          "section": "GitHub issue #88 — InMemoryKeyCustody ships unconditionally in production cdylib (P0 blocker: must be guarded before real KeyCustody can ship safely)"
         }
       ],
       "details": {
@@ -9599,6 +9603,10 @@
         {
           "file": "https://github.com/limn-works/scp/issues/115",
           "section": "GitHub issue #115"
+        },
+        {
+          "file": "https://github.com/limn-works/scp/issues/104",
+          "section": "GitHub issue #104 — input validation at bridge boundary"
         }
       ]
     },
@@ -9639,6 +9647,10 @@
         {
           "file": "https://github.com/limn-works/scp/issues/116",
           "section": "GitHub issue #116"
+        },
+        {
+          "file": "https://github.com/limn-works/scp/issues/109",
+          "section": "GitHub issue #109 — expose missing ContextParams fields in PyO3 bridge"
         }
       ]
     }
