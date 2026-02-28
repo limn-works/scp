@@ -458,7 +458,14 @@ fn py_context_create(
             .as_nanos()
     });
 
-    let handle = PyContextHandle::new(context_id, identity_did.to_owned());
+    let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned());
+
+    // Register runtime objects (ToolRegistry, EventLog, RoleState, RevocationList)
+    // in the global runtime registry so that tools/UCAN/event_log bridge functions
+    // can look them up by context ID.
+    crate::runtime::register_context(&context_id, identity_did).map_err(|e| {
+        PyRuntimeError::new_err(format!("failed to register context runtime: {e}"))
+    })?;
 
     // Transition to "active" -- in the full runtime this happens after MLS
     // group formation and parameter validation complete.
@@ -577,6 +584,9 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     // layer -- the full runtime will implement the cooperative closing window).
     "closed".clone_into(&mut state);
     drop(state);
+
+    // Remove context from the runtime registry to free resources.
+    let _ = crate::runtime::remove_context(&handle.context_id);
 
     Ok(())
 }
