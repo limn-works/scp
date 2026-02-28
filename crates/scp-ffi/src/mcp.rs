@@ -35,6 +35,7 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full MCP adapter design.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -48,6 +49,92 @@ use scp_mcp::server::{ContextProvider, ContextToolInfo, McpServer, MemberInfo};
 
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
+
+// ---------------------------------------------------------------------------
+// Stdio command allowlist (defense-in-depth)
+// ---------------------------------------------------------------------------
+
+/// Well-known MCP server launchers allowed by default.
+///
+/// Per MCP Security Best Practices, stdio transport must validate commands
+/// before execution. This allowlist restricts subprocess spawning to known
+/// MCP server runtimes. Use [`py_mcp_configure_stdio_allowlist`] to extend
+/// or disable.
+const DEFAULT_STDIO_ALLOWLIST: &[&str] = &[
+    // Package runners
+    "uvx",    // Python (uv tool runner)
+    "npx",    // Node.js (npm package runner)
+    "bunx",   // Bun (JavaScript runtime)
+    "pipx",   // Python (pip package runner)
+    // Direct interpreters
+    "python",
+    "python3",
+    "node",
+    "bun",
+    "deno",
+    // Containerized execution
+    "docker",
+    "podman",
+    // SCP's own CLI
+    "scp-mcp",
+];
+
+/// Runtime-configurable allowlist for stdio subprocess commands.
+struct StdioAllowlist {
+    /// Allowed binary basenames.
+    allowed: HashSet<String>,
+    /// If true, bypass the allowlist entirely (logs a warning).
+    unrestricted: bool,
+}
+
+impl StdioAllowlist {
+    fn default_list() -> Self {
+        Self {
+            allowed: DEFAULT_STDIO_ALLOWLIST
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            unrestricted: false,
+        }
+    }
+}
+
+/// Global singleton for the stdio allowlist.
+fn stdio_allowlist() -> &'static Mutex<StdioAllowlist> {
+    static INSTANCE: OnceLock<Mutex<StdioAllowlist>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(StdioAllowlist::default_list()))
+}
+
+/// Validates a command against the stdio allowlist.
+///
+/// Extracts the basename from the command path and checks it against the
+/// allowlist. Returns `Ok(basename)` if allowed, `Err(message)` if denied.
+fn validate_stdio_command(cmd: &str) -> Result<String, String> {
+    let basename = std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("invalid command path: '{cmd}'"))?
+        .to_owned();
+
+    let guard = stdio_allowlist()
+        .lock()
+        .map_err(|_| "stdio allowlist lock poisoned".to_owned())?;
+
+    if guard.unrestricted {
+        return Ok(basename);
+    }
+
+    if guard.allowed.contains(&basename) {
+        Ok(basename)
+    } else {
+        let mut sorted: Vec<&str> = guard.allowed.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        Err(format!(
+            "command '{basename}' is not in the MCP stdio allowlist. \
+             Allowed: {sorted:?}. Use py_mcp_configure_stdio_allowlist() to extend."
+        ))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Stdio client transport
@@ -84,6 +171,9 @@ impl StdioClientTransport {
     /// Returns an error message if the subprocess fails to start.
     fn spawn(command: &[String]) -> Result<Self, String> {
         let (cmd, args) = command.split_first().ok_or("command list is empty")?;
+
+        // Validate the command against the stdio allowlist (defense-in-depth).
+        let _basename = validate_stdio_command(cmd)?;
 
         let mut child = Command::new(cmd)
             .args(args)
@@ -1317,6 +1407,47 @@ pub fn py_mcp_load_contexts(
 }
 
 // ---------------------------------------------------------------------------
+// Stdio allowlist configuration (PyO3)
+// ---------------------------------------------------------------------------
+
+/// Configures the MCP stdio subprocess allowlist.
+///
+/// By default, only well-known MCP server launchers are permitted (e.g.
+/// `uvx`, `npx`, `node`, `python3`). Use this function to extend the list
+/// or bypass it entirely for advanced use cases.
+///
+/// # Arguments
+///
+/// * `additional_binaries` -- Binary basenames to add to the default allowlist.
+/// * `unrestricted` -- If `true`, disables the allowlist entirely. Logs a
+///   warning. Use only when the command source is fully trusted.
+///
+/// # Errors
+///
+/// Raises `TransportError` if the allowlist lock is poisoned.
+#[pyfunction]
+#[pyo3(name = "py_mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![], unrestricted=false))]
+pub fn py_mcp_configure_stdio_allowlist(
+    additional_binaries: Vec<String>,
+    unrestricted: bool,
+) -> PyResult<()> {
+    let mut guard = stdio_allowlist().lock().map_err(|e| {
+        ScpPyError::TransportError(format!("stdio allowlist lock poisoned: {e}"))
+    })?;
+
+    if unrestricted {
+        guard.unrestricted = true;
+    } else {
+        guard.unrestricted = false;
+        for name in additional_binaries {
+            guard.allowed.insert(name);
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1337,6 +1468,7 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_mcp_client_list_tools, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_client_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_load_contexts, m)?)?;
+    m.add_function(wrap_pyfunction!(py_mcp_configure_stdio_allowlist, m)?)?;
     Ok(())
 }
 
@@ -1412,11 +1544,10 @@ mod tests {
     #[test]
     fn sse_connect_rejects_https() {
         let result = SseClientTransport::connect("https://example.com/sse");
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("TLS"),
-            "should mention TLS in error"
-        );
+        match result {
+            Err(msg) => assert!(msg.contains("TLS"), "should mention TLS in error: {msg}"),
+            Ok(_) => panic!("expected error for https URL"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1483,15 +1614,67 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Stdio allowlist
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_stdio_command_allows_default_binaries() {
+        for bin in DEFAULT_STDIO_ALLOWLIST {
+            assert!(
+                validate_stdio_command(bin).is_ok(),
+                "default binary '{bin}' should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_stdio_command_extracts_basename_from_path() {
+        // Absolute path to an allowed binary should pass.
+        let result = validate_stdio_command("/usr/bin/node");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "node");
+    }
+
+    #[test]
+    fn validate_stdio_command_rejects_path_traversal() {
+        // Path traversal to an unknown binary should be rejected.
+        match validate_stdio_command("../../bin/sh") {
+            Err(msg) => assert!(msg.contains("allowlist"), "error should mention allowlist: {msg}"),
+            Ok(_) => panic!("expected rejection for path traversal to non-allowed binary"),
+        }
+    }
+
+    #[test]
+    fn validate_stdio_command_rejects_unknown_binary() {
+        match validate_stdio_command("curl") {
+            Err(msg) => assert!(msg.contains("allowlist"), "error should mention allowlist: {msg}"),
+            Ok(_) => panic!("expected rejection for unknown binary"),
+        }
+    }
+
+    #[test]
+    fn validate_stdio_command_rejects_shell() {
+        for shell in &["sh", "bash", "zsh", "fish", "cmd", "powershell"] {
+            assert!(
+                validate_stdio_command(shell).is_err(),
+                "shell '{shell}' should NOT be in the allowlist"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // StdioClientTransport
     // -----------------------------------------------------------------------
 
     #[test]
-    fn stdio_client_transport_spawn_nonexistent_command() {
+    fn stdio_client_transport_spawn_rejects_unlisted_command() {
         let result = StdioClientTransport::spawn(&[
             "nonexistent_command_that_does_not_exist_12345".to_owned(),
         ]);
-        assert!(result.is_err());
+        match result {
+            Err(msg) => assert!(msg.contains("allowlist"), "error should mention allowlist: {msg}"),
+            Ok(_) => panic!("expected rejection for unlisted command"),
+        }
     }
 
     #[test]

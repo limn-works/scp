@@ -35,6 +35,14 @@ logger = logging.getLogger("scp_sdk")
 #: Supported MCP transport modes.
 _VALID_TRANSPORTS: frozenset[str] = frozenset({"stdio", "sse"})
 
+#: Default allowlist of MCP server binaries for stdio transport.
+#: Matches the Rust-side DEFAULT_STDIO_ALLOWLIST in mcp.rs.
+DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset({
+    "uvx", "npx", "bunx", "pipx",
+    "python", "python3", "node", "bun", "deno",
+    "docker", "podman", "scp-mcp",
+})
+
 # ---------------------------------------------------------------------------
 # Lazy bridge import
 # ---------------------------------------------------------------------------
@@ -290,6 +298,48 @@ class McpClient:
         self._transport = transport
         self._command = command
 
+    @staticmethod
+    def configure_allowlist(
+        *,
+        additional_binaries: list[str] | None = None,
+        unrestricted: bool = False,
+    ) -> None:
+        """Configure the stdio subprocess allowlist.
+
+        By default, only well-known MCP server launchers are permitted
+        (see :data:`DEFAULT_STDIO_ALLOWLIST`). Use this method to extend
+        the list or disable it entirely for advanced use cases.
+
+        Args:
+            additional_binaries: Binary names to add to the default
+                allowlist (e.g. ``["my-custom-server"]``).
+            unrestricted: If ``True``, disables the allowlist entirely.
+                A warning is logged. Use only when the command source is
+                fully trusted.
+
+        Example::
+
+            # Extend the default allowlist
+            McpClient.configure_allowlist(
+                additional_binaries=["my-custom-server"],
+            )
+
+            # Disable the allowlist (advanced; logs a warning)
+            McpClient.configure_allowlist(unrestricted=True)
+        """
+        if unrestricted:
+            logger.warning(
+                "MCP stdio allowlist DISABLED — arbitrary commands will be "
+                "permitted. Only use this when the command source is fully "
+                "trusted."
+            )
+
+        bridge = _bridge()
+        bridge.py_mcp_configure_stdio_allowlist(
+            additional_binaries or [],
+            unrestricted,
+        )
+
     @classmethod
     async def connect(
         cls,
@@ -304,7 +354,8 @@ class McpClient:
             transport: Transport mode -- ``"stdio"`` to spawn a subprocess,
                 or ``"sse"`` to connect via HTTP/SSE.
             command: For ``"stdio"`` transport, the command and arguments to
-                spawn (e.g. ``["uvx", "some-mcp-server"]``).
+                spawn (e.g. ``["uvx", "some-mcp-server"]``). Must be in
+                the stdio allowlist (see :meth:`configure_allowlist`).
             url: For ``"sse"`` transport, the URL of the SSE endpoint.
 
         Returns:
@@ -313,7 +364,8 @@ class McpClient:
         Raises:
             ValidationError: If transport is invalid or required parameters
                 are missing.
-            TransportError: If the connection fails.
+            TransportError: If the connection fails or the command is not
+                in the stdio allowlist.
 
         Example::
 
@@ -561,6 +613,7 @@ async def _wait_for_shutdown(handle: Any, transport: str) -> None:
 
 
 __all__ = [
+    "DEFAULT_STDIO_ALLOWLIST",
     "McpClient",
     "McpProvenance",
     "McpServer",
