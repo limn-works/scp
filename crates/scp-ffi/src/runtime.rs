@@ -19,6 +19,19 @@
 //! 2. Bridge functions call [`with_context`] to access runtime objects.
 //! 3. `py_context_close` calls [`remove_context`] to clean up.
 //!
+//! # Context Discovery (SCP-213)
+//!
+//! The SCP relay is a dumb blob store routing by `RoutingId` -- it has no
+//! concept of which DID belongs to which context or what contexts exist.
+//! Context discovery is therefore **client-side**: the [`KnownContext`]
+//! registry tracks context-to-routing-id-to-relay mappings locally.
+//!
+//! When `py_mcp_load_contexts` runs, it:
+//! 1. Reads locally registered contexts from the [`ContextRuntime`] registry
+//! 2. Reads the [`KnownContext`] registry for relay routing metadata
+//! 3. If a relay connection is active, probes known routing IDs via QUERY
+//! 4. Falls back to local-only when the relay is unreachable
+//!
 //! # Error Propagation
 //!
 //! All public functions return `Result<T, ScpPyError>`, propagating typed
@@ -28,7 +41,7 @@
 //! See SCP-163 for the wiring story.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
 use scp_core::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
@@ -37,6 +50,7 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::event_log::EventLog;
 use scp_core::identity::cache::SystemClock;
+use scp_transport::native::adapter::NativeRelayAdapter;
 
 use crate::error::ScpPyError;
 
@@ -53,9 +67,34 @@ pub type ToolHandler =
 /// Global registry of per-context runtime state.
 static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::new();
 
+/// Global registry of known context-to-relay mappings for discovery (SCP-213).
+///
+/// Tracks contexts that have been created/joined locally, along with their
+/// routing IDs and relay URLs. This allows `py_mcp_load_contexts` to probe
+/// relays for context activity even across process restarts (when combined
+/// with persistence, a future story).
+static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new();
+
+/// Global relay connection for context discovery probing.
+///
+/// Set by [`set_relay_connection`] when `py_transport_connect` succeeds.
+/// Read by `py_mcp_load_contexts` to probe routing IDs on the relay.
+/// Uses `RwLock` for infrequent writes (connect) and concurrent reads (probe).
+static RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>> = OnceLock::new();
+
 /// Returns a reference to the global context registry.
 fn registry() -> &'static DashMap<String, ContextRuntime> {
     CONTEXT_REGISTRY.get_or_init(DashMap::new)
+}
+
+/// Returns a reference to the global known-contexts registry.
+fn known_contexts_registry() -> &'static DashMap<String, KnownContext> {
+    KNOWN_CONTEXTS.get_or_init(DashMap::new)
+}
+
+/// Returns a reference to the global relay connection state.
+fn relay_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
+    RELAY_CONNECTION.get_or_init(|| RwLock::new(None))
 }
 
 /// Per-context runtime state: the live objects needed by bridge functions.
@@ -242,4 +281,115 @@ pub fn register_tool_handler(
 /// Does not error if the context was not found (idempotent).
 pub fn remove_context(context_id: &str) {
     registry().remove(context_id);
+    // Also remove from known-contexts registry.
+    known_contexts_registry().remove(context_id);
+}
+
+// ---------------------------------------------------------------------------
+// Known context registry (SCP-213: context discovery)
+// ---------------------------------------------------------------------------
+
+/// Metadata about a known context's relay presence.
+///
+/// Stored in the [`KNOWN_CONTEXTS`] registry so that `py_mcp_load_contexts`
+/// can probe relays for context activity. The relay is a dumb blob store
+/// with no identity-to-context mapping, so the client must track which
+/// routing IDs correspond to which contexts.
+///
+/// See SCP-213 and ADR-015 in `.docs/adrs/phase-3.md`.
+#[derive(Debug, Clone)]
+pub struct KnownContext {
+    /// The context's routing ID (32-byte pseudonym for relay routing).
+    pub routing_id: [u8; 32],
+    /// The relay URL where this context's blobs are stored.
+    pub relay_url: String,
+    /// The DID of the member who registered this known context.
+    pub member_did: String,
+    /// Unix timestamp (seconds) when this context was last seen active.
+    pub last_seen: u64,
+}
+
+/// Registers a known context in the discovery registry.
+///
+/// Called after `py_context_create` to record the context's routing ID and
+/// relay URL for later discovery via `py_mcp_load_contexts`.
+///
+/// Overwrites any existing entry for the same context ID (idempotent).
+pub fn register_known_context(context_id: &str, known: KnownContext) {
+    known_contexts_registry().insert(context_id.to_owned(), known);
+}
+
+/// Returns all known contexts from the discovery registry.
+///
+/// Used by `py_mcp_load_contexts` to find routing IDs to probe on the relay.
+#[must_use]
+pub fn all_known_contexts() -> Vec<(String, KnownContext)> {
+    known_contexts_registry()
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect()
+}
+
+/// Returns known contexts where the given DID is the registered member.
+#[must_use]
+pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)> {
+    known_contexts_registry()
+        .iter()
+        .filter(|entry| entry.value().member_did == member_did)
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Relay connection state (SCP-213: transport wiring)
+// ---------------------------------------------------------------------------
+
+/// Stores a relay adapter connection for use by context discovery.
+///
+/// Called by `py_transport_connect` after a successful connection. The
+/// adapter is wrapped in `Arc` for shared ownership between the transport
+/// module and the discovery path in `py_mcp_load_contexts`.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
+pub fn set_relay_connection(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpPyError> {
+    let mut guard = relay_state().write().map_err(|_| {
+        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+    })?;
+    *guard = Some(adapter);
+    Ok(())
+}
+
+/// Returns the current relay adapter connection, if one is active.
+///
+/// Used by `py_mcp_load_contexts` to probe routing IDs. Returns `None`
+/// if `py_transport_connect` has not been called or the connection was
+/// cleared.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
+pub fn get_relay_connection() -> Result<Option<Arc<NativeRelayAdapter>>, ScpPyError> {
+    let guard = relay_state().read().map_err(|_| {
+        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+    })?;
+    Ok(guard.clone())
+}
+
+/// Clears the active relay connection.
+///
+/// Called when the transport is disconnected. After this, relay-based
+/// context discovery in `py_mcp_load_contexts` will fall back to
+/// local-only mode.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
+pub fn clear_relay_connection() -> Result<(), ScpPyError> {
+    let mut guard = relay_state().write().map_err(|_| {
+        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+    })?;
+    *guard = None;
+    Ok(())
 }

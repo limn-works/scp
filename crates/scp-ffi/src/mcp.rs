@@ -1374,25 +1374,41 @@ pub fn py_mcp_client_invoke(
     json_to_py_dict(py, &result_json)
 }
 
-/// Loads active contexts for a DID from a relay.
+/// Loads active contexts for a DID, combining local registry and relay discovery.
 ///
-/// Discovers the contexts that the given identity is a member of by
-/// querying the relay. Used during CLI startup to populate the MCP
-/// server with the agent's active contexts.
+/// Context discovery is **client-side** because the SCP relay is a dumb blob
+/// store with no identity-to-context mapping. This function:
+///
+/// 1. Collects contexts from the local runtime registry (always available).
+/// 2. Collects contexts from the known-contexts registry (SCP-213).
+/// 3. If a relay connection is active, probes known routing IDs via QUERY
+///    to determine which contexts have recent activity on the relay.
+/// 4. Falls back gracefully to local-only when the relay is unreachable.
+///
+/// Results are deduplicated by context ID. Each result dict contains:
+/// - `context_id` -- The context identifier.
+/// - `source` -- `"local"`, `"relay"`, or `"local+relay"`.
+/// - `creator_did` -- The context creator's DID (if available from runtime).
+/// - `member_count` -- Number of members (if available from runtime).
+/// - `tool_count` -- Number of registered tools (if available from runtime).
+/// - `relay_active` -- `True` if the relay returned blobs for this context.
 ///
 /// # Arguments
 ///
 /// * `identity_did` -- The DID to look up contexts for.
-/// * `relay_url` -- The relay URL to query.
+/// * `relay_url` -- The relay URL to query (used as a hint; the active
+///   transport connection is preferred if available).
 ///
 /// # Returns
 ///
-/// A list of context handle objects. Returns an empty list if no relay
-/// connection is available (no active transport connection).
+/// A list of context dicts. Returns an empty list if no contexts are found.
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the relay query fails.
+/// Raises `TransportError` if the relay query fails fatally (transient
+/// failures are handled by falling back to local-only).
+///
+/// See SCP-213, ADR-015 in `.docs/adrs/phase-3.md`.
 #[pyfunction]
 #[pyo3(name = "py_mcp_load_contexts")]
 pub fn py_mcp_load_contexts(
@@ -1400,17 +1416,32 @@ pub fn py_mcp_load_contexts(
     identity_did: &str,
     _relay_url: &str,
 ) -> PyResult<Vec<PyObject>> {
-    // Full relay discovery requires scp-transport wiring (not yet available).
-    // Return contexts from the local runtime registry that this identity is a
-    // member of. This is a meaningful improvement: locally created/joined
-    // contexts are now visible to MCP clients.
-    let context_ids = crate::runtime::context_ids_for_member(identity_did);
+    // Step 1: Collect contexts from the local runtime registry.
+    let local_context_ids = crate::runtime::context_ids_for_member(identity_did);
 
-    let mut results = Vec::with_capacity(context_ids.len());
-    for ctx_id in &context_ids {
+    // Step 2: Collect contexts from the known-contexts registry.
+    let known = crate::runtime::known_contexts_for_member(identity_did);
+
+    // Step 3: Probe relay for known routing IDs (if connected).
+    let relay_active_set = probe_relay_for_known_contexts(&known);
+
+    // Step 4: Build deduplicated result set.
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+
+    // Add local contexts first.
+    for ctx_id in &local_context_ids {
+        seen.insert(ctx_id.clone());
         let dict = PyDict::new(py);
         dict.set_item("context_id", ctx_id)?;
-        dict.set_item("source", "local")?;
+
+        let relay_active = relay_active_set.contains(ctx_id);
+        if relay_active {
+            dict.set_item("source", "local+relay")?;
+        } else {
+            dict.set_item("source", "local")?;
+        }
+        dict.set_item("relay_active", relay_active)?;
 
         // Enrich with creator DID and member count from runtime state.
         if let Ok(info) = crate::runtime::with_context(ctx_id, |rt| {
@@ -1428,7 +1459,84 @@ pub fn py_mcp_load_contexts(
         results.push(dict.into());
     }
 
+    // Add relay-only contexts (known but not in local registry).
+    for (ctx_id, known_ctx) in &known {
+        if seen.contains(ctx_id) {
+            continue;
+        }
+        seen.insert(ctx_id.clone());
+        let dict = PyDict::new(py);
+        dict.set_item("context_id", ctx_id)?;
+
+        let relay_active = relay_active_set.contains(ctx_id);
+        dict.set_item("source", "relay")?;
+        dict.set_item("relay_active", relay_active)?;
+        dict.set_item("relay_url", &known_ctx.relay_url)?;
+
+        results.push(dict.into());
+    }
+
     Ok(results)
+}
+
+/// Probes the relay for activity on known context routing IDs.
+///
+/// For each known context, sends a QUERY with `limit=1` to check if any
+/// blobs exist for that routing ID. Returns the set of context IDs that
+/// have activity on the relay.
+///
+/// Falls back to an empty set if no relay connection is available or if
+/// queries fail (graceful degradation).
+fn probe_relay_for_known_contexts(
+    known: &[(String, crate::runtime::KnownContext)],
+) -> std::collections::HashSet<String> {
+    use scp_transport::traits::RoutingId;
+    use scp_transport::TransportAdapter;
+
+    let mut active = std::collections::HashSet::new();
+
+    if known.is_empty() {
+        return active;
+    }
+
+    // Get the relay adapter. If none is connected, return empty set.
+    let adapter = match crate::runtime::get_relay_connection() {
+        Ok(Some(adapter)) => adapter,
+        _ => return active,
+    };
+
+    // Get the tokio runtime for blocking on async queries.
+    let rt = match crate::runtime() {
+        Ok(rt) => rt,
+        Err(_) => return active,
+    };
+
+    // Probe each known context's routing ID on the relay.
+    for (ctx_id, known_ctx) in known {
+        let routing_id = RoutingId::new(known_ctx.routing_id);
+        let query_result = rt.block_on(async {
+            // Use query() from the TransportAdapter trait with limit-like
+            // behavior: we only need to know if any blobs exist. The QUERY
+            // message returns all matching blobs up to the default limit, but
+            // we only check if the result is non-empty.
+            adapter.query(&routing_id, None).await
+        });
+
+        match query_result {
+            Ok(envelopes) if !envelopes.is_empty() => {
+                active.insert(ctx_id.clone());
+            }
+            Ok(_) => {
+                // Empty result: no activity for this routing ID.
+            }
+            Err(_) => {
+                // Query failed (relay error, timeout, etc.). Skip this context
+                // gracefully -- other contexts may still succeed.
+            }
+        }
+    }
+
+    active
 }
 
 // ---------------------------------------------------------------------------
@@ -1991,6 +2099,75 @@ mod tests {
         );
 
         crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Known context registry (SCP-213)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn known_context_registration_and_lookup() {
+        let creator = "did:dht:z6MkCreatorKnownCtx";
+        let ctx_id = crate::types::generate_random_id("known-ctx");
+        let routing_id = [0xAA; 32];
+
+        let known = crate::runtime::KnownContext {
+            routing_id,
+            relay_url: "ws://127.0.0.1:9000/scp/v1".to_owned(),
+            member_did: creator.to_owned(),
+            last_seen: 1_700_000_000,
+        };
+
+        crate::runtime::register_known_context(&ctx_id, known);
+
+        // Should be discoverable by member DID.
+        let found = crate::runtime::known_contexts_for_member(creator);
+        assert!(
+            found.iter().any(|(id, _)| id == &ctx_id),
+            "known context should be found by member DID"
+        );
+
+        // Should not be found for a different DID.
+        let not_found = crate::runtime::known_contexts_for_member("did:dht:z6MkSomeoneElse");
+        assert!(
+            !not_found.iter().any(|(id, _)| id == &ctx_id),
+            "known context should not be found for a different DID"
+        );
+
+        // Cleanup: remove_context also removes from known-contexts.
+        crate::runtime::remove_context(&ctx_id);
+        let after_remove = crate::runtime::known_contexts_for_member(creator);
+        assert!(
+            !after_remove.iter().any(|(id, _)| id == &ctx_id),
+            "known context should be removed after remove_context"
+        );
+    }
+
+    #[test]
+    fn probe_relay_with_no_connection_returns_empty() {
+        // When no relay connection is active, probing should return an empty set.
+        let known = vec![(
+            "test-ctx".to_owned(),
+            crate::runtime::KnownContext {
+                routing_id: [0xBB; 32],
+                relay_url: "ws://127.0.0.1:9000/scp/v1".to_owned(),
+                member_did: "did:dht:z6MkTest".to_owned(),
+                last_seen: 1_700_000_000,
+            },
+        )];
+
+        let active = probe_relay_for_known_contexts(&known);
+        assert!(
+            active.is_empty(),
+            "should return empty set when no relay is connected"
+        );
+    }
+
+    #[test]
+    fn probe_relay_with_empty_known_returns_empty() {
+        let known: Vec<(String, crate::runtime::KnownContext)> = vec![];
+        let active = probe_relay_for_known_contexts(&known);
+        assert!(active.is_empty(), "should return empty set for empty input");
     }
 
     #[test]

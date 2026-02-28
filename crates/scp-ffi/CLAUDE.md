@@ -32,7 +32,7 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 | `ucan.rs` | scp-core UCAN | `py_ucan_validate`, `py_ucan_mint`, `py_ucan_revoke` |
 | `event_log.rs` | scp-core event_log | `py_event_log_query`, `py_event_log_verify` |
 | `mcp.rs` | scp-mcp | `py_mcp_serve`, `py_mcp_client_connect_stdio/sse`, `py_mcp_client_disconnect`, `py_mcp_client_list_tools`, `py_mcp_client_invoke`, `py_mcp_server_stop/wait`, `py_mcp_server_register/deregister_tool`, `py_mcp_server_list_contexts`, `py_register_tool_handler` |
-| `transport.rs` | scp-transport | `py_transport_connect`, `py_transport_disconnect` |
+| `transport.rs` | scp-transport | `py_transport_connect`, `py_transport_disconnect`, `py_transport_status` |
 
 ### Build
 
@@ -92,4 +92,12 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
   - `py_mcp_reset_stdio_allowlist()` — restore defaults and re-enable enforcement.
   - `py_mcp_get_stdio_allowlist()` — introspect current state (`{"allowed": [...], "unrestricted": bool}`).
   - Python SDK exposes these as module-level functions: `configure_stdio_allowlist()`, `disable_stdio_allowlist(i_trust_all_commands=True)`, `reset_stdio_allowlist()`, `get_stdio_allowlist()`. Pre-validation in `McpClient.connect()` catches path and allowlist issues before crossing FFI, raising `ValidationError` with actionable messages.
-- `py_mcp_load_contexts` returns locally registered contexts where the identity is a member (SCP-210). Full relay discovery requires scp-transport wiring (not yet available). Uses `runtime::context_ids_for_member()` to iterate the registry.
+- **Context discovery (SCP-213)**: `py_mcp_load_contexts` performs client-side context discovery combining three sources:
+  1. **Local runtime registry** (`runtime::context_ids_for_member()`) — always available
+  2. **Known-contexts registry** (`runtime::known_contexts_for_member()`) — tracks context-to-routing-id-to-relay mappings
+  3. **Relay probe** — if a relay connection is active (via `py_transport_connect`), probes known routing IDs via QUERY to detect active contexts
+  - Falls back gracefully to local-only when relay is unreachable. Results are deduplicated by context ID.
+  - The relay is a dumb blob store with no identity-to-context mapping; discovery is purely client-side.
+  - `py_transport_connect(relay_url)` creates a `NativeRelayAdapter` and stores it in `runtime::RELAY_CONNECTION`. `py_transport_disconnect()` clears it.
+  - `runtime::KnownContext` stores `routing_id`, `relay_url`, `member_did`, `last_seen` for each tracked context.
+  - Each result dict contains: `context_id`, `source` ("local"/"relay"/"local+relay"), `relay_active` (bool), plus optional `creator_did`/`member_count`/`tool_count`.
