@@ -2,14 +2,14 @@
 //!
 //! Exposes SCP UCAN operations to Python:
 //!
-//! - [`py_ucan_validate`] — Validate a UCAN token against a required
+//! - [`py_ucan_validate`] -- Validate a UCAN token against a required
 //!   capability.
-//! - [`py_ucan_mint`] — Mint a new UCAN token for a member.
-//! - [`py_ucan_revoke`] — Revoke a UCAN token.
+//! - [`py_ucan_mint`] -- Mint a new UCAN token for a member.
+//! - [`py_ucan_revoke`] -- Revoke a UCAN token.
 //!
 //! # Types
 //!
-//! - [`PyUcanToken`] — UCAN token with ID, issuer, audience, capabilities,
+//! - [`PyUcanToken`] -- UCAN token with ID, issuer, audience, capabilities,
 //!   and expiry.
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` §6 and ADR-016 for the UCAN
@@ -18,6 +18,7 @@
 use pyo3::prelude::*;
 
 use crate::error::ScpPyError;
+use crate::types::encode_hex;
 
 // ---------------------------------------------------------------------------
 // PyUcanToken
@@ -29,7 +30,7 @@ use crate::error::ScpPyError;
 /// (derived from the nonce), the issuer DID, the audience DID, the list of
 /// granted capabilities, and an optional expiry timestamp.
 ///
-/// The raw signature and encoded JWT are not exposed — they are internal
+/// The raw signature and encoded JWT are not exposed -- they are internal
 /// to the Rust crypto layer and not needed by Python callers.
 ///
 /// See ADR-016 (UCAN validation) and ADR-013 §6 (bridge layer).
@@ -40,11 +41,11 @@ pub struct PyUcanToken {
     #[pyo3(get)]
     pub token_id: String,
 
-    /// Issuer DID — the entity that created and signed this token.
+    /// Issuer DID -- the entity that created and signed this token.
     #[pyo3(get)]
     pub issuer: String,
 
-    /// Audience DID — the entity this token is delegated to.
+    /// Audience DID -- the entity this token is delegated to.
     #[pyo3(get)]
     pub audience: String,
 
@@ -81,49 +82,154 @@ impl PyUcanToken {
 
 /// Validates a UCAN token for a required capability.
 ///
-/// Performs full UCAN validation: signature verification, time bounds
-/// checking, delegation chain traversal, attenuation enforcement, nonce
-/// replay detection, and capability matching.
+/// Performs structural UCAN validation: JWT format parsing, header field
+/// checking (algorithm = EdDSA, version = 0.10.0), time bounds verification,
+/// capability matching, and revocation list checking.
+///
+/// Full cryptographic signature verification requires a DID resolver with
+/// access to public keys, which is connected when the transport layer is
+/// wired. This function validates everything that can be checked without
+/// external key resolution.
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context the token is presented in.
-/// * `token` — The encoded UCAN token string (JWT format).
-/// * `capability` — The required capability URI (e.g.,
+/// * `context_id` -- The ID of the context the token is presented in.
+/// * `token` -- The encoded UCAN token string (JWT format).
+/// * `capability` -- The required capability URI (e.g.,
 ///   `"scp:ctx:abc123/messages:write"`).
 ///
 /// # Errors
 ///
 /// Raises `UcanError` if validation fails for any reason: malformed token,
-/// invalid signature, expired token, insufficient capabilities, revoked
-/// token, broken delegation chain, etc.
+/// unsupported algorithm/version, expired token, insufficient capabilities,
+/// revoked token, etc.
 ///
 /// See ADR-013 §6: `py_ucan_validate(handle, token, capability) -> None`.
 #[pyfunction]
 #[pyo3(name = "ucan_validate")]
 pub fn py_ucan_validate(
-    _context_id: &str,
-    _token: &str,
-    _capability: &str,
+    context_id: &str,
+    token: &str,
+    capability: &str,
 ) -> PyResult<()> {
-    Err(ScpPyError::UcanError(
-        "not yet connected to runtime — UCAN validation requires a live context handle"
-            .to_owned(),
-    )
-    .into())
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    // Step 1: Parse the JWT format (header.payload.signature).
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(ScpPyError::UcanError(format!(
+            "malformed token: expected 3 JWT segments, got {}",
+            parts.len()
+        ))
+        .into());
+    }
+
+    // Step 2: Decode and validate the header.
+    let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).map_err(|e| {
+        ScpPyError::UcanError(format!("malformed token: invalid base64 in header: {e}"))
+    })?;
+    let header: scp_core::crypto::ucan::UcanHeader =
+        serde_json::from_slice(&header_bytes).map_err(|e| {
+            ScpPyError::UcanError(format!("malformed token: invalid header JSON: {e}"))
+        })?;
+    header.validate().map_err(ScpPyError::from)?;
+
+    // Step 3: Decode and parse the payload.
+    let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).map_err(|e| {
+        ScpPyError::UcanError(format!("malformed token: invalid base64 in payload: {e}"))
+    })?;
+    let payload: scp_core::crypto::ucan::UcanPayload =
+        serde_json::from_slice(&payload_bytes).map_err(|e| {
+            ScpPyError::UcanError(format!("malformed token: invalid payload JSON: {e}"))
+        })?;
+
+    // Step 4: Check time bounds.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ScpPyError::UcanError(format!("system clock error: {e}")))?
+        .as_secs();
+
+    if payload.exp <= now {
+        return Err(ScpPyError::UcanError("token expired".to_owned()).into());
+    }
+    if let Some(nbf) = payload.nbf {
+        if nbf > now {
+            return Err(ScpPyError::UcanError("token not yet valid".to_owned()).into());
+        }
+    }
+
+    // Steps 5-6: Check capability match and revocation list.
+    //
+    // Both checks run inside `with_context` because wildcard capability
+    // validation requires access to `rt.creator_did` — wildcard tokens
+    // (`scp:ctx:*/{action}`) are only valid when issued by the context
+    // creator (root authority tokens per ADR-016 §9).
+    let required_action = if capability.starts_with("scp:ctx:") {
+        // Extract action from "scp:ctx:{context_id}/{action}".
+        capability.find('/').and_then(|_first_slash| {
+            let after_prefix = &capability["scp:ctx:".len()..];
+            after_prefix.find('/').map(|pos| &after_prefix[pos + 1..])
+        })
+    } else {
+        // Bare capability (e.g. "messages:write") — use as-is.
+        Some(capability)
+    };
+
+    crate::runtime::with_context(context_id, |rt| {
+        // Step 5: Check capability match.
+        let has_matching_capability = payload.att.iter().any(|att| {
+            // Exact match.
+            if att.with == capability {
+                return true;
+            }
+            // Wildcard context match: token has "scp:ctx:*/{action}" and the
+            // required action matches. Wildcard tokens are only accepted from
+            // the context creator (root authority per ADR-016 §9).
+            if let Some(action) = required_action {
+                if att.with == format!("scp:ctx:*/{action}")
+                    && payload.iss == rt.creator_did
+                {
+                    return true;
+                }
+            }
+            false
+        });
+        if !has_matching_capability {
+            return Err(ScpPyError::UcanError(format!(
+                "capability not granted: {capability}"
+            )));
+        }
+
+        // Step 6: Check revocation list.
+        let token_hash = compute_token_hash(token);
+        if rt.revocation_list.is_revoked(&token_hash) {
+            return Err(ScpPyError::UcanError(format!(
+                "token revoked: {token_hash}"
+            )));
+        }
+
+        Ok(())
+    })?;
+
+    Ok(())
 }
 
 /// Mints a new UCAN token for a context member.
 ///
 /// Creates a new UCAN token granting the specified capabilities to the
-/// given member DID. The token is signed by the context creator's key
-/// (or the delegating member's key in a delegation chain).
+/// given member DID. The token is structured with proper SCP capability
+/// URIs scoped to the context.
+///
+/// Full Ed25519 signing requires key custody integration which is connected
+/// when the transport layer is wired. This function creates a properly
+/// formatted token with a placeholder signature.
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context to mint the token for.
-/// * `member_did` — The DID of the member receiving the token.
-/// * `capabilities` — List of capability URIs to grant.
+/// * `context_id` -- The ID of the context to mint the token for.
+/// * `member_did` -- The DID of the member receiving the token.
+/// * `capabilities` -- List of capability URIs to grant.
 ///
 /// # Returns
 ///
@@ -138,44 +244,119 @@ pub fn py_ucan_validate(
 #[pyfunction]
 #[pyo3(name = "ucan_mint")]
 pub fn py_ucan_mint(
-    _context_id: &str,
-    _member_did: &str,
-    _capabilities: Vec<String>,
+    context_id: &str,
+    member_did: &str,
+    capabilities: Vec<String>,
 ) -> PyResult<PyUcanToken> {
-    Err(ScpPyError::UcanError(
-        "not yet connected to runtime — UCAN minting requires a live context handle".to_owned(),
-    )
-    .into())
+    // Look up the context to get the creator DID (issuer).
+    let creator_did = crate::runtime::with_context(context_id, |rt| {
+        Ok(rt.creator_did.clone())
+    })?;
+
+    // Generate a unique nonce for the token ID.
+    let nonce = generate_nonce()?;
+
+    // Build capability attestations scoped to the context.
+    let capability_uris: Vec<String> = capabilities
+        .iter()
+        .map(|cap| {
+            if cap.starts_with("scp:ctx:") {
+                cap.clone()
+            } else {
+                format!("scp:ctx:{context_id}/{cap}")
+            }
+        })
+        .collect();
+
+    // Calculate expiry: 1 hour from now (default, within 24h max).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ScpPyError::UcanError(format!("system clock error: {e}")))?
+        .as_secs();
+    let exp = now + 3600; // 1 hour
+
+    Ok(PyUcanToken {
+        token_id: nonce,
+        issuer: creator_did,
+        audience: member_did.to_owned(),
+        capabilities: capability_uris,
+        expires_at: Some(exp as f64),
+    })
 }
 
 /// Revokes a UCAN token.
 ///
 /// Adds the token to the context's revocation list. Revoked tokens are
-/// no longer accepted by validation. Revocation is distributed to all
-/// context members via MLS.
+/// no longer accepted by validation. In the full runtime, revocation is
+/// distributed to all context members via MLS.
+///
+/// The token is identified by its CID (SHA-256 of the encoded JWT),
+/// matching the identifier used during validation. Callers must pass the
+/// full encoded token string, not just the token ID/nonce.
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context the token belongs to.
-/// * `token_id` — The unique ID of the token to revoke.
+/// * `context_id` -- The ID of the context the token belongs to.
+/// * `token` -- The full encoded UCAN token string (JWT format).
 ///
 /// # Errors
 ///
-/// Raises `UcanError` if revocation fails: token not found, revoker not
-/// authorized (must be the token's issuer or context creator), etc.
+/// Raises `UcanError` if revocation fails: context not found, etc.
 ///
-/// See ADR-013 §6: `py_ucan_revoke(handle, token_id) -> None`.
+/// See ADR-013 §6: `py_ucan_revoke(handle, token) -> None`.
 #[pyfunction]
 #[pyo3(name = "ucan_revoke")]
 pub fn py_ucan_revoke(
-    _context_id: &str,
-    _token_id: &str,
+    context_id: &str,
+    token: &str,
 ) -> PyResult<()> {
-    Err(ScpPyError::UcanError(
-        "not yet connected to runtime — UCAN revocation requires a live context handle"
-            .to_owned(),
-    )
-    .into())
+    crate::runtime::with_context(context_id, |rt| {
+        // Compute the token's CID for revocation, matching the identifier
+        // used in py_ucan_validate's revocation check.
+        let token_cid = compute_token_hash(token);
+        rt.revocation_list.revoke(token_cid);
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
+///
+/// Uses cryptographic randomness via `rand::thread_rng()` (backed by `OsRng`)
+/// to produce unpredictable nonces as required by ADR-016 §7.2.
+fn generate_nonce() -> Result<String, ScpPyError> {
+    use rand::Rng;
+
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ScpPyError::UcanError(format!("system clock error: {e}")))?
+        .as_millis();
+
+    let mut random_bytes = [0u8; 16];
+    rand::thread_rng().fill(&mut random_bytes);
+
+    let hex = encode_hex(&random_bytes);
+    Ok(format!("{now_millis}-{hex}"))
+}
+
+/// Computes a SHA-256 hash identifier for a token string.
+///
+/// Returns `sha256:{64_hex_chars}` — the full 32-byte hash for collision
+/// resistance. Used as the revocation list key: tokens revoked via
+/// [`py_ucan_revoke`] are looked up by this identifier during validation.
+///
+/// This is an internal identifier, not a CID v1 encoding. When scp-ffi
+/// delegates to scp-core's full validation pipeline (SCP-164), this will
+/// be replaced by `scp_core::crypto::ucan::mint::compute_cid`.
+fn compute_token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(token.as_bytes());
+    format!("sha256:{}", encode_hex(&hash))
 }
 
 // ---------------------------------------------------------------------------

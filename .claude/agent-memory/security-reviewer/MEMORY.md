@@ -64,12 +64,19 @@
 - REMAINING (MEDIUM): Attestation canonical hash uses Debug format for type tag
 - REMAINING (MEDIUM): attestation.claim.to_string() JSON not canonically ordered
 
-### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`)
-- OnceLock for tokio runtime singleton -- correct pattern
-- `#![allow(unsafe_code)]` -- correct FFI exception
-- init_runtime NOW uses map_err (no panic across FFI)
-- shutdown_runtime reduced to 100ms (from 5s) but still blocks GIL
-- SHUTDOWN_TIMEOUT const stale (5s) vs actual behavior (100ms)
+### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- Audit 2026-02-28
+- See `pyo3-audit-20260228.md` for full finding details
+- HIGH: expect() panic across FFI in py_context_create (line 457) -- only unguarded clock call
+- HIGH: UCAN validate does not bind token to presented context -- wildcard cross-context bypass
+- HIGH: Context IDs are nanosecond timestamps, not CSPRNG -- predictable + collidable
+- MEDIUM: py_ucan_revoke has no authorization check
+- MEDIUM: py_ucan_mint has no authorization check (always uses creator_did)
+- MEDIUM: py_context_close ignores identity_did, no ContextClose capability check
+- MEDIUM: py_context_close TOCTOU between state="closed" and remove_context
+- MEDIUM: MCP SSE client accepts any URL scheme (file://, javascript:, etc.)
+- MEDIUM: u128-to-u64 timestamp truncation via `as` cast in mcp.rs
+- TRACKED: UCAN sig verification (#105), MCP stubs (#106), registries unbounded (#108), recursion depth (#110), clock drift (#107), missing ContextParams (#109)
+- GOOD: DashMap, CSPRNG MCP handles, NaN/Infinity rejection, poisoned mutex handling, typed errors, tool invoke capability check, bounded mpsc(256)
 
 ### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 Review (2026-02-26)
 - CRITICAL: scp-platform testing feature STILL in production deps (cdylib)

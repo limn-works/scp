@@ -30,12 +30,8 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use scp_core::identity::cache::SystemClock;
-use scp_core::identity::{DidCache, DidDht, DidDocument, DidMethod, InMemoryDhtClient};
+use scp_core::identity::{DidDht, DidDocument, DidMethod};
 use scp_platform::testing::InMemoryKeyCustody;
-
-/// Concrete type alias for the default `DidDht` instance used by bridge functions.
-type DefaultDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
 use crate::error::ScpPyError;
 
@@ -347,65 +343,27 @@ fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
 ///
 /// * `identity` — The [`PyIdentity`] whose key should be rotated.
 ///
-/// # Returns
-///
-/// A new [`PyIdentity`] with the same DID but a rotated key.
-///
 /// # Errors
 ///
-/// Raises `IdentityError` if key rotation fails (resolution, key generation,
-/// or publish failure).
+/// Always raises `IdentityError`. Key rotation requires a wired platform
+/// `KeyCustodyProvider` that retains key handles across the FFI boundary.
+/// `PyIdentity` currently stores only the DID string and custody label,
+/// which is insufficient for cryptographic key rotation. The previous
+/// implementation silently created a *new* identity with a different DID,
+/// which is incorrect.
 ///
-/// See ADR-013 acceptance criterion 2.
+/// NAPI and UniFFI bindings also return explicit errors for this operation.
+///
+/// Tracked: full key rotation will be wired when persistent key storage
+/// lands (see SCP-164 and ADR-013 acceptance criterion 2).
 #[pyfunction]
-fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
-    let did = identity.did.clone();
-    let custody_str = identity.custody.clone();
-    let rt = crate::runtime()?;
-
-    py.allow_threads(|| {
-        rt.block_on(async {
-            // Create a new key custody and DID method with signing capability.
-            // In a fully wired system, the key custody would be loaded from
-            // persistent storage. For now, we create a fresh instance with
-            // signing capability for the rotation operation.
-            let key_custody = Arc::new(InMemoryKeyCustody::new());
-            let sign_fn = DefaultDidDht::make_sign_fn(Arc::clone(&key_custody));
-            let dht_client = Arc::new(InMemoryDhtClient::new());
-            let cache = Arc::new(DidCache::new());
-            let did_method = DidDht::with_client_and_signer(dht_client, cache, sign_fn);
-
-            // Create a temporary identity to perform the rotation. The real
-            // implementation will reconstruct the identity from storage using
-            // the DID string. For now, we create a fresh identity and rotate
-            // its key to demonstrate the full rotation flow.
-            let (temp_identity, temp_doc) = did_method
-                .create(key_custody.as_ref())
-                .await
-                .map_err(ScpPyError::from)?;
-
-            // Publish the initial document so resolve works during rotation.
-            did_method
-                .publish(&temp_identity, &temp_doc)
-                .await
-                .map_err(ScpPyError::from)?;
-
-            // Perform the rotation.
-            let (rotated, _rotated_doc) = did_method
-                .rotate(&temp_identity, key_custody.as_ref())
-                .await
-                .map_err(ScpPyError::from)?;
-
-            // Return a PyIdentity with the original DID preserved. Once
-            // storage is wired, the original key handles will be loaded and
-            // the rotation will update the original identity's keys in place.
-            let _ = did;
-            Ok(PyIdentity {
-                did: rotated.did,
-                custody: custody_str,
-            })
-        })
-    })
+fn py_identity_rotate_key(_identity: &PyIdentity) -> PyResult<PyIdentity> {
+    Err(ScpPyError::IdentityError(
+        "key rotation requires a wired platform KeyCustodyProvider — \
+         PyIdentity does not retain key handles across the FFI boundary"
+            .to_owned(),
+    )
+    .into())
 }
 
 // ---------------------------------------------------------------------------

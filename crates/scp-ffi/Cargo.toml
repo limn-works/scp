@@ -17,9 +17,14 @@ test = false
 pyo3 = { version = "0.23", features = ["extension-module", "experimental-async"] }
 tokio = { workspace = true }
 scp-core = { path = "../scp-core" }
+scp-mcp = { path = "../scp-mcp" }
 scp-platform = { path = "../scp-platform", features = ["software_platform"] }
 scp-transport = { path = "../scp-transport" }
 serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 pyo3 = { version = "0.23", features = ["auto-initialize"] }

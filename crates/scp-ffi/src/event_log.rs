@@ -2,16 +2,16 @@
 //!
 //! Exposes SCP event log operations to Python:
 //!
-//! - [`py_event_log_query`] — Query the context event log with optional
+//! - [`py_event_log_query`] -- Query the context event log with optional
 //!   filters.
-//! - [`py_event_log_verify`] — Verify a claim against the event log
+//! - [`py_event_log_verify`] -- Verify a claim against the event log
 //!   (inclusion/absence proofs).
 //!
 //! # Types
 //!
-//! - [`PyEvent`] — A protocol event (type, actor, timestamp, payload,
+//! - [`PyEvent`] -- A protocol event (type, actor, timestamp, payload,
 //!   sequence).
-//! - [`PyProof`] — A verification proof (verified, proof type, details).
+//! - [`PyProof`] -- A verification proof (verified, proof type, details).
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` §7 and ADR-011 for the event
 //! log specification.
@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::error::ScpPyError;
-use crate::types::json_to_py_dict;
+use crate::types::{encode_hex, json_to_py_dict};
 
 // ---------------------------------------------------------------------------
 // PyEvent
@@ -115,13 +115,14 @@ impl PyProof {
 
 /// Queries the context event log.
 ///
-/// Returns a list of events matching the optional filter criteria. If no
-/// filter is provided, returns all events in the log.
+/// Returns metadata about the event log: current event count and the Merkle
+/// root hash. Direct event replay requires the full transport layer; this
+/// function provides verifiable log state information.
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context whose event log to query.
-/// * `filter` — An optional Python dict with filter parameters:
+/// * `context_id` -- The ID of the context whose event log to query.
+/// * `filter` -- An optional Python dict with filter parameters:
 ///   - `"event_type"` (str): Filter by event type name.
 ///   - `"actor_did"` (str): Filter by actor DID.
 ///   - `"after_sequence"` (int): Only events after this sequence number.
@@ -132,7 +133,10 @@ impl PyProof {
 ///
 /// # Returns
 ///
-/// A list of [`PyEvent`] objects matching the filter.
+/// A list of [`PyEvent`] objects. Currently returns a single summary event
+/// with the log's Merkle root and event count, since full event replay
+/// requires transport-layer event storage (events are hashed into the Merkle
+/// tree but the raw events are not stored in the in-memory tree structure).
 ///
 /// # Errors
 ///
@@ -141,16 +145,60 @@ impl PyProof {
 ///
 /// See ADR-013 §7: `py_event_log_query(handle, filter) -> list[PyEvent]`.
 #[pyfunction]
-#[pyo3(name = "event_log_query", signature = (_context_id, _filter=None))]
+#[pyo3(name = "event_log_query", signature = (context_id, filter=None))]
 pub fn py_event_log_query(
-    _context_id: &str,
-    _filter: Option<&Bound<'_, PyDict>>,
+    py: Python<'_>,
+    context_id: &str,
+    filter: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<PyEvent>> {
-    Err(ScpPyError::ContextError(
-        "not yet connected to runtime — event log query requires a live context handle"
-            .to_owned(),
-    )
-    .into())
+    // Look up the context's event log from the runtime registry.
+    let (event_count, merkle_root_hex) = crate::runtime::with_context(context_id, |rt| {
+        let count = scp_core::event_log::tree::event_count(&rt.event_log);
+        let root = scp_core::event_log::tree::root(&rt.event_log);
+        Ok((count, encode_hex(&root)))
+    })?;
+
+    // Apply limit filter if provided.
+    let limit = if let Some(f) = filter {
+        f.get_item("limit")?
+            .and_then(|v| v.extract::<usize>().ok())
+    } else {
+        None
+    };
+
+    // If the log is empty, return an empty list.
+    if event_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Build a summary event with log metadata. The Merkle tree stores leaf
+    // hashes, not raw events, so we return log state information. Full event
+    // replay will be available when events are persisted via the transport layer.
+    let payload_json = serde_json::json!({
+        "event_count": event_count,
+        "merkle_root": merkle_root_hex,
+    });
+    let payload = json_to_py_dict(py, &payload_json)?;
+
+    let summary_event = PyEvent {
+        event_type: "LogSummary".to_owned(),
+        actor_did: String::new(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| ScpPyError::ContextError(format!("system clock error: {e}")))?
+            .as_secs() as f64,
+        payload,
+        sequence: event_count.saturating_sub(1),
+    };
+
+    let events = vec![summary_event];
+
+    // Apply limit if specified.
+    if let Some(lim) = limit {
+        Ok(events.into_iter().take(lim).collect())
+    } else {
+        Ok(events)
+    }
 }
 
 /// Verifies a claim against the context event log.
@@ -161,9 +209,9 @@ pub fn py_event_log_query(
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context whose event log to verify
+/// * `context_id` -- The ID of the context whose event log to verify
 ///   against.
-/// * `claim` — A Python dict describing the claim to verify:
+/// * `claim` -- A Python dict describing the claim to verify:
 ///   - `"type"` (str): `"inclusion"` or `"absence"`.
 ///   - `"leaf_index"` (int): For inclusion proofs, the event's position.
 ///   - `"event_hash"` (str): For absence proofs, the hex-encoded hash
@@ -183,17 +231,176 @@ pub fn py_event_log_query(
 #[pyo3(name = "event_log_verify")]
 pub fn py_event_log_verify(
     py: Python<'_>,
-    _context_id: &str,
-    _claim: &Bound<'_, PyDict>,
+    context_id: &str,
+    claim: &Bound<'_, PyDict>,
 ) -> PyResult<PyProof> {
-    // Ensure json_to_py_dict is available for future implementations
-    // that will convert proof details to Python objects.
-    let _ = json_to_py_dict(py, &serde_json::Value::Null)?;
-    Err(ScpPyError::ContextError(
-        "not yet connected to runtime — event log verification requires a live context handle"
-            .to_owned(),
-    )
-    .into())
+    use crate::types::py_dict_to_json;
+
+    // Parse the claim dict.
+    let claim_json = py_dict_to_json(claim)?;
+
+    let claim_type = claim_json
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ScpPyError::ValidationError(
+                "claim must include 'type' field ('inclusion' or 'absence')".to_owned(),
+            )
+        })?;
+
+    match claim_type {
+        "inclusion" => {
+            let leaf_index = claim_json
+                .get("leaf_index")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| {
+                    ScpPyError::ValidationError(
+                        "inclusion claim must include 'leaf_index' (integer)".to_owned(),
+                    )
+                })?;
+
+            // Generate and verify the inclusion proof via scp-core.
+            let proof_result = crate::runtime::with_context(context_id, |rt| {
+                let proof = scp_core::event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
+                    .map_err(|e| {
+                        ScpPyError::ContextError(format!("inclusion proof failed: {e}"))
+                    })?;
+                let verified = scp_core::event_log::proof::verify_inclusion(&proof);
+
+                let path_steps: Vec<serde_json::Value> = proof
+                    .path
+                    .iter()
+                    .map(|step| {
+                        let direction = match step.direction {
+                            scp_core::event_log::proof::Direction::Left => "left",
+                            scp_core::event_log::proof::Direction::Right => "right",
+                        };
+                        serde_json::json!({
+                            "sibling_hash": encode_hex(&step.sibling_hash),
+                            "direction": direction,
+                        })
+                    })
+                    .collect();
+
+                let details = serde_json::json!({
+                    "leaf_index": proof.leaf_index,
+                    "leaf_hash": encode_hex(&proof.leaf_hash),
+                    "root": encode_hex(&proof.root),
+                    "path": path_steps,
+                    "path_length": proof.path.len(),
+                });
+
+                Ok((verified, details))
+            })?;
+
+            let (verified, details_json) = proof_result;
+            let details = json_to_py_dict(py, &details_json)?;
+
+            Ok(PyProof {
+                verified,
+                proof_type: "inclusion".to_owned(),
+                details,
+            })
+        }
+        "absence" => {
+            let event_hash_hex = claim_json
+                .get("event_hash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ScpPyError::ValidationError(
+                        "absence claim must include 'event_hash' (hex string)".to_owned(),
+                    )
+                })?;
+
+            // Decode the hex event hash.
+            let event_hash = decode_hex_hash(event_hash_hex).map_err(|e| {
+                ScpPyError::ValidationError(format!("invalid event_hash: {e}"))
+            })?;
+
+            // Generate the absence proof via scp-core.
+            let proof_result = crate::runtime::with_context(context_id, |rt| {
+                let proof = scp_core::event_log::proof::prove_absence(&rt.event_log, &event_hash)
+                    .map_err(|e| {
+                        ScpPyError::ContextError(format!("absence proof failed: {e}"))
+                    })?;
+
+                let lower = proof.lower.as_ref().map(|lwp| {
+                    serde_json::json!({
+                        "leaf_hash": encode_hex(&lwp.leaf_hash),
+                        "leaf_index": lwp.leaf_index,
+                    })
+                });
+
+                let upper = proof.upper.as_ref().map(|uwp| {
+                    serde_json::json!({
+                        "leaf_hash": encode_hex(&uwp.leaf_hash),
+                        "leaf_index": uwp.leaf_index,
+                    })
+                });
+
+                // Verify the neighbor inclusion proofs.
+                let lower_verified = proof
+                    .lower
+                    .as_ref()
+                    .is_none_or(|lwp| {
+                        scp_core::event_log::proof::verify_inclusion(&lwp.inclusion_proof)
+                    });
+                let upper_verified = proof
+                    .upper
+                    .as_ref()
+                    .is_none_or(|uwp| {
+                        scp_core::event_log::proof::verify_inclusion(&uwp.inclusion_proof)
+                    });
+                let verified = lower_verified && upper_verified;
+
+                let details = serde_json::json!({
+                    "query_hash": encode_hex(&proof.query_hash),
+                    "root": encode_hex(&proof.root),
+                    "leaf_count": proof.leaf_count,
+                    "lower": lower,
+                    "upper": upper,
+                });
+
+                Ok((verified, details))
+            })?;
+
+            let (verified, details_json) = proof_result;
+            let details = json_to_py_dict(py, &details_json)?;
+
+            Ok(PyProof {
+                verified,
+                proof_type: "absence".to_owned(),
+                details,
+            })
+        }
+        other => Err(ScpPyError::ValidationError(format!(
+            "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
+        ))
+        .into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Decodes a hex string into a 32-byte hash.
+fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "expected 64 hex characters (32 bytes), got {}",
+            hex.len()
+        ));
+    }
+
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk)
+            .map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
+        bytes[i] = u8::from_str_radix(s, 16)
+            .map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
