@@ -2,6 +2,8 @@
 .fastembed_cache/
 target/
 bindings/swift/.build/
+bindings/kotlin/.gradle/
+bindings/kotlin/**/build/
 
 .claude/worktrees
 

@@ -1,0 +1,16 @@
+build:
+  maxIssues: 0
+
+complexity:
+  LongMethod:
+    threshold: 60
+  ComplexCondition:
+    threshold: 4
+  CyclomaticComplexMethod:
+    threshold: 15
+
+style:
+  MagicNumber:
+    active: false
+  ReturnCount:
+    max: 4
