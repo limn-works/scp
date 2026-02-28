@@ -1,6 +1,7 @@
 .DS_Store
 .fastembed_cache/
 target/
+__pycache__/
 bindings/swift/.build/
 bindings/kotlin/.gradle/
 bindings/kotlin/**/build/
