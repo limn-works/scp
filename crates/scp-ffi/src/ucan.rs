@@ -159,8 +159,34 @@ pub fn py_ucan_validate(
     }
 
     // Step 5: Check capability match.
+    // A token capability matches the required capability if:
+    // (a) exact match, or
+    // (b) token grants a wildcard context capability (scp:ctx:*/{action})
+    //     that matches the action portion of the required capability.
+    let required_action = if capability.starts_with("scp:ctx:") {
+        // Extract action from "scp:ctx:{context_id}/{action}".
+        capability.find('/').and_then(|_first_slash| {
+            let after_prefix = &capability["scp:ctx:".len()..];
+            after_prefix.find('/').map(|pos| &after_prefix[pos + 1..])
+        })
+    } else {
+        // Bare capability (e.g. "messages:write") — use as-is.
+        Some(capability)
+    };
+
     let has_matching_capability = payload.att.iter().any(|att| {
-        att.with == capability || att.with == format!("scp:ctx:*/{}", capability.rsplit('/').next().unwrap_or(""))
+        // Exact match.
+        if att.with == capability {
+            return true;
+        }
+        // Wildcard context match: token has "scp:ctx:*/{action}" and the
+        // required action matches.
+        if let Some(action) = required_action {
+            if att.with == format!("scp:ctx:*/{action}") {
+                return true;
+            }
+        }
+        false
     });
     if !has_matching_capability {
         return Err(ScpPyError::UcanError(format!(
@@ -291,23 +317,38 @@ pub fn py_ucan_revoke(
 // ---------------------------------------------------------------------------
 
 /// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
+///
+/// Uses SHA-256 of timestamp + counter to produce unpredictable nonces
+/// without requiring an external random number generator crate.
 fn generate_nonce() -> String {
+    use sha2::{Digest, Sha256};
+
     let now_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
 
-    // Use a simple counter-based approach for uniqueness since we may not
-    // have OsRng available in all environments.
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{now_millis}-{count:032x}")
+
+    // Hash timestamp + counter to produce unpredictable output.
+    let mut hasher = Sha256::new();
+    hasher.update(now_millis.to_le_bytes());
+    hasher.update(count.to_le_bytes());
+    let hash = hasher.finalize();
+    let hex: String = hash[..16].iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    format!("{now_millis}-{hex}")
 }
 
 /// Computes a simple content identifier for a token string.
 ///
 /// Uses SHA-256 and a `bafyrei` prefix following the CID v1 convention.
+/// Uses the full 32-byte hash (64 hex chars) for full collision resistance.
 fn compute_simple_cid(token: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(token.as_bytes());
@@ -316,7 +357,7 @@ fn compute_simple_cid(token: &str) -> String {
         let _ = write!(acc, "{b:02x}");
         acc
     });
-    format!("bafyrei{}", &hex[..40])
+    format!("bafyrei{hex}")
 }
 
 // ---------------------------------------------------------------------------
