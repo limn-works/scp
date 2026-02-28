@@ -191,6 +191,13 @@ pub fn py_tool_register(
     // Extract test vectors (optional).
     let test_vectors = extract_test_vectors(registration)?;
 
+    // Extract implementation hash (optional, 32-byte SHA-256 of tool code).
+    // Per spec §5.4: content-addressable reference to the tool's implementation.
+    let implementation_hash = extract_implementation_hash(registration)?;
+
+    // Extract economic metadata (optional, per spec §5.4).
+    let economic_metadata = extract_economic_metadata(registration)?;
+
     // Generate a tool ID from the name (deterministic, human-readable).
     let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
@@ -203,10 +210,10 @@ pub fn py_tool_register(
             input_schema,
             output_schema,
         },
-        implementation_hash: [0u8; 32], // Default hash; caller can update later.
+        implementation_hash,
         test_vectors,
         operator_did: operator_did.into(),
-        economic_metadata: None,
+        economic_metadata,
     };
 
     // Look up the context runtime and register the tool.
@@ -379,6 +386,95 @@ pub fn py_tool_verify(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Extracts the optional `implementation_hash` from the registration dict.
+///
+/// Accepts a hex-encoded SHA-256 hash string (64 chars). Returns zeroed hash
+/// if not provided. Per spec §5.4: content-addressable reference to the tool's
+/// implementation.
+fn extract_implementation_hash(
+    registration: &Bound<'_, PyDict>,
+) -> PyResult<[u8; 32]> {
+    let hash_obj = match registration.get_item("implementation_hash")? {
+        Some(val) if !val.is_none() => val,
+        _ => return Ok([0u8; 32]),
+    };
+
+    let hex_str: String = hash_obj.extract().map_err(|_| {
+        ScpPyError::ValidationError(
+            "'implementation_hash' must be a hex string".to_owned(),
+        )
+    })?;
+
+    if hex_str.len() != 64 {
+        return Err(ScpPyError::ValidationError(format!(
+            "'implementation_hash' must be 64 hex chars (SHA-256), got {}",
+            hex_str.len()
+        ))
+        .into());
+    }
+
+    let mut hash = [0u8; 32];
+    for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
+        let byte_str = std::str::from_utf8(chunk).map_err(|_| {
+            ScpPyError::ValidationError("invalid UTF-8 in implementation_hash".to_owned())
+        })?;
+        hash[i] = u8::from_str_radix(byte_str, 16).map_err(|_| {
+            ScpPyError::ValidationError(format!(
+                "invalid hex in implementation_hash at position {}", i * 2
+            ))
+        })?;
+    }
+
+    Ok(hash)
+}
+
+/// Extracts optional `economic_metadata` from the registration dict.
+///
+/// Accepts a Python dict with `cost_per_invoke` (int), optional
+/// `cost_formula` (str), and `payee` (str DID). Per spec §5.4.
+fn extract_economic_metadata(
+    registration: &Bound<'_, PyDict>,
+) -> PyResult<Option<scp_core::context::tools::ToolEconomicMetadata>> {
+    let meta_obj = match registration.get_item("economic_metadata")? {
+        Some(val) if !val.is_none() => val,
+        _ => return Ok(None),
+    };
+
+    let dict = meta_obj.downcast::<PyDict>().map_err(|_| {
+        ScpPyError::ValidationError("'economic_metadata' must be a dict".to_owned())
+    })?;
+
+    let cost_per_invoke: u64 = dict
+        .get_item("cost_per_invoke")?
+        .ok_or_else(|| {
+            ScpPyError::ValidationError(
+                "economic_metadata missing 'cost_per_invoke'".to_owned(),
+            )
+        })?
+        .extract()?;
+
+    let cost_formula: Option<String> = dict
+        .get_item("cost_formula")?
+        .and_then(|v| if v.is_none() { None } else { Some(v) })
+        .map(|v| v.extract())
+        .transpose()?;
+
+    let payee: String = dict
+        .get_item("payee")?
+        .ok_or_else(|| {
+            ScpPyError::ValidationError(
+                "economic_metadata missing 'payee'".to_owned(),
+            )
+        })?
+        .extract()?;
+
+    Ok(Some(scp_core::context::tools::ToolEconomicMetadata {
+        cost_per_invoke,
+        cost_formula,
+        payee: payee.into(),
+    }))
+}
 
 /// Extracts test vectors from the registration dict's `test_vectors` field.
 ///
