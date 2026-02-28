@@ -477,7 +477,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - `publicKey(keyHandle: String) -> Data`: Returns the 32-byte public key for a handle. Derived from the stored private key bytes.
    - `destroyKey(keyHandle: String)`: Deletes the Keychain item. Verifies deletion by confirming `errSecItemNotFound` on re-fetch. Returns `PlatformError.destructionFailed` if the item persists.
    - `dhAgree(keyHandle: String, peerPublic: Data) -> Data`: Performs X25519 ECDH. Returns the 32-byte shared secret. Private key never leaves the `AppleKeyCustody` implementation boundary. Returns `PlatformError.wrongKeyType` for Ed25519 handles.
-   - `derivePseudonym(keyHandle: String, contextId: Data) -> PseudonymKeypair`: Computes `HMAC-SHA256(ed25519_private_key_bytes, contextId || "scp-pseudonym")`, derives Ed25519 keypair from the first 32 bytes. Algorithm is identical to `InMemoryKeyCustody` per ADR-006. Returns `PlatformError.wrongKeyType` for X25519 handles.
+   - `derivePseudonym(keyHandle: String, contextId: Data) -> PseudonymKeypair`: Computes `HMAC-SHA256(ed25519_public_key_bytes, contextId || "scp-pseudonym")`, derives Ed25519 keypair from the first 32 bytes. **Amendment (ADR-027):** Originally `ed25519_private_key_bytes`; corrected to `ed25519_public_key_bytes` to match the canonical cross-platform definition (Android Keystore TEE cannot export private bytes). The Apple Keychain adapter must be updated to use public key bytes to maintain cross-platform test vector compatibility. Returns `PlatformError.wrongKeyType` for X25519 handles.
    - `custodyType(keyHandle: String) -> CustodyType`: Returns `CustodyType.keychain`.
 
 2. **`AppleKeyCustody` — Keychain access:**

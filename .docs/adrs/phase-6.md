@@ -170,9 +170,12 @@ class AndroidKeyCustody : KeyCustodyProvider {
     }
 
     override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle {
-        // Algorithm: seed = HMAC-SHA256(identity_key_material, contextId || "scp-pseudonym")
+        // Algorithm: seed = HMAC-SHA256(ed25519_public_key_bytes, contextId || "scp-pseudonym")
         // pseudonym_keypair = Ed25519_keygen(seed[0..32])
-        val keyMaterial = publicKey(keyHandle)  // use public key as HMAC key material for hardware keys
+        // identity_key_material is the 32-byte public key for ALL adapter types (ADR-006 amendment,
+        // ADR-027): Android Keystore TEE on API 33+ cannot export private bytes. Using the public
+        // key as the HMAC key ensures cross-platform determinism across hardware and software adapters.
+        val keyMaterial = publicKey(keyHandle)  // 32-byte Ed25519 public key (canonical for all adapters)
         val mac = Mac.getInstance("HmacSHA256").apply {
             init(SecretKeySpec(keyMaterial, "HmacSHA256"))
             update(contextId)
@@ -418,7 +421,7 @@ dependencies {
 6. **`AndroidKeyCustody.derivePseudonym(keyHandle, contextId)`:**
    - Computes `HMAC-SHA256(key_material, contextId || "scp-pseudonym")`. Derives Ed25519 keypair from first 32 bytes.
    - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE`.
-   - Identical derivation algorithm to ADR-006 in-memory adapter — cross-platform test vectors apply.
+   - **key_material definition (IMPORTANT):** For hardware-backed keys (API 33+), private key bytes are inaccessible inside the TEE and cannot be used as HMAC key material. `key_material` is therefore defined as the **raw 32-byte Ed25519 public key** for ALL adapters (hardware and software alike). This ensures cross-platform determinism: a given SCP identity always derives the same pseudonym for a given contextId regardless of whether the key is TEE-backed or software-backed. ADR-006 acceptance criterion 6 must be updated to reflect this definition. All adapters (Apple, Android, in-memory) MUST use `publicKey(keyHandle)` bytes as the HMAC key, not private key bytes. Cross-platform test vectors are defined using public key bytes.
 
 7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
    - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
