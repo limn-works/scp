@@ -13,6 +13,8 @@ A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live ru
 - `EventLog` — event recording, querying, Merkle proofs
 - `RevocationList` — UCAN token revocation tracking
 - `RoleState` — role assignments for capability checking
+- `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9)
+- `ceiling_strings: HashSet<String>` — capability ceiling as `{resource}:{action}` strings (ADR-016 step 8)
 - `creator_did` — the DID of the context creator
 
 DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpPyError>` with typed errors.
@@ -57,5 +59,5 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 - `py_context_create` creates real `ToolRegistry` and `EventLog` objects in the runtime registry. If context creation fails partway, the registry entry must be cleaned up.
 - MCP bridge functions use opaque string handles (cryptographically random hex IDs) for server/client instances. Server and client state tracked in separate `DashMap` registries in `mcp.rs`.
 - `with_context` closures must return `Result<T, ScpPyError>` — use typed error variants (`ScpPyError::ContextError`, `ScpPyError::UcanError`, etc.) not raw strings.
-- UCAN validation (SCP-164) currently implements 5 of 11 ADR-016 steps — Ed25519 signature verification is NOT yet wired. See GitHub issue #105.
+- UCAN validation (SCP-164) now delegates to scp-core's full 11-step ADR-016 pipeline including Ed25519 signature verification. Bridge trait implementations (`BridgeDidResolver`, `BridgeRevocationChecker`, `BridgeProofResolver`, `BridgeNonceTracker`) in `ucan.rs` adapt runtime state to scp-core's validation traits. The `py_ucan_validate` function accepts optional `presenting_agent_did` and `proof_tokens` parameters for delegation chain verification.
 - MCP bridge functions (SCP-165) register state but do not delegate to real scp-mcp transport. See GitHub issue #106.
