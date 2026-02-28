@@ -9515,7 +9515,7 @@
         "transportDependency": "py_mcp_load_contexts requires relay transport (scp-transport) wiring. validate_capability and invoke_tool can be completed independently.",
         "relationship": "SCP-165 delivered the bridge wiring. This story completes the remaining stubs that SCP-165 deferred."
       },
-      "result": "Implemented validate_capability with has_tool_invoke_capability, invoke_tool with schema validation, py_mcp_load_contexts with local registry query. Dead code annotations moved to field-level. Tests written (cannot run due to PyO3 cdylib test=false). Commit c7a46c4."
+      "result": "validate_capability checks has_tool_invoke_capability against role state (generic wire-facing error, detailed server-side tracing::warn). invoke_tool validates input against JSON schema, returns status=validated (no handler dispatch — ToolRegistry is metadata-only). py_mcp_load_contexts returns local registry contexts via context_ids_for_member. dead_code annotations removed (added py_mcp_server_info/py_mcp_client_info introspection). All 41 scp-ffi tests pass. Residual architectural gaps tracked in #115 (invoke_tool handler dispatch) and #116 (relay-based context discovery)."
     },
     {
       "id": "SCP-211",
@@ -9562,6 +9562,85 @@
           "scaffold/kotlin.md — Build infrastructure blueprint"
         ]
       }
+    },
+    {
+      "id": "SCP-212",
+      "title": "Wire invoke_tool to scp-core execution pipeline with handler registration",
+      "gate": "gate-3",
+      "priority": "P2",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/mcp.rs",
+        "crates/scp-core/src/context/tools/invoke.rs"
+      ],
+      "description": "FfiBridgeProvider::invoke_tool validates input schema but cannot dispatch to actual tool handlers. ToolRegistry stores metadata only (no handler functions). The real invoke_tool in scp-core accepts an executor: F parameter injected by the caller. Need to design a handler registration mechanism at the FFI layer so Python callers can register callable tool handlers that Rust can dispatch to. Also need to handle the sync→async boundary (ContextProvider trait is sync, scp-core invoke is async).",
+      "acceptanceCriteria": [
+        "Python tool handlers can be registered via PyO3 and stored in the runtime registry",
+        "FfiBridgeProvider::invoke_tool dispatches through scp-core invoke with the registered handler",
+        "invoke_tool response contains actual computed output, not echoed input",
+        "Sync→async boundary handled correctly (ContextProvider is sync)",
+        "Test: registered Python handler is called and result returned via MCP"
+      ],
+      "actionItems": [
+        "Design handler registration API at FFI layer (store Python callables as closures)",
+        "Wire FfiBridgeProvider::invoke_tool through scp-core::context::tools::invoke::invoke_tool",
+        "Handle sync/async boundary between ContextProvider trait and scp-core invoke",
+        "Write integration tests with real Python handlers"
+      ],
+      "blockedBy": [
+        "SCP-210"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-010: Tool Registration and Invocation"
+        },
+        {
+          "file": "https://github.com/limn-works/scp/issues/115",
+          "section": "GitHub issue #115"
+        }
+      ]
+    },
+    {
+      "id": "SCP-213",
+      "title": "Wire py_mcp_load_contexts to relay-based context discovery",
+      "gate": "gate-3",
+      "priority": "P2",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/mcp.rs",
+        "crates/scp-transport/src/native/protocol.rs",
+        "crates/scp-ffi/src/transport.rs"
+      ],
+      "description": "py_mcp_load_contexts returns local registry contexts only. The relay wire protocol (ClientMessage enum) has no ListContexts message type — the relay is a dumb blob store routing by RoutingId with no concept of identity-to-context membership. Need to design a context discovery mechanism (new relay protocol message or client-side probing), wire scp-transport initialization into FFI runtime, and implement relay-based discovery falling back to local registry.",
+      "acceptanceCriteria": [
+        "Context discovery protocol designed (relay message or client-side approach)",
+        "scp-transport initialized in FFI runtime",
+        "py_mcp_load_contexts queries relay for active contexts",
+        "Falls back to local registry when relay unavailable",
+        "Test: contexts created on relay are discoverable via py_mcp_load_contexts"
+      ],
+      "actionItems": [
+        "Design context discovery mechanism for relay protocol",
+        "Wire scp-transport initialization into FFI runtime",
+        "Implement relay query in py_mcp_load_contexts with local fallback",
+        "Write integration test with relay"
+      ],
+      "blockedBy": [
+        "SCP-210"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "## ADR-015: MCP Adapter"
+        },
+        {
+          "file": "https://github.com/limn-works/scp/issues/116",
+          "section": "GitHub issue #116"
+        }
+      ]
     }
   ]
 }
