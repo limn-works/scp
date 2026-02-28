@@ -20,19 +20,19 @@ for conventions.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from scp_sdk.errors import TransportError, ValidationError
 from scp_sdk.mcp import (
+    _VALID_TRANSPORTS,
     DEFAULT_STDIO_ALLOWLIST,
     McpClient,
     McpProvenance,
     McpServer,
     McpToolDefinition,
     McpToolResult,
-    _VALID_TRANSPORTS,
     cli_main,
     configure_stdio_allowlist,
     disable_stdio_allowlist,
@@ -40,7 +40,6 @@ from scp_sdk.mcp import (
     reset_stdio_allowlist,
     serve_mcp,
 )
-
 
 # -----------------------------------------------------------------------
 # McpToolDefinition tests

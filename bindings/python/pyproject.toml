@@ -48,6 +48,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "RUF"]
+ignore = ["UP047"]  # PEP 695 type params require Python 3.12+, we support 3.10+
 
 [tool.mypy]
 python_version = "3.12"

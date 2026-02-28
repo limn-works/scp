@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ScpError, ToolError, TransportError, ValidationError
+from scp_sdk.errors import TransportError, ValidationError
 
 if TYPE_CHECKING:
     from scp_sdk.context import Context
@@ -154,7 +154,7 @@ class McpServer:
     ``read_messages``, and ``list_members``.
     """
 
-    __slots__ = ("_handle", "_identity", "_contexts", "_transport")
+    __slots__ = ("_contexts", "_handle", "_identity", "_transport")
 
     def __init__(
         self,
@@ -413,7 +413,7 @@ class McpClient:
         )
     """
 
-    __slots__ = ("_handle", "_transport", "_command")
+    __slots__ = ("_command", "_handle", "_transport")
 
     def __init__(self, handle: Any, transport: str, command: list[str] | None) -> None:
         self._handle = handle
@@ -674,7 +674,7 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
     )
 
     # Step 1: Load the identity.
-    identity = await Identity.load(did)
+    await Identity.load(did)
 
     # Step 2: Connect to the relay.
     await connect_relay(relay_url)

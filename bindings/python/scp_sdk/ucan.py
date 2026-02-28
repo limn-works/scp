@@ -24,8 +24,8 @@ specification and ADR-013 section 6 for the bridge layer design.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 from scp_sdk.errors import UcanPermissionError
 
