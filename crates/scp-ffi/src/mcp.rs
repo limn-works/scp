@@ -339,9 +339,8 @@ impl SseClientTransport {
             );
         }
 
-        // Build the full POST URL.
-        let scheme = if port == 443 { "https" } else { "http" };
-        let post_url = format!("{scheme}://{host}:{port}{post_path}");
+        // Build the full POST URL. Always http — HTTPS is rejected at entry.
+        let post_url = format!("http://{host}:{port}{post_path}");
 
         Ok(Self {
             _url: url.to_owned(),
