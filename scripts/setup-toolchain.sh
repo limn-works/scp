@@ -158,7 +158,7 @@ if brew list kotlin &>/dev/null 2>&1; then
     warn "Homebrew kotlin detected — run without --check to migrate to asdf"
   else
     info "Removing Homebrew kotlin (migrating to asdf)..."
-    brew uninstall kotlin
+    brew uninstall --ignore-dependencies kotlin
     ok "Homebrew kotlin removed"
   fi
 else
