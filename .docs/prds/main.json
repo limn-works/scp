@@ -9527,7 +9527,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/build.gradle.kts",
         "bindings/kotlin/settings.gradle.kts",
@@ -9565,7 +9565,8 @@
           "ADR-028 — Kotlin SDK layout and conventions",
           "scaffold/kotlin.md — Build infrastructure blueprint"
         ]
-      }
+      },
+      "result": "Android module scaffold complete. Both :scp-sdk-kotlin:build and :scp-sdk-kotlin-android:build succeed. Commit 9c0ff7d."
     },
     {
       "id": "SCP-212",
@@ -9573,7 +9574,7 @@
       "gate": "gate-3",
       "priority": "P2",
       "severity": "moderate",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/mcp.rs",
         "crates/scp-core/src/context/tools/invoke.rs"
@@ -9608,7 +9609,8 @@
           "file": "https://github.com/limn-works/scp/issues/104",
           "section": "GitHub issue #104 — input validation at bridge boundary"
         }
-      ]
+      ],
+      "result": "Tool handler registration and dispatch wired. Python callables stored as closures in runtime registry. FfiBridgeProvider dispatches to handlers. Commit 8d4c405."
     },
     {
       "id": "SCP-213",
@@ -9616,7 +9618,7 @@
       "gate": "gate-3",
       "priority": "P2",
       "severity": "moderate",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/mcp.rs",
         "crates/scp-transport/src/native/protocol.rs",
@@ -9652,7 +9654,8 @@
           "file": "https://github.com/limn-works/scp/issues/109",
           "section": "GitHub issue #109 — expose missing ContextParams fields in PyO3 bridge"
         }
-      ]
+      ],
+      "result": "Client-side context discovery via KnownContext registry + relay QUERY probing. Falls back to local registry when relay unavailable. Commit 3d8016f."
     }
   ]
 }
