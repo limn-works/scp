@@ -51,6 +51,21 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 
 `types.rs` provides `json_to_py_dict` and `py_dict_to_json` for serde_json::Value ↔ Python dict conversions.
 
+### MCP Bridge (`mcp.rs`)
+
+The MCP bridge delegates to real `scp-mcp` server/client implementations via two DashMap registries (one for servers, one for clients), keyed by opaque cryptographically random hex handles.
+
+**Server side:**
+- `FfiBridgeProvider` implements `scp_mcp::server::ContextProvider` by reading tool registrations, role state, and event log data from the runtime registry via `with_context()`.
+- Servers run on the shared tokio runtime. Shutdown is coordinated via `tokio::sync::oneshot` channel. `py_mcp_server_wait` blocks until the task completes.
+- Supports both `stdio` and `sse` transport modes.
+
+**Client side:**
+- `StdioClientTransport` spawns a subprocess, communicates via line-delimited JSON-RPC over piped stdin/stdout using `BufReader`/`BufWriter`.
+- `SseClientTransport` connects via raw `TcpStream` with HTTP/1.1, parsing SSE event streams.
+- `ClientTransport` enum dispatches between Stdio and Sse variants (avoids orphan rule — cannot implement foreign `McpTransport` trait for `Box<dyn McpTransport>`).
+- Connection functions run the MCP `initialize` handshake and store real `McpClient` instances in the registry.
+
 ## Gotchas
 
 - The tokio runtime (`RUNTIME` in `lib.rs`) must be initialized before any async bridge call. It's auto-initialized at module import.
@@ -58,4 +73,6 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 - MCP bridge functions use opaque string handles (cryptographically random hex IDs) for server/client instances. Server and client state tracked in separate `DashMap` registries in `mcp.rs`.
 - `with_context` closures must return `Result<T, ScpPyError>` — use typed error variants (`ScpPyError::ContextError`, `ScpPyError::UcanError`, etc.) not raw strings.
 - UCAN validation (SCP-164) currently implements 5 of 11 ADR-016 steps — Ed25519 signature verification is NOT yet wired. See GitHub issue #105.
-- MCP bridge functions (SCP-165) register state but do not delegate to real scp-mcp transport. See GitHub issue #106.
+- MCP server async tasks hold `Arc<Mutex<McpServer>>` — when extracting data from the mutex guard for use in async code (e.g. SSE transport), scope the lock to avoid holding `MutexGuard` across `.await` points (the guard is not `Send`).
+- `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. The `context_events` provider method returns event count and Merkle root, not raw events.
+- `ToolRegistry::registrations()` returns an iterator, not a Vec. There is no `invoke()` method — tool invocation checks tool existence and returns a JSON status response.
