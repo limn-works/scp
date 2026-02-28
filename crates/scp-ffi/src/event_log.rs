@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::error::ScpPyError;
-use crate::types::json_to_py_dict;
+use crate::types::{encode_hex, json_to_py_dict};
 
 // ---------------------------------------------------------------------------
 // PyEvent
@@ -155,12 +155,7 @@ pub fn py_event_log_query(
     let (event_count, merkle_root_hex) = crate::runtime::with_context(context_id, |rt| {
         let count = scp_core::event_log::tree::event_count(&rt.event_log);
         let root = scp_core::event_log::tree::root(&rt.event_log);
-        let root_hex: String = root.iter().fold(String::new(), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-        Ok((count, root_hex))
+        Ok((count, encode_hex(&root)))
     })
     .map_err(|e| ScpPyError::ContextError(e))?;
 
@@ -271,35 +266,16 @@ pub fn py_event_log_verify(
                     .map_err(|e| format!("{e}"))?;
                 let verified = scp_core::event_log::proof::verify_inclusion(&proof);
 
-                // Build proof details as JSON.
-                let root_hex: String = proof.root.iter().fold(String::new(), |mut acc, b| {
-                    use std::fmt::Write;
-                    let _ = write!(acc, "{b:02x}");
-                    acc
-                });
-                let leaf_hex: String =
-                    proof.leaf_hash.iter().fold(String::new(), |mut acc, b| {
-                        use std::fmt::Write;
-                        let _ = write!(acc, "{b:02x}");
-                        acc
-                    });
-
                 let path_steps: Vec<serde_json::Value> = proof
                     .path
                     .iter()
                     .map(|step| {
-                        let sibling_hex: String =
-                            step.sibling_hash.iter().fold(String::new(), |mut acc, b| {
-                                use std::fmt::Write;
-                                let _ = write!(acc, "{b:02x}");
-                                acc
-                            });
                         let direction = match step.direction {
                             scp_core::event_log::proof::Direction::Left => "left",
                             scp_core::event_log::proof::Direction::Right => "right",
                         };
                         serde_json::json!({
-                            "sibling_hash": sibling_hex,
+                            "sibling_hash": encode_hex(&step.sibling_hash),
                             "direction": direction,
                         })
                     })
@@ -307,8 +283,8 @@ pub fn py_event_log_verify(
 
                 let details = serde_json::json!({
                     "leaf_index": proof.leaf_index,
-                    "leaf_hash": leaf_hex,
-                    "root": root_hex,
+                    "leaf_hash": encode_hex(&proof.leaf_hash),
+                    "root": encode_hex(&proof.root),
                     "path": path_steps,
                     "path_length": proof.path.len(),
                 });
@@ -346,41 +322,16 @@ pub fn py_event_log_verify(
                 let proof = scp_core::event_log::proof::prove_absence(&rt.event_log, &event_hash)
                     .map_err(|e| format!("{e}"))?;
 
-                let root_hex: String = proof.root.iter().fold(String::new(), |mut acc, b| {
-                    use std::fmt::Write;
-                    let _ = write!(acc, "{b:02x}");
-                    acc
-                });
-                let query_hex: String =
-                    proof.query_hash.iter().fold(String::new(), |mut acc, b| {
-                        use std::fmt::Write;
-                        let _ = write!(acc, "{b:02x}");
-                        acc
-                    });
-
-                // Build neighbor details.
                 let lower = proof.lower.as_ref().map(|lwp| {
-                    let hash_hex: String =
-                        lwp.leaf_hash.iter().fold(String::new(), |mut acc, b| {
-                            use std::fmt::Write;
-                            let _ = write!(acc, "{b:02x}");
-                            acc
-                        });
                     serde_json::json!({
-                        "leaf_hash": hash_hex,
+                        "leaf_hash": encode_hex(&lwp.leaf_hash),
                         "leaf_index": lwp.leaf_index,
                     })
                 });
 
                 let upper = proof.upper.as_ref().map(|uwp| {
-                    let hash_hex: String =
-                        uwp.leaf_hash.iter().fold(String::new(), |mut acc, b| {
-                            use std::fmt::Write;
-                            let _ = write!(acc, "{b:02x}");
-                            acc
-                        });
                     serde_json::json!({
-                        "leaf_hash": hash_hex,
+                        "leaf_hash": encode_hex(&uwp.leaf_hash),
                         "leaf_index": uwp.leaf_index,
                     })
                 });
@@ -401,8 +352,8 @@ pub fn py_event_log_verify(
                 let verified = lower_verified && upper_verified;
 
                 let details = serde_json::json!({
-                    "query_hash": query_hex,
-                    "root": root_hex,
+                    "query_hash": encode_hex(&proof.query_hash),
+                    "root": encode_hex(&proof.root),
                     "leaf_count": proof.leaf_count,
                     "lower": lower,
                     "upper": upper,

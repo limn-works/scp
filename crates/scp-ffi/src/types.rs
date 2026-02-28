@@ -4,6 +4,7 @@
 //!
 //! - [`py_dict_to_json`]: `Python dict` -> [`serde_json::Value`]
 //! - [`json_to_py_dict`]: [`serde_json::Value`] -> `Python object`
+//! - [`encode_hex`]: `&[u8]` -> lowercase hex `String`
 //!
 //! These are the foundational conversion functions used by all bridge modules
 //! that pass structured data between Python and Rust (context params, tool
@@ -16,6 +17,23 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyString};
 use serde_json::Value;
 
 use crate::error::ScpPyError;
+
+// ---------------------------------------------------------------------------
+// Hex encoding
+// ---------------------------------------------------------------------------
+
+/// Encodes a byte slice as a lowercase hex string.
+///
+/// Used across the bridge for Merkle roots, token CIDs, nonces, and proof
+/// details. Centralised here to avoid duplicating the fold pattern.
+pub fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
 
 // ---------------------------------------------------------------------------
 // Python dict -> serde_json::Value

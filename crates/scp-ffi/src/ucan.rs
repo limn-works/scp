@@ -18,6 +18,7 @@
 use pyo3::prelude::*;
 
 use crate::error::ScpPyError;
+use crate::types::encode_hex;
 
 // ---------------------------------------------------------------------------
 // PyUcanToken
@@ -285,26 +286,31 @@ pub fn py_ucan_mint(
 /// no longer accepted by validation. In the full runtime, revocation is
 /// distributed to all context members via MLS.
 ///
+/// The token is identified by its CID (SHA-256 of the encoded JWT),
+/// matching the identifier used during validation. Callers must pass the
+/// full encoded token string, not just the token ID/nonce.
+///
 /// # Arguments
 ///
 /// * `context_id` -- The ID of the context the token belongs to.
-/// * `token_id` -- The unique ID of the token to revoke.
+/// * `token` -- The full encoded UCAN token string (JWT format).
 ///
 /// # Errors
 ///
 /// Raises `UcanError` if revocation fails: context not found, etc.
 ///
-/// See ADR-013 §6: `py_ucan_revoke(handle, token_id) -> None`.
+/// See ADR-013 §6: `py_ucan_revoke(handle, token) -> None`.
 #[pyfunction]
 #[pyo3(name = "ucan_revoke")]
 pub fn py_ucan_revoke(
     context_id: &str,
-    token_id: &str,
+    token: &str,
 ) -> PyResult<()> {
     crate::runtime::with_context(context_id, |rt| {
-        // Add the token ID to the revocation list. The RevocationList uses
-        // CIDs as keys; we use the token_id directly as a simplified CID.
-        rt.revocation_list.revoke(token_id.to_owned());
+        // Compute the token's CID for revocation, matching the identifier
+        // used in py_ucan_validate's revocation check.
+        let token_cid = compute_simple_cid(token);
+        rt.revocation_list.revoke(token_cid);
         Ok(())
     })
     .map_err(|e| ScpPyError::UcanError(e))?;
@@ -318,30 +324,20 @@ pub fn py_ucan_revoke(
 
 /// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
 ///
-/// Uses SHA-256 of timestamp + counter to produce unpredictable nonces
-/// without requiring an external random number generator crate.
+/// Uses cryptographic randomness via `rand::thread_rng()` (backed by `OsRng`)
+/// to produce unpredictable nonces as required by ADR-016 §7.2.
 fn generate_nonce() -> String {
-    use sha2::{Digest, Sha256};
+    use rand::Rng;
 
     let now_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
 
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut random_bytes = [0u8; 16];
+    rand::thread_rng().fill(&mut random_bytes);
 
-    // Hash timestamp + counter to produce unpredictable output.
-    let mut hasher = Sha256::new();
-    hasher.update(now_millis.to_le_bytes());
-    hasher.update(count.to_le_bytes());
-    let hash = hasher.finalize();
-    let hex: String = hash[..16].iter().fold(String::new(), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    });
+    let hex = encode_hex(&random_bytes);
     format!("{now_millis}-{hex}")
 }
 
@@ -352,12 +348,7 @@ fn generate_nonce() -> String {
 fn compute_simple_cid(token: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(token.as_bytes());
-    let hex: String = hash.iter().fold(String::new(), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    });
-    format!("bafyrei{hex}")
+    format!("bafyrei{}", encode_hex(&hash))
 }
 
 // ---------------------------------------------------------------------------

@@ -75,16 +75,13 @@ fn client_registry() -> &'static Mutex<HashMap<String, McpClientState>> {
     CLIENT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Generates a unique handle ID.
+/// Generates a unique, unpredictable handle ID.
 fn generate_handle_id(prefix: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("{prefix}-{now}-{count}")
+    use rand::Rng;
+    let mut random_bytes = [0u8; 16];
+    rand::thread_rng().fill(&mut random_bytes);
+    let hex = crate::types::encode_hex(&random_bytes);
+    format!("{prefix}-{hex}")
 }
 
 // ---------------------------------------------------------------------------
