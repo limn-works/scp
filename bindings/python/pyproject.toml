@@ -38,7 +38,7 @@ Repository = "https://github.com/limn-scp/scp-protocol-core"
 Documentation = "https://scp.dev/docs"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["extension-module"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
 python-source = "."
