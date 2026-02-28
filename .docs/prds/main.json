@@ -6187,7 +6187,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "crates/scp-platform/android/key_custody.rs"
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
       "description": "Implement the KeyCustody platform trait for Android Keystore. Android Keystore provides TEE-backed key custody; Ed25519 support requires API 33+ (Android 13+). StrongBox is available but dramatically slower than TEE-backed operations. Must decide minimum API level (API 33+ for Ed25519 Keystore, or software fallback for older devices) and TEE vs StrongBox policy (performance vs security tradeoff). Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.",
       "acceptanceCriteria": [
@@ -6212,7 +6212,8 @@
       "blockedBy": [
         "SCP-094",
         "SCP-076",
-        "SCP-105"
+        "SCP-105",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6243,7 +6244,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "crates/scp-platform/android/device_attestation.rs"
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
       "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).",
       "acceptanceCriteria": [
@@ -6263,7 +6264,8 @@
       "blockedBy": [
         "SCP-094",
         "SCP-076",
-        "SCP-105"
+        "SCP-105",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6290,7 +6292,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "crates/scp-platform/android/push_provider.rs"
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidPushProvider.kt"
       ],
       "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.",
       "acceptanceCriteria": [
@@ -6310,7 +6312,8 @@
       "blockedBy": [
         "SCP-094",
         "SCP-076",
-        "SCP-105"
+        "SCP-105",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6337,7 +6340,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "crates/scp-platform/android/storage.rs"
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidStorage.kt"
       ],
       "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.",
       "acceptanceCriteria": [
@@ -6358,7 +6361,8 @@
         "SCP-110",
         "SCP-094",
         "SCP-076",
-        "SCP-105"
+        "SCP-105",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6386,7 +6390,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "crates/scp-platform/android/mod.rs"
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/PlatformAdapter.kt"
       ],
       "description": "Create the scp-platform/android/ module root in mod.rs. Declares and re-exports all Android platform adapter modules: key_custody, device_attestation, push_provider, storage. Platform adapters implement traits defined in scp-platform/ (KeyCustody, PushProvider, DeviceAttestation, Storage). Android module is conditionally compiled for Android targets only. Mirrors Apple platform module root SCP-097 (gate-5).",
       "acceptanceCriteria": [
@@ -6409,7 +6413,8 @@
         "SCP-111",
         "SCP-112",
         "SCP-113",
-        "SCP-105"
+        "SCP-105",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6452,7 +6457,8 @@
       "blockedBy": [
         "SCP-076",
         "SCP-110",
-        "SCP-106"
+        "SCP-106",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6500,7 +6506,8 @@
       ],
       "blockedBy": [
         "SCP-115",
-        "SCP-106"
+        "SCP-106",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6548,7 +6555,8 @@
       "blockedBy": [
         "SCP-115",
         "SCP-105",
-        "SCP-106"
+        "SCP-106",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6596,7 +6604,8 @@
       "blockedBy": [
         "SCP-116",
         "SCP-117",
-        "SCP-106"
+        "SCP-106",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6645,7 +6654,8 @@
       ],
       "blockedBy": [
         "SCP-115",
-        "SCP-106"
+        "SCP-106",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -6693,7 +6703,8 @@
       "blockedBy": [
         "SCP-115",
         "SCP-099",
-        "SCP-106"
+        "SCP-106",
+        "SCP-211"
       ],
       "sources": [
         {
@@ -9485,7 +9496,9 @@
         "Write unit tests for validate_capability and invoke_tool",
         "Write integration test for py_mcp_load_contexts with relay"
       ],
-      "blockedBy": ["SCP-165"],
+      "blockedBy": [
+        "SCP-165"
+      ],
       "sources": [
         {
           "file": ".docs/adrs/phase-3.md",
@@ -9501,6 +9514,52 @@
         "currentState": "validate_capability returns Ok(()) with TODO(#106). invoke_tool returns {\"status\": \"invoked\", \"tool\": name, \"note\": \"TODO(#106)...\"}. py_mcp_load_contexts returns empty Vec.",
         "transportDependency": "py_mcp_load_contexts requires relay transport (scp-transport) wiring. validate_capability and invoke_tool can be completed independently.",
         "relationship": "SCP-165 delivered the bridge wiring. This story completes the remaining stubs that SCP-165 deferred."
+      }
+    },
+    {
+      "id": "SCP-211",
+      "title": "Scaffold Kotlin SDK build infrastructure",
+      "gate": "gate-6",
+      "priority": "P2",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/kotlin/build.gradle.kts",
+        "bindings/kotlin/settings.gradle.kts",
+        "bindings/kotlin/scp-sdk-kotlin/build.gradle.kts",
+        "bindings/kotlin/scp-sdk-kotlin-android/build.gradle.kts"
+      ],
+      "description": "Scaffold the Kotlin SDK Gradle build infrastructure. Multi-module project with scp-sdk-kotlin (core JVM) and scp-sdk-kotlin-android (Android platform adapter). Must match ADR-028 layout conventions.",
+      "acceptanceCriteria": [
+        "gradle build succeeds from bindings/kotlin/",
+        "Multi-module structure matches ADR-028 layout (scp-sdk-kotlin + scp-sdk-kotlin-android)",
+        "UniFFI-generated NativeLib.kt integration configured",
+        "Android dependencies declared: Bouncy Castle, Play Integrity, FCM, SQLCipher, AndroidX Security",
+        "Source directories exist and are recognized by Gradle"
+      ],
+      "actionItems": [
+        "Create root build.gradle.kts with shared configuration",
+        "Create settings.gradle.kts with module includes",
+        "Create scp-sdk-kotlin/build.gradle.kts for core JVM module",
+        "Create scp-sdk-kotlin-android/build.gradle.kts with Android dependencies",
+        "Create source directory structure per ADR-028 conventions"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-028: Kotlin SDK"
+        },
+        {
+          "file": ".docs/scaffold/kotlin.md",
+          "section": "Build infrastructure"
+        }
+      ],
+      "details": {
+        "references": [
+          "ADR-028 — Kotlin SDK layout and conventions",
+          "scaffold/kotlin.md — Build infrastructure blueprint"
+        ]
       }
     }
   ]

@@ -37,7 +37,7 @@ Android's hardware security landscape has two tiers: TEE (Trusted Execution Envi
 
 ### Decision
 
-Implement the Android platform adapter in Kotlin at `bindings/kotlin/Sources/SCP/Platform/`. Five files implement the four platform traits plus a factory:
+Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/`. Five files implement the four platform traits plus a factory:
 
 - **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. Ed25519 (`EdDSA`) at API 33+; software Ed25519 fallback (Bouncy Castle) for API 26-32. X25519 wrapping keys always software-managed. TEE-backed by default; StrongBox explicitly opt-out.
 - **`AndroidDeviceAttestation.kt`** — `DeviceAttestationProvider` implementation using Play Integrity Standard API. Standard (server-side, low-latency) preferred over Classic (offline, high-cost) attestation.
@@ -69,7 +69,7 @@ Implement the Android platform adapter in Kotlin at `bindings/kotlin/Sources/SCP
 **File layout:**
 
 ```
-bindings/kotlin/Sources/SCP/Platform/
+bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/
   AndroidKeyCustody.kt        — KeyCustodyProvider: Android Keystore Ed25519, software fallback
   AndroidDeviceAttestation.kt — DeviceAttestationProvider: Play Integrity Standard API
   AndroidPushProvider.kt      — PushProvider: FCM registration, opaque data payload
@@ -372,7 +372,7 @@ suspend fun SCP.Companion.create(
 **Gradle dependencies** for the platform module:
 
 ```kotlin
-// In bindings/kotlin/Sources/SCP/Platform/build.gradle.kts
+// In bindings/kotlin/scp-sdk-kotlin-android/build.gradle.kts
 dependencies {
     implementation("com.google.android.play:integrity:1.4.0")
     implementation("com.google.firebase:firebase-messaging-ktx:24.1.0")
@@ -465,7 +465,7 @@ dependencies {
 ### Scope
 
 ```
-bindings/kotlin/Sources/SCP/Platform/ — 5 files, ~25 functions
+bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/ — 5 files, ~25 functions
 ```
 
 | File | Functions |
