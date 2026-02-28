@@ -13,6 +13,8 @@ A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live ru
 - `EventLog` — event recording, querying, Merkle proofs
 - `RevocationList` — UCAN token revocation tracking
 - `RoleState` — role assignments for capability checking
+- `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9)
+- `ceiling_strings: HashSet<String>` — capability ceiling as `{resource}:{action}` strings (ADR-016 step 8)
 - `creator_did` — the DID of the context creator
 
 DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpPyError>` with typed errors.
@@ -51,11 +53,39 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 
 `types.rs` provides `json_to_py_dict` and `py_dict_to_json` for serde_json::Value ↔ Python dict conversions.
 
+### MCP Bridge (`mcp.rs`)
+
+The MCP bridge delegates to real `scp-mcp` server/client implementations via two DashMap registries (one for servers, one for clients), keyed by opaque cryptographically random hex handles.
+
+**Server side:**
+- `FfiBridgeProvider` implements `scp_mcp::server::ContextProvider` by reading tool registrations, role state, and event log data from the runtime registry via `with_context()`.
+- Servers run on the shared tokio runtime. Shutdown is coordinated via `tokio::sync::oneshot` channel. `py_mcp_server_wait` blocks until the task completes.
+- Supports both `stdio` and `sse` transport modes.
+
+**Client side:**
+- `StdioClientTransport` spawns a subprocess, communicates via line-delimited JSON-RPC over piped stdin/stdout using `BufReader`/`BufWriter`.
+- `SseClientTransport` connects via raw `TcpStream` with HTTP/1.1, parsing SSE event streams.
+- `ClientTransport` enum dispatches between Stdio and Sse variants (avoids orphan rule — cannot implement foreign `McpTransport` trait for `Box<dyn McpTransport>`).
+- Connection functions run the MCP `initialize` handshake and store real `McpClient` instances in the registry.
+
 ## Gotchas
 
 - The tokio runtime (`RUNTIME` in `lib.rs`) must be initialized before any async bridge call. It's auto-initialized at module import.
 - `py_context_create` creates real `ToolRegistry` and `EventLog` objects in the runtime registry. If context creation fails partway, the registry entry must be cleaned up.
 - MCP bridge functions use opaque string handles (cryptographically random hex IDs) for server/client instances. Server and client state tracked in separate `DashMap` registries in `mcp.rs`.
 - `with_context` closures must return `Result<T, ScpPyError>` — use typed error variants (`ScpPyError::ContextError`, `ScpPyError::UcanError`, etc.) not raw strings.
-- UCAN validation (SCP-164) currently implements 5 of 11 ADR-016 steps — Ed25519 signature verification is NOT yet wired. See GitHub issue #105.
-- MCP bridge functions (SCP-165) register state but do not delegate to real scp-mcp transport. See GitHub issue #106.
+- UCAN validation (SCP-164) now delegates to scp-core's full 11-step ADR-016 pipeline including Ed25519 signature verification. Bridge trait implementations (`BridgeDidResolver`, `BridgeRevocationChecker`, `BridgeProofResolver`, `BridgeNonceTracker`) in `ucan.rs` adapt runtime state to scp-core's validation traits. The `py_ucan_validate` function accepts optional `presenting_agent_did` and `proof_tokens` parameters for delegation chain verification.
+- MCP server async tasks hold `Arc<Mutex<McpServer>>` — when extracting data from the mutex guard for use in async code (e.g. SSE transport), scope the lock to avoid holding `MutexGuard` across `.await` points (the guard is not `Send`).
+- `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. The `context_events` provider method returns event count and Merkle root, not raw events.
+- `ToolRegistry::registrations()` returns an iterator, not a Vec. There is no `invoke()` method — tool invocation checks tool existence and returns a JSON status response.
+- `SseClientTransport` uses raw `TcpStream` — `https://` URLs are explicitly rejected (no TLS). Only `http://` is supported; add `rustls` dependency for HTTPS.
+- `FfiBridgeProvider::validate_capability` always returns `Ok(())` (TODO #106) — authorization depends on UCAN layer. `invoke_tool` returns stub JSON (TODO #106), not real tool execution.
+- `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
+- SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
+- **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Only bare binary names are accepted — paths (absolute or relative) are rejected to prevent basename-spoofing bypasses. The OS resolves the binary via `PATH`. Per MCP Security Best Practices.
+  - `py_mcp_configure_stdio_allowlist(additional_binaries)` — add entries (validated: no paths, no NUL, no empty).
+  - `py_mcp_disable_stdio_allowlist()` — enter unrestricted mode (separate function for ceremony).
+  - `py_mcp_reset_stdio_allowlist()` — restore defaults and re-enable enforcement.
+  - `py_mcp_get_stdio_allowlist()` — introspect current state (`{"allowed": [...], "unrestricted": bool}`).
+  - Python SDK exposes these as module-level functions: `configure_stdio_allowlist()`, `disable_stdio_allowlist(i_trust_all_commands=True)`, `reset_stdio_allowlist()`, `get_stdio_allowlist()`. Pre-validation in `McpClient.connect()` catches path and allowlist issues before crossing FFI, raising `ValidationError` with actionable messages.
+- `py_mcp_load_contexts` always returns an empty list — requires relay transport layer (scp-transport) not yet wired.

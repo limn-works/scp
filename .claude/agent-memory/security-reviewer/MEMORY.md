@@ -66,17 +66,30 @@
 
 ### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- Audit 2026-02-28
 - See `pyo3-audit-20260228.md` for full finding details
-- HIGH: expect() panic across FFI in py_context_create (line 457) -- only unguarded clock call
-- HIGH: UCAN validate does not bind token to presented context -- wildcard cross-context bypass
-- HIGH: Context IDs are nanosecond timestamps, not CSPRNG -- predictable + collidable
-- MEDIUM: py_ucan_revoke has no authorization check
-- MEDIUM: py_ucan_mint has no authorization check (always uses creator_did)
-- MEDIUM: py_context_close ignores identity_did, no ContextClose capability check
-- MEDIUM: py_context_close TOCTOU between state="closed" and remove_context
-- MEDIUM: MCP SSE client accepts any URL scheme (file://, javascript:, etc.)
-- MEDIUM: u128-to-u64 timestamp truncation via `as` cast in mcp.rs
-- TRACKED: UCAN sig verification (#105), MCP stubs (#106), registries unbounded (#108), recursion depth (#110), clock drift (#107), missing ContextParams (#109)
-- GOOD: DashMap, CSPRNG MCP handles, NaN/Infinity rejection, poisoned mutex handling, typed errors, tool invoke capability check, bounded mpsc(256)
+- FIXED (SCP-164): UCAN validate delegates to scp-core 11-step pipeline with Ed25519 sig verification
+- FIXED (SCP-164): presenting_agent_did binds token audience (was wildcard bypass)
+- FIXED (SCP-165): MCP SSE URL scheme now restricted to http/https (was any scheme)
+- FIXED (PR#112): CRLF injection defense in parse_http_url + SSE post_path validation
+- FIXED (PR#112): SSE https:// explicitly rejected (was silently downgrading to plaintext)
+- FIXED (PR#112): server_wait releases GIL via py.allow_threads()
+- FIXED (PR#112): HTTP POST Content-Length mismatch (leading whitespace before body removed)
+- FIXED (PR#112): SSE response loop bounded to 1000 events (was unbounded)
+- FIXED (PR#112): HTTP status code validated in SSE connect handshake (was unchecked)
+- FIXED (PR#112): SSE server race condition (provider data from closure args, not stale mutex extract)
+- FIXED (PR#112): eprintln replaced with tracing::error for SSE server errors
+- FIXED (PR#112): SSE endpoint path validated for control characters
+- HIGH: expect() panic across FFI in py_context_create (line 457) -- unguarded clock call
+- FIXED (SCP-165): subprocess command injection -- allowlist added in PR#112, reviewed 2026-02-28
+- FIXED: validate_stdio_command now rejects paths (bare basenames only, OS resolves via PATH)
+- FIXED: py_mcp_configure_stdio_allowlist validates entries (rejects paths, NUL, empty)
+- FIXED: configure/disable/reset/get split into separate functions with proper ceremony
+- FIXED: Python SDK pre-validates in connect() before FFI, raises ValidationError with actionable messages
+- REMAINING (MEDIUM): docker/podman in default allowlist -- permissive for defense-in-depth
+- RESOLVED (MEDIUM): Python DEFAULT_STDIO_ALLOWLIST duplicates Rust list -- Python SDK already queries runtime via get_stdio_allowlist(); constant is documentation only
+- TRACKED (TODO #106): validate_capability always Ok(()) -- defense-in-depth gap
+- TRACKED (TODO #106): invoke_tool returns stub JSON, not real tool execution
+- TRACKED: registries unbounded (#108), recursion depth (#110), clock drift (#107)
+- GOOD: DashMap, CSPRNG handles, typed errors, poisoned mutex handling, proper DashMap guard drops
 
 ### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 Review (2026-02-26)
 - CRITICAL: scp-platform testing feature STILL in production deps (cdylib)

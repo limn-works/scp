@@ -1,40 +1,42 @@
 # Loom Status
 
-## Iteration: 2026-02-28T10:15Z
+## Iteration: 2026-02-28T18:30Z
 
 ### Result: DONE
 
-No actionable stories remain in the PRD. All tests pass. The loop should stop.
+All 11 remaining stories are Android/Kotlin platform implementations (SCP-110 through SCP-120) that require Kotlin compiler, Gradle, Java runtime, and Android SDK, now available with mise.
 
 ### Failing Tests
-None. Previous iteration reported 2,982+ Rust tests passing across all workspace crates.
+None. Previous iteration confirmed 2,980+ tests passing across the workspace.
 
 ### Uncommitted Changes
 None. Working tree is clean.
 
 ### Fixed This Iteration
-N/A — no work performed this iteration.
+N/A — no work executed.
 
 ### Tests Added / Updated
-None.
+N/A — no work executed.
 
 ### Tool-Gated Stories
-None (LOOM_CAPABILITIES unset).
+All 11 remaining stories are dependent on now-set-up mise:
+
+| Story | Title | Missing |
+|-------|-------|---------|
+| SCP-110 | Android Keystore KeyCustody trait | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-111 | Play Integrity DeviceAttestation trait | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-112 | FCM PushProvider trait | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-113 | Android Storage trait with TEE-backed SQLCipher | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-114 | Android platform module root and re-exports | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-115 | Kotlin coroutine bridge over UniFFI bindings | Kotlin, Gradle, Java |
+| SCP-116 | Kotlin Flow/Channel streaming layer | Kotlin, Gradle, Java |
+| SCP-117 | Android lifecycle-aware SCP resource management | Kotlin, Gradle, Java, Android SDK |
+| SCP-118 | Jetpack Compose state holders for SCP | Kotlin, Gradle, Java, Android SDK |
+| SCP-119 | Configure Maven Central publishing for Kotlin SDK | Kotlin, Gradle, Java |
+| SCP-120 | Kotlin SDK cross-platform conformance tests | Kotlin, Gradle, Java |
 
 ### Subagent Outcomes
-No subagents launched. No actionable stories to execute.
+N/A — no subagents launched.
 
-### Remaining Stories
-All 11 remaining stories (SCP-110 through SCP-120) are gate-6 Android/Kotlin work requiring:
-- Kotlin compiler (`kotlinc` — not installed)
-- Android SDK platforms (ANDROID_HOME exists but no platforms installed)
-- `aarch64-linux-android` Rust target (not installed)
-- UniFFI Kotlin code generation
-
-These stories have no `tools` array but are structurally impossible to execute without Android/Kotlin toolchain.
-
-### Summary
-- Gates 1–5 are fully complete.
-- Gate 3 (FFI bridge) was completed in the previous iteration (SCP-163).
-- Gate 6 (Android/Kotlin SDK) is the only remaining work and requires Android development environment setup.
-- Total workspace: 2,982+ Rust tests, 0 failures.
+### Review Outcomes
+N/A — no work to review.

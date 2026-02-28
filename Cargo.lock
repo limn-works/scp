@@ -3505,6 +3505,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "dashmap",
+ "ed25519-dalek",
  "pyo3",
  "rand 0.8.5",
  "scp-core",
@@ -3514,6 +3515,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tracing",
+ "z-base-32",
 ]
 
 [[package]]

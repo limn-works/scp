@@ -27,13 +27,16 @@
 //!
 //! See SCP-163 for the wiring story.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
 use scp_core::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_core::context::tools::ToolRegistry;
+use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::event_log::EventLog;
+use scp_core::identity::cache::SystemClock;
 
 use crate::error::ScpPyError;
 
@@ -47,9 +50,10 @@ fn registry() -> &'static DashMap<String, ContextRuntime> {
 
 /// Per-context runtime state: the live objects needed by bridge functions.
 ///
-/// Each context gets its own tool registry, event log, role state, and UCAN
-/// revocation list. These are created when `py_context_create` is called and
-/// destroyed when `py_context_close` is called.
+/// Each context gets its own tool registry, event log, role state, UCAN
+/// revocation list, nonce tracker, and capability ceiling string set. These
+/// are created when `py_context_create` is called and destroyed when
+/// `py_context_close` is called.
 pub struct ContextRuntime {
     /// Tool registry for this context.
     pub tool_registry: ToolRegistry,
@@ -59,6 +63,11 @@ pub struct ContextRuntime {
     pub role_state: ContextRoleState,
     /// UCAN revocation list for this context.
     pub revocation_list: RevocationList,
+    /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
+    pub nonce_tracker: NonceTracker<SystemClock>,
+    /// Capability ceiling as a set of `{resource}:{action}` strings for
+    /// UCAN validation (ADR-016 step 8).
+    pub ceiling_strings: HashSet<String>,
     /// The DID of the context creator.
     pub creator_did: String,
 }
@@ -106,20 +115,29 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
         Entry::Vacant(vacant) => {
             let tool_registry = ToolRegistry::new();
             let event_log = EventLog::new(context_id.to_owned());
+            let ceiling = default_ceiling();
+            let ceiling_strings = ceiling
+                .capabilities
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<HashSet<String>>();
             let role_state =
-                ContextRoleState::new(context_id, creator_did, default_ceiling(), vec![])
+                ContextRoleState::new(context_id, creator_did, ceiling, vec![])
                     .map_err(|e| {
                         ScpPyError::ContextError(format!(
                             "failed to create role state: {e}"
                         ))
                     })?;
             let revocation_list = RevocationList::new(context_id.to_owned());
+            let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
 
             let runtime = ContextRuntime {
                 tool_registry,
                 event_log,
                 role_state,
                 revocation_list,
+                nonce_tracker,
+                ceiling_strings,
                 creator_did: creator_did.to_owned(),
             };
 
