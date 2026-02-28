@@ -459,6 +459,33 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     crate::runtime::register_context(&context_id, identity_did)
         .map_err(|e| PyRuntimeError::new_err(format!("failed to register context runtime: {e}")))?;
 
+    // Register in the known-contexts registry for discovery via
+    // py_mcp_load_contexts. Derive a routing ID from the context ID
+    // (SHA-256 hash) and use the currently connected relay URL if available.
+    {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(context_id.as_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        // Get the relay URL from transport status if a relay is connected.
+        let relay_url = crate::transport::py_transport_status()
+            .ok()
+            .and_then(|status| status.relay_url)
+            .unwrap_or_default();
+
+        let known = crate::runtime::KnownContext {
+            routing_id: hash,
+            relay_url,
+            member_did: identity_did.to_owned(),
+            last_seen: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        crate::runtime::register_known_context(&context_id, known);
+    }
+
     // Transition to "active" -- in the full runtime this happens after MLS
     // group formation and parameter validation complete.
     {

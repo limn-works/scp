@@ -684,7 +684,7 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
     context_handles = bridge.py_mcp_load_contexts(did, relay_url)
 
     # Step 4: Start the MCP server.
-    context_ids = [h.context_id for h in context_handles]
+    context_ids = [h["context_id"] for h in context_handles]
     handle = bridge.py_mcp_serve(did, context_ids, transport)
 
     logger.info(
