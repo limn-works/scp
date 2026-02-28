@@ -8,7 +8,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { BRIDGE_TARGET } from "../src/internal/bridge.js";
 
 describe("bridge selection", () => {
