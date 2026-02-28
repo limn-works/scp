@@ -39,6 +39,8 @@ use pyo3::prelude::*;
 pub mod error;
 pub mod event_log;
 pub mod identity;
+pub mod mcp;
+pub mod runtime;
 pub mod tools;
 pub mod transport;
 pub mod types;
@@ -186,6 +188,7 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     transport::register_transport(m)?;
     ucan::register_ucan(m)?;
     event_log::register_event_log(m)?;
+    mcp::register_mcp(m)?;
 
     Ok(())
 }

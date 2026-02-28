@@ -3483,11 +3483,14 @@ dependencies = [
 name = "scp-ffi"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "pyo3",
  "scp-core",
+ "scp-mcp",
  "scp-platform",
  "scp-transport",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
