@@ -3465,6 +3465,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-media",
  "scp-platform",
  "serde",
  "serde_bytes",
