@@ -9474,7 +9474,7 @@
       "gate": "gate-3",
       "priority": "P2",
       "severity": "moderate",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/mcp.rs"
       ],
@@ -9514,7 +9514,8 @@
         "currentState": "validate_capability returns Ok(()) with TODO(#106). invoke_tool returns {\"status\": \"invoked\", \"tool\": name, \"note\": \"TODO(#106)...\"}. py_mcp_load_contexts returns empty Vec.",
         "transportDependency": "py_mcp_load_contexts requires relay transport (scp-transport) wiring. validate_capability and invoke_tool can be completed independently.",
         "relationship": "SCP-165 delivered the bridge wiring. This story completes the remaining stubs that SCP-165 deferred."
-      }
+      },
+      "result": "Implemented validate_capability with has_tool_invoke_capability, invoke_tool with schema validation, py_mcp_load_contexts with local registry query. Dead code annotations moved to field-level. Tests written (cannot run due to PyO3 cdylib test=false). Commit c7a46c4."
     },
     {
       "id": "SCP-211",
