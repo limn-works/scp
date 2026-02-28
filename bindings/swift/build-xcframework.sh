@@ -182,13 +182,20 @@ cp "$GENERATED_HEADER" "$HEADER_DIR/ScpFFI.h"
 
 # Generate module map for the XCFramework header
 log "Generating module.modulemap"
-cat > "$MODULE_MAP" <<'MODULEMAP'
-framework module ScpFFI {
+# Use uniffi-bindgen's generated modulemap if available (it knows the
+# correct module name), otherwise generate one matching the crate's
+# FFI module name (scpFFI — derived from scp_ffi_uniffi by UniFFI).
+if [ -n "$GENERATED_MODULEMAP" ] && [ -f "$GENERATED_MODULEMAP" ]; then
+    cp "$GENERATED_MODULEMAP" "$MODULE_MAP"
+else
+    cat > "$MODULE_MAP" <<'MODULEMAP'
+module scpFFI {
     umbrella header "ScpFFI.h"
     export *
     module * { export * }
 }
 MODULEMAP
+fi
 
 log "Generated: $BINDINGS_DIR/ScpBindings.swift"
 log "Generated: $HEADER_DIR/ScpFFI.h"

@@ -4063,8 +4063,11 @@ public protocol PushProvider: AnyObject, Sendable {
      *
      * Returns the platform-specific token bytes (APNs device token, FCM
      * registration token).
+     *
+     * Named `register_push` (not `register`) to avoid collision with the
+     * C keyword `register` in the UniFFI-generated callback vtable header.
      */
-    func register() async throws  -> Data
+    func registerPush() async throws  -> Data
     
     /**
      * Handle an incoming push notification `payload`.
@@ -4085,7 +4088,7 @@ fileprivate struct UniffiCallbackInterfacePushProvider {
     // This creates 1-element array, since this seems to be the only way to construct a const
     // pointer that we can pass to the Rust code.
     static let vtable: [UniffiVTableCallbackInterfacePushProvider] = [UniffiVTableCallbackInterfacePushProvider(
-        register_: { (
+        registerPush: { (
             uniffiHandle: UInt64,
             uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
             uniffiCallbackData: UInt64,
@@ -4096,7 +4099,7 @@ fileprivate struct UniffiCallbackInterfacePushProvider {
                 guard let uniffiObj = try? FfiConverterCallbackInterfacePushProvider.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
-                return try await uniffiObj.register(
+                return try await uniffiObj.registerPush(
                 )
             }
 
@@ -5708,7 +5711,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_messagelistener_on_complete() != 33199) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_register() != 39474) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_register_push() != 31432) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 49354) {
