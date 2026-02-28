@@ -43,7 +43,7 @@ Properties of identity attestations:
 - **User-initiated.** Only the human creates attestations for their own identities. No third party can assert a link on someone's behalf.
 - **Independently verifiable.** Any participant can verify the attestation without relying on a central authority. Verification methods vary by platform (OAuth proof, signed message, DNS record, etc.).
 - **Revocable.** Users can revoke attestations at any time, severing the link.
-- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Discovery mechanism TBD — possibilities include a distributed registry, DHT, or attestations published alongside the DID document.
+- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through discovery contexts (§6.2.2B) and DID document capability entries (§7.4.1). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` tool in discovery contexts (§22.5).
 
 Identity attestations enable three critical flows:
 
@@ -96,6 +96,7 @@ Identity (DID)
     ├── Graph visibility policies (default + per-identity grants)
     ├── Agent configuration defaults (cross-context preferences)
     ├── Personal annotations on other DIDs
+    ├── Petnames for DIDs and contexts (§22.4)
     ├── Notification preferences
     ├── Draft attestations (not yet published)
     └── (extensible — any identity-level private data)

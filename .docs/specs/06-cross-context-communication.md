@@ -99,7 +99,7 @@ agent_deregister(did) → removal
   output: { removed: bool }
 ```
 
-These are conventions, not mandates — discovery contexts can add custom tools (e.g., reputation scoring, category browsing, geographic filtering) beyond the standard schema.
+These are conventions, not mandates — discovery contexts can add custom tools (e.g., reputation scoring, category browsing, geographic filtering) beyond the standard schema. Discovery contexts that support human-readable addressing (§22) additionally implement `handle_register`, `handle_lookup`, `handle_deregister`, and `attestation_lookup` tools.
 
 **Two-tier membership model.** Discovery contexts use a two-tier architecture to support unbounded scale while maintaining MLS-based governance:
 

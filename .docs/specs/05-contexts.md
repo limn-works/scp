@@ -123,7 +123,9 @@ Metadata updates (e.g., member count changes, governance-driven ceiling modifica
 
 ## 5.8 Context Identity
 
-Contexts are cryptographic entities. You opt into a key, not a name. Naming and display are client-layer concerns. Spoofing a name is a UI problem for clients to solve. Spoofing a cryptographic identity is hard.
+Contexts are cryptographic entities. You opt into a key, not a name. Spoofing a cryptographic identity is hard; spoofing a name is a UI problem for clients to solve.
+
+Human-readable addressing (§22) adds a protocol-level resolution layer — discovery context handles, petnames, attestation-backed handles, and domain handles — that maps human-readable strings to context IDs and DIDs. Handles are resolution hints; the cryptographic context ID remains canonical. Each resolution result carries a trust level (§22.7) indicating the strength of the name-to-identifier binding.
 
 ## 5.9 Governance
 

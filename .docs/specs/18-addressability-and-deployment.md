@@ -108,6 +108,7 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
 | `did` | string | Yes | The operator's DID (did:dht preferred). Enables partial verification via DHT resolution (§18.3.2). |
 | `relay` | string | Yes | Primary relay URL (`wss://` scheme, `/scp/v1` path). |
 | `contexts` | array | No | Publicly listed contexts. See constraints below. |
+| `handles` | object | No | Map of local-part → resolution record for domain handles (§22.6.1). |
 | `relay_config` | object | No | Relay operator configuration subset (§18.3.3). |
 
 **Context entry fields:**
@@ -192,6 +193,7 @@ scp://context/<context_id_hex>?relay=<url>[&relay=<url2>][&mode=<mode>][&name=<n
 | `relay` | Yes (at least one) | Relay URL(s) where the context is reachable. Multiple `relay` parameters for multi-relay contexts. |
 | `mode` | No | `encrypted` or `broadcast`. Advisory — actual mode is verified from context metadata. |
 | `name` | No | Human-readable context name. Advisory, unverified against context metadata. Percent-encoded per RFC 3986. |
+| `handle` | No | Human-readable handle (§22.9.2). Advisory, same status as `name`. Provides a resolution hint for display and address resolution. |
 
 **Parsing rules:**
 
