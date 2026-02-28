@@ -101,3 +101,7 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
   - `py_transport_connect(relay_url)` creates a `NativeRelayAdapter` and stores it in `runtime::RELAY_CONNECTION`. `py_transport_disconnect()` clears it.
   - `runtime::KnownContext` stores `routing_id`, `relay_url`, `member_did`, `last_seen` for each tracked context.
   - Each result dict contains: `context_id`, `source` ("local"/"relay"/"local+relay"), `relay_active` (bool), plus optional `creator_did`/`member_count`/`tool_count`.
+  - **KNOWN BUGS (SCP-213 review, 2026-02-28):**
+    - `py_context_create` does NOT call `register_known_context` — `KNOWN_CONTEXTS` is always empty in production; the relay probe path is dead code. Fix: call `register_known_context` from `py_context_create` after `register_context` succeeds.
+    - Python `mcp.py:687` uses `h.context_id` (attribute access) on dicts returned by `py_mcp_load_contexts` — must be `h["context_id"]` (key access). Dicts do not support attribute access.
+    - Result dicts must be consumed with `h["key"]` syntax in Python — NOT `h.key`. Prefer returning a `#[pyclass]` struct for new structured return types.

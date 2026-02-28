@@ -12,193 +12,81 @@
 - See `pr76-findings.md` for full details
 
 ### PR#76 Fix Verification (2026-02-26)
-- FIXED: `claim_shadow` now verifies both ClaimRequest and Attestation Ed25519 signatures
-- FIXED: RFC 6962 domain separation (0x00 leaf, 0x01 interior) consistent across all 4 event_log submodules
-- FIXED: `allowed_adapters` enforcement added to `check_and_record()` in spending.rs
-- FIXED: `CertificateData` Debug impl redacts private_key_pem
-- FIXED: FFI `init_runtime` uses map_err instead of expect -- no panic across FFI
-- FIXED: `content_hash()` returns Result instead of unwrap_or_default
-- FIXED: `validate_child_ttl` rejects infinite child under finite parent
-- FIXED: Standing channel TOCTOU -- lock held across get-or-create
-- REMAINING (HIGH): GovernanceAction (shadow.rs) still has no signature field
-- REMAINING (HIGH): Duplicate proposal check in SingleAdminEngine placed AFTER construction
-- REMAINING (MEDIUM): Attestation canonical hash uses Debug format for type tag
-- REMAINING (MEDIUM): shutdown_runtime still blocks GIL for 100ms
-- REMAINING (MEDIUM): SHUTDOWN_TIMEOUT const (5s) stale vs actual 100ms
-- UNFIXED: CurrencyCode Deserialize bypasses ASCII validation
-- UNFIXED: EventLogMetrics proof profile Vecs unbounded
-- UNFIXED: PaymentReceipt Debug leaks adapter_proof
-- UNFIXED: SenderVelocityTracker unbounded HashMap
+- FIXED: claim_shadow Ed25519 sigs, RFC 6962 domain separation, allowed_adapters, CertificateData redaction, FFI expect() removal, content_hash Result, validate_child_ttl, standing channel TOCTOU
+- REMAINING (HIGH): GovernanceAction (shadow.rs) no signature field; SingleAdminEngine duplicate check after construction
+- REMAINING (MEDIUM): Attestation canonical hash uses Debug format for type tag; shutdown_runtime blocks GIL 100ms; SHUTDOWN_TIMEOUT const stale
+- UNFIXED: CurrencyCode Deserialize bypasses ASCII; EventLogMetrics Vecs unbounded; SenderVelocityTracker unbounded HashMap
 
 ### MCP Server (`crates/scp-mcp/src/server.rs`)
-- Uses `ContextProvider` trait for testability -- good pattern
-- `tools/list` filters by both role (admin_only) and UCAN capability -- good
+- `tools/list` filters by role + UCAN capability -- good
 - `tools/call` validates UCAN before invocation -- good
 - FINDING (PR#4): No pre-initialization guard on `handle_request`
 - FINDING (PR#4): `resources/read` has no UCAN capability check
 - FINDING (PR#4): Schema validation is type-check-only, not full JSON Schema
 
 ### Relay Server (`crates/scp-transport/src/native/server.rs`)
-- FINDING (PR#4): Zero rate limiting on PUBLISH, SUBSCRIBE, QUERY, DELETE
-- FINDING (PR#4): No storage quota -- InMemoryBlobStorage has no capacity limit
-- FINDING (PR#4): DELETE is unauthenticated
+- FINDING (PR#4): Zero rate limiting; no storage quota; DELETE unauthenticated
 
 ### UCAN (`crates/scp-core/src/crypto/ucan/`)
-- 11-step validation pipeline is thorough -- good
-- `SpendingCapability` attenuation validation is correct and thorough
-- `allowed_adapters` now enforced in check_and_record
-- FINDING (PR#4): `validate_ucan_stateless` skips nonce, revocation, chain, attenuation checks
+- 11-step validation pipeline thorough; SpendingCapability attenuation correct
+- FINDING (PR#4): `validate_ucan_stateless` skips nonce, revocation, chain, attenuation
 - FINDING (PR#4): `now_secs()` uses `unwrap_or_default()` -- returns 0 on clock error
 - UNFIXED: `CurrencyCode` serde deserialize bypasses ASCII validation
 
 ### Shadow Identity (`crates/scp-core/src/bridge/`)
-- Capability restriction via `VERIFIED_IDENTITY_CAPABILITIES` -- good
-- Shadow capacity limits (10k/bridge, 100k total) -- good
-- claim_shadow NOW verifies Ed25519 signatures (both claim + attestation)
+- REMAINING (HIGH): `GovernanceAction` has no signature
+- REMAINING (MEDIUM): Attestation canonical hash uses Debug format; attestation.claim JSON not canonically ordered
 - NEW FINDING (HIGH): Canonical hash no field separators -- concatenation collision risk
-- NEW FINDING (MEDIUM): did:key:<hex> non-standard, not gated behind cfg(test)
-- NEW FINDING (MEDIUM): Shadow governance check only compares shadow_id, no test coverage
-- NEW FINDING (MEDIUM): extract_public_key_from_did + hex_decode duplicated in tree.rs
-- NEW FINDING (MEDIUM): claim canonical hash binds attestation only by ID, not content hash
-- REMAINING (HIGH): `GovernanceAction` has no signature -- still unfixed
-- REMAINING (MEDIUM): Attestation canonical hash uses Debug format for type tag
-- REMAINING (MEDIUM): attestation.claim.to_string() JSON not canonically ordered
+- NEW FINDING (MEDIUM): did:key:<hex> non-standard, not gated behind cfg(test); shadow governance check only compares shadow_id
 
 ### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- Audit 2026-02-28
-- See `pyo3-audit-20260228.md` for full finding details
-- FIXED (SCP-164): UCAN validate delegates to scp-core 11-step pipeline with Ed25519 sig verification
-- FIXED (SCP-164): presenting_agent_did binds token audience (was wildcard bypass)
-- FIXED (SCP-165): MCP SSE URL scheme now restricted to http/https (was any scheme)
-- FIXED (PR#112): CRLF injection defense in parse_http_url + SSE post_path validation
-- FIXED (PR#112): SSE https:// explicitly rejected (was silently downgrading to plaintext)
-- FIXED (PR#112): server_wait releases GIL via py.allow_threads()
-- FIXED (PR#112): HTTP POST Content-Length mismatch (leading whitespace before body removed)
-- FIXED (PR#112): SSE response loop bounded to 1000 events (was unbounded)
-- FIXED (PR#112): HTTP status code validated in SSE connect handshake (was unchecked)
-- FIXED (PR#112): SSE server race condition (provider data from closure args, not stale mutex extract)
-- FIXED (PR#112): eprintln replaced with tracing::error for SSE server errors
-- FIXED (PR#112): SSE endpoint path validated for control characters
+- See `pyo3-audit-20260228.md` for full PR#112 fix list
 - HIGH: expect() panic across FFI in py_context_create (line 457) -- unguarded clock call
-- FIXED (SCP-165): subprocess command injection -- allowlist added in PR#112, reviewed 2026-02-28
-- FIXED: validate_stdio_command now rejects paths (bare basenames only, OS resolves via PATH)
-- FIXED: py_mcp_configure_stdio_allowlist validates entries (rejects paths, NUL, empty)
-- FIXED: configure/disable/reset/get split into separate functions with proper ceremony
-- FIXED: Python SDK pre-validates in connect() before FFI, raises ValidationError with actionable messages
-- REMAINING (MEDIUM): docker/podman in default allowlist -- permissive for defense-in-depth
-- RESOLVED (MEDIUM): Python DEFAULT_STDIO_ALLOWLIST duplicates Rust list -- Python SDK already queries runtime via get_stdio_allowlist(); constant is documentation only
+- REMAINING (MEDIUM): docker/podman in default allowlist
 - TRACKED (TODO #106): validate_capability always Ok(()) -- defense-in-depth gap
-- TRACKED (TODO #106): invoke_tool returns stub JSON, not real tool execution
 - TRACKED: registries unbounded (#108), recursion depth (#110), clock drift (#107)
-- GOOD: DashMap, CSPRNG handles, typed errors, poisoned mutex handling, proper DashMap guard drops
+- SCP-212 (2026-02-28): invoke_tool dispatches to registered ToolHandler closures
+  - HIGH: No ToolInvokedEvent appended to event_log -- ADR-010 spec gap (no audit trail)
+  - HIGH: mcp_register_tool_handler Rust fn not wrapped in Python SDK (mcp.py) -- unreachable to SDK users
+  - MEDIUM: DashMap shard lock held during Python handler execution -- free-threaded Python shard starvation risk; fix by cloning handler Arc before entering with_context
+  - MEDIUM: No timeout on Python handler call -- blocking handler can starve tokio runtime
+  - BUG: Redundant second tool_registry.get() in output-schema validation; make unconditional (fail-closed)
+  - GOOD: Callable check at registration; tool-existence gate before handler stored; input+output schema validation
 
-### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 Review (2026-02-26)
-- CRITICAL: scp-platform testing feature STILL in production deps (cdylib)
-- HIGH: transport_connect accepts ANY URL scheme -- no wss:// enforcement (NAPI/WASM have it)
-- MEDIUM: std::sync::Mutex in async context (short holds, but latent deadlock risk)
-- MEDIUM: serde_json Error messages may leak struct details
-- LOW: identity_load hardcodes CustodyMethod::InMemory regardless of actual custody
-- LOW: HANDLE_COUNT uses Ordering::Relaxed -- shutdown race on ARM
-- FIXED: ContextHandle::state() now returns error on poisoned mutex (was silently defaulting)
-- FIXED: Context IDs now use UUID v4 CSPRNG (was nanosecond timestamp)
-- FIXED: runtime() uses tracing::error instead of eprintln
-- GOOD: OnceLock runtime pattern, abort on fatal init, Send+Sync on callbacks
-- GOOD: ScpError enum with machine-readable codes
-- GOOD: OpaqueInMemoryKeyCustody Debug redaction
-- GOOD: Handle ref counting with Drop for shutdown ordering
-- GOOD: Callback interfaces (KeyCustodyProvider, StorageProvider, PushProvider)
+### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86
+- CRITICAL: scp-platform testing feature in production deps (cdylib)
+- HIGH: transport_connect accepts ANY URL scheme -- no wss:// enforcement
+- MEDIUM: std::sync::Mutex in async context; serde_json errors may leak struct details
+
+### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86
+- FIXED: transport_connect now rejects non-wss:// URLs
+- MEDIUM: WasmDIDDocument::from_fields no validation; context_send base64 check is_empty() only; panic hook leaks file paths; Missing #![forbid(unsafe_code)]; JsMessageCallback lacks catch
+
+### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86
+- CRITICAL: scp-platform testing feature in production deps (cdylib)
+- HIGH: unreachable!() in identity_create -- panic across FFI
+- MEDIUM: std::sync::Mutex in async context; missing #![forbid(unsafe_code)]; status() silently defaults on poisoned mutex
 
 ### TLS (`crates/scp-node/src/tls.rs`)
-- TLS 1.3 enforced via `with_protocol_versions` -- good
-- ACME HTTP-01 challenge router is correct
-- CertificateData Debug NOW redacts private_key_pem
-- Private key stored via Storage trait at `scp.tls.private_key_pem`
+- TLS 1.3 enforced; ACME HTTP-01 correct; CertificateData Debug redacts key
 - `zeroize` crate still not used for private key material
 
-### Economy (`crates/scp-core/src/economy/`)
-- `Amount(u64)` with `saturating_add` -- no overflow risk
-- `PaymentAdapter` trait: authorize/capture two-phase pattern
-- UNFIXED: `SenderVelocityTracker` unbounded HashMap growth
-- FIXED: `PaymentReceipt` Debug now redacts adapter_proof and signature to byte-length
+### Economy
+- UNFIXED: SenderVelocityTracker unbounded HashMap growth
+- SCP-156: HIGH: Step 5 missing adapter.verify() -- no cryptographic auth validity check
+- SCP-156: MEDIUM: Dummy PaymentAuthorization (zeroed auth_id) on 3 free paths; IntegrationError erased to string
+- SCP-160 tests: TestAdapter::verify_authorization() no-op; Invariant 7 test self-referential
 
-### Economy Integration (SCP-156 Review, 2026-02-27)
-- HIGH: Step 5 missing adapter.verify() -- only checks cost sufficiency, not cryptographic auth validity
-- MEDIUM: Dummy PaymentAuthorization (zeroed auth_id) leaked to closures on 3 free paths
-- MEDIUM: IntegrationError erased to ContextError::MembershipFailed(string) in ContextManager
-- GOOD: Fail-closed on arithmetic overflow (unwrap_or(Amount(u64::MAX)))
-- GOOD: Integer-only arithmetic throughout (no f64)
-- Pattern: execute_paid_action combines sender+receiver flows -- needs split for production 2-party use
-
-### Economy Integration Tests (SCP-160 Review, 2026-02-27)
-- 40 tests covering all 9 invariants from spec 19.14, all pass
-- MEDIUM: Invariant 7 test is self-referential (checks hardcoded string, not real encryption path)
-- MEDIUM: TestAdapter::verify() returns Amount(0) not receipt amount -- weakens invariant 4
-- MEDIUM: signed_event helper duplicates EventType-to-tag mapping from tree.rs -- divergence risk
-- TestAdapter::verify_authorization() is no-op -- spec 19.2.2 step 5 not tested
-- GOOD: Tests exercise real production functions (evaluate_cost, auto_accept_blocked_by_economics, etc.)
-- GOOD: Merkle proof integration with signed events and real EventLog
-- Pattern: Test adapter fidelity matters for invariant tests -- echoing values back catches mismatches
-
-### Context Nesting (`crates/scp-core/src/context/nesting.rs`)
-- content_hash NOW returns Result (no hash collision on serialization error)
-- validate_child_ttl NOW rejects infinite child under finite parent
-- Standing channel TOCTOU fixed -- lock held across get-or-create
-
-### Governance (`crates/scp-core/src/context/governance/mod.rs`)
-- SingleAdminEngine has duplicate proposal check but placed after construction
-- GovernanceProposal tracks votes with signed votes (DID + signature)
-
-### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 Review (2026-02-26)
-- Bridge-stub architecture: no scp-core dependency, delegates real logic to TypeScript SDK
-- GOOD: No unwrap/expect/panic in source; workspace clippy deny inherited
-- GOOD: CSPRNG context IDs via uuid v4 + getrandom/js
-- GOOD: JsKeyCustody and JsStorage extern methods use `catch`
-- GOOD: No key material in Rust structs -- keys stay in JS WebCrypto boundary
-- GOOD: No scp-platform/scp-testing dependency
-- GOOD: Stable error codes matching cross-SDK standard
-- FIXED: transport_connect NOW rejects non-wss:// URLs (was HIGH)
-- MEDIUM: WasmDIDDocument::from_fields performs zero validation on JS-provided strings
-- MEDIUM: context_send claims base64 validation but only checks is_empty()
-- MEDIUM: Panic hook leaks file paths and internal state to browser console
-- MEDIUM: Missing #![forbid(unsafe_code)] -- no architectural need for unsafe
-- MEDIUM: serde_json Error messages may leak struct details when typed deserialization added
-- MEDIUM: JsMessageCallback on_message/on_complete lack `catch` -- JS throw = WASM trap
-
-### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86 Review (2026-02-26)
-- CRITICAL: scp-platform testing feature in production deps (cdylib) -- same as UniFFI
-- HIGH: unreachable!() in identity_create match arm -- panic across FFI boundary
-- MEDIUM: std::sync::Mutex in async context (short holds, latent risk)
-- MEDIUM: Missing #![forbid(unsafe_code)]
-- MEDIUM: NapiTransportManager::status() silently defaults on poisoned mutex
-- LOW: transport_disconnect silently ignores poisoned lock on state update
-- LOW: identity_load hardcodes custody_type "in_memory"
-- LOW: HANDLE_COUNT uses Ordering::Relaxed
-- GOOD: OnceLock runtime pattern, abort on fatal init
-- GOOD: OpaqueInMemoryKeyCustody Debug redaction
-- GOOD: wss:// validation in transport_connect
-- GOOD: Handle ref counting with Drop for shutdown ordering
-- GOOD: thiserror + machine-readable error codes
-
-### Tiered Storage (`crates/scp-core/src/event_log/tiered_storage.rs`) -- SCP-127 Review (2026-02-27)
-- HIGH: checkpoint_root invalidated after second migration -- overwrites with partial hot root
-- HIGH: Hot log rebuild resets indices to 0-based, breaking global sequence mapping
-- MEDIUM: cold_entries linear scan O(n) -- should binary search by sequence
-- MEDIUM: No defense-in-depth checks on relay-returned proof (leaf_hash, leaf_index not asserted)
-- MEDIUM: leaf_hash sent to untrusted relay in fetch -- info leak
-- MEDIUM: hot_log_mut() allows bypassing record_hot_event -- metadata desync
-- MEDIUM: Unbounded cold_entries Vec growth
-- MEDIUM: now parameter caller-supplied with no validation
-- GOOD: Relay root overridden with local checkpoint_root before verification
-- GOOD: MaliciousProvider test for forged proof rejection
-- GOOD: thiserror for TieredStorageError, no unwrap/expect in lib code
-- GOOD: OR semantics for migration thresholds (age, count, bytes)
-- GOOD: ColdTierProvider trait is injectable and object-safe
+### Tiered Storage & Context Discovery
+- See `tiered-storage-scp213.md` for full finding details (SCP-127, SCP-213)
+- SCP-127: HIGH x2 (checkpoint_root clobbered, index reset); MEDIUM x5
+- SCP-213: HIGH BUG x2 (register_known_context never called; `h.context_id` AttributeError)
 
 ### General Patterns
 - No `unwrap`/`expect` in lib code -- project standard via clippy deny
-- `thiserror` for error types -- consistent across crates
-- Rust edition 2024, `#![forbid(unsafe_code)]` on all crates except scp-ffi
-- `zeroize` crate not yet used anywhere
-- Recurring: `unwrap_or_default()` on clock ops -- systemic pattern
-- Pattern: multi-migration checkpoint root management is a subtle invariant -- always test proof verification across 2+ migration cycles
-- Pattern: Duplicated canonical hash logic in test helpers is a recurring fragility -- always import production functions instead of reimplementing
-- Pattern: Test adapters that return hardcoded success values weaken invariant tests -- echo real values back
+- `thiserror` for error types; Rust edition 2024; `#![forbid(unsafe_code)]` on all crates except scp-ffi
+- `zeroize` crate not yet used anywhere; `unwrap_or_default()` on clock ops is a recurring systemic pattern
+- FfiBridgeProvider reimplementing scp-core logic instead of delegating silently drops spec obligations (event log, timeout, request_id) -- always prefer delegation
+- DashMap shard locks must not be held across Python GIL acquisition -- clone Arc before entering with_context
+- New PyO3 Rust functions must also be wrapped in the Python SDK layer or they are unreachable to SDK users
+- Test adapters that return hardcoded values weaken invariant tests; duplicated canonical hash logic in test helpers diverges from production
