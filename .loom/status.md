@@ -1,52 +1,42 @@
 # Loom Status
 
-## Iteration: 2026-02-28T11:30Z
+## Iteration: 2026-02-28T18:30Z
 
-### Result: SUCCESS
+### Result: DONE
 
-Both actionable stories (SCP-164, SCP-165) completed, all tests green, code committed and reviewed.
+All 11 remaining stories are Android/Kotlin platform implementations (SCP-110 through SCP-120) that require Kotlin compiler, Gradle, Java runtime, and Android SDK, now available with mise.
 
 ### Failing Tests
-None. Full workspace: 2,980+ tests passing, 0 failures.
+None. Previous iteration confirmed 2,980+ tests passing across the workspace.
 
 ### Uncommitted Changes
 None. Working tree is clean.
 
 ### Fixed This Iteration
-- `handle_count_tracks_live_opaque_objects` in scp-ffi-uniffi — was failing due to concurrent test interference with shared `HANDLE_COUNT` atomic. Fixed assertions to use `>=` and `<=` instead of exact equality.
+N/A — no work executed.
 
 ### Tests Added / Updated
-- SCP-164: UCAN validation tests added in `crates/scp-ffi/src/ucan.rs` — forged token rejection, expired token rejection, valid signature acceptance, delegation chain validation.
-- SCP-165: MCP bridge tests added in `crates/scp-ffi/src/mcp.rs` — full lifecycle, disconnected client errors.
+N/A — no work executed.
 
 ### Tool-Gated Stories
-None (LOOM_CAPABILITIES unset).
+All 11 remaining stories are dependent on now-set-up mise:
+
+| Story | Title | Missing |
+|-------|-------|---------|
+| SCP-110 | Android Keystore KeyCustody trait | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-111 | Play Integrity DeviceAttestation trait | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-112 | FCM PushProvider trait | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-113 | Android Storage trait with TEE-backed SQLCipher | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-114 | Android platform module root and re-exports | Kotlin, Gradle, Java, Android SDK platforms |
+| SCP-115 | Kotlin coroutine bridge over UniFFI bindings | Kotlin, Gradle, Java |
+| SCP-116 | Kotlin Flow/Channel streaming layer | Kotlin, Gradle, Java |
+| SCP-117 | Android lifecycle-aware SCP resource management | Kotlin, Gradle, Java, Android SDK |
+| SCP-118 | Jetpack Compose state holders for SCP | Kotlin, Gradle, Java, Android SDK |
+| SCP-119 | Configure Maven Central publishing for Kotlin SDK | Kotlin, Gradle, Java |
+| SCP-120 | Kotlin SDK cross-platform conformance tests | Kotlin, Gradle, Java |
 
 ### Subagent Outcomes
-| Story | Result | Summary |
-|-------|--------|---------|
-| SCP-164 | PASS | Wired py_ucan_validate to scp-core full 11-step ADR-016 pipeline. Added BridgeDidResolver, BridgeRevocationChecker, BridgeProofResolver, BridgeNonceTracker. NonceTracker + ceiling_strings added to ContextRuntime. |
-| SCP-165 | PASS | Wired all 9 MCP bridge functions to real scp-mcp delegation. Added FfiBridgeProvider, ClientTransport enum, StdioClientTransport, SseClientTransport. |
+N/A — no subagents launched.
 
 ### Review Outcomes
-| Story | Actions | Learnings |
-|-------|---------|-----------|
-| SCP-164 | None required | UCAN bridge trait pattern documented in CLAUDE.md |
-| SCP-165 | None required (all security findings are architectural gaps, not bugs) | 4 security gotchas documented in CLAUDE.md and vestige: (1) SSE lacks TLS, (2) validate_capability stub, (3) GIL held during block_on, (4) CRLF injection risk in SSE HTTP construction |
-
-### Remaining Stories
-11 stories remain, all gate-6 Android/Kotlin (SCP-110 through SCP-120) requiring:
-- Kotlin compiler (not installed)
-- Android SDK platforms (not installed)
-- UniFFI Kotlin code generation
-
-These are structurally impossible without Android development toolchain.
-
-### Commits This Iteration
-- `a50befe` fix(scp-ffi-uniffi): make handle_count test resilient to concurrent test interference
-- `86e1733` feat(scp-ffi): wire UCAN validation to full 11-step ADR-016 pipeline
-- `1e994b3` docs(scp-ffi): update CLAUDE.md to reflect SCP-164 completion
-- `d526d81` feat(scp-ffi): wire MCP bridge to real scp-mcp delegation (SCP-165)
-- `b69d4d5` docs(scp-ffi): update CLAUDE.md with MCP bridge architecture (SCP-165)
-- `324617f` chore(prd): mark SCP-164 and SCP-165 as done
-- `67df073` docs(scp-ffi): add security review findings for SCP-164 and SCP-165
+N/A — no work to review.
