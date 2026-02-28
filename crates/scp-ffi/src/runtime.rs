@@ -176,6 +176,7 @@ where
 /// Used by `py_mcp_load_contexts` to return locally known contexts when
 /// relay transport is not yet wired. Returns an empty Vec if no contexts
 /// match.
+#[must_use]
 pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
     registry()
         .iter()

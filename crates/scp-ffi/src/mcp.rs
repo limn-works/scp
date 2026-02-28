@@ -1049,6 +1049,7 @@ pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     dict.set_item("context_ids", &entry.context_ids)?;
     dict.set_item("transport", &entry.transport)?;
     dict.set_item("stopped", entry.stopped)?;
+    drop(entry);
     Ok(dict.into())
 }
 
@@ -1076,6 +1077,7 @@ pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     dict.set_item("transport", &entry.transport)?;
     dict.set_item("command", &entry.command)?;
     dict.set_item("url", &entry.url)?;
+    drop(entry);
     Ok(dict.into())
 }
 
@@ -1658,10 +1660,7 @@ mod tests {
 
     /// Registers a context in the runtime registry and optionally adds a tool.
     /// Returns a unique context ID to avoid collisions with parallel tests.
-    fn setup_test_context(
-        creator_did: &str,
-        with_tool: bool,
-    ) -> String {
+    fn setup_test_context(creator_did: &str, with_tool: bool) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
         crate::runtime::register_context(&ctx_id, creator_did).unwrap();
@@ -1817,11 +1816,8 @@ mod tests {
 
         // Input schema requires an object with "a" and "b" as required fields.
         // Pass a string instead.
-        let result = provider.invoke_tool(
-            &ctx_id,
-            "calculator",
-            serde_json::json!("not an object"),
-        );
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!("not an object"));
         assert!(result.is_err(), "invalid input should be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -1830,22 +1826,15 @@ mod tests {
         );
 
         // Pass an object missing required fields.
-        let result = provider.invoke_tool(
-            &ctx_id,
-            "calculator",
-            serde_json::json!({"a": 1}),
-        );
+        let result = provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1}));
         assert!(
             result.is_err(),
             "input missing required field 'b' should be rejected"
         );
 
         // Pass valid input — should succeed.
-        let result = provider.invoke_tool(
-            &ctx_id,
-            "calculator",
-            serde_json::json!({"a": 1, "b": 2}),
-        );
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_ok(), "valid input should succeed: {result:?}");
 
         crate::runtime::remove_context(&ctx_id);
@@ -1865,11 +1854,7 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
         };
 
-        let result = provider.invoke_tool(
-            &ctx_id,
-            "nonexistent",
-            serde_json::json!({}),
-        );
+        let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
         assert!(result.is_err(), "unknown tool should be rejected");
         let err = result.unwrap_err();
         assert!(
