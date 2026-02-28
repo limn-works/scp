@@ -108,6 +108,9 @@ enum class DestructionMethod {
  * - `SCP-CRYPTO-4003`: Wrong key type for operation
  * - `SCP-CRYPTO-4004`: Key destruction failed
  * - `SCP-CRYPTO-4005`: Cryptographic operation failed
+ * - `SCP-STORAGE-6001`: Storage key not found
+ * - `SCP-STORAGE-6002`: Storage operation failed
+ * - `SCP-STORAGE-6003`: Storage encryption key derivation failed
  *
  * @property code Structured SCP error code.
  */
@@ -275,4 +278,79 @@ interface KeyCustodyProvider {
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      */
     fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle
+}
+
+/**
+ * Platform trait for encrypted key-value storage.
+ *
+ * Abstracts persistent, encrypted storage behind a uniform interface. The Android
+ * implementation ([AndroidStorage]) uses SQLCipher with a TEE-derived AES-256
+ * encryption key stored in Android Keystore.
+ *
+ * This interface mirrors the Rust `Storage` trait in `scp-platform/src/traits.rs`
+ * and the UniFFI `StorageProvider` callback interface in `scp-ffi/uniffi/src/bridge.rs`.
+ *
+ * All keys are UTF-8 strings. Values are opaque byte arrays. Keys are unique — storing
+ * a value with an existing key replaces the previous value.
+ *
+ * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
+ */
+interface StorageProvider {
+    /**
+     * Store a key-value pair, replacing any existing value for the key.
+     *
+     * @param key The storage key (UTF-8 string).
+     * @param data The value to store (opaque bytes).
+     * @throws ScpException with code `SCP-STORAGE-6002` if the store operation fails.
+     */
+    fun store(key: String, data: ByteArray)
+
+    /**
+     * Retrieve the value associated with a key.
+     *
+     * @param key The storage key to look up.
+     * @return The stored bytes, or `null` if the key does not exist.
+     * @throws ScpException with code `SCP-STORAGE-6002` if the read operation fails.
+     */
+    fun retrieve(key: String): ByteArray?
+
+    /**
+     * Delete the value associated with a key.
+     *
+     * Deleting a non-existent key is a no-op (no exception thrown).
+     *
+     * @param key The storage key to delete.
+     * @throws ScpException with code `SCP-STORAGE-6002` if the delete operation fails.
+     */
+    fun delete(key: String)
+
+    /**
+     * List all keys matching a prefix, in lexicographic order.
+     *
+     * Lexicographic ordering is required for KeyPackage buffer management
+     * and event log range queries. An empty prefix returns all keys.
+     *
+     * @param prefix The key prefix to match. Use `""` for all keys.
+     * @return Keys matching the prefix, sorted in ascending lexicographic order.
+     * @throws ScpException with code `SCP-STORAGE-6002` if the list operation fails.
+     */
+    fun listKeys(prefix: String): List<String>
+
+    /**
+     * Delete all keys matching a prefix.
+     *
+     * @param prefix The key prefix to match.
+     * @return The number of keys deleted.
+     * @throws ScpException with code `SCP-STORAGE-6002` if the delete operation fails.
+     */
+    fun deletePrefix(prefix: String): Long
+
+    /**
+     * Check whether a key exists in storage.
+     *
+     * @param key The storage key to check.
+     * @return `true` if the key exists, `false` otherwise.
+     * @throws ScpException with code `SCP-STORAGE-6002` if the check operation fails.
+     */
+    fun exists(key: String): Boolean
 }
