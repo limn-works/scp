@@ -147,7 +147,7 @@ pub fn py_ucan_validate(
     // Step 4: Check time bounds.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .map_err(|e| ScpPyError::UcanError(format!("system clock error: {e}")))?
         .as_secs();
 
     if payload.exp <= now {
@@ -267,7 +267,7 @@ pub fn py_ucan_mint(
     // Calculate expiry: 1 hour from now (default, within 24h max).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .map_err(|e| ScpPyError::UcanError(format!("system clock error: {e}")))?
         .as_secs();
     let exp = now + 3600; // 1 hour
 
@@ -330,7 +330,7 @@ fn generate_nonce() -> String {
 
     let now_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock before Unix epoch")
         .as_millis();
 
     let mut random_bytes = [0u8; 16];

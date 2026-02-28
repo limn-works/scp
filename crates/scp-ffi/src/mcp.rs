@@ -413,8 +413,8 @@ pub fn py_mcp_client_invoke(
     // Build provenance metadata using scp-mcp's ExternalToolProvenance.
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .map_err(|e| ScpPyError::TransportError(format!("system clock error: {e}")))?
+        .as_millis() as u64;
 
     let provenance = scp_mcp::client::ExternalToolProvenance::new(
         tool_name,
