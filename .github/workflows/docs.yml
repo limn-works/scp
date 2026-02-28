@@ -112,10 +112,10 @@ jobs:
       - name: Generate DocC
         working-directory: bindings/swift
         run: |
-          if [ -f Package.swift ]; then
+          if [ -f Package.swift ] && [ -d ScpFFI.xcframework ]; then
             swift package generate-documentation --target SCP --output-path docs
           else
-            echo "::notice::Package.swift not found -- skipping Swift docs"
+            echo "::notice::Package.swift or ScpFFI.xcframework not found -- skipping Swift docs"
           fi
       - uses: actions/upload-artifact@v4
         with:
