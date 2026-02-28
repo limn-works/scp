@@ -1,0 +1,19 @@
+[tools]
+java = "zulu-17.64.17"
+bun = "1.3.9"
+python = "3.12.12"
+kotlin = "2.3.10"
+rust = { version = "stable", targets = "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android,x86_64-apple-darwin,aarch64-apple-darwin" }
+"cargo:cargo-nextest" = "latest"
+"cargo:wasm-pack" = "latest"
+"cargo:maturin" = "latest"
+"cargo:cargo-deny" = "latest"
+"npm:@napi-rs/cli" = "latest"
+
+[env]
+ANDROID_NDK_VERSION = "27.2.12479018"
+ANDROID_HOME = "{% if os() == 'macos' %}{{ env.HOME }}/Library/Android/sdk{% else %}{{ env.HOME }}/Android/Sdk{% endif %}"
+ANDROID_NDK_HOME = "{{ env.ANDROID_HOME }}/ndk/{{ env.ANDROID_NDK_VERSION }}"
+
+# Android NDK linkers need host-platform detection — delegate to shell
+_.source = "scripts/android-linkers.sh"

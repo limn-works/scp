@@ -89,45 +89,37 @@ Without a strong, open protocol for shareable context, the result is fragmented 
 Install these manually (one-time):
 
 1. **Homebrew** — https://brew.sh
-2. **asdf** — `brew install asdf` ([asdf-vm.com](https://asdf-vm.com))
-3. **rustup** — https://rustup.rs
-4. **Xcode Command Line Tools** — `xcode-select --install`
+2. **mise** — `brew install mise` ([mise.jdx.dev](https://mise.jdx.dev))
+3. **Xcode Command Line Tools** — `xcode-select --install`
+
+Then activate mise in your shell profile (`~/.zshrc`):
+
+```sh
+eval "$(mise activate zsh)"
+```
+
+mise automatically manages environment variables (`JAVA_HOME`, `ANDROID_HOME`, `ANDROID_NDK_HOME`, `CARGO_TARGET_*_LINKER`) — no manual sourcing needed.
 
 ### Setup
 
 ```sh
-./scripts/setup-toolchain.sh
+mise install         # languages, Rust targets, cargo tools, npm globals
+./scripts/setup-toolchain.sh   # Android SDK/NDK (the one thing mise can't do)
 ```
 
-The script is idempotent — safe to re-run at any time. It installs and configures:
+Both commands are idempotent — safe to re-run at any time. Together they install:
 
 | Category | What | Manager |
 |---|---|---|
-| Languages | Java 17 (Zulu), Bun 1.3, Python 3.12, Kotlin 2.3 | asdf (pinned in `.tool-versions`) |
-| Rust targets | WASM, iOS, iOS Simulator, Android (4 arch), macOS universal | rustup |
-| Cargo tools | cargo-nextest, wasm-pack, maturin, cargo-deny | cargo |
-| Bun globals | @napi-rs/cli | bun |
+| Languages | Java 17 (Zulu), Bun 1.3, Python 3.12, Kotlin 2.3 | mise (pinned in `.mise.toml`) |
+| Rust | Stable toolchain + 10 cross-compilation targets | mise (via rustup backend) |
+| Cargo tools | cargo-nextest, wasm-pack, maturin, cargo-deny | mise (cargo backend) |
+| npm globals | @napi-rs/cli | mise (npm backend) |
 | Android | SDK command-line tools, NDK 27.2 | sdkmanager (via Homebrew) |
 
-Rust and Swift are **not** managed by asdf — they use their own canonical tooling (rustup and Xcode, respectively).
+Swift uses Xcode — not managed by mise.
 
-If Homebrew-installed Kotlin or OpenJDK are detected, the script warns but does not remove them. asdf takes precedence within the repo via `.tool-versions`.
-
-### Environment
-
-Add this to your shell profile (`~/.zshrc` or `~/.bashrc`):
-
-```sh
-source /path/to/scp/scripts/env.sh
-```
-
-This sets:
-- `ANDROID_HOME` — auto-detected from `~/Library/Android/sdk` or `~/Android/Sdk`
-- `ANDROID_NDK_HOME` — pinned NDK version under `ANDROID_HOME`
-- `JAVA_HOME` — resolved from asdf
-- `CARGO_TARGET_*_LINKER` — NDK clang linkers for all 4 Android architectures, so `cargo build --target aarch64-linux-android` works without extra flags
-
-CI (`build-matrix.yml`) pins the same NDK version so local and CI builds match.
+If Homebrew-installed Kotlin or OpenJDK are detected, the setup script warns but does not remove them. mise takes precedence within the repo via `.mise.toml`.
 
 ### Verify
 

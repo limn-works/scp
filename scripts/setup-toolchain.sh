@@ -7,9 +7,12 @@
 #
 # Prerequisites (install manually first):
 #   - Homebrew: https://brew.sh
-#   - asdf: https://asdf-vm.com (brew install asdf)
-#   - rustup: https://rustup.rs
+#   - mise: https://mise.jdx.dev (brew install mise)
 #   - Xcode Command Line Tools: xcode-select --install
+#
+# mise handles: language versions, Rust targets, cargo tools, npm globals,
+# and environment variables (JAVA_HOME, ANDROID_HOME, NDK linkers, etc.)
+# This script only covers what mise can't: Android SDK/NDK via sdkmanager.
 
 set -euo pipefail
 
@@ -18,30 +21,6 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 NDK_VERSION="27.2.12479018"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-
-RUST_TARGETS=(
-  # WASM
-  wasm32-unknown-unknown
-  # iOS
-  aarch64-apple-ios
-  aarch64-apple-ios-sim
-  x86_64-apple-ios
-  # Android
-  aarch64-linux-android
-  armv7-linux-androideabi
-  x86_64-linux-android
-  i686-linux-android
-  # macOS universal
-  x86_64-apple-darwin
-  aarch64-apple-darwin
-)
-
-CARGO_TOOLS=(
-  cargo-nextest
-  wasm-pack
-  maturin
-  cargo-deny
-)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,8 +64,7 @@ section "Prerequisites"
 
 require_cmd git
 require_cmd brew || true
-require_cmd asdf || true
-require_cmd rustup || true
+require_cmd mise || true
 
 # Xcode CLT
 if xcode-select -p &>/dev/null; then
@@ -96,154 +74,105 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. asdf plugins
+# 2. mise install (languages, Rust targets, cargo tools, npm globals)
 # ---------------------------------------------------------------------------
-section "asdf plugins"
-
-ASDF_PLUGINS=(java bun python kotlin)
-
-for plugin in "${ASDF_PLUGINS[@]}"; do
-  if asdf plugin list 2>/dev/null | grep -q "^${plugin}$"; then
-    ok "plugin: $plugin"
-  elif $CHECK_MODE; then
-    fail "plugin missing: $plugin"
-  else
-    info "Adding plugin: $plugin"
-    asdf plugin add "$plugin"
-    ok "plugin added: $plugin"
-  fi
-done
-
-# ---------------------------------------------------------------------------
-# 3. asdf versions (from .tool-versions)
-# ---------------------------------------------------------------------------
-section "asdf versions"
+section "mise install"
 
 cd "$REPO_ROOT"
 
 if $CHECK_MODE; then
-  # Check each tool version is installed
-  while IFS=' ' read -r tool version; do
-    [[ -z "$tool" || "$tool" == "#"* ]] && continue
-    if asdf list "$tool" 2>/dev/null | grep -q "$version"; then
-      ok "$tool $version"
-    else
-      fail "$tool $version not installed"
-    fi
-  done < .tool-versions
-else
-  info "Installing versions from .tool-versions..."
-  asdf install
-  asdf reshim
-  ok "asdf install complete"
+  info "Running mise doctor..."
+  mise doctor 2>&1 | head -30 || true
+  echo ""
 
-  # Verify
-  while IFS=' ' read -r tool version; do
-    [[ -z "$tool" || "$tool" == "#"* ]] && continue
-    if asdf list "$tool" 2>/dev/null | grep -q "$version"; then
-      ok "$tool $version"
+  # Verify key tools are installed
+  for tool in java bun python kotlin rust; do
+    if mise ls --installed "$tool" &>/dev/null && [[ -n "$(mise ls --installed "$tool" 2>/dev/null)" ]]; then
+      ok "$tool $(mise current "$tool" 2>/dev/null || echo '?')"
     else
-      fail "$tool $version failed to install"
+      fail "$tool not installed via mise"
     fi
-  done < .tool-versions
+  done
+
+  for cargo_tool in cargo-nextest wasm-pack maturin cargo-deny; do
+    if mise ls --installed "cargo:$cargo_tool" &>/dev/null && [[ -n "$(mise ls --installed "cargo:$cargo_tool" 2>/dev/null)" ]]; then
+      ok "cargo:$cargo_tool"
+    else
+      fail "cargo:$cargo_tool not installed via mise"
+    fi
+  done
+
+  if mise ls --installed "npm:@napi-rs/cli" &>/dev/null && [[ -n "$(mise ls --installed "npm:@napi-rs/cli" 2>/dev/null)" ]]; then
+    ok "npm:@napi-rs/cli"
+  else
+    fail "npm:@napi-rs/cli not installed via mise"
+  fi
+else
+  info "Installing tools from .mise.toml..."
+  mise install --yes
+  ok "mise install complete"
+
+  # Verify key tools
+  for tool in java bun python kotlin rust; do
+    if mise current "$tool" &>/dev/null; then
+      ok "$tool $(mise current "$tool" 2>/dev/null)"
+    else
+      fail "$tool failed to install"
+    fi
+  done
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Homebrew overlap detection
+# 3. Homebrew overlap detection
 # ---------------------------------------------------------------------------
 section "Homebrew overlap detection"
 
 if brew list kotlin &>/dev/null 2>&1; then
-  warn "Homebrew kotlin also installed — asdf version takes precedence in this repo"
+  warn "Homebrew kotlin also installed — mise version takes precedence in this repo"
   info "To remove: brew uninstall kotlin"
 else
   ok "No Homebrew kotlin overlap"
 fi
 
 if brew list openjdk &>/dev/null 2>&1; then
-  warn "Homebrew openjdk also installed — asdf java takes precedence in this repo"
+  warn "Homebrew openjdk also installed — mise java takes precedence in this repo"
   info "To remove: brew uninstall openjdk"
 else
   ok "No Homebrew openjdk overlap"
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Bun migration
+# 4. Bun standalone check
 # ---------------------------------------------------------------------------
 section "Bun standalone check"
 
-if [[ -d "$HOME/.bun" ]] && [[ ! "$HOME/.bun" -ef "$(asdf where bun 2>/dev/null || echo __none__)" ]]; then
+if [[ -d "$HOME/.bun" ]] && [[ ! "$HOME/.bun" -ef "$(mise where bun 2>/dev/null || echo __none__)" ]]; then
   warn "Standalone ~/.bun installation detected"
-  warn "Consider removing it in favor of asdf-managed bun:"
+  warn "Consider removing it in favor of mise-managed bun:"
   warn "  rm -rf ~/.bun && remove bun entries from your shell profile"
 else
   ok "No standalone bun conflict"
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Rust targets
-# ---------------------------------------------------------------------------
-section "Rust targets"
-
-INSTALLED_TARGETS="$(rustup target list --installed 2>/dev/null || echo "")"
-
-for target in "${RUST_TARGETS[@]}"; do
-  if echo "$INSTALLED_TARGETS" | grep -q "^${target}$"; then
-    ok "$target"
-  elif $CHECK_MODE; then
-    fail "$target not installed"
-  else
-    info "Adding target: $target"
-    rustup target add "$target"
-    ok "$target"
-  fi
-done
-
-# ---------------------------------------------------------------------------
-# 7. Cargo tools
-# ---------------------------------------------------------------------------
-section "Cargo tools"
-
-for tool in "${CARGO_TOOLS[@]}"; do
-  if cargo install --list 2>/dev/null | grep -q "^${tool} "; then
-    ok "$tool"
-  elif $CHECK_MODE; then
-    fail "$tool not installed"
-  else
-    info "Installing $tool..."
-    cargo install --locked "$tool"
-    ok "$tool"
-  fi
-done
-
-# ---------------------------------------------------------------------------
-# 8. Bun globals
-# ---------------------------------------------------------------------------
-section "Bun globals"
-
-if bun pm ls -g 2>/dev/null | grep -q "@napi-rs/cli"; then
-  ok "@napi-rs/cli"
-elif $CHECK_MODE; then
-  fail "@napi-rs/cli not installed globally"
-else
-  info "Installing @napi-rs/cli..."
-  bun install -g @napi-rs/cli
-  ok "@napi-rs/cli"
-fi
-
-# ---------------------------------------------------------------------------
-# 9. Android SDK + NDK
+# 5. Android SDK + NDK
 # ---------------------------------------------------------------------------
 section "Android SDK + NDK"
 
-# Source env.sh to get ANDROID_HOME
-# shellcheck source=env.sh
-source "$REPO_ROOT/scripts/env.sh" 2>/dev/null || true
+# Resolve ANDROID_HOME/NDK_HOME the same way mise does
+if [[ -d "$HOME/Library/Android/sdk" ]]; then
+  _ANDROID_HOME="$HOME/Library/Android/sdk"
+elif [[ -d "$HOME/Android/Sdk" ]]; then
+  _ANDROID_HOME="$HOME/Android/Sdk"
+else
+  _ANDROID_HOME="$HOME/Library/Android/sdk"
+fi
+_ANDROID_NDK_HOME="$_ANDROID_HOME/ndk/$NDK_VERSION"
 
-if [[ -d "${ANDROID_NDK_HOME:-}" ]]; then
+if [[ -d "$_ANDROID_NDK_HOME" ]]; then
   ok "NDK $NDK_VERSION"
 elif $CHECK_MODE; then
-  fail "NDK $NDK_VERSION not found at ${ANDROID_NDK_HOME:-<unset>}"
+  fail "NDK $NDK_VERSION not found at $_ANDROID_NDK_HOME"
 else
   # Ensure sdkmanager is available
   if ! command -v sdkmanager &>/dev/null; then
@@ -258,17 +187,11 @@ else
   if command -v sdkmanager &>/dev/null; then
     info "Installing NDK $NDK_VERSION..."
     yes | sdkmanager "ndk;$NDK_VERSION" || true
-    if [[ -d "${ANDROID_NDK_HOME:-}" ]]; then
+    if [[ -d "$_ANDROID_NDK_HOME" ]]; then
       ok "NDK $NDK_VERSION"
     else
-      # Re-source to pick up new install
-      source "$REPO_ROOT/scripts/env.sh" 2>/dev/null || true
-      if [[ -d "${ANDROID_NDK_HOME:-}" ]]; then
-        ok "NDK $NDK_VERSION"
-      else
-        fail "NDK installation may have succeeded but not found at expected path"
-        info "Check ANDROID_HOME and run: sdkmanager \"ndk;$NDK_VERSION\""
-      fi
+      fail "NDK installation may have succeeded but not found at expected path"
+      info "Check ANDROID_HOME and run: sdkmanager \"ndk;$NDK_VERSION\""
     fi
   else
     fail "sdkmanager not available — install Android command-line tools manually"
@@ -283,7 +206,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 10. Summary
+# 6. Summary
 # ---------------------------------------------------------------------------
 section "Summary"
 
@@ -296,18 +219,18 @@ fi
 
 echo ""
 bold "Installed versions:"
-info "java:    $(asdf current java 2>/dev/null | awk 'NR>1{print $2}' || echo 'not found')"
-info "bun:     $(asdf current bun 2>/dev/null | awk 'NR>1{print $2}' || echo 'not found')"
-info "python:  $(asdf current python 2>/dev/null | awk 'NR>1{print $2}' || echo 'not found')"
-info "kotlin:  $(asdf current kotlin 2>/dev/null | awk 'NR>1{print $2}' || echo 'not found')"
+info "java:    $(mise current java 2>/dev/null || echo 'not found')"
+info "bun:     $(mise current bun 2>/dev/null || echo 'not found')"
+info "python:  $(mise current python 2>/dev/null || echo 'not found')"
+info "kotlin:  $(mise current kotlin 2>/dev/null || echo 'not found')"
 info "rustc:   $(rustc --version 2>/dev/null || echo 'not found')"
 info "cargo:   $(cargo --version 2>/dev/null || echo 'not found')"
 
 echo ""
 bold "Environment setup:"
-info "Add to your shell profile (~/.zshrc or ~/.bashrc):"
+info "Add to your shell profile (~/.zshrc):"
 info ""
-info "  source $(cd "$REPO_ROOT" && pwd)/scripts/env.sh"
+info "  eval \"\$(mise activate zsh)\""
 info ""
 
 if [[ "$ERRORS" -gt 0 ]]; then
