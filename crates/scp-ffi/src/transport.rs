@@ -119,12 +119,9 @@ pub fn py_transport_connect(relay_url: &str) -> PyResult<()> {
             crate::runtime::set_relay_connection(Arc::clone(&arc_adapter))?;
 
             // Track the URL for status queries.
-            let mut url_guard = connected_url_state().write().map_err(|_| {
-                ScpPyError::TransportError(
-                    "connected relay URL lock is poisoned".to_owned(),
-                )
-            })?;
-            *url_guard = Some(url);
+            *connected_url_state().write().map_err(|_| {
+                ScpPyError::TransportError("connected relay URL lock is poisoned".to_owned())
+            })? = Some(url);
 
             Ok(())
         }
@@ -147,10 +144,9 @@ pub fn py_transport_connect(relay_url: &str) -> PyResult<()> {
 pub fn py_transport_disconnect() -> PyResult<()> {
     crate::runtime::clear_relay_connection()?;
 
-    let mut url_guard = connected_url_state().write().map_err(|_| {
+    *connected_url_state().write().map_err(|_| {
         ScpPyError::TransportError("connected relay URL lock is poisoned".to_owned())
-    })?;
-    *url_guard = None;
+    })? = None;
 
     Ok(())
 }
@@ -217,7 +213,7 @@ mod tests {
     fn transport_status_disconnected_by_default() {
         // Before any connection, status should report disconnected.
         let status = py_transport_status().unwrap();
-        assert!(!status.connected || status.connected); // Just verifies it doesn't panic.
+        let _ = status.connected; // Verify field is accessible without panic.
     }
 
     #[test]
