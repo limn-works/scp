@@ -600,10 +600,18 @@ impl ContextProvider for FfiBridgeProvider {
             ) {
                 Ok(())
             } else {
-                Err(ScpPyError::ContextError(format!(
-                    "agent '{}' does not have capability to invoke tool '{}' in context '{}'",
-                    self.agent_did, tool_name, context_id
-                )))
+                // Generic message for the wire — detailed info stays server-side.
+                // The Err string propagates into a JSON-RPC error response via
+                // McpServer::handle_tool_call (server.rs:430-435).
+                tracing::warn!(
+                    agent = %self.agent_did,
+                    tool = %tool_name,
+                    context = %context_id,
+                    "capability check failed: agent lacks ToolInvoke capability"
+                );
+                Err(ScpPyError::ContextError(
+                    "insufficient permissions to invoke tool".to_owned(),
+                ))
             }
         })
         .map_err(|e| format!("{e}"))
@@ -1709,8 +1717,8 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            err.contains("does not have capability"),
-            "error should describe missing capability: {err}"
+            err.contains("insufficient permissions"),
+            "error should be generic (no agent DID/tool/context leaked): {err}"
         );
 
         crate::runtime::remove_context(&ctx_id);
