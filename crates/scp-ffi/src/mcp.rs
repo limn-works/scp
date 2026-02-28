@@ -651,9 +651,9 @@ impl ContextProvider for FfiBridgeProvider {
             Ok(serde_json::json!({
                 "tool": tool_name,
                 "context": context_id,
-                "status": "executed",
+                "status": "validated",
                 "input_valid": true,
-                "result": arguments,
+                "validated_input": arguments,
             }))
         })
         .map_err(|e| format!("{e}"))
@@ -1799,13 +1799,13 @@ mod tests {
 
         let output = result.unwrap();
         assert_eq!(
-            output["status"], "executed",
-            "status should be 'executed' (not 'invoked')"
+            output["status"], "validated",
+            "status should be 'validated' (schema-only, no handler dispatch)"
         );
         assert_eq!(output["tool"], "calculator");
         assert_eq!(output["context"], ctx_id);
         assert_eq!(output["input_valid"], true);
-        assert_eq!(output["result"], input);
+        assert_eq!(output["validated_input"], input);
 
         crate::runtime::remove_context(&ctx_id);
     }
