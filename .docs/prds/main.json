@@ -142,7 +142,7 @@
       "id": "gate-5",
       "name": "Phase 5: Platform Adapters + Swift + Bridges + Media",
       "priority": "P1",
-      "status": "in-progress",
+      "status": "done",
       "stories": [
         "SCP-084",
         "SCP-085",
@@ -5879,7 +5879,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "tests/phase5_integration.rs"
       ],
@@ -5945,7 +5945,8 @@
           "Phase 3 (UCAN)",
           "Phase 4 (UniFFI)"
         ]
-      }
+      },
+      "result": "Phase 5 integration test created at crates/scp-core/tests/phase5_integration.rs with 11 tests covering bridge lifecycle (ADR-023), media lifecycle (ADR-024), platform adapters (ADR-025), and cross-ADR integration. All tests pass. Swift SDK tests (ACs 4, 9) deferred to XCFramework build (SCP-103)."
     },
     {
       "id": "SCP-105",
