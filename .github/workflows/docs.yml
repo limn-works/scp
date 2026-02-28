@@ -105,7 +105,7 @@ jobs:
   # ---- Swift (DocC) ----
   swift-docs:
     name: "Swift API docs (DocC)"
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Generate DocC
