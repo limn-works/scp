@@ -8,6 +8,10 @@ import Testing
 /// Tests for tool definition, invocation, registration, and test vector
 /// verification via the ``Context`` actor's tool extensions.
 ///
+/// UniFFI ToolDefinition fields: name, description, inputSchemaJson, outputSchemaJson,
+///     operatorDid, testVectorsJson (String?), implementationHash (Data?)
+/// UniFFI ToolVerificationResult fields: toolId (String), passed (Bool), failures ([String])
+///
 /// These tests validate the Swift ergonomics layer and type shapes. The
 /// UniFFI bridge stubs return placeholder errors until SCP-103 ships.
 ///
@@ -43,25 +47,24 @@ struct ToolsTests {
 
     @Test("ToolDefinition stores all fields correctly")
     func toolDefinitionFields() {
-        let testVectors = [
-            TestVector(input: #"{"x": 1}"#, expectedOutput: #"{"result": 2}"#),
-        ]
+        // UniFFI ToolDefinition uses inputSchemaJson/outputSchemaJson (String)
+        // and testVectorsJson (String?) instead of typed arrays.
         let definition = ToolDefinition(
             name: "calculator",
             description: "Performs arithmetic",
-            inputSchema: #"{"type": "object"}"#,
-            outputSchema: #"{"type": "object"}"#,
+            inputSchemaJson: #"{"type": "object"}"#,
+            outputSchemaJson: #"{"type": "object"}"#,
             operatorDid: "did:dht:z6MkOperator",
-            testVectors: testVectors,
+            testVectorsJson: #"[{"input": {"x": 1}, "expected_output": {"result": 2}}]"#,
             implementationHash: Data([0x01, 0x02, 0x03])
         )
 
         #expect(definition.name == "calculator")
         #expect(definition.description == "Performs arithmetic")
-        #expect(definition.inputSchema == #"{"type": "object"}"#)
-        #expect(definition.outputSchema == #"{"type": "object"}"#)
+        #expect(definition.inputSchemaJson == #"{"type": "object"}"#)
+        #expect(definition.outputSchemaJson == #"{"type": "object"}"#)
         #expect(definition.operatorDid == "did:dht:z6MkOperator")
-        #expect(definition.testVectors?.count == 1)
+        #expect(definition.testVectorsJson != nil)
         #expect(definition.implementationHash == Data([0x01, 0x02, 0x03]))
     }
 
@@ -70,14 +73,14 @@ struct ToolsTests {
         let definition = ToolDefinition(
             name: "simple-tool",
             description: "No test vectors",
-            inputSchema: "{}",
-            outputSchema: "{}",
+            inputSchemaJson: "{}",
+            outputSchemaJson: "{}",
             operatorDid: "did:dht:z6MkOp",
-            testVectors: nil,
+            testVectorsJson: nil,
             implementationHash: nil
         )
 
-        #expect(definition.testVectors == nil)
+        #expect(definition.testVectorsJson == nil)
         #expect(definition.implementationHash == nil)
     }
 
@@ -86,16 +89,16 @@ struct ToolsTests {
         let definition: any Sendable = ToolDefinition(
             name: "sendable-tool",
             description: "Test",
-            inputSchema: "{}",
-            outputSchema: "{}",
+            inputSchemaJson: "{}",
+            outputSchemaJson: "{}",
             operatorDid: "did:dht:z6MkOp",
-            testVectors: nil,
+            testVectorsJson: nil,
             implementationHash: nil
         )
         #expect(definition is ToolDefinition)
     }
 
-    // MARK: - TestVector type shape
+    // MARK: - TestVector type shape (hand-written, not UniFFI)
 
     @Test("TestVector stores input and expected output")
     func testVectorFields() {
@@ -113,7 +116,7 @@ struct ToolsTests {
         #expect(vector is TestVector)
     }
 
-    // MARK: - ToolInvocationResult type shape
+    // MARK: - ToolInvocationResult type shape (hand-written, not UniFFI)
 
     @Test("ToolInvocationResult stores all fields")
     func toolInvocationResultFields() {
@@ -129,39 +132,31 @@ struct ToolsTests {
         #expect(result.timestamp == 1_700_000_000)
     }
 
-    // MARK: - ToolVerificationResult type shape
+    // MARK: - ToolVerificationResult type shape (UniFFI)
 
     @Test("ToolVerificationResult stores all fields")
     func toolVerificationResultFields() {
+        // UniFFI ToolVerificationResult: toolId, passed, failures
         let result = ToolVerificationResult(
-            allTestsPassed: true,
-            testsRun: 5,
-            testsPassed: 5,
-            implementationHashMatches: true,
-            verifiedAt: 1_700_000_000,
-            verifiedBy: "did:dht:z6MkVerifier"
+            toolId: "calculator",
+            passed: true,
+            failures: []
         )
-        #expect(result.allTestsPassed)
-        #expect(result.testsRun == 5)
-        #expect(result.testsPassed == 5)
-        #expect(result.implementationHashMatches)
-        #expect(result.verifiedAt == 1_700_000_000)
-        #expect(result.verifiedBy == "did:dht:z6MkVerifier")
+        #expect(result.toolId == "calculator")
+        #expect(result.passed)
+        #expect(result.failures.isEmpty)
     }
 
     @Test("ToolVerificationResult reports failing tests")
     func toolVerificationResultFailing() {
         let result = ToolVerificationResult(
-            allTestsPassed: false,
-            testsRun: 3,
-            testsPassed: 1,
-            implementationHashMatches: false,
-            verifiedAt: 1_700_000_000,
-            verifiedBy: "did:dht:z6MkVerifier"
+            toolId: "calculator",
+            passed: false,
+            failures: ["Vector 1 mismatch", "Vector 3 timeout"]
         )
-        #expect(!result.allTestsPassed)
-        #expect(result.testsPassed < result.testsRun)
-        #expect(!result.implementationHashMatches)
+        #expect(!result.passed)
+        #expect(result.failures.count == 2)
+        #expect(result.failures[0] == "Vector 1 mismatch")
     }
 
     // MARK: - Tool invocation via Context
@@ -173,10 +168,10 @@ struct ToolsTests {
             _ = try await context.invokeTool("calculator", input: Data("{}".utf8))
             Issue.record("Expected invokeTool to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-TOOL-001")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -192,10 +187,10 @@ struct ToolsTests {
             _ = try await context.invokeTool("calculator", input: Data("{}".utf8))
             Issue.record("Expected invokeTool to throw on closed context")
         } catch let error as ScpError {
-            if case .context(_, let code) = error {
+            if case .Context(_, let code) = error {
                 #expect(code == "SCP-CTX-001")
             } else {
-                Issue.record("Expected ScpError.context, got \(error)")
+                Issue.record("Expected ScpError.Context, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -210,20 +205,20 @@ struct ToolsTests {
         let definition = ToolDefinition(
             name: "test-tool",
             description: "A test tool",
-            inputSchema: "{}",
-            outputSchema: "{}",
+            inputSchemaJson: "{}",
+            outputSchemaJson: "{}",
             operatorDid: "did:dht:z6MkOp",
-            testVectors: nil,
+            testVectorsJson: nil,
             implementationHash: nil
         )
         do {
             _ = try await context.registerTool(definition)
             Issue.record("Expected registerTool to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-TOOL-002")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -238,20 +233,20 @@ struct ToolsTests {
         let definition = ToolDefinition(
             name: "test-tool",
             description: "A test tool",
-            inputSchema: "{}",
-            outputSchema: "{}",
+            inputSchemaJson: "{}",
+            outputSchemaJson: "{}",
             operatorDid: "did:dht:z6MkOp",
-            testVectors: nil,
+            testVectorsJson: nil,
             implementationHash: nil
         )
         do {
             _ = try await context.registerTool(definition)
             Issue.record("Expected registerTool to throw on closed context")
         } catch let error as ScpError {
-            if case .context(_, let code) = error {
+            if case .Context(_, let code) = error {
                 #expect(code == "SCP-CTX-001")
             } else {
-                Issue.record("Expected ScpError.context, got \(error)")
+                Issue.record("Expected ScpError.Context, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -267,10 +262,10 @@ struct ToolsTests {
             _ = try await context.verifyTool("calculator")
             Issue.record("Expected verifyTool to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-TOOL-003")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -286,10 +281,10 @@ struct ToolsTests {
             _ = try await context.verifyTool("calculator")
             Issue.record("Expected verifyTool to throw on closed context")
         } catch let error as ScpError {
-            if case .context(_, let code) = error {
+            if case .Context(_, let code) = error {
                 #expect(code == "SCP-CTX-001")
             } else {
-                Issue.record("Expected ScpError.context, got \(error)")
+                Issue.record("Expected ScpError.Context, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -298,27 +293,21 @@ struct ToolsTests {
 
     // MARK: - Test vector verification
 
-    @Test("ToolDefinition with test vectors preserves vector data")
+    @Test("ToolDefinition with test vectors JSON preserves data")
     func toolDefinitionPreservesTestVectors() {
-        let vectors = [
-            TestVector(input: #"{"a": 1, "b": 2}"#, expectedOutput: #"{"sum": 3}"#),
-            TestVector(input: #"{"a": 10, "b": 20}"#, expectedOutput: #"{"sum": 30}"#),
-            TestVector(input: #"{"a": -1, "b": 1}"#, expectedOutput: #"{"sum": 0}"#),
-        ]
+        let vectorsJson = #"[{"input": {"a": 1, "b": 2}, "expected_output": {"sum": 3}}, {"input": {"a": 10, "b": 20}, "expected_output": {"sum": 30}}]"#
         let definition = ToolDefinition(
             name: "add",
             description: "Adds two numbers",
-            inputSchema: #"{"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}"#,
-            outputSchema: #"{"type": "object", "properties": {"sum": {"type": "number"}}}"#,
+            inputSchemaJson: #"{"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}"#,
+            outputSchemaJson: #"{"type": "object", "properties": {"sum": {"type": "number"}}}"#,
             operatorDid: "did:dht:z6MkMath",
-            testVectors: vectors,
+            testVectorsJson: vectorsJson,
             implementationHash: Data([0xAA, 0xBB, 0xCC])
         )
 
-        #expect(definition.testVectors?.count == 3)
-        #expect(definition.testVectors?[0].input == #"{"a": 1, "b": 2}"#)
-        #expect(definition.testVectors?[0].expectedOutput == #"{"sum": 3}"#)
-        #expect(definition.testVectors?[2].expectedOutput == #"{"sum": 0}"#)
+        #expect(definition.testVectorsJson != nil)
+        #expect(definition.testVectorsJson!.contains("sum"))
     }
 
 } // end ToolsTests
@@ -328,13 +317,16 @@ struct ToolsTests {
 /// Mock implementation of ``ContextHandleProtocol`` for tool testing.
 private final class MockToolContextHandle: ContextHandleProtocol, @unchecked Sendable {
     let id: String
+    let creator: String
     let initialState: String
 
-    init(id: String = "tool-test-ctx", state: String = "active") {
+    init(id: String = "tool-test-ctx", creator: String = "did:dht:z6MkCreator", state: String = "active") {
         self.id = id
+        self.creator = creator
         self.initialState = state
     }
 
     func contextId() -> String { id }
-    func state() -> String { initialState }
+    func creatorDid() -> String { creator }
+    func state() throws -> String { initialState }
 }

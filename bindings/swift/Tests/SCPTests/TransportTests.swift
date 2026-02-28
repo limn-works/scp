@@ -8,6 +8,11 @@ import Testing
 /// Tests for transport configuration, connection, status, and envelope
 /// subscription.
 ///
+/// UniFFI TransportStatus is a struct with fields:
+///   - connected: Bool
+///   - relayUrl: String?
+///   - latencyMs: Double?
+///
 /// These tests validate the Swift ergonomics layer and type shapes for
 /// transport operations. The UniFFI bridge stubs return placeholder errors
 /// until SCP-103 ships.
@@ -74,25 +79,35 @@ struct TransportTests {
         #expect(config is TransportConfig)
     }
 
-    // MARK: - TransportStatus type shape
+    // MARK: - TransportStatus type shape (UniFFI struct)
 
-    @Test("TransportStatus raw values match expected strings")
-    func statusRawValues() {
-        #expect(TransportStatus.disconnected.rawValue == "disconnected")
-        #expect(TransportStatus.connecting.rawValue == "connecting")
-        #expect(TransportStatus.connected.rawValue == "connected")
-        #expect(TransportStatus.failed.rawValue == "failed")
+    @Test("TransportStatus stores connected state and relay URL")
+    func statusFields() {
+        let status = TransportStatus(
+            connected: true,
+            relayUrl: "wss://relay.example.com/scp/v1",
+            latencyMs: 42.5
+        )
+        #expect(status.connected)
+        #expect(status.relayUrl == "wss://relay.example.com/scp/v1")
+        #expect(status.latencyMs == 42.5)
     }
 
-    @Test("TransportStatus is Equatable")
-    func statusEquatable() {
-        #expect(TransportStatus.connected == TransportStatus.connected)
-        #expect(TransportStatus.disconnected != TransportStatus.connected)
+    @Test("TransportStatus disconnected with nil fields")
+    func statusDisconnected() {
+        let status = TransportStatus(
+            connected: false,
+            relayUrl: nil,
+            latencyMs: nil
+        )
+        #expect(!status.connected)
+        #expect(status.relayUrl == nil)
+        #expect(status.latencyMs == nil)
     }
 
     @Test("TransportStatus is Sendable")
     func statusIsSendable() async {
-        let status: any Sendable = TransportStatus.connected
+        let status: any Sendable = TransportStatus(connected: true, relayUrl: nil, latencyMs: nil)
         #expect(status is TransportStatus)
     }
 
@@ -105,10 +120,10 @@ struct TransportTests {
             try await connectTransport(config: config)
             Issue.record("Expected connectTransport to throw")
         } catch let error as ScpError {
-            if case .transport(_, let code) = error {
+            if case .Transport(_, let code) = error {
                 #expect(code == "SCP-TRANSPORT-001")
             } else {
-                Issue.record("Expected ScpError.transport, got \(error)")
+                Issue.record("Expected ScpError.Transport, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -122,10 +137,10 @@ struct TransportTests {
             try await connectTransport(config: config)
             Issue.record("Expected connectTransport to throw")
         } catch let error as ScpError {
-            if case .transport(_, let code) = error {
+            if case .Transport(_, let code) = error {
                 #expect(code == "SCP-TRANSPORT-001")
             } else {
-                Issue.record("Expected ScpError.transport, got \(error)")
+                Issue.record("Expected ScpError.Transport, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -140,10 +155,10 @@ struct TransportTests {
             _ = try await transportStatus()
             Issue.record("Expected transportStatus to throw")
         } catch let error as ScpError {
-            if case .transport(_, let code) = error {
+            if case .Transport(_, let code) = error {
                 #expect(code == "SCP-TRANSPORT-002")
             } else {
-                Issue.record("Expected ScpError.transport, got \(error)")
+                Issue.record("Expected ScpError.Transport, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -154,7 +169,7 @@ struct TransportTests {
 
     @Test("Context send delegates payload to bridge function")
     func contextSendDelegatesPayload() async throws {
-        // This is effectively an envelope send test — Context.send() wraps
+        // This is effectively an envelope send test -- Context.send() wraps
         // the payload in an MLS-encrypted envelope via the bridge function.
         let handle = MockTransportContextHandle(id: "transport-ctx", state: "active")
         var sentPayload: Data?
@@ -217,13 +232,16 @@ struct TransportTests {
 
 private final class MockTransportContextHandle: ContextHandleProtocol, @unchecked Sendable {
     let id: String
+    let creator: String
     let initialState: String
 
-    init(id: String, state: String = "active") {
+    init(id: String, creator: String = "did:dht:z6MkCreator", state: String = "active") {
         self.id = id
+        self.creator = creator
         self.initialState = state
     }
 
     func contextId() -> String { id }
-    func state() -> String { initialState }
+    func creatorDid() -> String { creator }
+    func state() throws -> String { initialState }
 }

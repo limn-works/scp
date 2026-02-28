@@ -173,10 +173,10 @@ struct McpTests {
             try await serveMcp(config: config)
             Issue.record("Expected serveMcp to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-MCP-001")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -193,10 +193,10 @@ struct McpTests {
             try await serveMcp(config: config)
             Issue.record("Expected serveMcp to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-MCP-001")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -214,10 +214,10 @@ struct McpTests {
             ))
             Issue.record("Expected McpClient.connect to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-MCP-002")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -232,10 +232,10 @@ struct McpTests {
             ))
             Issue.record("Expected McpClient.connect to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-MCP-002")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -253,10 +253,10 @@ struct McpTests {
             _ = try await client.listTools()
             Issue.record("Expected listTools to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-MCP-003")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -278,10 +278,10 @@ struct McpTests {
             )
             Issue.record("Expected invoke to throw")
         } catch let error as ScpError {
-            if case .tool(_, let code) = error {
+            if case .Tool(_, let code) = error {
                 #expect(code == "SCP-MCP-004")
             } else {
-                Issue.record("Expected ScpError.tool, got \(error)")
+                Issue.record("Expected ScpError.Tool, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")

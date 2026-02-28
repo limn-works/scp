@@ -149,7 +149,7 @@ internal func scpMcpServe(
     completion: @Sendable @escaping (Result<Void, ScpError>) -> Void
 ) {
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.tool(
+    completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
         code: "SCP-MCP-001"
     )))
@@ -167,7 +167,7 @@ internal func scpMcpClientCreate(
     completion: @Sendable @escaping (Result<McpClientHandle, ScpError>) -> Void
 ) {
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.tool(
+    completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
         code: "SCP-MCP-002"
     )))
@@ -185,7 +185,7 @@ internal func scpMcpClientListTools(
     completion: @Sendable @escaping (Result<[McpToolDefinition], ScpError>) -> Void
 ) {
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.tool(
+    completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
         code: "SCP-MCP-003"
     )))
@@ -211,7 +211,7 @@ internal func scpMcpClientInvoke(
     completion: @Sendable @escaping (Result<McpToolResult, ScpError>) -> Void
 ) {
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.tool(
+    completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
         code: "SCP-MCP-004"
     )))

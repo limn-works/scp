@@ -4,64 +4,11 @@ import CryptoKit
 import DeviceCheck
 import Foundation
 
-// ---------------------------------------------------------------------------
-// DeviceAttestationProvider protocol
-//
-// Mirrors the UniFFI callback interface `DeviceAttestationProvider` defined in
-// `crates/scp-ffi/uniffi/src/lib.rs` (ADR-021, ADR-025). The generated Swift
-// bindings will declare this protocol; this local definition is the source of
-// truth until the XCFramework build pipeline is wired (SCP-103).
-//
-// Methods:
-//   attest(challenge:deviceId:)  -> Data  — generate hardware (or software)
-//                                           attestation object bound to the
-//                                           supplied challenge and device ID
-//   assertRequest(requestHash:)  -> Data  — generate a per-request assertion
-//                                           using the stored App Attest key
-// ---------------------------------------------------------------------------
-
-/// Platform contract for device attestation.
-///
-/// Implemented by `AppleDeviceAttestation` and injected into the Rust engine
-/// at SDK initialization via the UniFFI callback interface binding
-/// (`DeviceAttestationProvider` in `scp.udl` / `lib.rs`). See ADR-021 and
-/// ADR-025.
-public protocol DeviceAttestationProvider: Sendable {
-    /// Generate a device attestation token bound to `challenge` and
-    /// `deviceId`.
-    ///
-    /// On hardware that supports App Attest the returned bytes are the
-    /// CBOR-encoded Apple App Attest object from
-    /// `DCAppAttestService.attestKey(_:clientDataHash:)`. On simulator or
-    /// where App Attest is unavailable, a synthetic software-only token is
-    /// returned.
-    ///
-    /// - Parameters:
-    ///   - challenge: A server-issued random challenge (≥ 16 bytes). Included
-    ///     in the `clientDataHash` so the attestation is bound to this
-    ///     specific request.
-    ///   - deviceId: A stable identifier for the device (e.g. the identity
-    ///     DID UTF-8 bytes). Included in the `clientDataHash`.
-    /// - Returns: Raw attestation bytes to be forwarded to the SCP relay for
-    ///   server-side verification.
-    /// - Throws: `AttestationError` on fatal failure (App Attest service
-    ///   unreachable on a real device; should not throw on simulator).
-    func attest(challenge: Data, deviceId: Data) async throws -> Data
-
-    /// Generate a per-request assertion for a previously attested key.
-    ///
-    /// Called for every authenticated operation after the initial attestation.
-    /// Wraps `DCAppAttestService.generateAssertion(_:clientData:)`.
-    ///
-    /// On simulator or where App Attest is unavailable, returns a synthetic
-    /// assertion token.
-    ///
-    /// - Parameter requestHash: SHA-256 digest of the request payload to bind
-    ///   this assertion to.
-    /// - Returns: Raw assertion bytes to include in the request to the relay.
-    /// - Throws: `AttestationError` on fatal failure.
-    func assertRequest(requestHash: Data) async throws -> Data
-}
+// DeviceAttestationProvider protocol is now defined by UniFFI in ScpBindings.swift.
+// The UniFFI-generated protocol has the same method signatures:
+//   attest(challenge: Data, deviceId: Data) async throws -> Data
+//   assertRequest(requestHash: Data) async throws -> Data
+// It also requires AnyObject conformance.
 
 // ---------------------------------------------------------------------------
 // Error type

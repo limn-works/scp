@@ -8,6 +8,9 @@ import Testing
 /// Tests for the append-only Merkle event log: event type shape, proof
 /// generation, proof verification, and checkpoint types.
 ///
+/// UniFFI Event fields: eventType, actorDid, timestamp, payloadJson (String), sequence
+/// UniFFI Proof fields: verified (Bool), proofType (String), detailsJson (String)
+///
 /// These tests validate the Swift ergonomics layer and type shapes. The
 /// UniFFI bridge stubs return placeholder errors until SCP-103 ships.
 ///
@@ -15,46 +18,38 @@ import Testing
 @Suite("Event Log Tests")
 struct EventLogTests {
 
-    // MARK: - Event type shape
+    // MARK: - Event type shape (UniFFI struct)
 
     @Test("Event stores all fields correctly")
     func eventFields() {
-        let prevHash = Data(repeating: 0x00, count: 32)
-        let signature = Data(repeating: 0xFF, count: 64)
+        // UniFFI Event uses payloadJson (String) instead of payload (Data).
+        // No prevHash or signature fields in the UniFFI version.
         let event = Event(
             eventType: "message_sent",
             actorDid: "did:dht:z6MkActor",
             timestamp: 1_700_000_000,
-            sequence: 42,
-            payload: Data("hello".utf8),
-            prevHash: prevHash,
-            signature: signature
+            payloadJson: #"{"content": "hello"}"#,
+            sequence: 42
         )
 
         #expect(event.eventType == "message_sent")
         #expect(event.actorDid == "did:dht:z6MkActor")
         #expect(event.timestamp == 1_700_000_000)
+        #expect(event.payloadJson == #"{"content": "hello"}"#)
         #expect(event.sequence == 42)
-        #expect(event.payload == Data("hello".utf8))
-        #expect(event.prevHash.count == 32)
-        #expect(event.signature.count == 64)
     }
 
-    @Test("Event genesis sentinel has all-zero prevHash")
+    @Test("Event genesis sentinel has sequence 0")
     func eventGenesisSentinel() {
-        let genesisHash = Data(repeating: 0x00, count: 32)
         let event = Event(
             eventType: "context_created",
             actorDid: "did:dht:z6MkCreator",
             timestamp: 1_700_000_000,
-            sequence: 0,
-            payload: Data(),
-            prevHash: genesisHash,
-            signature: Data(repeating: 0x01, count: 64)
+            payloadJson: "{}",
+            sequence: 0
         )
 
         #expect(event.sequence == 0)
-        #expect(event.prevHash == Data(repeating: 0x00, count: 32))
     }
 
     @Test("Event is Sendable")
@@ -63,57 +58,40 @@ struct EventLogTests {
             eventType: "test",
             actorDid: "did:dht:z6MkTest",
             timestamp: 0,
-            sequence: 0,
-            payload: Data(),
-            prevHash: Data(repeating: 0, count: 32),
-            signature: Data(repeating: 0, count: 64)
+            payloadJson: "{}",
+            sequence: 0
         )
         #expect(event is Event)
     }
 
-    // MARK: - Proof type shape
+    // MARK: - Proof type shape (UniFFI struct)
 
-    @Test("Proof stores leaf index, hash, path, and root")
+    @Test("Proof stores verified flag, type, and details JSON")
     func proofFields() {
-        let leafHash = Data(repeating: 0xAA, count: 32)
-        let root = Data(repeating: 0xBB, count: 32)
-        let siblingHash = Data(repeating: 0xCC, count: 32)
-
+        // UniFFI Proof: verified (Bool), proofType (String), detailsJson (String)
         let proof = Proof(
-            leafIndex: 5,
-            leafHash: leafHash,
-            path: [(hash: siblingHash, direction: "left")],
-            root: root
+            verified: true,
+            proofType: "inclusion",
+            detailsJson: #"{"leaf_index": 5, "path": [{"hash": "aa", "direction": "left"}]}"#
         )
 
-        #expect(proof.leafIndex == 5)
-        #expect(proof.leafHash == leafHash)
-        #expect(proof.path.count == 1)
-        #expect(proof.path[0].direction == "left")
-        #expect(proof.path[0].hash == siblingHash)
-        #expect(proof.root == root)
+        #expect(proof.verified)
+        #expect(proof.proofType == "inclusion")
+        #expect(proof.detailsJson.contains("leaf_index"))
     }
 
-    @Test("Proof with multi-level path")
-    func proofMultiLevelPath() {
-        let path: [(hash: Data, direction: String)] = [
-            (hash: Data(repeating: 0x01, count: 32), direction: "left"),
-            (hash: Data(repeating: 0x02, count: 32), direction: "right"),
-            (hash: Data(repeating: 0x03, count: 32), direction: "left"),
-        ]
+    @Test("Proof unverified")
+    func proofUnverified() {
         let proof = Proof(
-            leafIndex: 0,
-            leafHash: Data(repeating: 0xAA, count: 32),
-            path: path,
-            root: Data(repeating: 0xFF, count: 32)
+            verified: false,
+            proofType: "inclusion",
+            detailsJson: #"{"error": "root mismatch"}"#
         )
 
-        // O(log n) path: 3 levels implies 4-8 leaves
-        #expect(proof.path.count == 3)
-        #expect(proof.path[1].direction == "right")
+        #expect(!proof.verified)
     }
 
-    // MARK: - Checkpoint type shape
+    // MARK: - Checkpoint type shape (hand-written, not UniFFI)
 
     @Test("Checkpoint stores all fields correctly")
     func checkpointFields() {
@@ -167,7 +145,7 @@ struct EventLogTests {
         #expect(checkpoint is Checkpoint)
     }
 
-    // MARK: - EventLog type shape
+    // MARK: - EventLog type shape (hand-written, not UniFFI)
 
     @Test("EventLog stores context ID from handle")
     func eventLogContextId() {
@@ -183,7 +161,7 @@ struct EventLogTests {
         #expect(log is EventLog)
     }
 
-    // MARK: - Append (query — bridge stub error propagation)
+    // MARK: - Append (query -- bridge stub error propagation)
 
     @Test("EventLog query throws bridge error with SCP-ELOG-001")
     func queryThrowsBridgeError() async {
@@ -194,10 +172,10 @@ struct EventLogTests {
             _ = try await log.query(fromSequence: 0, limit: 10)
             Issue.record("Expected query to throw")
         } catch let error as ScpError {
-            if case .validation(_, let code) = error {
+            if case .Validation(_, let code) = error {
                 #expect(code == "SCP-ELOG-001")
             } else {
-                Issue.record("Expected ScpError.validation, got \(error)")
+                Issue.record("Expected ScpError.Validation, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -215,10 +193,10 @@ struct EventLogTests {
             _ = try await log.proveInclusion(leafIndex: 0)
             Issue.record("Expected proveInclusion to throw")
         } catch let error as ScpError {
-            if case .validation(_, let code) = error {
+            if case .Validation(_, let code) = error {
                 #expect(code == "SCP-ELOG-002")
             } else {
-                Issue.record("Expected ScpError.validation, got \(error)")
+                Issue.record("Expected ScpError.Validation, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
@@ -229,21 +207,21 @@ struct EventLogTests {
 
     @Test("EventLog verifyInclusion throws bridge error with SCP-ELOG-003")
     func verifyInclusionThrowsBridgeError() async {
+        // UniFFI Proof: verified, proofType, detailsJson
         let proof = Proof(
-            leafIndex: 0,
-            leafHash: Data(repeating: 0xAA, count: 32),
-            path: [],
-            root: Data(repeating: 0xBB, count: 32)
+            verified: false,
+            proofType: "inclusion",
+            detailsJson: "{}"
         )
 
         do {
             _ = try await EventLog.verifyInclusion(proof)
             Issue.record("Expected verifyInclusion to throw")
         } catch let error as ScpError {
-            if case .validation(_, let code) = error {
+            if case .Validation(_, let code) = error {
                 #expect(code == "SCP-ELOG-003")
             } else {
-                Issue.record("Expected ScpError.validation, got \(error)")
+                Issue.record("Expected ScpError.Validation, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
