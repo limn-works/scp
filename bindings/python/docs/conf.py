@@ -1,5 +1,10 @@
 """Sphinx configuration for scp-sdk Python API reference."""
 
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(".."))
+
 project = "scp-sdk"
 author = "Limn"
 release = "0.1.0"

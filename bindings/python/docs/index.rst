@@ -7,7 +7,7 @@ Python SDK for the Shareable Context Protocol.
    :maxdepth: 2
    :caption: API Reference
 
-.. automodule:: scp
+.. automodule:: scp_sdk
    :members:
    :undoc-members:
    :show-inheritance:
