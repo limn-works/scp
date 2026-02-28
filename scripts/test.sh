@@ -8,6 +8,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 run_rust() (
+  set -euo pipefail
   echo "═══ Rust ═══"
   cd "$REPO_ROOT"
 
@@ -28,12 +29,14 @@ run_rust() (
 )
 
 run_python() (
+  set -euo pipefail
   echo "═══ Python ═══"
   cd "$REPO_ROOT/bindings/python"
   PYTHONPATH=. python3 -m pytest tests/ -v
 )
 
 run_kotlin() (
+  set -euo pipefail
   echo "═══ Kotlin ═══"
   cd "$REPO_ROOT/bindings/kotlin"
   local java_home
@@ -45,6 +48,7 @@ run_kotlin() (
 )
 
 run_typescript() (
+  set -euo pipefail
   echo "═══ TypeScript ═══"
   cd "$REPO_ROOT/bindings/typescript"
   bun install --frozen-lockfile 2>/dev/null || bun install
