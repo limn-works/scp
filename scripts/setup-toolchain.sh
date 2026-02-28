@@ -149,32 +149,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Homebrew Kotlin cleanup
+# 4. Homebrew overlap detection
 # ---------------------------------------------------------------------------
-section "Homebrew Kotlin cleanup"
+section "Homebrew overlap detection"
 
 if brew list kotlin &>/dev/null 2>&1; then
-  if $CHECK_MODE; then
-    warn "Homebrew kotlin detected — run without --check to migrate to asdf"
-  else
-    info "Removing Homebrew kotlin (migrating to asdf)..."
-    brew uninstall --ignore-dependencies kotlin
-    ok "Homebrew kotlin removed"
-  fi
+  warn "Homebrew kotlin also installed — asdf version takes precedence in this repo"
+  info "To remove: brew uninstall kotlin"
 else
-  ok "No Homebrew kotlin"
+  ok "No Homebrew kotlin overlap"
 fi
 
 if brew list openjdk &>/dev/null 2>&1; then
-  if $CHECK_MODE; then
-    warn "Homebrew openjdk detected — run without --check to remove in favor of asdf java"
-  else
-    info "Removing Homebrew openjdk (migrating to asdf)..."
-    brew uninstall --ignore-dependencies openjdk
-    ok "Homebrew openjdk removed"
-  fi
+  warn "Homebrew openjdk also installed — asdf java takes precedence in this repo"
+  info "To remove: brew uninstall openjdk"
 else
-  ok "No Homebrew openjdk"
+  ok "No Homebrew openjdk overlap"
 fi
 
 # ---------------------------------------------------------------------------
