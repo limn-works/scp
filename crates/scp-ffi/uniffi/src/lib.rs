@@ -1,6 +1,6 @@
-//! UniFFI FFI bridge for SCP — generates Swift and Kotlin bindings.
+//! `UniFFI` FFI bridge for SCP — generates Swift and Kotlin bindings.
 //!
-//! This crate is the Rust half of the Swift and Kotlin SDKs. It uses UniFFI's
+//! This crate is the Rust half of the Swift and Kotlin SDKs. It uses `UniFFI`'s
 //! proc-macros (`#[uniffi::export]`) as the primary definition approach, with
 //! a minimal supplementary UDL file (`scp.udl`) containing only the namespace
 //! anchor required by `uniffi::include_scaffolding!`.
@@ -26,12 +26,12 @@
 //! `PushProvider`, `DeviceAttestationProvider`) and the message streaming
 //! callback (`MessageListener`)
 //! are defined via `#[uniffi::export(callback_interface)]` in this module.
-//! UniFFI generates the Swift and Kotlin callback wiring from these annotations.
+//! `UniFFI` generates the Swift and Kotlin callback wiring from these annotations.
 //!
 //! # Async runtime
 //!
 //! A single tokio `Runtime` is created at library initialization and stored
-//! in a `OnceLock<Runtime>`. All async bridge functions use UniFFI's native
+//! in a `OnceLock<Runtime>`. All async bridge functions use `UniFFI`'s native
 //! async support, which bridges between the tokio runtime and the caller's
 //! concurrency context (Swift structured concurrency / Kotlin coroutines).
 //!
@@ -60,15 +60,46 @@ pub mod bridge;
 
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
-    CustodyMethod, ContextHandle, ContextParams, ContextState, DIDDocument, DataProvenance,
-    Event, GovernanceModel, Identity, MemoryScope, Message, Proof, ScpError, ToolDefinition,
-    ToolVerificationResult, TransportManager, TransportStatus, TrustInput, UcanToken,
+    ContextHandle,
+    ContextParams,
+    ContextState,
+    CustodyMethod,
+    DIDDocument,
+    DataProvenance,
+    Event,
+    GovernanceModel,
+    Identity,
+    MemoryScope,
+    Message,
+    Proof,
+    ScpError,
+    ToolDefinition,
+    ToolVerificationResult,
+    TransportManager,
+    TransportStatus,
+    TrustInput,
+    UcanToken,
     UcanTokenData,
     // Free functions
-    context_close, context_create, context_join, context_leave, context_send,
-    context_subscribe, event_log_query, event_log_verify, identity_create, identity_load,
-    identity_resolve, tool_invoke, tool_register, tool_verify, transport_connect,
-    transport_status, ucan_mint, ucan_revoke, ucan_validate,
+    context_close,
+    context_create,
+    context_join,
+    context_leave,
+    context_send,
+    context_subscribe,
+    event_log_query,
+    event_log_verify,
+    identity_create,
+    identity_load,
+    identity_resolve,
+    tool_invoke,
+    tool_register,
+    tool_verify,
+    transport_connect,
+    transport_status,
+    ucan_mint,
+    ucan_revoke,
+    ucan_validate,
 };
 // Re-export shutdown function defined in this module.
 // (scp_shutdown is defined here and exported via #[uniffi::export] above.)
@@ -163,11 +194,8 @@ pub fn scp_shutdown(timeout_secs: u64) {
     if timeout_secs == 0 {
         return;
     }
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while HANDLE_COUNT.load(Ordering::Relaxed) > 0
-        && std::time::Instant::now() < deadline
-    {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     // The tokio runtime (`RUNTIME`) is a static and will be dropped on
@@ -225,7 +253,7 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on whatever Rust tokio thread is currently
+/// `UniFFI` callbacks execute on whatever Rust tokio thread is currently
 /// running — NOT on the Swift/Kotlin main thread. Implementations MUST be
 /// thread-safe (`Send + Sync`) and MUST NOT assume main-thread execution.
 /// Any UI or main-thread-only operations MUST be dispatched explicitly:
@@ -255,7 +283,7 @@ pub trait MessageListener: Send + Sync {
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
 /// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
 /// NOT assume main-thread execution. Keychain / Secure Enclave operations are
 /// generally thread-safe; UI updates triggered from within implementations
@@ -291,11 +319,11 @@ pub trait KeyCustodyProvider: Send + Sync {
 /// Callback for platform persistent key-value storage.
 ///
 /// Swift SDK: Core Data / Keychain / file-based storage.
-/// Kotlin SDK: Room / SharedPreferences.
+/// Kotlin SDK: Room / `SharedPreferences`.
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
 /// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
 /// NOT assume main-thread execution. Storage operations are generally
 /// thread-safe (Core Data with proper context management, Room with DAOs).
@@ -334,7 +362,7 @@ pub trait StorageProvider: Send + Sync {
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
 /// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
 /// NOT assume main-thread execution. APNs and FCM APIs are thread-safe;
 /// any UI notification work triggered within an implementation MUST be
@@ -363,14 +391,14 @@ pub trait PushProvider: Send + Sync {
 
 /// Callback for platform device attestation.
 ///
-/// Swift SDK: DCAppAttestService (App Attest on iOS 14+ / macOS 11+).
+/// Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
 /// Kotlin SDK: Play Integrity API on Android.
 ///
 /// Implemented by Swift/Kotlin code and injected into the Rust engine.
 ///
 /// # SAFETY: Thread execution context
 ///
-/// UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
 /// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
 /// NOT assume main-thread execution.
 ///
@@ -404,6 +432,7 @@ pub trait DeviceAttestationProvider: Send + Sync {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

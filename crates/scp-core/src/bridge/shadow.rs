@@ -285,7 +285,7 @@ impl ShadowRegistry {
     /// Creates a new empty shadow registry for the given context with default
     /// capacity limits.
     #[must_use]
-    pub fn new(context_id: ContextId) -> Self {
+    pub const fn new(context_id: ContextId) -> Self {
         Self {
             context_id,
             shadows: Vec::new(),
@@ -304,7 +304,7 @@ impl ShadowRegistry {
     /// - `max_shadows_per_bridge` -- Maximum shadows per bridge.
     /// - `max_total_shadows` -- Maximum total shadows across all bridges.
     #[must_use]
-    pub fn with_limits(
+    pub const fn with_limits(
         context_id: ContextId,
         max_shadows_per_bridge: usize,
         max_total_shadows: usize,
@@ -345,13 +345,13 @@ impl ShadowRegistry {
 
     /// Returns the maximum number of shadows allowed per bridge.
     #[must_use]
-    pub fn max_shadows_per_bridge(&self) -> usize {
+    pub const fn max_shadows_per_bridge(&self) -> usize {
         self.max_shadows_per_bridge
     }
 
     /// Returns the maximum total number of shadows allowed.
     #[must_use]
-    pub fn max_total_shadows(&self) -> usize {
+    pub const fn max_total_shadows(&self) -> usize {
         self.max_total_shadows
     }
 
@@ -429,11 +429,9 @@ pub fn create_shadow(
     // Defense-in-depth: reject shadow ID that collides with a real context
     // member DID. A bridge operator could otherwise map a shadow to a real
     // member's DID, enabling message forgery.
-    if context_member_dids.iter().any(|did| *did == shadow_id) {
+    if context_member_dids.contains(&shadow_id) {
         return Err(ShadowError::ShadowIdentityCollision {
-            reason: format!(
-                "shadow ID {shadow_id} collides with existing context member DID"
-            ),
+            reason: format!("shadow ID {shadow_id} collides with existing context member DID"),
         });
     }
 
@@ -545,6 +543,7 @@ pub fn create_shadow(
 ///
 /// See ADR-023 acceptance criterion 4: "Specific role upgradeable by context
 /// governance."
+#[cfg(test)]
 pub(crate) fn upgrade_shadow_role(
     registry: &mut ShadowRegistry,
     shadow_id: &str,
@@ -571,8 +570,7 @@ pub(crate) fn upgrade_shadow_role(
     {
         return Err(ShadowError::InvalidGovernanceAction {
             reason: format!(
-                "governance actor {} is a shadow identity and cannot authorize role upgrades",
-                governance_did_str
+                "governance actor {governance_did_str} is a shadow identity and cannot authorize role upgrades"
             ),
         });
     }

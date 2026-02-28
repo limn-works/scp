@@ -16,14 +16,14 @@
 //! All groups use `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` — no
 //! ciphersuite negotiation. See ADR-001 for the rationale.
 
+use super::credential::ScpCredential;
+use super::error::MlsError;
+use super::storage::ScpMlsProvider;
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
-use super::credential::ScpCredential;
-use super::error::MlsError;
-use super::storage::ScpMlsProvider;
 
 /// The single ciphersuite used by all SCP MLS groups.
 ///
@@ -351,11 +351,7 @@ pub fn remove_member(
 
     // Remove the member. Returns (commit, optional_welcome, group_info).
     let (commit, _welcome, group_info) = g
-        .remove_members(
-            &group.provider,
-            signer,
-            core::slice::from_ref(&leaf_index),
-        )
+        .remove_members(&group.provider, signer, core::slice::from_ref(&leaf_index))
         .map_err(|e| MlsError::RemoveMemberFailed(e.to_string()))?;
 
     // Merge the pending commit to advance the group epoch locally.

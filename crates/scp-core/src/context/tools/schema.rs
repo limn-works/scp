@@ -147,7 +147,12 @@ pub fn string_schema() -> Value {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::approx_constant
+)]
 mod tests {
     use super::*;
 

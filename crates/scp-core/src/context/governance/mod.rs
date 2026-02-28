@@ -53,10 +53,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::event_log::{ContextId, Ed25519Signature};
-use crate::identity::DID;
 use super::params::{Capability, ContextParams, ToolRegistration};
 use super::roles::ToolId;
+use crate::event_log::{ContextId, Ed25519Signature};
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // ProposalId
@@ -603,12 +603,8 @@ impl GovernanceEngine for SingleAdminEngine {
         let action_bytes = serde_json::to_vec(&action)
             .map_err(|e| GovernanceError::SerializationFailed(e.to_string()))?;
 
-        let proposal_id = compute_proposal_id(
-            &context.context_id,
-            proposer,
-            &action_bytes,
-            context.now,
-        );
+        let proposal_id =
+            compute_proposal_id(&context.context_id, proposer, &action_bytes, context.now);
 
         // Reject duplicate proposals before constructing events.
         if self.proposals.contains_key(&proposal_id) {
@@ -663,11 +659,12 @@ impl GovernanceEngine for SingleAdminEngine {
         voter: &DID,
         _context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
-            GovernanceError::ProposalNotFound {
-                id: hex_encode(proposal_id),
-            }
-        })?;
+        let proposal =
+            self.proposals
+                .get(proposal_id)
+                .ok_or_else(|| GovernanceError::ProposalNotFound {
+                    id: hex_encode(proposal_id),
+                })?;
 
         // In single-admin mode, only the admin can interact.
         if *voter != self.admin_did {
@@ -686,11 +683,12 @@ impl GovernanceEngine for SingleAdminEngine {
         voter: &DID,
         _context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
-            GovernanceError::ProposalNotFound {
-                id: hex_encode(proposal_id),
-            }
-        })?;
+        let proposal =
+            self.proposals
+                .get(proposal_id)
+                .ok_or_else(|| GovernanceError::ProposalNotFound {
+                    id: hex_encode(proposal_id),
+                })?;
 
         // In single-admin mode, only the admin can interact.
         if *voter != self.admin_did {
@@ -725,10 +723,12 @@ impl GovernanceEngine for SingleAdminEngine {
 /// Encode bytes as lowercase hex string for error messages.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -825,9 +825,7 @@ mod tests {
                 reason: RejectionReason::MajorityRejected,
             },
             ProposalStatus::Rejected {
-                reason: RejectionReason::UnanimityBroken {
-                    rejector: bob(),
-                },
+                reason: RejectionReason::UnanimityBroken { rejector: bob() },
             },
             ProposalStatus::Rejected {
                 reason: RejectionReason::ApprovalImpossible,
@@ -844,8 +842,7 @@ mod tests {
 
         for status in &statuses {
             let json = serde_json::to_string(status).expect("serialize");
-            let deserialized: ProposalStatus =
-                serde_json::from_str(&json).expect("deserialize");
+            let deserialized: ProposalStatus = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(&deserialized, status);
         }
     }
@@ -886,16 +883,13 @@ mod tests {
             GovernanceAction::ExtendTtl {
                 additional_secs: 3600,
             },
-            GovernanceAction::TransferAdmin {
-                new_admin: bob(),
-            },
+            GovernanceAction::TransferAdmin { new_admin: bob() },
         ];
 
         for action in &actions {
             let json = serde_json::to_string(action).expect("serialize");
             // Verify it deserializes without error (round-trip validates serde).
-            let _deserialized: GovernanceAction =
-                serde_json::from_str(&json).expect("deserialize");
+            let _deserialized: GovernanceAction = serde_json::from_str(&json).expect("deserialize");
         }
     }
 
@@ -906,9 +900,7 @@ mod tests {
     #[test]
     fn governance_model_config_serialization_roundtrip() {
         let configs = vec![
-            GovernanceModelConfig::SingleAdmin {
-                admin_did: alice(),
-            },
+            GovernanceModelConfig::SingleAdmin { admin_did: alice() },
             GovernanceModelConfig::Threshold {
                 signers: vec![alice(), bob(), carol()],
                 threshold: 2,
@@ -960,8 +952,7 @@ mod tests {
 
         for event in &events {
             let json = serde_json::to_string(event).expect("serialize");
-            let _deserialized: GovernanceEvent =
-                serde_json::from_str(&json).expect("deserialize");
+            let _deserialized: GovernanceEvent = serde_json::from_str(&json).expect("deserialize");
         }
     }
 
@@ -995,7 +986,10 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], GovernanceEvent::ProposalCreated { .. }));
         assert!(matches!(events[1], GovernanceEvent::VoteCast { .. }));
-        assert!(matches!(events[2], GovernanceEvent::ProposalResolved { .. }));
+        assert!(matches!(
+            events[2],
+            GovernanceEvent::ProposalResolved { .. }
+        ));
 
         // Verify the resolved event has Approved status.
         if let GovernanceEvent::ProposalResolved { status, .. } = &events[2] {
@@ -1154,9 +1148,7 @@ mod tests {
         let config = engine.model_config();
         assert_eq!(
             config,
-            GovernanceModelConfig::SingleAdmin {
-                admin_did: admin,
-            }
+            GovernanceModelConfig::SingleAdmin { admin_did: admin }
         );
     }
 
@@ -1214,9 +1206,7 @@ mod tests {
         let ctx = test_context(&admin);
 
         // Propose transfer.
-        let action = GovernanceAction::TransferAdmin {
-            new_admin: bob(),
-        };
+        let action = GovernanceAction::TransferAdmin { new_admin: bob() };
         let (proposal, _) = engine.propose(&admin, action, &ctx).expect("propose");
         assert_eq!(proposal.status, ProposalStatus::Approved);
 
@@ -1227,9 +1217,7 @@ mod tests {
         assert_eq!(engine.admin_did(), &bob());
         assert_eq!(
             engine.model_config(),
-            GovernanceModelConfig::SingleAdmin {
-                admin_did: bob(),
-            }
+            GovernanceModelConfig::SingleAdmin { admin_did: bob() }
         );
 
         // Alice can no longer propose.
@@ -1317,9 +1305,7 @@ mod tests {
             GovernanceAction::ExtendTtl {
                 additional_secs: 7200,
             },
-            GovernanceAction::TransferAdmin {
-                new_admin: carol(),
-            },
+            GovernanceAction::TransferAdmin { new_admin: carol() },
             GovernanceAction::CreateChildContext {
                 params: Box::new(ContextParams::default()),
             },
@@ -1379,7 +1365,10 @@ mod tests {
         let (proposal, events) = engine.propose(&admin, action, &ctx).expect("propose");
 
         // Verify the events trace the full lifecycle.
-        assert!(matches!(&events[0], GovernanceEvent::ProposalCreated { .. }));
+        assert!(matches!(
+            &events[0],
+            GovernanceEvent::ProposalCreated { .. }
+        ));
         assert!(matches!(&events[1], GovernanceEvent::VoteCast { .. }));
         assert!(matches!(
             &events[2],

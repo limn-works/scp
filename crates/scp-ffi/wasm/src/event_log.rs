@@ -68,18 +68,21 @@ pub struct WasmEvent {
 #[wasm_bindgen]
 impl WasmEvent {
     /// Returns the event type string.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "eventType")]
     pub fn event_type(&self) -> String {
         self.event_type.clone()
     }
 
     /// Returns the DID of the actor who produced this event.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "actorDid")]
     pub fn actor_did(&self) -> String {
         self.actor_did.clone()
     }
 
     /// Returns the event timestamp as seconds since Unix epoch.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn timestamp(&self) -> f64 {
         self.timestamp
@@ -88,12 +91,14 @@ impl WasmEvent {
     /// Returns the event payload as a JSON string.
     ///
     /// The TypeScript SDK parses this with `JSON.parse()`.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "payloadJson")]
     pub fn payload_json(&self) -> String {
         self.payload_json.clone()
     }
 
     /// Returns the monotonic sequence number of this event in the log.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn sequence(&self) -> u64 {
         self.sequence
@@ -132,12 +137,14 @@ pub struct WasmProof {
 #[wasm_bindgen]
 impl WasmProof {
     /// Returns `true` if the claim was verified successfully.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn verified(&self) -> bool {
         self.verified
     }
 
     /// Returns the proof type (`"inclusion"` or `"absence"`).
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "proofType")]
     pub fn proof_type(&self) -> String {
         self.proof_type.clone()
@@ -147,6 +154,7 @@ impl WasmProof {
     ///
     /// For inclusion proofs: a Merkle path array.
     /// For absence proofs: sorted neighbor hashes.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "detailsJson")]
     pub fn details_json(&self) -> String {
         self.details_json.clone()
@@ -191,11 +199,9 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
     future_to_promise(async move {
         // Validate filter JSON if provided.
         if let Some(ref filter) = filter_json {
-            let _f: serde_json::Value = serde_json::from_str(filter)
-                .map_err(|e| ScpWasmError::Validation(format!(
-                    "filter_json is not valid JSON: {e}"
-                ))
-                .into_js())?;
+            let _f: serde_json::Value = serde_json::from_str(filter).map_err(|e| {
+                ScpWasmError::Validation(format!("filter_json is not valid JSON: {e}")).into_js()
+            })?;
         }
 
         let _ = context_id;
@@ -240,11 +246,9 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
     let context_id = context.context_id();
     future_to_promise(async move {
         // Validate claim_json.
-        let _claim: serde_json::Value = serde_json::from_str(&claim_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
-                "claim_json is not valid JSON: {e}"
-            ))
-            .into_js())?;
+        let _claim: serde_json::Value = serde_json::from_str(&claim_json).map_err(|e| {
+            ScpWasmError::Validation(format!("claim_json is not valid JSON: {e}")).into_js()
+        })?;
 
         let _ = context_id;
 

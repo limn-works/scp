@@ -225,6 +225,7 @@ impl SenderKeyStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -355,10 +356,7 @@ mod tests {
         // the address will differ from `expected_ptr`, but calling get()
         // twice must return the same address — proving it borrows, not clones.
         let ptr1 = retrieved.unwrap().as_bytes() as *const [u8; 32];
-        let ptr2 = store
-            .get("ctx-1", "did:example:alice")
-            .unwrap()
-            .as_bytes() as *const [u8; 32];
+        let ptr2 = store.get("ctx-1", "did:example:alice").unwrap().as_bytes() as *const [u8; 32];
         assert_eq!(
             ptr1, ptr2,
             "consecutive get() calls must return the same pointer (borrow, not clone)"

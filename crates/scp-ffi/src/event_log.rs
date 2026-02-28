@@ -160,8 +160,7 @@ pub fn py_event_log_query(
 
     // Apply limit filter if provided.
     let limit = if let Some(f) = filter {
-        f.get_item("limit")?
-            .and_then(|v| v.extract::<usize>().ok())
+        f.get_item("limit")?.and_then(|v| v.extract::<usize>().ok())
     } else {
         None
     };
@@ -183,10 +182,13 @@ pub fn py_event_log_query(
     let summary_event = PyEvent {
         event_type: "LogSummary".to_owned(),
         actor_did: String::new(),
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| ScpPyError::ContextError(format!("system clock error: {e}")))?
-            .as_secs() as f64,
+        #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
+        timestamp: {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| ScpPyError::ContextError(format!("system clock error: {e}")))?
+                .as_secs() as f64
+        },
         payload,
         sequence: event_count.saturating_sub(1),
     };
@@ -229,6 +231,7 @@ pub fn py_event_log_query(
 /// See ADR-013 §7: `py_event_log_verify(handle, claim) -> PyProof`.
 #[pyfunction]
 #[pyo3(name = "event_log_verify")]
+#[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
 pub fn py_event_log_verify(
     py: Python<'_>,
     context_id: &str,
@@ -252,7 +255,7 @@ pub fn py_event_log_verify(
         "inclusion" => {
             let leaf_index = claim_json
                 .get("leaf_index")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| {
                     ScpPyError::ValidationError(
                         "inclusion claim must include 'leaf_index' (integer)".to_owned(),
@@ -313,16 +316,15 @@ pub fn py_event_log_verify(
                 })?;
 
             // Decode the hex event hash.
-            let event_hash = decode_hex_hash(event_hash_hex).map_err(|e| {
-                ScpPyError::ValidationError(format!("invalid event_hash: {e}"))
-            })?;
+            let event_hash = decode_hex_hash(event_hash_hex)
+                .map_err(|e| ScpPyError::ValidationError(format!("invalid event_hash: {e}")))?;
 
             // Generate the absence proof via scp-core.
             let proof_result = crate::runtime::with_context(context_id, |rt| {
                 let proof = scp_core::event_log::proof::prove_absence(&rt.event_log, &event_hash)
                     .map_err(|e| {
-                        ScpPyError::ContextError(format!("absence proof failed: {e}"))
-                    })?;
+                    ScpPyError::ContextError(format!("absence proof failed: {e}"))
+                })?;
 
                 let lower = proof.lower.as_ref().map(|lwp| {
                     serde_json::json!({
@@ -339,18 +341,12 @@ pub fn py_event_log_verify(
                 });
 
                 // Verify the neighbor inclusion proofs.
-                let lower_verified = proof
-                    .lower
-                    .as_ref()
-                    .is_none_or(|lwp| {
-                        scp_core::event_log::proof::verify_inclusion(&lwp.inclusion_proof)
-                    });
-                let upper_verified = proof
-                    .upper
-                    .as_ref()
-                    .is_none_or(|uwp| {
-                        scp_core::event_log::proof::verify_inclusion(&uwp.inclusion_proof)
-                    });
+                let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
+                    scp_core::event_log::proof::verify_inclusion(&lwp.inclusion_proof)
+                });
+                let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
+                    scp_core::event_log::proof::verify_inclusion(&uwp.inclusion_proof)
+                });
                 let verified = lower_verified && upper_verified;
 
                 let details = serde_json::json!({
@@ -395,10 +391,9 @@ fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
 
     let mut bytes = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk)
-            .map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
-        bytes[i] = u8::from_str_radix(s, 16)
-            .map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
+        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
+        bytes[i] =
+            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
     }
     Ok(bytes)
 }

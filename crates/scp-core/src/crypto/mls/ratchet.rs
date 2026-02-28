@@ -129,11 +129,7 @@ pub fn propose_update(group: &mut ScpMlsGroup) -> Result<MlsMessageOut, MlsError
     // Commit (and optionally a Welcome if there were pending Add proposals).
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let bundle = g
-        .self_update(
-            &group.provider,
-            signer,
-            LeafNodeParameters::default(),
-        )
+        .self_update(&group.provider, signer, LeafNodeParameters::default())
         .map_err(|e| MlsError::UpdateFailed(e.to_string()))?;
 
     // Extract the Commit message.
@@ -338,20 +334,20 @@ mod tests {
     /// previous epoch key material (via `delete_previous_epoch_keypairs()`),
     /// making old-epoch ciphertexts undecryptable.
     ///
-    /// **Documented finding (SCP-171):** OpenMLS's `merge_staged_commit()`
+    /// **Documented finding (SCP-171):** `OpenMLS`'s `merge_staged_commit()`
     /// and `merge_pending_commit()` automatically call
     /// `delete_previous_epoch_keypairs()`, which removes the previous epoch's
     /// encryption key pairs from the storage provider. Additionally, the
     /// `MlsGroupCreateConfig` default `max_past_epochs` is 0, meaning no
     /// past epoch message secrets are retained in the `MessageSecretsStore`.
     /// Therefore, forward secrecy of cryptographic key material is enforced
-    /// by OpenMLS itself, not by the `EpochGraceStore`. The grace store's
+    /// by `OpenMLS` itself, not by the `EpochGraceStore`. The grace store's
     /// role is to control whether the SCP layer *attempts* decryption for a
     /// given epoch.
     #[test]
     #[allow(clippy::unwrap_used)]
     fn forward_secrecy_old_epoch_ciphertext_undecryptable_after_advance() {
-        use crate::crypto::mls::encrypt::{encrypt, decrypt, serialize_ciphertext};
+        use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
@@ -382,13 +378,13 @@ mod tests {
         );
     }
 
-    /// Verify that OpenMLS deletes key material across multiple epoch
+    /// Verify that `OpenMLS` deletes key material across multiple epoch
     /// advances, not just the most recent one. After two epoch advances,
     /// ciphertext from epoch N should be undecryptable at epoch N+2.
     #[test]
     #[allow(clippy::unwrap_used)]
     fn forward_secrecy_survives_multiple_epoch_advances() {
-        use crate::crypto::mls::encrypt::{encrypt, decrypt, serialize_ciphertext};
+        use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
@@ -414,7 +410,7 @@ mod tests {
         );
     }
 
-    /// Verify that the epoch expiration callback fires during process_commit
+    /// Verify that the epoch expiration callback fires during `process_commit`
     /// when the grace store is at capacity and must evict old epochs.
     #[test]
     #[allow(clippy::unwrap_used)]

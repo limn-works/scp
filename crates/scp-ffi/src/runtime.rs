@@ -119,15 +119,12 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
             let ceiling_strings = ceiling
                 .capabilities
                 .iter()
-                .map(|c| c.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<HashSet<String>>();
-            let role_state =
-                ContextRoleState::new(context_id, creator_did, ceiling, vec![])
-                    .map_err(|e| {
-                        ScpPyError::ContextError(format!(
-                            "failed to create role state: {e}"
-                        ))
-                    })?;
+            let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
+                .map_err(|e| {
+                    ScpPyError::ContextError(format!("failed to create role state: {e}"))
+                })?;
             let revocation_list = RevocationList::new(context_id.to_owned());
             let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
 
@@ -164,14 +161,12 @@ where
 {
     let map = registry();
 
-    let mut entry = map
-        .get_mut(context_id)
-        .ok_or_else(|| {
-            ScpPyError::ContextError(format!(
-                "context '{context_id}' not found in runtime registry \
+    let mut entry = map.get_mut(context_id).ok_or_else(|| {
+        ScpPyError::ContextError(format!(
+            "context '{context_id}' not found in runtime registry \
                  -- was it created with py_context_create?"
-            ))
-        })?;
+        ))
+    })?;
 
     f(entry.value_mut())
 }

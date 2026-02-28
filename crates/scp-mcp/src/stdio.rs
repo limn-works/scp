@@ -58,29 +58,29 @@ enum Incoming {
 
 /// Parses a raw JSON line into either a [`JsonRpcRequest`] or a
 /// [`JsonRpcNotification`].
-fn parse_incoming(line: &str) -> Result<Incoming, JsonRpcResponse> {
+fn parse_incoming(line: &str) -> Result<Incoming, Box<JsonRpcResponse>> {
     let raw: RawIncoming = serde_json::from_str(line).map_err(|e| {
-        JsonRpcResponse::error(
+        Box::new(JsonRpcResponse::error(
             RequestId::Number(0),
             JsonRpcError {
                 code: crate::protocol::PARSE_ERROR,
                 message: format!("failed to parse JSON-RPC message: {e}"),
                 data: None,
             },
-        )
+        ))
     })?;
 
     match raw.id {
         Some(id_val) => {
             let id: RequestId = serde_json::from_value(id_val).map_err(|e| {
-                JsonRpcResponse::error(
+                Box::new(JsonRpcResponse::error(
                     RequestId::Number(0),
                     JsonRpcError {
                         code: crate::protocol::PARSE_ERROR,
                         message: format!("invalid request id: {e}"),
                         data: None,
                     },
-                )
+                ))
             })?;
             Ok(Incoming::Request(JsonRpcRequest {
                 jsonrpc: crate::protocol::JSONRPC_VERSION.to_owned(),
@@ -145,7 +145,7 @@ pub async fn run_stdio<P: ContextProvider>(server: &mut McpServer<P>) -> Result<
                 // Notifications never produce a response.
                 None
             }
-            Err(err_response) => Some(err_response),
+            Err(err_response) => Some(*err_response),
         };
 
         if let Some(resp) = response {
@@ -173,7 +173,7 @@ pub async fn run_stdio<P: ContextProvider>(server: &mut McpServer<P>) -> Result<
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::protocol::{JSONRPC_VERSION, METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
+    use crate::protocol::{METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
 
     // -- parse_incoming -------------------------------------------------------
 
@@ -401,7 +401,7 @@ mod tests {
             "id": 2
         });
 
-        let input = format!("{}\n{}\n", init_req, ping_req);
+        let input = format!("{init_req}\n{ping_req}\n");
         let mut output = Vec::new();
 
         let mut server = McpServer::new(MockProvider::default());
@@ -409,7 +409,7 @@ mod tests {
 
         // Parse output lines.
         let output_str = String::from_utf8(output).unwrap();
-        let lines: Vec<&str> = output_str.trim().split('\n').collect();
+        let lines: Vec<&str> = output_str.lines().collect();
         assert_eq!(lines.len(), 2);
 
         let resp1: JsonRpcResponse = serde_json::from_str(lines[0]).unwrap();
@@ -481,7 +481,7 @@ mod tests {
                     server.handle_request(&synthetic);
                     None
                 }
-                Err(err_response) => Some(err_response),
+                Err(err_response) => Some(*err_response),
             };
 
             if let Some(resp) = response {

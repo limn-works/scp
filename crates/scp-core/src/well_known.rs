@@ -226,7 +226,7 @@ impl WellKnownScp {
         if document.id != self.did {
             return Err(WellKnownValidationError::OperatorDidMismatch {
                 claimed: self.did.clone(),
-                resolved: document.id.clone(),
+                resolved: document.id,
             });
         }
 
@@ -272,7 +272,12 @@ impl WellKnownScp {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::manual_async_fn
+)]
 mod tests {
     use std::future::Future;
     use std::sync::Arc;

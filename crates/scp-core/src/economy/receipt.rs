@@ -75,6 +75,7 @@ pub struct ReceiptFilter {
 ///
 /// Corresponds to the SDK surface `SCP.Economy.paymentHistory(context)`
 /// (spec section 19.11).
+#[must_use]
 pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<PaymentReceipt> {
     let mut receipts = Vec::new();
 
@@ -84,33 +85,32 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
         }
 
         // Attempt to deserialize the receipt from the event payload.
-        let receipt: PaymentReceipt =
-            match serde_json::from_slice(&event.payload.data) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+        let receipt: PaymentReceipt = match serde_json::from_slice(&event.payload.data) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
 
         // Apply optional filter.
         if let Some(f) = filter {
-            if let Some(ref payer) = f.payer {
-                if receipt.payer.as_ref() != payer.as_str() {
-                    continue;
-                }
+            if let Some(ref payer) = f.payer
+                && receipt.payer.as_ref() != payer.as_str()
+            {
+                continue;
             }
-            if let Some(ref payee) = f.payee {
-                if receipt.payee.as_ref() != payee.as_str() {
-                    continue;
-                }
+            if let Some(ref payee) = f.payee
+                && receipt.payee.as_ref() != payee.as_str()
+            {
+                continue;
             }
-            if let Some(after) = f.after_timestamp {
-                if receipt.timestamp < after {
-                    continue;
-                }
+            if let Some(after) = f.after_timestamp
+                && receipt.timestamp < after
+            {
+                continue;
             }
-            if let Some(before) = f.before_timestamp {
-                if receipt.timestamp > before {
-                    continue;
-                }
+            if let Some(before) = f.before_timestamp
+                && receipt.timestamp > before
+            {
+                continue;
             }
         }
 
@@ -125,7 +125,12 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names
+)]
 mod tests {
     use super::*;
     use crate::economy::types::{Amount, CurrencyCode, PaidActionType};
@@ -133,12 +138,7 @@ mod tests {
     use crate::identity::DID;
 
     /// Creates a test `PaymentReceipt`.
-    fn make_receipt(
-        payer: &str,
-        payee: &str,
-        amount: u64,
-        timestamp: u64,
-    ) -> PaymentReceipt {
+    fn make_receipt(payer: &str, payee: &str, amount: u64, timestamp: u64) -> PaymentReceipt {
         PaymentReceipt {
             receipt_id: [0xAA; 32],
             payer: DID::from(payer),
@@ -163,9 +163,7 @@ mod tests {
             actor_did: receipt.payer.clone(),
             timestamp: receipt.timestamp,
             sequence,
-            payload: EventPayload {
-                data: payload_data,
-            },
+            payload: EventPayload { data: payload_data },
             prev_hash: [0u8; 32],
             signature: vec![0xFF; 64],
         }
@@ -378,10 +376,7 @@ mod tests {
             signature: vec![0xFF; 64],
         };
 
-        let events = vec![
-            bad_event,
-            make_payment_event(&good_receipt, 1),
-        ];
+        let events = vec![bad_event, make_payment_event(&good_receipt, 1)];
 
         let history = payment_history(&events, None);
         assert_eq!(history.len(), 1);
@@ -460,9 +455,18 @@ mod tests {
         assert_ne!(EventType::PaymentReceived, EventType::EconomicPolicyChanged);
         assert_ne!(EventType::PaymentReceived, EventType::SpendingUcanGranted);
         assert_ne!(EventType::PaymentReceived, EventType::SpendingUcanRevoked);
-        assert_ne!(EventType::EconomicPolicyChanged, EventType::SpendingUcanGranted);
-        assert_ne!(EventType::EconomicPolicyChanged, EventType::SpendingUcanRevoked);
-        assert_ne!(EventType::SpendingUcanGranted, EventType::SpendingUcanRevoked);
+        assert_ne!(
+            EventType::EconomicPolicyChanged,
+            EventType::SpendingUcanGranted
+        );
+        assert_ne!(
+            EventType::EconomicPolicyChanged,
+            EventType::SpendingUcanRevoked
+        );
+        assert_ne!(
+            EventType::SpendingUcanGranted,
+            EventType::SpendingUcanRevoked
+        );
     }
 
     // -------------------------------------------------------------------

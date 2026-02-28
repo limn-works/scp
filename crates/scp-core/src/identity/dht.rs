@@ -661,16 +661,12 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .await
             .map_err(IdentityError::Platform)?;
 
-        let sig_bytes: [u8; 64] =
-            proof_sig
-                .into_bytes()
-                .try_into()
-                .map_err(|v: Vec<u8>| {
-                    IdentityError::KeyRotationFailed(format!(
-                        "expected 64-byte signature, got {} bytes",
-                        v.len()
-                    ))
-                })?;
+        let sig_bytes: [u8; 64] = proof_sig.into_bytes().try_into().map_err(|v: Vec<u8>| {
+            IdentityError::KeyRotationFailed(format!(
+                "expected 64-byte signature, got {} bytes",
+                v.len()
+            ))
+        })?;
 
         let old_pub_bytes: [u8; 32] =
             old_identity_public
@@ -994,11 +990,13 @@ pub fn verify_migration(
 
     let signature = ed25519_dalek::Signature::from_bytes(&migration_proof.signature);
 
-    verifying_key.verify_strict(&digest, &signature).map_err(|e| {
-        IdentityError::MigrationVerificationFailed(format!(
-            "migration proof signature verification failed: {e}"
-        ))
-    })?;
+    verifying_key
+        .verify_strict(&digest, &signature)
+        .map_err(|e| {
+            IdentityError::MigrationVerificationFailed(format!(
+                "migration proof signature verification failed: {e}"
+            ))
+        })?;
 
     // Step 2: Verify the pre-rotation proof if present.
     if let Some(pre_rot) = pre_rotation_proof {

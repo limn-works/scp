@@ -3,7 +3,7 @@
 import asyncio
 
 from scp_sdk import Context, Identity
-from scp_sdk.ucan import delegate, mint
+from scp_sdk.ucan import mint
 
 
 async def run_agent(name: str, identity: Identity, context_id: str) -> None:
@@ -45,13 +45,13 @@ async def main() -> None:
     print(f"Context created: {ctx.context_id}")
 
     # Mint UCANs for each agent (capability delegation)
-    token_a = await mint(
+    await mint(
         issuer=coordinator,
         audience=agent_a.did,
         capabilities=["msg:send", "msg:receive"],
         context_id=ctx.context_id,
     )
-    token_b = await mint(
+    await mint(
         issuer=coordinator,
         audience=agent_b.did,
         capabilities=["msg:send", "msg:receive"],

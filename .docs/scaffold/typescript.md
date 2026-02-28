@@ -103,8 +103,7 @@ Built via `wasm-pack build --target bundler`. Produces `.wasm` + JS glue code. A
     "check": "tsc --noEmit",
     "lint": "biome check src/ tests/",
     "format": "biome format --write src/ tests/",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "bun test"
   },
   "engines": {
     "node": ">=22",
@@ -113,7 +112,6 @@ Built via `wasm-pack build --target bundler`. Produces `.wasm` + JS glue code. A
   "devDependencies": {
     "typescript": "^5.7.0",
     "@biomejs/biome": "latest",
-    "vitest": "latest",
     "tsup": "latest"
   }
 }

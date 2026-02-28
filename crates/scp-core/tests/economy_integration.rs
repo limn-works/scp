@@ -1,3 +1,15 @@
+#![allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::large_stack_arrays,
+    clippy::unreadable_literal,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::redundant_field_names,
+    clippy::unnecessary_literal_unwrap
+)]
 //! End-to-end integration test covering ALL 9 invariants from spec section 19.14.
 //!
 //! Invariants tested:
@@ -11,14 +23,12 @@
 //! 8. Free relays MUST always exist in bootstrap list
 //! 9. Auto-accept never applies to paid contexts
 //!
-//! Integration flow: create context with EconomicPolicy -> register tool with cost
+//! Integration flow: create context with `EconomicPolicy` -> register tool with cost
 //! -> grant spending UCAN -> verify spending checks -> verify receipt provenance
-//! -> test auto-accept rejection -> test SpendingCapabilityRequired
+//! -> test auto-accept rejection -> test `SpendingCapabilityRequired`
 //! -> test dynamic pricing -> test anti-spam escalation -> verify free relay exists.
 //!
 //! See spec section 19.14 and ADR-033.
-
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::time::Duration;
 
@@ -61,7 +71,7 @@ struct TestAdapter {
 }
 
 impl TestAdapter {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             authorize_fail: None,
             capture_fail: None,
@@ -117,10 +127,7 @@ impl PaymentAdapter for TestAdapter {
         })
     }
 
-    async fn capture(
-        &self,
-        auth: &PaymentAuthorization,
-    ) -> Result<PaymentReceipt, PaymentError> {
+    async fn capture(&self, auth: &PaymentAuthorization) -> Result<PaymentReceipt, PaymentError> {
         if let Some(ref err) = self.capture_fail {
             return Err(err.clone());
         }
@@ -146,10 +153,7 @@ impl PaymentAdapter for TestAdapter {
         Ok(())
     }
 
-    async fn verify(
-        &self,
-        _receipt: &PaymentReceipt,
-    ) -> Result<VerificationResult, PaymentError> {
+    async fn verify(&self, _receipt: &PaymentReceipt) -> Result<VerificationResult, PaymentError> {
         Ok(VerificationResult {
             valid: true,
             adapter_id: self.id.to_owned(),
@@ -159,10 +163,7 @@ impl PaymentAdapter for TestAdapter {
         })
     }
 
-    async fn verify_authorization(
-        &self,
-        _auth: &PaymentAuthorization,
-    ) -> Result<(), PaymentError> {
+    async fn verify_authorization(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
         Ok(())
     }
 
@@ -290,9 +291,7 @@ fn make_payment_event(receipt: &PaymentReceipt, sequence: u64) -> Event {
         actor_did: receipt.payer.clone(),
         timestamp: receipt.timestamp,
         sequence,
-        payload: EventPayload {
-            data: payload_data,
-        },
+        payload: EventPayload { data: payload_data },
         prev_hash: [0u8; 32],
         signature: vec![0xFF; 64],
     }
@@ -326,7 +325,7 @@ fn signed_event(
     use sha2::{Digest, Sha256};
 
     let mut event = Event {
-        event_type: event_type.clone(),
+        event_type,
         actor_did: DID::from(actor_did),
         timestamp: 1_000_000 + sequence,
         sequence,
@@ -384,12 +383,12 @@ fn leaf_hash_of(event: &Event) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let serialized = rmp_serde::to_vec(event).unwrap();
     let mut hasher = Sha256::new();
-    hasher.update(&[0x00]);
+    hasher.update([0x00]);
     hasher.update(&serialized);
     hasher.finalize().into()
 }
 
-/// Creates a test keypair and returns (did_string, signing_key).
+/// Creates a test keypair and returns (`did_string`, `signing_key`).
 fn test_keypair() -> (String, ed25519_dalek::SigningKey) {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let verifying_key = signing_key.verifying_key();
@@ -505,7 +504,7 @@ fn invariant_1_relay_economic_config_visible_in_wellknown() {
 // ===========================================================================
 
 /// Invariant 2: Attempt paid action without spending UCAN returns
-/// SpendingCapabilityRequired error.
+/// `SpendingCapabilityRequired` error.
 #[test]
 fn invariant_2_paid_action_without_spending_ucan_rejected() {
     use scp_core::crypto::ucan::spending::check_and_composition;
@@ -654,7 +653,7 @@ fn invariant_2_no_action_ucan_rejected() {
 // Invariant 3: Free operation is default -- no economic policy = free
 // ===========================================================================
 
-/// Invariant 3: Context without EconomicPolicy -- all actions are free.
+/// Invariant 3: Context without `EconomicPolicy` -- all actions are free.
 #[test]
 fn invariant_3_no_economic_policy_all_actions_free() {
     let metrics = default_metrics();
@@ -682,7 +681,7 @@ fn invariant_3_no_economic_policy_all_actions_free() {
     assert_eq!(cost, Some(Amount(0)));
 }
 
-/// Invariant 3: estimate_cost returns 0 when no economic policy.
+/// Invariant 3: `estimate_cost` returns 0 when no economic policy.
 #[test]
 fn invariant_3_estimate_cost_zero_without_policy() {
     use scp_core::economy::estimate::estimate_cost;
@@ -698,11 +697,15 @@ fn invariant_3_estimate_cost_zero_without_policy() {
         PaidActionType::ByteStored,
     ] {
         let cost = estimate_cost(None, action, &metrics);
-        assert_eq!(cost, Some(Amount(0)), "action {action:?} should be free without policy");
+        assert_eq!(
+            cost,
+            Some(Amount(0)),
+            "action {action:?} should be free without policy"
+        );
     }
 }
 
-/// Invariant 3: policy_requires_payment returns false for free policy.
+/// Invariant 3: `policy_requires_payment` returns false for free policy.
 #[test]
 fn invariant_3_policy_requires_payment_false_for_free() {
     let free = free_policy_no_costs();
@@ -797,7 +800,7 @@ async fn invariant_4_receipt_in_event_log_with_merkle_proof() {
     assert_eq!(history[0].amount, Amount(10));
 }
 
-/// Invariant 4: PaymentReceipt fields match expected values after capture.
+/// Invariant 4: `PaymentReceipt` fields match expected values after capture.
 #[tokio::test]
 async fn invariant_4_receipt_fields_match() {
     let adapter = TestAdapter::new();
@@ -925,7 +928,7 @@ fn invariant_4_payment_history_with_filters() {
 // Invariant 5: Payment adapters are substitutable
 // ===========================================================================
 
-/// Invariant 5: Replace TestAdapter with a second mock adapter -- same flow
+/// Invariant 5: Replace `TestAdapter` with a second mock adapter -- same flow
 /// works identically.
 #[tokio::test]
 async fn invariant_5_substitute_adapter_same_flow() {
@@ -982,7 +985,7 @@ async fn invariant_5_substitute_adapter_same_flow() {
     assert_eq!(receipt_b.adapter_id, "alt-test");
 }
 
-/// Invariant 5: PaymentAdapter trait is implemented by both adapters identically.
+/// Invariant 5: `PaymentAdapter` trait is implemented by both adapters identically.
 #[test]
 fn invariant_5_adapter_trait_is_uniform() {
     let adapter_a = TestAdapter::new();
@@ -1028,7 +1031,7 @@ fn invariant_6_unlocked_policy_update_succeeds() {
         locked: false,
         cost_schedule: CostSchedule {
             currency: usd(),
-            per_message: Some(Amount(20)), // Updated cost.
+            per_message: Some(Amount(20)),      // Updated cost.
             per_tool_invoke: Some(Amount(100)), // New cost.
             per_join: None,
             per_period: None,
@@ -1117,7 +1120,7 @@ fn invariant_6_voluntary_lock_transition() {
 // Invariant 7: Payment data inside encrypted envelope
 // ===========================================================================
 
-/// Invariant 7: PaymentAuthorization and PaymentReceipt carry payment metadata
+/// Invariant 7: `PaymentAuthorization` and `PaymentReceipt` carry payment metadata
 /// that must live inside the encrypted envelope, not at the transport layer.
 /// The relay sees only opaque encrypted bytes.
 #[tokio::test]
@@ -1161,7 +1164,7 @@ async fn invariant_7_payment_data_inside_encrypted_envelope() {
     );
 }
 
-/// Invariant 7: PaymentAuthorization is serializable for embedding in encrypted
+/// Invariant 7: `PaymentAuthorization` is serializable for embedding in encrypted
 /// envelope payloads.
 #[test]
 fn invariant_7_authorization_serializable_for_envelope() {
@@ -1193,7 +1196,7 @@ fn invariant_7_authorization_serializable_for_envelope() {
 // ===========================================================================
 
 /// Invariant 8: Validate SDK's bootstrap relay list includes at least one free
-/// relay. Uses scp-core's WellKnownScp types to build relay entries.
+/// relay. Uses scp-core's `WellKnownScp` types to build relay entries.
 #[test]
 fn invariant_8_bootstrap_list_has_free_relay() {
     // Construct a realistic bootstrap relay list.
@@ -1232,24 +1235,33 @@ fn invariant_8_bootstrap_list_has_free_relay() {
     };
 
     // Validate: list with free relay passes.
-    let relays = vec![&free_relay, &paid_relay];
-    let has_free = relays
-        .iter()
-        .any(|r| r.relay_config.as_ref().and_then(|rc| rc.economic.as_ref()).is_none());
-    assert!(has_free, "bootstrap list must include at least one free relay");
+    let relays = [&free_relay, &paid_relay];
+    let has_free = relays.iter().any(|r| {
+        r.relay_config
+            .as_ref()
+            .and_then(|rc| rc.economic.as_ref())
+            .is_none()
+    });
+    assert!(
+        has_free,
+        "bootstrap list must include at least one free relay"
+    );
 
     // Validate: list with only paid relays fails.
-    let paid_only = vec![&paid_relay];
-    let has_free_in_paid_only = paid_only
-        .iter()
-        .any(|r| r.relay_config.as_ref().and_then(|rc| rc.economic.as_ref()).is_none());
+    let paid_only = [&paid_relay];
+    let has_free_in_paid_only = paid_only.iter().any(|r| {
+        r.relay_config
+            .as_ref()
+            .and_then(|rc| rc.economic.as_ref())
+            .is_none()
+    });
     assert!(
         !has_free_in_paid_only,
         "list of only paid relays should NOT have a free relay"
     );
 }
 
-/// Invariant 8: Relay with no relay_config is treated as free.
+/// Invariant 8: Relay with no `relay_config` is treated as free.
 #[test]
 fn invariant_8_no_relay_config_is_free() {
     let minimal_relay = WellKnownScp {
@@ -1265,7 +1277,10 @@ fn invariant_8_no_relay_config_is_free() {
         .as_ref()
         .and_then(|rc| rc.economic.as_ref())
         .is_none();
-    assert!(is_free, "relay without relay_config should be treated as free");
+    assert!(
+        is_free,
+        "relay without relay_config should be treated as free"
+    );
 }
 
 // ===========================================================================
@@ -1553,29 +1568,21 @@ fn integration_anti_spam_with_cap() {
     let tracker = SenderVelocityTracker::new(60);
     let sender = DID::from("did:dht:z6MkSpammer");
     let config = EscalationConfig {
-        thresholds: vec![
-            EscalationThreshold {
-                velocity_threshold: 1,
-                additional_cost: Amount(1000),
-            },
-        ],
+        thresholds: vec![EscalationThreshold {
+            velocity_threshold: 1,
+            additional_cost: Amount(1000),
+        }],
     };
 
     tracker.record_message(&sender, 100);
 
     // Cap at 500.
-    let cost = tracker.compute_escalated_cost(
-        &sender,
-        100,
-        Amount(100),
-        &config,
-        None,
-        Some(Amount(500)),
-    );
+    let cost =
+        tracker.compute_escalated_cost(&sender, 100, Amount(100), &config, None, Some(Amount(500)));
     assert_eq!(cost, Amount(500), "cost should be clamped to cap");
 }
 
-/// Anti-spam: per-sender pricing formula integration via SenderVelocity metric.
+/// Anti-spam: per-sender pricing formula integration via `SenderVelocity` metric.
 #[test]
 fn integration_anti_spam_via_pricing_formula() {
     let policy = EconomicPolicy {
@@ -1593,11 +1600,7 @@ fn integration_anti_spam_via_pricing_formula() {
             base_cost: Amount(0),
             variables: vec![PricingVariable::Step {
                 metric: PricingMetric::SenderVelocity,
-                thresholds: vec![
-                    (10, Amount(1)),
-                    (50, Amount(10)),
-                    (200, Amount(100)),
-                ],
+                thresholds: vec![(10, Amount(1)), (50, Amount(10)), (200, Amount(100))],
             }],
             cap: Some(Amount(1000)),
             floor: None,
@@ -1663,7 +1666,7 @@ fn integration_spending_ucan_scope_mismatch() {
     );
 }
 
-/// Budget tracker enforces per-action and total limits via check_and_record.
+/// Budget tracker enforces per-action and total limits via `check_and_record`.
 #[test]
 fn integration_budget_tracker_limits() {
     let cap = test_spending_capability();
@@ -1711,7 +1714,10 @@ fn integration_budget_tracker_per_action_limit() {
     );
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), SpendingError::PerActionLimitExceeded { .. }),
+        matches!(
+            result.unwrap_err(),
+            SpendingError::PerActionLimitExceeded { .. }
+        ),
         "expected PerActionLimitExceeded"
     );
 }
@@ -1808,7 +1814,10 @@ fn integration_merkle_tree_with_economic_events() {
     // Every leaf has a valid inclusion proof.
     for i in 0..3 {
         let proof = prove_inclusion(&log, i).unwrap();
-        assert!(verify_inclusion(&proof), "inclusion proof for leaf {i} should verify");
+        assert!(
+            verify_inclusion(&proof),
+            "inclusion proof for leaf {i} should verify"
+        );
     }
 
     // Root hash is consistent.

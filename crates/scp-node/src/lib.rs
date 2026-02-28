@@ -165,7 +165,7 @@ impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
             .field("relay", &self.relay)
             .field("identity", &self.identity)
             .field("storage", &"<Storage>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -345,8 +345,13 @@ impl Default
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, B: BlobStorage + 'static, Id>
-    ApplicationNodeBuilder<K, D, S, B, NoDomain, Id>
+impl<
+    K: KeyCustody + 'static,
+    D: DidMethod + 'static,
+    S: Storage + 'static,
+    B: BlobStorage + 'static,
+    Id,
+> ApplicationNodeBuilder<K, D, S, B, NoDomain, Id>
 {
     /// Sets the domain this node serves.
     ///
@@ -367,8 +372,14 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, B: B
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, B: BlobStorage + 'static, Dom, Id>
-    ApplicationNodeBuilder<K, D, S, B, Dom, Id>
+impl<
+    K: KeyCustody + 'static,
+    D: DidMethod + 'static,
+    S: Storage + 'static,
+    B: BlobStorage + 'static,
+    Dom,
+    Id,
+> ApplicationNodeBuilder<K, D, S, B, Dom, Id>
 {
     /// Sets the socket address for the relay server to bind to.
     ///
@@ -491,8 +502,12 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static, B: BlobStorage + 'static>
-    ApplicationNodeBuilder<K, D, S, B, HasDomain, HasIdentity>
+impl<
+    K: KeyCustody + 'static,
+    D: DidMethod + 'static,
+    S: Storage + Default + 'static,
+    B: BlobStorage + 'static,
+> ApplicationNodeBuilder<K, D, S, B, HasDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`].
     ///
@@ -586,7 +601,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
 
         Ok(ApplicationNode {
             domain,
-            relay: RelayHandle { bound_addr, shutdown_handle },
+            relay: RelayHandle {
+                bound_addr,
+                shutdown_handle,
+            },
             identity: IdentityHandle { identity, document },
             storage,
             state,
@@ -811,8 +829,7 @@ mod tests {
     }
 
     /// Helper: creates a builder with domain and `generate_identity` configured.
-    fn test_builder(
-    ) -> ApplicationNodeBuilder<
+    fn test_builder() -> ApplicationNodeBuilder<
         InMemoryKeyCustody,
         TestDidDht,
         InMemoryStorage,
@@ -1185,7 +1202,7 @@ mod tests {
         use tower::ServiceExt;
 
         /// Builds a node and returns it along with the well-known router
-        /// for direct testing via tower::ServiceExt.
+        /// for direct testing via `tower::ServiceExt`.
         async fn build_test_node() -> ApplicationNode<InMemoryStorage> {
             test_builder()
                 .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -1241,11 +1258,8 @@ mod tests {
             let node = build_test_node().await;
 
             // Register a broadcast context.
-            node.register_broadcast_context(
-                "abc123".to_owned(),
-                Some("Test Broadcast".to_owned()),
-            )
-            .await;
+            node.register_broadcast_context("abc123".to_owned(), Some("Test Broadcast".to_owned()))
+                .await;
 
             let router = node.well_known_router();
 
@@ -1268,7 +1282,11 @@ mod tests {
             assert_eq!(contexts[0].name.as_deref(), Some("Test Broadcast"));
             assert_eq!(contexts[0].mode.as_deref(), Some("broadcast"));
             assert!(
-                contexts[0].uri.as_ref().unwrap().starts_with("scp://context/abc123"),
+                contexts[0]
+                    .uri
+                    .as_ref()
+                    .unwrap()
+                    .starts_with("scp://context/abc123"),
                 "URI should start with scp://context/abc123, got: {}",
                 contexts[0].uri.as_ref().unwrap()
             );
@@ -1292,7 +1310,8 @@ mod tests {
             assert!(doc.contexts.is_none());
 
             // Register a context.
-            node.register_broadcast_context("def456".to_owned(), None).await;
+            node.register_broadcast_context("def456".to_owned(), None)
+                .await;
 
             // Second request: context appears.
             let router = node.well_known_router();
@@ -1318,9 +1337,7 @@ mod tests {
 
             // Start the relay router on a separate port.
             let relay_router = node.relay_router();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let http_addr = listener.local_addr().unwrap();
 
             let server_handle = tokio::spawn(async move {
@@ -1347,10 +1364,8 @@ mod tests {
             let node = build_test_node().await;
 
             // Create a simple app route.
-            let app_router = axum::Router::new().route(
-                "/health",
-                axum::routing::get(|| async { "ok" }),
-            );
+            let app_router =
+                axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
 
             // Merge with SCP routes.
             let well_known = node.well_known_router();

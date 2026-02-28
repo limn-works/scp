@@ -482,6 +482,7 @@ where
 /// # Errors
 ///
 /// Returns a specific [`UcanError`] variant indicating which step failed.
+#[cfg(test)]
 pub(crate) fn validate_ucan_stateless<D, S>(
     token: &UcanToken,
     required_capability: &CapabilityUri,
@@ -660,8 +661,13 @@ fn verify_chain_recursive(
         verify_signature(&parent, did_resolver)?;
 
         // Recurse to find the root.
-        let found_root =
-            verify_chain_recursive(&parent, did_resolver, proof_resolver, depth + 1, seen_issuers)?;
+        let found_root = verify_chain_recursive(
+            &parent,
+            did_resolver,
+            proof_resolver,
+            depth + 1,
+            seen_issuers,
+        )?;
 
         // All proof chains must converge to the same root issuer.
         if let Some(ref existing_root) = root_issuer {
@@ -2626,7 +2632,7 @@ mod tests {
         );
     }
 
-    /// MAX_CHAIN_DEPTH guard still terminates excessively long chains.
+    /// `MAX_CHAIN_DEPTH` guard still terminates excessively long chains.
     #[test]
     fn verify_chain_recursive_rejects_excessive_depth() {
         let token = UcanToken {

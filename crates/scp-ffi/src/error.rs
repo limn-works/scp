@@ -32,22 +32,50 @@ use pyo3::prelude::*;
 // ---------------------------------------------------------------------------
 
 // Root exception: scp_sdk.ScpError (extends Python's Exception).
-pyo3::create_exception!(scp_sdk, ScpError, pyo3::exceptions::PyException,
-    "Base exception for all SCP protocol errors.");
+pyo3::create_exception!(
+    scp_sdk,
+    ScpError,
+    pyo3::exceptions::PyException,
+    "Base exception for all SCP protocol errors."
+);
 
 // Domain-specific exceptions, all rooted at ScpError.
-pyo3::create_exception!(scp_sdk, IdentityError, ScpError,
-    "An identity operation failed (DID creation, resolution, key rotation).");
-pyo3::create_exception!(scp_sdk, ContextError, ScpError,
-    "A context lifecycle operation failed (create, join, leave, close, send).");
-pyo3::create_exception!(scp_sdk, CryptoError, ScpError,
-    "A cryptographic operation failed (MLS, sender keys, encryption, decryption).");
-pyo3::create_exception!(scp_sdk, TransportError, ScpError,
-    "A transport operation failed (connection, send, subscription).");
-pyo3::create_exception!(scp_sdk, UcanError, ScpError,
-    "A UCAN operation failed (validation, minting, revocation).");
-pyo3::create_exception!(scp_sdk, ValidationError, ScpError,
-    "Input validation failed (malformed data, schema mismatch, constraint violation).");
+pyo3::create_exception!(
+    scp_sdk,
+    IdentityError,
+    ScpError,
+    "An identity operation failed (DID creation, resolution, key rotation)."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    ContextError,
+    ScpError,
+    "A context lifecycle operation failed (create, join, leave, close, send)."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    CryptoError,
+    ScpError,
+    "A cryptographic operation failed (MLS, sender keys, encryption, decryption)."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    TransportError,
+    ScpError,
+    "A transport operation failed (connection, send, subscription)."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    UcanError,
+    ScpError,
+    "A UCAN operation failed (validation, minting, revocation)."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    ValidationError,
+    ScpError,
+    "Input validation failed (malformed data, schema mismatch, constraint violation)."
+);
 
 // ---------------------------------------------------------------------------
 // ScpPyError enum

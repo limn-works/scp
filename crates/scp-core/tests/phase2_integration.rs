@@ -1,3 +1,10 @@
+#![allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::unused_async,
+    clippy::redundant_field_names
+)]
 //! Phase 2 end-to-end integration test.
 //!
 //! Exercises all 5 Phase 2 ADRs together with the Phase 1 crypto stack:
@@ -23,14 +30,14 @@ use tokio::sync::mpsc;
 use scp_core::context::roles::{
     Capability, CapabilityCeiling, ContextRoleState, RoleError, assign_role,
 };
-use scp_core::context::tools::invoke::{invoke_tool, has_tool_invoke_capability};
+use scp_core::context::tools::invoke::{has_tool_invoke_capability, invoke_tool};
 use scp_core::context::tools::lifecycle::ToolStatus;
 use scp_core::context::tools::registry::{
     ToolRegistration, ToolRegistry, ToolSchema, register_tool,
 };
 use scp_core::context::{
-    ContextHandle, ContextParams, ContextState, MemoryScope, ToolRegistration as ParamsToolReg,
-    RoleDefinition as ParamsRoleDef,
+    ContextHandle, ContextParams, ContextState, MemoryScope, RoleDefinition as ParamsRoleDef,
+    ToolRegistration as ParamsToolReg,
 };
 use scp_core::event_log::checkpoint::{
     CheckpointComparison, compare_checkpoint, generate_checkpoint,
@@ -140,7 +147,7 @@ fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
     // RFC 6962 §2.1 leaf domain separation: SHA-256(0x00 || serialized)
     let serialized = rmp_serde::to_vec(event).expect("serialize");
     let mut hasher = Sha256::new();
-    hasher.update(&[0x00]);
+    hasher.update([0x00]);
     hasher.update(&serialized);
     hasher.finalize().into()
 }
@@ -403,15 +410,21 @@ async fn phase2_end_to_end_integration() {
     // legibility tenet). Bob inspects the ceiling, roles, tools, TTL, and
     // memory scope before opting in.
     let discovered_params = context.params();
-    assert!(discovered_params
-        .ceiling
-        .contains(&Capability::MessagesRead));
-    assert!(discovered_params
-        .ceiling
-        .contains(&Capability::MessagesWrite));
-    assert!(discovered_params
-        .ceiling
-        .contains(&Capability::ToolInvokeAll));
+    assert!(
+        discovered_params
+            .ceiling
+            .contains(&Capability::MessagesRead)
+    );
+    assert!(
+        discovered_params
+            .ceiling
+            .contains(&Capability::MessagesWrite)
+    );
+    assert!(
+        discovered_params
+            .ceiling
+            .contains(&Capability::ToolInvokeAll)
+    );
 
     // Bob joins: add to member set.
     role_state.members.insert(bob_did.to_string());
@@ -595,9 +608,7 @@ async fn phase2_end_to_end_integration() {
         Err(RoleError::AssignerNotAuthorized(did)) => {
             assert_eq!(did, bob_did.to_string());
         }
-        other => panic!(
-            "expected AssignerNotAuthorized, got {other:?}"
-        ),
+        other => panic!("expected AssignerNotAuthorized, got {other:?}"),
     }
 
     // -----------------------------------------------------------------------
@@ -620,10 +631,9 @@ async fn phase2_end_to_end_integration() {
             .await
             .expect("Alice checkpoint");
 
-    let bob_checkpoint =
-        generate_checkpoint(&bob_log, &bob_did, 1, &custody, &bob_checkpoint_key)
-            .await
-            .expect("Bob checkpoint");
+    let bob_checkpoint = generate_checkpoint(&bob_log, &bob_did, 1, &custody, &bob_checkpoint_key)
+        .await
+        .expect("Bob checkpoint");
 
     // Both should have the same event count.
     assert_eq!(alice_checkpoint.event_count, bob_checkpoint.event_count);
@@ -731,8 +741,7 @@ async fn phase2_end_to_end_integration() {
     let alice_final_root = tree::root(&alice_log);
     let bob_final_root = tree::root(&bob_log);
     assert_ne!(
-        alice_final_root,
-        [0u8; 32],
+        alice_final_root, [0u8; 32],
         "Merkle root should not be zero"
     );
     assert_eq!(

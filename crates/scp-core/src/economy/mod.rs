@@ -38,6 +38,10 @@ pub use adapter::{
     PaymentReceipt, RefundConfirmation, VerificationResult,
 };
 pub use antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
+pub use credentials::{
+    AdapterCredential, AdapterCredentialStore, CredentialError, configure_adapter,
+    retrieve_adapter_credential, validate_adapter,
+};
 pub use estimate::estimate_cost;
 pub use integration::{
     ActionEnvelope, IntegrationError, PreparedAction, ProcessedAction, prepare_paid_action,
@@ -51,10 +55,6 @@ pub use policy::{
 pub use pricing::{
     FormulaChange, FormulaChangeStatus, PriceDirection, RelayPriceAdjustment, RelayPricingConfig,
     adjust_relay_price,
-};
-pub use credentials::{
-    AdapterCredential, AdapterCredentialStore, CredentialError, configure_adapter,
-    retrieve_adapter_credential, validate_adapter,
 };
 pub use receipt::{PaymentVerifier, ReceiptFilter, payment_history};
 pub use types::{

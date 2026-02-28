@@ -150,7 +150,7 @@ impl std::fmt::Display for OfflineTier {
 ///
 /// See ADR-029 section 1.
 #[must_use]
-pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTier {
+pub const fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTier {
     let duration_secs = now.saturating_sub(last_relay_contact);
     match duration_secs {
         0..=14_400 => OfflineTier::Short,
@@ -197,9 +197,7 @@ pub enum SyncError {
     },
 
     /// Sender key re-acquisition timed out (Phase 4 of reconnection protocol).
-    #[error(
-        "sender key timeout for sender {sender_did} in context {context_id}"
-    )]
+    #[error("sender key timeout for sender {sender_did} in context {context_id}")]
     SenderKeyTimeout {
         /// The context where the timeout occurred.
         context_id: ContextId,
@@ -242,9 +240,7 @@ pub enum SyncError {
     },
 
     /// A Commit in the catch-up sequence was corrupted or failed to process.
-    #[error(
-        "commit processing failed at epoch {epoch} in context {context_id}: {reason}"
-    )]
+    #[error("commit processing failed at epoch {epoch} in context {context_id}: {reason}")]
     CommitProcessingFailed {
         /// The context where processing failed.
         context_id: ContextId,

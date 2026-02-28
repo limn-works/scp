@@ -17,7 +17,7 @@ use crate::identity::DID;
 // ---------------------------------------------------------------------------
 
 /// Amount in the smallest currency unit. USD: cents (1 USD = 100).
-/// BTC: satoshis (1 BTC = 100_000_000).
+/// BTC: satoshis (1 BTC = `100_000_000`).
 ///
 /// Always integer -- no floating-point in economic calculations. Cross-party
 /// determinism guaranteed: both payer and receiver evaluate the same `Amount`
@@ -140,7 +140,7 @@ impl std::fmt::Display for CurrencyCode {
 
 /// Fixed-point coefficient with 6 decimal places of precision.
 ///
-/// Value = raw / 1_000_000. Example: 1_500_000 = 1.5, 100 = 0.0001.
+/// Value = raw / `1_000_000`. Example: `1_500_000` = 1.5, 100 = 0.0001.
 /// Used in pricing formulas where fractional multipliers are needed.
 /// Both sides evaluate identically -- no IEEE 754 variance.
 ///
@@ -148,7 +148,7 @@ impl std::fmt::Display for CurrencyCode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Coefficient(pub i64);
 
-/// The fixed-point scale factor for [`Coefficient`]: 1_000_000.
+/// The fixed-point scale factor for [`Coefficient`]: `1_000_000`.
 pub const COEFFICIENT_SCALE: i64 = 1_000_000;
 
 impl Coefficient {
@@ -175,7 +175,7 @@ impl Coefficient {
         if metric_value > i64::MAX as u64 {
             return None;
         }
-        let mv = metric_value as i64;
+        let mv = metric_value.cast_signed();
         match self.0.checked_mul(mv) {
             Some(product) => Some(product / COEFFICIENT_SCALE),
             None => None,
@@ -305,7 +305,7 @@ pub enum PricingMetric {
 /// See spec section 19.4.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PricingVariable {
-    /// Linear multiplier: cost += (coefficient.0 * metric_value) / 1_000_000.
+    /// Linear multiplier: cost += (coefficient.0 * `metric_value`) / `1_000_000`.
     ///
     /// [`Coefficient`] is fixed-point with 6 decimal places (section 19.1.1).
     Linear {

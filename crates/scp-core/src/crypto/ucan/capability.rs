@@ -322,7 +322,12 @@ pub fn check_capability_match(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::iter_on_single_items
+)]
 mod tests {
     use super::*;
 

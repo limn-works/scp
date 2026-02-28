@@ -277,7 +277,7 @@ impl MigrationHandle {
 impl<D: DhtClient + 'static> MigrationRepublisher<D> {
     /// Creates a new migration republisher with the default interval (1 hour).
     #[must_use]
-    pub fn new(dht_client: Arc<D>) -> Self {
+    pub const fn new(dht_client: Arc<D>) -> Self {
         Self {
             dht_client,
             interval_secs: MIGRATION_REPUBLISH_INTERVAL_SECS,
@@ -286,7 +286,7 @@ impl<D: DhtClient + 'static> MigrationRepublisher<D> {
 
     /// Creates a new migration republisher with a custom interval.
     #[must_use]
-    pub fn with_interval(dht_client: Arc<D>, interval_secs: u64) -> Self {
+    pub const fn with_interval(dht_client: Arc<D>, interval_secs: u64) -> Self {
         Self {
             dht_client,
             interval_secs,
@@ -298,15 +298,12 @@ impl<D: DhtClient + 'static> MigrationRepublisher<D> {
     /// The task immediately republishes the old DID document with the redirect,
     /// then repeats at the configured interval. Returns a [`MigrationHandle`]
     /// that can cancel the task.
+    #[must_use]
     pub fn start(&self, entry: RepublishEntry) -> MigrationHandle {
         let dht_client = Arc::clone(&self.dht_client);
         let interval_secs = self.interval_secs;
 
-        let join_handle = tokio::spawn(migration_republish_loop(
-            dht_client,
-            entry,
-            interval_secs,
-        ));
+        let join_handle = tokio::spawn(migration_republish_loop(dht_client, entry, interval_secs));
 
         MigrationHandle {
             abort_handle: join_handle.abort_handle(),
@@ -475,7 +472,10 @@ mod tests {
         let dht = Arc::new(InMemoryDhtClient::new());
         // Use default interval — verify it's configurable.
         let default_republisher = MigrationRepublisher::new(Arc::clone(&dht));
-        assert_eq!(default_republisher.interval_secs, MIGRATION_REPUBLISH_INTERVAL_SECS);
+        assert_eq!(
+            default_republisher.interval_secs,
+            MIGRATION_REPUBLISH_INTERVAL_SECS
+        );
 
         // Use custom interval.
         let custom_republisher = MigrationRepublisher::with_interval(Arc::clone(&dht), 42);

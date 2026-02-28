@@ -313,14 +313,9 @@ impl ReceiveBuffer {
             self.dropped_since_last_consume += 1;
 
             // Update the existing overflow marker's count in place.
-            if let Some(ContextEvent::BufferOverflow { dropped_count }) =
-                self.events.back_mut()
-            {
+            if let Some(ContextEvent::BufferOverflow { dropped_count }) = self.events.back_mut() {
                 *dropped_count = self.dropped_since_last_consume;
             }
-
-            // Push the new event.
-            self.events.push_back(event);
         } else {
             // No existing overflow marker. We need two slots: one for the
             // overflow marker and one for the new event. Drop two oldest.
@@ -329,12 +324,14 @@ impl ReceiveBuffer {
             self.events.pop_front();
             self.dropped_since_last_consume += 1;
 
-            // Push the overflow marker and the new event.
+            // Push the overflow marker.
             self.events.push_back(ContextEvent::BufferOverflow {
                 dropped_count: self.dropped_since_last_consume,
             });
-            self.events.push_back(event);
         }
+
+        // Push the new event.
+        self.events.push_back(event);
 
         // Return the overflow indicator.
         Some(ContextEvent::BufferOverflow {
@@ -442,7 +439,10 @@ mod tests {
         state.add_member("did:key:alice".into(), "admin".into(), vec![]);
         state.add_member("did:key:bob".into(), "member".into(), vec![]);
 
-        let mut dids: Vec<&str> = state.member_dids().map(|d| d.as_ref()).collect();
+        let mut dids: Vec<&str> = state
+            .member_dids()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
         dids.sort_unstable();
         assert_eq!(dids, vec!["did:key:alice", "did:key:bob"]);
     }

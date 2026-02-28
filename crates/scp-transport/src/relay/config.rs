@@ -21,9 +21,7 @@ use scp_core::economy::types::Amount;
 /// `Amount(0)` — i.e., the relay is free for publishing.
 #[must_use]
 pub fn per_publish_cost(config: Option<&RelayEconomicConfig>) -> Amount {
-    config
-        .and_then(|c| c.per_publish)
-        .unwrap_or(Amount::new(0))
+    config.and_then(|c| c.per_publish).unwrap_or(Amount::new(0))
 }
 
 /// Returns `true` if the relay has no economic configuration (free relay).

@@ -10,11 +10,11 @@
 //! - [`WasmTransportStatus`] — Connection status (connected, relay URL,
 //!   latency).
 //!
-//! # Browser WebSocket transport
+//! # Browser `WebSocket` transport
 //!
 //! In browser targets, transport connections use the browser's native
-//! WebSocket API (not a Rust WebSocket crate). The TypeScript SDK wrapper
-//! manages the WebSocket lifecycle and injects messages into the Rust bridge
+//! `WebSocket` API (not a Rust `WebSocket` crate). The TypeScript SDK wrapper
+//! manages the `WebSocket` lifecycle and injects messages into the Rust bridge
 //! via callback. This is consistent with the transport independence tenet
 //! (spec §4 — no structural coupling to any single transport).
 //!
@@ -58,12 +58,14 @@ pub struct WasmTransportStatus {
 #[wasm_bindgen]
 impl WasmTransportStatus {
     /// Returns `true` if the transport is currently connected.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn connected(&self) -> bool {
         self.connected
     }
 
     /// Returns the relay URL if connected, or `null` if disconnected.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "relayUrl")]
     pub fn relay_url(&self) -> Option<String> {
         self.relay_url.clone()
@@ -71,6 +73,7 @@ impl WasmTransportStatus {
 
     /// Returns the round-trip latency in milliseconds, or `null` if
     /// not measured or disconnected.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "latencyMs")]
     pub fn latency_ms(&self) -> Option<f64> {
         self.latency_ms
@@ -84,20 +87,20 @@ impl WasmTransportStatus {
 /// Connects to an SCP relay.
 ///
 /// In browser targets, transport connections use the browser's native
-/// WebSocket API managed by the TypeScript SDK wrapper. This function
+/// `WebSocket` API managed by the TypeScript SDK wrapper. This function
 /// validates the relay URL format and signals to the TypeScript wrapper
-/// that a WebSocket connection should be established.
+/// that a `WebSocket` connection should be established.
 ///
 /// # Arguments
 ///
-/// * `relay_url` — The WebSocket URL of the SCP relay (must use `wss://`
+/// * `relay_url` — The `WebSocket` URL of the SCP relay (must use `wss://`
 ///   scheme in browser contexts for security).
 ///
 /// # Returns
 ///
 /// `Promise<WasmTransportStatus>` — resolves to a [`WasmTransportStatus`]
 /// reflecting the (intended) connected state. The TypeScript wrapper
-/// establishes the actual WebSocket connection.
+/// establishes the actual `WebSocket` connection.
 ///
 /// # Errors
 ///
@@ -140,7 +143,7 @@ pub fn transport_connect(relay_url: String) -> Promise {
 ///
 /// Returns a disconnected status in the bridge layer. The TypeScript SDK
 /// wrapper maintains the authoritative connection state via the browser's
-/// WebSocket API and calls this to obtain a Rust-typed status object.
+/// `WebSocket` API and calls this to obtain a Rust-typed status object.
 ///
 /// # Returns
 ///

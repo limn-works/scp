@@ -80,7 +80,7 @@ pub enum MlsImpact {
 /// assert_eq!(classify_action(&close), MlsImpact::NoMlsChange);
 /// ```
 #[must_use]
-pub fn classify_action(action: &GovernanceAction) -> MlsImpact {
+pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
     match action {
         GovernanceAction::AddMember { .. } | GovernanceAction::RemoveMember { .. } => {
             MlsImpact::MembershipChange
@@ -209,7 +209,7 @@ pub struct CoordinationRecord {
 impl EpochCoordinator {
     /// Creates a new, empty coordinator.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             records: Vec::new(),
         }
@@ -263,7 +263,7 @@ impl EpochCoordinator {
 
     /// Returns the number of coordination records.
     #[must_use]
-    pub fn record_count(&self) -> usize {
+    pub const fn record_count(&self) -> usize {
         self.records.len()
     }
 }
@@ -347,10 +347,10 @@ pub fn check_consistency(
     }
 
     // Check epoch consistency if both are known.
-    if let (Some(expected), Some(actual)) = (expected_epoch, actual_epoch) {
-        if expected != actual {
-            issues.push(ConsistencyCheck::EpochMismatch { expected, actual });
-        }
+    if let (Some(expected), Some(actual)) = (expected_epoch, actual_epoch)
+        && expected != actual
+    {
+        issues.push(ConsistencyCheck::EpochMismatch { expected, actual });
     }
 
     issues
@@ -391,8 +391,7 @@ pub fn proposals_invalidated_by_reset(
         .iter()
         .filter(|p| {
             p.status == ProposalStatus::Pending
-                && p.created_at_epoch
-                    .map_or(true, |epoch| epoch <= reset_epoch)
+                && p.created_at_epoch.is_none_or(|epoch| epoch <= reset_epoch)
         })
         .map(|p| p.proposal_id)
         .collect()
@@ -409,7 +408,10 @@ pub fn proposals_invalidated_by_reset(
 /// full reset (epoch dropped below the proposal's creation epoch), which
 /// should not happen under normal operation.
 #[must_use]
-pub fn is_proposal_epoch_valid(proposal: &GovernanceProposal, context: &GovernanceContext) -> bool {
+pub const fn is_proposal_epoch_valid(
+    proposal: &GovernanceProposal,
+    context: &GovernanceContext,
+) -> bool {
     match (proposal.created_at_epoch, context.current_epoch) {
         // Both epochs known: proposal is valid if current >= created.
         (Some(created), Some(current)) => current >= created,
@@ -572,9 +574,7 @@ mod tests {
 
     #[test]
     fn classify_transfer_admin_is_no_mls_change() {
-        let action = GovernanceAction::TransferAdmin {
-            new_admin: bob(),
-        };
+        let action = GovernanceAction::TransferAdmin { new_admin: bob() };
         assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);
     }
 
@@ -1031,20 +1031,14 @@ mod tests {
 
     #[test]
     fn proposal_valid_at_same_epoch() {
-        let proposal = pending_proposal(
-            GovernanceAction::CloseContext { reason: None },
-            Some(5),
-        );
+        let proposal = pending_proposal(GovernanceAction::CloseContext { reason: None }, Some(5));
         let ctx = test_governance_context();
         assert!(is_proposal_epoch_valid(&proposal, &ctx));
     }
 
     #[test]
     fn proposal_valid_at_later_epoch() {
-        let proposal = pending_proposal(
-            GovernanceAction::CloseContext { reason: None },
-            Some(3),
-        );
+        let proposal = pending_proposal(GovernanceAction::CloseContext { reason: None }, Some(3));
         let ctx = test_governance_context(); // epoch 5
         assert!(is_proposal_epoch_valid(&proposal, &ctx));
     }
@@ -1061,10 +1055,7 @@ mod tests {
 
     #[test]
     fn proposal_valid_when_no_epoch_info() {
-        let proposal = pending_proposal(
-            GovernanceAction::CloseContext { reason: None },
-            None,
-        );
+        let proposal = pending_proposal(GovernanceAction::CloseContext { reason: None }, None);
         let mut ctx = test_governance_context();
         ctx.current_epoch = None;
         assert!(is_proposal_epoch_valid(&proposal, &ctx));
@@ -1072,20 +1063,14 @@ mod tests {
 
     #[test]
     fn proposal_valid_when_proposal_has_no_epoch() {
-        let proposal = pending_proposal(
-            GovernanceAction::CloseContext { reason: None },
-            None,
-        );
+        let proposal = pending_proposal(GovernanceAction::CloseContext { reason: None }, None);
         let ctx = test_governance_context();
         assert!(is_proposal_epoch_valid(&proposal, &ctx));
     }
 
     #[test]
     fn proposal_valid_when_context_has_no_epoch() {
-        let proposal = pending_proposal(
-            GovernanceAction::CloseContext { reason: None },
-            Some(5),
-        );
+        let proposal = pending_proposal(GovernanceAction::CloseContext { reason: None }, Some(5));
         let mut ctx = test_governance_context();
         ctx.current_epoch = None;
         assert!(is_proposal_epoch_valid(&proposal, &ctx));
@@ -1114,8 +1099,7 @@ mod tests {
 
         for op in &operations {
             let json = serde_json::to_string(op).expect("serialize");
-            let deserialized: MlsOperation =
-                serde_json::from_str(&json).expect("deserialize");
+            let deserialized: MlsOperation = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(&deserialized, op);
         }
     }
@@ -1138,8 +1122,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&record).expect("serialize");
-        let deserialized: CoordinationRecord =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: CoordinationRecord = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(deserialized.proposal_id, record.proposal_id);
         assert_eq!(deserialized.epoch_before, record.epoch_before);
@@ -1156,8 +1139,7 @@ mod tests {
     fn mls_impact_serialization_roundtrip() {
         for impact in &[MlsImpact::MembershipChange, MlsImpact::NoMlsChange] {
             let json = serde_json::to_string(impact).expect("serialize");
-            let deserialized: MlsImpact =
-                serde_json::from_str(&json).expect("deserialize");
+            let deserialized: MlsImpact = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(&deserialized, impact);
         }
     }
@@ -1220,21 +1202,14 @@ mod tests {
             .expect("record");
 
         // Step 6: Verify consistency after the operation.
-        let gov_members = vec![
-            alice(),
-            bob(),
-            carol(),
-            DID::from("did:dht:z6MkDave"),
-        ];
-        let mls_members = vec![
-            alice(),
-            bob(),
-            carol(),
-            DID::from("did:dht:z6MkDave"),
-        ];
+        let gov_members = vec![alice(), bob(), carol(), DID::from("did:dht:z6MkDave")];
+        let mls_members = vec![alice(), bob(), carol(), DID::from("did:dht:z6MkDave")];
 
         let issues = check_consistency(&gov_members, &mls_members, Some(6), Some(6));
-        assert!(issues.is_empty(), "state should be consistent after coordination");
+        assert!(
+            issues.is_empty(),
+            "state should be consistent after coordination"
+        );
     }
 
     #[test]
@@ -1365,11 +1340,19 @@ mod tests {
 
         // Role change does not need MLS coordination.
         assert!(!requires_mls_coordination(&role_proposal));
-        assert!(generate_mls_operations(&role_proposal).expect("generate").is_none());
+        assert!(
+            generate_mls_operations(&role_proposal)
+                .expect("generate")
+                .is_none()
+        );
 
         // Add member does need MLS coordination.
         assert!(requires_mls_coordination(&add_proposal));
-        assert!(generate_mls_operations(&add_proposal).expect("generate").is_some());
+        assert!(
+            generate_mls_operations(&add_proposal)
+                .expect("generate")
+                .is_some()
+        );
 
         // Only the membership change is recorded in the coordinator.
         let mut coordinator = EpochCoordinator::new();

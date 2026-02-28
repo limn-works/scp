@@ -1,7 +1,37 @@
+# OS
 .DS_Store
-.fastembed_cache/
+
+# Rust
 target/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# TypeScript
+node_modules/
+dist/
+
+# Swift
 bindings/swift/.build/
+
+# Kotlin
+bindings/kotlin/.gradle/
+bindings/kotlin/**/build/
+
+# Native build artifacts
+*.node
+*.wasm
+*.so
+*.dylib
+
+# Misc
+.fastembed_cache/
 
 .claude/worktrees
 

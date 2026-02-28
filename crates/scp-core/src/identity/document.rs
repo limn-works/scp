@@ -42,10 +42,7 @@ mod serde_signature_64 {
     {
         let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
         v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!(
-                "expected 64-byte signature, got {} bytes",
-                v.len()
-            ))
+            serde::de::Error::custom(format!("expected 64-byte signature, got {} bytes", v.len()))
         })
     }
 }
@@ -471,7 +468,12 @@ fn base58btc_encode(input: &[u8]) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
 

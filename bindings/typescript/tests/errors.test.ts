@@ -4,7 +4,7 @@
  * See `.docs/standards/sdk-common.md` for the cross-SDK error hierarchy.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import {
   ContextError,
   CryptoError,

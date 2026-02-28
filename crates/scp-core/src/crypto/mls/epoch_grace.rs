@@ -513,11 +513,7 @@ mod tests {
 
         // Adding one more should evict the oldest.
         let expired = store.add_epoch(max as u64);
-        assert_eq!(
-            store.len(),
-            max,
-            "store must not exceed max_capacity"
-        );
+        assert_eq!(store.len(), max, "store must not exceed max_capacity");
         // The evicted epoch should be in the returned list.
         assert_eq!(expired.len(), 1, "exactly one epoch should be evicted");
         assert!(
@@ -537,15 +533,24 @@ mod tests {
 
         // Insert epochs with progressively later deadlines.
         // Epoch 10 gets the earliest deadline, epoch 12 the latest.
-        store.epochs.insert(10, Instant::now() + std::time::Duration::from_secs(5));
-        store.epochs.insert(11, Instant::now() + std::time::Duration::from_secs(15));
-        store.epochs.insert(12, Instant::now() + std::time::Duration::from_secs(25));
+        store
+            .epochs
+            .insert(10, Instant::now() + std::time::Duration::from_secs(5));
+        store
+            .epochs
+            .insert(11, Instant::now() + std::time::Duration::from_secs(15));
+        store
+            .epochs
+            .insert(12, Instant::now() + std::time::Duration::from_secs(25));
         assert_eq!(store.len(), 3);
 
         // Adding epoch 13 should evict epoch 10 (oldest deadline).
         let expired = store.add_epoch(13);
         assert_eq!(store.len(), 3);
-        assert!(expired.contains(&10), "epoch 10 (oldest deadline) should be evicted");
+        assert!(
+            expired.contains(&10),
+            "epoch 10 (oldest deadline) should be evicted"
+        );
         assert!(!store.is_in_grace(10));
         assert!(store.is_in_grace(11));
         assert!(store.is_in_grace(12));
@@ -638,7 +643,10 @@ mod tests {
         // Adding a third should evict the oldest (epoch 1).
         store.add_epoch(3);
         let n = notified.borrow();
-        assert!(n.contains(&1), "epoch 1 should have been evicted and notified");
+        assert!(
+            n.contains(&1),
+            "epoch 1 should have been evicted and notified"
+        );
     }
 
     #[test]
@@ -669,9 +677,15 @@ mod tests {
         let mut store = EpochGraceStore::with_max_capacity(3);
 
         // Two expired epochs and one valid.
-        store.epochs.insert(0, Instant::now() - std::time::Duration::from_secs(1));
-        store.epochs.insert(1, Instant::now() - std::time::Duration::from_secs(1));
-        store.epochs.insert(2, Instant::now() + std::time::Duration::from_secs(25));
+        store
+            .epochs
+            .insert(0, Instant::now() - std::time::Duration::from_secs(1));
+        store
+            .epochs
+            .insert(1, Instant::now() - std::time::Duration::from_secs(1));
+        store
+            .epochs
+            .insert(2, Instant::now() + std::time::Duration::from_secs(25));
         assert_eq!(store.len(), 3);
 
         // Adding epoch 3: time-expired purge removes 0 and 1, making room

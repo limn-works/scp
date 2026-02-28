@@ -57,7 +57,7 @@ pub struct SseConfig {
 impl SseConfig {
     /// Creates a new configuration with the given bind address.
     #[must_use]
-    pub fn new(bind_addr: SocketAddr) -> Self {
+    pub const fn new(bind_addr: SocketAddr) -> Self {
         Self {
             bind_addr,
             channel_capacity: 256,
@@ -101,7 +101,6 @@ pub(crate) struct AppState<P: ContextProvider> {
 ///
 /// The returned router can be served with `axum::serve` or composed into a
 /// larger application.
-#[must_use]
 pub fn sse_router<P: ContextProvider + 'static>(
     server: McpServer<P>,
     channel_capacity: usize,
@@ -153,9 +152,10 @@ async fn sse_handler<P: ContextProvider + 'static>(
     let endpoint_event = Event::default().event("endpoint").data("/message");
 
     let rx = state.tx.subscribe();
-    let message_stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(data) => Some(Ok(Event::default().event("message").data(data))),
-        Err(_) => None, // Lagged receiver -- skip missed messages.
+    let message_stream = BroadcastStream::new(rx).filter_map(|result| {
+        result
+            .map(|data| Ok(Event::default().event("message").data(data)))
+            .ok()
     });
 
     // Prepend the endpoint event to the message stream.
@@ -197,15 +197,15 @@ async fn message_handler<P: ContextProvider + 'static>(
             server.handle_request(&synthetic);
             None
         }
-        Err(err_response) => Some(err_response),
+        Err(err_response) => Some(*err_response),
     };
 
     // Send the response over the SSE channel.
-    if let Some(resp) = response {
-        if let Ok(json) = serde_json::to_string(&resp) {
-            // Ignore send errors (no receivers connected).
-            let _ = state.tx.send(json);
-        }
+    if let Some(resp) = response
+        && let Ok(json) = serde_json::to_string(&resp)
+    {
+        // Ignore send errors (no receivers connected).
+        let _ = state.tx.send(json);
     }
 
     StatusCode::ACCEPTED
@@ -222,14 +222,12 @@ async fn message_handler<P: ContextProvider + 'static>(
 ///
 /// Returns the number of receivers that received the message, or 0 if
 /// serialization fails or no receivers are connected.
+#[cfg(test)]
 pub(crate) fn send_notification<P: ContextProvider>(
     state: &Arc<AppState<P>>,
     notification: &JsonRpcNotification,
 ) -> usize {
-    match serde_json::to_string(notification) {
-        Ok(json) => state.tx.send(json).unwrap_or(0),
-        Err(_) => 0,
-    }
+    serde_json::to_string(notification).map_or(0, |json| state.tx.send(json).unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -253,29 +251,29 @@ enum SseIncoming {
     Notification(JsonRpcNotification),
 }
 
-fn parse_sse_incoming(body: &str) -> Result<SseIncoming, JsonRpcResponse> {
+fn parse_sse_incoming(body: &str) -> Result<SseIncoming, Box<JsonRpcResponse>> {
     let raw: RawSseIncoming = serde_json::from_str(body).map_err(|e| {
-        JsonRpcResponse::error(
+        Box::new(JsonRpcResponse::error(
             RequestId::Number(0),
             JsonRpcError {
                 code: PARSE_ERROR,
                 message: format!("failed to parse JSON-RPC message: {e}"),
                 data: None,
             },
-        )
+        ))
     })?;
 
     match raw.id {
         Some(id_val) => {
             let id: RequestId = serde_json::from_value(id_val).map_err(|e| {
-                JsonRpcResponse::error(
+                Box::new(JsonRpcResponse::error(
                     RequestId::Number(0),
                     JsonRpcError {
                         code: PARSE_ERROR,
                         message: format!("invalid request id: {e}"),
                         data: None,
                     },
-                )
+                ))
             })?;
             Ok(SseIncoming::Request(JsonRpcRequest {
                 jsonrpc: crate::protocol::JSONRPC_VERSION.to_owned(),
@@ -300,7 +298,7 @@ fn parse_sse_incoming(body: &str) -> Result<SseIncoming, JsonRpcResponse> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::protocol::{JSONRPC_VERSION, METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
+    use crate::protocol::{METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
     use crate::server::{ContextToolInfo, MemberInfo};
 
     // -- Mock provider (same shape as stdio tests) ----------------------------

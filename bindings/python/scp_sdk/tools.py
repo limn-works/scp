@@ -9,7 +9,7 @@ See ``.docs/adrs/phase-3.md`` ADR-014 acceptance criterion 3 and
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 

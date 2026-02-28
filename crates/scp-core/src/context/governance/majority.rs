@@ -326,12 +326,8 @@ impl GovernanceEngine for MajorityVoteEngine {
         let action_bytes = serde_json::to_vec(&action)
             .map_err(|e| GovernanceError::SerializationFailed(e.to_string()))?;
 
-        let proposal_id = compute_proposal_id(
-            &context.context_id,
-            proposer,
-            &action_bytes,
-            context.now,
-        );
+        let proposal_id =
+            compute_proposal_id(&context.context_id, proposer, &action_bytes, context.now);
 
         // Reject duplicate proposals.
         if self.proposals.contains_key(&proposal_id) {
@@ -736,7 +732,9 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let action = GovernanceAction::CloseContext { reason: None };
 
-        let _ = engine.propose(&alice(), action.clone(), &ctx).expect("first propose");
+        let _ = engine
+            .propose(&alice(), action.clone(), &ctx)
+            .expect("first propose");
         let result = engine.propose(&alice(), action, &ctx);
         assert!(result.is_err());
         assert!(matches!(
@@ -774,7 +772,13 @@ mod tests {
 
         assert_eq!(status, ProposalStatus::Pending);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], GovernanceEvent::VoteCast { vote: VoteType::Approve, .. }));
+        assert!(matches!(
+            &events[0],
+            GovernanceEvent::VoteCast {
+                vote: VoteType::Approve,
+                ..
+            }
+        ));
 
         let stored = engine.get_proposal(&proposal.proposal_id).unwrap();
         assert_eq!(stored.approvals.len(), 1);
@@ -793,7 +797,13 @@ mod tests {
 
         assert_eq!(status, ProposalStatus::Pending);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], GovernanceEvent::VoteCast { vote: VoteType::Reject, .. }));
+        assert!(matches!(
+            &events[0],
+            GovernanceEvent::VoteCast {
+                vote: VoteType::Reject,
+                ..
+            }
+        ));
 
         let stored = engine.get_proposal(&proposal.proposal_id).unwrap();
         assert_eq!(stored.rejections.len(), 1);
@@ -933,10 +943,10 @@ mod tests {
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
         // Two approvals -- not enough.
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
-        let (status, _) = engine
-            .approve(&proposal.proposal_id, &bob(), &ctx)
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
             .unwrap();
+        let (status, _) = engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
         assert_eq!(status, ProposalStatus::Pending);
 
         // Third approval -- majority (3 > 5/2 = 2.5).
@@ -963,9 +973,7 @@ mod tests {
         assert_eq!(status, ProposalStatus::Pending);
 
         // 2 rejections -- approval impossible. ceil(3/2) = 2 rejections needed.
-        let (status, events) = engine
-            .reject(&proposal.proposal_id, &bob(), &ctx)
-            .unwrap();
+        let (status, events) = engine.reject(&proposal.proposal_id, &bob(), &ctx).unwrap();
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -983,7 +991,9 @@ mod tests {
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
         // 3 rejections needed for 5 voters: ceil(5/2) = 3.
-        engine.reject(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .reject(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.reject(&proposal.proposal_id, &bob(), &ctx).unwrap();
         let (status, _) = engine
             .reject(&proposal.proposal_id, &carol(), &ctx)
@@ -1009,7 +1019,9 @@ mod tests {
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
         // 2 approvals, 0 rejections. Quorum: 2/5 = 0.4 >= 0.4.
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
 
         // Before deadline -- still pending (2 is not > 5/2 = 2.5).
@@ -1033,7 +1045,9 @@ mod tests {
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
         // Only 2 votes cast (2/5 = 0.4 < 0.5).
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.reject(&proposal.proposal_id, &bob(), &ctx).unwrap();
 
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
@@ -1056,9 +1070,13 @@ mod tests {
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
         // 1 approve, 2 reject. Quorum met (3/5 = 0.6 >= 0.5).
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.reject(&proposal.proposal_id, &bob(), &ctx).unwrap();
-        engine.reject(&proposal.proposal_id, &carol(), &ctx).unwrap();
+        engine
+            .reject(&proposal.proposal_id, &carol(), &ctx)
+            .unwrap();
 
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
         let (status, _) = engine
@@ -1080,9 +1098,13 @@ mod tests {
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
         // 2 approvals, 2 rejections. Quorum met (4/4 = 1.0 >= 0.5).
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
-        engine.reject(&proposal.proposal_id, &carol(), &ctx).unwrap();
+        engine
+            .reject(&proposal.proposal_id, &carol(), &ctx)
+            .unwrap();
         engine.reject(&proposal.proposal_id, &dave(), &ctx).unwrap();
 
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
@@ -1109,7 +1131,9 @@ mod tests {
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
 
         // At deadline: 2 votes cast, quorum met (2/5=0.4>=0.4), 2 approvals > 0 rejections.
@@ -1128,7 +1152,9 @@ mod tests {
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
 
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
         let (status, _) = engine
@@ -1147,7 +1173,9 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
 
         // Try to approve past deadline.
         let ctx_late = test_context(&three_voters(), T0 + WINDOW + 1);
@@ -1171,9 +1199,13 @@ mod tests {
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
-        engine.reject(&proposal.proposal_id, &carol(), &ctx).unwrap();
+        engine
+            .reject(&proposal.proposal_id, &carol(), &ctx)
+            .unwrap();
 
         // Try to reject past deadline. 3 votes cast / 5 eligible = 0.6 >= 0.5 quorum.
         // 2 approvals > 1 rejection -> Approved.
@@ -1190,7 +1222,9 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
 
         // Already approved. Resolve again should be a no-op.
@@ -1240,9 +1274,15 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         assert_eq!(
-            engine.get_proposal(&proposal.proposal_id).unwrap().approvals.len(),
+            engine
+                .get_proposal(&proposal.proposal_id)
+                .unwrap()
+                .approvals
+                .len(),
             1
         );
 
@@ -1253,7 +1293,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], GovernanceEvent::VoteWithdrawn { .. }));
         assert_eq!(
-            engine.get_proposal(&proposal.proposal_id).unwrap().approvals.len(),
+            engine
+                .get_proposal(&proposal.proposal_id)
+                .unwrap()
+                .approvals
+                .len(),
             0
         );
     }
@@ -1264,9 +1308,15 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.reject(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .reject(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         assert_eq!(
-            engine.get_proposal(&proposal.proposal_id).unwrap().rejections.len(),
+            engine
+                .get_proposal(&proposal.proposal_id)
+                .unwrap()
+                .rejections
+                .len(),
             1
         );
 
@@ -1274,7 +1324,11 @@ mod tests {
             .withdraw_vote(&proposal.proposal_id, &alice(), &ctx)
             .unwrap();
         assert_eq!(
-            engine.get_proposal(&proposal.proposal_id).unwrap().rejections.len(),
+            engine
+                .get_proposal(&proposal.proposal_id)
+                .unwrap()
+                .rejections
+                .len(),
             0
         );
     }
@@ -1286,9 +1340,15 @@ mod tests {
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
         // Alice approves, then withdraws, then rejects.
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
-        engine.withdraw_vote(&proposal.proposal_id, &alice(), &ctx).unwrap();
-        engine.reject(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
+        engine
+            .withdraw_vote(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
+        engine
+            .reject(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
 
         let stored = engine.get_proposal(&proposal.proposal_id).unwrap();
         assert!(stored.approvals.is_empty());
@@ -1326,7 +1386,9 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
         // Now approved.
 
@@ -1356,7 +1418,9 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
 
         let ctx_late = test_context(&three_voters(), T0 + WINDOW + 1);
         let result = engine.withdraw_vote(&proposal.proposal_id, &alice(), &ctx_late);
@@ -1373,7 +1437,9 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
         // Now approved.
 
@@ -1390,7 +1456,9 @@ mod tests {
         let ctx = test_context(&three_voters(), T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
 
         let result = engine.reject(&proposal.proposal_id, &carol(), &ctx);
@@ -1517,9 +1585,7 @@ mod tests {
         assert_eq!(status, ProposalStatus::Pending);
 
         // Second approval: 2 * 2 = 4 > 2? Yes -> approved.
-        let (status, _) = engine
-            .approve(&proposal.proposal_id, &bob(), &ctx)
-            .unwrap();
+        let (status, _) = engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
         assert_eq!(status, ProposalStatus::Approved);
     }
 
@@ -1530,7 +1596,9 @@ mod tests {
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         // Bob abstains. At deadline: 1 vote cast, quorum 1/2 = 0.5 >= 0.5, 1 > 0.
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
         let (status, _) = engine
@@ -1547,10 +1615,10 @@ mod tests {
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.reject(&proposal.proposal_id, &alice(), &ctx).unwrap();
-        let (status, _) = engine
-            .reject(&proposal.proposal_id, &bob(), &ctx)
+        engine
+            .reject(&proposal.proposal_id, &alice(), &ctx)
             .unwrap();
+        let (status, _) = engine.reject(&proposal.proposal_id, &bob(), &ctx).unwrap();
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -1608,20 +1676,36 @@ mod tests {
         };
         let (proposal, create_events) = engine.propose(&alice(), action, &ctx).unwrap();
         assert_eq!(create_events.len(), 1);
-        assert!(matches!(&create_events[0], GovernanceEvent::ProposalCreated { .. }));
+        assert!(matches!(
+            &create_events[0],
+            GovernanceEvent::ProposalCreated { .. }
+        ));
 
         let (_, vote_events) = engine
             .approve(&proposal.proposal_id, &alice(), &ctx)
             .unwrap();
         assert_eq!(vote_events.len(), 1);
-        assert!(matches!(&vote_events[0], GovernanceEvent::VoteCast { vote: VoteType::Approve, .. }));
+        assert!(matches!(
+            &vote_events[0],
+            GovernanceEvent::VoteCast {
+                vote: VoteType::Approve,
+                ..
+            }
+        ));
 
-        let (_, resolve_events) = engine
-            .approve(&proposal.proposal_id, &bob(), &ctx)
-            .unwrap();
+        let (_, resolve_events) = engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
         assert_eq!(resolve_events.len(), 2);
-        assert!(matches!(&resolve_events[0], GovernanceEvent::VoteCast { .. }));
-        assert!(matches!(&resolve_events[1], GovernanceEvent::ProposalResolved { status: ProposalStatus::Approved, .. }));
+        assert!(matches!(
+            &resolve_events[0],
+            GovernanceEvent::VoteCast { .. }
+        ));
+        assert!(matches!(
+            &resolve_events[1],
+            GovernanceEvent::ProposalResolved {
+                status: ProposalStatus::Approved,
+                ..
+            }
+        ));
 
         // All events must serialize for Merkle log.
         let all_events: Vec<&GovernanceEvent> = create_events
@@ -1656,7 +1740,9 @@ mod tests {
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
+            .unwrap();
         engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
         // 2 of 5 voted, 3 abstain. Quorum: 2/5 = 0.4 < 1.0.
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
@@ -1678,11 +1764,11 @@ mod tests {
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx);
 
-        engine.approve(&proposal.proposal_id, &alice(), &ctx).unwrap();
-        // 2 of 3 approved -> early majority resolution.
-        let (status, _) = engine
-            .approve(&proposal.proposal_id, &bob(), &ctx)
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx)
             .unwrap();
+        // 2 of 3 approved -> early majority resolution.
+        let (status, _) = engine.approve(&proposal.proposal_id, &bob(), &ctx).unwrap();
         assert_eq!(status, ProposalStatus::Approved);
     }
 }

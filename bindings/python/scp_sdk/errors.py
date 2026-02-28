@@ -119,13 +119,13 @@ BRIDGE_ERROR_MAP: dict[str, type[ScpError]] = {
 
 
 __all__ = [
-    "ScpError",
-    "IdentityError",
-    "ContextError",
-    "UcanPermissionError",
-    "CryptoError",
-    "TransportError",
-    "ToolError",
-    "ValidationError",
     "BRIDGE_ERROR_MAP",
+    "ContextError",
+    "CryptoError",
+    "IdentityError",
+    "ScpError",
+    "ToolError",
+    "TransportError",
+    "UcanPermissionError",
+    "ValidationError",
 ]

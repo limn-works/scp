@@ -2,7 +2,7 @@
 //!
 //! Exposes context operations to JavaScript as typed handles and
 //! `#[wasm_bindgen]` functions. Bridge functions mirror the Python FFI
-//! bridge (`crates/scp-ffi/src/context.rs`) and the UniFFI bridge
+//! bridge (`crates/scp-ffi/src/context.rs`) and the `UniFFI` bridge
 //! (`crates/scp-ffi/uniffi/src/bridge.rs`) at the same logical API surface.
 //!
 //! # Types
@@ -24,7 +24,7 @@
 //! # Streaming
 //!
 //! WASM has no Rust async streams compatible with wasm-bindgen. Message
-//! streaming uses a callback injection pattern (matching the UniFFI bridge's
+//! streaming uses a callback injection pattern (matching the `UniFFI` bridge's
 //! `MessageListener` approach): the TypeScript wrapper registers a
 //! [`JsMessageCallback`] object; the bridge calls `onMessage` for each
 //! incoming message and `onComplete` when the stream ends.
@@ -118,10 +118,10 @@ pub struct WasmContextHandle {
     ceiling_policy: String,
     /// Optional time-to-live in seconds. None means persistent. See spec §5.10.
     ttl_seconds: Option<u64>,
-    /// Optional promotion policy: "no_promotion" or "promotable". Only
-    /// meaningful when ttl_seconds is Some. See spec §5.10.
+    /// Optional promotion policy: `"no_promotion"` or `"promotable"`. Only
+    /// meaningful when `ttl_seconds` is `Some`. See spec §5.10.
     promotion_policy: Option<String>,
-    /// Governance model string (e.g. "single_admin"). See spec §5.9.
+    /// Governance model string (e.g. `"single_admin"`). See spec §5.9.
     governance: String,
     /// Number of context members. Starts at 1 (creator) at creation.
     /// See spec §5.6 and §5.7.
@@ -134,6 +134,7 @@ pub struct WasmContextHandle {
 #[wasm_bindgen]
 impl WasmContextHandle {
     /// Returns the context's unique identifier.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "contextId")]
     pub fn context_id(&self) -> String {
         self.context_id.clone()
@@ -142,12 +143,14 @@ impl WasmContextHandle {
     /// Returns the context's current lifecycle state.
     ///
     /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn state(&self) -> String {
         self.state.clone()
     }
 
     /// Returns the DID of the context creator.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "creatorDid")]
     pub fn creator_did(&self) -> String {
         self.creator_did.clone()
@@ -157,6 +160,7 @@ impl WasmContextHandle {
     ///
     /// Set at creation and immutable. `"Encrypted"` uses an MLS group;
     /// `"Broadcast"` uses per-author broadcast keys. See spec §5.1 and §5.14.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn mode(&self) -> String {
         self.mode.clone()
@@ -166,17 +170,16 @@ impl WasmContextHandle {
     ///
     /// The ceiling is the maximum set of capabilities available in this context.
     /// See spec §5.3.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn ceiling(&self) -> js_sys::Array {
-        self.ceiling
-            .iter()
-            .map(|s| JsValue::from_str(s))
-            .collect()
+        self.ceiling.iter().map(|s| JsValue::from_str(s)).collect()
     }
 
     /// Returns the ceiling policy: `"immutable"` or `"governed"`.
     ///
     /// The policy itself is immutable (locked at creation). See spec §5.3.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "ceilingPolicy")]
     pub fn ceiling_policy(&self) -> String {
         self.ceiling_policy.clone()
@@ -185,6 +188,7 @@ impl WasmContextHandle {
     /// Returns the TTL in seconds, or `undefined` if the context is persistent.
     ///
     /// See spec §5.10.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "ttlSeconds")]
     pub fn ttl_seconds(&self) -> Option<u64> {
         self.ttl_seconds
@@ -194,6 +198,7 @@ impl WasmContextHandle {
     ///
     /// One of `"no_promotion"` | `"promotable"`. Only meaningful when
     /// `ttlSeconds` is defined. See spec §5.10.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "promotionPolicy")]
     pub fn promotion_policy(&self) -> Option<String> {
         self.promotion_policy.clone()
@@ -202,6 +207,7 @@ impl WasmContextHandle {
     /// Returns the governance model string (e.g. `"single_admin"`).
     ///
     /// See spec §5.9.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn governance(&self) -> String {
         self.governance.clone()
@@ -210,6 +216,7 @@ impl WasmContextHandle {
     /// Returns the current member count.
     ///
     /// Starts at `1` (the creator) at creation. See spec §5.6 and §5.7.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> u64 {
         self.member_count
@@ -219,6 +226,7 @@ impl WasmContextHandle {
     ///
     /// Economic policy governs what actions cost, orthogonal to the capability
     /// ceiling. See spec §5.3 and §19.3.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "economicPolicy")]
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
@@ -292,6 +300,7 @@ pub struct WasmMessage {
 #[wasm_bindgen]
 impl WasmMessage {
     /// Returns the DID of the message sender.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "senderDid")]
     pub fn sender_did(&self) -> String {
         self.sender_did.clone()
@@ -301,18 +310,21 @@ impl WasmMessage {
     ///
     /// The TypeScript SDK decodes this to `Uint8Array` before surfacing to
     /// application code.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "payloadBase64")]
     pub fn payload_base64(&self) -> String {
         self.payload_base64.clone()
     }
 
     /// Returns the message timestamp as seconds since Unix epoch.
+    #[must_use]
     #[wasm_bindgen(getter)]
     pub fn timestamp(&self) -> f64 {
         self.timestamp
     }
 
     /// Returns the context ID this message belongs to.
+    #[must_use]
     #[wasm_bindgen(getter, js_name = "contextId")]
     pub fn context_id(&self) -> String {
         self.context_id.clone()
@@ -353,36 +365,35 @@ impl WasmMessage {
 pub fn context_create(identity_did: String, params_json: String) -> Promise {
     future_to_promise(async move {
         // Parse and validate params_json.
-        let params: serde_json::Value = serde_json::from_str(&params_json)
-            .map_err(|e| ScpWasmError::Validation(format!(
+        let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
+            ScpWasmError::Validation(format!(
                 "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
             ))
-            .into_js())?;
+            .into_js()
+        })?;
 
         // Extract §5.7 metadata fields with spec-defined defaults.
-        let mode = params["mode"]
-            .as_str()
-            .unwrap_or("Encrypted")
-            .to_owned();
+        let mode = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
         let ceiling: Vec<String> = params["ceiling"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default();
         let ceiling_policy = params["ceilingPolicy"]
             .as_str()
             .unwrap_or("immutable")
             .to_owned();
         let ttl_seconds: Option<u64> = params["ttlSeconds"].as_u64();
-        let promotion_policy: Option<String> = params["promotionPolicy"]
-            .as_str()
-            .map(str::to_owned);
+        let promotion_policy: Option<String> =
+            params["promotionPolicy"].as_str().map(str::to_owned);
         let governance = params["governance"]
             .as_str()
             .unwrap_or("single_admin")
             .to_owned();
-        let economic_policy: Option<String> = params["economicPolicy"]
-            .as_str()
-            .map(str::to_owned);
+        let economic_policy: Option<String> = params["economicPolicy"].as_str().map(str::to_owned);
 
         // Generate a context ID using a UUID (CSPRNG-backed via getrandom/js).
         let context_id = format!("ctx-{}", uuid::Uuid::new_v4().as_hyphenated());
