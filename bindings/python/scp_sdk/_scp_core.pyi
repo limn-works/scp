@@ -31,30 +31,37 @@ from typing import Any
 
 class ScpError(Exception):
     """Base exception for all SCP protocol errors."""
+
     ...
 
 class IdentityError(ScpError):
     """An identity operation failed (DID creation, resolution, key rotation)."""
+
     ...
 
 class ContextError(ScpError):
     """A context lifecycle operation failed (create, join, leave, close, send)."""
+
     ...
 
 class CryptoError(ScpError):
     """A cryptographic operation failed (MLS, sender keys, encryption, decryption)."""
+
     ...
 
 class TransportError(ScpError):
     """A transport operation failed (connection, send, subscription)."""
+
     ...
 
 class UcanError(ScpError):
     """A UCAN operation failed (validation, minting, revocation)."""
+
     ...
 
 class ValidationError(ScpError):
     """Input validation failed (malformed data, schema mismatch, constraint violation)."""
+
     ...
 
 # ---------------------------------------------------------------------------
@@ -168,7 +175,6 @@ class PyContextParams:
     """
 
     def __init__(self, params: dict[str, Any]) -> None: ...
-
     @property
     def ceiling(self) -> list[str]:
         """Capability ceiling -- maximum capabilities any participant can hold."""
@@ -261,7 +267,6 @@ class ToolRegistration:
         schema: Any,
         test_vectors: list[Any],
     ) -> None: ...
-
     def __repr__(self) -> str: ...
 
 class ToolVerificationResult:

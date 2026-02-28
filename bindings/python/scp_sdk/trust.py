@@ -268,9 +268,7 @@ async def evaluate_trust(
         behavioral = BehavioralRecord(
             contexts_participated=1,
             tool_invocations=[
-                {"type": e.event_type, "count": 1}
-                for e in events
-                if e.event_type == "ToolInvoked"
+                {"type": e.event_type, "count": 1} for e in events if e.event_type == "ToolInvoked"
             ],
         )
     except Exception:

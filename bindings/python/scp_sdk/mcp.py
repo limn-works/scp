@@ -39,11 +39,22 @@ _VALID_TRANSPORTS: frozenset[str] = frozenset({"stdio", "sse"})
 #: Matches the Rust-side ``DEFAULT_ALLOWLIST`` in ``scp-mcp/src/allowlist.rs``.
 #: The Rust layer is the single source of truth; use
 #: :func:`get_stdio_allowlist` to query the live state at runtime.
-DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset({
-    "uvx", "npx", "bunx", "pipx",
-    "python", "python3", "node", "bun", "deno",
-    "docker", "podman", "scp-mcp",
-})
+DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "uvx",
+        "npx",
+        "bunx",
+        "pipx",
+        "python",
+        "python3",
+        "node",
+        "bun",
+        "deno",
+        "docker",
+        "podman",
+        "scp-mcp",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Lazy bridge import
@@ -180,10 +191,7 @@ class McpServer:
 
     def __repr__(self) -> str:
         ctx_ids = [c.context_id for c in self._contexts]
-        return (
-            f"McpServer(transport={self._transport!r}, "
-            f"contexts={ctx_ids!r})"
-        )
+        return f"McpServer(transport={self._transport!r}, contexts={ctx_ids!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -589,10 +597,7 @@ class McpClient:
         logger.debug("MCP client disconnected")
 
     def __repr__(self) -> str:
-        return (
-            f"McpClient(transport={self._transport!r}, "
-            f"command={self._command!r})"
-        )
+        return f"McpClient(transport={self._transport!r}, command={self._command!r})"
 
 
 # ---------------------------------------------------------------------------

@@ -229,8 +229,7 @@ async def delegate(
     excess = requested_caps - parent_caps
     if excess:
         raise UcanPermissionError(
-            f"Cannot delegate capabilities not present in parent token: "
-            f"{sorted(excess)}",
+            f"Cannot delegate capabilities not present in parent token: {sorted(excess)}",
             code="SCP-PERM-3002",
         )
 
