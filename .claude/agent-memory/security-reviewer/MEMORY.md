@@ -66,17 +66,23 @@
 
 ### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- Audit 2026-02-28
 - See `pyo3-audit-20260228.md` for full finding details
-- HIGH: expect() panic across FFI in py_context_create (line 457) -- only unguarded clock call
-- HIGH: UCAN validate does not bind token to presented context -- wildcard cross-context bypass
-- HIGH: Context IDs are nanosecond timestamps, not CSPRNG -- predictable + collidable
-- MEDIUM: py_ucan_revoke has no authorization check
-- MEDIUM: py_ucan_mint has no authorization check (always uses creator_did)
-- MEDIUM: py_context_close ignores identity_did, no ContextClose capability check
-- MEDIUM: py_context_close TOCTOU between state="closed" and remove_context
-- MEDIUM: MCP SSE client accepts any URL scheme (file://, javascript:, etc.)
-- MEDIUM: u128-to-u64 timestamp truncation via `as` cast in mcp.rs
-- TRACKED: UCAN sig verification (#105), MCP stubs (#106), registries unbounded (#108), recursion depth (#110), clock drift (#107), missing ContextParams (#109)
-- GOOD: DashMap, CSPRNG MCP handles, NaN/Infinity rejection, poisoned mutex handling, typed errors, tool invoke capability check, bounded mpsc(256)
+- FIXED (SCP-164): UCAN validate delegates to scp-core 11-step pipeline with Ed25519 sig verification
+- FIXED (SCP-164): presenting_agent_did binds token audience (was wildcard bypass)
+- FIXED (SCP-165): MCP SSE URL scheme now restricted to http/https (was any scheme)
+- HIGH: expect() panic across FFI in py_context_create (line 457) -- unguarded clock call
+- HIGH (SCP-165): SSE transport CRLF header injection via host/path in format!() HTTP construction
+- HIGH (SCP-165): SSE https:// silently downgrades to plaintext TCP (no TLS)
+- HIGH (SCP-165): subprocess command injection -- arbitrary exec via py_mcp_client_connect_stdio
+- MEDIUM (SCP-165): validate_capability always Ok(()) -- authorization bypass in MCP server bridge
+- MEDIUM (SCP-165): invoke_tool returns stub JSON, not real tool execution
+- MEDIUM (SCP-165): SSE response loop unbounded (no timeout/size limit), no request ID matching
+- MEDIUM (SCP-165): HTTP POST Content-Length mismatch from leading whitespace before body
+- MEDIUM (SCP-165): server_wait blocks GIL -- needs py.allow_threads()
+- MEDIUM (SCP-165): eprintln for SSE error instead of tracing::error
+- MEDIUM (SCP-165): SSE endpoint path not validated (no / prefix check, no traversal check)
+- MEDIUM (SCP-165): HTTP status code not checked in SSE response
+- TRACKED: MCP stubs (#106), registries unbounded (#108), recursion depth (#110), clock drift (#107)
+- GOOD: DashMap, CSPRNG handles, typed errors, poisoned mutex handling, proper DashMap guard drops
 
 ### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 Review (2026-02-26)
 - CRITICAL: scp-platform testing feature STILL in production deps (cdylib)
