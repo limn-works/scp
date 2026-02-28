@@ -9336,7 +9336,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/ucan.rs",
         "crates/scp-core/src/crypto/ucan.rs"
@@ -9386,7 +9386,8 @@
         "currentState": "Bridge implements: JWT parsing, header validation, time bounds, capability string matching, revocation list check. Missing: signature verification, proof chains, delegation depth, audience/issuer chain, scope attenuation, nonce uniqueness.",
         "ADR-016 steps": "11 validation steps defined. Bridge implements steps 1-3 (parse), 4 (time bounds), 10 (capability match), 11 (revocation). Missing steps 5 (signature), 6 (proof chain), 7 (delegation depth), 8 (audience/issuer chain), 9 (scope attenuation), plus nonce uniqueness.",
         "DID resolver dependency": "Signature verification requires resolving DID to public key. In-memory DID document cache for bridge-layer testing; transport-backed resolver for production."
-      }
+      },
+      "result": "Wired py_ucan_validate to scp-core full 11-step ADR-016 pipeline with Ed25519 signature verification, DID resolution, nonce tracking, and delegation chain validation. Added BridgeDidResolver, BridgeRevocationChecker, BridgeProofResolver, BridgeNonceTracker trait implementations. NonceTracker added to ContextRuntime. Tests for forged tokens, expired tokens, valid signatures added."
     },
     {
       "id": "SCP-165",
@@ -9394,7 +9395,7 @@
       "gate": "gate-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/mcp.rs",
         "crates/scp-mcp/src/server.rs",
@@ -9450,7 +9451,8 @@
         "scpMcpCrate": "scp-mcp has working MCP server (tool namespace mapping, capability filtering) and client (stdio/SSE transports, JSON-RPC). 158 tests passing.",
         "transportDependency": "Full MCP bridge completion requires the transport layer to be wired for relay communication (py_mcp_load_contexts). Server/client transport can be wired independently.",
         "ADR-015": "Defines context namespace mapping, capability-filtered tool listing, and provenance wrapping for external tool invocations."
-      }
+      },
+      "result": "Wired all 9 MCP bridge functions to real scp-mcp delegation. Server starts via scp-mcp with stdio/SSE transport, wait blocks on event loop, stop signals graceful shutdown. Client connects via subprocess (stdio) or HTTP (SSE), list_tools sends real JSON-RPC tools/list, invoke sends tools/call with provenance wrapping. Added FfiBridgeProvider, ClientTransport enum, StdioClientTransport, SseClientTransport."
     }
   ]
 }
