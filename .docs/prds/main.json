@@ -6185,7 +6185,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
@@ -6238,7 +6238,8 @@
           "§9.15 — Key destruction verification",
           "ADR-025 — Apple adapter as parallel reference"
         ]
-      }
+      },
+      "result": "AndroidKeyCustody.kt + Types.kt implemented. TEE-backed Ed25519 on API 33+, Bouncy Castle fallback for API 26-32, software X25519. 32 JVM unit tests. Commits: 77f48a0, 87fc586."
     },
     {
       "id": "SCP-111",
@@ -6246,7 +6247,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
@@ -6286,7 +6287,8 @@
         "references": [
           "ADR-025 — Apple adapter as parallel reference"
         ]
-      }
+      },
+      "result": "AndroidDeviceAttestation.kt implemented. Play Integrity Standard API, SHA-256 nonce, JWT token return. 14 JVM unit tests. Commits: bd4e2f7, 87fc586."
     },
     {
       "id": "SCP-112",
@@ -6294,7 +6296,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidPushProvider.kt"
       ],
@@ -6334,7 +6336,8 @@
         "references": [
           "ADR-025 — Apple adapter as parallel reference"
         ]
-      }
+      },
+      "result": "AndroidPushProvider.kt implemented. FCM data-only opaque payload, SCP-PUSH-5001/5002 error codes. 10 JVM unit tests. Commits: b37d2f0, 87fc586."
     },
     {
       "id": "SCP-113",
