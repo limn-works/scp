@@ -171,6 +171,20 @@ where
     f(entry.value_mut())
 }
 
+/// Returns the IDs of all registered contexts where the given DID is a member.
+///
+/// Used by `py_mcp_load_contexts` to return locally known contexts when
+/// relay transport is not yet wired. Returns an empty Vec if no contexts
+/// match.
+#[must_use]
+pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
+    registry()
+        .iter()
+        .filter(|entry| entry.value().role_state.members.contains(member_did))
+        .map(|entry| entry.key().clone())
+        .collect()
+}
+
 /// Removes a context from the global runtime registry.
 ///
 /// Called when a context is closed. All associated runtime objects are dropped.

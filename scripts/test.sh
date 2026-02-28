@@ -12,9 +12,13 @@ run_rust() (
   echo "═══ Rust ═══"
   cd "$REPO_ROOT"
 
-  # scp-ffi needs library path for libpython (auto-initialize links against it)
+  # scp-ffi needs library path for libpython (auto-initialize links against it).
+  # Prefer the mise-managed Python matching .mise.toml (3.12) over the system
+  # python3 which may be a different version (e.g. Xcode ships 3.9).
+  local python_bin
+  python_bin="$(command -v python3.12 2>/dev/null || command -v python3 2>/dev/null || true)"
   local python_libdir
-  python_libdir="$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))" 2>/dev/null || true)"
+  python_libdir="$($python_bin -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))" 2>/dev/null || true)"
   if [[ -n "$python_libdir" ]]; then
     export DYLD_LIBRARY_PATH="${python_libdir}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
     export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

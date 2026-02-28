@@ -81,7 +81,7 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. The `context_events` provider method returns event count and Merkle root, not raw events.
 - `ToolRegistry::registrations()` returns an iterator, not a Vec. There is no `invoke()` method — tool invocation checks tool existence and returns a JSON status response.
 - `SseClientTransport` uses raw `TcpStream` — `https://` URLs are explicitly rejected (no TLS). Only `http://` is supported; add `rustls` dependency for HTTPS.
-- `FfiBridgeProvider::validate_capability` always returns `Ok(())` (TODO #106) — authorization depends on UCAN layer. `invoke_tool` returns stub JSON (TODO #106), not real tool execution.
+- `FfiBridgeProvider::validate_capability` performs real capability checking via `has_tool_invoke_capability` against the context's role state (SCP-210). Defense-in-depth alongside the UCAN layer. `invoke_tool` validates input against the tool's JSON schema and returns a response with `"status": "validated"` (no runtime handler dispatch at the FFI layer — tools are registered with metadata only).
 - `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
 - SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
 - **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Only bare binary names are accepted — paths (absolute or relative) are rejected to prevent basename-spoofing bypasses. The OS resolves the binary via `PATH`. Per MCP Security Best Practices.
@@ -90,4 +90,4 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
   - `py_mcp_reset_stdio_allowlist()` — restore defaults and re-enable enforcement.
   - `py_mcp_get_stdio_allowlist()` — introspect current state (`{"allowed": [...], "unrestricted": bool}`).
   - Python SDK exposes these as module-level functions: `configure_stdio_allowlist()`, `disable_stdio_allowlist(i_trust_all_commands=True)`, `reset_stdio_allowlist()`, `get_stdio_allowlist()`. Pre-validation in `McpClient.connect()` catches path and allowlist issues before crossing FFI, raising `ValidationError` with actionable messages.
-- `py_mcp_load_contexts` always returns an empty list — requires relay transport layer (scp-transport) not yet wired.
+- `py_mcp_load_contexts` returns locally registered contexts where the identity is a member (SCP-210). Full relay discovery requires scp-transport wiring (not yet available). Uses `runtime::context_ids_for_member()` to iterate the registry.
