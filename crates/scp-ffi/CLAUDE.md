@@ -82,4 +82,5 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - `FfiBridgeProvider::validate_capability` always returns `Ok(())` (TODO #106) — authorization depends on UCAN layer. `invoke_tool` returns stub JSON (TODO #106), not real tool execution.
 - `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
 - SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
+- **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Basename is extracted (neutralizes path traversal). Extend via `py_mcp_configure_stdio_allowlist()` or set `unrestricted=True` to bypass. Per MCP Security Best Practices.
 - `py_mcp_load_contexts` always returns an empty list — requires relay transport layer (scp-transport) not yet wired.
