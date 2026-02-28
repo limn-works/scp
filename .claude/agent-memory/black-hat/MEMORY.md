@@ -34,6 +34,35 @@ Notes:
 ### HIGH: TestAdapter has no production exclusion
 - File: `crates/scp-testing/src/test_adapter.rs`
 
+## Key Attack Surfaces Identified (Spec 22 -- Human-Readable Addressing)
+
+### CRITICAL: MultiLayerCorroborated trust level is trivially gameable
+- File: `.docs/specs/22-human-readable-addressing.md` Section 22.7, 22.8.2, 22.10.2
+- Single attacker controls domain + discovery context + attestation = highest trust
+- No independence verification between corroborating layers
+
+### CRITICAL: Discovery context governance capture = total namespace hijack
+- File: `.docs/specs/22-human-readable-addressing.md` Section 22.3.4
+- Default handle-registry template is single-admin governance
+- Writer verification is behavioral (SHOULD), not protocol-enforced
+- Compromised governance -> writers skip signature verification on deregister
+
+### HIGH: Handle squatting -- zero economic cost for bulk registration
+- File: `.docs/specs/22-human-readable-addressing.md` Section 22.3.1
+- No rate limits per DID, no cost, no attestation linkage in default template
+
+### HIGH: Petname auto-creation permanent after one successful deception
+- File: `.docs/specs/22-human-readable-addressing.md` Section 22.8.3, 22.8.4
+- Disambiguation selection auto-creates indefinite petname, overrides all layers
+
+### HIGH: Privacy -- all lookups DID-authenticated, discovery contexts see who queries whom
+- File: `.docs/specs/22-human-readable-addressing.md` Section 22.10.4
+- Unscoped resolution broadcasts to ALL known discovery contexts
+
+### HIGH: Cache poisoning via stale-while-revalidate pattern
+- File: `.docs/specs/22-human-readable-addressing.md` Section 22.8.4
+- Poisoned result returned immediately, background verification happens after user acts
+
 ## Patterns Confirmed Working
 - Ceiling inheritance in nesting is sound
 - Template spoofing detection works correctly
@@ -41,3 +70,7 @@ Notes:
 - Auto-accept hard rules (tools, payment) non-bypassable
 - Budget tracker uses saturating arithmetic throughout
 - UCAN attenuation validation is thorough
+- ASCII-only local-part `[a-z0-9._-]` blocks Unicode homoglyph attacks
+- DID canonical identity + MLS binding means resolution hijack cannot forge messages
+- Scoped resolution (with @scope) is unambiguous within its namespace
+- Domain verification chain is sound for domain operator's own DID
