@@ -354,10 +354,9 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 ///
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn set_relay_connection(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpPyError> {
-    let mut guard = relay_state().write().map_err(|_| {
+    *relay_state().write().map_err(|_| {
         ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
-    })?;
-    *guard = Some(adapter);
+    })? = Some(adapter);
     Ok(())
 }
 
@@ -387,9 +386,8 @@ pub fn get_relay_connection() -> Result<Option<Arc<NativeRelayAdapter>>, ScpPyEr
 ///
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn clear_relay_connection() -> Result<(), ScpPyError> {
-    let mut guard = relay_state().write().map_err(|_| {
+    *relay_state().write().map_err(|_| {
         ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
-    })?;
-    *guard = None;
+    })? = None;
     Ok(())
 }

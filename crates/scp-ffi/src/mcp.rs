@@ -656,10 +656,9 @@ impl ContextProvider for FfiBridgeProvider {
                 let handler = handler.clone();
                 // Call the handler with validated input. The handler is a sync
                 // closure wrapping a Python callable (acquired via GIL).
-                let output = handler(arguments)
-                    .map_err(|e| ScpPyError::ContextError(format!(
-                        "tool handler for '{tool_name}' failed: {e}"
-                    )))?;
+                let output = handler(arguments).map_err(|e| {
+                    ScpPyError::ContextError(format!("tool handler for '{tool_name}' failed: {e}"))
+                })?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
                 if let Some(reg) = rt.tool_registry.get(tool_name) {
@@ -1490,8 +1489,8 @@ pub fn py_mcp_load_contexts(
 fn probe_relay_for_known_contexts(
     known: &[(String, crate::runtime::KnownContext)],
 ) -> std::collections::HashSet<String> {
-    use scp_transport::traits::RoutingId;
     use scp_transport::TransportAdapter;
+    use scp_transport::traits::RoutingId;
 
     let mut active = std::collections::HashSet::new();
 
@@ -1500,15 +1499,13 @@ fn probe_relay_for_known_contexts(
     }
 
     // Get the relay adapter. If none is connected, return empty set.
-    let adapter = match crate::runtime::get_relay_connection() {
-        Ok(Some(adapter)) => adapter,
-        _ => return active,
+    let Ok(Some(adapter)) = crate::runtime::get_relay_connection() else {
+        return active;
     };
 
     // Get the tokio runtime for blocking on async queries.
-    let rt = match crate::runtime() {
-        Ok(rt) => rt,
-        Err(_) => return active,
+    let Ok(rt) = crate::runtime() else {
+        return active;
     };
 
     // Probe each known context's routing ID on the relay.
@@ -1526,13 +1523,9 @@ fn probe_relay_for_known_contexts(
             Ok(envelopes) if !envelopes.is_empty() => {
                 active.insert(ctx_id.clone());
             }
-            Ok(_) => {
-                // Empty result: no activity for this routing ID.
-            }
-            Err(_) => {
-                // Query failed (relay error, timeout, etc.). Skip this context
-                // gracefully -- other contexts may still succeed.
-            }
+            // Empty result (no activity) or query failure (relay error,
+            // timeout, etc.) — skip gracefully; other contexts may succeed.
+            _ => {}
         }
     }
 
@@ -1678,10 +1671,7 @@ pub fn py_register_tool_handler(
 ) -> PyResult<()> {
     // Verify the handler is callable before storing it.
     if !handler.bind(py).is_callable() {
-        return Err(ScpPyError::ValidationError(
-            "handler must be callable".to_owned(),
-        )
-        .into());
+        return Err(ScpPyError::ValidationError("handler must be callable".to_owned()).into());
     }
 
     // Wrap the Python callable in a Rust closure that acquires the GIL,
@@ -1700,9 +1690,9 @@ pub fn py_register_tool_handler(
                     .map_err(|e| format!("Python handler raised an exception: {e}"))?;
 
                 // Convert Python result back to serde_json::Value.
-                let result_dict = py_result.downcast_bound::<PyDict>(py).map_err(|_| {
-                    "tool handler must return a dict".to_owned()
-                })?;
+                let result_dict = py_result
+                    .downcast_bound::<PyDict>(py)
+                    .map_err(|_| "tool handler must return a dict".to_owned())?;
                 crate::types::py_dict_to_json(result_dict)
                     .map_err(|e| format!("failed to convert handler output to JSON: {e}"))
             })
@@ -2238,7 +2228,10 @@ mod tests {
             std::sync::Arc::new(|_input| Ok(serde_json::json!({})));
 
         let result = crate::runtime::register_tool_handler(&ctx_id, "nonexistent", handler);
-        assert!(result.is_err(), "should reject handler for unregistered tool");
+        assert!(
+            result.is_err(),
+            "should reject handler for unregistered tool"
+        );
         let err = format!("{}", result.unwrap_err());
         assert!(
             err.contains("not found"),
