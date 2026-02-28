@@ -78,7 +78,8 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - MCP server async tasks hold `Arc<Mutex<McpServer>>` — when extracting data from the mutex guard for use in async code (e.g. SSE transport), scope the lock to avoid holding `MutexGuard` across `.await` points (the guard is not `Send`).
 - `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. The `context_events` provider method returns event count and Merkle root, not raw events.
 - `ToolRegistry::registrations()` returns an iterator, not a Vec. There is no `invoke()` method — tool invocation checks tool existence and returns a JSON status response.
-- **Security**: `SseClientTransport` uses raw `TcpStream` — `https://` URLs are silently downgraded to plaintext. No TLS support yet.
-- **Security**: `FfiBridgeProvider::validate_capability` always returns `Ok(())` — authorization is not enforced at the MCP bridge layer. `invoke_tool` returns a stub response, not real tool execution.
-- **Security**: `py_mcp_server_wait` holds the Python GIL during `block_on` — must use `py.allow_threads()` for long waits.
-- **Security**: The SSE transport constructs HTTP requests via `format!()` string interpolation — host/path values must be validated for CRLF injection before use.
+- `SseClientTransport` uses raw `TcpStream` — `https://` URLs are explicitly rejected (no TLS). Only `http://` is supported; add `rustls` dependency for HTTPS.
+- `FfiBridgeProvider::validate_capability` always returns `Ok(())` (TODO #106) — authorization depends on UCAN layer. `invoke_tool` returns stub JSON (TODO #106), not real tool execution.
+- `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
+- SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
+- `py_mcp_load_contexts` always returns an empty list — requires relay transport layer (scp-transport) not yet wired.

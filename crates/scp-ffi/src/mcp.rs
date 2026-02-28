@@ -263,7 +263,28 @@ impl SseClientTransport {
 
         let mut reader = BufReader::new(stream);
 
-        // Read HTTP response headers.
+        // Read the HTTP status line and validate.
+        let mut status_line = String::new();
+        let n = reader
+            .read_line(&mut status_line)
+            .map_err(|e| format!("failed to read HTTP status line: {e}"))?;
+        if n == 0 {
+            return Err("connection closed before HTTP status line".to_owned());
+        }
+        // Parse "HTTP/1.1 200 OK" — extract the status code.
+        let status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        if !(200..300).contains(&status_code) {
+            return Err(format!(
+                "SSE endpoint returned HTTP {status_code}: {}",
+                status_line.trim()
+            ));
+        }
+
+        // Read remaining HTTP response headers.
         let mut header_line = String::new();
         loop {
             header_line.clear();
@@ -347,13 +368,15 @@ impl McpTransport for SseClientTransport {
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
-             \r\n\
-             {body}",
+             \r\n",
             body.len()
         );
         writer
             .write_all(post_request.as_bytes())
             .map_err(|e| format!("failed to send POST request: {e}"))?;
+        writer
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("failed to write POST body: {e}"))?;
         writer
             .flush()
             .map_err(|e| format!("failed to flush POST: {e}"))?;
@@ -370,7 +393,11 @@ impl McpTransport for SseClientTransport {
             .ok_or("SSE connection is closed")?;
 
         // Read SSE events until we find a `message` event with our response.
-        loop {
+        // Bounded to prevent a misbehaving server from consuming resources
+        // indefinitely. The TCP read timeout (30s) handles individual reads;
+        // this bounds the total number of non-matching events we'll tolerate.
+        const MAX_SSE_EVENTS: usize = 1000;
+        for _ in 0..MAX_SSE_EVENTS {
             let mut line = String::new();
             let n = reader
                 .read_line(&mut line)
@@ -390,6 +417,9 @@ impl McpTransport for SseClientTransport {
                 }
             }
         }
+        Err(format!(
+            "no matching JSON-RPC response after {MAX_SSE_EVENTS} SSE events"
+        ))
     }
 
     fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
@@ -410,13 +440,15 @@ impl McpTransport for SseClientTransport {
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
-             \r\n\
-             {body}",
+             \r\n",
             body.len()
         );
         writer
             .write_all(post_request.as_bytes())
             .map_err(|e| format!("failed to send notification: {e}"))?;
+        writer
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("failed to write notification body: {e}"))?;
         writer
             .flush()
             .map_err(|e| format!("failed to flush notification: {e}"))?;
@@ -562,10 +594,9 @@ impl ContextProvider for FfiBridgeProvider {
         tool_name: &str,
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // Tool invocation in scp-core uses an async function with a handler
-        // closure. For the bridge layer, we look up the tool and return the
-        // arguments as a basic result. Full tool execution is handled by the
-        // tool invocation pipeline in scp-core (invoke_tool in tools/invoke.rs).
+        // TODO(#106): Wire to scp-core's tool invocation pipeline (tools/invoke.rs)
+        // for real execution with schema validation and handler dispatch.
+        // Currently returns a stub JSON response indicating the tool exists.
         crate::runtime::with_context(context_id, |rt| {
             // Verify the tool exists.
             if rt.tool_registry.get(tool_name).is_none() {
@@ -755,6 +786,8 @@ pub fn py_mcp_serve(
     let rt = crate::runtime()?;
     let server_clone = Arc::clone(&server);
     let transport_mode = transport.to_owned();
+    let sse_agent_did = identity_did.to_owned();
+    let sse_context_ids = context_ids.clone();
 
     let task_handle = rt.spawn(async move {
         match transport_mode.as_str() {
@@ -830,33 +863,23 @@ pub fn py_mcp_serve(
             "sse" => {
                 // For SSE, run_sse takes ownership of the McpServer and
                 // binds to a configurable address. We create a dedicated
-                // server instance for the SSE transport task.
-                //
-                // Extract provider data while holding the lock, then
-                // release the lock before any async operations.
-                let provider_data = server_clone.lock().ok().map(|srv| {
-                    (
-                        srv.provider().agent_did().to_owned(),
-                        srv.provider().active_context_ids(),
-                    )
-                });
+                // server instance using the captured identity and context
+                // IDs (avoids re-extracting from the mutex which would
+                // create a stale-data race window).
+                let provider = FfiBridgeProvider {
+                    agent_did: sse_agent_did,
+                    context_ids: sse_context_ids,
+                };
+                let sse_server = McpServer::new(provider);
+                let config = scp_mcp::sse::SseConfig::new(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                );
 
-                if let Some((agent_did, context_ids)) = provider_data {
-                    let provider = FfiBridgeProvider {
-                        agent_did,
-                        context_ids,
-                    };
-                    let sse_server = McpServer::new(provider);
-                    let config = scp_mcp::sse::SseConfig::new(
-                        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                    );
-
-                    tokio::select! {
-                        _ = shutdown_rx => {}
-                        result = scp_mcp::sse::run_sse(sse_server, config) => {
-                            if let Err(e) = result {
-                                eprintln!("MCP SSE server error: {e}");
-                            }
+                tokio::select! {
+                    _ = shutdown_rx => {}
+                    result = scp_mcp::sse::run_sse(sse_server, config) => {
+                        if let Err(e) = result {
+                            tracing::error!("MCP SSE server error: {e}");
                         }
                     }
                 }
@@ -1366,6 +1389,34 @@ mod tests {
     fn parse_http_url_unsupported_scheme() {
         let result = parse_http_url("ftp://example.com");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_http_url_rejects_crlf_injection() {
+        let result = parse_http_url("http://evil.com\r\nX-Injected: bad/path");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("control characters"),
+            "should mention control characters in error"
+        );
+    }
+
+    #[test]
+    fn parse_http_url_rejects_null_byte() {
+        let result = parse_http_url("http://evil.com\0/path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sse_connect_rejects_https() {
+        let result = SseClientTransport::connect("https://example.com/sse");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("TLS"),
+            "should mention TLS in error"
+        );
     }
 
     // -----------------------------------------------------------------------

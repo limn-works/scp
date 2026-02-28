@@ -69,19 +69,20 @@
 - FIXED (SCP-164): UCAN validate delegates to scp-core 11-step pipeline with Ed25519 sig verification
 - FIXED (SCP-164): presenting_agent_did binds token audience (was wildcard bypass)
 - FIXED (SCP-165): MCP SSE URL scheme now restricted to http/https (was any scheme)
+- FIXED (PR#112): CRLF injection defense in parse_http_url + SSE post_path validation
+- FIXED (PR#112): SSE https:// explicitly rejected (was silently downgrading to plaintext)
+- FIXED (PR#112): server_wait releases GIL via py.allow_threads()
+- FIXED (PR#112): HTTP POST Content-Length mismatch (leading whitespace before body removed)
+- FIXED (PR#112): SSE response loop bounded to 1000 events (was unbounded)
+- FIXED (PR#112): HTTP status code validated in SSE connect handshake (was unchecked)
+- FIXED (PR#112): SSE server race condition (provider data from closure args, not stale mutex extract)
+- FIXED (PR#112): eprintln replaced with tracing::error for SSE server errors
+- FIXED (PR#112): SSE endpoint path validated for control characters
 - HIGH: expect() panic across FFI in py_context_create (line 457) -- unguarded clock call
-- HIGH (SCP-165): SSE transport CRLF header injection via host/path in format!() HTTP construction
-- HIGH (SCP-165): SSE https:// silently downgrades to plaintext TCP (no TLS)
 - HIGH (SCP-165): subprocess command injection -- arbitrary exec via py_mcp_client_connect_stdio
-- MEDIUM (SCP-165): validate_capability always Ok(()) -- authorization bypass in MCP server bridge
-- MEDIUM (SCP-165): invoke_tool returns stub JSON, not real tool execution
-- MEDIUM (SCP-165): SSE response loop unbounded (no timeout/size limit), no request ID matching
-- MEDIUM (SCP-165): HTTP POST Content-Length mismatch from leading whitespace before body
-- MEDIUM (SCP-165): server_wait blocks GIL -- needs py.allow_threads()
-- MEDIUM (SCP-165): eprintln for SSE error instead of tracing::error
-- MEDIUM (SCP-165): SSE endpoint path not validated (no / prefix check, no traversal check)
-- MEDIUM (SCP-165): HTTP status code not checked in SSE response
-- TRACKED: MCP stubs (#106), registries unbounded (#108), recursion depth (#110), clock drift (#107)
+- TRACKED (TODO #106): validate_capability always Ok(()) -- defense-in-depth gap
+- TRACKED (TODO #106): invoke_tool returns stub JSON, not real tool execution
+- TRACKED: registries unbounded (#108), recursion depth (#110), clock drift (#107)
 - GOOD: DashMap, CSPRNG handles, typed errors, poisoned mutex handling, proper DashMap guard drops
 
 ### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 Review (2026-02-26)
