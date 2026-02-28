@@ -435,6 +435,8 @@ class StubNativeBindings : NativeBindings {
     var contextSendCalled = false
     var contextLeaveCalled = false
     var contextCloseCalled = false
+    var contextUnsubscribeCalled = false
+    var lastUnsubscribeHandle: Long? = null
     var ucanValidateCalled = false
     var ucanRevokeCalled = false
 
@@ -510,6 +512,11 @@ class StubNativeBindings : NativeBindings {
     ): Long {
         lastMessageCallback = callback
         return contextSubscribeResult
+    }
+
+    override fun contextUnsubscribe(subscriptionHandle: Long) {
+        contextUnsubscribeCalled = true
+        lastUnsubscribeHandle = subscriptionHandle
     }
 
     override fun toolRegister(

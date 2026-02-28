@@ -20,17 +20,14 @@ package com.limn.scp.bridge
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
-import kotlinx.coroutines.CancellationException as CoroutineCancellationException
 
 /**
  * Handle for propagating coroutine cancellation to long-running Rust operations.
@@ -116,6 +113,8 @@ interface ContextBindings {
         contextHandle: Long,
         callback: MessageCallback,
     ): Long
+
+    fun contextUnsubscribe(subscriptionHandle: Long)
 }
 
 /**
@@ -316,9 +315,6 @@ class CoroutineBridge(
             ensureActive()
             try {
                 block()
-            } catch (e: CoroutineCancellationException) {
-                cancellationHandle.cancel()
-                throw e
             } finally {
                 if (!isActive) {
                     cancellationHandle.cancel()
@@ -435,7 +431,10 @@ class ContextBridge internal constructor(
             val callback =
                 object : MessageCallback {
                     override fun onMessage(messageJson: String) {
-                        trySend(messageJson)
+                        val result = trySend(messageJson)
+                        if (result.isFailure && !result.isClosed) {
+                            close(BridgeException("Message buffer overflow", "SCP-BRIDGE-001"))
+                        }
                     }
 
                     override fun onError(
@@ -451,19 +450,17 @@ class ContextBridge internal constructor(
                 }
 
             // Subscribe on IO dispatcher since it crosses the FFI boundary.
-            // The handle is retained for use in awaitClose cleanup.
-            @Suppress("UNUSED_VARIABLE")
             val subscriptionHandle =
                 withContext(bridge.ioDispatcher) {
                     bindings.contextSubscribe(contextHandle, callback)
                 }
 
             awaitClose {
-                // Cleanup: the subscription handle will be used to unsubscribe
-                // when UniFFI bindings are wired. The Rust side detects the
-                // dropped callback and cleans up in the interim.
+                withContext(bridge.ioDispatcher) {
+                    bindings.contextUnsubscribe(subscriptionHandle)
+                }
             }
-        }.buffer(Channel.BUFFERED)
+        }
 }
 
 /**

@@ -77,7 +77,7 @@
 - SCP-156: MEDIUM: Dummy PaymentAuthorization (zeroed auth_id) on 3 free paths; IntegrationError erased to string
 - SCP-160 tests: TestAdapter::verify_authorization() no-op; Invariant 7 test self-referential
 
-### Android Platform Adapter (SCP-110, SCP-111, SCP-112) -- 2026-02-28
+### Android Platform Adapter (SCP-110, SCP-111, SCP-112, SCP-113) -- 2026-02-28
 - AndroidKeyCustody.kt: HIGH CRYPTO BUG: derivePseudonym uses publicKey() as HMAC key for hardware-backed keys (private key inaccessible in TEE) -- this breaks pseudonym determinism cross-device (public key unavailable before first publicKey() call) and is cryptographically weak (HMAC key = HMAC input context produces correlated outputs). ADR-006 says "identity_key_material" not "public key". The Apple adapter presumably uses the private key seed. Requires cross-platform test vector coordination.
 - AndroidKeyCustody.kt: HIGH BUG: publicKeyFromKeystore takeLast(32) is fragile -- assumes SubjectPublicKeyInfo header is exactly 12 bytes, which is documented as 44 bytes total for Ed25519 but is not spec-guaranteed. Use PublicKey.encoded length - 32 rather than hardcoded offset, or parse ASN.1 properly with BouncyCastle.
 - AndroidKeyCustody.kt: MEDIUM: ADR-027 spec says software Ed25519 keys stored in EncryptedSharedPreferences; implementation uses in-memory ConcurrentHashMap only -- keys lost on process death.
@@ -87,6 +87,13 @@
 - AndroidPushProviderTest: BUG -- test helper duplicates production logic instead of calling AndroidPushProvider directly; test is not testing the real code path
 - ADR spec says `WakeSignal.Pull` (PascalCase) in code sample but Types.kt defines UPPER_CASE `WakeSignal.PULL`; implementation correctly uses UPPER_CASE; ADR sample was wrong (noted in CLAUDE.md)
 - dhAgree: no validation that peerPublic is exactly 32 bytes -- malformed input propagates to Bouncy Castle raw constructor
+- AndroidStorage.kt (SCP-113): HIGH: Missing setRandomizedEncryptionRequired(false) on GCM KeyGenParameterSpec -- will crash at runtime on many devices
+- AndroidStorage.kt (SCP-113): HIGH: Derived passphrase ByteArray not zeroed after database open -- key material lingers in heap
+- AndroidStorage.kt (SCP-113): MEDIUM: SQL LIKE prefix not escaped for % and _ wildcards -- data integrity risk
+- AndroidStorage.kt (SCP-113): MEDIUM: deletePrefix uses two-step DELETE + SELECT changes() -- not atomic, use db.delete() instead
+- AndroidStorage.kt (SCP-113): MEDIUM: Error messages leak storage key names and exception details across FFI boundary
+- Types.kt (SCP-113): MEDIUM: StorageProvider method names (store/retrieve) diverge from UniFFI callback interface (set/get) -- migration debt
+- AndroidStorageTest.kt (SCP-113): Tests exercise InMemoryStorageProvider not AndroidStorage -- SQL LIKE wildcard issues undetectable
 
 ### Tiered Storage & Context Discovery
 - See `tiered-storage-scp213.md` for full finding details (SCP-127, SCP-213)
@@ -101,3 +108,5 @@
 - DashMap shard locks must not be held across Python GIL acquisition -- clone Arc before entering with_context
 - New PyO3 Rust functions must also be wrapped in the Python SDK layer or they are unreachable to SDK users
 - Test adapters that return hardcoded values weaken invariant tests; duplicated canonical hash logic in test helpers diverges from production
+- Android Keystore AES-GCM requires setRandomizedEncryptionRequired(false) for deterministic IV usage -- default is true and will throw InvalidAlgorithmParameterException
+- SQL LIKE prefix matching without wildcard escaping (% and _) is a recurring KV store risk; prefer ESCAPE clause or range queries (>= and <)
