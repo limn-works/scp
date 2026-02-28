@@ -159,11 +159,12 @@ pub fn py_ucan_validate(
         }
     }
 
-    // Step 5: Check capability match.
-    // A token capability matches the required capability if:
-    // (a) exact match, or
-    // (b) token grants a wildcard context capability (scp:ctx:*/{action})
-    //     that matches the action portion of the required capability.
+    // Steps 5-6: Check capability match and revocation list.
+    //
+    // Both checks run inside `with_context` because wildcard capability
+    // validation requires access to `rt.creator_did` — wildcard tokens
+    // (`scp:ctx:*/{action}`) are only valid when issued by the context
+    // creator (root authority tokens per ADR-016 §9).
     let required_action = if capability.starts_with("scp:ctx:") {
         // Extract action from "scp:ctx:{context_id}/{action}".
         capability.find('/').and_then(|_first_slash| {
@@ -175,36 +176,39 @@ pub fn py_ucan_validate(
         Some(capability)
     };
 
-    let has_matching_capability = payload.att.iter().any(|att| {
-        // Exact match.
-        if att.with == capability {
-            return true;
-        }
-        // Wildcard context match: token has "scp:ctx:*/{action}" and the
-        // required action matches.
-        if let Some(action) = required_action {
-            if att.with == format!("scp:ctx:*/{action}") {
+    crate::runtime::with_context(context_id, |rt| {
+        // Step 5: Check capability match.
+        let has_matching_capability = payload.att.iter().any(|att| {
+            // Exact match.
+            if att.with == capability {
                 return true;
             }
-        }
-        false
-    });
-    if !has_matching_capability {
-        return Err(ScpPyError::UcanError(format!(
-            "capability not granted: {capability}"
-        ))
-        .into());
-    }
-
-    // Step 6: Check revocation list.
-    crate::runtime::with_context(context_id, |rt| {
-        // Compute a simple token CID for revocation checking.
-        let token_cid = compute_simple_cid(token);
-        if rt.revocation_list.is_revoked(&token_cid) {
+            // Wildcard context match: token has "scp:ctx:*/{action}" and the
+            // required action matches. Wildcard tokens are only accepted from
+            // the context creator (root authority per ADR-016 §9).
+            if let Some(action) = required_action {
+                if att.with == format!("scp:ctx:*/{action}")
+                    && payload.iss == rt.creator_did
+                {
+                    return true;
+                }
+            }
+            false
+        });
+        if !has_matching_capability {
             return Err(ScpPyError::UcanError(format!(
-                "token revoked: {token_cid}"
+                "capability not granted: {capability}"
             )));
         }
+
+        // Step 6: Check revocation list.
+        let token_hash = compute_token_hash(token);
+        if rt.revocation_list.is_revoked(&token_hash) {
+            return Err(ScpPyError::UcanError(format!(
+                "token revoked: {token_hash}"
+            )));
+        }
+
         Ok(())
     })?;
 
@@ -309,7 +313,7 @@ pub fn py_ucan_revoke(
     crate::runtime::with_context(context_id, |rt| {
         // Compute the token's CID for revocation, matching the identifier
         // used in py_ucan_validate's revocation check.
-        let token_cid = compute_simple_cid(token);
+        let token_cid = compute_token_hash(token);
         rt.revocation_list.revoke(token_cid);
         Ok(())
     })?;
@@ -340,14 +344,19 @@ fn generate_nonce() -> Result<String, ScpPyError> {
     Ok(format!("{now_millis}-{hex}"))
 }
 
-/// Computes a simple content identifier for a token string.
+/// Computes a SHA-256 hash identifier for a token string.
 ///
-/// Uses SHA-256 and a `bafyrei` prefix following the CID v1 convention.
-/// Uses the full 32-byte hash (64 hex chars) for full collision resistance.
-fn compute_simple_cid(token: &str) -> String {
+/// Returns `sha256:{64_hex_chars}` — the full 32-byte hash for collision
+/// resistance. Used as the revocation list key: tokens revoked via
+/// [`py_ucan_revoke`] are looked up by this identifier during validation.
+///
+/// This is an internal identifier, not a CID v1 encoding. When scp-ffi
+/// delegates to scp-core's full validation pipeline (SCP-164), this will
+/// be replaced by `scp_core::crypto::ucan::mint::compute_cid`.
+fn compute_token_hash(token: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(token.as_bytes());
-    format!("bafyrei{}", encode_hex(&hash))
+    format!("sha256:{}", encode_hex(&hash))
 }
 
 // ---------------------------------------------------------------------------

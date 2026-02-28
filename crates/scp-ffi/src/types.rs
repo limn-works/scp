@@ -5,6 +5,8 @@
 //! - [`py_dict_to_json`]: `Python dict` -> [`serde_json::Value`]
 //! - [`json_to_py_dict`]: [`serde_json::Value`] -> `Python object`
 //! - [`encode_hex`]: `&[u8]` -> lowercase hex `String`
+//! - [`generate_context_id`]: CSPRNG context ID (pure hex, spec-compliant)
+//! - [`generate_random_id`]: CSPRNG prefixed handle ID (internal use)
 //!
 //! These are the foundational conversion functions used by all bridge modules
 //! that pass structured data between Python and Rust (context params, tool
@@ -33,6 +35,36 @@ pub fn encode_hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{byte:02x}");
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// Random ID generation
+// ---------------------------------------------------------------------------
+
+/// Generates a spec-compliant context ID: 32 cryptographically random bytes,
+/// hex-encoded to 64 characters.
+///
+/// Context IDs MUST be valid hexadecimal per §18.4.1 (addressability spec)
+/// so they can be embedded directly in `scp://context/<context_id_hex>` URIs.
+///
+/// Uses `rand::thread_rng()` (backed by `OsRng`) for unpredictable,
+/// collision-resistant identifiers.
+pub(crate) fn generate_context_id() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill(&mut bytes);
+    encode_hex(&bytes)
+}
+
+/// Generates a prefixed random handle ID for internal use.
+///
+/// Produces `{prefix}-{32_hex_chars}` (128 bits of CSPRNG). Used for opaque
+/// handles that never appear in `scp://` URIs (MCP server/client handles).
+pub(crate) fn generate_random_id(prefix: &str) -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill(&mut bytes);
+    format!("{prefix}-{}", encode_hex(&bytes))
 }
 
 // ---------------------------------------------------------------------------

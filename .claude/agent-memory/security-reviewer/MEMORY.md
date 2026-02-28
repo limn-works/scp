@@ -64,29 +64,19 @@
 - REMAINING (MEDIUM): Attestation canonical hash uses Debug format for type tag
 - REMAINING (MEDIUM): attestation.claim.to_string() JSON not canonically ordered
 
-### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- PR#103 Review (2026-02-27)
-- OnceLock for tokio runtime singleton -- correct pattern
-- `#![allow(unsafe_code)]` -- correct FFI exception, scoped to lib.rs only
-- init_runtime uses map_err (no panic across FFI)
-- shutdown_runtime blocks GIL for 100ms (SHUTDOWN_DRAIN const correct)
-- HIGH: py_ucan_validate skips Ed25519 signature verification entirely
-- HIGH: py_ucan_mint returns metadata-only PyUcanToken, no signed JWT -- broken lifecycle
-- HIGH: unwrap_or_default() on clock returns epoch 0, bypasses all time checks (5 instances)
-- MEDIUM: Context IDs are nanosecond timestamps, not CSPRNG (UniFFI/WASM use UUID v4)
-- MEDIUM: py_ucan_revoke has no authorization check -- any caller can revoke any CID
-- MEDIUM: MCP SSE client accepts any URL scheme -- no https/wss enforcement
-- MEDIUM: All three global registries (context, MCP server, MCP client) unbounded
-- MEDIUM: py_ucan_validate does not bind token capabilities to the context_id parameter
-- MEDIUM: py_tool_register uses deterministic tool IDs from name -- collision risk
-- MEDIUM: InMemoryKeyCustody in production cdylib (same as NAPI/UniFFI)
-- MEDIUM: py_context_close/join/leave discard identity_did -- no capability checks
-- MEDIUM: py_dict_to_json recursion has no depth limit -- stack overflow risk
-- GOOD: All Mutex::lock() calls handle poisoned locks cleanly
-- GOOD: ScpPyError hierarchy with actionable error messages
-- GOOD: py_any_to_json checks bool before int, rejects NaN/Infinity
-- GOOD: MCP handle IDs use CSPRNG (generate_handle_id)
-- GOOD: Schema validation on tool invocation
-- GOOD: Bounded mpsc channel(256) for message receive
+### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- Audit 2026-02-28
+- See `pyo3-audit-20260228.md` for full finding details
+- HIGH: expect() panic across FFI in py_context_create (line 457) -- only unguarded clock call
+- HIGH: UCAN validate does not bind token to presented context -- wildcard cross-context bypass
+- HIGH: Context IDs are nanosecond timestamps, not CSPRNG -- predictable + collidable
+- MEDIUM: py_ucan_revoke has no authorization check
+- MEDIUM: py_ucan_mint has no authorization check (always uses creator_did)
+- MEDIUM: py_context_close ignores identity_did, no ContextClose capability check
+- MEDIUM: py_context_close TOCTOU between state="closed" and remove_context
+- MEDIUM: MCP SSE client accepts any URL scheme (file://, javascript:, etc.)
+- MEDIUM: u128-to-u64 timestamp truncation via `as` cast in mcp.rs
+- TRACKED: UCAN sig verification (#105), MCP stubs (#106), registries unbounded (#108), recursion depth (#110), clock drift (#107), missing ContextParams (#109)
+- GOOD: DashMap, CSPRNG MCP handles, NaN/Infinity rejection, poisoned mutex handling, typed errors, tool invoke capability check, bounded mpsc(256)
 
 ### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 Review (2026-02-26)
 - CRITICAL: scp-platform testing feature STILL in production deps (cdylib)

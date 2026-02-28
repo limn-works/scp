@@ -77,6 +77,17 @@
 - 34 tests, all passing; missing proptest for serialization roundtrips
 - ProtocolStore<S: Storage> wraps platform Storage trait for domain methods
 
+### scp-ffi Bridge Layer (reviewed 2026-02-28)
+- compute_simple_cid: SHA-256 + "bafyrei" prefix is NOT a valid CID v1 -- purely opaque internal ID
+- UcanHeader::validate() skips typ field check (alg + ucv only)
+- Context ID: as_nanos() only, no randomness -- collision/predictability risk
+- rand 0.8 thread_rng() is CSPRNG (ChaCha12 reseeded from OsRng)
+- Nonce format: {millis}-{16 random hex bytes} matches UcanPayload.nnc spec
+- Base64 URL_SAFE_NO_PAD correct for JWT
+- MCP handles: 128-bit CSPRNG randomness, sufficient
+- encode_hex: infallible for String, no truncation bugs
+- extract_implementation_hash: correct 64-char hex validation, byte-by-byte decode
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs

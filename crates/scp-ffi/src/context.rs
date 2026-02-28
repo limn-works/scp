@@ -447,16 +447,11 @@ fn py_context_create(
     // Validate params eagerly (before any async work).
     let _parsed = PyContextParams::from_py_dict(params)?;
 
-    // Generate a context ID. In the full runtime this would come from
-    // scp-core's builder flow (MLS group formation, event log init).
-    // For the bridge layer, we generate a timestamp-based ID.
-    let context_id = format!("ctx-{:016x}", {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before Unix epoch")
-            .as_nanos()
-    });
+    // Generate a context ID using cryptographic randomness. In the full
+    // runtime this would come from scp-core's builder flow (MLS group
+    // formation, event log init). Context IDs are pure hex per §18.4.1
+    // for embedding in scp://context/<id> URIs.
+    let context_id = crate::types::generate_context_id();
 
     let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned());
 

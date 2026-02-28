@@ -76,12 +76,12 @@ fn client_registry() -> &'static DashMap<String, McpClientState> {
 }
 
 /// Generates a unique, unpredictable handle ID.
+///
+/// Delegates to [`crate::types::generate_random_id`] for the shared CSPRNG
+/// pattern. MCP handles use prefixed IDs (e.g., `mcp-server-{hex}`) since
+/// they are internal-only and never appear in `scp://` URIs.
 fn generate_handle_id(prefix: &str) -> String {
-    use rand::Rng;
-    let mut random_bytes = [0u8; 16];
-    rand::thread_rng().fill(&mut random_bytes);
-    let hex = crate::types::encode_hex(&random_bytes);
-    format!("{prefix}-{hex}")
+    crate::types::generate_random_id(prefix)
 }
 
 // ---------------------------------------------------------------------------
