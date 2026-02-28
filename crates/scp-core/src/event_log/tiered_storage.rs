@@ -356,6 +356,10 @@ impl TieredEventLog {
         if let Some(&leaf_hash) = hot_leaves.last() {
             self.all_leaf_hashes.push(leaf_hash);
         }
+
+        // Invariant: parallel metadata vectors must stay in sync with hot leaves.
+        debug_assert_eq!(self.hot.leaves().len(), self.hot_timestamps.len());
+        debug_assert_eq!(self.hot.leaves().len(), self.hot_byte_sizes.len());
     }
 
     /// Returns the estimated total bytes in the hot tier.
@@ -433,6 +437,12 @@ impl TieredEventLog {
         if count == 0 {
             return Err(TieredStorageError::NothingToMigrate);
         }
+
+        // Invariant: parallel metadata vectors must stay in sync with hot leaves.
+        debug_assert_eq!(self.hot.leaves().len(), self.hot_timestamps.len());
+        debug_assert_eq!(self.hot.leaves().len(), self.hot_byte_sizes.len());
+        // NOTE: This holds only while cold entries are never pruned.
+        debug_assert_eq!(self.global_index_offset, self.cold_entries.len() as u64);
 
         // Compute the checkpoint root from the FULL ghost tree (all leaves
         // ever appended, both cold and hot). This ensures the root is valid
