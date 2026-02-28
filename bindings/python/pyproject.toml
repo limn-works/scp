@@ -29,6 +29,7 @@ classifiers = [
 [project.optional-dependencies]
 langchain = ["langchain-core>=0.1.0"]
 mcp = ["mcp>=1.0.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13"]
 
 [project.scripts]
 scp-mcp = "scp_sdk.mcp:cli_main"
@@ -36,6 +37,23 @@ scp-mcp = "scp_sdk.mcp:cli_main"
 [project.urls]
 Repository = "https://github.com/limn-scp/scp-protocol-core"
 Documentation = "https://scp.dev/docs"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
 
 [tool.maturin]
 features = ["extension-module"]
