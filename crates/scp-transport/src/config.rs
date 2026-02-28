@@ -256,10 +256,7 @@ impl DefaultRelayResolver {
     /// return it. Returns `None` if the fetch fails or the document is
     /// invalid.
     #[must_use]
-    pub fn with_well_known_fetcher(
-        mut self,
-        fetcher: WellKnownFetcher,
-    ) -> Self {
+    pub fn with_well_known_fetcher(mut self, fetcher: WellKnownFetcher) -> Self {
         self.well_known_fetcher = Some(fetcher);
         self
     }

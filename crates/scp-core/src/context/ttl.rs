@@ -777,7 +777,7 @@ pub const fn expiry_notification() -> ContextEvent {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::iter_on_single_items,
+    clippy::iter_on_single_items
 )]
 mod tests {
     use std::sync::Mutex;

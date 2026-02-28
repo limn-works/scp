@@ -276,7 +276,7 @@ impl WellKnownScp {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::manual_async_fn,
+    clippy::manual_async_fn
 )]
 mod tests {
     use std::future::Future;

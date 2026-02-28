@@ -8,7 +8,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::redundant_field_names,
-    clippy::unnecessary_literal_unwrap,
+    clippy::unnecessary_literal_unwrap
 )]
 //! End-to-end integration test covering ALL 9 invariants from spec section 19.14.
 //!
@@ -325,7 +325,7 @@ fn signed_event(
     use sha2::{Digest, Sha256};
 
     let mut event = Event {
-        event_type: event_type,
+        event_type,
         actor_did: DID::from(actor_did),
         timestamp: 1_000_000 + sequence,
         sequence,

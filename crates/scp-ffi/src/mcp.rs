@@ -1272,7 +1272,10 @@ pub fn py_mcp_client_invoke(
 /// Raises `TransportError` if the relay query fails.
 #[pyfunction]
 #[pyo3(name = "py_mcp_load_contexts")]
-pub const fn py_mcp_load_contexts(_identity_did: &str, _relay_url: &str) -> PyResult<Vec<PyObject>> {
+pub const fn py_mcp_load_contexts(
+    _identity_did: &str,
+    _relay_url: &str,
+) -> PyResult<Vec<PyObject>> {
     // Context discovery requires a live relay connection which is wired via
     // the transport layer (scp-transport). Since relay connections are managed
     // separately from MCP, this function returns an empty list when no relay

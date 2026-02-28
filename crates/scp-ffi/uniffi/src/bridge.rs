@@ -659,7 +659,7 @@ pub struct Identity {
 #[uniffi::export]
 impl Identity {
     /// Returns the DID string for this identity.
-    #[must_use] 
+    #[must_use]
     pub fn did(&self) -> String {
         self.did.clone()
     }
@@ -667,7 +667,7 @@ impl Identity {
     /// Returns the custody method string for this identity.
     ///
     /// One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
-    #[must_use] 
+    #[must_use]
     pub fn custody_type(&self) -> String {
         match self.custody_type {
             CustodyMethod::InMemory => "in_memory".to_owned(),
@@ -800,37 +800,37 @@ pub struct UcanToken {
 #[uniffi::export]
 impl UcanToken {
     /// Returns the token's stable metadata record.
-    #[must_use] 
+    #[must_use]
     pub fn token_data(&self) -> UcanTokenData {
         self.data.clone()
     }
 
     /// Returns the token's unique ID.
-    #[must_use] 
+    #[must_use]
     pub fn token_id(&self) -> String {
         self.data.token_id.clone()
     }
 
     /// Returns the issuer DID.
-    #[must_use] 
+    #[must_use]
     pub fn issuer(&self) -> String {
         self.data.issuer.clone()
     }
 
     /// Returns the audience DID.
-    #[must_use] 
+    #[must_use]
     pub fn audience(&self) -> String {
         self.data.audience.clone()
     }
 
     /// Returns the list of capability URIs granted by this token.
-    #[must_use] 
+    #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
         self.data.capabilities.clone()
     }
 
     /// Returns the expiry timestamp (seconds since epoch) or `None` if no expiry.
-    #[must_use] 
+    #[must_use]
     pub const fn expires_at(&self) -> Option<u64> {
         self.data.expires_at
     }

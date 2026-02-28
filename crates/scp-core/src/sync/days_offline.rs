@@ -452,9 +452,10 @@ pub fn compute_delta(
     // Members who joined (in new but not in old)
     for did in &new_dids {
         if !old_dids.contains(did)
-            && let Some(entry) = new.members.get(*did) {
-                membership_changes.push(MembershipChange::Joined(entry.clone()));
-            }
+            && let Some(entry) = new.members.get(*did)
+        {
+            membership_changes.push(MembershipChange::Joined(entry.clone()));
+        }
     }
 
     // Members who left (in old but not in new)
@@ -469,13 +470,14 @@ pub fn compute_delta(
     // Members whose role changed (in both, but different role)
     for did in old_dids.intersection(&new_dids) {
         if let (Some(old_entry), Some(new_entry)) = (old.members.get(*did), new.members.get(*did))
-            && old_entry.role_name != new_entry.role_name {
-                membership_changes.push(MembershipChange::RoleChanged {
-                    did: DID::from(*did),
-                    old_role: old_entry.role_name.clone(),
-                    new_role: new_entry.role_name.clone(),
-                });
-            }
+            && old_entry.role_name != new_entry.role_name
+        {
+            membership_changes.push(MembershipChange::RoleChanged {
+                did: DID::from(*did),
+                old_role: old_entry.role_name.clone(),
+                new_role: new_entry.role_name.clone(),
+            });
+        }
     }
 
     // Role definition changes

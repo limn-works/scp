@@ -804,7 +804,7 @@ const fn _assert_send_sync() {
     clippy::panic,
     clippy::needless_collect,
     clippy::significant_drop_tightening,
-    clippy::match_same_arms,
+    clippy::match_same_arms
 )]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1605,8 +1605,7 @@ mod tests {
             let mgr = std::sync::Arc::clone(&manager);
             let h = std::sync::Arc::clone(&handle);
             join_handles.push(tokio::spawn(async move {
-                mgr.send_message(&h, &"did:key:creator".into(), &[i])
-                    .await
+                mgr.send_message(&h, &"did:key:creator".into(), &[i]).await
             }));
         }
 

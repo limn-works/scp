@@ -439,7 +439,10 @@ mod tests {
         state.add_member("did:key:alice".into(), "admin".into(), vec![]);
         state.add_member("did:key:bob".into(), "member".into(), vec![]);
 
-        let mut dids: Vec<&str> = state.member_dids().map(std::convert::AsRef::as_ref).collect();
+        let mut dids: Vec<&str> = state
+            .member_dids()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
         dids.sort_unstable();
         assert_eq!(dids, vec!["did:key:alice", "did:key:bob"]);
     }

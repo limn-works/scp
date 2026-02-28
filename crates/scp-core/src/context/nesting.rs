@@ -650,12 +650,13 @@ pub fn validate_child_ttl(
     let min_parent_ttl = parent_ttls.iter().filter_map(|t| t.as_ref()).min().copied();
 
     if let Some(min_ttl) = min_parent_ttl
-        && child_ttl > min_ttl {
-            return Err(NestingError::TtlExceedsParent {
-                child_ttl,
-                min_parent_ttl: min_ttl,
-            });
-        }
+        && child_ttl > min_ttl
+    {
+        return Err(NestingError::TtlExceedsParent {
+            child_ttl,
+            min_parent_ttl: min_ttl,
+        });
+    }
 
     Ok(())
 }
@@ -688,7 +689,7 @@ pub const fn validate_nesting_depth(depth: u32) -> Result<(), NestingError> {
     clippy::match_same_arms,
     clippy::cloned_ref_to_slice_refs,
     clippy::iter_on_single_items,
-    clippy::manual_let_else,
+    clippy::manual_let_else
 )]
 mod tests {
     use super::*;

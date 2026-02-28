@@ -70,7 +70,8 @@ impl ThresholdEngine {
                 "signers must be non-empty".to_owned(),
             ));
         }
-        #[allow(clippy::cast_possible_truncation)] // signers.len() bounded by realistic member counts
+        #[allow(clippy::cast_possible_truncation)]
+        // signers.len() bounded by realistic member counts
         if threshold == 0 || threshold > signers.len() as u32 {
             return Err(GovernanceError::InvalidConfig(format!(
                 "threshold must be in [1, {}], got {threshold}",

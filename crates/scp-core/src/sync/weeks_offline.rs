@@ -756,7 +756,7 @@ pub fn determine_inflight_handling(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::match_wildcard_for_single_variants,
+    clippy::match_wildcard_for_single_variants
 )]
 mod tests {
     use super::*;

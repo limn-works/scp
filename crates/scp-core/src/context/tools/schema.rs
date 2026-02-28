@@ -151,7 +151,7 @@ pub fn string_schema() -> Value {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::approx_constant,
+    clippy::approx_constant
 )]
 mod tests {
     use super::*;

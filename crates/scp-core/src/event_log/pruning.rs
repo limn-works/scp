@@ -396,34 +396,40 @@ fn compute_prune_boundary(
 ) -> u64 {
     let max_boundary = checkpoint_event_count;
 
-    config.effective_retention_secs().map_or(max_boundary, |retention_secs| {
-        // Find the latest event that is outside the retention window,
-        // considering structural event multiplier.
-        let mut boundary: u64 = 0;
+    config
+        .effective_retention_secs()
+        .map_or(max_boundary, |retention_secs| {
+            // Find the latest event that is outside the retention window,
+            // considering structural event multiplier.
+            let mut boundary: u64 = 0;
 
-        #[allow(clippy::cast_possible_truncation)] // event counts fit in usize
-        let take_count = max_boundary as usize;
-        for event in events.iter().take(take_count) {
-            let effective_retention = if is_structural_event(&event.event_type) {
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-                let multiplied =
-                    (retention_secs as f64 * config.structural_retention_multiplier) as u64;
-                multiplied
-            } else {
-                retention_secs
-            };
+            #[allow(clippy::cast_possible_truncation)] // event counts fit in usize
+            let take_count = max_boundary as usize;
+            for event in events.iter().take(take_count) {
+                let effective_retention = if is_structural_event(&event.event_type) {
+                    #[allow(
+                        clippy::cast_sign_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_precision_loss
+                    )]
+                    let multiplied =
+                        (retention_secs as f64 * config.structural_retention_multiplier) as u64;
+                    multiplied
+                } else {
+                    retention_secs
+                };
 
-            let cutoff = now.saturating_sub(effective_retention);
+                let cutoff = now.saturating_sub(effective_retention);
 
-            if event.timestamp < cutoff {
-                // This event is outside the retention window.
-                boundary = event.sequence + 1;
+                if event.timestamp < cutoff {
+                    // This event is outside the retention window.
+                    boundary = event.sequence + 1;
+                }
             }
-        }
 
-        // Cannot prune beyond the checkpoint boundary.
-        boundary.min(max_boundary)
-    })
+            // Cannot prune beyond the checkpoint boundary.
+            boundary.min(max_boundary)
+        })
 }
 
 /// Estimates the serialized size of an event for storage reclamation metrics.
@@ -454,7 +460,7 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::cast_possible_truncation,
+    clippy::cast_possible_truncation
 )]
 mod tests {
     use ed25519_dalek::Signer;

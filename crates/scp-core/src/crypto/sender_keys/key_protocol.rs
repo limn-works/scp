@@ -630,7 +630,7 @@ pub struct NonceDedup {
 
 impl NonceDedup {
     /// Creates a new, empty dedup cache.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             seen: HashMap::new(),
@@ -653,9 +653,10 @@ impl NonceDedup {
     /// to make room.
     pub fn record(&mut self, nonce: [u8; REQUEST_NONCE_SIZE], now_secs: u64) {
         if self.seen.len() >= NONCE_DEDUP_CAPACITY
-            && let Some(oldest_key) = self.seen.iter().min_by_key(|(_, ts)| *ts).map(|(k, _)| *k) {
-                self.seen.remove(&oldest_key);
-            }
+            && let Some(oldest_key) = self.seen.iter().min_by_key(|(_, ts)| *ts).map(|(k, _)| *k)
+        {
+            self.seen.remove(&oldest_key);
+        }
         self.seen.insert(nonce, now_secs);
     }
 }

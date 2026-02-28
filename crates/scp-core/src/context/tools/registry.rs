@@ -458,7 +458,7 @@ fn validate_did(did: &str) -> Result<(), ToolError> {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::needless_collect,
+    clippy::needless_collect
 )]
 mod tests {
     use std::collections::HashSet;

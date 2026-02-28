@@ -245,34 +245,40 @@ fn compute_relevance(entry: &DiscoveryResultEntry, query: &DiscoveryQuery) -> f6
 
     // Factor 1: Capability match ratio.
     if let Some(ref caps) = query.capability_filter
-        && !caps.is_empty() {
-            let matched = caps
-                .iter()
-                .filter(|c| entry.capabilities.iter().any(|ec| ec == *c))
-                .count();
-            #[allow(clippy::cast_precision_loss)] // counts are small; precision loss irrelevant
-            { score += matched as f64 / caps.len() as f64; }
-            factors += 1;
+        && !caps.is_empty()
+    {
+        let matched = caps
+            .iter()
+            .filter(|c| entry.capabilities.iter().any(|ec| ec == *c))
+            .count();
+        #[allow(clippy::cast_precision_loss)] // counts are small; precision loss irrelevant
+        {
+            score += matched as f64 / caps.len() as f64;
         }
+        factors += 1;
+    }
 
     // Factor 2: Keyword match count.
     if let Some(ref keywords) = query.keywords
-        && !keywords.is_empty() {
-            let matched = keywords
-                .iter()
-                .filter(|kw| {
-                    let kw_lower = kw.to_lowercase();
-                    entry
-                        .capabilities
-                        .iter()
-                        .any(|c| c.to_lowercase().contains(&kw_lower))
-                        || entry.did.to_lowercase().contains(&kw_lower)
-                })
-                .count();
-            #[allow(clippy::cast_precision_loss)] // counts are small; precision loss irrelevant
-            { score += matched as f64 / keywords.len() as f64; }
-            factors += 1;
+        && !keywords.is_empty()
+    {
+        let matched = keywords
+            .iter()
+            .filter(|kw| {
+                let kw_lower = kw.to_lowercase();
+                entry
+                    .capabilities
+                    .iter()
+                    .any(|c| c.to_lowercase().contains(&kw_lower))
+                    || entry.did.to_lowercase().contains(&kw_lower)
+            })
+            .count();
+        #[allow(clippy::cast_precision_loss)] // counts are small; precision loss irrelevant
+        {
+            score += matched as f64 / keywords.len() as f64;
         }
+        factors += 1;
+    }
 
     // No query filters: all entries get a baseline score.
     if factors == 0 {
@@ -334,9 +340,10 @@ mod tests {
                     // queried capability. Partial matches rank lower via
                     // compute_relevance.
                     if let Some(ref caps) = query.capability_filter
-                        && !caps.iter().any(|c| e.capabilities.contains(c)) {
-                            return false;
-                        }
+                        && !caps.iter().any(|c| e.capabilities.contains(c))
+                    {
+                        return false;
+                    }
                     // Apply keyword filter.
                     if let Some(ref keywords) = query.keywords
                         && !keywords.iter().any(|kw| {
@@ -344,9 +351,10 @@ mod tests {
                             e.capabilities
                                 .iter()
                                 .any(|c| c.to_lowercase().contains(&kw_lower))
-                        }) {
-                            return false;
-                        }
+                        })
+                    {
+                        return false;
+                    }
                     true
                 })
                 .cloned()

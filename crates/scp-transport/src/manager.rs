@@ -521,7 +521,10 @@ impl TransportManager {
             .relay_assignments
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let costs = self.relay_costs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let costs = self
+            .relay_costs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut candidates: Vec<(usize, usize, f64, u64)> = (0..adapter_count)
             .map(|idx| {
                 let overlap = assignments
@@ -638,7 +641,10 @@ impl TransportManager {
     ///
     /// A cost of 0 or absence of a cost entry means the relay is free.
     pub fn set_relay_cost(&self, adapter_index: usize, cost: u64) {
-        let mut costs = self.relay_costs.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut costs = self
+            .relay_costs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         costs.insert(adapter_index, cost);
     }
 
@@ -647,7 +653,10 @@ impl TransportManager {
     /// Returns `0` if no cost has been set (free relay).
     #[must_use]
     pub fn get_relay_cost(&self, adapter_index: usize) -> u64 {
-        let costs = self.relay_costs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let costs = self
+            .relay_costs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         costs.get(&adapter_index).copied().unwrap_or(0)
     }
 }
@@ -1621,7 +1630,8 @@ mod tests {
         // We can't peek directly into the LRU, but we can verify via check_suppressions:
         // 2 out of 2 relays delivered => no warning.
         drop(tracker);
-        #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64 until year 584556
+        #[allow(clippy::cast_possible_truncation)]
+        // millis since epoch fits in u64 until year 584556
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1693,7 +1703,8 @@ mod tests {
         // The suppression tracker should have 1 delivery from adapter 0 only.
         // With 4 total relays, threshold = ceil(4/2) = 2. Only 1 delivered
         // => 1 < 2 => warning should be emitted.
-        #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64 until year 584556
+        #[allow(clippy::cast_possible_truncation)]
+        // millis since epoch fits in u64 until year 584556
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

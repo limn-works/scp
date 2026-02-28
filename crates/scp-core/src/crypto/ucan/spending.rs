@@ -816,7 +816,7 @@ pub fn validate_spending_ucan(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::unreadable_literal,
+    clippy::unreadable_literal
 )]
 mod tests {
     use super::*;

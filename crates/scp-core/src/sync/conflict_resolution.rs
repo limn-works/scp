@@ -585,11 +585,13 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
     hasher.update(b"fork");
     hasher.update(fork_point);
     let hash = hasher.finalize();
-    let hex: String = hash[..16].iter().fold(String::with_capacity(32), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    });
+    let hex: String = hash[..16]
+        .iter()
+        .fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
     format!("fork-{hex}")
 }
 
@@ -598,11 +600,7 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1236,9 +1234,7 @@ mod tests {
         assert_eq!(fork.map(|f| f.fork_event_count), Some(100));
         assert_eq!(fork.map(|f| f.members.len()), Some(2));
         // Fork ID should start with "fork-".
-        assert!(
-            fork.is_some_and(|f| f.forked_context_id.starts_with("fork-"))
-        );
+        assert!(fork.is_some_and(|f| f.forked_context_id.starts_with("fork-")));
     }
 
     #[test]

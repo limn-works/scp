@@ -305,9 +305,10 @@ fn verify_sender_in_group(group: &ScpMlsGroup, sender_did: &str) -> Result<(), E
     for member in &members {
         if let Ok(basic_cred) = BasicCredential::try_from(member.credential.clone())
             && let Ok(scp_cred) = ScpCredential::from_bytes(basic_cred.identity())
-                && scp_cred.did == sender_did {
-                    return Ok(());
-                }
+            && scp_cred.did == sender_did
+        {
+            return Ok(());
+        }
     }
 
     Err(EnvelopeError::UnknownSender(sender_did.to_owned()))

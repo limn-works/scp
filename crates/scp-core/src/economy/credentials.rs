@@ -281,7 +281,7 @@ pub async fn retrieve_adapter_credential<S: AdapterCredentialStore>(
     clippy::expect_used,
     clippy::panic,
     clippy::manual_async_fn,
-    clippy::significant_drop_tightening,
+    clippy::significant_drop_tightening
 )]
 mod tests {
     use std::collections::HashMap;

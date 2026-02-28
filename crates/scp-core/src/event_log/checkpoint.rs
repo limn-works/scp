@@ -1028,9 +1028,10 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
 
     let layers = recompute_tree_from_leaves(leaves);
     if let Some(top) = layers.last()
-        && top.len() == 1 {
-            return top[0];
-        }
+        && top.len() == 1
+    {
+        return top[0];
+    }
 
     [0u8; 32]
 }
@@ -1102,7 +1103,7 @@ fn current_timestamp() -> u64 {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::needless_range_loop,
+    clippy::needless_range_loop
 )]
 mod tests {
     use ed25519_dalek::{Signer, Verifier};

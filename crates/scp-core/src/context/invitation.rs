@@ -252,12 +252,13 @@ pub fn evaluate_invitation(
 
             // Check balance covers at least the per_join cost (if any).
             if let Some(ref per_join) = econ.cost_schedule.per_join
-                && ctx.available_balance < per_join.value() {
-                    return Err(InvitationError::InsufficientBalance {
-                        estimated: per_join.value(),
-                        available: ctx.available_balance,
-                    });
-                }
+                && ctx.available_balance < per_join.value()
+            {
+                return Err(InvitationError::InsufficientBalance {
+                    estimated: per_join.value(),
+                    available: ctx.available_balance,
+                });
+            }
         }
 
         // Paid contexts always prompt agent -- never auto-accept.
@@ -267,36 +268,39 @@ pub fn evaluate_invitation(
     // Step 3: Auto-accept check.
     // Only if a policy is provided AND hard constraints pass.
     if let Some(policy) = policy
-        && auto_accept_allowed(params) {
-            // 3a. Template match: policy must match the invitation's template.
-            let template_matches = params
-                .template_id == Some(policy.template);
+        && auto_accept_allowed(params)
+    {
+        // 3a. Template match: policy must match the invitation's template.
+        let template_matches = params.template_id == Some(policy.template);
 
-            if template_matches {
-                // 3b. Trust requirement.
-                if trust_oracle.satisfies_trust(inviter, &policy.from) {
-                    // 3c. TTL cap.
-                    let ttl_ok = match (&policy.max_ttl, &params.ttl) {
-                        (Some(max), Some(actual)) => actual <= max,
-                        // No TTL = unlimited but policy has a cap. This is
-                        // context-dependent; a persistent context with no
-                        // TTL is fine if the policy allows it (max_ttl is a
-                        // cap, not a requirement). No cap = any TTL OK.
-                        (Some(_), None) | (None, _) => true,
-                    };
+        if template_matches {
+            // 3b. Trust requirement.
+            if trust_oracle.satisfies_trust(inviter, &policy.from) {
+                // 3c. TTL cap.
+                let ttl_ok = match (&policy.max_ttl, &params.ttl) {
+                    (Some(max), Some(actual)) => actual <= max,
+                    // No TTL = unlimited but policy has a cap. This is
+                    // context-dependent; a persistent context with no
+                    // TTL is fine if the policy allows it (max_ttl is a
+                    // cap, not a requirement). No cap = any TTL OK.
+                    (Some(_), None) | (None, _) => true,
+                };
 
-                    if ttl_ok {
-                        // 3d. Rate limit.
-                        let rate_ok = policy.rate_limit.as_ref().is_none_or(|limit| rate_tracker.is_allowed(limit));
+                if ttl_ok {
+                    // 3d. Rate limit.
+                    let rate_ok = policy
+                        .rate_limit
+                        .as_ref()
+                        .is_none_or(|limit| rate_tracker.is_allowed(limit));
 
-                        if rate_ok {
-                            rate_tracker.record_accept();
-                            return Ok(EvaluationDecision::AutoAccept);
-                        }
+                    if rate_ok {
+                        rate_tracker.record_accept();
+                        return Ok(EvaluationDecision::AutoAccept);
                     }
                 }
             }
         }
+    }
 
     // Step 4: Agent prompt.
     // No auto-accept policy matched or conditions not met.

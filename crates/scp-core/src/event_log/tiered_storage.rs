@@ -395,10 +395,11 @@ impl TieredEventLog {
 
         // Count-based: if hot exceeds max, migrate the excess.
         if let Some(max_hot) = self.config.max_hot_events
-            && hot_count > max_hot {
-                let count_excess = hot_count - max_hot;
-                migrate_count = migrate_count.max(count_excess);
-            }
+            && hot_count > max_hot
+        {
+            let count_excess = hot_count - max_hot;
+            migrate_count = migrate_count.max(count_excess);
+        }
 
         // Size-based: migrate oldest events until under the byte limit.
         if let Some(max_bytes) = self.config.max_hot_bytes {
@@ -612,7 +613,7 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     clippy::expect_used,
     clippy::panic,
     clippy::branches_sharing_code,
-    clippy::cast_possible_truncation,
+    clippy::cast_possible_truncation
 )]
 mod tests {
     use ed25519_dalek::Signer;

@@ -75,7 +75,7 @@ pub struct ReceiptFilter {
 ///
 /// Corresponds to the SDK surface `SCP.Economy.paymentHistory(context)`
 /// (spec section 19.11).
-#[must_use] 
+#[must_use]
 pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<PaymentReceipt> {
     let mut receipts = Vec::new();
 
@@ -93,21 +93,25 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
         // Apply optional filter.
         if let Some(f) = filter {
             if let Some(ref payer) = f.payer
-                && receipt.payer.as_ref() != payer.as_str() {
-                    continue;
-                }
+                && receipt.payer.as_ref() != payer.as_str()
+            {
+                continue;
+            }
             if let Some(ref payee) = f.payee
-                && receipt.payee.as_ref() != payee.as_str() {
-                    continue;
-                }
+                && receipt.payee.as_ref() != payee.as_str()
+            {
+                continue;
+            }
             if let Some(after) = f.after_timestamp
-                && receipt.timestamp < after {
-                    continue;
-                }
+                && receipt.timestamp < after
+            {
+                continue;
+            }
             if let Some(before) = f.before_timestamp
-                && receipt.timestamp > before {
-                    continue;
-                }
+                && receipt.timestamp > before
+            {
+                continue;
+            }
         }
 
         receipts.push(receipt);
@@ -125,7 +129,7 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::similar_names,
+    clippy::similar_names
 )]
 mod tests {
     use super::*;

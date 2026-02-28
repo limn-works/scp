@@ -3,7 +3,7 @@
     clippy::too_many_lines,
     clippy::items_after_statements,
     clippy::unused_async,
-    clippy::redundant_field_names,
+    clippy::redundant_field_names
 )]
 //! Phase 2 end-to-end integration test.
 //!

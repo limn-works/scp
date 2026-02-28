@@ -4,7 +4,7 @@
     clippy::items_after_statements,
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic,
+    clippy::panic
 )]
 //! Phase 5 end-to-end integration test.
 //!

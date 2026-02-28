@@ -356,7 +356,7 @@ async fn void_on_failure<T, A: PaymentAdapter>(
     clippy::expect_used,
     clippy::panic,
     clippy::struct_field_names,
-    clippy::similar_names,
+    clippy::similar_names
 )]
 mod tests {
     use super::*;

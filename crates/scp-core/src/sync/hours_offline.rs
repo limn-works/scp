@@ -146,7 +146,7 @@ impl RelayMessageBuffer {
     /// `stored_at` ascending.
     ///
     /// After this call the buffer is empty.
-    #[must_use] 
+    #[must_use]
     pub fn drain_sorted(mut self) -> Vec<BufferedMessage> {
         self.messages.sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
         self.messages

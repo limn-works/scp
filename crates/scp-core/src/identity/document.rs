@@ -472,7 +472,7 @@ fn base58btc_encode(input: &[u8]) -> String {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::cast_possible_truncation,
+    clippy::cast_possible_truncation
 )]
 mod tests {
     use super::*;

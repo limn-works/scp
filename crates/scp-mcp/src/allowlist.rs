@@ -313,7 +313,9 @@ mod tests {
     // serializes those tests without adding a crate dependency.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
     fn lock_allowlist() -> std::sync::MutexGuard<'static, ()> {
-        let guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset().unwrap();
         guard
     }

@@ -458,7 +458,7 @@ pub enum CloseAction {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::manual_let_else,
+    clippy::manual_let_else
 )]
 mod tests {
     use super::*;

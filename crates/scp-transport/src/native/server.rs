@@ -439,7 +439,9 @@ async fn check_publish_rate_limit(
 
     // Refill tokens based on elapsed time.
     let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-    bucket.tokens = elapsed.mul_add(f64::from(rate), bucket.tokens).min(f64::from(rate));
+    bucket.tokens = elapsed
+        .mul_add(f64::from(rate), bucket.tokens)
+        .min(f64::from(rate));
     bucket.last_refill = now;
 
     let allowed = if bucket.tokens >= 1.0 {

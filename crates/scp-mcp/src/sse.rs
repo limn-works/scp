@@ -202,10 +202,11 @@ async fn message_handler<P: ContextProvider + 'static>(
 
     // Send the response over the SSE channel.
     if let Some(resp) = response
-        && let Ok(json) = serde_json::to_string(&resp) {
-            // Ignore send errors (no receivers connected).
-            let _ = state.tx.send(json);
-        }
+        && let Ok(json) = serde_json::to_string(&resp)
+    {
+        // Ignore send errors (no receivers connected).
+        let _ = state.tx.send(json);
+    }
 
     StatusCode::ACCEPTED
 }

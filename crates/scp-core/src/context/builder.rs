@@ -583,7 +583,7 @@ pub async fn create_context(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::significant_drop_tightening,
+    clippy::significant_drop_tightening
 )]
 mod tests {
     use std::sync::Mutex;

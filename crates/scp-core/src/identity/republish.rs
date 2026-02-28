@@ -298,7 +298,7 @@ impl<D: DhtClient + 'static> MigrationRepublisher<D> {
     /// The task immediately republishes the old DID document with the redirect,
     /// then repeats at the configured interval. Returns a [`MigrationHandle`]
     /// that can cancel the task.
-    #[must_use] 
+    #[must_use]
     pub fn start(&self, entry: RepublishEntry) -> MigrationHandle {
         let dht_client = Arc::clone(&self.dht_client);
         let interval_secs = self.interval_secs;

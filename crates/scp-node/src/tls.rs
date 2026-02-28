@@ -539,7 +539,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     ///
     /// The task runs until the returned [`tokio::task::JoinHandle`] is
     /// aborted or the process exits.
-    #[must_use] 
+    #[must_use]
     pub fn start_renewal_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()>
     where
         S: Send + Sync + 'static,
@@ -560,20 +560,17 @@ impl<S: Storage + 'static> AcmeProvider<S> {
                                     // Hot-reload if a resolver is configured.
                                     if let Some(resolver) = &self.cert_resolver
                                         && let Ok(certs) = new_cert.certificate_chain_der()
-                                            && let Ok(key) = new_cert.private_key_der()
-                                                && let Ok(signing_key) =
-                                                    rustls::crypto::ring::sign::any_supported_type(
-                                                        &key,
-                                                    )
-                                                {
-                                                    let certified =
-                                                        CertifiedKey::new(certs, signing_key);
-                                                    resolver.update(certified).await;
-                                                    tracing::info!(
-                                                        domain = %self.domain,
-                                                        "TLS certificate renewed and hot-reloaded"
-                                                    );
-                                                }
+                                        && let Ok(key) = new_cert.private_key_der()
+                                        && let Ok(signing_key) =
+                                            rustls::crypto::ring::sign::any_supported_type(&key)
+                                    {
+                                        let certified = CertifiedKey::new(certs, signing_key);
+                                        resolver.update(certified).await;
+                                        tracing::info!(
+                                            domain = %self.domain,
+                                            "TLS certificate renewed and hot-reloaded"
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(
