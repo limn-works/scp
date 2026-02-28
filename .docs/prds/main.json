@@ -85,7 +85,10 @@
         "SCP-056",
         "SCP-057",
         "SCP-058",
-        "SCP-163"
+        "SCP-163",
+        "SCP-164",
+        "SCP-165",
+        "SCP-210"
       ]
     },
     {
@@ -9453,6 +9456,52 @@
         "ADR-015": "Defines context namespace mapping, capability-filtered tool listing, and provenance wrapping for external tool invocations."
       },
       "result": "Wired all 9 MCP bridge functions to real scp-mcp delegation. Server starts via scp-mcp with stdio/SSE transport, wait blocks on event loop, stop signals graceful shutdown. Client connects via subprocess (stdio) or HTTP (SSE), list_tools sends real JSON-RPC tools/list, invoke sends tools/call with provenance wrapping. Added FfiBridgeProvider, ClientTransport enum, StdioClientTransport, SseClientTransport."
+    },
+    {
+      "id": "SCP-210",
+      "title": "Complete MCP ContextProvider defense-in-depth stubs and relay context loading",
+      "gate": "gate-3",
+      "priority": "P2",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/mcp.rs"
+      ],
+      "description": "Residual stubs from SCP-165 / GitHub #106. The MCP bridge wiring is complete (SCP-165 done), but two FfiBridgeProvider trait methods remain stubbed: (1) validate_capability always returns Ok(()) — no capability checking at the MCP layer, relying solely on UCAN for authorization, (2) invoke_tool returns stub JSON — tool invocations are accepted but not executed. Additionally, py_mcp_load_contexts returns an empty list because relay transport is not yet wired for context discovery.\n\nUCAN (SCP-164) provides the primary authorization boundary, so these stubs are defense-in-depth gaps, not security-breaking. However, they should be completed for layered security and full MCP functionality.\n\nSee GitHub issue #106 (remaining acceptance criteria).",
+      "acceptanceCriteria": [
+        "FfiBridgeProvider::validate_capability performs real capability checking against context role state and ceiling",
+        "FfiBridgeProvider::invoke_tool executes real tool invocations via ToolRegistry and returns actual results",
+        "py_mcp_load_contexts queries relay via scp-transport for active contexts",
+        "#[allow(dead_code)] annotations removed from MCP state structs if any remain",
+        "Test: invoke_tool returns real tool output (not stub JSON)",
+        "Test: validate_capability rejects unauthorized capability",
+        "Test: py_mcp_load_contexts returns context list from relay (integration test)"
+      ],
+      "actionItems": [
+        "Implement validate_capability in FfiBridgeProvider using context role state and capability ceiling from ContextRuntime",
+        "Implement invoke_tool in FfiBridgeProvider using ToolRegistry from ContextRuntime",
+        "Wire py_mcp_load_contexts to scp-transport relay query",
+        "Remove #[allow(dead_code)] annotations from MCP state structs",
+        "Write unit tests for validate_capability and invoke_tool",
+        "Write integration test for py_mcp_load_contexts with relay"
+      ],
+      "blockedBy": ["SCP-165"],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "## ADR-015: MCP Adapter"
+        },
+        {
+          "file": "https://github.com/limn-works/scp/issues/106",
+          "section": "GitHub issue #106 — remaining acceptance criteria"
+        }
+      ],
+      "details": {
+        "securityImpact": "MEDIUM — defense-in-depth gap. UCAN layer (SCP-164) is the primary authorization boundary and is fully implemented. These stubs mean MCP layer does not independently verify capabilities, so a UCAN bypass would have no secondary check.",
+        "currentState": "validate_capability returns Ok(()) with TODO(#106). invoke_tool returns {\"status\": \"invoked\", \"tool\": name, \"note\": \"TODO(#106)...\"}. py_mcp_load_contexts returns empty Vec.",
+        "transportDependency": "py_mcp_load_contexts requires relay transport (scp-transport) wiring. validate_capability and invoke_tool can be completed independently.",
+        "relationship": "SCP-165 delivered the bridge wiring. This story completes the remaining stubs that SCP-165 deferred."
+      }
     }
   ]
 }
