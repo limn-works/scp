@@ -156,8 +156,7 @@ pub fn py_event_log_query(
         let count = scp_core::event_log::tree::event_count(&rt.event_log);
         let root = scp_core::event_log::tree::root(&rt.event_log);
         Ok((count, encode_hex(&root)))
-    })
-    .map_err(|e| ScpPyError::ContextError(e))?;
+    })?;
 
     // Apply limit filter if provided.
     let limit = if let Some(f) = filter {
@@ -263,7 +262,9 @@ pub fn py_event_log_verify(
             // Generate and verify the inclusion proof via scp-core.
             let proof_result = crate::runtime::with_context(context_id, |rt| {
                 let proof = scp_core::event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
-                    .map_err(|e| format!("{e}"))?;
+                    .map_err(|e| {
+                        ScpPyError::ContextError(format!("inclusion proof failed: {e}"))
+                    })?;
                 let verified = scp_core::event_log::proof::verify_inclusion(&proof);
 
                 let path_steps: Vec<serde_json::Value> = proof
@@ -290,8 +291,7 @@ pub fn py_event_log_verify(
                 });
 
                 Ok((verified, details))
-            })
-            .map_err(|e| ScpPyError::ContextError(e))?;
+            })?;
 
             let (verified, details_json) = proof_result;
             let details = json_to_py_dict(py, &details_json)?;
@@ -320,7 +320,9 @@ pub fn py_event_log_verify(
             // Generate the absence proof via scp-core.
             let proof_result = crate::runtime::with_context(context_id, |rt| {
                 let proof = scp_core::event_log::proof::prove_absence(&rt.event_log, &event_hash)
-                    .map_err(|e| format!("{e}"))?;
+                    .map_err(|e| {
+                        ScpPyError::ContextError(format!("absence proof failed: {e}"))
+                    })?;
 
                 let lower = proof.lower.as_ref().map(|lwp| {
                     serde_json::json!({
@@ -360,8 +362,7 @@ pub fn py_event_log_verify(
                 });
 
                 Ok((verified, details))
-            })
-            .map_err(|e| ScpPyError::ContextError(e))?;
+            })?;
 
             let (verified, details_json) = proof_result;
             let details = json_to_py_dict(py, &details_json)?;

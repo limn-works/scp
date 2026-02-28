@@ -201,11 +201,12 @@ pub fn py_ucan_validate(
         // Compute a simple token CID for revocation checking.
         let token_cid = compute_simple_cid(token);
         if rt.revocation_list.is_revoked(&token_cid) {
-            return Err(format!("token revoked: {token_cid}"));
+            return Err(ScpPyError::UcanError(format!(
+                "token revoked: {token_cid}"
+            )));
         }
         Ok(())
-    })
-    .map_err(|e| ScpPyError::UcanError(e))?;
+    })?;
 
     Ok(())
 }
@@ -244,10 +245,9 @@ pub fn py_ucan_mint(
     capabilities: Vec<String>,
 ) -> PyResult<PyUcanToken> {
     // Look up the context to get the creator DID (issuer).
-    let (creator_did, _context_id_owned) = crate::runtime::with_context(context_id, |rt| {
-        Ok((rt.creator_did.clone(), context_id.to_owned()))
-    })
-    .map_err(|e| ScpPyError::UcanError(e))?;
+    let creator_did = crate::runtime::with_context(context_id, |rt| {
+        Ok(rt.creator_did.clone())
+    })?;
 
     // Generate a unique nonce for the token ID.
     let nonce = generate_nonce();
@@ -312,8 +312,7 @@ pub fn py_ucan_revoke(
         let token_cid = compute_simple_cid(token);
         rt.revocation_list.revoke(token_cid);
         Ok(())
-    })
-    .map_err(|e| ScpPyError::UcanError(e))?;
+    })?;
 
     Ok(())
 }

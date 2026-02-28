@@ -20,9 +20,9 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full MCP adapter design.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
+use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -62,17 +62,17 @@ struct McpClientState {
 }
 
 /// Global registry of MCP server instances.
-static SERVER_REGISTRY: OnceLock<Mutex<HashMap<String, McpServerState>>> = OnceLock::new();
+static SERVER_REGISTRY: OnceLock<DashMap<String, McpServerState>> = OnceLock::new();
 
 /// Global registry of MCP client instances.
-static CLIENT_REGISTRY: OnceLock<Mutex<HashMap<String, McpClientState>>> = OnceLock::new();
+static CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientState>> = OnceLock::new();
 
-fn server_registry() -> &'static Mutex<HashMap<String, McpServerState>> {
-    SERVER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+fn server_registry() -> &'static DashMap<String, McpServerState> {
+    SERVER_REGISTRY.get_or_init(DashMap::new)
 }
 
-fn client_registry() -> &'static Mutex<HashMap<String, McpClientState>> {
-    CLIENT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+fn client_registry() -> &'static DashMap<String, McpClientState> {
+    CLIENT_REGISTRY.get_or_init(DashMap::new)
 }
 
 /// Generates a unique, unpredictable handle ID.
@@ -127,10 +127,9 @@ pub fn py_mcp_serve(
 
     // Validate that all context IDs are registered in the runtime.
     for ctx_id in &context_ids {
-        crate::runtime::with_context(ctx_id, |_rt| Ok(()))
-            .map_err(|e| ScpPyError::TransportError(format!(
-                "cannot serve context '{ctx_id}': {e}"
-            )))?;
+        crate::runtime::with_context(ctx_id, |_rt| Ok(())).map_err(|e| {
+            ScpPyError::TransportError(format!("cannot serve context '{ctx_id}': {e}"))
+        })?;
     }
 
     // Create the server state and register it.
@@ -142,10 +141,7 @@ pub fn py_mcp_serve(
         stopped: false,
     };
 
-    let mut registry = server_registry()
-        .lock()
-        .map_err(|_| ScpPyError::TransportError("server registry lock poisoned".to_owned()))?;
-    registry.insert(handle.clone(), state);
+    server_registry().insert(handle.clone(), state);
 
     Ok(handle)
 }
@@ -162,22 +158,18 @@ pub fn py_mcp_serve(
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_stop")]
 pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
-    let mut registry = server_registry()
-        .lock()
-        .map_err(|_| ScpPyError::TransportError("server registry lock poisoned".to_owned()))?;
-
-    let state = registry.get_mut(handle).ok_or_else(|| {
+    let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
     })?;
 
-    if state.stopped {
+    if entry.stopped {
         return Err(ScpPyError::TransportError(format!(
             "MCP server '{handle}' is already stopped"
         ))
         .into());
     }
 
-    state.stopped = true;
+    entry.stopped = true;
     Ok(())
 }
 
@@ -200,17 +192,14 @@ pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_wait")]
 pub fn py_mcp_server_wait(handle: &str) -> PyResult<()> {
-    let registry = server_registry()
-        .lock()
-        .map_err(|_| ScpPyError::TransportError("server registry lock poisoned".to_owned()))?;
-
-    let state = registry.get(handle).ok_or_else(|| {
+    let entry = server_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
     })?;
 
     // In the full implementation, this would block on the server's event loop.
     // For now, if the server is stopped, return immediately.
-    if state.stopped {
+    // See #106 for the story to complete this with real transport blocking.
+    if entry.stopped {
         return Ok(());
     }
 
@@ -259,10 +248,7 @@ pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
         cached_tools: Vec::new(),
     };
 
-    let mut registry = client_registry()
-        .lock()
-        .map_err(|_| ScpPyError::TransportError("client registry lock poisoned".to_owned()))?;
-    registry.insert(handle.clone(), state);
+    client_registry().insert(handle.clone(), state);
 
     Ok(handle)
 }
@@ -302,10 +288,7 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
         cached_tools: Vec::new(),
     };
 
-    let mut registry = client_registry()
-        .lock()
-        .map_err(|_| ScpPyError::TransportError("client registry lock poisoned".to_owned()))?;
-    registry.insert(handle.clone(), state);
+    client_registry().insert(handle.clone(), state);
 
     Ok(handle)
 }
@@ -323,22 +306,18 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_disconnect")]
 pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
-    let mut registry = client_registry()
-        .lock()
-        .map_err(|_| ScpPyError::TransportError("client registry lock poisoned".to_owned()))?;
-
-    let state = registry.get_mut(handle).ok_or_else(|| {
+    let mut entry = client_registry().get_mut(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
 
-    if state.disconnected {
+    if entry.disconnected {
         return Err(ScpPyError::TransportError(format!(
             "MCP client '{handle}' is already disconnected"
         ))
         .into());
     }
 
-    state.disconnected = true;
+    entry.disconnected = true;
     Ok(())
 }
 
@@ -363,15 +342,11 @@ pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_list_tools")]
 pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
-    let registry = client_registry()
-        .lock()
-        .map_err(|_| ScpPyError::TransportError("client registry lock poisoned".to_owned()))?;
-
-    let state = registry.get(handle).ok_or_else(|| {
+    let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
 
-    if state.disconnected {
+    if entry.disconnected {
         return Err(ScpPyError::TransportError(format!(
             "MCP client '{handle}' is disconnected"
         ))
@@ -381,7 +356,7 @@ pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObje
     // In the bridge layer without a real transport connection, return the
     // cached tools (initially empty). The full implementation will send a
     // tools/list JSON-RPC request via the transport.
-    let tools_json = serde_json::Value::Array(state.cached_tools.clone());
+    let tools_json = serde_json::Value::Array(entry.cached_tools.clone());
     json_to_py_dict(py, &tools_json)
 }
 
@@ -417,20 +392,20 @@ pub fn py_mcp_client_invoke(
     context_id: &str,
     identity_did: &str,
 ) -> PyResult<PyObject> {
-    let registry = client_registry()
-        .lock()
-        .map_err(|_| ScpPyError::TransportError("client registry lock poisoned".to_owned()))?;
-
-    let state = registry.get(handle).ok_or_else(|| {
+    let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
 
-    if state.disconnected {
+    if entry.disconnected {
         return Err(ScpPyError::TransportError(format!(
             "MCP client '{handle}' is disconnected"
         ))
         .into());
     }
+
+    // Drop the DashMap guard before calling py_dict_to_json (which may
+    // acquire the GIL for Python object access).
+    drop(entry);
 
     // Convert input to JSON for provenance computation.
     let _input_json = py_dict_to_json(input)?;

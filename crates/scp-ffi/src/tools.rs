@@ -217,10 +217,11 @@ pub fn py_tool_register(
             core_registration,
             &rt.creator_did.clone(),
         )
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| {
+            ScpPyError::ContextError(format!("tool registration failed: {e}"))
+        })?;
         Ok(registered_id)
-    })
-    .map_err(|e| ScpPyError::ContextError(e))?;
+    })?;
 
     Ok(registered_id)
 }
@@ -269,14 +270,20 @@ pub fn py_tool_invoke(
         let registration = rt
             .tool_registry
             .get(tool_id)
-            .ok_or_else(|| format!("tool '{tool_id}' not found in context '{context_id}'"))?;
+            .ok_or_else(|| {
+                ScpPyError::ContextError(format!(
+                    "tool '{tool_id}' not found in context '{context_id}'"
+                ))
+            })?;
 
         // Validate input against the tool's input schema.
         scp_core::context::tools::validate_value_against_schema(
             &input_json,
             &registration.schema.input_schema,
         )
-        .map_err(|e| format!("input validation failed: {e}"))?;
+        .map_err(|e| {
+            ScpPyError::ValidationError(format!("input validation failed: {e}"))
+        })?;
 
         // Check that the invoker has the ToolInvoke capability.
         if !scp_core::context::tools::has_tool_invoke_capability(
@@ -284,17 +291,16 @@ pub fn py_tool_invoke(
             identity_did,
             tool_id,
         ) {
-            return Err(format!(
+            return Err(ScpPyError::UcanError(format!(
                 "invoker '{identity_did}' does not have ToolInvoke capability for '{tool_id}'"
-            ));
+            )));
         }
 
         // In the bridge layer without a full executor, we return the input as
         // a passthrough. Real tool execution happens via the transport layer
         // when it's wired to a relay.
         Ok(input_json.clone())
-    })
-    .map_err(|e| ScpPyError::ContextError(e))?;
+    })?;
 
     // Convert output back to Python dict.
     json_to_py_dict(py, &output_json)
@@ -348,11 +354,12 @@ pub fn py_tool_verify(
                 serde_json::Value::Null
             },
         )
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| {
+            ScpPyError::ContextError(format!("tool verification failed: {e}"))
+        })?;
 
         Ok(verification_result)
-    })
-    .map_err(|e| ScpPyError::ContextError(e))?;
+    })?;
 
     // Convert to PyToolVerificationResult.
     let failures: Vec<String> = result

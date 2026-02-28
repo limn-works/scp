@@ -8,12 +8,16 @@ This crate is the `_scp_core` Python extension module. It exposes scp-core/scp-m
 
 ### Runtime Registry (`runtime.rs`)
 
-A global `OnceLock<Mutex<HashMap<String, ContextRuntime>>>` maps context IDs to live runtime state:
+A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live runtime state:
 - `ToolRegistry` — tool registration/invocation
 - `EventLog` — event recording, querying, Merkle proofs
 - `RevocationList` — UCAN token revocation tracking
+- `RoleState` — role assignments for capability checking
+- `creator_did` — the DID of the context creator
 
-`py_context_create` in `context.rs` registers runtime state. Other modules (`tools.rs`, `ucan.rs`, `event_log.rs`) look up state by context ID.
+DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpPyError>` with typed errors.
+
+`py_context_create` in `context.rs` registers runtime state. Other modules (`tools.rs`, `ucan.rs`, `event_log.rs`) look up state by context ID via `with_context`.
 
 ### Module Structure
 
@@ -51,4 +55,7 @@ A global `OnceLock<Mutex<HashMap<String, ContextRuntime>>>` maps context IDs to 
 
 - The tokio runtime (`RUNTIME` in `lib.rs`) must be initialized before any async bridge call. It's auto-initialized at module import.
 - `py_context_create` creates real `ToolRegistry` and `EventLog` objects in the runtime registry. If context creation fails partway, the registry entry must be cleaned up.
-- MCP bridge functions use opaque handles (u64 IDs) for server/client instances. Handles are managed by a separate registry in `mcp.rs`.
+- MCP bridge functions use opaque string handles (cryptographically random hex IDs) for server/client instances. Server and client state tracked in separate `DashMap` registries in `mcp.rs`.
+- `with_context` closures must return `Result<T, ScpPyError>` — use typed error variants (`ScpPyError::ContextError`, `ScpPyError::UcanError`, etc.) not raw strings.
+- UCAN validation (SCP-164) currently implements 5 of 11 ADR-016 steps — Ed25519 signature verification is NOT yet wired. See GitHub issue #105.
+- MCP bridge functions (SCP-165) register state but do not delegate to real scp-mcp transport. See GitHub issue #106.
