@@ -269,7 +269,7 @@ impl BroadcastContext {
                         "gated broadcast requires messagesRead UCAN".to_owned(),
                     )
                 })?;
-                validate_messages_read_ucan(token, &self.context_id)?;
+                validate_messages_read_ucan(token, &self.context_id, subscriber_did)?;
                 true
             }
         };
@@ -372,16 +372,26 @@ impl BroadcastContext {
 // UCAN validation helper
 // ---------------------------------------------------------------------------
 
-/// Validates that a UCAN token contains a `messagesRead` attestation for the
-/// given context.
+/// Validates that a UCAN token grants `messagesRead` for the given context
+/// and is audience-bound to the presenting subscriber.
 ///
-/// Checks the `with` field of each attestation for a capability URI matching
-/// `scp:ctx:{context_id}/messages:read` or the wildcard `scp:ctx:*/messages:read`.
+/// Checks: (1) `token.aud == subscriber_did` — prevents presenting a UCAN
+/// issued to someone else. (2) An attestation matching
+/// `scp:ctx:{context_id}/messages:read` or `scp:ctx:*/messages:read`.
 ///
-/// This is a lightweight check against the stub UCAN token structure. Full
-/// cryptographic UCAN validation (signature chains, expiry, revocation) is
-/// deferred to the UCAN module (SCP-024).
-fn validate_messages_read_ucan(token: &UcanToken, context_id: &str) -> Result<(), ContextError> {
+/// Full cryptographic UCAN validation (signature chains, expiry, revocation)
+/// is deferred to the UCAN module (SCP-024).
+fn validate_messages_read_ucan(
+    token: &UcanToken,
+    context_id: &str,
+    subscriber_did: &str,
+) -> Result<(), ContextError> {
+    if token.aud != subscriber_did {
+        return Err(ContextError::PermissionDenied(format!(
+            "UCAN audience '{}' does not match subscriber '{}'",
+            token.aud, subscriber_did,
+        )));
+    }
     let specific = format!("scp:ctx:{context_id}/messages:read");
     let wildcard = "scp:ctx:*/messages:read";
     let has_messages_read = token
@@ -592,6 +602,17 @@ mod tests {
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn subscribe_gated_rejects_aud_mismatch() {
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        let ucan = make_messages_read_ucan("ctx-gated-1", "did:example:carol");
+
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
+        assert!(result.is_err());
+        assert!(!ctx.is_subscriber("did:example:bob"));
     }
 
     // -----------------------------------------------------------------------
