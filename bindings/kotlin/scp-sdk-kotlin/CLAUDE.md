@@ -86,12 +86,48 @@ Rust callbacks (`onMessage`, `onEvent`) run on non-coroutine threads. You cannot
 
 The `NativeBindings` interface defines placeholder signatures matching ADR-028. When UniFFI generates `internal/NativeLib.kt`, create a concrete `NativeBindings` implementation that delegates to it.
 
+## Conformance Tests (`conformance/`)
+
+Cross-platform conformance test suite (SCP-120) validating the Kotlin SDK API contract matches the specification in `.docs/scaffold/shared.md`. Mirrors the Swift SDK's `ConformanceTests.swift` pattern.
+
+### Architecture
+
+| Component | Purpose |
+|-----------|---------|
+| `ConformanceFixture` | `@Serializable` model matching JSON fixture format from scaffold |
+| `ConformanceFixtureLoader` | Loads shared fixtures from `tests/conformance/` (gracefully handles missing directory) |
+| `ConformanceDispatcher` | Maps 18 operation strings to SDK bridge calls, returns result dictionaries |
+| `ConformanceStubBindings` | Configurable `NativeBindings` where every op returns stub result or throws `BridgeException` |
+
+### Per-category test files (8 files, 95 tests)
+
+| File | Categories |
+|------|-----------|
+| `IdentityConformanceTest` | create, load, resolve |
+| `ContextConformanceTest` | create, join, leave, close, state machine transitions |
+| `MessagingConformanceTest` | send, receive (Flow subscription), sequence ordering |
+| `ToolsConformanceTest` | register, invoke, verify test vectors |
+| `UcanConformanceTest` | validate, mint, revoke, nonce replay, ceiling enforcement |
+| `TransportConformanceTest` | connect, status |
+| `EventLogConformanceTest` | query, verify proof |
+| `EncryptionConformanceTest` | encrypted send, sender key errors, decryption errors |
+| `GovernanceConformanceTest` | capability enforcement, ceiling governance, error code reachability |
+| `ConformanceRunnerTest` | fixture model, loader, result comparison, dispatcher infra |
+
+### Gotchas
+
+- **No colons in backtick test names.** Kotlin compiler rejects `:` in backtick-quoted function names. Use `-` or `--` instead (e.g., `` `context lifecycle - create then leave` `` not `` `context lifecycle: create then leave` ``).
+- **Use `async` + `runCatching` for error Flow tests.** `launch` propagates exceptions to the parent scope and fails the test. `async { runCatching { flow.first() } }` captures the exception for assertion.
+- **Split across files for detekt.** The suite is split into 10 files to stay under the `TooManyFunctions` threshold (30 per file) in `detekt.yml`.
+- **`ConformanceStubBindings` uses `@Suppress("TooManyFunctions")`.** It must implement all 19 `NativeBindings` methods plus configurable fields and `reset()`.
+
 ## Build
 
 ```bash
 # From bindings/kotlin/
 ./gradlew :scp-sdk-kotlin:build    # Full build (detekt + ktlint + compile + test)
 ./gradlew :scp-sdk-kotlin:test     # Tests only
+./gradlew :scp-sdk-kotlin:test --tests "com.limn.scp.conformance.*"  # Conformance only
 ./gradlew :scp-sdk-kotlin:detekt   # Static analysis only
 ./gradlew :scp-sdk-kotlin:runKtlintFormatOverMainSourceSet  # Auto-format
 ```
