@@ -374,7 +374,7 @@ fun ColdMessageFlow(
             if (closed.get()) return
             val result = trySend(messageJson)
             if (result.isFailure && !result.isClosed) {
-                close(BridgeException("Message buffer overflow", "SCP-STREAM-001"))
+                close(BridgeException("Message buffer overflow", "SCP-CTX-2001"))
             }
         }
 

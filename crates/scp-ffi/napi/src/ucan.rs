@@ -346,7 +346,7 @@ pub async fn ucan_validate(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-PERM-4004` if JWT serialization fails (system clock
+/// - Rejects with `SCP-PERM-3004` if JWT serialization fails (system clock
 ///   error or JSON encoding failure).
 ///
 /// Stub — real Ed25519 signing wired in SCP-214. See ADR-016 AC-3.
@@ -363,14 +363,14 @@ pub async fn ucan_mint(
 
     let nonce = generate_nonce().map_err(|e| ScpNapiError::Permission {
         message: format!("nonce generation failed: {e}"),
-        code: "SCP-PERM-4004".to_owned(),
+        code: "SCP-PERM-3004".to_owned(),
     })?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| ScpNapiError::Permission {
             message: format!("system clock error: {e}"),
-            code: "SCP-PERM-4004".to_owned(),
+            code: "SCP-PERM-3004".to_owned(),
         })?
         .as_secs();
     let exp = now + 3600;
@@ -410,11 +410,11 @@ pub async fn ucan_mint(
 
     let header_json = serde_json::to_vec(&header).map_err(|e| ScpNapiError::Permission {
         message: format!("header serialization failed: {e}"),
-        code: "SCP-PERM-4004".to_owned(),
+        code: "SCP-PERM-3004".to_owned(),
     })?;
     let payload_json = serde_json::to_vec(&payload).map_err(|e| ScpNapiError::Permission {
         message: format!("payload serialization failed: {e}"),
-        code: "SCP-PERM-4004".to_owned(),
+        code: "SCP-PERM-3004".to_owned(),
     })?;
 
     let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);

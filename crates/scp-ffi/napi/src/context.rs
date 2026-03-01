@@ -286,7 +286,7 @@ pub struct NapiMessage {
 ///
 /// - Rejects with `SCP-VALID-7000` if `params_json` is malformed JSON.
 /// - Rejects with `SCP-CTX-2000` if context creation fails.
-/// - Rejects with `SCP-CRYPTO-3010` if pseudonym derivation fails.
+/// - Rejects with `SCP-CRYPTO-4010` if pseudonym derivation fails.
 #[napi]
 pub async fn context_create(
     identity: &NapiIdentity,
@@ -335,7 +335,7 @@ pub async fn context_create(
                 .map_err(|e| {
                     NapiError::from(ScpNapiError::Crypto {
                         message: format!("failed to derive pseudonym routing ID: {e}"),
-                        code: "SCP-CRYPTO-3010".to_owned(),
+                        code: "SCP-CRYPTO-4010".to_owned(),
                     })
                 })?;
             Some(pseudonym.public_key.as_bytes().to_vec())

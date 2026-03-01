@@ -1549,7 +1549,7 @@ pub async fn context_create(
                         .await
                         .map_err(|e| ScpError::Crypto {
                             message: format!("failed to derive pseudonym routing ID: {e}"),
-                            code: "SCP-CRYPTO-3010".to_owned(),
+                            code: "SCP-CRYPTO-4010".to_owned(),
                         })?;
                     Some(pseudonym.public_key.as_bytes().to_vec())
                 }

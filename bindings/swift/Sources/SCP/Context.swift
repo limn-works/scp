@@ -246,13 +246,13 @@ public actor Context {
     /// sequencing, and transport.
     ///
     /// - Parameter payload: The raw message data to send.
-    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-001"`
+    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2001"`
     ///   if the context is not active, or if the bridge send operation fails.
     public func send(_ payload: Data) async throws {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-CTX-001"
+                code: "SCP-CTX-2001"
             )
         }
         try await sendFn(handle, payload)
@@ -294,7 +294,7 @@ public actor Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-CTX-001"
+                code: "SCP-CTX-2001"
             )
         }
         try await leaveFn(handle)

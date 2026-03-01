@@ -265,13 +265,13 @@ class StreamsTest {
 
             advanceUntilIdle()
 
-            stubBindings.lastEventCallback?.onError("SCP-CTX-500", "Internal error")
+            stubBindings.lastEventCallback?.onError("SCP-CTX-2500", "Internal error")
 
             advanceUntilIdle()
             job.join()
 
             assertEquals(1, events.size)
-            assertTrue(events[0].contains("SCP-CTX-500"))
+            assertTrue(events[0].contains("SCP-CTX-2500"))
         }
 
         @Test
@@ -362,14 +362,14 @@ class StreamsTest {
 
                 advanceUntilIdle()
 
-                stubBindings.lastMessageCallback?.onError("SCP-CTX-001", "Context closed")
+                stubBindings.lastMessageCallback?.onError("SCP-CTX-2001", "Context closed")
 
                 advanceUntilIdle()
                 job.join()
             }
 
             assertTrue(caughtException is BridgeException)
-            assertEquals("SCP-CTX-001", (caughtException as BridgeException).code)
+            assertEquals("SCP-CTX-2001", (caughtException as BridgeException).code)
         }
 
         @Test
