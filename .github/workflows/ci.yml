@@ -11,8 +11,17 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  check-draft:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Not a draft PR, proceeding"
+
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
+    needs: check-draft
     name: Rust / fmt
     runs-on: ubuntu-latest
     steps:
@@ -23,6 +32,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   rust-clippy:
+    needs: check-draft
     name: Rust / clippy
     runs-on: ubuntu-latest
     steps:
@@ -40,6 +50,7 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
 
   rust-test:
+    needs: check-draft
     name: Rust / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -65,6 +76,7 @@ jobs:
           cargo nextest run --workspace
 
   rust-doc:
+    needs: check-draft
     name: Rust / doc
     runs-on: ubuntu-latest
     steps:
@@ -81,6 +93,7 @@ jobs:
           cargo doc --workspace --no-deps
 
   rust-deny:
+    needs: check-draft
     name: Rust / deny
     runs-on: ubuntu-latest
     steps:
@@ -89,6 +102,7 @@ jobs:
 
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:
+    needs: check-draft
     name: Python / lint
     runs-on: ubuntu-latest
     defaults:
@@ -104,6 +118,7 @@ jobs:
       - run: ruff check .
 
   python-test:
+    needs: check-draft
     name: Python / test
     runs-on: ubuntu-latest
     defaults:
@@ -119,6 +134,7 @@ jobs:
 
   # ── TypeScript ──────────────────────────────────────────────────────
   typescript-check:
+    needs: check-draft
     name: TypeScript / check + lint + test
     runs-on: ubuntu-latest
     defaults:
@@ -134,6 +150,7 @@ jobs:
 
   # ── Kotlin ──────────────────────────────────────────────────────────
   kotlin-test:
+    needs: check-draft
     name: Kotlin / test
     runs-on: ubuntu-latest
     defaults:

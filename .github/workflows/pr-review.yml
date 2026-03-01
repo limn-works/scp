@@ -5,6 +5,9 @@ on:
     types: [opened, synchronize, ready_for_review]
     paths:
       - 'crates/**'
+      - 'bindings/**'
+      - 'tests/**'
+      - 'scripts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
 
@@ -28,6 +31,104 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Compute review scope
+        id: diff
+        run: |
+          EVENT="${{ github.event.action }}"
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          PR_BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          if [[ "$EVENT" == "synchronize" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            MODE="incremental"
+            DIFF_BASE="$BEFORE"
+            DIFF_HEAD="$AFTER"
+          else
+            MODE="full"
+            DIFF_BASE="$PR_BASE"
+            DIFF_HEAD="$HEAD"
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "diff_head=$DIFF_HEAD" >> "$GITHUB_OUTPUT"
+
+          # Write file list
+          git diff --name-only "$DIFF_BASE".."$DIFF_HEAD" > /tmp/changed-files.txt || \
+            gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > /tmp/changed-files.txt
+
+          # Write diff content
+          git diff "$DIFF_BASE".."$DIFF_HEAD" > /tmp/scope-diff.patch || \
+            gh pr diff ${{ github.event.pull_request.number }} > /tmp/scope-diff.patch
+
+          echo "## Review Scope" > /tmp/review-scope.md
+          echo "**Mode:** $MODE" >> /tmp/review-scope.md
+          echo "**Range:** \`${DIFF_BASE:0:8}..${DIFF_HEAD:0:8}\`" >> /tmp/review-scope.md
+          echo "**Files in scope:** $(wc -l < /tmp/changed-files.txt | tr -d ' ')" >> /tmp/review-scope.md
+          echo "" >> /tmp/review-scope.md
+          echo "### Changed files" >> /tmp/review-scope.md
+          cat /tmp/changed-files.txt >> /tmp/review-scope.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch review history
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          REPO="${{ github.repository }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+
+          echo "## Previous Review Threads" > /tmp/review-history.md
+
+          # Inline review threads with resolution status (GraphQL)
+          gh api graphql -f query='
+          {
+            repository(owner: "'"$OWNER"'", name: "'"$REPO_NAME"'") {
+              pullRequest(number: '"$PR"') {
+                reviewThreads(first: 100) {
+                  nodes {
+                    isResolved
+                    isOutdated
+                    path
+                    line
+                    comments(first: 5) {
+                      nodes {
+                        body
+                        author { login }
+                        createdAt
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }' --jq '.data.repository.pullRequest.reviewThreads.nodes' > /tmp/review-threads.json 2>/dev/null || echo "[]" > /tmp/review-threads.json
+
+          THREAD_COUNT=$(jq length /tmp/review-threads.json)
+          if [[ "$THREAD_COUNT" -gt 0 ]]; then
+            echo "" >> /tmp/review-history.md
+            echo "**$THREAD_COUNT thread(s) found.**" >> /tmp/review-history.md
+            echo "" >> /tmp/review-history.md
+            jq -r '.[] | "- [\(if .isResolved then "RESOLVED" elif .isOutdated then "OUTDATED" else "OPEN" end)] \(.path):\(.line) — \(.comments.nodes[0].body | .[0:200])"' /tmp/review-threads.json >> /tmp/review-history.md
+          else
+            echo "" >> /tmp/review-history.md
+            echo "No previous review threads." >> /tmp/review-history.md
+          fi
+
+          # Previous review verdicts
+          echo "" >> /tmp/review-history.md
+          echo "## Previous Review Verdicts" >> /tmp/review-history.md
+          gh api "repos/$REPO/pulls/$PR/reviews" \
+            --jq '.[] | "- \(.state) by \(.user.login) at \(.submitted_at): \(.body | .[0:300])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
+
+          # PR-level comments
+          echo "" >> /tmp/review-history.md
+          echo "## Previous PR Comments" >> /tmp/review-history.md
+          gh api "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | "- \(.user.login) at \(.created_at): \(.body | .[0:300])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run Claude PR review
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
@@ -38,17 +139,26 @@ jobs:
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
 
-            Perform a comprehensive multi-perspective review of this PR. For each perspective,
-            read the corresponding agent definition file under `.claude/agents/` to understand
-            the review criteria, then apply those criteria to the PR's changes.
-
             ## Setup
 
-            First, understand the PR:
-            ```bash
-            gh pr diff ${{ github.event.pull_request.number }}
-            gh pr view ${{ github.event.pull_request.number }} --json title,body,files
-            ```
+            Read the review scope and history (pre-computed):
+            1. Read `/tmp/review-scope.md` — the files and diff range in scope
+            2. Read `/tmp/review-history.md` — all previous review threads and verdicts
+            3. Read `/tmp/scope-diff.patch` — the actual diff to review
+
+            This review is in **${{ steps.diff.outputs.mode }}** mode.
+            - **full**: Review all changes. This is the first review or the PR just left draft.
+            - **incremental**: Review ONLY the latest push. Do not re-review unchanged code.
+
+            ## History Rules
+
+            - **RESOLVED threads**: Already fixed. Do NOT re-flag.
+            - **OUTDATED threads**: Code changed since comment. Check if new code fixes the concern.
+              If fixed, skip. If same issue persists, re-flag referencing the original.
+            - **OPEN threads**: Still active on unchanged code. Do NOT duplicate. If the file is in
+              your review scope and the issue persists, you may add a follow-up.
+            - **Previous verdicts**: If changes were previously requested, check whether this push
+              addresses them. Note resolved items and flag remaining ones.
 
             ## Perspectives
 
@@ -81,11 +191,13 @@ jobs:
 
             ## Output
 
-            For each issue found, post an inline review comment on the specific line(s) using:
+            For each NEW issue (not previously flagged), post an inline review comment on the specific line(s) using:
             ```bash
             gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
-              -f body="<comment>" -f path="<file>" -f commit_id="<sha>" -F line=<line> -f side=RIGHT
+              -f body="<comment>" -f path="<file>" -f commit_id="${{ steps.diff.outputs.diff_head }}" -F line=<line> -f side=RIGHT
             ```
+
+            ONLY comment on files listed in /tmp/changed-files.txt.
 
             Then submit your review verdict. If there are no critical or warning-level issues:
             ```bash
@@ -102,8 +214,10 @@ jobs:
             gh pr review ${{ github.event.pull_request.number }} --comment --body "<summary>"
             ```
 
-            The summary should include:
-            - A brief overall assessment
+            The summary must include:
+            - **Review mode**: ${{ steps.diff.outputs.mode }}
+            - **Files reviewed**: count from /tmp/changed-files.txt
+            - **History reconciliation**: which previous findings were resolved, which remain
             - A section per perspective with key findings (or "No issues found")
             - Total issue count by severity (critical / warning / note)
 

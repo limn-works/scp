@@ -2,12 +2,14 @@ name: Spec Drift Detection
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
     paths:
       - 'crates/**'
+      - 'bindings/**'
+      - 'tests/**'
+      - 'scripts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - "bindings/**"
 
 concurrency:
   group: spec-drift-${{ github.event.pull_request.number }}
@@ -15,6 +17,7 @@ concurrency:
 
 jobs:
   spec-drift:
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,6 +29,62 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Compute review scope
+        id: diff
+        run: |
+          EVENT="${{ github.event.action }}"
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          PR_BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          if [[ "$EVENT" == "synchronize" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            MODE="incremental"
+            DIFF_BASE="$BEFORE"
+            DIFF_HEAD="$AFTER"
+          else
+            MODE="full"
+            DIFF_BASE="$PR_BASE"
+            DIFF_HEAD="$HEAD"
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+          # Write file list
+          git diff --name-only "$DIFF_BASE".."$DIFF_HEAD" > /tmp/changed-files.txt || \
+            gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > /tmp/changed-files.txt
+
+          echo "## Review Scope" > /tmp/review-scope.md
+          echo "**Mode:** $MODE" >> /tmp/review-scope.md
+          echo "**Range:** \`${DIFF_BASE:0:8}..${DIFF_HEAD:0:8}\`" >> /tmp/review-scope.md
+          echo "**Files in scope:** $(wc -l < /tmp/changed-files.txt | tr -d ' ')" >> /tmp/review-scope.md
+          echo "" >> /tmp/review-scope.md
+          echo "### Changed files" >> /tmp/review-scope.md
+          cat /tmp/changed-files.txt >> /tmp/review-scope.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch review history
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          REPO="${{ github.repository }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+
+          echo "## Previous Spec Drift Comments" > /tmp/review-history.md
+
+          # PR-level comments (spec-drift posts as PR comments)
+          gh api "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | "- \(.user.login) at \(.created_at): \(.body | .[0:500])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
+
+          # Previous review verdicts (in case of inline comments)
+          echo "" >> /tmp/review-history.md
+          echo "## Previous Review Verdicts" >> /tmp/review-history.md
+          gh api "repos/$REPO/pulls/$PR/reviews" \
+            --jq '.[] | "- \(.state) by \(.user.login) at \(.submitted_at): \(.body | .[0:300])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run Claude spec drift check
         uses: anthropics/claude-code-action@v1
         with:
@@ -36,16 +95,30 @@ jobs:
             that diverges from the project's specifications.
 
             IMPORTANT: Be turn-efficient. Use parallel tool calls aggressively. Read multiple
-            files in one turn. Use `gh pr view --json files` (NOT `gh pr diff`) to get the
-            file list — do NOT read the full diff, it may be enormous.
+            files in one turn.
 
-            ## Step 1: Get changed files and group by spec area
+            ## Setup
 
-            ```bash
-            gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path'
-            ```
+            Read pre-computed files:
+            1. `/tmp/review-scope.md` — files in scope and review mode
+            2. `/tmp/review-history.md` — previous spec-drift comments
+            3. `/tmp/changed-files.txt` — file list for grouping by spec area
 
-            Group files into spec areas using these path prefixes:
+            This check is in **${{ steps.diff.outputs.mode }}** mode.
+            - **full**: Check all PR files against specs.
+            - **incremental**: Check ONLY files from the latest push against specs.
+
+            ## History Rules
+
+            Review previous spec-drift comments in /tmp/review-history.md.
+            - Do NOT repeat findings on files not in the current scope.
+            - If a previous "Action Required" is on a file in scope, check if fixed.
+              Report as **Resolved** or re-flag.
+            - If a previous finding is on a file NOT in scope, ignore it entirely.
+
+            ## Step 1: Group changed files by spec area
+
+            Group files from /tmp/changed-files.txt into spec areas using these path prefixes:
             - `**/identity/**`, `**/did/**` → `.docs/specs/01-identity.md`
             - `**/crypto/**`, `**/mls/**` → `.docs/specs/04-encryption.md`
             - `**/context/**` → `.docs/specs/05-contexts.md`
@@ -77,11 +150,7 @@ jobs:
 
             ## Step 2b: Cross-reference with PRD
 
-            Read the pending stories from the PRD to determine which spec gaps are planned work:
-            ```bash
-            gh pr view ${{ github.event.pull_request.number }} --json baseRefName --jq '.baseRefName'
-            ```
-            Then read `.docs/prds/main.json` and extract pending story titles:
+            Read `.docs/prds/main.json` and extract pending story titles:
             ```
             jq '[.stories[] | select(.status == "pending") | .title]' .docs/prds/main.json
             ```
@@ -105,7 +174,14 @@ jobs:
             Always start with a header line:
             `## Spec Drift Check — [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`
 
-            **If there are Action Required findings**, list them first under:
+            Include a scope line:
+            `**Mode:** ${{ steps.diff.outputs.mode }} | **Files checked:** <count>`
+
+            **If there are previously-resolved findings**, list them under:
+            `### Resolved (from previous review)`
+            Format: brief summary of what was fixed.
+
+            **If there are Action Required findings**, list them under:
             `### Action Required`
             Format each as:
             - **File:** `path/to/file.rs`
