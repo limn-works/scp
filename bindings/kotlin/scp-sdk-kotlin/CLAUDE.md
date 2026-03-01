@@ -74,6 +74,14 @@ Rust callbacks (`onMessage`, `onEvent`) run on non-coroutine threads. You cannot
 
 `HotStreamFactory` subscriptions are not tied to coroutine scope cancellation. You must call `stopContextEvents()`, `stopMessageStream()`, or `stopAll()` explicitly during teardown. In tests, use `@AfterEach` to call `factory.stopAll()`.
 
+### Streaming: messageHistoryPages and eventLogPages share the same FFI call
+
+`ColdStreamFactory.messageHistoryPages()` and `eventLogPages()` both call `infraBindings.eventLogQuery()` — they are currently identical at the FFI level. The distinction is semantic and documentary only. When a separate `messageHistoryQuery` FFI binding is added, `messageHistoryPages()` must be updated to call it, or it will silently continue routing message history queries to the event log endpoint.
+
+### Streaming: HotStreamFactory factory methods use runBlocking — do not call from constrained dispatchers
+
+`HotStreamFactory.contextEvents()` and `incomingMessages()` are synchronous (non-`suspend`) and use `runBlocking(Dispatchers.IO)` internally to call the subscribe FFI. This is correct when called from a non-coroutine context (e.g., ViewModel init). If called from a coroutine running on a single-threaded dispatcher (e.g., `Dispatchers.Main`), `runBlocking` will block that thread for the duration of the FFI call. Always call these from a non-constrained context or from within a `withContext(Dispatchers.IO)` block.
+
 ### UniFFI NativeLib.kt does not exist yet
 
 The `NativeBindings` interface defines placeholder signatures matching ADR-028. When UniFFI generates `internal/NativeLib.kt`, create a concrete `NativeBindings` implementation that delegates to it.

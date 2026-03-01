@@ -69,3 +69,61 @@ Tool extension error codes use `SCP-CTX-2001` (not `SCP-CTX-001`) to avoid
 collision with the existing codes in Context.swift. EventLog uses
 `SCP-CTX-2030`/`SCP-CTX-2031`. Transport uses `SCP-TRANS-5001`. MCP stubs
 use `SCP-MCP-10001` through `SCP-MCP-10004`.
+
+## ContextBridge type aliases must match ScpBindings, not ADR pseudocode
+
+When writing `*Bridge` typealias closures, derive signatures directly from
+the generated `ScpBindings.swift` function signatures — not from ADR
+pseudocode or the desired Swift API surface. The ADR-026 pseudocode omits
+the `identity` parameter that UniFFI-generated `contextSend`, `contextLeave`,
+and `contextClose` require:
+
+```swift
+// WRONG — derived from ADR pseudocode
+internal typealias SendFn = @Sendable (
+    _ handle: any ContextHandleProtocol,
+    _ payload: Data
+) async throws -> Void
+
+// CORRECT — derived from ScpBindings.swift
+// public func contextSend(handle: ContextHandle, identity: Identity, payload: Data) async throws
+internal typealias SendFn = @Sendable (
+    _ handle: ContextHandle,
+    _ identity: Identity,
+    _ payload: Data
+) async throws -> Void
+```
+
+The same applies to `LeaveFn`, `CloseFn`, and `CreateFn`. Mismatched
+signatures compile because tests inject mock closures that don't need to
+match UniFFI — the mismatch is invisible in tests but prevents production
+wiring. Always verify against `ScpBindings.swift` before writing defaults.
+
+## `noPointer:` constructors must not appear in production code paths
+
+`Identity(noPointer: .init())` and `ContextHandle(noPointer: .init())` are
+test infrastructure. Calling any Rust-backed method on them is undefined
+behaviour in a real build. Two patterns to avoid:
+
+1. Production bridge defaults that create `noPointer:` instances as
+   placeholder arguments (e.g., `let identity = Identity(noPointer: .init())`
+   inside `invokeTool`).
+2. Legacy API wrappers that create `ContextHandle(noPointer: .init())` as
+   a stand-in context handle (e.g., the `validate`/`mint`/`revoke` free
+   functions in `Ucan.swift`).
+
+If a production function needs an `Identity` or `ContextHandle`, it must
+receive one from the caller — not manufacture a fake. The injectable bridge
+pattern is for the bridge *function*, never for the bridge *arguments*.
+
+## Legacy API wrappers that manufacture fake handles always fail in production
+
+The legacy `validate(encoded:contextId:presenterDid:)` wrapper creates
+`ContextHandle(noPointer: .init())` and passes it to `ucanValidate`. The
+Rust bridge calls `crate::runtime::with_context(&handle.context_id, ...)`.
+A `noPointer:` handle has an empty `contextId`, so `with_context` returns
+`ScpError::Context("context not found")`. The validation never runs.
+
+Legacy free-function APIs that require a real context must either:
+- Accept a `ContextHandle` from the caller, or
+- Be removed in favour of the handle-based API.
