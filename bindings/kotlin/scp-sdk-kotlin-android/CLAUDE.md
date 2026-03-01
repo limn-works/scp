@@ -75,9 +75,33 @@ The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matchi
 
 `TestLifecycleOwner` from `lifecycle-runtime-testing` dispatches lifecycle events via a coroutine dispatcher. In tests, pass `UnconfinedTestDispatcher(testScheduler)` to `TestLifecycleOwner`'s constructor so lifecycle state changes take effect immediately. Using `StandardTestDispatcher` requires explicit `advanceUntilIdle()` calls between lifecycle transitions which can cause subtle ordering issues in flow collection tests.
 
-### ScpViewModel.onCleared() uses viewModelScope
+### ScpViewModel.onCleared() must NOT use viewModelScope
 
-The `onCleared()` method dispatches cleanup via `viewModelScope.launch`. In tests, set `Dispatchers.setMain(testDispatcher)` before constructing the ViewModel and call `Dispatchers.resetMain()` in teardown. The `viewModelScope` is cancelled after `onCleared()` returns, so cleanup coroutines must be launched before the scope is cancelled.
+DEFECT FOUND IN SCP-117 REVIEW: `ViewModel.clear()` cancels `viewModelScope` (via its `CloseableCoroutineScope` tag) **before** calling `onCleared()`. Any `viewModelScope.launch` inside `onCleared()` launches into a cancelled scope and silently does nothing — the coroutine is dropped. This means `ScpViewModel.onCleared()` as currently written does NOT call `leave()` on tracked contexts in production Android.
+
+The fix is to use a dedicated cleanup scope held by the ViewModel:
+```kotlin
+private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+override fun onCleared() {
+    cleanupScope.launch {
+        val contexts = mutex.withLock {
+            val snapshot = activeContexts.toList()
+            activeContexts.clear()
+            snapshot
+        }
+        for (ctx in contexts) {
+            runCatching { ctx.bridge.context.leave(ctx.handle) }
+        }
+        cleanupScope.cancel()
+    }
+    super.onCleared()
+}
+```
+
+Tests for `onCleared()` are also broken: `TestScpViewModel.callOnCleared()` calls `onCleared()` directly without pre-cancelling `viewModelScope`, so the tests pass but mask the production bug. Correct test strategy: use Robolectric with the real `ViewModelProvider` lifecycle, or restructure cleanup to use the dedicated scope above so its cancellation is controllable in tests.
+
+In tests, set `Dispatchers.setMain(testDispatcher)` before constructing the ViewModel and call `Dispatchers.resetMain()` in teardown.
 
 ### Lifecycle extension is generic, not SCP-specific
 
