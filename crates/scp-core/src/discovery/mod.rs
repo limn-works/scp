@@ -1,6 +1,7 @@
 //! Tool-interface discovery for SCP.
 //!
-//! Implements two-tier discovery per ADR-020 (`.docs/adrs/phase-4.md`):
+//! Implements two-tier discovery per ADR-020 (`.docs/adrs/phase-4.md`) and
+//! human-readable addressing per §22.
 //!
 //! 1. **DID document capabilities** -- Direct lookup via `did:dht`. Any agent
 //!    can publish capabilities in their DID document's `SCPCapabilities` service
@@ -9,9 +10,16 @@
 //! 2. **Discovery contexts** -- Searchable registries operated as standard SCP
 //!    contexts with open join policies and standardized tool schemas.
 //!
+//! 3. **Human-readable addressing** (§22) -- Resolution layer mapping human-
+//!    readable strings to DIDs and context IDs via petnames, discovery context
+//!    handles, attestation handles, and domain handles.
+//!
 //! # Modules
 //!
 //! - [`did_capabilities`] -- DID document capability resolution via `did:dht`.
+//! - [`addressing`] -- Address format types, trust levels, and unified resolution (§22).
+//! - [`handles`] -- Discovery context handle tools: register, lookup, deregister (§22.3).
+//! - [`petnames`] -- Petname storage in identity private state (§22.4).
 //!
 //! # Types
 //!
@@ -23,16 +31,29 @@
 //! - [`DiscoveryBootstrap`] -- Default discovery context configuration.
 //! - [`DataProvenance`] -- Placeholder provenance metadata (replaced by SCP-070).
 //! - [`DiscoveryError`] -- Error type for discovery operations.
+//! - [`AddressResolver`] -- Multi-path address resolution (§22.8).
+//! - [`TrustLevel`] -- Trust level for resolution results (§22.7).
+//! - [`HandleRegistry`] -- In-memory handle registry (§22.3).
+//! - [`PetnameMap`] -- Petname storage (§22.4).
 
+pub mod addressing;
 pub mod bootstrap;
 pub mod context;
 pub mod did_capabilities;
+pub mod handles;
+pub mod petnames;
 pub mod search;
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub use addressing::{
+    AddressResolution, AddressResolver, AddressType, AddressingError, HandleQuerier, HandleTarget,
+    ParsedAddress, PetnameStore, ResolutionCache, ResolutionLayer, ResolutionPath, TrustLevel,
+    normalize_address, parse_address, DISCOVERY_HANDLE_CACHE_TTL, DOMAIN_HANDLE_CACHE_TTL,
+    MAX_LOCAL_PART_LENGTH,
+};
 pub use bootstrap::{BootstrapConfig, BootstrapResolver, WellKnownBootstrapError};
 pub use context::{
     AgentDeregisterParams, AgentDeregisterResult, AgentRegisterParams, AgentRegisterResult,
@@ -41,6 +62,13 @@ pub use context::{
     TOOL_AGENT_SEARCH,
 };
 pub use did_capabilities::{CapabilityEntry, resolve_capabilities};
+pub use handles::{
+    HandleDeregisterParams, HandleDeregisterResult, HandleEntry, HandleLookupParams,
+    HandleLookupResult, HandleMetadata, HandleRegisterParams, HandleRegisterResult,
+    HandleRegisterStatus, HandleRegistry, HandleTypeFilter, TOOL_HANDLE_DEREGISTER,
+    TOOL_HANDLE_LOOKUP, TOOL_HANDLE_REGISTER,
+};
+pub use petnames::{PetnameEvent, PetnameMap};
 pub use search::{ContactCache, ContextQuerier, unified_search};
 
 // ---------------------------------------------------------------------------
