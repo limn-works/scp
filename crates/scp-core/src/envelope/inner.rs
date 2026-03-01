@@ -298,10 +298,17 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, E
 ///
 /// A domain separator ([`DOMAIN_SEPARATOR`]) is prepended to prevent
 /// cross-protocol signature confusion when the same Ed25519 key is reused
-/// across different signing contexts.
+/// across different signing contexts. Variable-length fields (`context_id`,
+/// `sender_did`) are prefixed with their length as a 4-byte big-endian u32 to
+/// prevent field-boundary ambiguity (e.g., `"abc" || "def"` vs `"abcd" || "ef"`).
+///
+/// Fixed-width fields (`epoch`, `generation`, `sequence`, `timestamp` as u64 BE;
+/// `payload_hash` and `provenance_hash` as 32-byte SHA-256 outputs) need no
+/// length prefix.
 ///
 /// ```text
-/// SHA-256(DOMAIN_SEPARATOR || context_id || sender_did || epoch_BE
+/// SHA-256(DOMAIN_SEPARATOR || len(context_id) || context_id
+///         || len(sender_did) || sender_did || epoch_BE
 ///         || generation_BE || sequence_BE || timestamp_BE
 ///         || payload_hash || provenance_hash)
 /// ```
@@ -632,10 +639,14 @@ mod tests {
         };
         let hash_with_domain = compute_canonical_hash(&params, &payload_hash, &provenance_hash);
 
-        // Hash WITHOUT any domain separator (manual construction).
+        // Hash WITHOUT any domain separator (manual construction with length prefixes).
+        #[allow(clippy::cast_possible_truncation)]
         let hash_without_domain = {
             let mut h = Sha256::new();
+            // No domain separator
+            h.update((5u32).to_be_bytes());
             h.update(b"ctx-1");
+            h.update((13u32).to_be_bytes());
             h.update(b"did:dht:alice");
             h.update(1u64.to_be_bytes());
             h.update(0u64.to_be_bytes());
@@ -646,11 +657,14 @@ mod tests {
             h.finalize().to_vec()
         };
 
-        // Hash with a DIFFERENT domain separator (manual construction).
+        // Hash with a DIFFERENT domain separator (manual construction with length prefixes).
+        #[allow(clippy::cast_possible_truncation)]
         let hash_alt_domain = {
             let mut h = Sha256::new();
             h.update(b"DIFFERENT-DOMAIN:");
+            h.update((5u32).to_be_bytes());
             h.update(b"ctx-1");
+            h.update((13u32).to_be_bytes());
             h.update(b"did:dht:alice");
             h.update(1u64.to_be_bytes());
             h.update(0u64.to_be_bytes());

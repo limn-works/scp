@@ -1050,9 +1050,14 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 /// Computes the canonical hash of a checkpoint for signing/verification.
 ///
 /// ```text
-/// SHA-256(context_id || sender_did || event_count_BE || merkle_root
+/// SHA-256("SCP-CHECKPOINT-V1:" || len(context_id) || context_id
+///         || len(sender_did) || sender_did || event_count_BE || merkle_root
 ///         || epoch_flag || epoch_BE || timestamp_BE)
 /// ```
+///
+/// Variable-length fields (`context_id`, `sender_did`) are prefixed with their
+/// length as a 4-byte big-endian u32 to prevent field-boundary ambiguity. The
+/// `SCP-CHECKPOINT-V1:` domain separator prevents cross-protocol hash confusion.
 ///
 /// The `epoch_flag` byte is `0x01` if epoch is `Some`, `0x00` if `None`.
 /// When `Some`, the epoch value follows as 8 big-endian bytes.
@@ -1065,8 +1070,16 @@ fn compute_checkpoint_canonical_hash(
     timestamp: u64,
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hasher.update(context_id.as_bytes());
-    hasher.update(sender_did.as_bytes());
+    hasher.update(b"SCP-CHECKPOINT-V1:");
+    // Length-prefix closure for variable-length fields. Field values (DIDs,
+    // context IDs) are short strings; truncation is not a concern.
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+    length_prefix(&mut hasher, context_id.as_bytes());
+    length_prefix(&mut hasher, sender_did.as_bytes());
     hasher.update(event_count.to_be_bytes());
     hasher.update(merkle_root);
     match epoch {

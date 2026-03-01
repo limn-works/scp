@@ -64,14 +64,19 @@ use crate::identity::DID;
 
 /// Unique identifier for a governance proposal.
 ///
-/// Computed as `SHA-256(context_id || proposer_did || action_cbor || timestamp)`.
+/// Computed as `SHA-256("SCP-PROPOSAL-V1:" || len(context_id) || context_id
+///   || len(proposer_did) || proposer_did || len(action_bytes) || action_bytes
+///   || timestamp_BE)`.
+/// Variable-length fields are prefixed with their length as a 4-byte big-endian
+/// u32 to prevent field-boundary ambiguity. The domain separator prevents
+/// cross-protocol hash confusion.
 /// Deterministic for identical inputs, collision-resistant across contexts.
 pub type ProposalId = [u8; 32];
 
 /// Compute a deterministic proposal ID from its components.
 ///
-/// Uses SHA-256 over the concatenation of context ID, proposer DID, serialized
-/// action bytes, and timestamp (big-endian u64).
+/// Uses SHA-256 with a domain separator and length-prefixed variable-length
+/// fields. Fixed-width fields (timestamp) need no prefix.
 pub(crate) fn compute_proposal_id(
     context_id: &str,
     proposer_did: &DID,
@@ -79,9 +84,17 @@ pub(crate) fn compute_proposal_id(
     timestamp: u64,
 ) -> ProposalId {
     let mut hasher = Sha256::new();
-    hasher.update(context_id.as_bytes());
-    hasher.update(proposer_did.as_ref().as_bytes());
-    hasher.update(action_bytes);
+    hasher.update(b"SCP-PROPOSAL-V1:");
+    // Length-prefix closure for variable-length fields. Field values (DIDs,
+    // context IDs) are short strings; truncation is not a concern.
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+    length_prefix(&mut hasher, context_id.as_bytes());
+    length_prefix(&mut hasher, proposer_did.as_ref().as_bytes());
+    length_prefix(&mut hasher, action_bytes);
     hasher.update(timestamp.to_be_bytes());
     let result = hasher.finalize();
     let mut id = [0u8; 32];
