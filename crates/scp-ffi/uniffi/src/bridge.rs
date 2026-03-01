@@ -29,7 +29,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use scp_core::crypto::ucan::UcanError as CoreUcanError;
+use scp_core::crypto::ucan::{Attenuation, UcanError as CoreUcanError, UcanHeader, UcanPayload};
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::validate::{
     DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
@@ -2075,6 +2075,11 @@ pub async fn ucan_validate(
 
 /// Mints a new UCAN token for a context member.
 ///
+/// Stub: builds a structurally valid JWT with a zero-signature placeholder
+/// (`[0u8; 64]`). The token has correct header, payload, and encoding but
+/// will NOT pass Ed25519 signature verification. Real signing requires
+/// `KeyCustody` to be plumbed through the FFI boundary (SCP-214).
+///
 /// # Arguments
 ///
 /// * `handle` — The context to mint the token for.
@@ -2087,8 +2092,8 @@ pub async fn ucan_validate(
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Permission` if minting fails (capabilities outside
-/// the context ceiling, issuer not authorized, etc.).
+/// Returns `ScpError::Permission` if minting fails (system clock error,
+/// nonce generation failure, or JSON serialization error).
 #[uniffi::export]
 pub async fn ucan_mint(
     handle: Arc<ContextHandle>,
@@ -2097,6 +2102,9 @@ pub async fn ucan_mint(
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
             let creator_did =
                 crate::runtime::with_context(&handle.context_id, |rt| Ok(rt.creator_did.clone()))?;
 
@@ -2123,27 +2131,42 @@ pub async fn ucan_mint(
                 .as_secs();
             let exp = now + 3600;
 
-            let key_custody = InMemoryKeyCustody::new();
-            let (signing_key, _doc) = DidDht::new()
-                .create(&key_custody)
-                .await
-                .map_err(ScpError::from)?;
+            let header = UcanHeader::new();
+            let att: Vec<Attenuation> = capability_uris
+                .iter()
+                .map(|uri| Attenuation {
+                    with: uri.clone(),
+                    can: "invoke".to_owned(),
+                })
+                .collect();
 
-            let mint_params = scp_core::crypto::ucan::mint::MintParams {
-                issuer_did: &creator_did,
-                issuer_key: &signing_key.active_signing_key,
-                audience_did: &member_did,
-                context_id: &handle.context_id,
-                capabilities: &capabilities,
-                lifetime_secs: 3600,
-                not_before: None,
-                proofs: Vec::new(),
-                facts: None,
+            let payload = UcanPayload {
+                iss: creator_did.clone(),
+                aud: member_did.clone(),
+                exp,
+                nbf: None,
+                nnc: nonce.clone(),
+                att,
+                prf: Vec::new(),
+                fct: None,
             };
 
-            let minted = scp_core::crypto::ucan::mint::mint_ucan(&mint_params, &key_custody)
-                .await
-                .map_err(ScpError::from)?;
+            let header_json = serde_json::to_vec(&header).map_err(|e| ScpError::Permission {
+                message: format!("header serialization failed: {e}"),
+                code: "SCP-PERM-3004".to_owned(),
+            })?;
+            let payload_json =
+                serde_json::to_vec(&payload).map_err(|e| ScpError::Permission {
+                    message: format!("payload serialization failed: {e}"),
+                    code: "SCP-PERM-3004".to_owned(),
+                })?;
+
+            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+
+            // Stub: zero-signature placeholder until KeyCustody is plumbed through FFI (SCP-214)
+            let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+            let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
 
             let token_handle = Arc::new(UcanToken {
                 data: UcanTokenData {
@@ -2153,7 +2176,7 @@ pub async fn ucan_mint(
                     capabilities: capability_uris,
                     expires_at: Some(exp),
                 },
-                encoded: minted.encoded,
+                encoded,
             });
             increment_handle_count();
             Ok(token_handle)

@@ -26,6 +26,7 @@ scp-core = { path = "../../scp-core" }
 # desktop contexts where no hardware security module is available.
 scp-platform = { path = "../../scp-platform", features = ["software_platform"] }
 scp-transport = { path = "../../scp-transport" }
+base64 = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
