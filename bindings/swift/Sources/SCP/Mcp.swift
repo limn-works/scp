@@ -135,86 +135,72 @@ public nonisolated enum McpClientConfig: Sendable {
     case sse(url: String)
 }
 
-// MARK: - UniFFI Bridge Stubs
+// MARK: - McpBridge
 
-/// Start an MCP server via the UniFFI bridge.
+/// Namespace for MCP bridge function references.
 ///
-/// Placeholder stub for the UniFFI-generated `mcp_serve` function.
+/// MCP bridge functions are not yet part of the UniFFI bridge (no Rust
+/// `mcp_serve`, `mcp_client_create`, etc. exports exist). These closures
+/// provide the injectable bridge pattern: defaults delegate to placeholder
+/// implementations that will be replaced when the MCP UniFFI exports land.
 ///
-/// - Parameters:
-///   - config: The MCP server configuration.
-///   - completion: Callback delivering success or an error.
-internal func scpMcpServe(
-    config: McpServerConfig,
-    completion: @Sendable @escaping (Result<Void, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Tool(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-MCP-10001"
-    )))
-}
+/// See ADR-015 for MCP spec and ADR-026 for the delegation pattern.
+internal enum McpBridge {
+    /// Start an MCP server.
+    internal typealias ServeFn = @Sendable (
+        _ config: McpServerConfig
+    ) async throws -> Void
 
-/// Create an MCP client via the UniFFI bridge.
-///
-/// Placeholder stub for the UniFFI-generated `mcp_client_create` function.
-///
-/// - Parameters:
-///   - config: The MCP client configuration.
-///   - completion: Callback delivering the client handle or an error.
-internal func scpMcpClientCreate(
-    config: McpClientConfig,
-    completion: @Sendable @escaping (Result<McpClientHandle, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Tool(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-MCP-10002"
-    )))
-}
+    /// Create an MCP client connection.
+    internal typealias ClientCreateFn = @Sendable (
+        _ config: McpClientConfig
+    ) async throws -> McpClientHandle
 
-/// List tools from an MCP client via the UniFFI bridge.
-///
-/// Placeholder stub for the UniFFI-generated `mcp_client_list_tools` function.
-///
-/// - Parameters:
-///   - handle: The MCP client handle.
-///   - completion: Callback delivering the tool definitions or an error.
-internal func scpMcpClientListTools(
-    handle: McpClientHandle,
-    completion: @Sendable @escaping (Result<[McpToolDefinition], ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Tool(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-MCP-10003"
-    )))
-}
+    /// List tools from an MCP client.
+    internal typealias ClientListToolsFn = @Sendable (
+        _ handle: McpClientHandle
+    ) async throws -> [McpToolDefinition]
 
-/// Invoke a tool via an MCP client via the UniFFI bridge.
-///
-/// Placeholder stub for the UniFFI-generated `mcp_client_invoke` function.
-///
-/// - Parameters:
-///   - handle: The MCP client handle.
-///   - toolName: The name of the tool to invoke.
-///   - input: The tool input as serialized JSON.
-///   - contextId: The SCP context ID for provenance.
-///   - invokerDid: The DID of the invoking agent for provenance.
-///   - completion: Callback delivering the result or an error.
-internal func scpMcpClientInvoke(
-    handle: McpClientHandle,
-    toolName: String,
-    input: Data,
-    contextId: String,
-    invokerDid: String,
-    completion: @Sendable @escaping (Result<McpToolResult, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Tool(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-MCP-10004"
-    )))
+    /// Invoke a tool via an MCP client.
+    internal typealias ClientInvokeFn = @Sendable (
+        _ handle: McpClientHandle,
+        _ toolName: String,
+        _ input: Data,
+        _ contextId: String,
+        _ invokerDid: String
+    ) async throws -> McpToolResult
+
+    /// Default serve function. Will delegate to UniFFI when MCP exports land.
+    internal static let defaultServe: ServeFn = { _ in
+        throw ScpError.Tool(
+            message: "MCP server bridge not yet wired to UniFFI — awaiting mcp_serve export",
+            code: "SCP-MCP-10001"
+        )
+    }
+
+    /// Default client create function. Will delegate to UniFFI when MCP exports land.
+    internal static let defaultClientCreate: ClientCreateFn = { _ in
+        throw ScpError.Tool(
+            message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_create export",
+            code: "SCP-MCP-10002"
+        )
+    }
+
+    /// Default client list tools function.
+    internal static let defaultClientListTools: ClientListToolsFn = { _ in
+        throw ScpError.Tool(
+            message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_list_tools export",
+            code: "SCP-MCP-10003"
+        )
+    }
+
+    /// Default client invoke function.
+    internal static let defaultClientInvoke: ClientInvokeFn = { _, _, _, _, _ in
+        throw ScpError.Tool(
+            message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_invoke export",
+            code: "SCP-MCP-10004"
+        )
+    }
 }
 
 // MARK: - McpClientHandle
@@ -248,30 +234,25 @@ internal final class McpClientHandle: Sendable {
 /// - Resource listing and reading
 /// - MCP lifecycle (`initialize`, `ping`)
 ///
-/// This function bridges the asynchronous UniFFI `mcp_serve` call to
-/// Swift concurrency via `CheckedContinuation`.
+/// Delegates to the MCP bridge serve function. When the UniFFI MCP exports
+/// land, this will call through to the generated `mcp_serve` binding.
 ///
-/// - Parameter config: The ``McpServerConfig`` specifying which contexts
-///   to expose and the transport type.
-/// - Throws: ``ScpError/tool(message:code:)`` if the server fails to start.
+/// - Parameters:
+///   - config: The ``McpServerConfig`` specifying which contexts to expose
+///     and the transport type.
+///   - serveFn: Bridge function override for testing.
+/// - Throws: ``ScpError/Tool(message:code:)`` if the server fails to start.
 ///
 /// ## Provenance
 ///
 /// - ADR-015 (MCP) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - Story SCP-101
-public func serveMcp(config: McpServerConfig) async throws {
-    try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Void, Error>) in
-        scpMcpServe(config: config) { result in
-            switch result {
-            case .success:
-                continuation.resume()
-            case .failure(let error):
-                continuation.resume(throwing: error)
-            }
-        }
-    }
+/// - Story SCP-221
+public func serveMcp(
+    config: McpServerConfig,
+    serveFn: McpBridge.ServeFn = McpBridge.defaultServe
+) async throws {
+    try await serveFn(config)
 }
 
 // MARK: - McpClient
@@ -307,6 +288,12 @@ public actor McpClient {
     /// The internal handle wrapping the native UniFFI MCP client.
     private let handle: McpClientHandle
 
+    /// Bridge function for listing tools (injectable for testing).
+    private let listToolsFn: McpBridge.ClientListToolsFn
+
+    /// Bridge function for invoking tools (injectable for testing).
+    private let invokeFn: McpBridge.ClientInvokeFn
+
     // MARK: - Internal Initializer
 
     /// Creates an ``McpClient`` from an internal ``McpClientHandle``.
@@ -314,35 +301,44 @@ public actor McpClient {
     /// This initializer is internal -- callers use ``connect(config:)`` to
     /// obtain an ``McpClient``.
     ///
-    /// - Parameter handle: The opaque MCP client handle from the UniFFI bridge.
-    internal init(handle: McpClientHandle) {
+    /// - Parameters:
+    ///   - handle: The opaque MCP client handle from the UniFFI bridge.
+    ///   - listToolsFn: Bridge function for listing tools.
+    ///   - invokeFn: Bridge function for invoking tools.
+    internal init(
+        handle: McpClientHandle,
+        listToolsFn: @escaping McpBridge.ClientListToolsFn = McpBridge.defaultClientListTools,
+        invokeFn: @escaping McpBridge.ClientInvokeFn = McpBridge.defaultClientInvoke
+    ) {
         self.handle = handle
+        self.listToolsFn = listToolsFn
+        self.invokeFn = invokeFn
     }
 
     // MARK: - Factory
 
     /// Connects to an external MCP server and completes the MCP handshake.
     ///
-    /// Establishes a connection using the specified transport (stdio or SSE)
-    /// and performs the MCP `initialize` / `initialized` handshake.
+    /// Delegates to the MCP bridge client create function. When the UniFFI
+    /// MCP exports land, this will call through to the generated binding.
     ///
-    /// - Parameter config: The ``McpClientConfig`` specifying the connection
-    ///   transport.
+    /// - Parameters:
+    ///   - config: The ``McpClientConfig`` specifying the connection transport.
+    ///   - createFn: Bridge function override for testing.
     /// - Returns: A connected ``McpClient`` ready to list and invoke tools.
-    /// - Throws: ``ScpError/tool(message:code:)`` if the connection or
+    /// - Throws: ``ScpError/Tool(message:code:)`` if the connection or
     ///   handshake fails.
-    public static func connect(config: McpClientConfig) async throws -> McpClient {
-        let handle = try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<McpClientHandle, Error>) in
-            scpMcpClientCreate(config: config) { result in
-                switch result {
-                case .success(let clientHandle):
-                    continuation.resume(returning: clientHandle)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+    ///
+    /// ## Provenance
+    ///
+    /// - ADR-015 (MCP) in `.docs/adrs/phase-3.md`
+    /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+    /// - Story SCP-221
+    public static func connect(
+        config: McpClientConfig,
+        createFn: McpBridge.ClientCreateFn = McpBridge.defaultClientCreate
+    ) async throws -> McpClient {
+        let handle = try await createFn(config)
         return McpClient(handle: handle)
     }
 
@@ -354,19 +350,9 @@ public actor McpClient {
     ///
     /// - Returns: An array of ``McpToolDefinition`` values describing available
     ///   tools.
-    /// - Throws: ``ScpError/tool(message:code:)`` if the listing fails.
+    /// - Throws: ``ScpError/Tool(message:code:)`` if the listing fails.
     public func listTools() async throws -> [McpToolDefinition] {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<[McpToolDefinition], Error>) in
-            scpMcpClientListTools(handle: handle) { result in
-                switch result {
-                case .success(let tools):
-                    continuation.resume(returning: tools)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+        try await listToolsFn(handle)
     }
 
     // MARK: - Tool Invocation
@@ -383,29 +369,13 @@ public actor McpClient {
     ///   - contextId: The SCP context ID for provenance tracking.
     ///   - invokerDid: The DID of the agent invoking the tool.
     /// - Returns: An ``McpToolResult`` containing the output and provenance.
-    /// - Throws: ``ScpError/tool(message:code:)`` if invocation fails.
+    /// - Throws: ``ScpError/Tool(message:code:)`` if invocation fails.
     public func invoke(
         tool: String,
         input: Data,
         contextId: String,
         invokerDid: String
     ) async throws -> McpToolResult {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<McpToolResult, Error>) in
-            scpMcpClientInvoke(
-                handle: handle,
-                toolName: tool,
-                input: input,
-                contextId: contextId,
-                invokerDid: invokerDid
-            ) { result in
-                switch result {
-                case .success(let toolResult):
-                    continuation.resume(returning: toolResult)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+        try await invokeFn(handle, tool, input, contextId, invokerDid)
     }
 }

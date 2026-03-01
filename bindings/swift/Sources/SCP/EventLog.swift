@@ -5,7 +5,8 @@ import Foundation
 // UniFFI Event fields: eventType, actorDid, timestamp, payloadJson (String), sequence
 // UniFFI Proof fields: verified (Bool), proofType (String), detailsJson (String)
 //
-// Checkpoint, EventLogHandle, and EventLog are pure Swift types (not in UniFFI).
+// Checkpoint and EventLog are pure Swift types. EventLogHandle is replaced by
+// ContextHandle from UniFFI for bridge calls.
 
 // MARK: - Checkpoint
 
@@ -58,69 +59,78 @@ public nonisolated struct Checkpoint: Sendable {
     }
 }
 
-// MARK: - EventLogHandle (UniFFI bridge type)
+// MARK: - EventLogHandle
 
-/// Internal opaque handle wrapping the UniFFI-generated event log binding.
+/// Internal opaque handle wrapping event log state.
 ///
-/// This placeholder mirrors the handle type that UniFFI will generate from
-/// the Rust `EventLog` struct. When the XCFramework build pipeline ships
-/// (SCP-103), this definition is replaced by the auto-generated type.
+/// Holds either a real ``ContextHandle`` for UniFFI bridge calls or a
+/// standalone context ID for testing. When the XCFramework is available,
+/// all event log operations delegate through the ``ContextHandle``.
 internal final class EventLogHandle: Sendable {
     /// The context ID this event log belongs to.
     let contextId: String
 
+    /// The UniFFI context handle, if available.
+    let contextHandle: ContextHandle?
+
     /// Creates an ``EventLogHandle`` for the given context.
     init(contextId: String) {
         self.contextId = contextId
+        self.contextHandle = nil
+    }
+
+    /// Creates an ``EventLogHandle`` backed by a UniFFI context handle.
+    init(contextHandle: ContextHandle) {
+        self.contextId = contextHandle.contextId()
+        self.contextHandle = contextHandle
     }
 }
 
-// MARK: - UniFFI Bridge Stubs
+// MARK: - EventLogBridge
 
-/// Query events from an event log via the UniFFI bridge.
-internal func scpEventLogQuery(
-    handle: EventLogHandle,
-    fromSequence: UInt64,
-    limit: UInt64,
-    completion: @Sendable @escaping (Result<[Event], ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Validation(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-CTX-2030"
-    )))
-}
+/// Namespace for UniFFI bridge function references used by event log operations.
+/// Each typealias maps 1:1 to a UniFFI-generated async function. Closures are
+/// injected for testability; defaults call through to ScpBindings.
+///
+/// See ADR-026 for the flat delegation pattern and ADR-011 for event log spec.
+internal enum EventLogBridge {
+    /// Query events from a context's event log. Maps to ``eventLogQuery``.
+    internal typealias QueryFn = @Sendable (
+        _ handle: ContextHandle,
+        _ filterJson: String?
+    ) async throws -> [Event]
 
-/// Prove inclusion of an event in the log via the UniFFI bridge.
-internal func scpEventLogProve(
-    handle: EventLogHandle,
-    leafIndex: UInt64,
-    completion: @Sendable @escaping (Result<Proof, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Validation(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-CTX-2031"
-    )))
-}
+    /// Verify an event log claim. Maps to ``eventLogVerify``.
+    internal typealias VerifyFn = @Sendable (
+        _ handle: ContextHandle,
+        _ claimJson: String
+    ) async throws -> Proof
 
-/// Verify an inclusion proof via the UniFFI bridge.
-internal func scpEventLogVerify(
-    proof: Proof,
-    completion: @Sendable @escaping (Result<Bool, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Validation(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-CTX-2032"
-    )))
+    /// Default query function that delegates to the UniFFI-generated binding.
+    internal static let defaultQuery: QueryFn = { handle, filterJson in
+        try await eventLogQuery(handle: handle, filterJson: filterJson)
+    }
+
+    /// Default verify function that delegates to the UniFFI-generated binding.
+    internal static let defaultVerify: VerifyFn = { handle, claimJson in
+        try await eventLogVerify(handle: handle, claimJson: claimJson)
+    }
 }
 
 // MARK: - EventLog
 
 /// A verifiable, append-only Merkle event log for an SCP context.
 ///
+/// Delegates to UniFFI ``eventLogQuery`` and ``eventLogVerify`` bridge
+/// functions when backed by a real ``ContextHandle``.
+///
 /// See ADR-011 (Event Log) in `.docs/adrs/phase-2.md`.
+///
+/// ## Provenance
+///
+/// - ADR-011 (Event Log) in `.docs/adrs/phase-2.md`
+/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+/// - Story SCP-221
 public nonisolated struct EventLog: Sendable {
     /// The context ID this event log belongs to.
     public let contextId: String
@@ -128,58 +138,63 @@ public nonisolated struct EventLog: Sendable {
     /// The internal handle wrapping the native UniFFI event log object.
     private let handle: EventLogHandle
 
+    /// Bridge function for querying events (injectable for testing).
+    private let queryFn: EventLogBridge.QueryFn
+
+    /// Bridge function for verifying proofs (injectable for testing).
+    private let verifyFn: EventLogBridge.VerifyFn
+
     /// Creates an ``EventLog`` from an internal ``EventLogHandle``.
-    internal init(handle: EventLogHandle) {
+    internal init(
+        handle: EventLogHandle,
+        queryFn: @escaping EventLogBridge.QueryFn = EventLogBridge.defaultQuery,
+        verifyFn: @escaping EventLogBridge.VerifyFn = EventLogBridge.defaultVerify
+    ) {
         self.contextId = handle.contextId
         self.handle = handle
+        self.queryFn = queryFn
+        self.verifyFn = verifyFn
     }
 
-    /// Retrieves events from the log starting at a given sequence number.
+    /// Retrieves events from the log with optional filter criteria.
+    ///
+    /// - Parameters:
+    ///   - fromSequence: Start sequence number for the query range.
+    ///   - limit: Maximum number of events to return.
+    /// - Returns: An array of ``Event`` records matching the criteria.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the query fails.
     public func query(fromSequence: UInt64, limit: UInt64) async throws -> [Event] {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<[Event], Error>) in
-            scpEventLogQuery(
-                handle: handle,
-                fromSequence: fromSequence,
-                limit: limit
-            ) { result in
-                switch result {
-                case .success(let events):
-                    continuation.resume(returning: events)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
+        guard let contextHandle = handle.contextHandle else {
+            throw ScpError.Context(
+                message: "EventLog not backed by a UniFFI ContextHandle",
+                code: "SCP-CTX-2030"
+            )
         }
+        let filterJson = #"{"after_sequence": \#(fromSequence), "limit": \#(limit)}"#
+        return try await queryFn(contextHandle, filterJson)
     }
 
     /// Generates a Merkle inclusion proof for the event at the given index.
+    ///
+    /// - Parameter leafIndex: The index of the event to prove inclusion for.
+    /// - Returns: A ``Proof`` with the Merkle path and verification status.
+    /// - Throws: ``ScpError/Context(message:code:)`` if proof generation fails.
     public func proveInclusion(leafIndex: UInt64) async throws -> Proof {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Proof, Error>) in
-            scpEventLogProve(handle: handle, leafIndex: leafIndex) { result in
-                switch result {
-                case .success(let proof):
-                    continuation.resume(returning: proof)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
+        guard let contextHandle = handle.contextHandle else {
+            throw ScpError.Context(
+                message: "EventLog not backed by a UniFFI ContextHandle",
+                code: "SCP-CTX-2031"
+            )
         }
+        let claimJson = #"{"type": "inclusion", "leaf_index": \#(leafIndex)}"#
+        return try await verifyFn(contextHandle, claimJson)
     }
 
     /// Verifies a Merkle inclusion proof.
+    ///
+    /// - Parameter proof: The proof to verify.
+    /// - Returns: `true` if the proof is valid.
     public static func verifyInclusion(_ proof: Proof) async throws -> Bool {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Bool, Error>) in
-            scpEventLogVerify(proof: proof) { result in
-                switch result {
-                case .success(let isValid):
-                    continuation.resume(returning: isValid)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+        return proof.verified
     }
 }

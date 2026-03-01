@@ -45,52 +45,48 @@ public nonisolated struct ToolInvocationResult: Sendable {
     }
 }
 
-// MARK: - UniFFI Bridge Stubs
+// MARK: - ToolBridge
 
-/// Invoke a tool via the UniFFI bridge.
+/// Namespace for UniFFI bridge function references used by tool operations.
+/// Each typealias maps 1:1 to a UniFFI-generated async function. Closures are
+/// injected for testability; defaults call through to ScpBindings.
 ///
-/// Placeholder stub for the UniFFI-generated `tool_invoke` function.
-internal func scpToolInvoke(
-    contextId: String,
-    toolName: String,
-    inputJson: Data,
-    completion: @Sendable @escaping (Result<ToolInvocationResult, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Tool(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TOOL-6001"
-    )))
-}
+/// See ADR-026 for the flat delegation pattern and ADR-011 for tool spec.
+internal enum ToolBridge {
+    /// Invoke a tool. Maps to ``toolInvoke`` in ScpBindings.
+    internal typealias InvokeFn = @Sendable (
+        _ handle: ContextHandle,
+        _ toolId: String,
+        _ inputJson: String,
+        _ identity: Identity
+    ) async throws -> String
 
-/// Register a tool via the UniFFI bridge.
-///
-/// Placeholder stub for the UniFFI-generated `tool_register` function.
-internal func scpToolRegister(
-    contextId: String,
-    definition: ToolDefinition,
-    completion: @Sendable @escaping (Result<String, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Tool(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TOOL-6002"
-    )))
-}
+    /// Register a tool. Maps to ``toolRegister`` in ScpBindings.
+    internal typealias RegisterFn = @Sendable (
+        _ handle: ContextHandle,
+        _ definition: ToolDefinition
+    ) async throws -> String
 
-/// Verify a tool via the UniFFI bridge.
-///
-/// Placeholder stub for the UniFFI-generated `tool_verify` function.
-internal func scpToolVerify(
-    contextId: String,
-    toolName: String,
-    completion: @Sendable @escaping (Result<ToolVerificationResult, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Tool(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TOOL-6003"
-    )))
+    /// Verify a tool. Maps to ``toolVerify`` in ScpBindings.
+    internal typealias VerifyFn = @Sendable (
+        _ handle: ContextHandle,
+        _ toolId: String
+    ) async throws -> ToolVerificationResult
+
+    /// Default invoke function that delegates to the UniFFI-generated binding.
+    internal static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity in
+        try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity)
+    }
+
+    /// Default register function that delegates to the UniFFI-generated binding.
+    internal static let defaultRegister: RegisterFn = { handle, definition in
+        try await toolRegister(handle: handle, definition: definition)
+    }
+
+    /// Default verify function that delegates to the UniFFI-generated binding.
+    internal static let defaultVerify: VerifyFn = { handle, toolId in
+        try await toolVerify(handle: handle, toolId: toolId)
+    }
 }
 
 // MARK: - Context Tool Extensions
@@ -100,84 +96,119 @@ extension Context {
 
     /// Invokes a registered tool in this context.
     ///
+    /// Delegates to the UniFFI ``toolInvoke`` bridge function. The input Data
+    /// is converted to a UTF-8 JSON string for the bridge call, and the output
+    /// JSON string is wrapped in a ``ToolInvocationResult`` with provenance.
+    ///
     /// - Parameters:
     ///   - tool: The name of the tool to invoke.
-    ///   - input: The tool input as serialized JSON.
+    ///   - input: The tool input as serialized JSON data.
+    ///   - invokeFn: Bridge function override for testing.
     /// - Returns: A ``ToolInvocationResult`` containing the tool's output and
     ///   provenance metadata.
     /// - Throws: ``ScpError/Tool(message:code:)`` if the tool is not found,
     ///   the input fails schema validation, or the invocation is unauthorized.
     ///   ``ScpError/Context(message:code:)`` if the context is not active.
-    public func invokeTool(_ tool: String, input: Data) async throws -> ToolInvocationResult {
+    ///
+    /// ## Provenance
+    ///
+    /// - ADR-011 (Event Log) in `.docs/adrs/phase-2.md`
+    /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+    /// - Story SCP-221
+    public func invokeTool(
+        _ tool: String,
+        input: Data,
+        invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
+    ) async throws -> ToolInvocationResult {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
-        return try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<ToolInvocationResult, Error>) in
-            scpToolInvoke(contextId: contextId, toolName: tool, inputJson: input) { result in
-                switch result {
-                case .success(let invocationResult):
-                    continuation.resume(returning: invocationResult)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
         }
+        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
+        let identity = Identity(noPointer: .init())
+        let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity)
+        return ToolInvocationResult(
+            output: Data(outputJson.utf8),
+            invokerDid: "",
+            contextId: contextId,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+        )
     }
 
     /// Registers a tool in this context.
     ///
-    /// - Parameter definition: The ``ToolDefinition`` describing the tool.
+    /// Delegates to the UniFFI ``toolRegister`` bridge function.
+    ///
+    /// - Parameters:
+    ///   - definition: The ``ToolDefinition`` describing the tool.
+    ///   - registerFn: Bridge function override for testing.
     /// - Returns: The assigned tool identifier.
     /// - Throws: ``ScpError/Tool(message:code:)`` if registration fails.
     ///   ``ScpError/Context(message:code:)`` if the context is not active.
-    public func registerTool(_ definition: ToolDefinition) async throws -> String {
+    ///
+    /// ## Provenance
+    ///
+    /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+    /// - Story SCP-221
+    public func registerTool(
+        _ definition: ToolDefinition,
+        registerFn: ToolBridge.RegisterFn = ToolBridge.defaultRegister
+    ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
-        return try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<String, Error>) in
-            scpToolRegister(contextId: contextId, definition: definition) { result in
-                switch result {
-                case .success(let toolId):
-                    continuation.resume(returning: toolId)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
         }
+        return try await registerFn(contextHandle, definition)
     }
 
     /// Verifies a tool against its registered test vectors.
     ///
-    /// - Parameter tool: The name of the tool to verify.
+    /// Delegates to the UniFFI ``toolVerify`` bridge function.
+    ///
+    /// - Parameters:
+    ///   - tool: The name of the tool to verify.
+    ///   - verifyFn: Bridge function override for testing.
     /// - Returns: A ``ToolVerificationResult`` describing the outcome.
     /// - Throws: ``ScpError/Tool(message:code:)`` if the tool is not found
     ///   or verification fails. ``ScpError/Context(message:code:)`` if the
     ///   context is not active.
-    public func verifyTool(_ tool: String) async throws -> ToolVerificationResult {
+    ///
+    /// ## Provenance
+    ///
+    /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+    /// - Story SCP-221
+    public func verifyTool(
+        _ tool: String,
+        verifyFn: ToolBridge.VerifyFn = ToolBridge.defaultVerify
+    ) async throws -> ToolVerificationResult {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
-        return try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<ToolVerificationResult, Error>) in
-            scpToolVerify(contextId: contextId, toolName: tool) { result in
-                switch result {
-                case .success(let verificationResult):
-                    continuation.resume(returning: verificationResult)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
         }
+        return try await verifyFn(contextHandle, tool)
     }
 }

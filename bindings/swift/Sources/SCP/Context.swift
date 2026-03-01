@@ -126,10 +126,13 @@ public actor Context {
     /// The current lifecycle state of this context.
     public private(set) var state: ContextState
 
-    // MARK: - Private state
+    // MARK: - Internal state
 
     /// The opaque UniFFI handle to the Rust context.
-    private let handle: any ContextHandleProtocol
+    ///
+    /// Internal visibility so that extensions in other files (Tools.swift,
+    /// etc.) can cast to ``ContextHandle`` for UniFFI bridge calls.
+    internal let handle: any ContextHandleProtocol
 
     /// The continuation for the active message stream, if any.
     /// Retained so that ``close()`` and ``leave()`` can finish the stream.
@@ -243,13 +246,13 @@ public actor Context {
     /// sequencing, and transport.
     ///
     /// - Parameter payload: The raw message data to send.
-    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2001"`
+    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-001"`
     ///   if the context is not active, or if the bridge send operation fails.
     public func send(_ payload: Data) async throws {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-CTX-2001"
+                code: "SCP-CTX-001"
             )
         }
         try await sendFn(handle, payload)
@@ -291,7 +294,7 @@ public actor Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-CTX-2001"
+                code: "SCP-CTX-001"
             )
         }
         try await leaveFn(handle)

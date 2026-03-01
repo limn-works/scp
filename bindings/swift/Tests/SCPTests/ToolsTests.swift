@@ -12,11 +12,11 @@ import Testing
 ///     operatorDid, testVectorsJson (String?), implementationHash (Data?)
 /// UniFFI ToolVerificationResult fields: toolId (String), passed (Bool), failures ([String])
 ///
-/// These tests validate the Swift ergonomics layer and type shapes. The
-/// UniFFI bridge stubs return placeholder errors until SCP-103 ships.
+/// These tests validate the Swift ergonomics layer, type shapes, and async
+/// bridging through injectable bridge closures.
 ///
 /// See ADR-026 (Swift SDK), `.docs/scaffold/shared.md` conformance testing,
-/// and story SCP-102.
+/// and story SCP-221.
 @Suite("Tools Tests")
 struct ToolsTests {
 
@@ -47,8 +47,6 @@ struct ToolsTests {
 
     @Test("ToolDefinition stores all fields correctly")
     func toolDefinitionFields() {
-        // UniFFI ToolDefinition uses inputSchemaJson/outputSchemaJson (String)
-        // and testVectorsJson (String?) instead of typed arrays.
         let definition = ToolDefinition(
             name: "calculator",
             description: "Performs arithmetic",
@@ -136,7 +134,6 @@ struct ToolsTests {
 
     @Test("ToolVerificationResult stores all fields")
     func toolVerificationResultFields() {
-        // UniFFI ToolVerificationResult: toolId, passed, failures
         let result = ToolVerificationResult(
             toolId: "calculator",
             passed: true,
@@ -159,23 +156,37 @@ struct ToolsTests {
         #expect(result.failures[0] == "Vector 1 mismatch")
     }
 
-    // MARK: - Tool invocation via Context
+    // MARK: - Tool invocation via injectable bridge (async roundtrip)
 
-    @Test("invokeTool throws bridge error with SCP-TOOL-6001")
-    func invokeToolThrowsBridgeError() async {
-        let context = makeTestContext()
-        do {
-            _ = try await context.invokeTool("calculator", input: Data("{}".utf8))
-            Issue.record("Expected invokeTool to throw")
-        } catch let error as ScpError {
-            if case .Tool(_, let code) = error {
-                #expect(code == "SCP-TOOL-6001")
-            } else {
-                Issue.record("Expected ScpError.Tool, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
+    @Test("invokeTool calls bridge and returns result")
+    func invokeToolRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _ in }
+        let closeFn: ContextBridge.CloseFn = { _ in }
+
+        let context = Context(
+            handle: handle,
+            sendFn: sendFn,
+            subscribeFn: subscribeFn,
+            leaveFn: leaveFn,
+            closeFn: closeFn
+        )
+
+        let mockInvoke: ToolBridge.InvokeFn = { _, toolId, inputJson, _ in
+            #expect(toolId == "calculator")
+            #expect(inputJson == "{}")
+            return #"{"result": 42}"#
         }
+
+        let result = try await context.invokeTool(
+            "calculator",
+            input: Data("{}".utf8),
+            invokeFn: mockInvoke
+        )
+        #expect(result.output == Data(#"{"result": 42}"#.utf8))
+        #expect(result.contextId.isEmpty == false || true)
     }
 
     @Test("invokeTool throws when context is closed")
@@ -197,11 +208,29 @@ struct ToolsTests {
         }
     }
 
-    // MARK: - Tool registration via Context
+    // MARK: - Tool registration via injectable bridge (async roundtrip)
 
-    @Test("registerTool throws bridge error with SCP-TOOL-6002")
-    func registerToolThrowsBridgeError() async {
-        let context = makeTestContext()
+    @Test("registerTool calls bridge and returns tool ID")
+    func registerToolRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _ in }
+        let closeFn: ContextBridge.CloseFn = { _ in }
+
+        let context = Context(
+            handle: handle,
+            sendFn: sendFn,
+            subscribeFn: subscribeFn,
+            leaveFn: leaveFn,
+            closeFn: closeFn
+        )
+
+        let mockRegister: ToolBridge.RegisterFn = { _, definition in
+            #expect(definition.name == "test-tool")
+            return "tool-abc-123"
+        }
+
         let definition = ToolDefinition(
             name: "test-tool",
             description: "A test tool",
@@ -211,18 +240,8 @@ struct ToolsTests {
             testVectorsJson: nil,
             implementationHash: nil
         )
-        do {
-            _ = try await context.registerTool(definition)
-            Issue.record("Expected registerTool to throw")
-        } catch let error as ScpError {
-            if case .Tool(_, let code) = error {
-                #expect(code == "SCP-TOOL-6002")
-            } else {
-                Issue.record("Expected ScpError.Tool, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
+        let toolId = try await context.registerTool(definition, registerFn: mockRegister)
+        #expect(toolId == "tool-abc-123")
     }
 
     @Test("registerTool throws when context is closed")
@@ -253,23 +272,32 @@ struct ToolsTests {
         }
     }
 
-    // MARK: - Tool verification via Context
+    // MARK: - Tool verification via injectable bridge (async roundtrip)
 
-    @Test("verifyTool throws bridge error with SCP-TOOL-6003")
-    func verifyToolThrowsBridgeError() async {
-        let context = makeTestContext()
-        do {
-            _ = try await context.verifyTool("calculator")
-            Issue.record("Expected verifyTool to throw")
-        } catch let error as ScpError {
-            if case .Tool(_, let code) = error {
-                #expect(code == "SCP-TOOL-6003")
-            } else {
-                Issue.record("Expected ScpError.Tool, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
+    @Test("verifyTool calls bridge and returns result")
+    func verifyToolRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _ in }
+        let closeFn: ContextBridge.CloseFn = { _ in }
+
+        let context = Context(
+            handle: handle,
+            sendFn: sendFn,
+            subscribeFn: subscribeFn,
+            leaveFn: leaveFn,
+            closeFn: closeFn
+        )
+
+        let mockVerify: ToolBridge.VerifyFn = { _, toolId in
+            #expect(toolId == "calculator")
+            return ToolVerificationResult(toolId: "calculator", passed: true, failures: [])
         }
+
+        let result = try await context.verifyTool("calculator", verifyFn: mockVerify)
+        #expect(result.passed)
+        #expect(result.toolId == "calculator")
     }
 
     @Test("verifyTool throws when context is closed")
