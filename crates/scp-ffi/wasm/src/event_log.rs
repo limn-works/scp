@@ -13,12 +13,12 @@
 //! - [`WasmProof`] — A verification proof (verified flag, proof type,
 //!   details as JSON).
 //!
-//! # Wiring
+//! # Bridge stub behavior
 //!
-//! All functions delegate to the WASM-local runtime registry in [`crate::runtime`].
-//! `event_log_query` returns log metadata (event count, Merkle root) and
-//! `event_log_verify` generates and verifies Merkle inclusion/absence proofs.
-//! Mirrors the `PyO3` bridge's `event_log.rs` wiring pattern.
+//! All functions are bridge stubs returning typed errors. The full event log
+//! implementation (Merkle tree, cryptographic proofs, log replay) is in
+//! scp-core/event_log and will be connected in a future story when
+//! WASM-compatible scp-core bindings are available.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` and ADR-011 (event log) for the
 //! full specification.
@@ -29,7 +29,6 @@ use wasm_bindgen_futures::future_to_promise;
 
 use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
-use crate::runtime;
 
 // ---------------------------------------------------------------------------
 // WasmEvent
@@ -191,48 +190,34 @@ impl WasmProof {
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `filter_json` is malformed.
-/// - Rejects with `[SCP-CTX-2000]` if the event log is not accessible.
+/// - Rejects with `[SCP-CTX-2007]` if the event log is not accessible.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
 pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
+        // Validate filter JSON if provided.
         if let Some(ref filter) = filter_json {
             let _f: serde_json::Value = serde_json::from_str(filter).map_err(|e| {
-                ScpWasmError::Validation(format!("filter_json is not valid JSON: {e}")).into_js()
+                ScpWasmError::Validation {
+                    message: format!("filter_json is not valid JSON: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                }
+                .into_js()
             })?;
         }
 
-        let (event_count, merkle_root_hex) = runtime::with_context(&context_id, |rt| {
-            let count = rt.event_log.event_count();
-            let root = rt.event_log.root();
-            Ok((count, runtime::encode_hex(&root)))
-        })
-        .map_err(ScpWasmError::into_js)?;
+        let _ = context_id;
 
-        if event_count == 0 {
-            return Ok(JsValue::from_str("[]"));
+        Err(ScpWasmError::Context {
+            message: "not yet connected to runtime — event log query requires a live context \
+                      handle wired to scp-core"
+                .to_owned(),
+            code: "SCP-CTX-2007".to_owned(),
         }
-
-        #[allow(clippy::cast_precision_loss)]
-        let now_secs = js_sys::Date::now() / 1000.0;
-
-        let summary = serde_json::json!([{
-            "eventType": "LogSummary",
-            "actorDid": "",
-            "timestamp": now_secs,
-            "payloadJson": serde_json::json!({
-                "event_count": event_count,
-                "merkle_root": merkle_root_hex,
-            }).to_string(),
-            "sequence": event_count.saturating_sub(1),
-        }]);
-
-        let result_str = serde_json::to_string(&summary)
-            .map_err(|e| ScpWasmError::Context(format!("serialization failed: {e}")).into_js())?;
-
-        Ok(JsValue::from_str(&result_str))
+        .into_js()
+        .into())
     })
 }
 
@@ -257,153 +242,32 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `claim_json` is malformed.
-/// - Rejects with `[SCP-CTX-2000]` if verification fails (empty log,
+/// - Rejects with `[SCP-CTX-2007]` if verification fails (empty log,
 ///   invalid index, not connected to runtime).
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-#[allow(clippy::too_many_lines)]
 pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let claim: serde_json::Value = serde_json::from_str(&claim_json).map_err(|e| {
-            ScpWasmError::Validation(format!("claim_json is not valid JSON: {e}")).into_js()
+        // Validate claim_json.
+        let _claim: serde_json::Value = serde_json::from_str(&claim_json).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("claim_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
         })?;
 
-        let claim_type = claim["type"]
-            .as_str()
-            .ok_or_else(|| {
-                ScpWasmError::Validation(
-                    "claim must include 'type' field ('inclusion' or 'absence')".to_owned(),
-                )
-                .into_js()
-            })?
-            .to_owned();
+        let _ = context_id;
 
-        match claim_type.as_str() {
-            "inclusion" => {
-                let leaf_index = claim["leafIndex"].as_u64().ok_or_else(|| {
-                    ScpWasmError::Validation(
-                        "inclusion claim must include 'leafIndex' (integer)".to_owned(),
-                    )
-                    .into_js()
-                })?;
-
-                let (verified, details_json) = runtime::with_context(&context_id, |rt| {
-                    let proof =
-                        runtime::prove_inclusion(&rt.event_log, leaf_index).map_err(|e| {
-                            ScpWasmError::Context(format!("inclusion proof failed: {e}"))
-                        })?;
-                    let verified = runtime::verify_inclusion(&proof);
-
-                    let path_steps: Vec<serde_json::Value> = proof
-                        .path
-                        .iter()
-                        .map(|step| {
-                            let direction = match step.direction {
-                                runtime::Direction::Left => "left",
-                                runtime::Direction::Right => "right",
-                            };
-                            serde_json::json!({
-                                "sibling_hash": runtime::encode_hex(&step.sibling_hash),
-                                "direction": direction,
-                            })
-                        })
-                        .collect();
-
-                    let details = serde_json::json!({
-                        "leaf_index": proof.leaf_index,
-                        "leaf_hash": runtime::encode_hex(&proof.leaf_hash),
-                        "root": runtime::encode_hex(&proof.root),
-                        "path": path_steps,
-                        "path_length": proof.path.len(),
-                    });
-
-                    Ok((verified, details))
-                })
-                .map_err(ScpWasmError::into_js)?;
-
-                let details_str =
-                    serde_json::to_string(&details_json).unwrap_or_else(|_| "{}".to_owned());
-
-                let proof = WasmProof {
-                    verified,
-                    proof_type: "inclusion".to_owned(),
-                    details_json: details_str,
-                };
-
-                Ok(JsValue::from(proof))
-            }
-            "absence" => {
-                let event_hash_hex = claim["eventHash"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        ScpWasmError::Validation(
-                            "absence claim must include 'eventHash' (hex string)".to_owned(),
-                        )
-                        .into_js()
-                    })?
-                    .to_owned();
-
-                let event_hash = runtime::decode_hex_hash(&event_hash_hex).map_err(|e| {
-                    ScpWasmError::Validation(format!("invalid eventHash: {e}")).into_js()
-                })?;
-
-                let (verified, details_json) = runtime::with_context(&context_id, |rt| {
-                    let proof = runtime::prove_absence(&rt.event_log, &event_hash)
-                        .map_err(|e| ScpWasmError::Context(format!("absence proof failed: {e}")))?;
-
-                    let lower = proof.lower.as_ref().map(|lwp| {
-                        serde_json::json!({
-                            "leaf_hash": runtime::encode_hex(&lwp.leaf_hash),
-                            "leaf_index": lwp.leaf_index,
-                        })
-                    });
-                    let upper = proof.upper.as_ref().map(|uwp| {
-                        serde_json::json!({
-                            "leaf_hash": runtime::encode_hex(&uwp.leaf_hash),
-                            "leaf_index": uwp.leaf_index,
-                        })
-                    });
-
-                    let lower_verified = proof
-                        .lower
-                        .as_ref()
-                        .is_none_or(|lwp| runtime::verify_inclusion(&lwp.inclusion_proof));
-                    let upper_verified = proof
-                        .upper
-                        .as_ref()
-                        .is_none_or(|uwp| runtime::verify_inclusion(&uwp.inclusion_proof));
-                    let verified = lower_verified && upper_verified;
-
-                    let details = serde_json::json!({
-                        "query_hash": runtime::encode_hex(&proof.query_hash),
-                        "root": runtime::encode_hex(&proof.root),
-                        "leaf_count": proof.leaf_count,
-                        "lower": lower,
-                        "upper": upper,
-                    });
-
-                    Ok((verified, details))
-                })
-                .map_err(ScpWasmError::into_js)?;
-
-                let details_str =
-                    serde_json::to_string(&details_json).unwrap_or_else(|_| "{}".to_owned());
-
-                let proof = WasmProof {
-                    verified,
-                    proof_type: "absence".to_owned(),
-                    details_json: details_str,
-                };
-
-                Ok(JsValue::from(proof))
-            }
-            other => Err(ScpWasmError::Validation(format!(
-                "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
-            ))
-            .into_js()
-            .into()),
+        Err(ScpWasmError::Context {
+            message: "not yet connected to runtime — event log verification requires a live \
+                      context handle wired to scp-core"
+                .to_owned(),
+            code: "SCP-CTX-2007".to_owned(),
         }
+        .into_js()
+        .into())
     })
 }

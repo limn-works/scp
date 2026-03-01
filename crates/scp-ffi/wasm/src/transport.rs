@@ -117,9 +117,12 @@ pub fn transport_connect(relay_url: String) -> Promise {
         // Plain ws:// is not permitted; it allows cleartext interception of
         // all SCP protocol traffic. See ADR-022 acceptance criterion 1.
         if !relay_url.starts_with("wss://") {
-            return Err(ScpWasmError::Validation(format!(
-                "relay_url must use wss:// scheme (TLS required), got: {relay_url:?}"
-            ))
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "relay_url must use wss:// scheme (TLS required), got: {relay_url:?}"
+                ),
+                code: "SCP-VALID-7000".to_owned(),
+            }
             .into_js()
             .into());
         }

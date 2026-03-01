@@ -38,9 +38,7 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
-use crate::custody::JsKeyCustody;
 use crate::error::ScpWasmError;
-use crate::runtime;
 
 // ---------------------------------------------------------------------------
 // JsMessageCallback — JS-injected message stream callback
@@ -131,10 +129,6 @@ pub struct WasmContextHandle {
     /// Optional economic policy. Orthogonal to capability ceiling.
     /// See spec §5.3 and §19.3.
     economic_policy: Option<String>,
-    /// Per-context pseudonym routing ID derived via `JsKeyCustody::derivePseudonym`.
-    /// 32-byte pseudonym public key for relay routing (spec section 9.10.4).
-    /// `None` if no custody provider was passed at context creation time.
-    routing_id: Option<Vec<u8>>,
 }
 
 #[wasm_bindgen]
@@ -237,20 +231,6 @@ impl WasmContextHandle {
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
-
-    /// Returns the per-context pseudonym routing ID as a `Uint8Array`, or
-    /// `undefined` if pseudonym derivation was not available at creation time.
-    ///
-    /// The routing ID is derived via `JsKeyCustody::derivePseudonym` (spec
-    /// section 9.10.4). It provides per-context unlinkability: different
-    /// contexts produce different routing IDs for the same identity key.
-    ///
-    /// See ADR-006 and SCP-214 criterion 5.
-    #[must_use]
-    #[wasm_bindgen(getter, js_name = "routingId")]
-    pub fn routing_id(&self) -> Option<Vec<u8>> {
-        self.routing_id.clone()
-    }
 }
 
 impl WasmContextHandle {
@@ -267,7 +247,6 @@ impl WasmContextHandle {
         promotion_policy: Option<String>,
         governance: String,
         economic_policy: Option<String>,
-        routing_id: Option<Vec<u8>>,
     ) -> Self {
         Self {
             context_id,
@@ -281,7 +260,6 @@ impl WasmContextHandle {
             governance,
             member_count: 1,
             economic_policy,
-            routing_id,
         }
     }
 }
@@ -370,38 +348,30 @@ impl WasmMessage {
 ///   - `"ttl"` (`number | null`): Time-to-live in seconds.
 ///   - `"memoryScope"` (`"ephemeral" | "summary" | "full"`): Memory scope.
 ///   - `"governance"` (`"single_admin"`): Governance model.
-/// * `custody` — Optional `JsKeyCustody` for routing ID derivation. If
-///   provided along with `identity_key_id`, the context will derive a
-///   per-context pseudonym routing ID via `derivePseudonym`.
-/// * `identity_key_id` — Optional key ID of the identity key in the custody
-///   provider. Required when `custody` is provided.
 ///
 /// # Returns
 ///
 /// `Promise<WasmContextHandle>` — resolves to a new context handle in
-/// `"active"` state with a routing ID if custody was provided.
+/// `"active"` state.
 ///
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `params_json` is malformed JSON or
 ///   contains invalid field values.
-/// - Rejects with `[SCP-CTX-2000]` if context creation fails.
-/// - Rejects with `[SCP-CRYPTO-4010]` if pseudonym derivation fails.
+/// - Rejects with `[SCP-CTX-2001]` if context creation fails.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn context_create(
-    identity_did: String,
-    params_json: String,
-    custody: Option<JsKeyCustody>,
-    identity_key_id: Option<String>,
-) -> Promise {
+pub fn context_create(identity_did: String, params_json: String) -> Promise {
     future_to_promise(async move {
         // Parse and validate params_json.
         let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
-            ScpWasmError::Validation(format!(
-                "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
-            ))
+            ScpWasmError::Validation {
+                message: format!(
+                    "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
+                ),
+                code: "SCP-VALID-7000".to_owned(),
+            }
             .into_js()
         })?;
 
@@ -431,37 +401,6 @@ pub fn context_create(
         // Generate a context ID using a UUID (CSPRNG-backed via getrandom/js).
         let context_id = format!("ctx-{}", uuid::Uuid::new_v4().as_hyphenated());
 
-        // Derive per-context pseudonym routing ID via JsKeyCustody::derivePseudonym
-        // (spec section 9.10.4, SCP-214 criterion 5). Only available when both
-        // custody and identity_key_id are provided.
-        let routing_id = match (&custody, &identity_key_id) {
-            (Some(cust), Some(key_id)) => {
-                let result = cust
-                    .derive_pseudonym(key_id, context_id.as_bytes())
-                    .map_err(|e| {
-                        ScpWasmError::Crypto(format!(
-                            "failed to derive pseudonym routing ID: {e:?}"
-                        ))
-                        .into_js()
-                    })?;
-
-                // The JS return value is { publicKeyBytes: Uint8Array, keyId: string }.
-                // Extract publicKeyBytes.
-                let public_key_val =
-                    js_sys::Reflect::get(&result, &JsValue::from_str("publicKeyBytes")).map_err(
-                        |e| {
-                            ScpWasmError::Crypto(format!(
-                                "derivePseudonym result missing publicKeyBytes field: {e:?}"
-                            ))
-                            .into_js()
-                        },
-                    )?;
-                let public_key_array = js_sys::Uint8Array::new(&public_key_val);
-                Some(public_key_array.to_vec())
-            }
-            _ => None,
-        };
-
         let handle = WasmContextHandle::new_active(
             context_id,
             identity_did,
@@ -472,11 +411,7 @@ pub fn context_create(
             promotion_policy,
             governance,
             economic_policy,
-            routing_id,
         );
-
-        runtime::register_context(&handle.context_id, &handle.creator_did)
-            .map_err(ScpWasmError::into_js)?;
 
         Ok(JsValue::from(handle))
     })
@@ -495,7 +430,7 @@ pub fn context_create(
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// Rejects with `[SCP-CTX-2013]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -505,9 +440,12 @@ pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise
 
     future_to_promise(async move {
         if state != "active" {
-            return Err(ScpWasmError::Context(format!(
-                "cannot join context in '{state}' state — context must be 'active'"
-            ))
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cannot join context in '{state}' state — context must be 'active'"
+                ),
+                code: "SCP-CTX-2013".to_owned(),
+            }
             .into_js()
             .into());
         }
@@ -529,7 +467,7 @@ pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// Rejects with `[SCP-CTX-2015]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -539,9 +477,12 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 
     future_to_promise(async move {
         if state != "active" {
-            return Err(ScpWasmError::Context(format!(
-                "cannot leave context in '{state}' state — context must be 'active'"
-            ))
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cannot leave context in '{state}' state — context must be 'active'"
+                ),
+                code: "SCP-CTX-2015".to_owned(),
+            }
             .into_js()
             .into());
         }
@@ -569,25 +510,25 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// Rejects with `[SCP-CTX-2017]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
 pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promise {
     let state = handle.state.clone();
-    let context_id = handle.context_id.clone();
     let _ = identity_did; // Used when full runtime is wired.
 
     future_to_promise(async move {
         if state != "active" {
-            return Err(ScpWasmError::Context(format!(
-                "cannot close context in '{state}' state — context must be 'active'"
-            ))
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cannot close context in '{state}' state — context must be 'active'"
+                ),
+                code: "SCP-CTX-2017".to_owned(),
+            }
             .into_js()
             .into());
         }
-
-        runtime::remove_context(&context_id);
 
         Ok(JsValue::UNDEFINED)
     })
@@ -608,7 +549,7 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
 ///
 /// # Errors
 ///
-/// - Rejects with `[SCP-CTX-2000]` if the context is not `"active"`.
+/// - Rejects with `[SCP-CTX-2019]` if the context is not `"active"`.
 /// - Rejects with `[SCP-VALID-7000]` if `payload_base64` is not valid base64.
 ///
 /// See ADR-022 acceptance criterion 1.
@@ -623,19 +564,24 @@ pub fn context_send(
 
     future_to_promise(async move {
         if state != "active" {
-            return Err(ScpWasmError::Context(format!(
-                "cannot send to context in '{state}' state — context must be 'active'"
-            ))
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cannot send to context in '{state}' state — context must be 'active'"
+                ),
+                code: "SCP-CTX-2019".to_owned(),
+            }
             .into_js()
             .into());
         }
 
         // Validate that the payload is valid base64.
         if payload_base64.is_empty() {
-            return Err(ScpWasmError::Validation(
-                "payload_base64 must not be empty — encode payload bytes as base64 before calling context_send"
-                    .to_owned(),
-            )
+            return Err(ScpWasmError::Validation {
+                message:
+                    "payload_base64 must not be empty — encode payload bytes as base64 before calling context_send"
+                        .to_owned(),
+                code: "SCP-VALID-7000".to_owned(),
+            }
             .into_js()
             .into());
         }
@@ -665,7 +611,7 @@ pub fn context_send(
 ///
 /// # Errors
 ///
-/// Returns `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// Returns `[SCP-CTX-2021]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -674,10 +620,13 @@ pub fn context_subscribe(
     callback: JsMessageCallback,
 ) -> Result<(), JsError> {
     if handle.state != "active" {
-        return Err(ScpWasmError::Context(format!(
-            "cannot subscribe to context in '{}' state — context must be 'active'",
-            handle.state
-        ))
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "cannot subscribe to context in '{}' state — context must be 'active'",
+                handle.state
+            ),
+            code: "SCP-CTX-2021".to_owned(),
+        }
         .into_js());
     }
 

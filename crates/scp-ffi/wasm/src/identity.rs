@@ -105,9 +105,10 @@ impl WasmIdentity {
     #[wasm_bindgen(js_name = "fromDid")]
     pub fn from_did(did: String) -> Result<Self, JsError> {
         if !did.starts_with("did:dht:") {
-            return Err(ScpWasmError::Identity(format!(
-                "unsupported DID method in {did:?} — only did:dht is supported"
-            ))
+            return Err(ScpWasmError::Identity {
+                message: format!("unsupported DID method in {did:?} — only did:dht is supported"),
+                code: "SCP-IDENT-1004".to_owned(),
+            }
             .into_js());
         }
         Ok(Self {
@@ -260,9 +261,10 @@ impl WasmDIDDocument {
 pub fn identity_load(did: String) -> Promise {
     future_to_promise(async move {
         if !did.starts_with("did:dht:") {
-            return Err(ScpWasmError::Identity(format!(
-                "unsupported DID method in {did:?} — only did:dht is supported"
-            ))
+            return Err(ScpWasmError::Identity {
+                message: format!("unsupported DID method in {did:?} — only did:dht is supported"),
+                code: "SCP-IDENT-1004".to_owned(),
+            }
             .into_js()
             .into());
         }

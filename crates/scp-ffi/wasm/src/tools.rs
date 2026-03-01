@@ -11,14 +11,15 @@
 //! - [`WasmToolVerificationResult`] — Verification result (tool ID, pass/fail,
 //!   failure messages).
 //!
-//! # Wiring
+//! # Bridge stub behavior
 //!
-//! All functions delegate to the WASM-local runtime registry in [`crate::runtime`].
-//! Tool registration validates the JSON Schema, invocation validates input against
-//! the schema and returns a passthrough, and verification runs test vectors against
-//! an identity executor. Mirrors the `PyO3` bridge's `tools.rs` wiring pattern.
+//! All functions in this module are bridge stubs that return typed errors.
+//! The full protocol implementation (tool registration in MLS group state,
+//! capability-gated invocation, schema validation) is implemented in scp-core
+//! and will be connected in a future story when WASM-compatible scp-core
+//! bindings are available.
 //!
-//! See ADR-022 in `.docs/adrs/phase-4.md` and SCP-218 for the full specification.
+//! See ADR-022 in `.docs/adrs/phase-4.md` for the full specification.
 
 use js_sys::Promise;
 use wasm_bindgen::prelude::*;
@@ -26,7 +27,6 @@ use wasm_bindgen_futures::future_to_promise;
 
 use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
-use crate::runtime;
 
 // ---------------------------------------------------------------------------
 // WasmToolVerificationResult
@@ -107,7 +107,7 @@ impl WasmToolVerificationResult {
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `definition_json` is malformed.
-/// - Rejects with `[SCP-TOOL-6000]` if registration fails (permission denied,
+/// - Rejects with `[SCP-TOOL-6001]` if registration fails (permission denied,
 ///   schema invalid, not yet connected to runtime).
 ///
 /// See ADR-022 acceptance criterion 1.
@@ -115,72 +115,25 @@ impl WasmToolVerificationResult {
 pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let def: serde_json::Value = serde_json::from_str(&definition_json).map_err(|e| {
-            ScpWasmError::Validation(format!("definition_json is not valid JSON: {e}")).into_js()
+        // Validate that definition_json is valid JSON.
+        let _def: serde_json::Value = serde_json::from_str(&definition_json).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("definition_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
         })?;
 
-        let name = def["name"]
-            .as_str()
-            .ok_or_else(|| {
-                ScpWasmError::Validation("missing 'name' field in definition".to_owned()).into_js()
-            })?
-            .to_owned();
-        let description = def["description"]
-            .as_str()
-            .ok_or_else(|| {
-                ScpWasmError::Validation("missing 'description' field in definition".to_owned())
-                    .into_js()
-            })?
-            .to_owned();
-        let operator_did = def["operatorDid"]
-            .as_str()
-            .ok_or_else(|| {
-                ScpWasmError::Validation("missing 'operatorDid' field in definition".to_owned())
-                    .into_js()
-            })?
-            .to_owned();
+        let _ = context_id;
 
-        let schema_val = def.get("schema").ok_or_else(|| {
-            ScpWasmError::Validation("missing 'schema' field in definition".to_owned()).into_js()
-        })?;
-        let input_schema = schema_val
-            .get("inputSchema")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-        let output_schema = schema_val
-            .get("outputSchema")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-
-        runtime::validate_schema(&input_schema).map_err(|e| {
-            ScpWasmError::Validation(format!("invalid input schema: {e}")).into_js()
-        })?;
-        runtime::validate_schema(&output_schema).map_err(|e| {
-            ScpWasmError::Validation(format!("invalid output schema: {e}")).into_js()
-        })?;
-
-        let test_vectors = extract_test_vectors(&def);
-
-        let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
-
-        let registration = runtime::ToolRegistration {
-            tool_id: tool_id.clone(),
-            name,
-            description,
-            input_schema,
-            output_schema,
-            test_vectors,
-            operator_did,
-        };
-
-        runtime::with_context(&context_id, |rt| {
-            rt.tool_registry
-                .insert(registration)
-                .map_err(ScpWasmError::Tool)
-        })
-        .map_err(ScpWasmError::into_js)?;
-
-        Ok(JsValue::from_str(&tool_id))
+        Err(ScpWasmError::Tool {
+            message: "not yet connected to runtime — tool registration requires a live context \
+                      handle wired to scp-core"
+                .to_owned(),
+            code: "SCP-TOOL-6001".to_owned(),
+        }
+        .into_js()
+        .into())
     })
 }
 
@@ -202,7 +155,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `input_json` is malformed.
-/// - Rejects with `[SCP-TOOL-6000]` if invocation fails (tool not found,
+/// - Rejects with `[SCP-TOOL-6002]` if invocation fails (tool not found,
 ///   insufficient capability, schema mismatch, execution timeout).
 ///
 /// See ADR-022 acceptance criterion 1.
@@ -215,41 +168,25 @@ pub fn tool_invoke(
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
-            ScpWasmError::Validation(format!("input_json is not valid JSON: {e}")).into_js()
+        // Validate that input_json is valid JSON.
+        let _input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("input_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
         })?;
 
-        let output_json = runtime::with_context(&context_id, |rt| {
-            let registration = rt.tool_registry.get(&tool_id).ok_or_else(|| {
-                ScpWasmError::Tool(format!(
-                    "tool '{tool_id}' not found in context '{context_id}'"
-                ))
-            })?;
+        let _ = (context_id, tool_id, identity_did);
 
-            runtime::validate_value_against_schema(&input, &registration.input_schema)
-                .map_err(|e| ScpWasmError::Validation(format!("input validation failed: {e}")))?;
-
-            if identity_did.is_empty() {
-                return Err(ScpWasmError::Permission(
-                    "identity_did is required for tool invocation".to_owned(),
-                ));
-            }
-
-            if !rt.ceiling_strings.contains("tool_invoke:*") {
-                return Err(ScpWasmError::Permission(format!(
-                    "context '{context_id}' does not permit tool_invoke capability"
-                )));
-            }
-
-            Ok(input.clone())
-        })
-        .map_err(ScpWasmError::into_js)?;
-
-        let result_str = serde_json::to_string(&output_json).map_err(|e| {
-            ScpWasmError::Tool(format!("failed to serialize output: {e}")).into_js()
-        })?;
-
-        Ok(JsValue::from_str(&result_str))
+        Err(ScpWasmError::Tool {
+            message: "not yet connected to runtime — tool invocation requires a live context \
+                      handle wired to scp-core"
+                .to_owned(),
+            code: "SCP-TOOL-6002".to_owned(),
+        }
+        .into_js()
+        .into())
     })
 }
 
@@ -266,7 +203,7 @@ pub fn tool_invoke(
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-TOOL-6000]` if the context is not connected to the
+/// Rejects with `[SCP-TOOL-6003]` if the context is not connected to the
 /// runtime or the tool is not found.
 ///
 /// See ADR-022 acceptance criterion 1.
@@ -274,66 +211,15 @@ pub fn tool_invoke(
 pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let result = runtime::with_context(&context_id, |rt| {
-            let registration = rt.tool_registry.get(&tool_id).ok_or_else(|| {
-                ScpWasmError::Tool(format!(
-                    "tool '{tool_id}' not found in context '{context_id}'"
-                ))
-            })?;
+        let _ = (context_id, tool_id);
 
-            let mut failures: Vec<String> = Vec::new();
-            for (i, tv) in registration.test_vectors.iter().enumerate() {
-                if runtime::validate_value_against_schema(&tv.input, &registration.input_schema)
-                    .is_err()
-                {
-                    failures.push(format!(
-                        "test vector {i} ('{}') input does not match input schema",
-                        tv.description
-                    ));
-                }
-            }
-
-            Ok((tool_id.clone(), failures))
-        })
-        .map_err(ScpWasmError::into_js)?;
-
-        let (tid, failures) = result;
-        let passed = failures.is_empty();
-        let failures_json = serde_json::to_string(&failures).unwrap_or_else(|_| "[]".to_owned());
-
-        let verification = WasmToolVerificationResult {
-            tool_id: tid,
-            passed,
-            failures_json,
-        };
-
-        Ok(JsValue::from(verification))
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Extracts test vectors from a JSON tool definition.
-fn extract_test_vectors(def: &serde_json::Value) -> Vec<runtime::TestVector> {
-    let Some(vectors) = def.get("testVectors").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-
-    vectors
-        .iter()
-        .map(|tv| runtime::TestVector {
-            input: tv.get("input").cloned().unwrap_or(serde_json::Value::Null),
-            expected_output: tv
-                .get("expectedOutput")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            description: tv
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+        Err(ScpWasmError::Tool {
+            message: "not yet connected to runtime — tool verification requires a live context \
+                      handle wired to scp-core"
                 .to_owned(),
-        })
-        .collect()
+            code: "SCP-TOOL-6003".to_owned(),
+        }
+        .into_js()
+        .into())
+    })
 }
