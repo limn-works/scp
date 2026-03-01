@@ -74,8 +74,8 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
     bytes
 }
 
-// Re-export broadcast subscription validation (SCP-227).
-pub use broadcast::validate_messages_read_ucan;
+// broadcast::validate_messages_read_ucan is intentionally module-private
+// after RED-012 fix (wildcard rejection). Callers use BroadcastContext methods.
 
 // Re-export all parameter types for convenience.
 pub use params::{
