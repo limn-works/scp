@@ -459,23 +459,28 @@ struct CacheEntry {
 /// See §22.8.4 Resolution Caching.
 #[derive(Debug)]
 pub struct ResolutionCache {
-    entries: HashMap<String, CacheEntry>,
+    entries: lru::LruCache<String, CacheEntry>,
 }
 
+/// Default maximum capacity of the resolution cache.
+const DEFAULT_CACHE_CAPACITY: usize = 10_000;
+
 impl ResolutionCache {
-    /// Creates a new empty resolution cache.
+    /// Creates a new empty resolution cache with default capacity (10,000).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: lru::LruCache::new(
+                std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY)
+                    .expect("DEFAULT_CACHE_CAPACITY is non-zero"),
+            ),
         }
     }
 
     /// Looks up a cached result for the given normalized address.
     ///
     /// Returns `None` if no entry exists or the entry has expired.
-    #[must_use]
-    pub fn get(&self, address: &str) -> Option<&[AddressResolution]> {
+    pub fn get(&mut self, address: &str) -> Option<&[AddressResolution]> {
         let entry = self.entries.get(address)?;
         if Instant::now() >= entry.expires_at {
             return None;
@@ -485,7 +490,7 @@ impl ResolutionCache {
 
     /// Inserts a resolution result into the cache with the given TTL.
     pub fn insert(&mut self, address: String, results: Vec<AddressResolution>, ttl: Duration) {
-        self.entries.insert(
+        self.entries.put(
             address,
             CacheEntry {
                 results,
@@ -494,10 +499,18 @@ impl ResolutionCache {
         );
     }
 
-    /// Removes expired entries from the cache.
+    /// Removes expired entries from the cache (defense-in-depth alongside LRU).
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
-        self.entries.retain(|_, entry| entry.expires_at > now);
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.expires_at <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in expired {
+            self.entries.pop(&key);
+        }
     }
 
     /// Returns the number of entries in the cache (including expired).

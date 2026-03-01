@@ -29,6 +29,23 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use scp_platform::traits::Storage;
 
 // ---------------------------------------------------------------------------
+// Key sanitization
+// ---------------------------------------------------------------------------
+
+/// Validates a storage key component, rejecting path traversal characters.
+///
+/// Rejects strings containing `/`, `\`, `..`, or null bytes to prevent
+/// storage path traversal attacks.
+pub fn sanitize_key_component(s: &str) -> Result<&str, StoreError> {
+    if s.contains('/') || s.contains('\\') || s.contains("..") || s.contains('\0') {
+        return Err(StoreError::SerializationFailed(format!(
+            "invalid key component: contains forbidden characters: {s:?}"
+        )));
+    }
+    Ok(s)
+}
+
+// ---------------------------------------------------------------------------
 // StoreError
 // ---------------------------------------------------------------------------
 

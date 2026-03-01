@@ -46,23 +46,28 @@ pub struct NonceRecord {
 ///
 /// Format: `context/{context_id}/ucan_token/{token_id}`
 /// See spec section 17.3.
-fn ucan_token_key(context_id: &str, token_id: &str) -> String {
-    format!("context/{context_id}/ucan_token/{token_id}")
+fn ucan_token_key(context_id: &str, token_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let tok = super::sanitize_key_component(token_id)?;
+    Ok(format!("context/{ctx}/ucan_token/{tok}"))
 }
 
 /// Builds the prefix for listing all UCAN tokens in a context.
 ///
 /// Format: `context/{context_id}/ucan_token/`
-fn ucan_token_prefix(context_id: &str) -> String {
-    format!("context/{context_id}/ucan_token/")
+fn ucan_token_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/ucan_token/"))
 }
 
 /// Builds the storage key for a UCAN revocation entry.
 ///
 /// Format: `context/{context_id}/ucan_revocation/{token_id}`
 /// See spec section 17.3.
-fn revocation_key(context_id: &str, token_id: &str) -> String {
-    format!("context/{context_id}/ucan_revocation/{token_id}")
+fn revocation_key(context_id: &str, token_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let tok = super::sanitize_key_component(token_id)?;
+    Ok(format!("context/{ctx}/ucan_revocation/{tok}"))
 }
 
 /// Builds the storage key for a UCAN nonce entry.
@@ -113,7 +118,7 @@ impl<S: Storage> ProtocolStore<S> {
         token_id: &str,
         token: &[u8],
     ) -> Result<(), StoreError> {
-        let key = ucan_token_key(context_id, token_id);
+        let key = ucan_token_key(context_id, token_id)?;
         self.store_value(&key, &token.to_vec()).await
     }
 
@@ -130,7 +135,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         token_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = ucan_token_key(context_id, token_id);
+        let key = ucan_token_key(context_id, token_id)?;
         self.load_value(&key).await
     }
 
@@ -146,7 +151,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         token_id: &str,
     ) -> Result<(), StoreError> {
-        let key = ucan_token_key(context_id, token_id);
+        let key = ucan_token_key(context_id, token_id)?;
         self.storage.delete(&key).await?;
         Ok(())
     }
@@ -159,7 +164,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn list_ucan_tokens(&self, context_id: &str) -> Result<Vec<String>, StoreError> {
-        let prefix = ucan_token_prefix(context_id);
+        let prefix = ucan_token_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
         let token_ids: Vec<String> = keys
             .into_iter()
@@ -182,7 +187,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         token_id: &str,
     ) -> Result<(), StoreError> {
-        let key = revocation_key(context_id, token_id);
+        let key = revocation_key(context_id, token_id)?;
         self.store_value(&key, &true).await
     }
 
@@ -194,7 +199,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn is_revoked(&self, context_id: &str, token_id: &str) -> Result<bool, StoreError> {
-        let key = revocation_key(context_id, token_id);
+        let key = revocation_key(context_id, token_id)?;
         Ok(self.storage.exists(&key).await?)
     }
 
@@ -586,20 +591,20 @@ mod tests {
     #[test]
     fn ucan_token_key_follows_convention() {
         assert_eq!(
-            ucan_token_key("ctx-123", "tok-abc"),
+            ucan_token_key("ctx-123", "tok-abc").unwrap(),
             "context/ctx-123/ucan_token/tok-abc"
         );
     }
 
     #[test]
     fn ucan_token_prefix_follows_convention() {
-        assert_eq!(ucan_token_prefix("ctx-123"), "context/ctx-123/ucan_token/");
+        assert_eq!(ucan_token_prefix("ctx-123").unwrap(), "context/ctx-123/ucan_token/");
     }
 
     #[test]
     fn revocation_key_follows_convention() {
         assert_eq!(
-            revocation_key("ctx-123", "tok-abc"),
+            revocation_key("ctx-123", "tok-abc").unwrap(),
             "context/ctx-123/ucan_revocation/tok-abc"
         );
     }
