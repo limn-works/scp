@@ -74,6 +74,9 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
     bytes
 }
 
+// Re-export broadcast subscription validation (SCP-227).
+pub use broadcast::validate_messages_read_ucan;
+
 // Re-export all parameter types for convenience.
 pub use params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, GovernanceModel, MemoryScope,
