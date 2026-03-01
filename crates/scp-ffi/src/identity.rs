@@ -32,6 +32,7 @@ use pyo3::types::{PyDict, PyList};
 
 use scp_core::identity::{DidDht, DidDocument, DidMethod};
 use scp_platform::testing::InMemoryKeyCustody;
+use scp_platform::traits::Storage;
 
 use crate::error::ScpPyError;
 
@@ -219,6 +220,83 @@ fn parse_custody(custody: &str) -> Result<(Arc<InMemoryKeyCustody>, String), Scp
 }
 
 // ---------------------------------------------------------------------------
+// Storage key helpers (spec section 17.3)
+// ---------------------------------------------------------------------------
+
+/// Returns the storage key for an identity's persisted state.
+///
+/// Follows the key convention from spec section 17.3:
+/// `identity/{did}/state`.
+fn identity_state_key(did: &str) -> String {
+    format!("identity/{did}/state")
+}
+
+/// Serialized identity state for storage persistence.
+///
+/// Stores the minimum metadata needed to reconstruct a [`PyIdentity`] from
+/// storage: the DID string and custody type. Key material is NOT stored
+/// here — it remains within the [`KeyCustody`](scp_platform::KeyCustody)
+/// boundary.
+///
+/// Uses a simple `did\ncustody` text format. When `ProtocolStore`'s identity
+/// module lands (spec 17.4), this will migrate to `StoredValue<T>` with
+/// MessagePack serialization.
+fn serialize_identity_state(did: &str, custody: &str) -> Vec<u8> {
+    format!("{did}\n{custody}").into_bytes()
+}
+
+/// Deserializes identity state from storage bytes.
+///
+/// Returns `(did, custody)` on success.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if the stored data is malformed.
+fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyError> {
+    let text = std::str::from_utf8(data).map_err(|e| {
+        ScpPyError::IdentityError(format!("stored identity state is not valid UTF-8: {e}"))
+    })?;
+    let mut lines = text.splitn(2, '\n');
+    let did = lines
+        .next()
+        .ok_or_else(|| ScpPyError::IdentityError("stored identity state is empty".to_owned()))?
+        .to_owned();
+    let custody = lines
+        .next()
+        .ok_or_else(|| {
+            ScpPyError::IdentityError(
+                "stored identity state is missing custody type".to_owned(),
+            )
+        })?
+        .to_owned();
+    Ok((did, custody))
+}
+
+// ---------------------------------------------------------------------------
+// Storage initialization bridge function
+// ---------------------------------------------------------------------------
+
+/// Initializes the global storage provider for identity persistence.
+///
+/// Must be called before `py_identity_create` or `py_identity_load` if
+/// storage persistence is desired. The storage provider follows the same
+/// injection pattern as the runtime registry (global `OnceLock`).
+///
+/// # Arguments
+///
+/// * `storage_type` — The storage backend type: `"in_memory"`.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if the storage type is not recognized.
+///
+/// See SCP-217 and spec section 17.4.
+#[pyfunction]
+fn py_init_storage(storage_type: &str) -> PyResult<()> {
+    crate::runtime::init_storage(storage_type).map_err(PyErr::from)
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -237,6 +315,12 @@ fn parse_custody(custody: &str) -> Result<(Arc<InMemoryKeyCustody>, String), Scp
 /// Raises `IdentityError` if key generation or DID creation fails.
 /// Raises `ValidationError` if the custody string is invalid.
 ///
+/// # Storage
+///
+/// If a storage provider has been initialized via [`py_init_storage`],
+/// the identity state (DID, custody type) is persisted under the key
+/// `identity/{did}/state` after successful creation (SCP-217).
+///
 /// See ADR-013 acceptance criterion 2.
 #[pyfunction]
 fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
@@ -251,8 +335,22 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
                 .await
                 .map_err(ScpPyError::from)?;
 
+            let did = identity.did;
+
+            // Persist identity state if storage is initialized (SCP-217).
+            if let Ok(storage) = crate::runtime::get_storage() {
+                let key = identity_state_key(&did);
+                let data = serialize_identity_state(&did, &custody_str);
+                storage
+                    .store(&key, &data)
+                    .await
+                    .map_err(|e| ScpPyError::IdentityError(format!(
+                        "failed to persist identity state: {e}"
+                    )))?;
+            }
+
             Ok(PyIdentity {
-                did: identity.did,
+                did,
                 custody: custody_str,
             })
         })
@@ -261,26 +359,33 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 
 /// Loads an existing identity from storage.
 ///
+/// Retrieves persisted identity state (DID, custody type) from the storage
+/// provider and reconstructs a fully functional [`PyIdentity`].
+///
 /// # Arguments
 ///
 /// * `did` — The DID string to load (e.g., `"did:dht:z6Mk..."`).
 ///
 /// # Returns
 ///
-/// A [`PyIdentity`] containing the loaded DID string.
+/// A [`PyIdentity`] containing the loaded DID string and custody type.
 ///
 /// # Errors
 ///
-/// Raises `IdentityError` if the DID format is unsupported.
+/// Raises `IdentityError` if:
+/// - The DID format is unsupported (not `did:dht:` prefix).
+/// - Storage has not been initialized (call `py_init_storage` first).
+/// - The DID is not found in storage.
+/// - The stored state is malformed.
 ///
-/// # Note
+/// Does NOT silently fall back to in-memory — an explicit error is raised
+/// if the DID is not found (SCP-217 acceptance criterion 4).
 ///
-/// Stub — see SCP-217 for `StorageProvider` wiring. Currently reconstructs a
-/// `PyIdentity` from the DID string with `"in_memory"` custody instead of
-/// loading from persistent storage (ADR-013 acceptance criterion 2).
+/// See SCP-217 and spec section 17.3.
 #[pyfunction]
 fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
     let did_owned = did.to_owned();
+    let rt = crate::runtime()?;
 
     py.allow_threads(|| {
         // Validate the DID format.
@@ -290,9 +395,34 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
             ))));
         }
 
-        Ok(PyIdentity {
-            did: did_owned,
-            custody: "in_memory".to_owned(),
+        let storage = crate::runtime::get_storage().map_err(PyErr::from)?;
+
+        rt.block_on(async {
+            let key = identity_state_key(&did_owned);
+            let data = storage
+                .retrieve(&key)
+                .await
+                .map_err(|e| ScpPyError::IdentityError(format!(
+                    "failed to read identity state from storage: {e}"
+                )))?
+                .ok_or_else(|| ScpPyError::IdentityError(format!(
+                    "identity not found in storage: {did_owned} — \
+                     was it created with py_identity_create?"
+                )))?;
+
+            let (stored_did, custody) = deserialize_identity_state(&data)?;
+
+            // Sanity check: the stored DID should match the requested DID.
+            if stored_did != did_owned {
+                return Err(PyErr::from(ScpPyError::IdentityError(format!(
+                    "stored DID mismatch: expected {did_owned}, found {stored_did}"
+                ))));
+            }
+
+            Ok(PyIdentity {
+                did: stored_did,
+                custody,
+            })
         })
     })
 }
@@ -378,6 +508,7 @@ fn py_identity_rotate_key(_identity: &PyIdentity) -> PyResult<PyIdentity> {
 pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIdentity>()?;
     m.add_class::<PyDIDDocument>()?;
+    m.add_function(wrap_pyfunction!(py_init_storage, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_create, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_load, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_resolve, m)?)?;
