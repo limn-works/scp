@@ -87,7 +87,7 @@ internal func scpEventLogQuery(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Validation(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-ELOG-001"
+        code: "SCP-CTX-2030"
     )))
 }
 
@@ -100,7 +100,7 @@ internal func scpEventLogProve(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Validation(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-ELOG-002"
+        code: "SCP-CTX-2031"
     )))
 }
 
@@ -112,7 +112,7 @@ internal func scpEventLogVerify(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Validation(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-ELOG-003"
+        code: "SCP-CTX-2032"
     )))
 }
 

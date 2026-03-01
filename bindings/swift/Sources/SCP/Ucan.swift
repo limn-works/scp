@@ -69,7 +69,7 @@ internal func scpUcanValidate(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Permission(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-UCAN-001"
+        code: "SCP-PERM-3001"
     )))
 }
 
@@ -87,7 +87,7 @@ internal func scpUcanMint(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Permission(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-UCAN-002"
+        code: "SCP-PERM-3002"
     )))
 }
 
@@ -102,7 +102,7 @@ internal func scpUcanRevoke(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Permission(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-UCAN-003"
+        code: "SCP-PERM-3003"
     )))
 }
 

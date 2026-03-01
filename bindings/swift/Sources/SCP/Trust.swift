@@ -117,7 +117,7 @@ internal func scpTrustEvaluate(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Validation(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TRUST-001"
+        code: "SCP-ATTEST-9001"
     )))
 }
 

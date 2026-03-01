@@ -264,7 +264,7 @@ struct ConformanceTests {
                 "presenter_did": "did:dht:z6MkPresenter",
             ]
         )
-        #expect(result["error"] == "SCP-UCAN-001")
+        #expect(result["error"] == "SCP-PERM-3001")
     }
 
     @Test("Conformance runner dispatches ucan_mint operation")
@@ -276,7 +276,7 @@ struct ConformanceTests {
                 "audience_did": "did:dht:z6MkAudience",
             ]
         )
-        #expect(result["error"] == "SCP-UCAN-002")
+        #expect(result["error"] == "SCP-PERM-3002")
     }
 
     @Test("Conformance runner dispatches ucan_revoke operation")
@@ -288,7 +288,7 @@ struct ConformanceTests {
                 "revoker_did": "did:dht:z6MkRevoker",
             ]
         )
-        #expect(result["error"] == "SCP-UCAN-003")
+        #expect(result["error"] == "SCP-PERM-3003")
     }
 
     @Test("Conformance runner dispatches transport_connect operation")
@@ -297,7 +297,7 @@ struct ConformanceTests {
             operation: "transport_connect",
             input: ["relay_url": "wss://relay.test/scp/v1"]
         )
-        #expect(result["error"] == "SCP-TRANSPORT-001")
+        #expect(result["error"] == "SCP-TRANS-5001")
     }
 
     @Test("Conformance runner dispatches transport_status operation")
@@ -306,7 +306,7 @@ struct ConformanceTests {
             operation: "transport_status",
             input: [:]
         )
-        #expect(result["error"] == "SCP-TRANSPORT-002")
+        #expect(result["error"] == "SCP-TRANS-5002")
     }
 
     @Test("Conformance runner dispatches event_log_query operation")
@@ -315,7 +315,7 @@ struct ConformanceTests {
             operation: "event_log_query",
             input: ["context_id": "ctx-test"]
         )
-        #expect(result["error"] == "SCP-ELOG-001")
+        #expect(result["error"] == "SCP-CTX-2030")
     }
 
     @Test("Conformance runner dispatches event_log_prove operation")
@@ -324,7 +324,7 @@ struct ConformanceTests {
             operation: "event_log_prove",
             input: ["context_id": "ctx-test"]
         )
-        #expect(result["error"] == "SCP-ELOG-002")
+        #expect(result["error"] == "SCP-CTX-2031")
     }
 
     @Test("Conformance runner dispatches event_log_verify operation")
@@ -333,7 +333,7 @@ struct ConformanceTests {
             operation: "event_log_verify",
             input: [:]
         )
-        #expect(result["error"] == "SCP-ELOG-003")
+        #expect(result["error"] == "SCP-CTX-2032")
     }
 
     @Test("Conformance runner returns error for unsupported operation")
@@ -361,14 +361,14 @@ struct ConformanceTests {
             description: "Validate a UCAN token",
             operation: "ucan_validate",
             input: ["encoded": "test.token.sig"],
-            expected: ["error": "SCP-UCAN-001"]
+            expected: ["error": "SCP-PERM-3001"]
         )
 
         #expect(fixture.testId == "ucan-validate-001")
         #expect(fixture.category == "ucan")
         #expect(fixture.operation == "ucan_validate")
         #expect(fixture.input["encoded"] == "test.token.sig")
-        #expect(fixture.expected["error"] == "SCP-UCAN-001")
+        #expect(fixture.expected["error"] == "SCP-PERM-3001")
     }
 
     @Test("Conformance result comparison matches expected output")
@@ -386,7 +386,7 @@ struct ConformanceTests {
                 "context_id": "ctx-1",
                 "presenter_did": "did:dht:z6MkPresenter",
             ],
-            expected: ["error": "SCP-UCAN-001"]
+            expected: ["error": "SCP-PERM-3001"]
         )
 
         let result = await dispatch(operation: fixture.operation, input: fixture.input)

@@ -151,7 +151,7 @@ internal func scpMcpServe(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-MCP-001"
+        code: "SCP-MCP-10001"
     )))
 }
 
@@ -169,7 +169,7 @@ internal func scpMcpClientCreate(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-MCP-002"
+        code: "SCP-MCP-10002"
     )))
 }
 
@@ -187,7 +187,7 @@ internal func scpMcpClientListTools(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-MCP-003"
+        code: "SCP-MCP-10003"
     )))
 }
 
@@ -213,7 +213,7 @@ internal func scpMcpClientInvoke(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-MCP-004"
+        code: "SCP-MCP-10004"
     )))
 }
 

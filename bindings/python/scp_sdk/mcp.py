@@ -71,7 +71,7 @@ def _bridge() -> Any:
         raise TransportError(
             "The _scp_core extension module is not installed. "
             "Install scp-sdk with: pip install scp-sdk",
-            code="SCP-MCP-8001",
+            code="SCP-MCP-10001",
         ) from exc
 
 
@@ -238,13 +238,13 @@ async def serve_mcp(
     if transport not in _VALID_TRANSPORTS:
         raise ValidationError(
             f"transport must be 'stdio' or 'sse', got {transport!r}",
-            code="SCP-MCP-8002",
+            code="SCP-MCP-10002",
         )
 
     if not contexts:
         raise ValidationError(
             "at least one context is required",
-            code="SCP-MCP-8003",
+            code="SCP-MCP-10003",
         )
 
     logger.info(
@@ -340,7 +340,7 @@ def disable_stdio_allowlist(
         raise ValidationError(
             "You must pass i_trust_all_commands=True to disable the "
             "stdio allowlist. This allows arbitrary command execution.",
-            code="SCP-MCP-8007",
+            code="SCP-MCP-10007",
         )
 
     logger.warning(
@@ -426,7 +426,7 @@ def register_tool_handler(
     if not callable(handler):
         raise ValidationError(
             "handler must be callable",
-            code="SCP-MCP-8008",
+            code="SCP-MCP-10008",
         )
 
     bridge = _bridge()
@@ -504,19 +504,19 @@ class McpClient:
         if transport not in _VALID_TRANSPORTS:
             raise ValidationError(
                 f"transport must be 'stdio' or 'sse', got {transport!r}",
-                code="SCP-MCP-8002",
+                code="SCP-MCP-10002",
             )
 
         if transport == "stdio" and not command:
             raise ValidationError(
                 "command is required for stdio transport",
-                code="SCP-MCP-8004",
+                code="SCP-MCP-10004",
             )
 
         if transport == "sse" and not url:
             raise ValidationError(
                 "url is required for sse transport",
-                code="SCP-MCP-8005",
+                code="SCP-MCP-10005",
             )
 
         # Pre-validate the command binary against the allowlist before
@@ -532,7 +532,7 @@ class McpClient:
                 raise ValidationError(
                     f"command must be a bare binary name, not a path: "
                     f"'{binary}'. The OS will resolve it via PATH.",
-                    code="SCP-MCP-8006",
+                    code="SCP-MCP-10006",
                 )
 
             state = get_stdio_allowlist()
@@ -543,7 +543,7 @@ class McpClient:
                     f"Allowed: {allowed}. "
                     f"Call configure_stdio_allowlist("
                     f"additional_binaries=['{basename}']) first.",
-                    code="SCP-MCP-8006",
+                    code="SCP-MCP-10006",
                 )
 
         logger.info(

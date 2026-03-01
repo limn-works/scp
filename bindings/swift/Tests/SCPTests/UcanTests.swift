@@ -163,7 +163,7 @@ struct UcanTests {
 
     // MARK: - Validate (bridge stub error propagation)
 
-    @Test("validate throws bridge error with SCP-UCAN-001")
+    @Test("validate throws bridge error with SCP-PERM-3001")
     func validateThrowsBridgeError() async {
         do {
             _ = try await validate(
@@ -174,7 +174,7 @@ struct UcanTests {
             Issue.record("Expected validate to throw")
         } catch let error as ScpError {
             if case .Permission(_, let code) = error {
-                #expect(code == "SCP-UCAN-001")
+                #expect(code == "SCP-PERM-3001")
             } else {
                 Issue.record("Expected ScpError.Permission, got \(error)")
             }
@@ -185,7 +185,7 @@ struct UcanTests {
 
     // MARK: - Mint (bridge stub error propagation)
 
-    @Test("mint throws bridge error with SCP-UCAN-002")
+    @Test("mint throws bridge error with SCP-PERM-3002")
     func mintThrowsBridgeError() async {
         do {
             _ = try await mint(
@@ -200,7 +200,7 @@ struct UcanTests {
             Issue.record("Expected mint to throw")
         } catch let error as ScpError {
             if case .Permission(_, let code) = error {
-                #expect(code == "SCP-UCAN-002")
+                #expect(code == "SCP-PERM-3002")
             } else {
                 Issue.record("Expected ScpError.Permission, got \(error)")
             }
@@ -222,7 +222,7 @@ struct UcanTests {
         } catch let error as ScpError {
             // The bridge stub error is expected -- we're verifying default params work.
             if case .Permission(_, let code) = error {
-                #expect(code == "SCP-UCAN-002")
+                #expect(code == "SCP-PERM-3002")
             } else {
                 Issue.record("Expected ScpError.Permission, got \(error)")
             }
@@ -233,7 +233,7 @@ struct UcanTests {
 
     // MARK: - Revoke (bridge stub error propagation)
 
-    @Test("revoke throws bridge error with SCP-UCAN-003")
+    @Test("revoke throws bridge error with SCP-PERM-3003")
     func revokeThrowsBridgeError() async {
         do {
             try await revoke(
@@ -243,7 +243,7 @@ struct UcanTests {
             Issue.record("Expected revoke to throw")
         } catch let error as ScpError {
             if case .Permission(_, let code) = error {
-                #expect(code == "SCP-UCAN-003")
+                #expect(code == "SCP-PERM-3003")
             } else {
                 Issue.record("Expected ScpError.Permission, got \(error)")
             }

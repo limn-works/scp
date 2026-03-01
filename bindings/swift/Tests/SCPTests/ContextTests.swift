@@ -139,7 +139,7 @@ func createReturnsActiveContext() async throws {
 @Test("Context.create propagates bridge errors")
 func createPropagatesBridgeErrors() async {
     let createFn: ContextBridge.CreateFn = { _, _ in
-        throw ScpError.Context(message: "creation failed", code: "SCP-CTX-100")
+        throw ScpError.Context(message: "creation failed", code: "SCP-CTX-2100")
     }
     let noOpSend: ContextBridge.SendFn = { _, _ in }
     let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
@@ -186,7 +186,7 @@ func sendThrowsWhenClosed() async throws {
     }
 }
 
-@Test("send throws SCP-CTX-001 when context is not active")
+@Test("send throws SCP-CTX-2001 when context is not active")
 func sendThrowsCorrectErrorCode() async throws {
     let context = makeTestContext()
     try await context.close()
@@ -196,7 +196,7 @@ func sendThrowsCorrectErrorCode() async throws {
         Issue.record("Expected send to throw after close")
     } catch let error as ScpError {
         if case .Context(let message, let code) = error {
-            #expect(code == "SCP-CTX-001")
+            #expect(code == "SCP-CTX-2001")
             #expect(message == "Context is not active")
         } else {
             Issue.record("Expected ScpError.Context, got \(error)")
@@ -303,7 +303,7 @@ func messagesStreamFinishesOnError() async throws {
     ))
     resolvedListener.onError(error: ScpError.Transport(
         message: "connection lost",
-        code: "SCP-TXP-001"
+        code: "SCP-TRANS-5001"
     ))
 
     var received: [Message] = []

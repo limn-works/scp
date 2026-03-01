@@ -197,7 +197,7 @@ pub struct NapiDIDDocument {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-VAL-7007` if `custody` is not a recognized value.
+/// - Rejects with `SCP-VALID-7007` if `custody` is not a recognized value.
 /// - Rejects with `SCP-IDENT-1003` for `"platform"` or `"software"` custody
 ///   (not yet wired).
 /// - Rejects with `SCP-IDENT-1001` if key generation or DID creation fails.

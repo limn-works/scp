@@ -236,7 +236,7 @@ class TestServeMcpValidation:
                 contexts=[mock_context],
                 transport="invalid",
             )
-        assert exc_info.value.code == "SCP-MCP-8002"
+        assert exc_info.value.code == "SCP-MCP-10002"
 
     @pytest.mark.asyncio
     async def test_validation_error_has_correct_code_for_empty_contexts(self) -> None:
@@ -249,7 +249,7 @@ class TestServeMcpValidation:
                 contexts=[],
                 transport="stdio",
             )
-        assert exc_info.value.code == "SCP-MCP-8003"
+        assert exc_info.value.code == "SCP-MCP-10003"
 
 
 # -----------------------------------------------------------------------
@@ -279,15 +279,15 @@ class TestMcpClientConnectValidation:
     async def test_validation_error_codes(self) -> None:
         with pytest.raises(ValidationError) as exc_info:
             await McpClient.connect("invalid")
-        assert exc_info.value.code == "SCP-MCP-8002"
+        assert exc_info.value.code == "SCP-MCP-10002"
 
         with pytest.raises(ValidationError) as exc_info:
             await McpClient.connect("stdio")
-        assert exc_info.value.code == "SCP-MCP-8004"
+        assert exc_info.value.code == "SCP-MCP-10004"
 
         with pytest.raises(ValidationError) as exc_info:
             await McpClient.connect("sse")
-        assert exc_info.value.code == "SCP-MCP-8005"
+        assert exc_info.value.code == "SCP-MCP-10005"
 
 
 # -----------------------------------------------------------------------
@@ -437,7 +437,7 @@ class TestBridgeImportError:
             "scp_sdk.mcp._bridge",
             side_effect=TransportError(
                 "The _scp_core extension module is not installed.",
-                code="SCP-MCP-8001",
+                code="SCP-MCP-10001",
             ),
         ):
             with pytest.raises(TransportError, match="_scp_core"):
@@ -454,7 +454,7 @@ class TestBridgeImportError:
             "scp_sdk.mcp._bridge",
             side_effect=TransportError(
                 "The _scp_core extension module is not installed.",
-                code="SCP-MCP-8001",
+                code="SCP-MCP-10001",
             ),
         ):
             with pytest.raises(TransportError, match="_scp_core"):
@@ -591,7 +591,7 @@ class TestMcpClientAllowlistPreValidation:
     async def test_path_rejection_error_code(self) -> None:
         with pytest.raises(ValidationError) as exc_info:
             await McpClient.connect("stdio", command=["/tmp/evil/node"])
-        assert exc_info.value.code == "SCP-MCP-8006"
+        assert exc_info.value.code == "SCP-MCP-10006"
 
     @pytest.mark.asyncio
     async def test_unlisted_binary_rejected_with_actionable_message(self) -> None:

@@ -161,7 +161,7 @@ struct ToolsTests {
 
     // MARK: - Tool invocation via Context
 
-    @Test("invokeTool throws bridge error with SCP-TOOL-001")
+    @Test("invokeTool throws bridge error with SCP-TOOL-6001")
     func invokeToolThrowsBridgeError() async {
         let context = makeTestContext()
         do {
@@ -169,7 +169,7 @@ struct ToolsTests {
             Issue.record("Expected invokeTool to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-TOOL-001")
+                #expect(code == "SCP-TOOL-6001")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }
@@ -188,7 +188,7 @@ struct ToolsTests {
             Issue.record("Expected invokeTool to throw on closed context")
         } catch let error as ScpError {
             if case .Context(_, let code) = error {
-                #expect(code == "SCP-CTX-001")
+                #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
             }
@@ -199,7 +199,7 @@ struct ToolsTests {
 
     // MARK: - Tool registration via Context
 
-    @Test("registerTool throws bridge error with SCP-TOOL-002")
+    @Test("registerTool throws bridge error with SCP-TOOL-6002")
     func registerToolThrowsBridgeError() async {
         let context = makeTestContext()
         let definition = ToolDefinition(
@@ -216,7 +216,7 @@ struct ToolsTests {
             Issue.record("Expected registerTool to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-TOOL-002")
+                #expect(code == "SCP-TOOL-6002")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }
@@ -244,7 +244,7 @@ struct ToolsTests {
             Issue.record("Expected registerTool to throw on closed context")
         } catch let error as ScpError {
             if case .Context(_, let code) = error {
-                #expect(code == "SCP-CTX-001")
+                #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
             }
@@ -255,7 +255,7 @@ struct ToolsTests {
 
     // MARK: - Tool verification via Context
 
-    @Test("verifyTool throws bridge error with SCP-TOOL-003")
+    @Test("verifyTool throws bridge error with SCP-TOOL-6003")
     func verifyToolThrowsBridgeError() async {
         let context = makeTestContext()
         do {
@@ -263,7 +263,7 @@ struct ToolsTests {
             Issue.record("Expected verifyTool to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-TOOL-003")
+                #expect(code == "SCP-TOOL-6003")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }
@@ -282,7 +282,7 @@ struct ToolsTests {
             Issue.record("Expected verifyTool to throw on closed context")
         } catch let error as ScpError {
             if case .Context(_, let code) = error {
-                #expect(code == "SCP-CTX-001")
+                #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
             }
