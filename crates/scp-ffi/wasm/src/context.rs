@@ -358,7 +358,7 @@ impl WasmMessage {
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `params_json` is malformed JSON or
 ///   contains invalid field values.
-/// - Rejects with `[SCP-CTX-2000]` if context creation fails.
+/// - Rejects with `[SCP-CTX-2001]` if context creation fails.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -366,9 +366,12 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
     future_to_promise(async move {
         // Parse and validate params_json.
         let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
-            ScpWasmError::Validation(format!(
-                "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
-            ))
+            ScpWasmError::Validation {
+                message: format!(
+                    "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
+                ),
+                code: "SCP-VALID-7000".to_owned(),
+            }
             .into_js()
         })?;
 
@@ -427,7 +430,7 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// Rejects with `[SCP-CTX-2013]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -437,9 +440,12 @@ pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise
 
     future_to_promise(async move {
         if state != "active" {
-            return Err(ScpWasmError::Context(format!(
-                "cannot join context in '{state}' state — context must be 'active'"
-            ))
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cannot join context in '{state}' state — context must be 'active'"
+                ),
+                code: "SCP-CTX-2013".to_owned(),
+            }
             .into_js()
             .into());
         }
@@ -461,7 +467,7 @@ pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// Rejects with `[SCP-CTX-2015]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -471,9 +477,12 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 
     future_to_promise(async move {
         if state != "active" {
-            return Err(ScpWasmError::Context(format!(
-                "cannot leave context in '{state}' state — context must be 'active'"
-            ))
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cannot leave context in '{state}' state — context must be 'active'"
+                ),
+                code: "SCP-CTX-2015".to_owned(),
+            }
             .into_js()
             .into());
         }
@@ -501,7 +510,7 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// Rejects with `[SCP-CTX-2017]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -511,9 +520,12 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
 
     future_to_promise(async move {
         if state != "active" {
-            return Err(ScpWasmError::Context(format!(
-                "cannot close context in '{state}' state — context must be 'active'"
-            ))
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cannot close context in '{state}' state — context must be 'active'"
+                ),
+                code: "SCP-CTX-2017".to_owned(),
+            }
             .into_js()
             .into());
         }
@@ -537,7 +549,7 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
 ///
 /// # Errors
 ///
-/// - Rejects with `[SCP-CTX-2000]` if the context is not `"active"`.
+/// - Rejects with `[SCP-CTX-2019]` if the context is not `"active"`.
 /// - Rejects with `[SCP-VALID-7000]` if `payload_base64` is not valid base64.
 ///
 /// See ADR-022 acceptance criterion 1.
@@ -552,19 +564,24 @@ pub fn context_send(
 
     future_to_promise(async move {
         if state != "active" {
-            return Err(ScpWasmError::Context(format!(
-                "cannot send to context in '{state}' state — context must be 'active'"
-            ))
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cannot send to context in '{state}' state — context must be 'active'"
+                ),
+                code: "SCP-CTX-2019".to_owned(),
+            }
             .into_js()
             .into());
         }
 
         // Validate that the payload is valid base64.
         if payload_base64.is_empty() {
-            return Err(ScpWasmError::Validation(
-                "payload_base64 must not be empty — encode payload bytes as base64 before calling context_send"
-                    .to_owned(),
-            )
+            return Err(ScpWasmError::Validation {
+                message:
+                    "payload_base64 must not be empty — encode payload bytes as base64 before calling context_send"
+                        .to_owned(),
+                code: "SCP-VALID-7000".to_owned(),
+            }
             .into_js()
             .into());
         }
@@ -594,7 +611,7 @@ pub fn context_send(
 ///
 /// # Errors
 ///
-/// Returns `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// Returns `[SCP-CTX-2021]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -603,10 +620,13 @@ pub fn context_subscribe(
     callback: JsMessageCallback,
 ) -> Result<(), JsError> {
     if handle.state != "active" {
-        return Err(ScpWasmError::Context(format!(
-            "cannot subscribe to context in '{}' state — context must be 'active'",
-            handle.state
-        ))
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "cannot subscribe to context in '{}' state — context must be 'active'",
+                handle.state
+            ),
+            code: "SCP-CTX-2021".to_owned(),
+        }
         .into_js());
     }
 

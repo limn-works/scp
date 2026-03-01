@@ -110,9 +110,12 @@ impl PyUcanToken {
 
 /// Bridge [`DidResolver`] that extracts Ed25519 public keys from DID strings.
 ///
-/// Supports:
+/// Production formats only:
 /// - `did:dht:z{z-base-32-encoded-pubkey}` -- production format.
-/// - `did:key:{hex-encoded-pubkey}` -- testing format.
+/// - `did:key:z{multibase-encoded-pubkey}` -- multibase production format.
+///
+/// In test builds, also supports:
+/// - `did:key:{hex-encoded-pubkey}` -- testing format (raw hex, no multibase prefix).
 ///
 /// This resolver operates in-memory with no network calls. `did:dht:` DIDs
 /// encode the public key directly in the DID string using z-base-32, so
@@ -135,7 +138,24 @@ impl DidResolver for BridgeDidResolver {
             return Ok(bytes);
         }
 
-        // did:key:{hex-encoded-pubkey} (testing format)
+        // did:key:z{multibase-encoded-pubkey} (production format)
+        if let Some(suffix) = did.strip_prefix("did:key:z") {
+            let decoded = zbase32::decode(suffix).map_err(|_| {
+                CoreUcanError::MalformedToken(format!(
+                    "multibase z-base-32 decode failed for DID: {did}"
+                ))
+            })?;
+            let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+                CoreUcanError::MalformedToken(format!(
+                    "DID public key must be 32 bytes, got {}",
+                    v.len()
+                ))
+            })?;
+            return Ok(bytes);
+        }
+
+        // did:key:{hex-encoded-pubkey} (testing format — gated to test builds only)
+        #[cfg(test)]
         if let Some(hex_str) = did.strip_prefix("did:key:") {
             let bytes = decode_hex(hex_str).map_err(|e| {
                 CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
@@ -150,7 +170,7 @@ impl DidResolver for BridgeDidResolver {
         }
 
         Err(CoreUcanError::MalformedToken(format!(
-            "unsupported DID method: {did} (expected did:dht: or did:key:)"
+            "unsupported DID method: {did} (expected did:dht:z or did:key:z)"
         )))
     }
 }
@@ -419,6 +439,9 @@ fn generate_nonce() -> Result<String, ScpPyError> {
 }
 
 /// Decodes a hex string to bytes.
+///
+/// Only used by the `did:key:` hex path (test-only) and test cases.
+#[cfg(test)]
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     if !hex.len().is_multiple_of(2) {
         return Err(format!("hex string has odd length: {}", hex.len()));

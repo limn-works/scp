@@ -135,7 +135,7 @@ impl WasmUcanToken {
 ///
 /// # Errors
 ///
-/// - Rejects with `[SCP-PERM-3000]` if validation fails for any reason:
+/// - Rejects with `[SCP-PERM-3002]` if validation fails for any reason:
 ///   malformed token, invalid signature, expired, insufficient capabilities,
 ///   revoked, broken delegation chain.
 ///
@@ -146,11 +146,12 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
     future_to_promise(async move {
         let _ = (context_id, token, capability);
 
-        Err(ScpWasmError::Permission(
-            "not yet connected to runtime — UCAN validation requires a live context handle \
-             wired to scp-core"
+        Err(ScpWasmError::Permission {
+            message: "not yet connected to runtime — UCAN validation requires a live context \
+                      handle wired to scp-core"
                 .to_owned(),
-        )
+            code: "SCP-PERM-3002".to_owned(),
+        }
         .into_js()
         .into())
     })
@@ -176,7 +177,7 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `capabilities_json` is malformed.
-/// - Rejects with `[SCP-PERM-3000]` if minting fails (capabilities outside
+/// - Rejects with `[SCP-PERM-3004]` if minting fails (capabilities outside
 ///   the context ceiling, issuer not authorized).
 ///
 /// See ADR-022 acceptance criterion 1.
@@ -190,24 +191,31 @@ pub fn ucan_mint(
     future_to_promise(async move {
         // Validate that capabilities_json is a valid JSON array.
         let caps: serde_json::Value = serde_json::from_str(&capabilities_json).map_err(|e| {
-            ScpWasmError::Validation(format!("capabilities_json is not valid JSON: {e}")).into_js()
+            ScpWasmError::Validation {
+                message: format!("capabilities_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
         })?;
 
         if !caps.is_array() {
-            return Err(ScpWasmError::Validation(
-                "capabilities_json must be a JSON array of capability URI strings".to_owned(),
-            )
+            return Err(ScpWasmError::Validation {
+                message: "capabilities_json must be a JSON array of capability URI strings"
+                    .to_owned(),
+                code: "SCP-VALID-7000".to_owned(),
+            }
             .into_js()
             .into());
         }
 
         let _ = (context_id, member_did);
 
-        Err(ScpWasmError::Permission(
-            "not yet connected to runtime — UCAN minting requires a live context handle \
-             wired to scp-core"
+        Err(ScpWasmError::Permission {
+            message: "not yet connected to runtime — UCAN minting requires a live context \
+                      handle wired to scp-core"
                 .to_owned(),
-        )
+            code: "SCP-PERM-3004".to_owned(),
+        }
         .into_js()
         .into())
     })
@@ -230,7 +238,7 @@ pub fn ucan_mint(
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-PERM-3000]` if revocation fails (token not found,
+/// Rejects with `[SCP-PERM-3006]` if revocation fails (token not found,
 /// revoker not authorized — must be the token's issuer or context creator).
 ///
 /// See ADR-022 acceptance criterion 1.
@@ -240,11 +248,12 @@ pub fn ucan_revoke(context: &WasmContextHandle, token_id: String) -> Promise {
     future_to_promise(async move {
         let _ = (context_id, token_id);
 
-        Err(ScpWasmError::Permission(
-            "not yet connected to runtime — UCAN revocation requires a live context handle \
-             wired to scp-core"
+        Err(ScpWasmError::Permission {
+            message: "not yet connected to runtime — UCAN revocation requires a live context \
+                      handle wired to scp-core"
                 .to_owned(),
-        )
+            code: "SCP-PERM-3006".to_owned(),
+        }
         .into_js()
         .into())
     })
