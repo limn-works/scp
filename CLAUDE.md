@@ -95,11 +95,23 @@ User provides a directive → dispatches parallel subagents → runs tests → c
 
 ### Toolchain
 
-All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). System `python3` is Xcode 3.9 — **do not use it**; use `python3.12`.
-- `cargo test -p scp-ffi` requires: `DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") cargo test -p scp-ffi`
-- `cargo test --workspace` includes scp-ffi — set `DYLD_LIBRARY_PATH` or it will fail to link
-- Kotlin/Android: JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise
-- WASM: `wasm-pack` via cargo, `wasm32-unknown-unknown` target installed
+All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm or npx** — bun only for JS/TS. System `python3` is Xcode 3.9 — **do not use it**; use `python3.12`.
+
+| Language | Location | Package Manager | Lint | Format | Test | Build |
+|----------|----------|----------------|------|--------|------|-------|
+| **Rust** | `crates/` | cargo (workspace) | `cargo clippy --workspace --all-targets` | `cargo fmt --all` | `cargo test --workspace` (needs `DYLD_LIBRARY_PATH` below) | `cargo build --workspace` |
+| **Python** | `bindings/python/` | pip + maturin | `python3.12 -m ruff check .` | `python3.12 -m ruff format .` | `python3.12 -m pytest tests/ -v` | `maturin develop --release` |
+| **TypeScript** | `bindings/typescript/` | **bun** (not npm) | `bun run lint` (biome) | `bun run format` (biome) | `bun test` | `bun run build` (tsup) |
+| **Kotlin** | `bindings/kotlin/` | Gradle 8.x | `./gradlew detekt` | — | `./gradlew :scp-sdk-kotlin:test :scp-sdk-kotlin-android:testDebugUnitTest` | `./gradlew assembleRelease` |
+| **WASM** | `crates/scp-ffi/wasm/` | cargo | `cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown` | `cargo fmt` | conformance via `cargo test -p scp-core --test wasm_conformance` | `wasm-pack build crates/scp-ffi/wasm --target bundler` |
+
+**Language-specific gotchas:**
+
+- **Rust/Python linkage:** `cargo test -p scp-ffi` and `cargo test --workspace` require `DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")`
+- **Kotlin:** JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise. Run `eval "$(mise env)"` first. Release unit tests fail (pre-existing ProGuard issue); CI only runs `assembleRelease` + `jar`, no test task.
+- **WASM:** Cannot depend on scp-core (tokio multi-thread). Re-implements algorithms locally. See ADR-034.
+- **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
+- **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
 
 ### Git
 
