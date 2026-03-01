@@ -19,9 +19,16 @@ Every story object must include all of these fields. No exceptions.
 | `acceptanceCriteria` | array | Concrete, machine-verifiable assertions (see below) |
 | `actionItems` | array | Specific implementation steps |
 | `blockedBy` | array | Story IDs this story cannot start without (may be empty) |
-| `tools` | array | Capability categories: `browser`, `mobile`, `design`, or `[]` |
 | `sources` | array | Backlinks to source artifacts (see below) |
 | `details` | object | Arbitrary metadata — use `{}` when empty |
+
+## Optional Fields
+
+Include when relevant. Absence implies the default.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tools` | array | `[]` | Capability categories: `browser`, `mobile`, `design` |
 
 ## Gate Registration
 

@@ -34,12 +34,6 @@ jobs:
 
       - name: Run structural validation
         run: python3 scripts/validate-prd.py
-        # TODO: Remove continue-on-error once existing PRD backlog is fixed.
-        # Pre-existing stories (SCP-020 through SCP-217) have source section
-        # references that use non-heading formats (§-refs, line ranges, etc.).
-        # The validator correctly flags these; they need to be fixed in a
-        # dedicated cleanup pass.
-        continue-on-error: true
 
       - name: Compute review scope
         id: diff

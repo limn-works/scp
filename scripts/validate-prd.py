@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_STORY_FIELDS = [
     "id", "title", "gate", "priority", "severity", "status",
     "files", "description", "acceptanceCriteria", "actionItems",
-    "blockedBy", "tools", "sources", "details",
+    "blockedBy", "sources", "details",
 ]
 
 VALID_PRIORITIES = {"P0", "P1", "P2"}
