@@ -2,6 +2,8 @@ package com.limn.scp.android.platform
 
 import android.content.Context
 import android.util.Base64
+import android.util.Log
+import com.google.android.gms.common.api.ApiException
 import com.google.android.play.core.integrity.IntegrityManagerFactory
 import com.google.android.play.core.integrity.IntegrityTokenRequest
 import kotlinx.coroutines.Dispatchers
@@ -78,9 +80,20 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
                     )
                     .await()
             }
-        } catch (e: Exception) {
+        } catch (e: ApiException) {
+            // Known Play Integrity API error — status code is a documented public
+            // constant (API_NOT_AVAILABLE, INTEGRITY_TOKEN_PROVIDER_INVALID, etc.).
             throw ScpException(
-                "Play Integrity token request failed: ${e.message}",
+                "Play Integrity token request failed: status ${e.statusCode}",
+                CODE_ATTESTATION_FAILED
+            )
+        } catch (e: Exception) {
+            // Unexpected failure — log details internally but surface only a
+            // generic message to avoid leaking Android framework internals
+            // across the FFI boundary.
+            Log.e(TAG, "Unexpected Play Integrity failure", e)
+            throw ScpException(
+                "Play Integrity token request failed",
                 CODE_ATTESTATION_FAILED
             )
         }
@@ -140,6 +153,8 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
     }
 
     companion object {
+        private const val TAG = "AndroidDeviceAttestation"
+
         /** Attestation type field value for clientDataJSON. */
         const val ATTESTATION_TYPE = "scp-device-attestation-v1"
 
