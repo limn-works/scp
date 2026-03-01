@@ -17,6 +17,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 tracing = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-platform = { path = "../../scp-platform", features = ["software_platform"] }
 
