@@ -89,3 +89,11 @@ Notes:
 - **Dead catch clause in blocking-to-coroutine bridge:** ffiCallWithCancellation catches CancellationException from a blocking JNA call, but blocking calls cannot throw CancellationException. Only finally{!isActive} fires. Pattern: try/catch for cooperative exceptions around non-cooperative blocking code.
 - **Empty awaitClose with captured handle:** subscriptionHandle captured but awaitClose body is empty. No unsubscribe call means Rust continues invoking callback after Flow cancellation. Pattern: placeholder cleanup that will leak when wired to real FFI.
 - **Double-buffering in callbackFlow + .buffer():** callbackFlow already has Channel.BUFFERED internal capacity; .buffer(Channel.BUFFERED) adds another 64-item layer. Total buffer is ~128, not the documented 64. Pattern: redundant buffer operator on callbackFlow.
+
+### Known Bug Patterns (Mar 2026 — PR #127, loom/main-0301-0312 review)
+- **UniFFI ucan_mint signs with ephemeral key:** Creates new InMemoryKeyCustody + DID per call, signs token with wrong key. Token claims issuer_did = creator but signature is from ephemeral key. Pattern: placeholder key generation that looks real but produces unverifiable signatures. Same pattern as prior "key material discarded on identity_create".
+- **Sentinel-value collision in TTL calculation:** shortest_ttl_for_results uses PETNAME_CACHE_TTL (365d) as both sentinel and real value. Petname-only results collide with "no results" case, get 15min TTL. Pattern: using domain value as sentinel.
+- **NAPI transport_disconnect TOCTOU:** Lock acquired for read, dropped, re-acquired for write. Same pattern as prior TOCTOU in standing_channel. Pattern: check-then-act with lock gap.
+- **HotStreamFactory thread-unsafe maps:** Plain mutableMapOf accessed from both caller thread and Rust callback thread (onComplete). Pattern: Kotlin mutableMapOf used across thread boundaries without synchronization.
+- **ScpViewModel.trackContext fire-and-forget:** viewModelScope.launch to add, but viewModelScope cancelled before onCleared. Pattern: async add to cleanup list where sync would be correct.
+- **WASM ucan_validate wildcard bypass:** can=="*" check doesn't verify resource is scoped to current context. Pattern: re-implemented validation logic that is weaker than scp-core's canonical implementation.

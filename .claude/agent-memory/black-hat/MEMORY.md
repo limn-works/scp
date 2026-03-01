@@ -63,7 +63,57 @@ Notes:
 - File: `.docs/specs/22-human-readable-addressing.md` Section 22.8.4
 - Poisoned result returned immediately, background verification happens after user acts
 
-## Patterns Confirmed Working
+## Key Attack Surfaces Identified (PR #127 -- FFI/SDK/Broadcast)
+
+### CRITICAL: WASM bridge UCAN validation has no signature verification
+- File: `crates/scp-ffi/wasm/src/ucan.rs` lines 147-220
+- Only checks JWT structure, expiry, capability matching, `can == "*"` wildcard
+- Zero Ed25519 verification -- any crafted JWT passes
+
+### CRITICAL: NAPI ucan_mint uses all-zero placeholder signatures
+- File: `crates/scp-ffi/napi/src/ucan.rs` line 423
+- `let placeholder_sig = [0u8; 64]` -- tokens parseable but unsigned
+- Cross-bridge token laundering: mint in NAPI, validate in WASM
+
+### CRITICAL: Cross-bridge security parity violation
+- PyO3 = full scp-core delegation; NAPI = full validation but broken minting; WASM = structural only
+- Heterogeneous deployments vulnerable to token laundering
+
+### HIGH: Broadcast UCAN validation skips all crypto
+- File: `crates/scp-core/src/context/broadcast.rs` lines 382-405
+- Accepts wildcard `scp:ctx:*/messages:read`
+- No signature, expiry, revocation, delegation chain checks
+
+### HIGH: context_close has no authorization in ANY bridge
+- PyO3/NAPI/WASM/UniFFI all skip admin/capability check
+
+### HIGH: Nonce replay TOCTOU in check_and_record_nonce
+- File: `crates/scp-core/src/store/ucan.rs` lines 128-145
+- exists() then store_value() is not atomic
+
+### HIGH: identity_load produces cryptographically dead handles
+- NAPI/PyO3: loaded identity has no KeyCustody, silent degradation
+
+### HIGH: Attestation renewal without re-verification
+- File: `crates/scp-core/src/trust/renewal.rs` lines 63-87
+
+### MEDIUM: Inner envelope canonical hash lacks length prefixes
+- File: `crates/scp-core/src/envelope/inner.rs` lines 373-386
+
+### MEDIUM: Cover traffic DUMMY_FLAG=0x00 + fixed 30s interval
+- File: `crates/scp-transport/src/cover_traffic.rs`
+
+## Patterns Confirmed Working (PR #127)
+- Broadcast key isolation per author is sound (independent AES-256-GCM, random nonces, AAD)
+- Epoch overflow protection at u64::MAX
+- Key material Debug redaction across all bridges
+- Inner envelope domain separation with message type discriminator
+- Signaling sender attribution verification
+- PyO3 UCAN validation delegates to scp-core 11-step pipeline
+- Transport TLS enforcement in NAPI (rejects ws://)
+- Storage key conventions with context scoping
+
+## Patterns Confirmed Working (prior PRs)
 - Ceiling inheritance in nesting is sound
 - Template spoofing detection works correctly
 - Shadow capability restrictions (VERIFIED_IDENTITY_CAPABILITIES) solid

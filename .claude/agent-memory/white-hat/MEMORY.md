@@ -1,5 +1,33 @@
 # White Hat Agent Memory
 
+## PR #127 Security Review (2026-03-01)
+
+### P0 Findings
+- WASM ucan_validate (wasm/src/ucan.rs L147-220) skips Ed25519 signature verification entirely
+- WASM compute_token_cid hashes raw string, scp-core compute_revocation_cid hashes JSON payload -- revocation CID mismatch
+- WASM ucan_revoke hashes token_id not full JWT payload -- third CID variant
+- No zeroization on SenderKey, BroadcastKey, SenderKeyStore (Clone derived, no Drop+Zeroize)
+- check_and_record_nonce (store/ucan.rs L128-145) has TOCTOU race
+
+### P1 Findings
+- NAPI ucan_mint uses [0u8; 64] placeholder signature (napi/src/ucan.rs L423) -- stub for SCP-214
+- HeartbeatConfig.suppression_threshold_multiplier is f64, no NaN/Infinity validation
+- WASM ucan_mint silently drops non-string capabilities via filter_map
+- Storage keys use unsanitized DID/context_id strings (potential traversal)
+- WASM runtime re-implements scp-core logic (divergence risk caused revocation CID mismatch)
+
+### Well-Defended
+- RevocationPending treated as revoked (fail-closed revocation state machine)
+- Inner envelope MessageType discriminator prevents type-flipping
+- Broadcast key independence (fresh random per epoch, not HKDF)
+- Debug redaction on SenderKey and BroadcastKey
+- NAPI full 11-step validate_ucan pipeline with real Ed25519
+- PyO3 real Ed25519 signing via KeyCustody
+- Epoch overflow checked with checked_add
+- AES-256-GCM nonces from OsRng
+- ProtocolStore version envelope rejects future versions
+- Signaling sender attribution verification
+
 ## PR #76 Security Review (2026-02-26)
 
 ### Critical Findings
@@ -26,3 +54,9 @@
 - FFI bridge UCAN functions are stubs returning errors (correct fail-closed)
 - Anti-spam tracks per-DID independently (Sybil deterrent)
 - Standing channels use deterministic SHA-256 IDs from sorted DID pairs
+
+## Recurring Patterns
+- TOCTOU races in check-then-act patterns (nonce replay, standing channels, budget)
+- Missing zeroization on crypto key material
+- WASM bridge diverges from scp-core (re-implements rather than delegates)
+- unwrap_or_default on serialization hides failures with known-constant fallbacks

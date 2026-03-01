@@ -57,19 +57,26 @@
   - MEDIUM: HMAC domain separation uses concatenation without length prefix (consistent with scp-core spec; both should fix)
   - GOOD: OsRng for secret generation; error handling on HMAC init; interim design matches scp-core pseudonym.rs pattern
 
-### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86
+### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 + PR#127
 - CRITICAL: scp-platform testing feature in production deps (cdylib)
 - HIGH: transport_connect accepts ANY URL scheme -- no wss:// enforcement
+- HIGH: did:key: hex format not gated behind cfg(test) in BridgeDidResolver
 - MEDIUM: std::sync::Mutex in async context; serde_json errors may leak struct details
+- MEDIUM: generate_nonce uses thread_rng() instead of OsRng (diverges from NAPI)
+- MEDIUM: custody_type() returns Hardware as silent default on lock contention
 
-### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86
-- FIXED: transport_connect now rejects non-wss:// URLs
-- MEDIUM: WasmDIDDocument::from_fields no validation; context_send base64 check is_empty() only; panic hook leaks file paths; Missing #![forbid(unsafe_code)]; JsMessageCallback lacks catch
+### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 + PR#127
+- CRITICAL: ucan_validate skips Ed25519 signature verification entirely -- complete auth bypass
+- CRITICAL: ucan_mint returns unsigned tokens accepted by ucan_validate
+- HIGH: runtime.rs reimplements scp-core logic (Merkle tree, schema, tool registry) -- divergence risk
+- MEDIUM: context_send base64 check is_empty() only; panic hook leaks file paths
+- MEDIUM: Context IDs use UUID format not crypto-random hex per spec 18.4.1
 
-### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86
-- CRITICAL: scp-platform testing feature in production deps (cdylib)
-- HIGH: unreachable!() in identity_create -- panic across FFI
-- MEDIUM: std::sync::Mutex in async context; missing #![forbid(unsafe_code)]; status() silently defaults on poisoned mutex
+### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86 + PR#127
+- CRITICAL: ucan_mint uses [0u8; 64] placeholder zero signature
+- HIGH: did:key: hex format not gated behind cfg(test) in BridgeDidResolver
+- MEDIUM: Context IDs use UUID format not crypto-random hex per spec 18.4.1
+- MEDIUM: std::sync::Mutex in async context; missing #![forbid(unsafe_code)]
 
 ### TLS (`crates/scp-node/src/tls.rs`)
 - TLS 1.3 enforced; ACME HTTP-01 correct; CertificateData Debug redacts key
@@ -107,6 +114,23 @@
 ### Kotlin SDK (`bindings/kotlin/scp-sdk-kotlin/`)
 - CoroutineBridge awaitClose uses runBlocking(ioDispatcher) -- safe for Dispatchers.IO but deadlock risk on single-threaded test dispatchers
 - callbackFlow subscribe/unsubscribe pattern is correct; trySend with overflow detection is good
+
+### Governance Engines (PR#127 -- `scp-core/src/context/governance/`)
+- HIGH: SignedVote.signature always Vec::new() -- votes never signed or verified
+- HIGH: compute_proposal_id concatenation without length prefixes -- collision risk
+- GOOD: Deadline guards on approve/reject/withdraw in all engines (multisig, unanimity, majority)
+- GOOD: Duplicate proposal rejection; deterministic proposal IDs; early resolution rules correct
+- GOOD: All engines are Send + Sync; GovernanceEngine trait is object-safe
+- mls_integration.rs: clean separation of governance/MLS concerns; epoch coordinator correct
+
+### CI/CD Security (PR#127 -- `.github/workflows/`)
+- MEDIUM: pr-review.yml grants contents:write with Claude agent reading untrusted diffs
+- MEDIUM: claude.yml grants contents:write triggered by any @claude comment (no collaborator check)
+- MEDIUM: release.yml uses --allow-dirty for cargo publish
+- MEDIUM: build-matrix.yml uses curl|sh for wasm-pack install
+- GOOD: build-matrix.yml uses permissions: contents: read (minimal)
+- GOOD: rust-deny job runs cargo-deny for supply chain security
+- GOOD: PyPI uses OIDC Trusted Publishers (no stored token)
 
 ### General Patterns
 - No `unwrap`/`expect` in lib code -- project standard via clippy deny
