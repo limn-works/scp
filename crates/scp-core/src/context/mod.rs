@@ -26,6 +26,7 @@
 //! handles are serialized internally via `tokio::sync::RwLock`. See
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
+pub mod broadcast;
 pub mod builder;
 pub mod close;
 pub mod governance;
@@ -138,6 +139,12 @@ pub use governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
     SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
+};
+
+// Re-export broadcast context types (SCP-227, spec section 5.14).
+pub use broadcast::{
+    AuthorState, BlockResult, BroadcastAdmission, BroadcastContext, SubscriberRecord,
+    SubscriptionResult,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).
