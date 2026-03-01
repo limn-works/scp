@@ -91,7 +91,6 @@ pub use bridge::{
     event_log_query,
     event_log_verify,
     identity_create,
-    identity_create_platform,
     identity_load,
     identity_resolve,
     tool_invoke,
