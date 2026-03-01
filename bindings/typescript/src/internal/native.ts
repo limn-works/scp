@@ -168,10 +168,7 @@ export function createNativeBridge(): Bridge {
       paramsJson: string,
     ): Promise<BridgeContextHandle> {
       const handle = await (
-        addon.contextCreate as (
-          id: BridgeIdentityHandle,
-          p: string,
-        ) => Promise<BridgeContextHandle>
+        addon.contextCreate as (id: BridgeIdentityHandle, p: string) => Promise<BridgeContextHandle>
       )(identity, paramsJson);
       return handle;
     },
