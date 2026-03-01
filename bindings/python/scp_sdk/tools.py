@@ -10,7 +10,10 @@ See ``.docs/adrs/phase-3.md`` ADR-014 acceptance criterion 3 and
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from scp_sdk.identity import Identity
 
 
 @dataclass
@@ -63,11 +66,9 @@ class ToolDefinition:
     #: JSON Schema describing the tool's output.
     output_schema: dict[str, Any]
 
-    #: DID string or ``Identity`` object of the tool operator.
-    #: Uses ``Any`` as the union type since ``Identity`` is defined in a
-    #: separate module (separate story).  At runtime this should be
-    #: ``Identity | str``.
-    operator: Any
+    #: DID string or :class:`~scp_sdk.identity.Identity` object of the
+    #: tool operator.
+    operator: Identity | str | None
 
     #: Optional test vectors for verification.
     test_vectors: list[TestVector] | None = None

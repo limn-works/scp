@@ -274,7 +274,7 @@ class EventLog:
 
     async def query(
         self,
-        filter: str | None = None,
+        query_filter: str | None = None,
         since: float | None = None,
         actor: str | None = None,
         event_type: str | None = None,
@@ -282,7 +282,7 @@ class EventLog:
         """Query the event log with optional filters.
 
         Args:
-            filter: General-purpose filter string.
+            query_filter: General-purpose filter string.
             since: Only return events after this Unix timestamp.
             actor: Only return events from this actor DID.
             event_type: Only return events of this type.
@@ -294,8 +294,8 @@ class EventLog:
             ContextError: If the query fails or the context is unavailable.
         """
         filter_dict: dict[str, Any] = {}
-        if filter is not None:
-            filter_dict["filter"] = filter
+        if query_filter is not None:
+            filter_dict["filter"] = query_filter
         if since is not None:
             filter_dict["after_timestamp"] = since
         if actor is not None:
