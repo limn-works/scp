@@ -171,6 +171,8 @@ pub enum ResolutionLayer {
     Attestation,
     /// Resolved via domain `.well-known/scp` handles map.
     Domain,
+    /// Multiple independent resolution paths agreed on the same DID (§22.8.2 step 4c).
+    MultiLayerCorroborated,
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +560,8 @@ impl AddressResolver {
     /// * `petname_store` -- Local petname store for instant lookup.
     /// * `handle_querier` -- Querier for discovery context handle lookups.
     /// * `known_contexts` -- Known discovery context scope names and their IDs.
+    /// * `known_domains` -- Configured domains to check for domain handles during
+    ///   unscoped resolution (§22.8.2 step 2a).
     ///
     /// # Errors
     ///
@@ -570,6 +574,7 @@ impl AddressResolver {
         petname_store: &P,
         handle_querier: &H,
         known_contexts: &HashMap<String, ContextId>,
+        known_domains: &[&str],
     ) -> Result<Vec<AddressResolution>, AddressingError>
     where
         P: PetnameStore,
@@ -633,6 +638,14 @@ impl AddressResolver {
                         .await;
                     results.extend(handle_results);
                     let _ = scope;
+                }
+
+                // Then check domain handles for each configured domain (§22.8.2 step 2a).
+                for domain in known_domains {
+                    let domain_results = handle_querier
+                        .lookup_domain_handle(domain, &name)
+                        .await;
+                    results.extend(domain_results);
                 }
 
                 // Then check attestation.
@@ -770,7 +783,7 @@ fn corroborate_results(results: Vec<AddressResolution>) -> Vec<AddressResolution
                         sources: sources.clone(),
                     },
                     resolution_path: ResolutionPath {
-                        layer: ResolutionLayer::DiscoveryContext,
+                        layer: ResolutionLayer::MultiLayerCorroborated,
                         source: "corroborated".to_owned(),
                         source_id: None,
                         resolved_at: now,
@@ -804,6 +817,7 @@ fn shortest_ttl_for_results(results: &[AddressResolution]) -> Duration {
             ResolutionLayer::Domain => DOMAIN_HANDLE_CACHE_TTL,
             ResolutionLayer::DiscoveryContext => DISCOVERY_HANDLE_CACHE_TTL,
             ResolutionLayer::Attestation => ATTESTATION_HANDLE_CACHE_TTL,
+            ResolutionLayer::MultiLayerCorroborated => DISCOVERY_HANDLE_CACHE_TTL,
         };
         if ttl < min_ttl {
             min_ttl = ttl;
@@ -1132,6 +1146,10 @@ mod tests {
             corroborated[0].trust_level(),
             TrustLevel::MultiLayerCorroborated { sources } if sources.len() == 2
         ));
+        assert_eq!(
+            corroborated[0].resolution_path().layer,
+            ResolutionLayer::MultiLayerCorroborated
+        );
     }
 
     #[test]
@@ -1310,7 +1328,7 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice@cooking-community", &petnames, &querier, &known)
+            .resolve("alice@cooking-community", &petnames, &querier, &known, &[])
             .await
             .unwrap();
 
@@ -1332,7 +1350,7 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice@example.com", &petnames, &querier, &known)
+            .resolve("alice@example.com", &petnames, &querier, &known, &[])
             .await
             .unwrap();
 
@@ -1355,7 +1373,7 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice@x.com", &petnames, &querier, &known)
+            .resolve("alice@x.com", &petnames, &querier, &known, &[])
             .await
             .unwrap();
 
@@ -1377,7 +1395,7 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("@alice_cooks", &petnames, &querier, &known)
+            .resolve("@alice_cooks", &petnames, &querier, &known, &[])
             .await
             .unwrap();
 
@@ -1401,7 +1419,7 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice", &petnames, &querier, &known)
+            .resolve("alice", &petnames, &querier, &known, &[])
             .await
             .unwrap();
 
@@ -1426,7 +1444,7 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice", &petnames, &querier, &known)
+            .resolve("alice", &petnames, &querier, &known, &[])
             .await
             .unwrap();
 
@@ -1439,6 +1457,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_unscoped_checks_domain_handles() {
+        let petnames = TestPetnameStore::new();
+        let mut querier = TestHandleQuerier::new();
+        querier.add_domain_handle("example.com", "alice", "did:dht:zAlice");
+
+        let known = HashMap::new();
+
+        let mut resolver = AddressResolver::new();
+        let results = resolver
+            .resolve("alice", &petnames, &querier, &known, &["example.com"])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0],
+            AddressResolution::Identity { did, trust_level: TrustLevel::DomainVerified, .. }
+            if did == "did:dht:zAlice"
+        ));
+    }
+
+    #[tokio::test]
     async fn resolve_not_found_returns_error() {
         let petnames = TestPetnameStore::new();
         let querier = TestHandleQuerier::new();
@@ -1446,7 +1486,7 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let result = resolver
-            .resolve("nonexistent@nowhere", &petnames, &querier, &known)
+            .resolve("nonexistent@nowhere", &petnames, &querier, &known, &[])
             .await;
 
         assert!(matches!(result, Err(AddressingError::NotFound(_))));
@@ -1465,13 +1505,13 @@ mod tests {
 
         // First resolve populates cache.
         let results1 = resolver
-            .resolve("alice@cooking-community", &petnames, &querier, &known)
+            .resolve("alice@cooking-community", &petnames, &querier, &known, &[])
             .await
             .unwrap();
 
         // Second resolve should hit cache.
         let results2 = resolver
-            .resolve("alice@cooking-community", &petnames, &querier, &known)
+            .resolve("alice@cooking-community", &petnames, &querier, &known, &[])
             .await
             .unwrap();
 
