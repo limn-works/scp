@@ -2,14 +2,20 @@ build:
   maxIssues: 0
 
 complexity:
+  CyclomaticComplexMethod:
+    threshold: 25
   LongMethod:
     threshold: 60
+  TooManyFunctions:
+    thresholdInFiles: 30
   ComplexCondition:
     threshold: 4
-  CyclomaticComplexMethod:
-    threshold: 15
 
 style:
+  ForbiddenComment:
+    values: ["TODO", "FIXME", "HACK"]
+  MaxLineLength:
+    maxLineLength: 120
   MagicNumber:
     active: false
   ReturnCount:

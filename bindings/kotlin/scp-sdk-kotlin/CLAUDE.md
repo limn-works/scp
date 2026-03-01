@@ -28,15 +28,27 @@ The single dispatcher gateway for all FFI calls. All SDK domain classes (Scp.kt,
 - **`Dispatchers.Default`**: CPU-bound work (JSON serialization, data mapping). Uses `cpuBound()`.
 - **`Dispatchers.Main`**: Never used by the SDK. Only by Android ViewModels.
 
-### Streaming
+### Streaming (`stream/Streams.kt`)
 
-`callbackFlow` with `Channel.BUFFERED` (64 items) for message subscription. Cold stream semantics: subscription starts on collect, stops on cancel.
+Two-tier streaming architecture per ADR-028:
+
+| Component | Type | API | Backpressure | Use Case |
+|-----------|------|-----|--------------|----------|
+| `ColdStreamFactory` | Cold | `Flow<String>` | Collector-driven (natural) | Paginated queries: event log, message history |
+| `HotStreamFactory` | Hot | `SharedFlow<String>` | `DROP_OLDEST` (64 buffer) | Real-time events, multi-collector messages |
+| `ColdMessageFlow` | Cold | `Flow<String>` via `callbackFlow` | `trySend` + explicit error on overflow | Single-collector message subscription (fixes SCP-115) |
+
+**Cold streams** use `flow {}` builder with `withContext(ioDispatcher)` for FFI calls. Lazy: no work until collected.
+
+**Hot streams** use `MutableSharedFlow` with `extraBufferCapacity = 64` and `BufferOverflow.DROP_OLDEST`. Callbacks from Rust use `tryEmit()` (non-blocking, never suspends). Multiple concurrent collectors supported. Idempotent: same SharedFlow returned for same context handle.
+
+**`EventContextBindings`** extends `ContextBindings` with `contextSubscribeEvents()` / `contextUnsubscribeEvents()` for lifecycle event streams. When UniFFI generates the real bindings, implement this interface alongside `NativeBindings`.
 
 ## Gotchas
 
-### detekt TooManyFunctions (threshold: 11)
+### detekt TooManyFunctions (threshold: 30)
 
-The `NativeBindings` interface has 19 methods (one per UniFFI function). It is split into 5 domain sub-interfaces (`IdentityBindings`, `ContextBindings`, `ToolBindings`, `UcanBindings`, `InfraBindings`) with `NativeBindings` as the composite. The test stub `StubNativeBindings` uses `@Suppress("TooManyFunctions")` since it must implement all 19.
+The `NativeBindings` interface has 19 methods (one per UniFFI function). It is split into 5 domain sub-interfaces (`IdentityBindings`, `ContextBindings`, `ToolBindings`, `UcanBindings`, `InfraBindings`) with `NativeBindings` as the composite. The test stub `StubNativeBindings` uses `@Suppress("TooManyFunctions")` since it must implement all 19. The file-level threshold is 30 (set in `detekt.yml` per `standards/kotlin.md`).
 
 ### ktlint vs detekt line length conflict
 
@@ -45,6 +57,22 @@ ktlint's `function-body-expression-wrapping` rule wants single-line expression b
 ### StandardTestDispatcher is a function, not a type
 
 In `kotlinx-coroutines-test`, `StandardTestDispatcher()` is a top-level function returning `TestDispatcher`. Declare test fields as `TestDispatcher`, not `StandardTestDispatcher`.
+
+### Streaming: Do NOT use suspending send() in Rust callbacks
+
+Rust callbacks (`onMessage`, `onEvent`) run on non-coroutine threads. You cannot call suspending functions inside them. Use `trySend()` (in callbackFlow) or `tryEmit()` (in SharedFlow) -- both are non-blocking. Always handle the result of `trySend()` explicitly; the SCP-115 bridge silently discarded it.
+
+### Streaming: No double-buffering
+
+`callbackFlow` already has an internal `Channel.BUFFERED` buffer (64 items). Do NOT chain `.buffer(Channel.BUFFERED)` on the returned flow -- that creates ~128 total capacity and the documented 64-item invariant from ADR-028 is violated. The bridge-level `ContextBridge.subscribe()` has this bug; `ColdMessageFlow` in the stream package does not.
+
+### Streaming: Always populate awaitClose in callbackFlow
+
+`awaitClose { }` with an empty body means the Rust-side subscription handle is never released -- resource leak. Always call `contextUnsubscribe(handle)` inside `awaitClose`. Use `runBlocking(Dispatchers.IO)` (not the injected test dispatcher) to avoid deadlock in single-threaded test scenarios.
+
+### Streaming: Hot stream cleanup is explicit
+
+`HotStreamFactory` subscriptions are not tied to coroutine scope cancellation. You must call `stopContextEvents()`, `stopMessageStream()`, or `stopAll()` explicitly during teardown. In tests, use `@AfterEach` to call `factory.stopAll()`.
 
 ### UniFFI NativeLib.kt does not exist yet
 
@@ -59,6 +87,32 @@ The `NativeBindings` interface defines placeholder signatures matching ADR-028. 
 ./gradlew :scp-sdk-kotlin:detekt   # Static analysis only
 ./gradlew :scp-sdk-kotlin:runKtlintFormatOverMainSourceSet  # Auto-format
 ```
+
+## Publishing (SCP-119)
+
+Maven Central publishing is configured via `maven-publish` + `signing` plugins.
+
+```bash
+./gradlew :scp-sdk-kotlin:publishToMavenLocal    # Local testing
+./gradlew :scp-sdk-kotlin:publish                 # Deploy to Sonatype OSSRH
+```
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `MAVEN_CENTRAL_USERNAME` | Sonatype OSSRH username |
+| `MAVEN_CENTRAL_TOKEN` | Sonatype OSSRH token |
+| `GPG_KEY_ID` | GPG signing key ID |
+| `GPG_PRIVATE_KEY` | ASCII-armored GPG private key |
+| `GPG_PASSPHRASE` | GPG key passphrase |
+
+Signing is skipped when `GPG_PRIVATE_KEY` is not set (local dev builds).
+
+### Repositories
+
+- **Staging** (releases): `https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/`
+- **Snapshots**: `https://s01.oss.sonatype.org/content/repositories/snapshots/`
 
 ## Standards
 

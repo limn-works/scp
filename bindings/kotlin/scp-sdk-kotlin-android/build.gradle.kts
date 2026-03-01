@@ -3,7 +3,12 @@ plugins {
     kotlin("android")
     kotlin("plugin.serialization")
     id("io.gitlab.arturbosch.detekt") version "1.23.8"
+    id("maven-publish")
+    id("signing")
 }
+
+group = "com.limn"
+version = "0.1.0"
 
 repositories {
     google()
@@ -30,12 +35,15 @@ android {
 
     testOptions {
         unitTests {
-            // Allow android.* stubs to return default values (null/0/false) instead
-            // of throwing RuntimeException("Stub!"). Required for tests that construct
-            // Android types but never call their real implementations.
             isReturnDefaultValues = true
-            // Include Android resources for Robolectric
             isIncludeAndroidResources = true
+        }
+    }
+
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
+            withJavadocJar()
         }
     }
 }
@@ -63,6 +71,10 @@ dependencies {
     // AndroidX Core — Kotlin extensions
     implementation("androidx.core:core-ktx:1.15.0")
 
+    // AndroidX Lifecycle — lifecycle-aware resource management (ADR-028, SCP-117)
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")
+
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
@@ -79,6 +91,7 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
     testImplementation("org.robolectric:robolectric:4.14.1")
     testImplementation("androidx.test:core:1.6.1")
+    testImplementation("androidx.lifecycle:lifecycle-runtime-testing:2.8.7")
     testImplementation("junit:junit:4.13.2")
     testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.11.4")
 }
@@ -86,4 +99,72 @@ dependencies {
 detekt {
     config.setFrom("../detekt.yml")
     buildUponDefaultConfig = true
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
+                from(components["release"])
+
+                groupId = "com.limn"
+                artifactId = "scp-sdk-kotlin-android"
+                version = project.version.toString()
+
+                pom {
+                    name.set("SCP SDK for Kotlin — Android Extensions")
+                    description.set("Android lifecycle and platform extensions for the SCP Kotlin SDK")
+                    url.set("https://github.com/limn/scp")
+                    licenses {
+                        license {
+                            name.set("Apache-2.0")
+                            url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                        }
+                    }
+                    developers {
+                        developer {
+                            id.set("limn")
+                            name.set("Limn")
+                            email.set("dev@limn.dev")
+                        }
+                    }
+                    scm {
+                        connection.set("scm:git:git://github.com/limn/scp.git")
+                        developerConnection.set("scm:git:ssh://github.com/limn/scp.git")
+                        url.set("https://github.com/limn/scp")
+                    }
+                }
+            }
+        }
+        repositories {
+            maven {
+                name = "sonatypeStaging"
+                url = uri("https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/")
+                credentials {
+                    username = System.getenv("MAVEN_CENTRAL_USERNAME")
+                    password = System.getenv("MAVEN_CENTRAL_TOKEN")
+                }
+            }
+            maven {
+                name = "sonatypeSnapshots"
+                url = uri("https://s01.oss.sonatype.org/content/repositories/snapshots/")
+                credentials {
+                    username = System.getenv("MAVEN_CENTRAL_USERNAME")
+                    password = System.getenv("MAVEN_CENTRAL_TOKEN")
+                }
+            }
+        }
+    }
+
+    signing {
+        val signingKeyId = System.getenv("GPG_KEY_ID")
+        val signingKey = System.getenv("GPG_PRIVATE_KEY")
+        val signingPassword = System.getenv("GPG_PASSPHRASE")
+        useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
+        sign(publishing.publications["release"])
+    }
+
+    tasks.withType<Sign>().configureEach {
+        onlyIf { System.getenv("GPG_PRIVATE_KEY") != null }
+    }
 }
