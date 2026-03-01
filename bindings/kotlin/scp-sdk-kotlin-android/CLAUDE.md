@@ -1,8 +1,8 @@
-# scp-sdk-kotlin-android — Android Platform Adapter & Lifecycle Integration
+# scp-sdk-kotlin-android — Android Platform Adapter, Lifecycle & Compose Integration
 
 ## Overview
 
-Android-specific platform trait implementations and lifecycle-aware resource management for SCP. Implements the four UniFFI callback interfaces (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`, `StorageProvider`) using Android's native platform security stack (ADR-027), and provides `LifecycleOwner`-aware cleanup of SCP resources (ADR-028).
+Android-specific platform trait implementations, lifecycle-aware resource management, and Jetpack Compose state holders for SCP. Implements the four UniFFI callback interfaces (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`, `StorageProvider`) using Android's native platform security stack (ADR-027), provides `LifecycleOwner`-aware cleanup of SCP resources (ADR-028), and exposes SCP context state as Compose-observable `State<T>` via remember-based patterns (ADR-028, SCP-118).
 
 ## Architecture
 
@@ -26,6 +26,21 @@ Lifecycle-aware SCP resource management for Activities and Fragments. Keeps the 
 |------|---------|-------|
 | `ContextLifecycle.kt` | `Flow<T>.asLifecycleFlow(LifecycleOwner)` extension — scopes flow collection to lifecycle | SCP-117 |
 | `ScpViewModel.kt` | `ScpViewModel` base class — tracks contexts, auto-cleanup on `onCleared()` | SCP-117 |
+
+### Compose State Holders (`com.limn.scp.android.compose`)
+
+Jetpack Compose integration via standard Compose patterns (`collectAsState()`, `DisposableEffect`, `remember`). No custom state management — thin wrappers that make SCP streams Compose-observable.
+
+| Component | Purpose | Story |
+|-----------|---------|-------|
+| `ScpContextHolder` | Holds context handle + coroutine scope, cleaned up via `DisposableEffect` | SCP-118 |
+| `rememberScpContext()` | Remember pattern for SCP context scoping with disposal cleanup | SCP-118 |
+| `rememberScpFlow()` | Collect any `Flow<T>` as Compose `State<T>` via `collectAsState()` | SCP-118 |
+| `rememberScpEventList()` | Accumulate `SharedFlow<String>` events into bounded `State<List<String>>` | SCP-118 |
+| `rememberScpStateIn()` | Convert `Flow<T>` to `StateFlow` scoped to holder's coroutine scope | SCP-118 |
+| `rememberScpHotStream()` | Managed hot stream subscription with `onStop` cleanup on disposal | SCP-118 |
+| `ScpContextState` | Observable context state string wrapper with manual `refresh()` | SCP-118 |
+| `rememberScpContextState()` | Remember pattern for `ScpContextState` keyed by context handle | SCP-118 |
 
 ## Gotchas
 
@@ -103,6 +118,18 @@ Tests for `onCleared()` are also broken: `TestScpViewModel.callOnCleared()` call
 
 In tests, set `Dispatchers.setMain(testDispatcher)` before constructing the ViewModel and call `Dispatchers.resetMain()` in teardown.
 
+### Compose tests require Robolectric + JUnit 4
+
+Compose UI tests (`createComposeRule()`) require `@RunWith(RobolectricTestRunner::class)` and JUnit 4's `@Rule` annotation for the Compose test rule. They cannot use JUnit 5's `@ExtendWith`. Use `@Config(manifest = Config.NONE, sdk = [33])` for headless execution. The `compose-ui-test-junit4` dependency is `testImplementation`, and `compose-ui-test-manifest` is `debugImplementation`.
+
+### Compose plugin is kotlin("plugin.compose"), not a separate artifact
+
+With Kotlin 2.x, the Compose compiler is built into the Kotlin compiler plugin. Declare `kotlin("plugin.compose")` in both the root `build.gradle.kts` (with `apply false`) and the android module. The old `org.jetbrains.compose.compiler` artifact is not needed. The Compose BOM (`androidx.compose:compose-bom:2024.12.01`) manages runtime/UI version alignment.
+
+### rememberScpEventList accumulator uses synchronized, not mutex
+
+The `rememberScpEventList` accumulator list is mutated inside a `map` operator on a `SharedFlow`. Since `map` can run on any dispatcher and the list is shared across the transform chain, access is synchronized via `synchronized(accumulator)` rather than a coroutine `Mutex` (which would require `suspend` context inside `map`).
+
 ### Lifecycle extension is generic, not SCP-specific
 
 `asLifecycleFlow` is defined as `Flow<T>.asLifecycleFlow()` (generic), not `Flow<Message>.asLifecycleFlow()`. This works with any Flow type including the bridge's `Flow<String>` from `ContextBridge.subscribe()` and the future ergonomics layer's `Flow<Message>` from `Context.receiveFlow()`.
@@ -119,6 +146,9 @@ In tests, set `Dispatchers.setMain(testDispatcher)` before constructing the View
 
 ## Dependencies (from build.gradle.kts)
 
+- `androidx.compose:compose-bom:2024.12.01` — Compose version alignment (SCP-118)
+- `androidx.compose.runtime:runtime` — Compose runtime: `State<T>`, `collectAsState()`, `remember`, `DisposableEffect` (SCP-118)
+- `androidx.compose.ui:ui` — Compose UI foundation (SCP-118)
 - `androidx.lifecycle:lifecycle-runtime-ktx:2.8.7` — `flowWithLifecycle()` for lifecycle-scoped flows (SCP-117)
 - `androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7` — ViewModel + `viewModelScope` (SCP-117)
 - `com.google.android.play:integrity:1.4.0` — Play Integrity API
@@ -129,6 +159,7 @@ In tests, set `Dispatchers.setMain(testDispatcher)` before constructing the View
 - `androidx.security:security-crypto:1.1.0-alpha06` — EncryptedSharedPreferences
 - `org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0` — Coroutines
 - `org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0` — Android dispatcher
+- `androidx.compose.ui:ui-test-junit4` — (test) Compose test rule for Robolectric (SCP-118)
 - `androidx.lifecycle:lifecycle-runtime-testing:2.8.7` — (test) `TestLifecycleOwner` for lifecycle tests
 
 ## Standards
