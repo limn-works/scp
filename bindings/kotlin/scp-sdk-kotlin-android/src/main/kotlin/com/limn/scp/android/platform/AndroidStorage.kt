@@ -75,6 +75,11 @@ class AndroidStorage(private val context: Context) : StorageProvider {
     private fun openEncryptedDatabase(): SQLiteDatabase {
         SQLiteDatabase.loadLibs(context)
         val encryptionKey = getOrCreateStorageKey()
+        // NOTE: The String copy of the passphrase cannot be zeroed due to JVM String
+        // immutability. The ByteArray source (encryptionKey) is zeroed in the finally
+        // block. The real protection is TEE-backed key derivation — the passphrase is
+        // useless without the Android Keystore key. If SQLCipher adds a char[] or
+        // ByteArray overload for getWritableDatabase, prefer that and zero after use.
         val passphrase = String(encryptionKey, Charsets.ISO_8859_1)
         val helper = ScpDatabaseHelper(context)
         return helper.getWritableDatabase(passphrase)
