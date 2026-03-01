@@ -2435,17 +2435,24 @@ mod tests {
 
         // Helper closure: append an event and track it.
         let append = |log: &mut EventLog,
-                          events: &mut Vec<Event>,
-                          event_type: EventType,
-                          actor_did: &str,
-                          timestamp: u64,
-                          seq: u64,
-                          payload: Vec<u8>,
-                          signing_key: &ed25519_dalek::SigningKey,
-                          prev: [u8; 32]|
+                      events: &mut Vec<Event>,
+                      event_type: EventType,
+                      actor_did: &str,
+                      timestamp: u64,
+                      seq: u64,
+                      payload: Vec<u8>,
+                      signing_key: &ed25519_dalek::SigningKey,
+                      prev: [u8; 32]|
          -> [u8; 32] {
-            let event =
-                sign_event(event_type, actor_did, timestamp, seq, payload, prev, signing_key);
+            let event = sign_event(
+                event_type,
+                actor_did,
+                timestamp,
+                seq,
+                payload,
+                prev,
+                signing_key,
+            );
             tree::append(log, &event).unwrap();
             let leaf_hash: [u8; 32] = {
                 let mut h = Sha256::new();

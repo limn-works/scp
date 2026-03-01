@@ -221,13 +221,13 @@ impl HandleRegistry {
         params: &HandleRegisterParams,
         registrant_did: &DID,
     ) -> HandleRegisterResult {
-        if let HandleTarget::Identity { ref did } = params.target {
-            if did != registrant_did {
-                return HandleRegisterResult {
-                    status: HandleRegisterStatus::OwnershipMismatch,
-                    entry_id: None,
-                };
-            }
+        if let HandleTarget::Identity { ref did } = params.target
+            && did != registrant_did
+        {
+            return HandleRegisterResult {
+                status: HandleRegisterStatus::OwnershipMismatch,
+                entry_id: None,
+            };
         }
 
         let normalized = params.handle.to_lowercase();

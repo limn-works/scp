@@ -45,7 +45,7 @@ pub enum MessageType {
 impl MessageType {
     /// Returns a single-byte discriminator for inclusion in canonical hashes.
     #[must_use]
-    pub fn as_discriminator_byte(&self) -> u8 {
+    pub const fn as_discriminator_byte(&self) -> u8 {
         match self {
             Self::Content => 0,
             Self::Signaling => 1,
@@ -53,11 +53,12 @@ impl MessageType {
     }
 }
 
-/// Provenance tracks the origin of message content — which tool generated it,
-/// which agent produced it, and any upstream references. The exact structure
-/// will be expanded in later phases; this provides a serializable placeholder.
+/// Provenance tracks the origin of message content.
 ///
-/// See spec section 7.7 for the full provenance model.
+/// Records which tool generated it, which agent produced it, and any upstream
+/// references. The exact structure will be expanded in later phases; this
+/// provides a serializable placeholder. See spec section 7.7 for the full
+/// provenance model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     /// Human-readable description of the content origin.

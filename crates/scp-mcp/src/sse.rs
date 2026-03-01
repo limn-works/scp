@@ -38,8 +38,8 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -876,9 +876,7 @@ mod tests {
         let handle = ShutdownHandle::new();
 
         let run_handle = handle.clone();
-        let task = tokio::spawn(async move {
-            run_sse(server, config, run_handle).await
-        });
+        let task = tokio::spawn(async move { run_sse(server, config, run_handle).await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.shutdown();

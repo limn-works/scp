@@ -29,12 +29,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use scp_core::crypto::ucan::{Attenuation, UcanError as CoreUcanError, UcanHeader, UcanPayload};
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::validate::{
     DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     ValidationContext, parse_ucan, validate_ucan,
 };
+use scp_core::crypto::ucan::{Attenuation, UcanError as CoreUcanError, UcanHeader, UcanPayload};
 use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
@@ -108,9 +108,7 @@ impl KeyCustody for KeyCustodyProviderAdapter {
             let handle = KeyHandle::new(id);
             self.handle_to_id
                 .write()
-                .map_err(|_| {
-                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
-                })?
+                .map_err(|_| PlatformError::CustodyError("handle_to_id lock poisoned".to_owned()))?
                 .insert(id, key_id);
             Ok(handle)
         }
@@ -253,9 +251,7 @@ impl KeyCustody for KeyCustodyProviderAdapter {
             let pseudo_handle = KeyHandle::new(pseudo_handle_id);
             self.handle_to_id
                 .write()
-                .map_err(|_| {
-                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
-                })?
+                .map_err(|_| PlatformError::CustodyError("handle_to_id lock poisoned".to_owned()))?
                 .insert(pseudo_handle_id, pseudo_key_id);
 
             Ok(PseudonymKeypair {
@@ -2173,11 +2169,10 @@ pub async fn ucan_mint(
                 message: format!("header serialization failed: {e}"),
                 code: "SCP-PERM-3004".to_owned(),
             })?;
-            let payload_json =
-                serde_json::to_vec(&payload).map_err(|e| ScpError::Permission {
-                    message: format!("payload serialization failed: {e}"),
-                    code: "SCP-PERM-3004".to_owned(),
-                })?;
+            let payload_json = serde_json::to_vec(&payload).map_err(|e| ScpError::Permission {
+                message: format!("payload serialization failed: {e}"),
+                code: "SCP-PERM-3004".to_owned(),
+            })?;
 
             let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
             let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);

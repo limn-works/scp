@@ -231,8 +231,7 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
                 let with_str = att["with"].as_str().unwrap_or("");
                 let can_str = att["can"].as_str().unwrap_or("");
                 let att_uri = format!("{with_str}/{can_str}");
-                att_uri == capability
-                    || (can_str == "*" && with_str.starts_with(&context_prefix))
+                att_uri == capability || (can_str == "*" && with_str.starts_with(&context_prefix))
             })
         });
 
@@ -418,14 +417,12 @@ fn verify_token_signature(
     })?;
 
     let sig_b64 = parts[2];
-    let sig_bytes_vec = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        sig_b64,
-    )
-    .map_err(|e| {
-        ScpWasmError::Permission(format!("malformed UCAN signature (base64 decode): {e}"))
-            .into_js()
-    })?;
+    let sig_bytes_vec =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, sig_b64)
+            .map_err(|e| {
+                ScpWasmError::Permission(format!("malformed UCAN signature (base64 decode): {e}"))
+                    .into_js()
+            })?;
 
     let sig_bytes: [u8; 64] = sig_bytes_vec.as_slice().try_into().map_err(|_| {
         ScpWasmError::Permission(format!(
@@ -472,8 +469,8 @@ fn resolve_did_public_key(did: &str) -> Result<[u8; 32], String> {
     }
 
     if let Some(hex_str) = did.strip_prefix("did:key:") {
-        let bytes = decode_hex(hex_str)
-            .map_err(|e| format!("hex decode failed for did:key DID: {e}"))?;
+        let bytes =
+            decode_hex(hex_str).map_err(|e| format!("hex decode failed for did:key DID: {e}"))?;
         let pk: [u8; 32] = bytes
             .try_into()
             .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
@@ -500,11 +497,9 @@ fn parse_jwt_payload(token: &str) -> Result<WasmUcanPayload, String> {
         return Err("malformed UCAN token: expected 3 dot-separated JWT segments".to_owned());
     }
 
-    let payload_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        parts[1],
-    )
-    .map_err(|e| format!("malformed UCAN payload (base64 decode): {e}"))?;
+    let payload_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[1])
+            .map_err(|e| format!("malformed UCAN payload (base64 decode): {e}"))?;
 
     serde_json::from_slice(&payload_bytes)
         .map_err(|e| format!("malformed UCAN payload (JSON parse): {e}"))

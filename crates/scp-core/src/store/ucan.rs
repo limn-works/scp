@@ -226,7 +226,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// 2. `ProtocolStore` nonce tracking is a defence-in-depth layer for
     ///    crash recovery — it re-populates the in-memory set on restart.
     /// 3. The race window is bounded by storage I/O latency (typically
-    ///    sub-millisecond for SQLite WAL).
+    ///    sub-millisecond for `SQLite` WAL).
     /// 4. The post-write re-read errs on the side of rejection: if two
     ///    writers race, at most one sees its own timestamps back; the
     ///    other gets a mismatch and returns `false` (safe rejection).
@@ -341,10 +341,7 @@ mod tests {
     #[tokio::test]
     async fn load_ucan_token_returns_none_for_missing() {
         let store = make_store();
-        let loaded = store
-            .load_ucan_token("ctx-1", "nonexistent")
-            .await
-            .unwrap();
+        let loaded = store.load_ucan_token("ctx-1", "nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }
 
@@ -396,14 +393,8 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded_1 = store
-            .load_ucan_token("ctx-1", "tok-shared")
-            .await
-            .unwrap();
-        let loaded_2 = store
-            .load_ucan_token("ctx-2", "tok-shared")
-            .await
-            .unwrap();
+        let loaded_1 = store.load_ucan_token("ctx-1", "tok-shared").await.unwrap();
+        let loaded_2 = store.load_ucan_token("ctx-2", "tok-shared").await.unwrap();
         assert_eq!(loaded_1, Some(b"data-1".to_vec()));
         assert_eq!(loaded_2, Some(b"data-2".to_vec()));
     }
@@ -602,10 +593,7 @@ mod tests {
 
     #[test]
     fn ucan_token_prefix_follows_convention() {
-        assert_eq!(
-            ucan_token_prefix("ctx-123"),
-            "context/ctx-123/ucan_token/"
-        );
+        assert_eq!(ucan_token_prefix("ctx-123"), "context/ctx-123/ucan_token/");
     }
 
     #[test]

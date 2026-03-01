@@ -560,7 +560,8 @@ fn merkle_roots_identical_at_each_step() {
         let wasm_root = wasm_log.root();
 
         assert_eq!(
-            core_root, wasm_root,
+            core_root,
+            wasm_root,
             "ROOT DIVERGENCE at event {i}: core={} wasm={}",
             encode_hex(&core_root),
             encode_hex(&wasm_root),
@@ -581,7 +582,8 @@ fn merkle_roots_identical_various_sizes() {
         let wasm_root = wasm_log.root();
 
         assert_eq!(
-            core_root, wasm_root,
+            core_root,
+            wasm_root,
             "ROOT DIVERGENCE at size {size}: core={} wasm={}",
             encode_hex(&core_root),
             encode_hex(&wasm_root),
@@ -622,7 +624,8 @@ fn interior_tree_layers_identical() {
                 core_layer.iter().zip(wasm_layer.iter()).enumerate()
             {
                 assert_eq!(
-                    core_node, wasm_node,
+                    core_node,
+                    wasm_node,
                     "TREE DIVERGENCE at size {size}, layer {layer_idx}, node {node_idx}: \
                      core={} wasm={}",
                     encode_hex(core_node),
@@ -675,7 +678,8 @@ fn inclusion_proofs_identical_for_every_leaf() {
                 .enumerate()
             {
                 assert_eq!(
-                    core_step.sibling_hash, wasm_step.sibling_hash,
+                    core_step.sibling_hash,
+                    wasm_step.sibling_hash,
                     "PROOF STEP HASH DIVERGENCE at size {size}, leaf {i}, step {step_idx}: \
                      core={} wasm={}",
                     encode_hex(&core_step.sibling_hash),
@@ -784,11 +788,7 @@ fn absence_proofs_identical() {
 
         for query_hash in &test_hashes {
             // Skip if the hash happens to be present (unlikely but possible).
-            let sorted: Vec<[u8; 32]> = core_log
-                .sorted_leaves()
-                .iter()
-                .map(|(h, _)| *h)
-                .collect();
+            let sorted: Vec<[u8; 32]> = core_log.sorted_leaves().iter().map(|(h, _)| *h).collect();
             if sorted.contains(query_hash) {
                 continue;
             }
@@ -813,7 +813,8 @@ fn absence_proofs_identical() {
             match (&core_absence.lower, &wasm_absence.lower) {
                 (Some(core_lower), Some(wasm_lower)) => {
                     assert_eq!(
-                        core_lower.leaf_hash, wasm_lower.leaf_hash,
+                        core_lower.leaf_hash,
+                        wasm_lower.leaf_hash,
                         "ABSENCE LOWER HASH DIVERGENCE at size {size}, query={}",
                         encode_hex(query_hash),
                     );
@@ -835,7 +836,8 @@ fn absence_proofs_identical() {
             match (&core_absence.upper, &wasm_absence.upper) {
                 (Some(core_upper), Some(wasm_upper)) => {
                     assert_eq!(
-                        core_upper.leaf_hash, wasm_upper.leaf_hash,
+                        core_upper.leaf_hash,
+                        wasm_upper.leaf_hash,
                         "ABSENCE UPPER HASH DIVERGENCE at size {size}, query={}",
                         encode_hex(query_hash),
                     );
@@ -865,10 +867,8 @@ fn sorted_leaf_index_identical() {
     for size in [1, 5, 10, 16] {
         let (core_log, wasm_log, _) = build_dual_logs(size);
 
-        let core_sorted: Vec<([u8; 32], u64)> =
-            core_log.sorted_leaves().iter().copied().collect();
-        let wasm_sorted: Vec<([u8; 32], u64)> =
-            wasm_log.sorted_leaves.iter().copied().collect();
+        let core_sorted: Vec<([u8; 32], u64)> = core_log.sorted_leaves().iter().copied().collect();
+        let wasm_sorted: Vec<([u8; 32], u64)> = wasm_log.sorted_leaves.iter().copied().collect();
 
         assert_eq!(
             core_sorted.len(),
@@ -876,11 +876,11 @@ fn sorted_leaf_index_identical() {
             "sorted index size differs at size {size}"
         );
 
-        for (i, (core_entry, wasm_entry)) in
-            core_sorted.iter().zip(wasm_sorted.iter()).enumerate()
+        for (i, (core_entry, wasm_entry)) in core_sorted.iter().zip(wasm_sorted.iter()).enumerate()
         {
             assert_eq!(
-                core_entry.0, wasm_entry.0,
+                core_entry.0,
+                wasm_entry.0,
                 "SORTED INDEX HASH DIVERGENCE at size {size}, entry {i}: \
                  core={} wasm={}",
                 encode_hex(&core_entry.0),
@@ -1099,10 +1099,8 @@ fn value_against_schema_validation_identical() {
     ];
 
     for (i, (value, test_schema, expected_ok)) in test_cases.iter().enumerate() {
-        let core_result =
-            schema::validate_value_against_schema(value, test_schema).is_ok();
-        let wasm_result =
-            wasm_mirror::validate_value_against_schema(value, test_schema).is_ok();
+        let core_result = schema::validate_value_against_schema(value, test_schema).is_ok();
+        let wasm_result = wasm_mirror::validate_value_against_schema(value, test_schema).is_ok();
 
         assert_eq!(
             core_result, wasm_result,
@@ -1166,8 +1164,14 @@ fn empty_log_edge_cases_match() {
     // Inclusion proof on empty log: both should error.
     let core_err = core_proof::prove_inclusion(&core_log, 0);
     let wasm_err = wasm_mirror::prove_inclusion(&wasm_log, 0);
-    assert!(core_err.is_err(), "core should reject inclusion on empty log");
-    assert!(wasm_err.is_err(), "wasm should reject inclusion on empty log");
+    assert!(
+        core_err.is_err(),
+        "core should reject inclusion on empty log"
+    );
+    assert!(
+        wasm_err.is_err(),
+        "wasm should reject inclusion on empty log"
+    );
 
     // Absence proof on empty log: both should error.
     let query = [0x42; 32];

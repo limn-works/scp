@@ -1,4 +1,4 @@
-//! Broadcast key lifecycle and BroadcastEnvelope seal/open for broadcast contexts.
+//! Broadcast key lifecycle and `BroadcastEnvelope` seal/open for broadcast contexts.
 //!
 //! Broadcast contexts (spec section 5.14) use per-author AES-256-GCM broadcast
 //! keys instead of MLS group encryption. Each author holds a broadcast key with
@@ -15,7 +15,7 @@
 //!    emits a [`BroadcastKeyEpochAdvance`] event.
 //! 4. Subscribers request new key via the pull-based protocol (SCP-227).
 //!
-//! # BroadcastEnvelope
+//! # `BroadcastEnvelope`
 //!
 //! [`seal_broadcast`] encrypts a payload with the author's current broadcast key
 //! (AES-256-GCM) and packages it into a [`BroadcastEnvelope`].

@@ -136,7 +136,7 @@ pub struct BlockResult {
 /// gated), maintains the subscriber roster, and coordinates blocking with key
 /// rotation.
 ///
-/// Thread safety: not internally synchronized. The caller (ContextManager) is
+/// Thread safety: not internally synchronized. The caller (`ContextManager`) is
 /// responsible for serializing access.
 #[derive(Debug)]
 pub struct BroadcastContext {
@@ -181,7 +181,7 @@ impl BroadcastContext {
 
     /// Returns the admission policy.
     #[must_use]
-    pub fn admission(&self) -> BroadcastAdmission {
+    pub const fn admission(&self) -> BroadcastAdmission {
         self.admission
     }
 
@@ -211,16 +211,14 @@ impl BroadcastContext {
     /// Returns [`ContextError::PermissionDenied`] if the author is already
     /// registered.
     pub fn add_author(&mut self, author_did: &str) -> Result<&AuthorState, ContextError> {
-        if self.authors.contains_key(author_did) {
-            return Err(ContextError::PermissionDenied(format!(
-                "author already registered: {author_did}"
-            )));
+        match self.authors.entry(author_did.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(_) => Err(ContextError::PermissionDenied(
+                format!("author already registered: {author_did}"),
+            )),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                Ok(entry.insert(AuthorState::new(author_did.to_owned())))
+            }
         }
-        self.authors.insert(
-            author_did.to_owned(),
-            AuthorState::new(author_did.to_owned()),
-        );
-        Ok(self.authors.get(author_did).expect("just inserted"))
     }
 
     /// Returns the author state for a given DID, if registered.

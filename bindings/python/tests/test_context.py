@@ -696,10 +696,7 @@ class TestReceiveBufferOverflowDrop002:
 
     async def test_oldest_dropped_on_overflow(self) -> None:
         buffer_size = 3
-        messages = [
-            _MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i))
-            for i in range(5)
-        ]
+        messages = [_MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i)) for i in range(5)]
         receiver = _FakeReceiver(messages)
         iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
 
@@ -738,10 +735,7 @@ class TestReceiveBufferOverflowWarning003:
 
     async def test_warning_emitted_on_overflow(self) -> None:
         buffer_size = 2
-        messages = [
-            _MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i))
-            for i in range(4)
-        ]
+        messages = [_MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i)) for i in range(4)]
         receiver = _FakeReceiver(messages)
         iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
 
@@ -756,10 +750,7 @@ class TestReceiveBufferOverflowWarning003:
 
     async def test_warning_includes_dropped_count(self) -> None:
         buffer_size = 2
-        messages = [
-            _MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i))
-            for i in range(5)
-        ]
+        messages = [_MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i)) for i in range(5)]
         receiver = _FakeReceiver(messages)
         iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
 
@@ -777,10 +768,7 @@ class TestReceiveBufferOverflowWarning003:
 
     async def test_warning_includes_buffer_capacity(self) -> None:
         buffer_size = 150
-        messages = [
-            _MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i))
-            for i in range(152)
-        ]
+        messages = [_MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i)) for i in range(152)]
         receiver = _FakeReceiver(messages)
         iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
 

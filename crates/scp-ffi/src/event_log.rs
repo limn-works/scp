@@ -488,9 +488,8 @@ pub fn py_event_log_checkpoint(
                 .await
             });
 
-            result.map_err(|e| {
-                ScpPyError::ContextError(format!("checkpoint generation failed: {e}"))
-            })
+            result
+                .map_err(|e| ScpPyError::ContextError(format!("checkpoint generation failed: {e}")))
         })
     })?;
 

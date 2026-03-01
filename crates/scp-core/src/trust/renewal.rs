@@ -26,8 +26,8 @@
 
 use std::time::Duration;
 
-use super::attestation::{Attestation, DidPublicKeyResolver, verify_attestation};
 use super::TrustError;
+use super::attestation::{Attestation, DidPublicKeyResolver, verify_attestation};
 use crate::identity::cache::Clock;
 
 // ---------------------------------------------------------------------------
@@ -335,8 +335,7 @@ mod tests {
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
         let clock = TestClock::new(2000);
-        let attestation =
-            make_signed_non_renewable_attestation(&signing_key, 1000, Some(5000));
+        let attestation = make_signed_non_renewable_attestation(&signing_key, 1000, Some(5000));
 
         let result = renew_attestation(&attestation, &resolver, &clock);
 
@@ -453,7 +452,10 @@ mod tests {
             Duration::from_secs(600),
             None,
         );
-        attestation.revocation_status = RevocationStatus::Revoked { revoked_at: 1500, reason: Some("revoked for test".to_owned()) };
+        attestation.revocation_status = RevocationStatus::Revoked {
+            revoked_at: 1500,
+            reason: Some("revoked for test".to_owned()),
+        };
 
         let result = renew_attestation(&attestation, &resolver, &clock);
 
@@ -498,12 +500,8 @@ mod tests {
     fn needs_renewal_true_when_past_interval() {
         let clock = TestClock::new(2000);
         let checker = DefaultRenewalChecker::new(clock);
-        let attestation = make_unsigned_renewable_attestation(
-            1000,
-            Some(5000),
-            Duration::from_secs(600),
-            None,
-        );
+        let attestation =
+            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_secs(600), None);
 
         assert!(checker.needs_renewal(&attestation));
     }
@@ -512,12 +510,8 @@ mod tests {
     fn needs_renewal_false_when_within_interval() {
         let clock = TestClock::new(1500);
         let checker = DefaultRenewalChecker::new(clock);
-        let attestation = make_unsigned_renewable_attestation(
-            1000,
-            Some(5000),
-            Duration::from_secs(600),
-            None,
-        );
+        let attestation =
+            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_secs(600), None);
 
         assert!(!checker.needs_renewal(&attestation));
     }
@@ -526,12 +520,8 @@ mod tests {
     fn needs_renewal_uses_issued_at_when_renewed_at_is_none() {
         let clock = TestClock::new(1700);
         let checker = DefaultRenewalChecker::new(clock);
-        let attestation = make_unsigned_renewable_attestation(
-            1000,
-            Some(5000),
-            Duration::from_secs(600),
-            None,
-        );
+        let attestation =
+            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_secs(600), None);
 
         assert!(
             checker.needs_renewal(&attestation),
@@ -585,12 +575,8 @@ mod tests {
     fn needs_renewal_true_at_exact_boundary() {
         let clock = TestClock::new(1600);
         let checker = DefaultRenewalChecker::new(clock);
-        let attestation = make_unsigned_renewable_attestation(
-            1000,
-            Some(5000),
-            Duration::from_secs(600),
-            None,
-        );
+        let attestation =
+            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_secs(600), None);
 
         assert!(
             checker.needs_renewal(&attestation),

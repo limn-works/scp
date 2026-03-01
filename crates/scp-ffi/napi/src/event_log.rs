@@ -335,7 +335,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 /// Decodes a hex string into a 32-byte hash.
 fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
-    bytes.try_into().map_err(|v: Vec<u8>| {
-        format!("expected 32 bytes (64 hex chars), got {}", v.len())
-    })
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32 bytes (64 hex chars), got {}", v.len()))
 }

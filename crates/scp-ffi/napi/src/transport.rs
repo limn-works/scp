@@ -186,11 +186,9 @@ pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<Na
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Result<()> {
-    let mut s = manager.status.lock().map_err(|_| {
-        ScpNapiError::Transport {
-            message: "transport status lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5002".to_owned(),
-        }
+    let mut s = manager.status.lock().map_err(|_| ScpNapiError::Transport {
+        message: "transport status lock is poisoned".to_owned(),
+        code: "SCP-TRANS-5002".to_owned(),
     })?;
 
     if !s.connected {

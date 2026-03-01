@@ -803,9 +803,10 @@ fn shortest_ttl_for_results(results: &[AddressResolution]) -> Duration {
         let ttl = match result.resolution_path().layer {
             ResolutionLayer::Petname => PETNAME_CACHE_TTL,
             ResolutionLayer::Domain => DOMAIN_HANDLE_CACHE_TTL,
-            ResolutionLayer::DiscoveryContext => DISCOVERY_HANDLE_CACHE_TTL,
+            ResolutionLayer::DiscoveryContext | ResolutionLayer::MultiLayerCorroborated => {
+                DISCOVERY_HANDLE_CACHE_TTL
+            }
             ResolutionLayer::Attestation => ATTESTATION_HANDLE_CACHE_TTL,
-            ResolutionLayer::MultiLayerCorroborated => DISCOVERY_HANDLE_CACHE_TTL,
         };
         min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
     }

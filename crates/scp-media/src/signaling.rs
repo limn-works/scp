@@ -137,10 +137,7 @@ pub fn create_ice_candidate(
 
 /// Creates a session-end signaling message.
 #[must_use]
-pub fn create_session_end(
-    session_id: &str,
-    sender_did: DID,
-) -> (SessionId, SignalingMessage) {
+pub fn create_session_end(session_id: &str, sender_did: DID) -> (SessionId, SignalingMessage) {
     (
         session_id.to_owned(),
         SignalingMessage::SessionEnd { sender_did },
