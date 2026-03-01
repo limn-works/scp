@@ -19,9 +19,11 @@
 
 use napi::Error as NapiError;
 use napi_derive::napi;
+use scp_platform::traits::KeyCustody;
 use uuid::Uuid;
 
 use crate::error::ScpNapiError;
+use crate::identity::NapiIdentity;
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -78,6 +80,10 @@ pub struct NapiContextHandle {
     member_count: u64,
     /// Optional economic policy string.
     economic_policy: Option<String>,
+    /// Per-context pseudonym routing ID derived via `KeyCustody::derive_pseudonym`.
+    /// 32-byte pseudonym public key for relay routing (spec section 9.10.4).
+    /// `None` if pseudonym derivation was not available at creation time.
+    routing_id: Option<Vec<u8>>,
 }
 
 /// Internal context lifecycle state.
@@ -193,6 +199,20 @@ impl NapiContextHandle {
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
+
+    /// Returns the per-context pseudonym routing ID (32 bytes), or `null` if
+    /// pseudonym derivation was not available at context creation time.
+    ///
+    /// The routing ID is derived via `KeyCustody::derive_pseudonym` (spec
+    /// section 9.10.4). It provides per-context unlinkability: different
+    /// contexts produce different routing IDs for the same identity key.
+    ///
+    /// See ADR-006 and SCP-214 criterion 5.
+    #[napi(getter, js_name = "routingId")]
+    #[must_use]
+    pub fn routing_id(&self) -> Option<Vec<u8>> {
+        self.routing_id.clone()
+    }
 }
 
 impl NapiContextHandle {
@@ -250,23 +270,26 @@ pub struct NapiMessage {
 ///
 /// # Arguments
 ///
-/// * `identity_did` — The DID string of the context creator.
+/// * `identity` — The identity handle of the context creator (must be a live
+///   `NapiIdentity` created via `identityCreate`).
 /// * `params_json` — Context creation parameters as a JSON string. Optional
 ///   fields: `ceiling` (string[]), `governance` (string), `memoryScope`
 ///   (string), `ttlSeconds` (number), `promotable` (boolean).
 ///
 /// # Returns
 ///
-/// A `Promise<NapiContextHandle>` in the `"active"` state.
+/// A `Promise<NapiContextHandle>` in the `"active"` state with a routing ID
+/// derived via `KeyCustody::derive_pseudonym` (if in-memory custody is
+/// available).
 ///
 /// # Errors
 ///
 /// - Rejects with `SCP-VALID-7000` if `params_json` is malformed JSON.
 /// - Rejects with `SCP-CTX-2000` if context creation fails.
+/// - Rejects with `SCP-CRYPTO-3010` if pseudonym derivation fails.
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn context_create(
-    identity_did: String,
+    identity: &NapiIdentity,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
     let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
@@ -300,10 +323,30 @@ pub async fn context_create(
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
     let context_id = format!("ctx-{}", Uuid::new_v4());
+
+    // Derive per-context pseudonym routing ID via KeyCustody::derive_pseudonym
+    // (spec section 9.10.4, SCP-214 criterion 5). Only available when
+    // in-memory custody and ScpIdentity are present on the identity handle.
+    let routing_id = match (identity.in_memory_custody(), identity.scp_identity()) {
+        (Some(custody), Some(core_id)) => {
+            let pseudonym = custody
+                .derive_pseudonym(&core_id.identity_key, context_id.as_bytes())
+                .await
+                .map_err(|e| {
+                    NapiError::from(ScpNapiError::Crypto {
+                        message: format!("failed to derive pseudonym routing ID: {e}"),
+                        code: "SCP-CRYPTO-3010".to_owned(),
+                    })
+                })?;
+            Some(pseudonym.public_key.as_bytes().to_vec())
+        }
+        _ => None,
+    };
+
     let handle = NapiContextHandle {
         context_id,
         state: std::sync::Mutex::new(ContextState::Active),
-        creator_did: identity_did,
+        creator_did: identity.did(),
         mode,
         ceiling,
         ceiling_policy,
@@ -312,6 +355,7 @@ pub async fn context_create(
         governance,
         member_count: 1,
         economic_policy,
+        routing_id,
     };
     increment_handle_count();
     Ok(handle)

@@ -135,6 +135,20 @@ impl NapiIdentity {
     }
 }
 
+impl NapiIdentity {
+    /// Returns the retained `InMemoryKeyCustody` if this identity uses in-memory
+    /// custody. Used by context creation for routing ID derivation (SCP-214).
+    pub(crate) fn in_memory_custody(&self) -> Option<&InMemoryKeyCustody> {
+        self.inner.in_memory_custody.as_ref().map(|c| &c.0)
+    }
+
+    /// Returns the retained `ScpIdentity` if available. Used by context creation
+    /// for routing ID derivation (SCP-214).
+    pub(crate) fn scp_identity(&self) -> Option<&ScpIdentity> {
+        self.inner.scp_identity.as_ref()
+    }
+}
+
 impl Drop for NapiIdentity {
     /// Decrements the global FFI handle count when the JS object is GC'd.
     fn drop(&mut self) {

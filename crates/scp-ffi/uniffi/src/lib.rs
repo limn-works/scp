@@ -91,6 +91,7 @@ pub use bridge::{
     event_log_query,
     event_log_verify,
     identity_create,
+    identity_create_platform,
     identity_load,
     identity_resolve,
     tool_invoke,
@@ -311,6 +312,32 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// Returns an opaque key identifier string.
     async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError>;
+
+    /// Perform X25519 Diffie-Hellman key agreement.
+    ///
+    /// `key_id` — the X25519 key handle.
+    /// `peer_public` — 32-byte peer X25519 public key.
+    ///
+    /// Returns the 32-byte shared secret. The private key never leaves the
+    /// custody boundary.
+    async fn dh_agree(&self, key_id: String, peer_public: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+
+    /// Derive a deterministic, context-scoped Ed25519 pseudonym keypair.
+    ///
+    /// Algorithm (all implementations MUST produce identical output):
+    ///   1. `seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")`
+    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+    ///
+    /// ADR-027 amendment: use public key bytes as HMAC key for cross-platform
+    /// determinism with hardware TEE keys.
+    ///
+    /// Returns a two-element list: `[public_key_bytes (32), key_id (string as UTF-8)]`.
+    /// The bridge unpacks this into a `PseudonymKeypair`.
+    async fn derive_pseudonym(
+        &self,
+        key_id: String,
+        context_id: Vec<u8>,
+    ) -> Result<Vec<u8>, ScpError>;
 
     /// Return the custody type for `key_id`: `"hardware"`, `"software"`, or
     /// `"in_memory"`. Stays sync — no I/O required.
@@ -677,5 +704,133 @@ mod tests {
     fn scp_shutdown_zero_timeout_returns_immediately() {
         // Should return without hanging even if handles are live.
         scp_shutdown(0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-platform pseudonym derivation (SCP-214 criterion 16)
+    // -----------------------------------------------------------------------
+
+    /// Verifies that `context_create` populates a non-empty `routing_id` when
+    /// the identity has in-memory custody, and that the routing_id matches the
+    /// expected value from `InMemoryKeyCustody::derive_pseudonym`.
+    ///
+    /// This test validates criterion 16 of SCP-214: same identity key + same
+    /// `context_id` must produce identical `routing_id` across all bridges
+    /// (PyO3, UniFFI, WASM) and across all `KeyCustody` implementations
+    /// (`InMemoryKeyCustody`, `AndroidKeyCustody`, `AppleKeyCustody`).
+    ///
+    /// The UniFFI bridge uses `InMemoryKeyCustody::derive_pseudonym` internally.
+    /// The NAPI bridge does the same. The WASM bridge delegates to
+    /// `JsKeyCustody::derivePseudonym` which must implement the same algorithm.
+    /// The golden vector test in `scp-platform` verifies algorithm correctness
+    /// against known inputs. This test verifies the bridge wiring is correct.
+    #[test]
+    fn context_create_populates_routing_id_from_derive_pseudonym() {
+        use scp_platform::traits::KeyCustody;
+
+        let rt = runtime();
+
+        // Create an identity with in-memory custody.
+        let identity = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed");
+
+        let params = bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+
+        let handle = rt
+            .block_on(context_create(identity.clone(), params))
+            .expect("context_create should succeed");
+
+        // Verify routing_id is populated.
+        let routing_id = handle
+            .routing_id()
+            .expect("routing_id should be Some for in-memory custody identity");
+        assert_eq!(
+            routing_id.len(),
+            32,
+            "routing_id must be 32 bytes (Ed25519 public key)"
+        );
+
+        // Verify the routing_id matches a direct call to derive_pseudonym
+        // with the same custody and identity key.
+        let expected_routing_id = rt.block_on(async {
+            let custody_ref = identity
+                .in_memory_custody
+                .as_ref()
+                .expect("in_memory_custody should be present");
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .expect("core_id should be present");
+            let pseudonym = custody_ref
+                .0
+                .derive_pseudonym(&core_id.identity_key, handle.context_id().as_bytes())
+                .await
+                .expect("derive_pseudonym should succeed");
+            pseudonym.public_key.as_bytes().to_vec()
+        });
+
+        assert_eq!(
+            routing_id, expected_routing_id,
+            "routing_id from context_create must match direct derive_pseudonym output"
+        );
+    }
+
+    /// Verifies that different contexts created by the same identity produce
+    /// different routing IDs, ensuring per-context unlinkability (spec
+    /// section 9.10.4).
+    #[test]
+    fn different_contexts_produce_different_routing_ids() {
+        let rt = runtime();
+
+        let identity = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed");
+
+        let params1 = bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+        let params2 = bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+
+        let handle1 = rt
+            .block_on(context_create(identity.clone(), params1))
+            .expect("first context_create failed");
+        let handle2 = rt
+            .block_on(context_create(identity, params2))
+            .expect("second context_create failed");
+
+        let rid1 = handle1
+            .routing_id()
+            .expect("first routing_id should be Some");
+        let rid2 = handle2
+            .routing_id()
+            .expect("second routing_id should be Some");
+
+        // Different context IDs (UUIDs) must produce different routing IDs.
+        assert_ne!(
+            handle1.context_id(),
+            handle2.context_id(),
+            "context IDs should differ (UUID uniqueness)"
+        );
+        assert_ne!(
+            rid1, rid2,
+            "routing IDs must differ for different contexts (per-context unlinkability)"
+        );
     }
 }

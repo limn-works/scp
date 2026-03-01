@@ -624,9 +624,9 @@ mod tests {
     ///
     /// Verifies that `derive_pseudonym` is deterministic and that different
     /// context IDs produce different pseudonyms. The `expected_seed` value is
-    /// computed from the reference HMAC-SHA256 algorithm defined in ADR-006
-    /// and is kept for future cross-language (Swift, Kotlin, TypeScript)
-    /// verification once those test harnesses are wired.
+    /// computed from the reference HMAC-SHA256 algorithm using public key bytes
+    /// as the HMAC key (ADR-027 amendment). This golden vector is authoritative
+    /// for cross-language (Swift, Kotlin, TypeScript) verification.
     #[tokio::test]
     async fn derive_pseudonym_cross_platform_golden_vector() {
         // Known identity key seed: 0x00...01 (31 zeros, then 0x01).
