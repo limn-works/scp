@@ -130,6 +130,31 @@ With Kotlin 2.x, the Compose compiler is built into the Kotlin compiler plugin. 
 
 The `rememberScpEventList` accumulator list is mutated inside a `map` operator on a `SharedFlow`. Since `map` can run on any dispatcher and the list is shared across the transform chain, access is synchronized via `synchronized(accumulator)` rather than a coroutine `Mutex` (which would require `suspend` context inside `map`).
 
+### Anonymous CoroutineScope inside remember() leaks — always pair with DisposableEffect cancel
+
+Any `CoroutineScope(...)` created inside a `remember { }` block is invisible to Compose. Compose will NOT cancel it when the Composable leaves composition. The scope's `SupervisorJob` keeps the scope and its child coroutines alive indefinitely — a resource leak.
+
+Pattern to avoid:
+```kotlin
+// WRONG: scope is never cancelled
+val stateFlow = remember(key) {
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    someFlow.stateIn(scope, ...)
+}
+```
+
+Correct pattern: hoist the scope out of the stateIn remember block and pair it with `DisposableEffect`:
+```kotlin
+// CORRECT: scope cancelled on disposal
+val scope = remember(key) { CoroutineScope(SupervisorJob() + Dispatchers.Default) }
+DisposableEffect(key) { onDispose { scope.cancel() } }
+val stateFlow = remember(key) { someFlow.stateIn(scope, ...) }
+```
+
+Alternatively, use Compose's built-in `rememberCoroutineScope()` for the default dispatcher, or reuse an existing managed scope (e.g., `holder.scope` from `ScpContextHolder`) so cancellation is already handled.
+
+This bug was flagged in the SCP-118 review. `rememberScpEventList` creates an anonymous scope that is never cancelled. `rememberScpStateIn` avoids this correctly by reusing `holder.scope`.
+
 ### Lifecycle extension is generic, not SCP-specific
 
 `asLifecycleFlow` is defined as `Flow<T>.asLifecycleFlow()` (generic), not `Flow<Message>.asLifecycleFlow()`. This works with any Flow type including the bridge's `Flow<String>` from `ContextBridge.subscribe()` and the future ergonomics layer's `Flow<Message>` from `Context.receiveFlow()`.
