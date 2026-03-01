@@ -329,9 +329,14 @@ impl KeyCustody for InMemoryKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(ed25519_private_key_bytes, context_id || "scp-pseudonym")
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(signing_key.to_bytes().as_slice())
-                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            // HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")
+            // ADR-027 amendment: uses verifying (public) key bytes, not signing
+            // (private) key bytes, for cross-platform determinism with hardware
+            // TEE adapters that cannot export private key material.
+            let verifying_key = signing_key.verifying_key();
+            let mut mac =
+                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
+                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(b"scp-pseudonym");
             let hmac_output = mac.finalize().into_bytes();
@@ -634,8 +639,13 @@ mod tests {
         let context_id = b"test";
 
         // Compute expected pseudonym seed using the reference algorithm directly:
-        // seed = HMAC-SHA256(sk_bytes, context_id || "scp-pseudonym")
-        let mut mac = Hmac::<Sha256>::new_from_slice(&seed_bytes).unwrap();
+        // seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")
+        // ADR-027 amendment: HMAC key is the Ed25519 PUBLIC key, not the private
+        // key, for cross-platform determinism with hardware TEE adapters.
+        let identity_signing_key = SigningKey::from_bytes(&seed_bytes);
+        let identity_public_key = identity_signing_key.verifying_key();
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(identity_public_key.to_bytes().as_slice()).unwrap();
         mac.update(context_id);
         mac.update(b"scp-pseudonym");
         let expected_seed: [u8; 32] = mac.finalize().into_bytes().into();
