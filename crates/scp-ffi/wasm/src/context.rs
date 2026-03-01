@@ -529,10 +529,13 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
     future_to_promise(async move {
         // Authorization: only the context creator can close the context.
         if identity_did != creator_did {
-            return Err(ScpWasmError::Permission(format!(
-                "identity '{identity_did}' is not authorized to close this context \
-                 — only the context creator ('{creator_did}') can close it"
-            ))
+            return Err(ScpWasmError::Permission {
+                message: format!(
+                    "identity '{identity_did}' is not authorized to close this context \
+                     — only the context creator ('{creator_did}') can close it"
+                ),
+                code: "SCP-PERM-3000".to_owned(),
+            }
             .into_js()
             .into());
         }

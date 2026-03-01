@@ -614,9 +614,10 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpWa
     CONTEXT_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
         if map.contains_key(context_id) {
-            return Err(ScpWasmError::Context(format!(
-                "context '{context_id}' is already registered"
-            )));
+            return Err(ScpWasmError::Context {
+                message: format!("context '{context_id}' is already registered"),
+                code: "SCP-CTX-2000".to_owned(),
+            });
         }
 
         let ceiling_strings: HashSet<String> = [
@@ -669,12 +670,15 @@ where
 {
     CONTEXT_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
-        let rt = map.get_mut(context_id).ok_or_else(|| {
-            ScpWasmError::Context(format!(
-                "context '{context_id}' not found in runtime registry \
-                 — was it created with context_create?"
-            ))
-        })?;
+        let rt = map
+            .get_mut(context_id)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!(
+                    "context '{context_id}' not found in runtime registry \
+                     — was it created with context_create?"
+                ),
+                code: "SCP-CTX-2001".to_owned(),
+            })?;
         f(rt)
     })
 }

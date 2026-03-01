@@ -598,7 +598,10 @@ mod tests {
 
     #[test]
     fn ucan_token_prefix_follows_convention() {
-        assert_eq!(ucan_token_prefix("ctx-123").unwrap(), "context/ctx-123/ucan_token/");
+        assert_eq!(
+            ucan_token_prefix("ctx-123").unwrap(),
+            "context/ctx-123/ucan_token/"
+        );
     }
 
     #[test]

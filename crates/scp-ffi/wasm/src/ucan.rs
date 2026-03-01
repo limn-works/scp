@@ -870,16 +870,24 @@ pub fn ucan_validate(
 
     future_to_promise(async move {
         // Parse the token.
-        let parsed = parse_ucan(&token)
-            .map_err(|e| ScpWasmError::Permission(format!("malformed token: {e}")).into_js())?;
+        let parsed = parse_ucan(&token).map_err(|e| {
+            ScpWasmError::Permission {
+                message: format!("malformed token: {e}"),
+                code: "SCP-PERM-3000".to_owned(),
+            }
+            .into_js()
+        })?;
 
         // Parse optional proof tokens.
         let proof_tokens: Option<Vec<String>> = match proof_tokens_json {
             Some(json_str) => {
                 let arr: Vec<String> = serde_json::from_str(&json_str).map_err(|e| {
-                    ScpWasmError::Validation(format!(
-                        "proof_tokens_json is not a valid JSON array of strings: {e}"
-                    ))
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "proof_tokens_json is not a valid JSON array of strings: {e}"
+                        ),
+                        code: "SCP-VALID-7000".to_owned(),
+                    }
                     .into_js()
                 })?;
                 Some(arr)
@@ -891,7 +899,13 @@ pub fn ucan_validate(
         let (ceiling, creator_did) = with_ucan_state(&context_id, |state| {
             Ok((state.ceiling.clone(), state.creator_did.clone()))
         })
-        .map_err(|e| ScpWasmError::Permission(e).into_js())?;
+        .map_err(|e| {
+            ScpWasmError::Permission {
+                message: e,
+                code: "SCP-PERM-3000".to_owned(),
+            }
+            .into_js()
+        })?;
 
         // Run full 11-step validation.
         validate_ucan_full(
@@ -903,7 +917,13 @@ pub fn ucan_validate(
             &ceiling,
             &creator_did,
         )
-        .map_err(|e| ScpWasmError::Permission(e).into_js())?;
+        .map_err(|e| {
+            ScpWasmError::Permission {
+                message: e,
+                code: "SCP-PERM-3000".to_owned(),
+            }
+            .into_js()
+        })?;
 
         Ok(JsValue::UNDEFINED)
     })
@@ -945,13 +965,19 @@ pub fn ucan_mint(
     future_to_promise(async move {
         // Validate that capabilities_json is a valid JSON array.
         let caps: serde_json::Value = serde_json::from_str(&capabilities_json).map_err(|e| {
-            ScpWasmError::Validation(format!("capabilities_json is not valid JSON: {e}")).into_js()
+            ScpWasmError::Validation {
+                message: format!("capabilities_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
         })?;
 
         if !caps.is_array() {
-            return Err(ScpWasmError::Validation(
-                "capabilities_json must be a JSON array of capability URI strings".to_owned(),
-            )
+            return Err(ScpWasmError::Validation {
+                message: "capabilities_json must be a JSON array of capability URI strings"
+                    .to_owned(),
+                code: "SCP-VALID-7000".to_owned(),
+            }
             .into_js()
             .into());
         }
@@ -961,15 +987,19 @@ pub fn ucan_mint(
         let cap_strings: Vec<String> = caps
             .as_array()
             .ok_or_else(|| {
-                ScpWasmError::Validation("capabilities_json must be a JSON array".to_owned())
-                    .into_js()
+                ScpWasmError::Validation {
+                    message: "capabilities_json must be a JSON array".to_owned(),
+                    code: "SCP-VALID-7000".to_owned(),
+                }
+                .into_js()
             })?
             .iter()
-            .map(|v| {
+            .map(|v: &serde_json::Value| {
                 v.as_str().map(str::to_owned).ok_or_else(|| {
-                    ScpWasmError::Validation(format!(
-                        "invalid capability: expected string, got {v}"
-                    ))
+                    ScpWasmError::Validation {
+                        message: format!("invalid capability: expected string, got {v}"),
+                        code: "SCP-VALID-7000".to_owned(),
+                    }
                     .into_js()
                 })
             })
@@ -980,15 +1010,20 @@ pub fn ucan_mint(
         // Validate each capability URI is parseable.
         for cap in &cap_strings {
             CapabilityUri::parse(cap).map_err(|e| {
-                ScpWasmError::Validation(format!("invalid capability URI '{cap}': {e}")).into_js()
+                ScpWasmError::Validation {
+                    message: format!("invalid capability URI '{cap}': {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                }
+                .into_js()
             })?;
         }
 
-        Err(ScpWasmError::Permission(
-            "not yet connected to runtime -- UCAN minting requires a live context handle \
-             wired to scp-core"
+        Err(ScpWasmError::Permission {
+            message: "not yet connected to runtime -- UCAN minting requires a live context handle \
+                      wired to scp-core"
                 .to_owned(),
-        )
+            code: "SCP-PERM-3000".to_owned(),
+        }
         .into_js()
         .into())
     })
@@ -1021,11 +1056,13 @@ pub fn ucan_revoke(context: &WasmContextHandle, token_id: String) -> Promise {
     future_to_promise(async move {
         let _ = (context_id, token_id);
 
-        Err(ScpWasmError::Permission(
-            "not yet connected to runtime -- UCAN revocation requires a live context handle \
-             wired to scp-core"
-                .to_owned(),
-        )
+        Err(ScpWasmError::Permission {
+            message:
+                "not yet connected to runtime -- UCAN revocation requires a live context handle \
+                      wired to scp-core"
+                    .to_owned(),
+            code: "SCP-PERM-3000".to_owned(),
+        }
         .into_js()
         .into())
     })
