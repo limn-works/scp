@@ -53,18 +53,28 @@ jobs:
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "diff_head=$DIFF_HEAD" >> "$GITHUB_OUTPUT"
 
-          # Write file list
-          git diff --name-only "$DIFF_BASE".."$DIFF_HEAD" > /tmp/changed-files.txt || \
-            gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > /tmp/changed-files.txt
+          # Write raw file list, then filter to in-scope paths
+          git diff --name-only "$DIFF_BASE".."$DIFF_HEAD" > /tmp/all-changed-files.txt || \
+            gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > /tmp/all-changed-files.txt
 
-          # Write diff content
-          git diff "$DIFF_BASE".."$DIFF_HEAD" > /tmp/scope-diff.patch || \
+          grep -E '^(crates/|bindings/|tests/|scripts/|Cargo\.(toml|lock)$)' /tmp/all-changed-files.txt > /tmp/changed-files.txt || true
+
+          FILE_COUNT=$(wc -l < /tmp/changed-files.txt | tr -d ' ')
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [[ "$FILE_COUNT" -eq 0 ]]; then
+            echo "No in-scope files changed — skipping review."
+            exit 0
+          fi
+
+          # Write diff content (only in-scope files)
+          git diff "$DIFF_BASE".."$DIFF_HEAD" -- $(cat /tmp/changed-files.txt) > /tmp/scope-diff.patch || \
             gh pr diff ${{ github.event.pull_request.number }} > /tmp/scope-diff.patch
 
           echo "## Review Scope" > /tmp/review-scope.md
           echo "**Mode:** $MODE" >> /tmp/review-scope.md
           echo "**Range:** \`${DIFF_BASE:0:8}..${DIFF_HEAD:0:8}\`" >> /tmp/review-scope.md
-          echo "**Files in scope:** $(wc -l < /tmp/changed-files.txt | tr -d ' ')" >> /tmp/review-scope.md
+          echo "**Files in scope:** $FILE_COUNT" >> /tmp/review-scope.md
           echo "" >> /tmp/review-scope.md
           echo "### Changed files" >> /tmp/review-scope.md
           cat /tmp/changed-files.txt >> /tmp/review-scope.md
@@ -72,6 +82,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Fetch review history
+        if: steps.diff.outputs.file_count != '0'
         run: |
           PR=${{ github.event.pull_request.number }}
           REPO="${{ github.repository }}"
@@ -130,6 +141,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Claude PR review
+        if: steps.diff.outputs.file_count != '0'
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
