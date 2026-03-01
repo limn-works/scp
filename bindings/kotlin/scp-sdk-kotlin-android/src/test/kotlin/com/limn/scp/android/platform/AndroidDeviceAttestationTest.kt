@@ -1,10 +1,14 @@
 package com.limn.scp.android.platform
 
 import android.util.Base64
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertNotEquals
-import org.junit.jupiter.api.Assertions.assertTrue
-import org.junit.jupiter.api.Test
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.security.MessageDigest
 
 // ---------------------------------------------------------------------------
@@ -21,11 +25,10 @@ import java.security.MessageDigest
 // End-to-end integration tests with actual Play Integrity require a physical
 // device and are covered by instrumentation tests.
 //
-// Note: android.util.Base64 is not available in pure JVM unit tests. These
-// tests use a Robolectric-compatible or mock Base64 shim. If running without
-// Robolectric, the android.util.Base64 calls must be shimmed or these tests
-// should be moved to androidTest/ for instrumentation execution.
+// Uses Robolectric to provide android.util.Base64 on the host JVM.
 
+@RunWith(RobolectricTestRunner::class)
+@Config(manifest = Config.NONE, sdk = [35])
 class AndroidDeviceAttestationTest {
 
     // -----------------------------------------------------------------------
@@ -252,8 +255,8 @@ class AndroidDeviceAttestationTest {
         val deviceIdIdx = json.indexOf("\"deviceId\"")
         val typeIdx = json.indexOf("\"type\"")
 
-        assertTrue(challengeIdx < deviceIdIdx, "challenge must come before deviceId")
-        assertTrue(deviceIdIdx < typeIdx, "deviceId must come before type")
+        assertTrue("challenge must come before deviceId", challengeIdx < deviceIdIdx)
+        assertTrue("deviceId must come before type", deviceIdIdx < typeIdx)
     }
 
     // -----------------------------------------------------------------------
@@ -270,17 +273,6 @@ class AndroidDeviceAttestationTest {
      */
     @Suppress("UNCHECKED_CAST")
     private fun createAttestationWithMockContext(): AndroidDeviceAttestation {
-        // In pure JVM unit tests, we cannot create a real Android Context.
-        // The helper methods under test do not use the context field, so
-        // passing a mock or null-cast is safe for these specific tests.
-        // Integration tests on a real device should use an actual Context.
-        @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
-        val mockContext = null as? android.content.Context
-        // If mockContext is null, AndroidDeviceAttestation constructor would
-        // fail. For unit tests that only call internal helpers, we use
-        // reflection or a test-specific constructor.
-        // Since Kotlin non-null parameters cannot accept null, we use an
-        // unchecked cast approach that works at the JVM level:
         return AndroidDeviceAttestation(
             @Suppress("CAST_NEVER_SUCCEEDS")
             (null as Any?) as android.content.Context

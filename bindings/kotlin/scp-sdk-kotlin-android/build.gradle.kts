@@ -27,6 +27,17 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        unitTests {
+            // Allow android.* stubs to return default values (null/0/false) instead
+            // of throwing RuntimeException("Stub!"). Required for tests that construct
+            // Android types but never call their real implementations.
+            isReturnDefaultValues = true
+            // Include Android resources for Robolectric
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 dependencies {
@@ -65,6 +76,9 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.4")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("junit:junit:4.13.2")
+    testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.11.4")
 }
 
 detekt {
