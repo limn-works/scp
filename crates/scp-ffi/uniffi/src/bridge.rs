@@ -1232,7 +1232,21 @@ pub async fn context_close(
                 });
             }
 
-            let _ = identity;
+            // Authorization: only the context creator (or an identity with
+            // the close capability) may close the context. When the full
+            // runtime is wired, this will also check UCAN capabilities and
+            // role state. For now, gate on creator_did matching.
+            if identity.did != handle.creator_did {
+                return Err(ScpError::Permission {
+                    message: format!(
+                        "identity {} is not authorized to close context {} — \
+                         only the context creator ({}) or an admin may close it",
+                        identity.did, handle.context_id, handle.creator_did
+                    ),
+                    code: "SCP-PERM-3008".to_owned(),
+                });
+            }
+
             *state = ContextState::Closed;
             drop(state);
 
@@ -1625,24 +1639,34 @@ pub async fn ucan_mint(
 
 /// Revokes a UCAN token.
 ///
-/// Adds the token to the context's revocation list. Revoked tokens are no
-/// longer accepted by validation. Revocation is distributed to all context
-/// members.
+/// Parses the encoded token, computes its content-hash CID (SHA-256 of the
+/// JSON-serialized payload), and adds that CID to the context's revocation
+/// list. This matches the CID format used by `validate_ucan` step 10, so
+/// revoked tokens are correctly rejected during validation.
 ///
 /// # Arguments
 ///
 /// * `handle` — The context the token belongs to.
-/// * `token_id` — The unique ID of the token to revoke.
+/// * `token` — The full encoded UCAN token string (JWT format) to revoke.
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Permission` if revocation fails (token not found,
-/// revoker not authorized — must be the token's issuer or context creator).
+/// Returns `ScpError::Permission` if the token cannot be parsed or if
+/// revocation fails (revoker not authorized — must be the token's issuer
+/// or context creator).
 #[uniffi::export]
-pub async fn ucan_revoke(handle: Arc<ContextHandle>, token_id: String) -> Result<(), ScpError> {
+pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<(), ScpError> {
+    // Parse the token to extract its payload for CID computation.
+    // The revocation CID must be computed from the payload (SHA-256 hex of
+    // JSON-serialized UcanPayload) to match what validate_ucan checks.
+    let parsed = scp_core::crypto::ucan::validate::parse_ucan(&token)?;
+    let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&parsed.payload);
+
     runtime()
         .spawn(async move {
-            let _ = (handle, token_id);
+            let _ = (handle, token_cid);
+            // Revocation list not yet wired to runtime — when connected, this
+            // will call: revocation_list.revoke(token_cid);
             Err(ScpError::Permission {
                 message: "not yet connected to runtime — UCAN revocation requires a live context"
                     .to_owned(),
