@@ -123,12 +123,10 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
   ["SCP-IDENT-", IdentityError],
   ["SCP-CTX-", ContextError],
   ["SCP-PERM-", PermissionError],
-  ["SCP-PRM-", PermissionError],
   ["SCP-CRYPTO-", CryptoError],
   ["SCP-TRANS-", TransportError],
   ["SCP-TOOL-", ToolError],
   ["SCP-VALID-", ValidationError],
-  ["SCP-VAL-", ValidationError],
 ];
 
 /**

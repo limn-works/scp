@@ -163,7 +163,7 @@ struct McpTests {
 
     // MARK: - serveMcp (bridge stub error propagation)
 
-    @Test("serveMcp throws bridge error with SCP-MCP-001")
+    @Test("serveMcp throws bridge error with SCP-MCP-10001")
     func serveMcpThrowsBridgeError() async {
         let config = McpServerConfig(
             contextIds: ["ctx-1"],
@@ -174,7 +174,7 @@ struct McpTests {
             Issue.record("Expected serveMcp to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-MCP-001")
+                #expect(code == "SCP-MCP-10001")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }
@@ -194,7 +194,7 @@ struct McpTests {
             Issue.record("Expected serveMcp to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-MCP-001")
+                #expect(code == "SCP-MCP-10001")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }
@@ -205,7 +205,7 @@ struct McpTests {
 
     // MARK: - McpClient connect (bridge stub error propagation)
 
-    @Test("McpClient.connect throws bridge error with SCP-MCP-002")
+    @Test("McpClient.connect throws bridge error with SCP-MCP-10002")
     func mcpClientConnectThrowsBridgeError() async {
         do {
             _ = try await McpClient.connect(config: .stdio(
@@ -215,7 +215,7 @@ struct McpTests {
             Issue.record("Expected McpClient.connect to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-MCP-002")
+                #expect(code == "SCP-MCP-10002")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }
@@ -233,7 +233,7 @@ struct McpTests {
             Issue.record("Expected McpClient.connect to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-MCP-002")
+                #expect(code == "SCP-MCP-10002")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }
@@ -244,7 +244,7 @@ struct McpTests {
 
     // MARK: - McpClient listTools (bridge stub error propagation)
 
-    @Test("McpClient.listTools throws bridge error with SCP-MCP-003")
+    @Test("McpClient.listTools throws bridge error with SCP-MCP-10003")
     func mcpClientListToolsThrowsBridgeError() async {
         // Create a client directly from a handle (bypassing connect)
         let client = McpClient(handle: McpClientHandle(initialized: true))
@@ -254,7 +254,7 @@ struct McpTests {
             Issue.record("Expected listTools to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-MCP-003")
+                #expect(code == "SCP-MCP-10003")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }
@@ -265,7 +265,7 @@ struct McpTests {
 
     // MARK: - McpClient invoke (bridge stub error propagation)
 
-    @Test("McpClient.invoke throws bridge error with SCP-MCP-004")
+    @Test("McpClient.invoke throws bridge error with SCP-MCP-10004")
     func mcpClientInvokeThrowsBridgeError() async {
         let client = McpClient(handle: McpClientHandle(initialized: true))
 
@@ -279,7 +279,7 @@ struct McpTests {
             Issue.record("Expected invoke to throw")
         } catch let error as ScpError {
             if case .Tool(_, let code) = error {
-                #expect(code == "SCP-MCP-004")
+                #expect(code == "SCP-MCP-10004")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
             }

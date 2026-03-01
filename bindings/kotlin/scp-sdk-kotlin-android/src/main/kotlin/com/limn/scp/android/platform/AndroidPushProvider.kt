@@ -16,7 +16,7 @@
  *
  * [handleNotification] **enforces** this invariant on receipt: payloads missing the
  * `scp` field or containing an unexpected value are rejected with [ScpException]
- * error codes `SCP-PUSH-5001` and `SCP-PUSH-5002` respectively.
+ * error codes `SCP-TRANS-5001` and `SCP-TRANS-5002` respectively.
  *
  * ## Token Registration Lifecycle
  *
@@ -99,8 +99,8 @@ class AndroidPushProvider(
      *   `RemoteMessage.getData()`). Expected: `{"scp": "1"}`.
      * @return [WakeSignal.PULL] — instructs the engine to connect to the relay
      *   and pull all pending encrypted envelopes.
-     * @throws ScpException with code `SCP-PUSH-5001` if the `scp` field is missing.
-     * @throws ScpException with code `SCP-PUSH-5002` if the `scp` field has an
+     * @throws ScpException with code `SCP-TRANS-5001` if the `scp` field is missing.
+     * @throws ScpException with code `SCP-TRANS-5002` if the `scp` field has an
      *   unexpected value.
      */
     override fun handleNotification(payload: Map<String, String>): WakeSignal {
@@ -109,12 +109,12 @@ class AndroidPushProvider(
         val scpField = payload["scp"]
             ?: throw ScpException(
                 "FCM payload missing 'scp' field",
-                "SCP-PUSH-5001"
+                "SCP-TRANS-5001"
             )
         if (scpField != "1") {
             throw ScpException(
                 "FCM payload 'scp' field has unexpected value: $scpField",
-                "SCP-PUSH-5002"
+                "SCP-TRANS-5002"
             )
         }
         return WakeSignal.PULL // connect to relay and pull pending envelopes

@@ -67,7 +67,7 @@ internal func scpTransportConnect(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Transport(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TRANSPORT-001"
+        code: "SCP-TRANS-5001"
     )))
 }
 
@@ -80,7 +80,7 @@ internal func scpTransportStatus(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Transport(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TRANSPORT-002"
+        code: "SCP-TRANS-5002"
     )))
 }
 

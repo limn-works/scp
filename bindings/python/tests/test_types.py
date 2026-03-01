@@ -46,23 +46,23 @@ class TestScpErrorBase:
     def test_scp_error_has_message_and_default_code(self) -> None:
         err = ScpError("something broke")
         assert err.message == "something broke"
-        assert err.code == "SCP-ERR-0000"
+        assert err.code == "SCP-UNKNOWN-0000"
 
     def test_scp_error_with_custom_code(self) -> None:
-        err = ScpError("bad input", code="SCP-CUSTOM-9999")
+        err = ScpError("bad input", code="SCP-CTX-2999")
         assert err.message == "bad input"
-        assert err.code == "SCP-CUSTOM-9999"
+        assert err.code == "SCP-CTX-2999"
 
     def test_scp_error_str_includes_code_and_message(self) -> None:
-        err = ScpError("oops", code="SCP-ERR-1234")
-        assert str(err) == "[SCP-ERR-1234] oops"
+        err = ScpError("oops", code="SCP-IDENT-1234")
+        assert str(err) == "[SCP-IDENT-1234] oops"
 
     def test_scp_error_repr(self) -> None:
         err = ScpError("fail")
         r = repr(err)
         assert "ScpError" in r
         assert "fail" in r
-        assert "SCP-ERR-0000" in r
+        assert "SCP-UNKNOWN-0000" in r
 
     def test_scp_error_is_exception(self) -> None:
         assert issubclass(ScpError, Exception)

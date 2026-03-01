@@ -140,7 +140,7 @@ impl Drop for NapiUcanToken {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-PRM-4002` if validation fails (malformed token,
+/// - Rejects with `SCP-PERM-3002` if validation fails (malformed token,
 ///   invalid signature, expired, insufficient capabilities, revoked,
 ///   broken delegation chain).
 #[napi]
@@ -155,7 +155,7 @@ pub async fn ucan_validate(
     Err(ScpNapiError::Permission {
         message: "not yet connected to runtime — UCAN validation requires a live context"
             .to_owned(),
-        code: "SCP-PRM-4002".to_owned(),
+        code: "SCP-PERM-3002".to_owned(),
     }
     .into())
 }
@@ -174,7 +174,7 @@ pub async fn ucan_validate(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-PERM-4004` if minting fails (capabilities outside
+/// - Rejects with `SCP-PERM-3004` if minting fails (capabilities outside
 ///   the context ceiling, issuer not authorized, etc.).
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
@@ -187,7 +187,7 @@ pub async fn ucan_mint(
     let _ = (handle, member_did, capabilities);
     Err(ScpNapiError::Permission {
         message: "not yet connected to runtime — UCAN minting requires a live context".to_owned(),
-        code: "SCP-PRM-4004".to_owned(),
+        code: "SCP-PERM-3004".to_owned(),
     }
     .into())
 }
@@ -205,7 +205,7 @@ pub async fn ucan_mint(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-PERM-4006` if revocation fails (token not found,
+/// - Rejects with `SCP-PERM-3006` if revocation fails (token not found,
 ///   revoker not authorized — must be the token's issuer or context creator).
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
@@ -215,7 +215,7 @@ pub async fn ucan_revoke(handle: &NapiContextHandle, token_id: String) -> napi::
     Err(ScpNapiError::Permission {
         message: "not yet connected to runtime — UCAN revocation requires a live context"
             .to_owned(),
-        code: "SCP-PRM-4006".to_owned(),
+        code: "SCP-PERM-3006".to_owned(),
     }
     .into())
 }

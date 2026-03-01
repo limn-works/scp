@@ -72,8 +72,8 @@ pub struct NapiToolVerificationResult {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-TOOL-5003` if the context is not `"active"`.
-/// - Rejects with `SCP-TOOL-5001` if registration fails (permission denied,
+/// - Rejects with `SCP-TOOL-6003` if the context is not `"active"`.
+/// - Rejects with `SCP-TOOL-6001` if registration fails (permission denied,
 ///   schema invalid, duplicate name, etc.) in the full runtime.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
@@ -87,7 +87,7 @@ pub async fn tool_register(
             message: format!(
                 "cannot register tool in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-5003".to_owned(),
+            code: "SCP-TOOL-6003".to_owned(),
         }
         .into());
     }
@@ -112,8 +112,8 @@ pub async fn tool_register(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-TOOL-5005` if the context is not `"active"`.
-/// - Rejects with `SCP-TOOL-5002` if invocation fails (tool not found,
+/// - Rejects with `SCP-TOOL-6005` if the context is not `"active"`.
+/// - Rejects with `SCP-TOOL-6002` if invocation fails (tool not found,
 ///   input fails schema validation, invoker lacks capability).
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
@@ -130,7 +130,7 @@ pub async fn tool_invoke(
             message: format!(
                 "cannot invoke tool in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-5005".to_owned(),
+            code: "SCP-TOOL-6005".to_owned(),
         }
         .into());
     }
@@ -152,8 +152,8 @@ pub async fn tool_invoke(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-TOOL-5007` if the context is not `"active"`.
-/// - Rejects with `SCP-TOOL-5001` if the tool is not found in the context.
+/// - Rejects with `SCP-TOOL-6007` if the context is not `"active"`.
+/// - Rejects with `SCP-TOOL-6001` if the tool is not found in the context.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
@@ -167,7 +167,7 @@ pub async fn tool_verify(
             message: format!(
                 "cannot verify tool in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-5007".to_owned(),
+            code: "SCP-TOOL-6007".to_owned(),
         }
         .into());
     }

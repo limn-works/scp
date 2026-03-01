@@ -434,7 +434,7 @@ class ContextBridge internal constructor(
                     override fun onMessage(messageJson: String) {
                         val result = trySend(messageJson)
                         if (result.isFailure && !result.isClosed) {
-                            close(BridgeException("Message buffer overflow", "SCP-BRIDGE-001"))
+                            close(BridgeException("Message buffer overflow", "SCP-CTX-2001"))
                         }
                     }
 
@@ -626,7 +626,7 @@ class InfraBridge internal constructor(
 /**
  * Exception thrown by the coroutine bridge when an FFI call fails.
  *
- * Carries a structured error code from the Rust engine (e.g., "SCP-CTX-001").
+ * Carries a structured error code from the Rust engine (e.g., "SCP-CTX-2001").
  * The ergonomics layer maps this to the SDK's public exception hierarchy.
  *
  * @property code Structured SCP error code.

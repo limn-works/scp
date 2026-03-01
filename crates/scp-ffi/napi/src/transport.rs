@@ -122,8 +122,8 @@ impl Drop for NapiTransportManager {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-VAL-7000` if `relay_url` does not start with `wss://`.
-/// - Rejects with `SCP-TRANS-6001` if the connection fails (unreachable relay,
+/// - Rejects with `SCP-VALID-7000` if `relay_url` does not start with `wss://`.
+/// - Rejects with `SCP-TRANS-5001` if the connection fails (unreachable relay,
 ///   protocol mismatch, timeout, authentication failure) in the full runtime.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
@@ -134,7 +134,7 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
                 "relay URL must use wss:// scheme (got {relay_url:?}) — \
                  plaintext ws:// connections are not permitted"
             ),
-            code: "SCP-VAL-7000".to_owned(),
+            code: "SCP-VALID-7000".to_owned(),
         }
         .into());
     }
@@ -182,7 +182,7 @@ pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<Na
 ///
 /// # Errors
 ///
-/// Rejects with `SCP-TRANS-6002` if the manager is not connected.
+/// Rejects with `SCP-TRANS-5002` if the manager is not connected.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Result<()> {
@@ -191,7 +191,7 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
     if !connected {
         return Err(ScpNapiError::Transport {
             message: "transport is not connected — call transportConnect first".to_owned(),
-            code: "SCP-TRANS-6002".to_owned(),
+            code: "SCP-TRANS-5002".to_owned(),
         }
         .into());
     }

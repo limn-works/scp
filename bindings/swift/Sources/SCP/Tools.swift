@@ -59,7 +59,7 @@ internal func scpToolInvoke(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TOOL-001"
+        code: "SCP-TOOL-6001"
     )))
 }
 
@@ -74,7 +74,7 @@ internal func scpToolRegister(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TOOL-002"
+        code: "SCP-TOOL-6002"
     )))
 }
 
@@ -89,7 +89,7 @@ internal func scpToolVerify(
     // Placeholder: replaced by UniFFI-generated binding (SCP-103).
     completion(.failure(.Tool(
         message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TOOL-003"
+        code: "SCP-TOOL-6003"
     )))
 }
 
@@ -112,7 +112,7 @@ extension Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-CTX-001"
+                code: "SCP-CTX-2001"
             )
         }
         return try await withCheckedThrowingContinuation {
@@ -138,7 +138,7 @@ extension Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-CTX-001"
+                code: "SCP-CTX-2001"
             )
         }
         return try await withCheckedThrowingContinuation {
@@ -165,7 +165,7 @@ extension Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-CTX-001"
+                code: "SCP-CTX-2001"
             )
         }
         return try await withCheckedThrowingContinuation {

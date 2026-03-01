@@ -163,7 +163,7 @@ struct EventLogTests {
 
     // MARK: - Append (query -- bridge stub error propagation)
 
-    @Test("EventLog query throws bridge error with SCP-ELOG-001")
+    @Test("EventLog query throws bridge error with SCP-CTX-2030")
     func queryThrowsBridgeError() async {
         let handle = EventLogHandle(contextId: "ctx-query")
         let log = EventLog(handle: handle)
@@ -173,7 +173,7 @@ struct EventLogTests {
             Issue.record("Expected query to throw")
         } catch let error as ScpError {
             if case .Validation(_, let code) = error {
-                #expect(code == "SCP-ELOG-001")
+                #expect(code == "SCP-CTX-2030")
             } else {
                 Issue.record("Expected ScpError.Validation, got \(error)")
             }
@@ -184,7 +184,7 @@ struct EventLogTests {
 
     // MARK: - Prove inclusion (bridge stub error propagation)
 
-    @Test("EventLog proveInclusion throws bridge error with SCP-ELOG-002")
+    @Test("EventLog proveInclusion throws bridge error with SCP-CTX-2031")
     func proveInclusionThrowsBridgeError() async {
         let handle = EventLogHandle(contextId: "ctx-prove")
         let log = EventLog(handle: handle)
@@ -194,7 +194,7 @@ struct EventLogTests {
             Issue.record("Expected proveInclusion to throw")
         } catch let error as ScpError {
             if case .Validation(_, let code) = error {
-                #expect(code == "SCP-ELOG-002")
+                #expect(code == "SCP-CTX-2031")
             } else {
                 Issue.record("Expected ScpError.Validation, got \(error)")
             }
@@ -205,7 +205,7 @@ struct EventLogTests {
 
     // MARK: - Verify proof (bridge stub error propagation)
 
-    @Test("EventLog verifyInclusion throws bridge error with SCP-ELOG-003")
+    @Test("EventLog verifyInclusion throws bridge error with SCP-CTX-2032")
     func verifyInclusionThrowsBridgeError() async {
         // UniFFI Proof: verified, proofType, detailsJson
         let proof = Proof(
@@ -219,7 +219,7 @@ struct EventLogTests {
             Issue.record("Expected verifyInclusion to throw")
         } catch let error as ScpError {
             if case .Validation(_, let code) = error {
-                #expect(code == "SCP-ELOG-003")
+                #expect(code == "SCP-CTX-2032")
             } else {
                 Issue.record("Expected ScpError.Validation, got \(error)")
             }

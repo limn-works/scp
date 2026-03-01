@@ -220,14 +220,14 @@ class AndroidDeviceAttestationTest {
 
     @Test
     fun `ScpException carries message and code`() {
-        val exception = ScpException("test message", "SCP-TEST-0001")
+        val exception = ScpException("test message", "SCP-ATTEST-9999")
         assertEquals("test message", exception.message)
-        assertEquals("SCP-TEST-0001", exception.code)
+        assertEquals("SCP-ATTEST-9999", exception.code)
     }
 
     @Test
     fun `ScpException is an Exception subclass`() {
-        val exception = ScpException("msg", "SCP-X-0000")
+        val exception = ScpException("msg", "SCP-ATTEST-9998")
         assertTrue(exception is Exception)
     }
 

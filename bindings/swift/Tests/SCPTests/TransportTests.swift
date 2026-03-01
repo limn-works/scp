@@ -113,7 +113,7 @@ struct TransportTests {
 
     // MARK: - Connect (bridge stub error propagation)
 
-    @Test("connectTransport throws bridge error with SCP-TRANSPORT-001")
+    @Test("connectTransport throws bridge error with SCP-TRANS-5001")
     func connectThrowsBridgeError() async {
         let config = TransportConfig(relayUrls: ["wss://relay.test/scp/v1"])
         do {
@@ -121,7 +121,7 @@ struct TransportTests {
             Issue.record("Expected connectTransport to throw")
         } catch let error as ScpError {
             if case .Transport(_, let code) = error {
-                #expect(code == "SCP-TRANSPORT-001")
+                #expect(code == "SCP-TRANS-5001")
             } else {
                 Issue.record("Expected ScpError.Transport, got \(error)")
             }
@@ -138,7 +138,7 @@ struct TransportTests {
             Issue.record("Expected connectTransport to throw")
         } catch let error as ScpError {
             if case .Transport(_, let code) = error {
-                #expect(code == "SCP-TRANSPORT-001")
+                #expect(code == "SCP-TRANS-5001")
             } else {
                 Issue.record("Expected ScpError.Transport, got \(error)")
             }
@@ -149,14 +149,14 @@ struct TransportTests {
 
     // MARK: - Status query (bridge stub error propagation)
 
-    @Test("transportStatus throws bridge error with SCP-TRANSPORT-002")
+    @Test("transportStatus throws bridge error with SCP-TRANS-5002")
     func statusThrowsBridgeError() async {
         do {
             _ = try await transportStatus()
             Issue.record("Expected transportStatus to throw")
         } catch let error as ScpError {
             if case .Transport(_, let code) = error {
-                #expect(code == "SCP-TRANSPORT-002")
+                #expect(code == "SCP-TRANS-5002")
             } else {
                 Issue.record("Expected ScpError.Transport, got \(error)")
             }

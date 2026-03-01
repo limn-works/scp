@@ -353,7 +353,7 @@ class CoroutineBridgeTest {
 
                 advanceUntilIdle()
 
-                stubBindings.lastMessageCallback?.onError("SCP-CTX-001", "Context not active")
+                stubBindings.lastMessageCallback?.onError("SCP-CTX-2001", "Context not active")
 
                 advanceUntilIdle()
 
@@ -361,7 +361,7 @@ class CoroutineBridgeTest {
                 assertTrue(result.isFailure)
                 val exception = result.exceptionOrNull()
                 assertTrue(exception is BridgeException)
-                assertEquals("SCP-CTX-001", (exception as BridgeException).code)
+                assertEquals("SCP-CTX-2001", (exception as BridgeException).code)
             }
 
         @Test
@@ -398,21 +398,21 @@ class CoroutineBridgeTest {
         fun `FFI exception propagates as BridgeException`() =
             runTest(ioDispatcher) {
                 stubBindings.identityCreateThrows =
-                    BridgeException("Identity not found", "SCP-ID-001")
+                    BridgeException("Identity not found", "SCP-IDENT-1001")
 
                 val exception =
                     assertFailsWith<BridgeException> {
                         bridge.identity.create("in_memory")
                     }
 
-                assertEquals("SCP-ID-001", exception.code)
+                assertEquals("SCP-IDENT-1001", exception.code)
                 assertEquals("Identity not found", exception.message)
             }
 
         @Test
         fun `BridgeException carries structured error code`() {
-            val exception = BridgeException("test error", "SCP-TEST-001")
-            assertEquals("SCP-TEST-001", exception.code)
+            val exception = BridgeException("test error", "SCP-CTX-2999")
+            assertEquals("SCP-CTX-2999", exception.code)
             assertEquals("test error", exception.message)
         }
     }

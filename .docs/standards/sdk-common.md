@@ -39,6 +39,7 @@ ScpError (root)
 | `SCP-VALID-` | 7000-7999 |
 | `SCP-STORAGE-` | 8000-8999 |
 | `SCP-ATTEST-` | 9000-9999 |
+| `SCP-MCP-` | 10000-10999 |
 
 ## Stub and Placeholder Policy
 

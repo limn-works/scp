@@ -19,12 +19,12 @@ import {
 
 describe("ScpError hierarchy", () => {
   it("ScpError is the root error class", () => {
-    const err = new ScpError("test", "SCP-TEST-0000");
+    const err = new ScpError("test", "SCP-CTX-2999");
     expect(err).toBeInstanceOf(Error);
     expect(err).toBeInstanceOf(ScpError);
     expect(err.name).toBe("ScpError");
     expect(err.message).toBe("test");
-    expect(err.code).toBe("SCP-TEST-0000");
+    expect(err.code).toBe("SCP-CTX-2999");
   });
 
   it("IdentityError extends ScpError", () => {
@@ -97,12 +97,6 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-PERM-3001");
   });
 
-  it("maps PRM prefix to PermissionError", () => {
-    const err = mapBridgeError(new Error("[SCP-PRM-4002] permission error: denied"));
-    expect(err).toBeInstanceOf(PermissionError);
-    expect(err.code).toBe("SCP-PRM-4002");
-  });
-
   it("maps crypto error codes to CryptoError", () => {
     const err = mapBridgeError(new Error("[SCP-CRYPTO-4001] crypto error: failed"));
     expect(err).toBeInstanceOf(CryptoError);
@@ -125,12 +119,6 @@ describe("mapBridgeError", () => {
     const err = mapBridgeError(new Error("[SCP-VALID-7001] validation error: failed"));
     expect(err).toBeInstanceOf(ValidationError);
     expect(err.code).toBe("SCP-VALID-7001");
-  });
-
-  it("maps VAL prefix to ValidationError", () => {
-    const err = mapBridgeError(new Error("[SCP-VAL-7000] validation error: failed"));
-    expect(err).toBeInstanceOf(ValidationError);
-    expect(err.code).toBe("SCP-VAL-7000");
   });
 
   it("falls back to ScpError for unknown error codes", () => {
