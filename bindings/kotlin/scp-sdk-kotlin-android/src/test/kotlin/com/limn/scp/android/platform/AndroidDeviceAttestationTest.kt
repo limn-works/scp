@@ -1,6 +1,7 @@
 package com.limn.scp.android.platform
 
 import android.util.Base64
+import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
@@ -264,18 +265,14 @@ class AndroidDeviceAttestationTest {
     // -----------------------------------------------------------------------
 
     /**
-     * Create an [AndroidDeviceAttestation] with a null context for unit testing.
+     * Create an [AndroidDeviceAttestation] with a Robolectric application context.
      *
      * The [android.content.Context] parameter is only used by
      * [IntegrityManagerFactory.create] during actual Play Integrity calls.
      * For testing deterministic helpers (buildClientDataJSON, computeNonce),
-     * a null context cast is sufficient since those methods never touch it.
+     * a Robolectric context is sufficient since those methods never touch it.
      */
-    @Suppress("UNCHECKED_CAST")
     private fun createAttestationWithMockContext(): AndroidDeviceAttestation {
-        return AndroidDeviceAttestation(
-            @Suppress("CAST_NEVER_SUCCEEDS")
-            (null as Any?) as android.content.Context
-        )
+        return AndroidDeviceAttestation(ApplicationProvider.getApplicationContext())
     }
 }

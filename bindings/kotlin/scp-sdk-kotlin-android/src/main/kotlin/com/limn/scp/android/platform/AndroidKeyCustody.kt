@@ -21,7 +21,7 @@ import android.security.keystore.KeyProperties
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
-import java.security.spec.EdDSAParameterSpec
+import java.security.spec.NamedParameterSpec
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Mac
@@ -342,7 +342,7 @@ class AndroidKeyCustody : KeyCustodyProvider {
             keystoreAlias,
             KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY,
         )
-            .setAlgorithmParameterSpec(EdDSAParameterSpec(EdDSAParameterSpec.Ed25519))
+            .setAlgorithmParameterSpec(NamedParameterSpec.ED25519)
             .setDigests() // EdDSA does not require explicit digest
             .setUserAuthenticationRequired(false) // SCP requires background processing
             .build()

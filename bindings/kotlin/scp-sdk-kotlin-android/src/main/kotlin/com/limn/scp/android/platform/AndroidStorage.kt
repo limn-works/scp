@@ -19,8 +19,8 @@ package com.limn.scp.android.platform
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import net.sqlcipher.database.SQLiteDatabase
-import net.sqlcipher.database.SQLiteOpenHelper
+import net.zetetic.database.sqlcipher.SQLiteDatabase
+import net.zetetic.database.sqlcipher.SQLiteOpenHelper
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -73,17 +73,16 @@ class AndroidStorage(private val context: Context) : StorageProvider {
     internal val db: SQLiteDatabase by lazy { openEncryptedDatabase() }
 
     private fun openEncryptedDatabase(): SQLiteDatabase {
-        SQLiteDatabase.loadLibs(context)
+        System.loadLibrary("sqlcipher")
         val encryptionKey = getOrCreateStorageKey()
         try {
-            // NOTE: The String copy of the passphrase cannot be zeroed due to JVM String
-            // immutability. The ByteArray source (encryptionKey) is zeroed in the finally
-            // block. The real protection is TEE-backed key derivation — the passphrase is
-            // useless without the Android Keystore key. If SQLCipher adds a char[] or
-            // ByteArray overload for getWritableDatabase, prefer that and zero after use.
-            val passphrase = String(encryptionKey, Charsets.ISO_8859_1)
-            val helper = ScpDatabaseHelper(context)
-            return helper.getWritableDatabase(passphrase)
+            // The passphrase is passed as byte[] to the SQLiteOpenHelper constructor.
+            // SQLCipher 4.6+ uses the constructor-supplied key for encryption.
+            // The ByteArray source (encryptionKey) is zeroed in the finally block.
+            // The real protection is TEE-backed key derivation — the passphrase is
+            // useless without the Android Keystore key.
+            val helper = ScpDatabaseHelper(context, encryptionKey)
+            return helper.writableDatabase
         } finally {
             // Zero key material immediately after use to limit exposure window.
             encryptionKey.fill(0)
@@ -327,11 +326,17 @@ class AndroidStorage(private val context: Context) : StorageProvider {
  */
 internal class ScpDatabaseHelper(
     context: Context,
+    password: ByteArray,
 ) : SQLiteOpenHelper(
     context,
     AndroidStorage.DATABASE_NAME,
-    null,
-    AndroidStorage.DATABASE_VERSION
+    password,
+    null, // cursorFactory
+    AndroidStorage.DATABASE_VERSION,
+    0, // minimumSupportedVersion
+    null, // errorHandler
+    null, // databaseHook
+    false, // enableWriteAheadLogging
 ) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
