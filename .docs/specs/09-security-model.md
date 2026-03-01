@@ -192,7 +192,7 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **Broadcast envelope signature scope:** Broadcast contexts (§5.14) use a different envelope format (`BroadcastEnvelope`) where the sender identity is visible (not inside MLS encryption). The signature covers: `SHA256(context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash)` where `content_hash = SHA256(original_plaintext)` and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. This is structurally consistent with the InnerEnvelope signature — it replaces `epoch || generation` (MLS-specific) with `key_epoch` (broadcast-specific) and omits MLS generation numbers (broadcast uses per-sender sequence numbers only). The signature is verified by subscribers against the author's known Active Signing Key (resolved from the author's DID document).
 
-**UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction.
+**UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
 **Why single ciphersuite:** Ciphersuite negotiation adds complexity and introduces downgrade attack vectors. For v1, every implementation uses exactly these algorithms. Future protocol versions may introduce additional ciphersuites with a secure negotiation mechanism, but v1 prioritizes simplicity and auditability.
 
@@ -321,7 +321,7 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 - Active Signing Key: Rotated via `rotate_active_key` (ADR-003 §4a). DID document is updated with new verification method, signed by the Identity Key, published to DHT with incremented sequence number. All active MLS groups receive an Update proposal with the new credential. The DID string does NOT change.
 - Identity Key: Migrated via `migrate_identity` (ADR-003 §4b) — rare operation. Creates a new DID with the pre-rotation key as the new Identity Key. Old DID document updated with `alsoKnownAs` forwarding. `DidRotationEvent` sent to all active contexts. Pre-rotation proof resolves ambiguity if the old key was compromised.
 - MLS epoch keys: Rotated automatically on every Commit (membership change or Update).
-- UCAN tokens: Expire per their `exp` field. Re-issued by the human's Active Signing Key. On active key rotation (ADR-003 §4a), all UCAN tokens signed by the old Active Signing Key are revoked and reissued under the new key. Revocation published to a revocation list referenced in the UCAN's revocation field.
+- UCAN tokens: Expire per their `exp` field. Re-issued by the human's Active Signing Key. On active key rotation (ADR-003 §4a), all UCAN tokens signed by the old Active Signing Key are revoked and reissued under the new key. Revocations are added to the per-context `RevocationList` and distributed as MLS application messages (see §9.5 UCAN revocation, ADR-016 criterion 5).
 
 **Key destruction:**
 
@@ -462,7 +462,7 @@ A specific relay attack: suppress an MLS Remove Commit to keep an excluded membe
 
 **Actual risk:** Suppressing the Commit from OTHER members. Members who don't receive the Commit stay in the old epoch and cannot decrypt new-epoch messages. This is a denial-of-service attack (group state divergence), not a confidentiality breach.
 
-**Mitigation:** MLS Commits are high-priority messages that SHOULD be published to all relays with delivery confirmation. If any member detects they are behind on epochs (they receive a message for epoch N+1 but are on epoch N), they MUST request the missing Commit from other members or other relays.
+**Mitigation:** MLS Commits are high-priority messages that SHOULD be published to all relays with delivery confirmation. "Delivery confirmation" means relay-level storage ACK — the relay confirms it received and stored the blob. This is NOT recipient-level ACK, which would leak metadata about recipient online status. The actual assurance mechanism is the recovery path: if any member detects they are behind on epochs (they receive a message for epoch N+1 but are on epoch N, or a Relay Consistency Protocol checkpoint (§9.9.3) reveals epoch divergence), they MUST request the missing Commit from other members via directed MLS application messages or from alternative relays in the context's relay set. Multi-relay publication (§9.9.2, recommended: 3 relays) ensures the Commit is available from at least one honest relay even if others suppress it.
 
 ## 9.10 Metadata Privacy Architecture
 
@@ -616,13 +616,15 @@ When a key is known or suspected to be compromised, the following ordered steps 
 
 **2. MLS Update in all active contexts.** Issue MLS Update proposals in every context. This provides post-compromise security: new epoch keys are derived from the new key material, making the compromised old key useless for future messages. If the old key is unavailable (device stolen), a trusted co-member with admin role must remove and re-add the member.
 
-**3. UCAN revocation.** Revoke all UCAN tokens issued by the compromised key. Publish revocations to the revocation endpoint. Issue new tokens signed by the new key.
+**3. UCAN revocation.** Revoke all UCAN tokens issued by the compromised key. Add revocations to each context's `RevocationList` and distribute via MLS application messages (§9.5). Issue new tokens signed by the new key.
 
 **4. KeyPackage rotation.** Delete all outstanding KeyPackages associated with the old key from relays. Publish new KeyPackages signed by the new key.
 
 **5. Contact notification.** The SDK sends a key-change notification to all known contacts. Contacts who completed Key Continuity Verification (§9.11) are alerted that re-verification is needed.
 
 **6. Identity private state re-encryption.** Re-encrypt identity private state (§3.7) under the new key. Publish re-encrypted state to relays.
+
+**Step ordering and failure isolation:** Steps 1-6 are ordered by dependency: key rotation (1) must complete before MLS Updates (2) because Updates use the new key material; MLS Updates (2) must complete before UCAN revocation/reissuance (3) because new UCAN tokens are signed by the new key; KeyPackage rotation (4) must follow to prevent new group additions using old key material; steps 5 and 6 are cleanup and can execute in any order after step 4. Steps 2-4 are per-context — failure in one context does not block recovery in other contexts. The SDK retries failed contexts independently. A context where MLS Update cannot succeed (e.g., member has been offline too long and requires Tier 3 re-join per ADR-029) is flagged for manual re-join and does not block recovery in other contexts.
 
 **Time-shifted key compromise:** An attacker who extracts MLS state at time T can read messages until the next PCS Update. Forward secrecy protects all messages from before T (old epoch keys already deleted). PCS protects all messages after the next Update. The vulnerability window is bounded by the PCS Update interval (§9.7.3).
 
