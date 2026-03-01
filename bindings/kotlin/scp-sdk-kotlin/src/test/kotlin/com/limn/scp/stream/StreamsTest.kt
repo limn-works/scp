@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -349,9 +350,14 @@ class StreamsTest {
 
             val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
 
-            val result = kotlin.runCatching {
+            var caughtException: Throwable? = null
+            supervisorScope {
                 val job = launch {
-                    flow.first()
+                    try {
+                        flow.first()
+                    } catch (e: BridgeException) {
+                        caughtException = e
+                    }
                 }
 
                 advanceUntilIdle()
@@ -362,10 +368,8 @@ class StreamsTest {
                 job.join()
             }
 
-            assertTrue(result.isFailure)
-            val exception = result.exceptionOrNull()
-            assertTrue(exception is BridgeException)
-            assertEquals("SCP-CTX-001", (exception as BridgeException).code)
+            assertTrue(caughtException is BridgeException)
+            assertEquals("SCP-CTX-001", (caughtException as BridgeException).code)
         }
 
         @Test

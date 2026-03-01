@@ -214,13 +214,14 @@ class HotStreamFactory(
         replay: Int = 0,
     ): SharedFlow<String> {
         val existing = activeEventSubscriptions[contextHandle]
-        if (existing != null) return existing.flow.asSharedFlow()
+        if (existing != null) return existing.readOnly
 
         val sharedFlow = MutableSharedFlow<String>(
             replay = replay,
             extraBufferCapacity = BUFFER_CAPACITY,
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
         )
+        val readOnly = sharedFlow.asSharedFlow()
 
         val callback = object : EventCallback {
             override fun onEvent(eventJson: String) {
@@ -240,8 +241,8 @@ class HotStreamFactory(
             contextBindings.contextSubscribeEvents(contextHandle, callback)
         }
 
-        activeEventSubscriptions[contextHandle] = HotStreamState(sharedFlow, subscriptionHandle)
-        return sharedFlow.asSharedFlow()
+        activeEventSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
+        return readOnly
     }
 
     /**
@@ -260,13 +261,14 @@ class HotStreamFactory(
         replay: Int = 0,
     ): SharedFlow<String> {
         val existing = activeMessageSubscriptions[contextHandle]
-        if (existing != null) return existing.flow.asSharedFlow()
+        if (existing != null) return existing.readOnly
 
         val sharedFlow = MutableSharedFlow<String>(
             replay = replay,
             extraBufferCapacity = BUFFER_CAPACITY,
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
         )
+        val readOnly = sharedFlow.asSharedFlow()
 
         val callback = object : MessageCallback {
             override fun onMessage(messageJson: String) {
@@ -286,8 +288,8 @@ class HotStreamFactory(
             contextBindings.contextSubscribe(contextHandle, callback)
         }
 
-        activeMessageSubscriptions[contextHandle] = HotStreamState(sharedFlow, subscriptionHandle)
-        return sharedFlow.asSharedFlow()
+        activeMessageSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
+        return readOnly
     }
 
     /**
@@ -336,6 +338,7 @@ class HotStreamFactory(
  */
 private data class HotStreamState(
     val flow: MutableSharedFlow<String>,
+    val readOnly: SharedFlow<String>,
     val subscriptionHandle: Long,
 )
 
