@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 
 /**
  * Holder for an SCP context's observable state within a Composable.
@@ -191,40 +192,58 @@ fun <T> rememberScpStateIn(
  * Remember and manage an SCP hot stream subscription within a Composable.
  *
  * Creates a hot stream subscription that persists across recompositions
- * for the same [key]. When the Composable leaves composition, [onStop]
- * is invoked to unsubscribe from the Rust engine (e.g., call
- * `hotStreamFactory.stopContextEvents(handle)`).
+ * for the same [key]. The [start] suspend lambda is launched in a
+ * coroutine scope tied to the Composable's lifetime. When the Composable
+ * leaves composition, [onStop] is invoked to unsubscribe from the Rust
+ * engine (e.g., call `hotStreamFactory.stopContextEvents(handle)`).
+ *
+ * The returned [State] is initially `null` until the [start] coroutine
+ * completes and the [SharedFlow] is available. Callers should handle the
+ * null case (e.g., show a loading indicator).
  *
  * Usage:
  * ```kotlin
  * @Composable
  * fun EventList(handle: Long, factory: HotStreamFactory) {
- *     val events = rememberScpHotStream(
+ *     val eventsState = rememberScpHotStream(
  *         key = handle,
  *         start = { factory.contextEvents(handle) },
  *         onStop = { factory.stopContextEvents(handle) },
  *     )
- *     val eventList by rememberScpFlow(events, emptyList<String>())
+ *     val events = eventsState.value
+ *     if (events != null) {
+ *         val eventList by rememberScpFlow(events, emptyList<String>())
+ *     }
  * }
  * ```
  *
  * @param key Recomposition key. The subscription restarts if this changes.
- * @param start Factory lambda that creates the [SharedFlow]. Called once
- *   per [key] value.
- * @param onStop Cleanup lambda invoked when the Composable leaves composition.
- * @return The [SharedFlow] for downstream collection.
+ * @param start Suspend factory lambda that creates the [SharedFlow]. Called
+ *   once per [key] value. Runs in a coroutine scoped to the Composable.
+ * @param onStop Suspend cleanup lambda invoked when the Composable leaves
+ *   composition.
+ * @return Compose [State] holding the [SharedFlow], or `null` until
+ *   the subscription is established.
  */
 @Composable
 fun <T> rememberScpHotStream(
     key: Any,
-    start: () -> SharedFlow<T>,
-    onStop: () -> Unit,
-): SharedFlow<T> {
-    val flow = remember(key) { start() }
+    start: suspend () -> SharedFlow<T>,
+    onStop: suspend () -> Unit,
+): State<SharedFlow<T>?> {
+    val flowState = remember(key) { mutableStateOf<SharedFlow<T>?>(null) }
+    val scope = remember(key) { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
+
     DisposableEffect(key) {
-        onDispose { onStop() }
+        scope.launch {
+            flowState.value = start()
+        }
+        onDispose {
+            scope.launch { onStop() }
+            scope.cancel()
+        }
     }
-    return flow
+    return flowState
 }
 
 /**

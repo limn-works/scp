@@ -174,6 +174,7 @@ class StateHoldersTest {
 
         showComposable.value = false
         composeRule.waitForIdle()
+        Thread.sleep(SETTLE_DELAY_MS)
 
         assertEquals(true, stopped.get())
     }
@@ -181,17 +182,19 @@ class StateHoldersTest {
     @Test
     fun `rememberScpHotStream returns the started flow`() {
         val eventFlow = MutableSharedFlow<String>()
-        var capturedFlow: MutableSharedFlow<String>? = null
+        var capturedFlow: kotlinx.coroutines.flow.SharedFlow<String>? = null
 
         composeRule.setContent {
-            @Suppress("UNCHECKED_CAST")
-            capturedFlow = rememberScpHotStream(
+            val flowState by rememberScpHotStream(
                 key = "key",
                 start = { eventFlow },
                 onStop = {},
-            ) as? MutableSharedFlow<String>
+            )
+            capturedFlow = flowState
         }
 
+        composeRule.waitForIdle()
+        Thread.sleep(SETTLE_DELAY_MS)
         composeRule.waitForIdle()
         assertTrue(capturedFlow === eventFlow)
     }

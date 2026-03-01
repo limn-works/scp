@@ -214,7 +214,7 @@ func messagesYieldsMessages() async throws {
         capturedListener.withLock { $0 = listener }
     })
 
-    let stream = await context.messages
+    let stream = try await context.messages
 
     // Wait for listener to be captured (subscribeFn is called synchronously
     // within the actor-isolated `messages` property, so it should be set
@@ -278,7 +278,7 @@ func messagesStreamFinishesOnError() async throws {
         capturedListener.withLock { $0 = listener }
     })
 
-    let stream = await context.messages
+    let stream = try await context.messages
 
     var listener: (any MessageListener)?
     for _ in 0..<100 {
@@ -338,7 +338,7 @@ func leaveFinishesStream() async throws {
         capturedListener.withLock { $0 = listener }
     })
 
-    let stream = await context.messages
+    let stream = try await context.messages
 
     var listener: (any MessageListener)?
     for _ in 0..<100 {
@@ -421,7 +421,7 @@ func closeFinishesStream() async throws {
         capturedListener.withLock { $0 = listener }
     })
 
-    let stream = await context.messages
+    let stream = try await context.messages
 
     var listener: (any MessageListener)?
     for _ in 0..<100 {
@@ -487,13 +487,36 @@ func noForceUnwrapsInPublicAPI() async throws {
     try await context.send(Data("test".utf8))
 
     // messages returns a stream (does not crash)
-    let _ = await context.messages
+    let _ = try await context.messages
 
     // leave succeeds
     try await context.leave()
 
     // State is now closed
     #expect(await context.state == .closed)
+}
+
+// MARK: - Single-stream enforcement tests
+
+@Test("messages throws SCP-CTX-2002 when a stream is already active")
+func messagesThrowsWhenStreamAlreadyActive() async throws {
+    let context = makeTestContext()
+
+    let _ = try await context.messages
+
+    await #expect(throws: ScpError.self) {
+        let _ = try await context.messages
+    }
+}
+
+@Test("messages allows new stream after close nils the continuation")
+func messagesAllowsNewStreamAfterClose() async throws {
+    let context = makeTestContext()
+
+    let _ = try await context.messages
+    try await context.close()
+
+    let _ = try await context.messages
 }
 
 // MARK: - ContextState tests

@@ -140,7 +140,7 @@ class StreamsTest {
         }
 
         @AfterEach
-        fun tearDown() {
+        fun tearDown() = runTest {
             factory.stopAll()
         }
 
@@ -169,7 +169,7 @@ class StreamsTest {
         }
 
         @Test
-        fun `contextEvents returns same SharedFlow for same context handle`() {
+        fun `contextEvents returns same SharedFlow for same context handle`() = runTest {
             val flow1 = factory.contextEvents(42L)
             val flow2 = factory.contextEvents(42L)
 
@@ -178,7 +178,7 @@ class StreamsTest {
         }
 
         @Test
-        fun `contextEvents with different handles creates separate streams`() {
+        fun `contextEvents with different handles creates separate streams`() = runTest {
             factory.contextEvents(42L)
             factory.contextEvents(43L)
 
@@ -186,7 +186,7 @@ class StreamsTest {
         }
 
         @Test
-        fun `stopContextEvents unsubscribes from Rust engine`() {
+        fun `stopContextEvents unsubscribes from Rust engine`() = runTest {
             factory.contextEvents(42L)
             factory.stopContextEvents(42L)
 
@@ -195,7 +195,7 @@ class StreamsTest {
         }
 
         @Test
-        fun `stopContextEvents is safe to call when no subscription exists`() {
+        fun `stopContextEvents is safe to call when no subscription exists`() = runTest {
             factory.stopContextEvents(999L)
             assertFalse(stubBindings.eventUnsubscribeCalled)
         }
@@ -225,7 +225,7 @@ class StreamsTest {
         }
 
         @Test
-        fun `incomingMessages returns same SharedFlow for same context handle`() {
+        fun `incomingMessages returns same SharedFlow for same context handle`() = runTest {
             val flow1 = factory.incomingMessages(42L)
             val flow2 = factory.incomingMessages(42L)
 
@@ -234,7 +234,7 @@ class StreamsTest {
         }
 
         @Test
-        fun `stopMessageStream unsubscribes from Rust engine`() {
+        fun `stopMessageStream unsubscribes from Rust engine`() = runTest {
             factory.incomingMessages(42L)
             factory.stopMessageStream(42L)
 
@@ -243,7 +243,7 @@ class StreamsTest {
         }
 
         @Test
-        fun `stopAll cleans up all subscriptions`() {
+        fun `stopAll cleans up all subscriptions`() = runTest {
             factory.contextEvents(42L)
             factory.contextEvents(43L)
             factory.incomingMessages(42L)

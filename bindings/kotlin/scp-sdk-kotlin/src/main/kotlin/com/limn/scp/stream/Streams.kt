@@ -97,24 +97,17 @@ class ColdStreamFactory(
         contextId: String,
         filterJson: String,
         pageSize: Int = 50,
-    ): Flow<String> = flow {
-        var offset = 0
-        while (true) {
-            val paginatedFilter = buildPaginatedFilter(filterJson, offset, pageSize)
-            val page = withContext(ioDispatcher) {
-                infraBindings.eventLogQuery(contextId, paginatedFilter)
-            }
-            if (page == "[]" || page.isBlank()) break
-            emit(page)
-            offset += pageSize
-        }
-    }
+    ): Flow<String> = paginatedEventQuery(contextId, filterJson, pageSize)
 
     /**
      * Cold flow of message history for a context, fetched page by page.
      *
      * Each emission is a JSON-encoded page of historical messages. The flow
      * terminates when the query returns an empty page.
+     *
+     * Note: Currently delegates to the same FFI binding as [eventLogPages]
+     * (`infraBindings.eventLogQuery`). These will diverge when separate
+     * message-history FFI bindings are added.
      *
      * @param contextId The context to query.
      * @param filterJson JSON-encoded query filter (e.g., time range, sender).
@@ -125,6 +118,20 @@ class ColdStreamFactory(
         contextId: String,
         filterJson: String,
         pageSize: Int = 50,
+    ): Flow<String> = paginatedEventQuery(contextId, filterJson, pageSize)
+
+    /**
+     * Shared implementation for paginated event/message queries.
+     *
+     * Both [eventLogPages] and [messageHistoryPages] currently use the same
+     * FFI binding ([InfraBindings.eventLogQuery]). This shared function
+     * eliminates the duplication. When separate FFI bindings exist for
+     * message history, the two public functions will diverge.
+     */
+    private fun paginatedEventQuery(
+        contextId: String,
+        filterJson: String,
+        pageSize: Int,
     ): Flow<String> = flow {
         var offset = 0
         while (true) {
@@ -210,7 +217,7 @@ class HotStreamFactory(
      * @param replay Number of past events to replay to new subscribers.
      * @return Hot [SharedFlow] of JSON-encoded context events.
      */
-    fun contextEvents(
+    suspend fun contextEvents(
         contextHandle: Long,
         replay: Int = 0,
     ): SharedFlow<String> {
@@ -238,7 +245,7 @@ class HotStreamFactory(
             }
         }
 
-        val subscriptionHandle = runBlocking(Dispatchers.IO) {
+        val subscriptionHandle = withContext(ioDispatcher) {
             contextBindings.contextSubscribeEvents(contextHandle, callback)
         }
 
@@ -257,7 +264,7 @@ class HotStreamFactory(
      * @param replay Number of past messages to replay to new subscribers.
      * @return Hot [SharedFlow] of JSON-encoded messages.
      */
-    fun incomingMessages(
+    suspend fun incomingMessages(
         contextHandle: Long,
         replay: Int = 0,
     ): SharedFlow<String> {
@@ -285,7 +292,7 @@ class HotStreamFactory(
             }
         }
 
-        val subscriptionHandle = runBlocking(Dispatchers.IO) {
+        val subscriptionHandle = withContext(ioDispatcher) {
             contextBindings.contextSubscribe(contextHandle, callback)
         }
 
@@ -302,9 +309,9 @@ class HotStreamFactory(
      *
      * @param contextHandle The context to stop receiving events for.
      */
-    fun stopContextEvents(contextHandle: Long) {
+    suspend fun stopContextEvents(contextHandle: Long) {
         val state = activeEventSubscriptions.remove(contextHandle) ?: return
-        runBlocking(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             contextBindings.contextUnsubscribeEvents(state.subscriptionHandle)
         }
     }
@@ -314,9 +321,9 @@ class HotStreamFactory(
      *
      * @param contextHandle The context to stop receiving messages for.
      */
-    fun stopMessageStream(contextHandle: Long) {
+    suspend fun stopMessageStream(contextHandle: Long) {
         val state = activeMessageSubscriptions.remove(contextHandle) ?: return
-        runBlocking(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             contextBindings.contextUnsubscribe(state.subscriptionHandle)
         }
     }
@@ -324,7 +331,7 @@ class HotStreamFactory(
     /**
      * Stop all active subscriptions. Call during teardown.
      */
-    fun stopAll() {
+    suspend fun stopAll() {
         activeEventSubscriptions.keys.toList().forEach { stopContextEvents(it) }
         activeMessageSubscriptions.keys.toList().forEach { stopMessageStream(it) }
     }

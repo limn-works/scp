@@ -260,26 +260,43 @@ public actor Context {
 
     /// An `AsyncStream` of incoming messages in this context.
     ///
-    /// Each access creates a new stream backed by a UniFFI subscription. The
-    /// stream yields ``Message`` values as they arrive and finishes when the
-    /// context is closed, left, or the subscription encounters an error.
+    /// Returns an `AsyncStream` backed by a UniFFI subscription. The stream
+    /// yields ``Message`` values as they arrive and finishes when the context
+    /// is closed, left, or the subscription encounters an error.
+    ///
+    /// Only one active message stream per context is supported. Accessing this
+    /// property while a previous stream is still active throws
+    /// ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2002"`.
+    /// To create a new stream, first ``close()`` or ``leave()`` the context
+    /// (which finishes the existing stream), or consume the existing stream
+    /// to completion.
     ///
     /// Usage:
     /// ```swift
-    /// for await message in await context.messages {
+    /// let stream = try await context.messages
+    /// for await message in stream {
     ///     print(message.senderDid, message.payload)
     /// }
     /// ```
     ///
-    /// - Note: Only one active stream per context is supported. Creating a new
-    ///   stream replaces the previous continuation reference used by ``close()``
-    ///   and ``leave()`` to terminate the stream.
+    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2002"`
+    ///   if a message stream is already active on this context.
     public var messages: AsyncStream<Message> {
-        let (stream, continuation) = AsyncStream<Message>.makeStream()
-        self.streamContinuation = continuation
-        let listener = MessageListenerAdapter(continuation: continuation)
-        subscribeFn(handle, listener)
-        return stream
+        get throws {
+            guard streamContinuation == nil else {
+                throw ScpError.Context(
+                    message: "A message stream is already active on this context. "
+                        + "Consume or close the existing stream before creating a new one.",
+                    code: "SCP-CTX-2002"
+                )
+            }
+
+            let (stream, continuation) = AsyncStream<Message>.makeStream()
+            self.streamContinuation = continuation
+            let listener = MessageListenerAdapter(continuation: continuation)
+            subscribeFn(handle, listener)
+            return stream
+        }
     }
 
     /// Leaves this context gracefully.
