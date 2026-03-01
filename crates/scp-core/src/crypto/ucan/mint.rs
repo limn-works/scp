@@ -72,11 +72,17 @@ pub struct MintParams<'a> {
 /// The timestamp prefix enables efficient pruning of expired nonces. The 16
 /// random bytes (32 hex chars) ensure uniqueness even under high concurrency.
 ///
+/// # Errors
+///
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix
+/// epoch. A nonce with timestamp 0 would always fail freshness checks on
+/// validation, so we fail fast instead of silently producing a broken nonce.
+///
 /// See ADR-009 acceptance criterion 7 and ADR-016 acceptance criterion 6.
-fn generate_nonce() -> String {
+fn generate_nonce() -> Result<String, UcanError> {
     let now_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))?
         .as_millis();
 
     let mut random_bytes = [0u8; 16];
@@ -90,15 +96,20 @@ fn generate_nonce() -> String {
             acc
         });
 
-    format!("{now_millis}-{hex_suffix}")
+    Ok(format!("{now_millis}-{hex_suffix}"))
 }
 
 /// Returns the current Unix timestamp in seconds.
-fn now_secs() -> u64 {
+///
+/// # Errors
+///
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix
+/// epoch. Defaulting to zero would silently produce expired tokens.
+fn now_secs() -> Result<u64, UcanError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))
 }
 
 /// Mints a new UCAN token with Ed25519 signature.
@@ -120,6 +131,7 @@ fn now_secs() -> u64 {
 ///
 /// # Errors
 ///
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix epoch.
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
 /// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
 ///
@@ -303,13 +315,21 @@ pub async fn delegate_ucan(
 
     // Step 2: Verify attenuation — all requested capabilities must be a subset
     // of the parent token's capabilities (never widen).
+    // SECURITY: fail-closed — any unparseable parent URI rejects the entire delegation.
     let parent_caps: Vec<CapabilityUri> = params
         .parent_token
         .payload
         .att
         .iter()
-        .filter_map(|att| att.with.parse::<CapabilityUri>().ok())
-        .collect();
+        .map(|att| {
+            att.with.parse::<CapabilityUri>().map_err(|_| {
+                UcanError::MalformedToken(format!(
+                    "unparseable capability URI in parent token: {}",
+                    att.with
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     for child_att in params.attenuated_capabilities {
         let child_cap: CapabilityUri = child_att.with.parse().map_err(|e: UcanError| {
