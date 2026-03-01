@@ -2,28 +2,29 @@
 //!
 //! Exposes SCP UCAN operations to JavaScript:
 //!
-//! - [`ucan_validate`] — Validate a UCAN token against a required capability.
-//! - [`ucan_mint`] — Mint a new UCAN token for a context member.
-//! - [`ucan_revoke`] — Revoke a UCAN token.
+//! - [`ucan_validate`] --- Validate a UCAN token against a required capability.
+//! - [`ucan_mint`] --- Mint a new UCAN token for a context member.
+//! - [`ucan_revoke`] --- Revoke a UCAN token.
 //!
 //! # Types
 //!
-//! - [`WasmUcanToken`] — UCAN token handle (ID, issuer, audience, capabilities,
+//! - [`WasmUcanToken`] --- UCAN token handle (ID, issuer, audience, capabilities,
 //!   expiry).
 //!
 //! # Wiring
 //!
 //! All functions delegate to the WASM-local runtime registry in [`crate::runtime`].
-//! `ucan_validate` performs structural validation (capability URI parsing, ceiling
-//! checking, revocation checking) without full Ed25519 signature verification
-//! (signature verification requires `KeyCustody` wiring — see SCP-214).
+//! `ucan_validate` performs Ed25519 signature verification, time bounds checking,
+//! capability matching with context scope enforcement, and revocation checking.
 //! `ucan_mint` creates a properly structured token with metadata (signing deferred
-//! to SCP-214). `ucan_revoke` adds the token CID to the context's revocation set.
+//! to SCP-214). `ucan_revoke` adds the token CID to the context's revocation set
+//! using the same CID computation as scp-core's `compute_revocation_cid`.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` and ADR-016 (UCAN validation)
 //! for the full specification.
 
 use js_sys::Promise;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -42,7 +43,7 @@ use crate::runtime;
 /// ID (derived from the UCAN nonce), issuer DID, audience DID, capabilities
 /// as a JSON string, and an optional expiry timestamp.
 ///
-/// The raw signature and encoded JWT are not exposed — they are internal to
+/// The raw signature and encoded JWT are not exposed --- they are internal to
 /// the Rust crypto layer and not needed by application code.
 ///
 /// # JS usage
@@ -60,9 +61,9 @@ use crate::runtime;
 pub struct WasmUcanToken {
     /// Unique token identifier (derived from the UCAN nonce).
     token_id: String,
-    /// Issuer DID — the entity that created and signed this token.
+    /// Issuer DID --- the entity that created and signed this token.
     issuer: String,
-    /// Audience DID — the entity this token is delegated to.
+    /// Audience DID --- the entity this token is delegated to.
     audience: String,
     /// Granted capabilities serialized as a JSON array of URI strings.
     /// Each string follows the SCP capability URI format:
@@ -116,25 +117,60 @@ impl WasmUcanToken {
 }
 
 // ---------------------------------------------------------------------------
+// UCAN payload types (mirrors scp-core for CID-compatible serialization)
+// ---------------------------------------------------------------------------
+
+/// Mirrors `scp_core::crypto::ucan::Attenuation` for JSON serialization.
+///
+/// Used by [`compute_revocation_cid`] and capability matching. Field names
+/// and serialization order must match scp-core exactly so that
+/// `serde_json::to_vec` produces identical bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WasmAttenuation {
+    with: String,
+    can: String,
+}
+
+/// Mirrors `scp_core::crypto::ucan::UcanPayload` for CID computation.
+///
+/// The revocation CID is `SHA-256(serde_json::to_vec(payload))`. For CIDs
+/// to match between the WASM bridge and scp-core, the struct layout and
+/// serde attributes must be identical.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WasmUcanPayload {
+    iss: String,
+    aud: String,
+    exp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nbf: Option<u64>,
+    nnc: String,
+    att: Vec<WasmAttenuation>,
+    prf: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fct: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
 /// Validates a UCAN token for a required capability.
 ///
-/// Performs full UCAN validation: signature verification, time bounds
-/// checking, delegation chain traversal, attenuation enforcement, nonce
-/// replay detection, and capability matching.
+/// Performs UCAN validation including Ed25519 signature verification, time
+/// bounds checking, capability matching with context scope enforcement, and
+/// revocation checking. The signature is verified against the issuer's
+/// public key extracted from the DID string.
 ///
 /// # Arguments
 ///
-/// * `context` — The context handle the token is presented in.
-/// * `token` — The encoded UCAN token string (JWT format).
-/// * `capability` — The required capability URI (e.g.,
+/// * `context` --- The context handle the token is presented in.
+/// * `token` --- The encoded UCAN token string (JWT format).
+/// * `capability` --- The required capability URI (e.g.,
 ///   `"scp:ctx:abc123/messages:write"`).
 ///
 /// # Returns
 ///
-/// `Promise<void>` — resolves on successful validation.
+/// `Promise<void>` --- resolves on successful validation.
 ///
 /// # Errors
 ///
@@ -142,7 +178,7 @@ impl WasmUcanToken {
 ///   malformed token, invalid signature, expired, insufficient capabilities,
 ///   revoked, broken delegation chain.
 ///
-/// See ADR-022 acceptance criterion 1.
+/// See ADR-022 acceptance criterion 1 and ADR-016 (UCAN Enforcement).
 #[wasm_bindgen]
 pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: String) -> Promise {
     let context_id = context.context_id();
@@ -170,6 +206,8 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
             ScpWasmError::Permission(format!("malformed UCAN payload (JSON parse): {e}")).into_js()
         })?;
 
+        verify_token_signature(&token, parts, &payload)?;
+
         let token_exp = payload["exp"].as_u64().ok_or_else(|| {
             ScpWasmError::Permission("UCAN payload missing 'exp' field".to_owned()).into_js()
         })?;
@@ -186,13 +224,15 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
             .into());
         }
 
+        let context_prefix = format!("scp:ctx:{context_id}");
         let token_atts = payload["att"].as_array();
         let has_capability = token_atts.is_some_and(|atts| {
             atts.iter().any(|att| {
                 let with_str = att["with"].as_str().unwrap_or("");
                 let can_str = att["can"].as_str().unwrap_or("");
                 let att_uri = format!("{with_str}/{can_str}");
-                att_uri == capability || can_str == "*"
+                att_uri == capability
+                    || (can_str == "*" && with_str.starts_with(&context_prefix))
             })
         });
 
@@ -204,8 +244,16 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
             .into());
         }
 
+        let typed_payload: WasmUcanPayload =
+            serde_json::from_slice(&payload_bytes).map_err(|e| {
+                ScpWasmError::Permission(format!(
+                    "failed to deserialize UCAN payload for CID computation: {e}"
+                ))
+                .into_js()
+            })?;
+
         runtime::with_context(&context_id, |rt| {
-            let token_cid = compute_token_cid(&token);
+            let token_cid = compute_revocation_cid(&typed_payload);
             if rt.revoked_tokens.contains(&token_cid) {
                 return Err(ScpWasmError::Permission(
                     "UCAN token has been revoked".to_owned(),
@@ -227,14 +275,14 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
 ///
 /// # Arguments
 ///
-/// * `context` — The context handle to mint the token for.
-/// * `member_did` — The DID of the member receiving the token.
-/// * `capabilities_json` — A JSON array of capability URI strings to grant
+/// * `context` --- The context handle to mint the token for.
+/// * `member_did` --- The DID of the member receiving the token.
+/// * `capabilities_json` --- A JSON array of capability URI strings to grant
 ///   (e.g., `'["scp:ctx:abc123/messages:write"]'`).
 ///
 /// # Returns
 ///
-/// `Promise<WasmUcanToken>` — resolves to the minted token handle.
+/// `Promise<WasmUcanToken>` --- resolves to the minted token handle.
 ///
 /// # Errors
 ///
@@ -299,31 +347,36 @@ pub fn ucan_mint(
 
 /// Revokes a UCAN token.
 ///
-/// Adds the token to the context's revocation list. Revoked tokens are no
-/// longer accepted by validation. Revocation is distributed to all context
-/// members via MLS.
+/// Parses the full encoded JWT token, computes its content-hash CID using
+/// the same algorithm as scp-core's `compute_revocation_cid` (SHA-256 of
+/// JSON-serialized payload struct), and adds the CID to the context's
+/// revocation set.
 ///
 /// # Arguments
 ///
-/// * `context` — The context handle the token belongs to.
-/// * `token_id` — The unique ID of the token to revoke.
+/// * `context` --- The context handle the token belongs to.
+/// * `token` --- The full encoded UCAN token string (JWT format).
 ///
 /// # Returns
 ///
-/// `Promise<void>` — resolves on success.
+/// `Promise<void>` --- resolves on success.
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-PERM-3000]` if revocation fails (token not found,
-/// revoker not authorized — must be the token's issuer or context creator).
+/// Rejects with `[SCP-PERM-3000]` if revocation fails (malformed token,
+/// context not found).
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
 #[allow(clippy::similar_names)]
-pub fn ucan_revoke(context: &WasmContextHandle, token_id: String) -> Promise {
+pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let token_cid = compute_token_cid(&token_id);
+        let payload = parse_jwt_payload(&token).map_err(|e| {
+            ScpWasmError::Permission(format!("failed to parse UCAN for revocation: {e}")).into_js()
+        })?;
+
+        let token_cid = compute_revocation_cid(&payload);
 
         runtime::with_context(&context_id, |rt| {
             rt.revoked_tokens.insert(token_cid.clone());
@@ -339,13 +392,148 @@ pub fn ucan_revoke(context: &WasmContextHandle, token_id: String) -> Promise {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Computes a content-hash CID (SHA-256 hex) for a token string.
+/// Verifies the Ed25519 signature on a JWT-format UCAN token.
 ///
-/// Mirrors scp-core's `compute_revocation_cid`. Uses the token string (or
-/// token ID) as the CID input.
-fn compute_token_cid(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    runtime::encode_hex(&hash)
+/// Resolves the issuer DID to extract the public key, decodes the signature
+/// from the third JWT segment, and verifies the signature over the signing
+/// input (`header_b64.payload_b64`).
+///
+/// Supports `did:dht:z{z-base-32}` (production) and `did:key:{hex}`
+/// (testing) DID formats, matching the NAPI bridge's `BridgeDidResolver`.
+fn verify_token_signature(
+    encoded_token: &str,
+    parts: Vec<&str>,
+    payload: &serde_json::Value,
+) -> Result<(), JsValue> {
+    let issuer_did = payload["iss"].as_str().ok_or_else(|| {
+        ScpWasmError::Permission("UCAN payload missing 'iss' field".to_owned()).into_js()
+    })?;
+
+    let pk_bytes = resolve_did_public_key(issuer_did).map_err(|e| {
+        ScpWasmError::Permission(format!("failed to resolve issuer DID: {e}")).into_js()
+    })?;
+
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).map_err(|e| {
+        ScpWasmError::Permission(format!("invalid public key from issuer DID: {e}")).into_js()
+    })?;
+
+    let sig_b64 = parts[2];
+    let sig_bytes_vec = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        sig_b64,
+    )
+    .map_err(|e| {
+        ScpWasmError::Permission(format!("malformed UCAN signature (base64 decode): {e}"))
+            .into_js()
+    })?;
+
+    let sig_bytes: [u8; 64] = sig_bytes_vec.as_slice().try_into().map_err(|_| {
+        ScpWasmError::Permission(format!(
+            "UCAN signature must be 64 bytes, got {}",
+            sig_bytes_vec.len()
+        ))
+        .into_js()
+    })?;
+
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+    let signing_input = encoded_token
+        .rfind('.')
+        .map(|pos| &encoded_token[..pos])
+        .ok_or_else(|| {
+            ScpWasmError::Permission("missing signature segment in JWT".to_owned()).into_js()
+        })?;
+
+    verifying_key
+        .verify_strict(signing_input.as_bytes(), &signature)
+        .map_err(|_| {
+            ScpWasmError::Permission("UCAN Ed25519 signature verification failed".to_owned())
+                .into_js()
+        })?;
+
+    Ok(())
+}
+
+/// Resolves a DID string to its Ed25519 public key bytes.
+///
+/// Supports:
+/// - `did:dht:z{z-base-32-encoded-pubkey}` --- production format.
+/// - `did:key:{hex-encoded-pubkey}` --- testing format.
+///
+/// Mirrors the NAPI bridge's `BridgeDidResolver::resolve_public_key`.
+fn resolve_did_public_key(did: &str) -> Result<[u8; 32], String> {
+    if let Some(suffix) = did.strip_prefix("did:dht:z") {
+        let decoded = zbase32::decode(suffix)
+            .map_err(|_| format!("z-base-32 decode failed for DID: {did}"))?;
+        let bytes: [u8; 32] = decoded
+            .try_into()
+            .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
+        return Ok(bytes);
+    }
+
+    if let Some(hex_str) = did.strip_prefix("did:key:") {
+        let bytes = decode_hex(hex_str)
+            .map_err(|e| format!("hex decode failed for did:key DID: {e}"))?;
+        let pk: [u8; 32] = bytes
+            .try_into()
+            .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
+        return Ok(pk);
+    }
+
+    Err(format!(
+        "unsupported DID method: {did} (expected did:dht: or did:key:)"
+    ))
+}
+
+/// Decodes a hex string to bytes.
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!("hex string has odd length: {}", hex.len()));
+    }
+
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte_str = &hex[i..i + 2];
+        let byte =
+            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+/// Parses a JWT-format UCAN token and returns the deserialized payload.
+///
+/// Used by `ucan_revoke` to compute the revocation CID from the payload
+/// struct, matching scp-core's `compute_revocation_cid` algorithm.
+fn parse_jwt_payload(token: &str) -> Result<WasmUcanPayload, String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err("malformed UCAN token: expected 3 dot-separated JWT segments".to_owned());
+    }
+
+    let payload_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        parts[1],
+    )
+    .map_err(|e| format!("malformed UCAN payload (base64 decode): {e}"))?;
+
+    serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("malformed UCAN payload (JSON parse): {e}"))
+}
+
+/// Computes the revocation CID for a UCAN payload.
+///
+/// Matches scp-core's `compute_revocation_cid` exactly: JSON-serialize the
+/// `UcanPayload` struct, then SHA-256 hash the bytes, then hex-encode.
+///
+/// The struct field order and serde attributes must match scp-core's
+/// `UcanPayload` so that `serde_json::to_vec` produces identical bytes.
+fn compute_revocation_cid(payload: &WasmUcanPayload) -> String {
+    let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let hash = Sha256::digest(&payload_bytes);
+    hash.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
