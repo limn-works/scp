@@ -353,6 +353,10 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 /// (unlike using the public DID as the HMAC key). The secret is in-memory
 /// only and will not match across process restarts.
 ///
+/// **Note:** The internal `IDENTITY_ROUTING_SECRETS` map grows without eviction,
+/// but is bounded by unique identity DIDs (typically 1–2 per process). This
+/// entire function is removed when `KeyCustody` is wired in (SCP-214).
+///
 /// When `KeyCustody` is wired in, replace callers with
 /// `scp_core::envelope::pseudonym::derive_pseudonym` using real key material.
 pub fn get_or_create_routing_secret(identity_did: &str) -> [u8; 32] {

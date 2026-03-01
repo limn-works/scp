@@ -341,6 +341,17 @@ class AndroidKeyCustodyTest {
             }
             assertEquals("SCP-CRYPTO-4002", exception.code)
         }
+
+        @Test
+        fun `dhAgree throws SCP-CRYPTO-4003 for wrong-size peerPublic`() {
+            val handle = custody.generateKeypair(KeyType.X25519)
+            for (badSize in listOf(0, 16, 31, 33, 64)) {
+                val exception = assertThrows<ScpException> {
+                    custody.dhAgree(handle, ByteArray(badSize))
+                }
+                assertEquals("SCP-CRYPTO-4003", exception.code)
+            }
+        }
     }
 
     // -------------------------------------------------------------------

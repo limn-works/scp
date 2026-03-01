@@ -223,6 +223,12 @@ class AndroidKeyCustody : KeyCustodyProvider {
      * @throws ScpException with code `SCP-CRYPTO-4002` if the X25519 key is not found.
      */
     override fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray {
+        if (peerPublic.size != 32) {
+            throw ScpException(
+                "peerPublic must be exactly 32 bytes (X25519 public key), got ${peerPublic.size}",
+                "SCP-CRYPTO-4003",
+            )
+        }
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "X25519 key not found: ${keyHandle.id}",
