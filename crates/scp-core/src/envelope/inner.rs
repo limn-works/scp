@@ -350,14 +350,26 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, E
 /// cross-protocol signature confusion when the same Ed25519 key is reused
 /// across different signing contexts.
 ///
+/// Variable-length fields (`context_id`, `sender_did`, `payload_hash`,
+/// `provenance_hash`) are length-prefixed with their byte length as a
+/// big-endian `u32`. This prevents ambiguous concatenation where different
+/// field boundary positions could produce identical hash inputs (e.g.,
+/// `context_id="ab" + sender_did="cd"` vs `context_id="abc" + sender_did="d"`).
+/// Fixed-size fields (`epoch`, `generation`, `sequence`, `timestamp`,
+/// `message_type`) do not need length prefixes.
+///
 /// The `message_type` discriminator byte is included after the timestamp to
 /// prevent type-flipping attacks. This ensures a signature over a content
 /// message cannot be replayed as a signaling message (or vice versa).
 ///
 /// ```text
-/// SHA-256(DOMAIN_SEPARATOR || context_id || sender_did || epoch_BE
-///         || generation_BE || sequence_BE || timestamp_BE
-///         || message_type_byte || payload_hash || provenance_hash)
+/// SHA-256(DOMAIN_SEPARATOR
+///         || len(context_id) as u32 BE || context_id
+///         || len(sender_did) as u32 BE || sender_did
+///         || epoch_BE || generation_BE || sequence_BE || timestamp_BE
+///         || message_type_byte
+///         || len(payload_hash) as u32 BE || payload_hash
+///         || len(provenance_hash) as u32 BE || provenance_hash)
 /// ```
 #[allow(clippy::too_many_arguments)]
 fn compute_canonical_hash(
@@ -371,16 +383,23 @@ fn compute_canonical_hash(
     payload_hash: &[u8],
     provenance_hash: &[u8],
 ) -> Vec<u8> {
+    #[allow(clippy::cast_possible_truncation)]
+    let len_prefix = |len: usize| -> [u8; 4] { (len as u32).to_be_bytes() };
+
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_SEPARATOR);
+    hasher.update(len_prefix(context_id.len()));
     hasher.update(context_id.as_bytes());
+    hasher.update(len_prefix(sender_did.len()));
     hasher.update(sender_did.as_bytes());
     hasher.update(epoch.to_be_bytes());
     hasher.update(generation.to_be_bytes());
     hasher.update(sequence.to_be_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.update([message_type.as_discriminator_byte()]);
+    hasher.update(len_prefix(payload_hash.len()));
     hasher.update(payload_hash);
+    hasher.update(len_prefix(provenance_hash.len()));
     hasher.update(provenance_hash);
     hasher.finalize().to_vec()
 }
@@ -811,6 +830,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(envelope.message_type, MessageType::Content);
+    }
+
+    #[test]
+    fn length_prefixes_prevent_field_boundary_collision() {
+        let payload_hash = Sha256::digest(b"test").to_vec();
+        let provenance_hash = Sha256::digest([0x00]).to_vec();
+
+        let hash_a = compute_canonical_hash(
+            "ab",
+            "cd",
+            1,
+            0,
+            1,
+            1_700_000_000,
+            MessageType::Content,
+            &payload_hash,
+            &provenance_hash,
+        );
+
+        let hash_b = compute_canonical_hash(
+            "abc",
+            "d",
+            1,
+            0,
+            1,
+            1_700_000_000,
+            MessageType::Content,
+            &payload_hash,
+            &provenance_hash,
+        );
+
+        assert_ne!(
+            hash_a, hash_b,
+            "different field boundaries must produce different canonical hashes"
+        );
     }
 
     mod proptest_inner {
