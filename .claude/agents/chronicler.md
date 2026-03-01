@@ -52,11 +52,15 @@ When invoked, you will:
 
 You have access to Vestige, the project's long-term memory system. Use it alongside `.docs/` artifacts — they serve different purposes. Artifacts are the system of record; Vestige is cognitive recall across sessions.
 
-**What to remember** — always tag with connotation so future sessions know how to act on it:
+**What to remember** — tag with connotation so future sessions know how to act:
 
-- **Good patterns** (tag `"good-pattern"`) — default to these. Proven approaches, preferred idioms, correct ways to use APIs. "This is how we do X."
-- **Bad patterns / anti-patterns** (tag `"anti-pattern"`) — avoid or detect these. Failed approaches, common mistakes, things that compiled but broke at runtime. "Never do X because Y."
-- **Bug fixes** (tag `"bug-fix"`) — error, root cause, solution, affected files. Recognize the same class of bug faster next time.
+- `"always"` — do this every time, no exceptions.
+- `"prefer"` — good default, may have exceptions. Use unless context says otherwise.
+- `"avoid"` — bad default, may have exceptions. Don't use unless context demands it.
+- `"never"` — don't do this. Detect it in others' code.
+
+Additional memory types:
+- **Bug fixes** (tag `"bug-fix"`) — error, root cause, solution, affected files. Recognize the same class of bug faster.
 - **Architectural decisions** — use `codebase(action="remember_decision")`. Mirrors the ADR for fast recall. Includes rationale and rejected alternatives so future sessions don't re-litigate.
 - **Toolchain gotchas** — environment quirks, build incantations, flag ordering issues that aren't worth a `.docs/lessons/` file.
 - **Session summaries** (tag `"session-end"`) — what was done, what's next.
