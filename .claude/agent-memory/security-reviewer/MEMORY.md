@@ -52,6 +52,10 @@
   - MEDIUM: No timeout on Python handler call -- blocking handler can starve tokio runtime
   - BUG: Redundant second tool_registry.get() in output-schema validation; make unconditional (fail-closed)
   - GOOD: Callable check at registration; tool-existence gate before handler stored; input+output schema validation
+- Routing ID derivation (2026-02-28): FIXED -- now uses HMAC-SHA256(per-identity random secret, context_id || "scp-pseudonym") instead of SHA-256(context_id). Previous version had no unlinkability.
+  - MEDIUM: Routing secret not zeroized; IDENTITY_ROUTING_SECRETS DashMap grows unboundedly; no eviction on identity close
+  - MEDIUM: HMAC domain separation uses concatenation without length prefix (consistent with scp-core spec; both should fix)
+  - GOOD: OsRng for secret generation; error handling on HMAC init; interim design matches scp-core pseudonym.rs pattern
 
 ### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86
 - CRITICAL: scp-platform testing feature in production deps (cdylib)
@@ -100,6 +104,10 @@
 - SCP-127: HIGH x2 (checkpoint_root clobbered, index reset); MEDIUM x5
 - SCP-213: HIGH BUG x2 (register_known_context never called; `h.context_id` AttributeError)
 
+### Kotlin SDK (`bindings/kotlin/scp-sdk-kotlin/`)
+- CoroutineBridge awaitClose uses runBlocking(ioDispatcher) -- safe for Dispatchers.IO but deadlock risk on single-threaded test dispatchers
+- callbackFlow subscribe/unsubscribe pattern is correct; trySend with overflow detection is good
+
 ### General Patterns
 - No `unwrap`/`expect` in lib code -- project standard via clippy deny
 - `thiserror` for error types; Rust edition 2024; `#![forbid(unsafe_code)]` on all crates except scp-ffi
@@ -110,3 +118,5 @@
 - Test adapters that return hardcoded values weaken invariant tests; duplicated canonical hash logic in test helpers diverges from production
 - Android Keystore AES-GCM requires setRandomizedEncryptionRequired(false) for deterministic IV usage -- default is true and will throw InvalidAlgorithmParameterException
 - SQL LIKE prefix matching without wildcard escaping (% and _) is a recurring KV store risk; prefer ESCAPE clause or range queries (>= and <)
+- Static DashMap registries in scp-ffi (CONTEXT_REGISTRY, KNOWN_CONTEXTS, IDENTITY_ROUTING_SECRETS) all lack eviction -- unbounded growth pattern
+- Kotlin runBlocking in callbackFlow awaitClose is the correct fix for non-suspend lambda but requires multi-threaded dispatcher
