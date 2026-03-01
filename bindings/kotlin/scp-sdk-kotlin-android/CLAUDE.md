@@ -47,13 +47,13 @@ Play Integrity API calls fail on emulators and devices without Google Play Servi
 
 Android Keystore enforces randomized encryption by default for GCM keys. If you use a fixed/caller-supplied IV (as `AndroidStorage.getOrCreateStorageKey()` does for deterministic passphrase derivation), you **must** call `.setRandomizedEncryptionRequired(false)` on the `KeyGenParameterSpec.Builder`. Without this, `Cipher.init()` throws `InvalidAlgorithmParameterException` at runtime. This is invisible to JVM unit tests since they cannot use the real Android Keystore -- it only manifests on actual devices.
 
-### StorageProvider method names diverge from UniFFI callback interface
+### StorageProvider method names match UniFFI callback interface
 
-The Kotlin `StorageProvider` interface in `Types.kt` uses `store()`/`retrieve()` but the UniFFI `StorageProvider` callback interface in `crates/scp-ffi/uniffi/src/lib.rs` uses `set()`/`get()`. When UniFFI-generated bindings replace `Types.kt`, `AndroidStorage.kt` will need method renames (`store` -> `set`, `retrieve` -> `get`). The UniFFI trait also uses `async` methods returning `Result<T, ScpError>` while the Kotlin interface uses synchronous methods with exceptions.
+The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matching the UniFFI `StorageProvider` callback interface in `crates/scp-ffi/uniffi/src/lib.rs`. The Rust `Storage` trait in `scp-platform/src/traits.rs` uses `store()`/`retrieve()` internally, but the UniFFI/Kotlin boundary uses `set`/`get`. The UniFFI trait uses `async` methods returning `Result<T, ScpError>` while the Kotlin interface uses synchronous methods with exceptions.
 
 ### SQL LIKE wildcards in prefix queries
 
-`listKeys()` and `deletePrefix()` use SQL `LIKE ? ` with `"$prefix%"`. The `%` and `_` characters in SQLite LIKE are wildcards. If storage keys ever contain these characters, prefix queries will match unintended keys. The in-memory test double uses `startsWith` which does not exhibit this behavior -- test and production semantics diverge here. Use `ESCAPE` clauses or range queries if key namespaces evolve to include these characters.
+`listKeys()` and `deletePrefix()` escape `%`, `_`, and `\` wildcards via `escapeLikePrefix()` and use `ESCAPE '\'` clauses in SQL LIKE patterns. The in-memory test double uses `startsWith` which does not need escaping but has equivalent prefix-match semantics.
 
 ## Build
 
