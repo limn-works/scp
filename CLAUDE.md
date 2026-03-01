@@ -63,6 +63,7 @@ User provides a directive → dispatches parallel subagents → runs tests → c
 - Plan mode for all non-trivial tasks (3+ steps or architectural decisions)
 - Aggressively reference and update `.docs/`; add lessons after any correction
 - Check `.docs/standards/` before writing code — read and follow them
+- PRD stories must conform to `.docs/standards/prd.md` — CI enforces structure, provenance, and references
 - Subagents: use liberally, one task each, keep main context clean
 - Verify all gates, tests, and builds pass before deciding you are done
 
