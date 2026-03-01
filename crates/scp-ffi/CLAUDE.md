@@ -22,11 +22,16 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 
 `py_context_create` in `context.rs` registers runtime state. Other modules (`tools.rs`, `ucan.rs`, `event_log.rs`) look up state by context ID via `with_context`.
 
+Additional global registries in `runtime.rs`:
+- `KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>>` — context-to-relay mappings for discovery (SCP-213)
+- `RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>>` — active relay connection
+- `STORAGE_PROVIDER: OnceLock<Arc<InMemoryStorage>>` — storage backend for identity persistence (SCP-217)
+
 ### Module Structure
 
 | Module | Delegates to | Functions |
 |--------|-------------|-----------|
-| `identity.rs` | scp-core identity | `py_identity_create`, `py_identity_load` |
+| `identity.rs` | scp-core identity | `py_init_storage`, `py_identity_create`, `py_identity_load` |
 | `context.rs` | runtime registry | `py_context_create`, `py_context_join`, `py_context_leave`, `py_context_close`, `py_context_send`, `py_context_receive` |
 | `tools.rs` | scp-core tools | `py_tool_register`, `py_tool_invoke`, `py_tool_verify` |
 | `ucan.rs` | scp-core UCAN | `py_ucan_validate`, `py_ucan_mint`, `py_ucan_revoke` |
@@ -102,3 +107,4 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
   - `runtime::KnownContext` stores `routing_id`, `relay_url`, `member_did`, `last_seen` for each tracked context.
   - Each result dict contains: `context_id`, `source` ("local"/"relay"/"local+relay"), `relay_active` (bool), plus optional `creator_did`/`member_count`/`tool_count`.
   - Result dicts from bridge functions must be consumed with `h["key"]` syntax in Python — NOT `h.key`. Prefer returning a `#[pyclass]` struct for new structured return types.
+- **Storage provider (SCP-217)**: `py_init_storage("in_memory")` injects a global `InMemoryStorage` via `OnceLock<Arc<InMemoryStorage>>` in `runtime.rs`. `py_identity_create` persists identity state under `identity/{did}/state` after creation. `py_identity_load` retrieves from storage and raises `IdentityError` if the DID is not found (no silent fallback). The `Storage` trait uses RPITIT and is **not dyn-compatible** — the global must use a concrete type (`InMemoryStorage`), not `Arc<dyn Storage>`. When `SqliteStorage` lands, this will need an enum dispatch or generic parameter.
