@@ -137,6 +137,11 @@ Strict order within every file:
 | `undo_change`          | Revert a bad AI change without touching git.            |
 | `get_feature_hub`      | Browse feature graph hubs. Find orphaned files.         |
 
+## SCP-Specific Notes
+
+- `semantic_code_search` fails on this codebase with "input length exceeds context length" — a Context+ bug where file batching exceeds the embedding model's context window. Use `semantic_identifier_search` or Grep instead.
+- `propose_commit` enforces Context+'s formatting rules (2-line headers, FEATURE tags, zero comments). This project has its own standards in `.docs/standards/`. Use standard Edit/Write tools for SCP code; use `propose_commit` only if you want its validation.
+
 ## Anti-Patterns to Avoid
 
 1. Reading entire files without checking the skeleton first.
