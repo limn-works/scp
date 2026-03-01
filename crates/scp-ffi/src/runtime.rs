@@ -50,6 +50,7 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::event_log::EventLog;
 use scp_core::identity::cache::SystemClock;
+use scp_platform::testing::InMemoryStorage;
 use scp_transport::native::adapter::NativeRelayAdapter;
 
 use crate::error::ScpPyError;
@@ -339,6 +340,66 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
         .filter(|entry| entry.value().member_did == member_did)
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Storage provider registry (SCP-217: identity persistence)
+// ---------------------------------------------------------------------------
+
+/// Global storage provider for identity persistence.
+///
+/// Injected via [`init_storage`] at Python initialization time. Bridge
+/// functions use [`get_storage`] to access the provider for storing and
+/// loading identity state. The storage backend is `InMemoryStorage` for
+/// now — persistent backends (SQLite via `SqliteStorage`) will replace it
+/// when platform storage adapters land.
+///
+/// Uses the same `OnceLock` pattern as `CONTEXT_REGISTRY` and
+/// `RELAY_CONNECTION`. The `Arc` enables shared ownership across bridge
+/// functions without lifetime issues.
+///
+/// See spec section 17.3 for key conventions and section 17.4 for
+/// `ProtocolStore` design.
+static STORAGE_PROVIDER: OnceLock<Arc<InMemoryStorage>> = OnceLock::new();
+
+/// Initializes the global storage provider.
+///
+/// Must be called before any storage-dependent bridge function
+/// (`py_identity_create`, `py_identity_load`). Calling multiple times is
+/// a no-op — the first call wins.
+///
+/// # Arguments
+///
+/// * `storage_type` — Currently only `"in_memory"` is supported.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ValidationError` if the storage type is not
+/// recognized.
+pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
+    match storage_type {
+        "in_memory" => {
+            let _ = STORAGE_PROVIDER.set(Arc::new(InMemoryStorage::new()));
+            Ok(())
+        }
+        other => Err(ScpPyError::ValidationError(format!(
+            "unknown storage type: {other:?} — expected \"in_memory\""
+        ))),
+    }
+}
+
+/// Returns a reference to the global storage provider.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if storage has not been initialized
+/// via [`init_storage`].
+pub fn get_storage() -> Result<&'static Arc<InMemoryStorage>, ScpPyError> {
+    STORAGE_PROVIDER.get().ok_or_else(|| {
+        ScpPyError::IdentityError(
+            "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
