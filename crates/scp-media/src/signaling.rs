@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use scp_core::envelope::MessageType;
 use scp_core::identity::DID;
 
 /// Errors from signaling operations.
@@ -143,6 +144,33 @@ pub fn serialize_signaling(msg: &SignalingMessage) -> Result<Vec<u8>, serde_json
 /// Returns an error if JSON deserialization fails.
 pub fn deserialize_signaling(bytes: &[u8]) -> Result<SignalingMessage, serde_json::Error> {
     serde_json::from_slice(bytes)
+}
+
+/// Returns [`MessageType::Signaling`] for use when constructing inner
+/// envelopes that carry signaling payloads.
+///
+/// This is a convenience accessor so that callers in the media layer do not
+/// need to depend on `scp_core::envelope::MessageType` directly.
+#[must_use]
+pub fn signaling_message_type() -> MessageType {
+    MessageType::Signaling
+}
+
+/// Serializes a signaling message and returns the payload bytes together
+/// with the [`MessageType::Signaling`] discriminator.
+///
+/// Callers pass the returned tuple directly to
+/// [`scp_core::envelope::create_inner_envelope_typed`] to construct an
+/// authenticated, encrypted SCP envelope that relays will route as a normal
+/// message. This function does **not** perform encryption or signing — it
+/// only prepares the payload and identifies the message type.
+///
+/// # Errors
+///
+/// Returns an error if JSON serialization of the signaling message fails.
+pub fn send_signaling(msg: &SignalingMessage) -> Result<(Vec<u8>, MessageType), serde_json::Error> {
+    let payload = serde_json::to_vec(msg)?;
+    Ok((payload, MessageType::Signaling))
 }
 
 /// Verifies that the sender DID claimed in a signaling message matches the
@@ -383,5 +411,84 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(matches!(err, SignalingError::SenderMismatch { .. }));
+    }
+
+    // -- signaling_message_type -----------------------------------------------
+
+    #[test]
+    fn signaling_message_type_returns_signaling_variant() {
+        use scp_core::envelope::MessageType;
+
+        let mt = signaling_message_type();
+        assert_eq!(mt, MessageType::Signaling);
+    }
+
+    // -- send_signaling -------------------------------------------------------
+
+    #[test]
+    fn send_signaling_produces_payload_and_signaling_type() {
+        use scp_core::envelope::MessageType;
+
+        let (_, msg) = create_offer("s1", "v=0\r\n".into(), "did:dht:zAlice".into());
+        let (payload, mt) = send_signaling(&msg).unwrap();
+
+        assert_eq!(mt, MessageType::Signaling);
+        assert!(!payload.is_empty());
+
+        let restored: SignalingMessage = serde_json::from_slice(&payload).unwrap();
+        match restored {
+            SignalingMessage::Offer(desc) => {
+                assert_eq!(desc.sdp, "v=0\r\n");
+                assert_eq!(desc.sender_did, "did:dht:zAlice");
+            }
+            _ => panic!("expected Offer after send_signaling roundtrip"),
+        }
+    }
+
+    #[test]
+    fn send_signaling_answer_roundtrip() {
+        let (_, msg) = create_answer("s2", "v=0\r\n".into(), "did:dht:zBob".into());
+        let (payload, _) = send_signaling(&msg).unwrap();
+
+        let restored = deserialize_signaling(&payload).unwrap();
+        match restored {
+            SignalingMessage::Answer(desc) => {
+                assert_eq!(desc.sender_did, "did:dht:zBob");
+            }
+            _ => panic!("expected Answer"),
+        }
+    }
+
+    #[test]
+    fn send_signaling_ice_candidate_roundtrip() {
+        let (_, msg) = create_ice_candidate(
+            "s3",
+            "candidate:1 1 UDP 2130706431 10.0.0.1 5000 typ host".to_owned(),
+            Some("audio".to_owned()),
+            Some(0),
+            "did:dht:zAlice".into(),
+        );
+        let (payload, _) = send_signaling(&msg).unwrap();
+
+        let restored = deserialize_signaling(&payload).unwrap();
+        match restored {
+            SignalingMessage::IceCandidate(c) => {
+                assert!(c.candidate.contains("candidate:1"));
+                assert_eq!(c.sdp_mid, Some("audio".to_owned()));
+                assert_eq!(c.sdp_mline_index, Some(0));
+            }
+            _ => panic!("expected IceCandidate"),
+        }
+    }
+
+    #[test]
+    fn send_signaling_session_end_roundtrip() {
+        let msg = SignalingMessage::SessionEnd;
+        let (payload, mt) = send_signaling(&msg).unwrap();
+
+        assert_eq!(mt, scp_core::envelope::MessageType::Signaling);
+
+        let restored = deserialize_signaling(&payload).unwrap();
+        assert!(matches!(restored, SignalingMessage::SessionEnd));
     }
 }

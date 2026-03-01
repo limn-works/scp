@@ -26,6 +26,38 @@ use super::padding::pad_to_bucket;
 // Types
 // ---------------------------------------------------------------------------
 
+/// Discriminator for the type of payload carried by an inner envelope.
+///
+/// Distinguishes regular content messages from protocol-level signaling
+/// messages (e.g., WebRTC SDP offers/answers and ICE candidates). The
+/// discriminator is included in the canonical hash to prevent type-flipping
+/// attacks where an attacker reinterprets a content message as signaling or
+/// vice versa.
+///
+/// See ADR-024 acceptance criteria 5 in `.docs/adrs/phase-5.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MessageType {
+    /// Regular content message (chat, tool output, etc.).
+    #[default]
+    Content,
+
+    /// WebRTC signaling message (SDP offer/answer, ICE candidate).
+    Signaling,
+}
+
+impl MessageType {
+    /// Returns a single-byte discriminator for inclusion in canonical hashes.
+    ///
+    /// Using a fixed-width encoding prevents ambiguity in the hash input.
+    #[must_use]
+    pub fn as_discriminator_byte(&self) -> u8 {
+        match self {
+            Self::Content => 0,
+            Self::Signaling => 1,
+        }
+    }
+}
+
 /// Provenance metadata attached to an inner envelope.
 ///
 /// Provenance tracks the origin of message content — which tool generated it,
@@ -67,6 +99,14 @@ pub struct InnerEnvelope {
     /// Creation timestamp (Unix milliseconds).
     pub timestamp: u64,
 
+    /// Discriminator for the payload type.
+    ///
+    /// Defaults to [`MessageType::Content`] for backward compatibility with
+    /// envelopes created before this field was introduced. The discriminator
+    /// is included in the canonical hash to prevent type-flipping attacks.
+    #[serde(default)]
+    pub message_type: MessageType,
+
     /// SHA-256 hash of the original plaintext payload (before padding).
     #[serde(with = "serde_bytes")]
     pub payload_hash: Vec<u8>,
@@ -94,11 +134,16 @@ pub struct InnerEnvelope {
 
 /// Creates an inner envelope with a signed, padded payload.
 ///
+/// The message type defaults to [`MessageType::Content`]. Use
+/// [`create_inner_envelope_typed`] to specify a different message type
+/// (e.g., [`MessageType::Signaling`] for WebRTC signaling messages).
+///
 /// **Processing order:**
 /// 1. Compute `payload_hash = SHA-256(payload)` (original plaintext).
 /// 2. Compute `provenance_hash = SHA-256(serialize(provenance))` if present,
 ///    or `SHA-256(0x00)` if absent.
-/// 3. Compute the canonical hash over all critical fields.
+/// 3. Compute the canonical hash over all critical fields (including
+///    `message_type`).
 /// 4. Sign the canonical hash with `key_custody.sign(signing_key, hash)`.
 /// 5. Pad the payload to the next bucket boundary.
 /// 6. Return the complete inner envelope.
@@ -122,6 +167,50 @@ pub async fn create_inner_envelope(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
 ) -> Result<InnerEnvelope, EnvelopeError> {
+    create_inner_envelope_typed(
+        context_id,
+        sender_did,
+        epoch,
+        generation,
+        sequence,
+        timestamp,
+        MessageType::Content,
+        payload,
+        provenance,
+        key_custody,
+        signing_key,
+    )
+    .await
+}
+
+/// Creates an inner envelope with an explicit [`MessageType`].
+///
+/// Identical to [`create_inner_envelope`] but accepts a `message_type`
+/// parameter. The message type is included in the canonical hash, so
+/// changing it after signing invalidates the signature. This prevents
+/// type-flipping attacks (e.g., reinterpreting a content message as
+/// signaling or vice versa).
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::SigningFailed`] if the signing operation fails.
+/// Returns [`EnvelopeError::SerializationFailed`] if provenance serialization fails.
+/// Returns [`EnvelopeError::PayloadTooLarge`] if the payload exceeds the
+/// maximum bucket size.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_inner_envelope_typed(
+    context_id: &str,
+    sender_did: &str,
+    epoch: u64,
+    generation: u64,
+    sequence: u64,
+    timestamp: u64,
+    message_type: MessageType,
+    payload: &[u8],
+    provenance: Option<Provenance>,
+    key_custody: &impl KeyCustody,
+    signing_key: &KeyHandle,
+) -> Result<InnerEnvelope, EnvelopeError> {
     // 1. Hash original plaintext.
     let payload_hash = Sha256::digest(payload).to_vec();
 
@@ -136,6 +225,7 @@ pub async fn create_inner_envelope(
         generation,
         sequence,
         timestamp,
+        message_type,
         &payload_hash,
         &provenance_hash,
     );
@@ -157,6 +247,7 @@ pub async fn create_inner_envelope(
         generation,
         sequence,
         timestamp,
+        message_type,
         payload_hash,
         payload: padded_payload,
         provenance,
@@ -217,6 +308,7 @@ pub fn verify_inner_signature(
         inner.generation,
         inner.sequence,
         inner.timestamp,
+        inner.message_type,
         &inner.payload_hash,
         &provenance_hash,
     );
@@ -258,10 +350,14 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, E
 /// cross-protocol signature confusion when the same Ed25519 key is reused
 /// across different signing contexts.
 ///
+/// The `message_type` discriminator byte is included after the timestamp to
+/// prevent type-flipping attacks. This ensures a signature over a content
+/// message cannot be replayed as a signaling message (or vice versa).
+///
 /// ```text
 /// SHA-256(DOMAIN_SEPARATOR || context_id || sender_did || epoch_BE
 ///         || generation_BE || sequence_BE || timestamp_BE
-///         || payload_hash || provenance_hash)
+///         || message_type_byte || payload_hash || provenance_hash)
 /// ```
 #[allow(clippy::too_many_arguments)]
 fn compute_canonical_hash(
@@ -271,6 +367,7 @@ fn compute_canonical_hash(
     generation: u64,
     sequence: u64,
     timestamp: u64,
+    message_type: MessageType,
     payload_hash: &[u8],
     provenance_hash: &[u8],
 ) -> Vec<u8> {
@@ -282,6 +379,7 @@ fn compute_canonical_hash(
     hasher.update(generation.to_be_bytes());
     hasher.update(sequence.to_be_bytes());
     hasher.update(timestamp.to_be_bytes());
+    hasher.update([message_type.as_discriminator_byte()]);
     hasher.update(payload_hash);
     hasher.update(provenance_hash);
     hasher.finalize().to_vec()
@@ -558,6 +656,7 @@ mod tests {
             0,
             1,
             1_700_000_000,
+            MessageType::Content,
             &payload_hash,
             &provenance_hash,
         );
@@ -571,6 +670,7 @@ mod tests {
             h.update(0u64.to_be_bytes());
             h.update(1u64.to_be_bytes());
             h.update(1_700_000_000u64.to_be_bytes());
+            h.update([0u8]);
             h.update(&payload_hash);
             h.update(&provenance_hash);
             h.finalize().to_vec()
@@ -586,6 +686,7 @@ mod tests {
             h.update(0u64.to_be_bytes());
             h.update(1u64.to_be_bytes());
             h.update(1_700_000_000u64.to_be_bytes());
+            h.update([0u8]);
             h.update(&payload_hash);
             h.update(&provenance_hash);
             h.finalize().to_vec()
@@ -599,6 +700,117 @@ mod tests {
             hash_with_domain, hash_alt_domain,
             "different domain separator must produce different hash"
         );
+    }
+
+    #[test]
+    fn message_type_changes_canonical_hash() {
+        let payload_hash = Sha256::digest(b"test").to_vec();
+        let provenance_hash = Sha256::digest([0x00]).to_vec();
+
+        let hash_content = compute_canonical_hash(
+            "ctx-1",
+            "did:dht:alice",
+            1,
+            0,
+            1,
+            1_700_000_000,
+            MessageType::Content,
+            &payload_hash,
+            &provenance_hash,
+        );
+
+        let hash_signaling = compute_canonical_hash(
+            "ctx-1",
+            "did:dht:alice",
+            1,
+            0,
+            1,
+            1_700_000_000,
+            MessageType::Signaling,
+            &payload_hash,
+            &provenance_hash,
+        );
+
+        assert_ne!(
+            hash_content, hash_signaling,
+            "different message types must produce different canonical hashes"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_typed_envelope_with_signaling() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let envelope = create_inner_envelope_typed(
+            "ctx-1",
+            "did:dht:alice",
+            1,
+            0,
+            1,
+            1_700_000_000,
+            MessageType::Signaling,
+            b"signaling payload",
+            None,
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(envelope.message_type, MessageType::Signaling);
+
+        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(valid, "signaling envelope signature should verify");
+    }
+
+    #[tokio::test]
+    async fn signaling_signature_rejects_type_flip_to_content() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let mut envelope = create_inner_envelope_typed(
+            "ctx-1",
+            "did:dht:alice",
+            1,
+            0,
+            1,
+            1_700_000_000,
+            MessageType::Signaling,
+            b"payload",
+            None,
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        envelope.message_type = MessageType::Content;
+
+        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(!valid, "type-flipped envelope must fail verification");
+    }
+
+    #[tokio::test]
+    async fn default_create_uses_content_type() {
+        let (custody, signing_key) = setup().await;
+
+        let envelope = create_inner_envelope(
+            "ctx-1",
+            "did:dht:alice",
+            1,
+            0,
+            1,
+            1_700_000_000,
+            b"hello",
+            None,
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(envelope.message_type, MessageType::Content);
     }
 
     mod proptest_inner {
