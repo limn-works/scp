@@ -57,6 +57,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub mod bridge;
+pub(crate) mod runtime;
 
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
