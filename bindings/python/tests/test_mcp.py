@@ -502,6 +502,7 @@ class TestModuleAll:
             "configure_stdio_allowlist",
             "disable_stdio_allowlist",
             "get_stdio_allowlist",
+            "register_tool_handler",
             "reset_stdio_allowlist",
             "serve_mcp",
         }
