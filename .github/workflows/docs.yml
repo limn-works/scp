@@ -38,8 +38,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-draft:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Not a draft PR, proceeding"
+
   # ---- Rust (rustdoc) ----
   rust-docs:
+    needs: check-draft
     name: "Rust API docs (rustdoc)"
     runs-on: ubuntu-latest
     steps:
@@ -55,6 +64,7 @@ jobs:
 
   # ---- Python (sphinx) ----
   python-docs:
+    needs: check-draft
     name: "Python API docs (sphinx)"
     runs-on: ubuntu-latest
     steps:
@@ -81,6 +91,7 @@ jobs:
 
   # ---- TypeScript (typedoc) ----
   typescript-docs:
+    needs: check-draft
     name: "TypeScript API docs (typedoc)"
     runs-on: ubuntu-latest
     steps:
@@ -104,6 +115,7 @@ jobs:
 
   # ---- Kotlin (Dokka) ----
   kotlin-docs:
+    needs: check-draft
     name: "Kotlin API docs (Dokka)"
     runs-on: ubuntu-latest
     steps:
@@ -129,6 +141,7 @@ jobs:
 
   # ---- Go (pkgsite) ----
   go-docs:
+    needs: check-draft
     name: "Go API docs (godoc)"
     runs-on: ubuntu-latest
     steps:
@@ -147,6 +160,7 @@ jobs:
 
   # ---- C# (xmldoc) ----
   csharp-docs:
+    needs: check-draft
     name: "C# API docs (xmldoc)"
     runs-on: ubuntu-latest
     steps:
@@ -166,6 +180,7 @@ jobs:
 
   # ---- Java (javadoc) ----
   java-docs:
+    needs: check-draft
     name: "Java API docs (javadoc)"
     runs-on: ubuntu-latest
     steps:
@@ -192,7 +207,7 @@ jobs:
   # ---- Aggregate and publish ----
   publish-docs:
     name: "Publish API docs"
-    needs: [rust-docs, python-docs, typescript-docs, kotlin-docs, go-docs, csharp-docs, java-docs]
+    needs: [check-draft, rust-docs, python-docs, typescript-docs, kotlin-docs, go-docs, csharp-docs, java-docs]
     if: startsWith(github.ref, 'refs/tags/scp-core@')
     runs-on: ubuntu-latest
     environment:
