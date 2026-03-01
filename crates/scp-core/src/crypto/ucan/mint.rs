@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
 use super::capability::CapabilityUri;
+use super::nonce::generate_nonce;
 use super::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
@@ -65,32 +66,6 @@ pub struct MintParams<'a> {
     pub proofs: Vec<String>,
     /// Optional facts to attach to the token.
     pub facts: Option<serde_json::Value>,
-}
-
-/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
-///
-/// The timestamp prefix enables efficient pruning of expired nonces. The 16
-/// random bytes (32 hex chars) ensure uniqueness even under high concurrency.
-///
-/// See ADR-009 acceptance criterion 7 and ADR-016 acceptance criterion 6.
-fn generate_nonce() -> String {
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-
-    let mut random_bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random_bytes);
-
-    let hex_suffix = random_bytes
-        .iter()
-        .fold(String::with_capacity(32), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-
-    format!("{now_millis}-{hex_suffix}")
 }
 
 /// Returns the current Unix timestamp in seconds.

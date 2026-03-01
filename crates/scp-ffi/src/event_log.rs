@@ -381,21 +381,12 @@ pub fn py_event_log_verify(
 // ---------------------------------------------------------------------------
 
 /// Decodes a hex string into a 32-byte hash.
-fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!(
-            "expected 64 hex characters (32 bytes), got {}",
-            hex.len()
-        ));
-    }
-
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
-        bytes[i] =
-            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
-    }
-    Ok(bytes)
+fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
+    Ok(arr)
 }
 
 // ---------------------------------------------------------------------------

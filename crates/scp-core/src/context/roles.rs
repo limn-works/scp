@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::ContextError;
+use crate::crypto::ucan::nonce::generate_nonce;
 
 // ---------------------------------------------------------------------------
 // ToolId
@@ -765,35 +766,6 @@ fn mint_role_tokens(
             }
         })
         .collect()
-}
-
-/// Generates a unique nonce for a UCAN token.
-///
-/// Format: `{unix_millis_timestamp}-{16_random_bytes_hex}` per ADR-009 spec.
-/// Example: `1708646400000-a3f2b1c9d4e5f6071829`.
-///
-/// Phase 2 stub: uses `std::time::SystemTime` for the timestamp and `rand`
-/// for the random bytes.
-fn generate_nonce() -> String {
-    use std::fmt::Write;
-    use std::time::SystemTime;
-
-    let millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    let mut random_bytes = [0u8; 16];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut random_bytes);
-
-    let hex = random_bytes
-        .iter()
-        .fold(String::with_capacity(32), |mut acc, b| {
-            // write! to a String is infallible.
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-    format!("{millis}-{hex}")
 }
 
 // ---------------------------------------------------------------------------
