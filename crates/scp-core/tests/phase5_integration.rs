@@ -218,6 +218,7 @@ fn make_identity_attestation(
         issued_at: 1_700_000_200,
         expires_at: Some(1_700_100_000),
         renewal_interval: Some(Duration::from_secs(86_400)),
+        renewed_at: None,
         revocation_status: RevocationStatus::Active,
         signature: Vec::new(),
     };

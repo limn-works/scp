@@ -68,6 +68,13 @@ pub struct Attestation {
     /// Optional renewal interval. Attestations past this interval but not
     /// expired are considered stale (degraded, not revoked).
     pub renewal_interval: Option<Duration>,
+    /// Timestamp (seconds) of the last renewal, if renewable (spec 7.4.1).
+    ///
+    /// When present, freshness is measured from `renewed_at` instead of
+    /// `issued_at`. A renewable attestation that has never been renewed
+    /// should set this to `None`, causing freshness to be measured from
+    /// `issued_at`.
+    pub renewed_at: Option<u64>,
     /// Current revocation status.
     pub revocation_status: RevocationStatus,
     /// Ed25519 signature over the attestation content.
@@ -343,10 +350,14 @@ pub fn check_attestation_freshness(
         return FreshnessStatus::Expired;
     }
 
-    // Check renewal interval.
+    // Check renewal interval. When `renewed_at` is present, measure
+    // freshness from the last renewal time, not the original issue time.
+    // This ensures that renewed attestations are considered fresh per
+    // spec section 7.3.6.
     if let Some(renewal_interval) = attestation.renewal_interval {
         let renewal_secs = renewal_interval.as_secs();
-        let renewal_deadline = attestation.issued_at.saturating_add(renewal_secs);
+        let base_time = attestation.renewed_at.unwrap_or(attestation.issued_at);
+        let renewal_deadline = base_time.saturating_add(renewal_secs);
         if now >= renewal_deadline {
             return FreshnessStatus::Stale {
                 since: renewal_deadline,
@@ -609,6 +620,7 @@ mod tests {
             issued_at,
             expires_at,
             renewal_interval,
+            renewed_at: None,
             revocation_status: RevocationStatus::Active,
             signature: vec![],
         };
@@ -889,6 +901,7 @@ mod tests {
             renewal_interval: Some(Duration::from_secs(200)),
             revocation_status: RevocationStatus::Active,
             signature: vec![0u8; 64],
+            renewed_at: None,
         };
 
         assert_eq!(
@@ -914,6 +927,7 @@ mod tests {
             renewal_interval: Some(Duration::from_secs(50)),
             revocation_status: RevocationStatus::Active,
             signature: vec![0u8; 64],
+            renewed_at: None,
         };
 
         assert_eq!(
@@ -937,6 +951,7 @@ mod tests {
             renewal_interval: Some(Duration::from_secs(50)),
             revocation_status: RevocationStatus::Active,
             signature: vec![0u8; 64],
+            renewed_at: None,
         };
 
         assert_eq!(
@@ -960,6 +975,7 @@ mod tests {
             renewal_interval: None, // No renewal interval -> always fresh until expired.
             revocation_status: RevocationStatus::Active,
             signature: vec![0u8; 64],
+            renewed_at: None,
         };
 
         assert_eq!(
@@ -983,6 +999,7 @@ mod tests {
             renewal_interval: None,
             revocation_status: RevocationStatus::Active,
             signature: vec![0u8; 64],
+            renewed_at: None,
         };
 
         assert_eq!(
@@ -1022,6 +1039,7 @@ mod tests {
             renewal_interval: None,
             revocation_status: RevocationStatus::Active,
             signature: vec![0u8; 64],
+            renewed_at: None,
         }
     }
 

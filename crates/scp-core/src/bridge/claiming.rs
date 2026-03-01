@@ -619,6 +619,7 @@ mod tests {
             renewal_interval: Some(Duration::from_secs(86_400)),
             revocation_status: RevocationStatus::Active,
             signature: Vec::new(),
+            renewed_at: None,
         };
 
         // Sign the attestation with the issuer's key using the canonical
