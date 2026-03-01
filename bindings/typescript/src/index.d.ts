@@ -85,7 +85,7 @@ export interface ContextParams {
   readonly roles?: Record<string, string[]>;
   readonly ttl?: number;
   readonly memoryScope?: "ephemeral" | "summary" | "full";
-  readonly governance?: "single_admin";
+  readonly governance?: "single_admin" | "threshold" | "majority" | "unanimity";
 }
 
 export interface TrustEvaluation {
