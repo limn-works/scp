@@ -6417,7 +6417,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/PlatformAdapter.kt"
       ],
@@ -6454,7 +6454,8 @@
       "details": {
         "stubADR": true,
         "note": "Mirrors SCP-097 (Apple platform module root). Creates conditional compilation module root for Android platform adapters."
-      }
+      },
+      "result": "Android platform module root with conditional compilation, re-exports, Kotlin PlatformAdapter factory. Commit 35991ea."
     },
     {
       "id": "SCP-115",
@@ -6515,7 +6516,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/src/main/kotlin/com/limn/scp/stream/Streams.kt"
       ],
@@ -6555,7 +6556,8 @@
           "scaffold/kotlin.md",
           "standards/kotlin.md — kotlinx.coroutines"
         ]
-      }
+      },
+      "result": "Two-tier streaming: ColdStreamFactory, HotStreamFactory, ColdMessageFlow. 22 tests. Commit e220e49."
     },
     {
       "id": "SCP-117",
@@ -6563,7 +6565,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/src/main/kotlin/com/limn/scp/lifecycle/LifecycleManager.kt"
       ],
@@ -6604,7 +6606,8 @@
           "scaffold/kotlin.md",
           "ADR-026 (Swift SDK) as parallel reference"
         ]
-      }
+      },
+      "result": "ContextLifecycle extension + ScpViewModel base class. 11 tests. Commit 2548f6c."
     },
     {
       "id": "SCP-118",
@@ -6661,7 +6664,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/build.gradle.kts"
       ],
@@ -6703,7 +6706,8 @@
           "scaffold/kotlin.md — Gradle/KTS build",
           "standards/kotlin.md — ktlint + detekt, JVM 11+"
         ]
-      }
+      },
+      "result": "Maven Central publishing config for both modules. Sonatype OSSRH, GPG signing, detekt update. Commit 45e97a9."
     },
     {
       "id": "SCP-120",
@@ -10047,7 +10051,7 @@
       "id": "SCP-221",
       "title": "Wire Swift SDK wrapper functions to UniFFI bridge",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-220",
         "SCP-103"
@@ -10080,7 +10084,8 @@
         }
       ],
       "actionItems": [],
-      "details": {}
+      "details": {},
+      "result": "All 6 Swift wrapper modules wired to UniFFI bridge via injectable closures. 18 async tests. Commit 622e26a."
     },
     {
       "id": "SCP-222",
