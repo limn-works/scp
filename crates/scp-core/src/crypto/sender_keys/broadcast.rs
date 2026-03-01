@@ -26,6 +26,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{SenderKey, SenderKeyError};
 
@@ -41,8 +42,11 @@ const NONCE_SIZE: usize = 12;
 /// Each author in a broadcast context holds one of these. The key material is
 /// a random 32-byte AES-256 key. The epoch is a monotonic counter incremented
 /// on each rotation (triggered by blocking). Key material is freshly generated
-/// on rotation — not HKDF-derived — to provide key independence per §5.14.2.
-#[derive(Clone)]
+/// on rotation -- not HKDF-derived -- to provide key independence per section 5.14.2.
+///
+/// Key material is zeroized on drop via the inner [`SenderKey`]. Clone is
+/// retained for production use in `BroadcastAuthorState`.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct BroadcastKey {
     /// The underlying 32-byte AES-256 key (reuses [`SenderKey`] for consistency).
     key: SenderKey,

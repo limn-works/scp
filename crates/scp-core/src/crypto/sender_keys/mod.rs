@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use broadcast::{
     BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, generate_broadcast_key,
@@ -49,7 +50,11 @@ pub use key_protocol::{
 ///
 /// Sender keys are used to encrypt messages before MLS group encryption,
 /// enabling per-relationship blocking. See ADR-007.
-#[derive(Clone)]
+///
+/// Key material is zeroized on drop to prevent sensitive bytes from
+/// persisting in freed memory. Clone is retained for API compatibility
+/// (e.g. `SenderKeyStore::get_all`).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SenderKey([u8; 32]);
 
 impl SenderKey {

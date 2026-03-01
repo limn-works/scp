@@ -5,13 +5,18 @@
 //!
 //! - [`CoverTrafficConfig`] -- per-connection configuration (interval, padding
 //!   size, enabled flag).
-//! - [`CoverTrafficGenerator`] -- produces dummy messages on a timer, skipping
-//!   when real messages were recently sent.
-//! - [`CoverAction`] -- the decision output: send a dummy or skip this cycle.
+//! - [`CoverTrafficGenerator`] -- produces dummy messages on a strict timer,
+//!   always emitting exactly one dummy per interval regardless of real traffic.
+//! - [`CoverAction`] -- the decision output: send a dummy or skip (disabled).
 //!
 //! Cover traffic is per relay connection, not per context (spec 9.10.6 item 4).
 //! A single timer per connection prevents relay correlation of traffic rate
 //! changes with context activity.
+//!
+//! **Constant-rate invariant:** The generator always emits a dummy at each tick.
+//! Real messages sent by the application are additional traffic; they never
+//! suppress a dummy. Suppressing dummies when real messages are sent creates a
+//! timing oracle -- observable gaps reveal that a real message was sent.
 //!
 //! See spec section 9.10.6 for the full design.
 
@@ -78,9 +83,10 @@ pub enum CoverAction {
     /// Send a dummy message. The payload is a padded dummy (single `DUMMY_FLAG`
     /// byte followed by zero-padding to `message_size`).
     SendDummy(Vec<u8>),
-    /// Skip this cycle because cover traffic is disabled or a real message was
-    /// sent within the current window, replacing the dummy (spec 9.10.6 item 1:
-    /// "real messages replace dummy messages").
+    /// Skip this cycle because cover traffic is disabled or the interval has
+    /// not yet elapsed. This variant is never returned due to real message
+    /// activity -- dummies are always sent at each tick to maintain constant
+    /// rate and prevent timing oracles.
     Skip,
 }
 
@@ -113,9 +119,11 @@ pub trait CoverTrafficSender: Send + Sync {
 
 /// Generates cover traffic for a single relay connection.
 ///
-/// Tracks the last time a real message was sent and produces dummy messages
-/// at the configured interval, skipping cycles where a real message already
-/// provided traffic (spec 9.10.6 item 1).
+/// Produces dummy messages at a strict constant rate regardless of real
+/// message activity (spec 9.10.6 item 1). Real messages are sent by the
+/// application as additional traffic; they never suppress a dummy. This
+/// ensures the relay always observes exactly one dummy per interval,
+/// preventing timing oracles where gaps reveal real message sends.
 ///
 /// This struct is per-connection, not per-context (spec 9.10.6 item 4).
 ///
@@ -123,13 +131,10 @@ pub trait CoverTrafficSender: Send + Sync {
 ///
 /// The caller runs a timer at the configured interval and calls
 /// [`next_action`](Self::next_action) each tick, passing the current
-/// [`Instant`]. When real messages are sent on the connection, call
-/// [`record_real_send`](Self::record_real_send) so the generator knows
-/// to skip the next dummy within that window.
+/// [`Instant`].
 #[derive(Debug)]
 pub struct CoverTrafficGenerator {
     config: CoverTrafficConfig,
-    last_real_send: Option<Instant>,
     last_tick: Option<Instant>,
 }
 
@@ -139,7 +144,6 @@ impl CoverTrafficGenerator {
     pub const fn new(config: CoverTrafficConfig) -> Self {
         Self {
             config,
-            last_real_send: None,
             last_tick: None,
         }
     }
@@ -156,21 +160,18 @@ impl CoverTrafficGenerator {
         self.config.enabled
     }
 
-    /// Records that a real message was sent at the given instant.
-    ///
-    /// The next call to [`next_action`](Self::next_action) will return
-    /// [`CoverAction::Skip`] if the real send falls within the current
-    /// cover traffic window, because the real message replaces the dummy.
-    pub const fn record_real_send(&mut self, now: Instant) {
-        self.last_real_send = Some(now);
-    }
-
     /// Determines whether to send a dummy message or skip this cycle.
     ///
     /// Called at each interval tick. Returns [`CoverAction::SendDummy`] with
-    /// a padded payload if no real message was sent since the last tick.
-    /// Returns [`CoverAction::Skip`] if cover traffic is disabled, the
-    /// interval has not elapsed, or a real message replaced the dummy.
+    /// a padded payload unconditionally when the interval has elapsed,
+    /// maintaining constant-rate traffic regardless of real message activity.
+    /// Returns [`CoverAction::Skip`] only if cover traffic is disabled or the
+    /// interval has not yet elapsed.
+    ///
+    /// Real messages sent by the application are additional traffic and never
+    /// suppress a dummy. This prevents timing oracles where a relay operator
+    /// could observe gaps in the constant-rate stream and infer that a real
+    /// message was sent during that window.
     ///
     /// The `now` parameter enables deterministic testing without real timers.
     #[must_use]
@@ -185,15 +186,7 @@ impl CoverTrafficGenerator {
             return CoverAction::Skip;
         }
 
-        let previous_tick = self.last_tick;
         self.last_tick = Some(now);
-
-        if let Some(last_real) = self.last_real_send.take() {
-            let window_start = previous_tick.unwrap_or(last_real);
-            if last_real >= window_start {
-                return CoverAction::Skip;
-            }
-        }
 
         CoverAction::SendDummy(Self::build_dummy_payload(self.config.message_size))
     }
@@ -310,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn real_message_replaces_dummy_in_window() {
+    fn dummy_always_sent_regardless_of_real_traffic() {
         let config = CoverTrafficConfig {
             interval: Duration::from_secs(30),
             ..CoverTrafficConfig::default()
@@ -320,16 +313,17 @@ mod tests {
 
         assert!(matches!(ctg.next_action(now), CoverAction::SendDummy(_)));
 
-        ctg.record_real_send(now + Duration::from_secs(10));
-
-        assert_eq!(
-            ctg.next_action(now + Duration::from_secs(31)),
-            CoverAction::Skip,
+        assert!(
+            matches!(
+                ctg.next_action(now + Duration::from_secs(31)),
+                CoverAction::SendDummy(_),
+            ),
+            "dummy must always be sent at tick regardless of real message activity",
         );
     }
 
     #[test]
-    fn dummy_resumes_after_real_message_window_expires() {
+    fn constant_rate_maintained_across_intervals() {
         let config = CoverTrafficConfig {
             interval: Duration::from_secs(30),
             ..CoverTrafficConfig::default()
@@ -339,12 +333,10 @@ mod tests {
 
         assert!(matches!(ctg.next_action(now), CoverAction::SendDummy(_)));
 
-        ctg.record_real_send(now + Duration::from_secs(10));
-
-        assert_eq!(
+        assert!(matches!(
             ctg.next_action(now + Duration::from_secs(31)),
-            CoverAction::Skip,
-        );
+            CoverAction::SendDummy(_),
+        ));
 
         assert!(matches!(
             ctg.next_action(now + Duration::from_secs(62)),
@@ -414,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn real_send_before_first_tick_replaces_first_dummy() {
+    fn no_timing_oracle_from_real_messages() {
         let config = CoverTrafficConfig {
             interval: Duration::from_secs(30),
             ..CoverTrafficConfig::default()
@@ -422,11 +414,14 @@ mod tests {
         let mut ctg = CoverTrafficGenerator::new(config);
         let now = Instant::now();
 
-        ctg.record_real_send(now);
+        assert!(matches!(ctg.next_action(now), CoverAction::SendDummy(_)));
 
-        assert_eq!(
-            ctg.next_action(now + Duration::from_secs(31)),
-            CoverAction::Skip,
+        assert!(
+            matches!(
+                ctg.next_action(now + Duration::from_secs(31)),
+                CoverAction::SendDummy(_),
+            ),
+            "real message activity must never suppress dummies (timing oracle)",
         );
 
         assert!(matches!(
