@@ -25,6 +25,8 @@
 //! - [`transport`] — Transport connection and status.
 //! - [`ucan`] — UCAN token management (validate, mint, revoke).
 //! - [`event_log`] — Event log queries and Merkle proofs.
+//! - [`runtime`] — WASM-local runtime registry (tool registry, event log,
+//!   UCAN revocation, schema validation).
 //! - [`custody`] — JS-injected key custody callback types (`WebCrypto`).
 //! - [`storage`] — JS-injected storage callback types (OPFS/`IndexedDB`).
 //!
@@ -75,6 +77,7 @@ pub mod custody;
 pub mod error;
 pub mod event_log;
 pub mod identity;
+pub mod runtime;
 pub mod storage;
 pub mod tools;
 pub mod transport;

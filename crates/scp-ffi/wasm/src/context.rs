@@ -39,6 +39,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::error::ScpWasmError;
+use crate::runtime;
 
 // ---------------------------------------------------------------------------
 // JsMessageCallback — JS-injected message stream callback
@@ -410,6 +411,9 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
             economic_policy,
         );
 
+        runtime::register_context(&handle.context_id, &handle.creator_did)
+            .map_err(ScpWasmError::into_js)?;
+
         Ok(JsValue::from(handle))
     })
 }
@@ -507,6 +511,7 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 #[wasm_bindgen]
 pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promise {
     let state = handle.state.clone();
+    let context_id = handle.context_id.clone();
     let _ = identity_did; // Used when full runtime is wired.
 
     future_to_promise(async move {
@@ -517,6 +522,8 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
             .into_js()
             .into());
         }
+
+        runtime::remove_context(&context_id);
 
         Ok(JsValue::UNDEFINED)
     })
