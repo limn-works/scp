@@ -1,41 +1,48 @@
 # Loom Status
 
-## Iteration: 2026-03-01T10:30Z
+## Iteration: 2026-03-01T12:30Z
 
 ### Result: SUCCESS
 
-5 of 5 dispatched stories completed. All tests pass. All code committed.
+4 of 5 dispatched stories completed fully. SCP-214 partially completed (2 of 17 criteria). All tests pass. All code committed. Review fixes applied.
 
 ### Commits
 
 | Commit | Story | Description |
 |--------|-------|-------------|
-| `0b97971` | SCP-222 | feat(store): implement ProtocolStore typed domain layer |
-| `3c0d9cd` | SCP-224 | feat(crypto): implement broadcast key lifecycle and BroadcastEnvelope |
-| `6b7a084` | SCP-225 | feat(transport): implement cover traffic and heartbeat monitoring |
-| `047f363` | SCP-215 | fix(sdk): normalize error codes across all SDKs |
-| `f5f70a7` | SCP-220 | feat(uniffi): wire UCAN and event log to scp-core |
-| `6cb9be8` | SCP-220 | docs(uniffi): add feature-scoped CLAUDE.md for UniFFI bridge |
-| `b4b9727` | — | chore(prd): mark SCP-215, SCP-220, SCP-222, SCP-224, SCP-225 done |
-| `6584d5b` | SCP-215 | fix(sdk): correct CTX error code range and CI script exclusions |
+| `596826a` | SCP-214 | fix(scp-platform): use public key bytes for pseudonym HMAC derivation |
+| `a2d37dd` | SCP-217 | feat(ffi): wire StorageProvider into Python FFI bridge for identity persistence |
+| `3f331a4` | SCP-092 | feat(envelope,media): add MessageType::Signaling and signaling routing |
+| `f1a330f` | SCP-217 | docs(ffi): update CLAUDE.md with SCP-217 storage provider documentation |
+| `ca19c8e` | SCP-227 | feat(context): implement broadcast subscriber registration and blocking |
+| `9811830` | SCP-216 | feat(ffi): implement Python receive() iterator lifecycle semantics |
+| `1fe60a7` | SCP-216 | docs(lessons): add tokio mutex blocking_lock gotcha |
+| `cf40df8` | SCP-214 | merge: InMemoryKeyCustody public key fix |
+| `999b64d` | SCP-227 | merge: broadcast subscriber registration and blocking |
+| `6c46d14` | SCP-216 | merge: Python receive() iterator lifecycle |
+| `6e5c753` | SCP-217 | merge: StorageProvider wiring for Python FFI |
+| `1fcd7b0` | — | chore(prd): mark SCP-092, SCP-216, SCP-217, SCP-227 done; SCP-214 in-progress |
+| `72ff4e4` | SCP-216 | fix(ffi): address review findings (single-drop overflow, mutex contention) |
+| `42a3dcb` | SCP-216 | docs(ffi): update CLAUDE.md with corrected deliver_message semantics |
+| `d7addd0` | SCP-227 | fix(context): add UCAN audience validation in broadcast subscription |
 
 ### Failing Tests
-None. Full workspace compiles and tests pass (`cargo test --workspace --exclude scp-ffi`).
+None. Full workspace compiles and tests pass (`cargo test --workspace --exclude scp-ffi`). 2503+ tests green.
 
 ### Uncommitted Changes
 None.
 
 ### Fixed This Iteration
-N/A — no previously failing tests.
+- InMemoryKeyCustody::derive_pseudonym bug: was using private key bytes for HMAC, now uses public key bytes per ADR-027 (SCP-214 criteria 12-13)
+- SCP-216 deliver_message: was dropping 2 messages on overflow, now drops 1 per spec
+- SCP-216 deliver_message: silent message loss on mutex contention, now returns error
+- SCP-227 validate_messages_read_ucan: missing UCAN audience (aud) binding check, now validates aud matches subscriber_did
 
 ### Tests Added / Updated
-- `crates/scp-core/src/store/identity.rs` — identity state CRUD tests (store/load/delete roundtrips)
-- `crates/scp-core/src/store/context.rs` — context state CRUD tests (params, membership, roles, list)
-- `crates/scp-core/src/store/ucan.rs` — UCAN revocation and nonce tracking tests
-- `crates/scp-core/src/store/tools.rs` — tool registration and session CRUD tests
-- `crates/scp-core/src/crypto/sender_keys/broadcast.rs` — 23 tests: key generation, rotation, seal/open roundtrip, epoch mismatch, wrong key, tampered ciphertext, serialization, property-based testing
-- `crates/scp-transport/src/cover_traffic.rs` — 14 tests: timing intervals, dummy format, real-replaces-dummy, disabled state
-- `crates/scp-transport/src/heartbeat.rs` — 13 tests: suppression detection, threshold calculation, gap tracking
+- `crates/scp-core/src/context/broadcast.rs` — 22 tests: subscriber registration (open/gated/duplicate/aud-mismatch), blocking (rotate key, per-author, unknown author), capabilities (write-authors-only, read-subscribers-and-authors), integration (3-subscriber decrypt, blocked author, cross-author blocking, gated+block)
+- `crates/scp-ffi/src/context.rs` — Updated overflow tests for single-drop semantics
+- `crates/scp-platform/src/testing/key_custody.rs` — Updated golden vector test for public-key-based HMAC
+- `crates/scp-media/src/signaling.rs` — Signaling construction and routing tests (SCP-092)
 
 ### Tool-Gated Stories
 None.
@@ -44,35 +51,31 @@ None.
 
 | Story | Agent ID | Result | Summary |
 |-------|----------|--------|---------|
-| SCP-222 (ProtocolStore) | ac3df730 | SUCCESS | ProtocolStore<S: Storage> with 5 domain modules (identity, context, ucan, tools, economy). StoredValue<T> envelope, MessagePack serialization. 1773 lines. |
-| SCP-224 (Broadcast keys) | a88c72e4 | SUCCESS | BroadcastKey, seal/open with AES-256-GCM, BroadcastKeyEpochAdvance event, epoch validation. 580 lines, 23 tests. |
-| SCP-225 (Cover traffic) | ac1d0754 | SUCCESS | CoverTrafficGenerator (30s default, real-replaces-dummy), HeartbeatMonitor (60s default, 2x suppression threshold). 900 lines, 27 tests. |
-| SCP-215 (Error codes) | af4d663a | SUCCESS | 33 files changed, 493 error codes verified conformant. SCP-MCP- range allocated (10000-10999). NAPI swap fixed. CI script created. |
-| SCP-220 (UniFFI bridge) | a5c2e254 | SUCCESS | UniFFI bridge wired to scp-core: ucan_validate (11-step), ucan_mint, ucan_revoke, event_log_query, event_log_verify. DashMap runtime registry added. CLAUDE.md created. |
+| SCP-214 (KeyCustody wiring) | a2570cff | PARTIAL | Only InMemoryKeyCustody public key fix committed (criteria 12-13). Agent reported broader work but only 1 commit produced. Story too large for single iteration. |
+| SCP-216 (Receive lifecycle) | a07fb303 | SUCCESS | Full implementation: async bounded channel (1000 events), oldest-drop overflow, BufferOverflow warning, deterministic shutdown. ADR-014 amended. Lesson documented. |
+| SCP-217 (StorageProvider) | a7ab5954 | SUCCESS | py_init_storage injection, identity persistence via ProtocolStore-style keys, py_identity_load with error on not-found. CLAUDE.md updated. |
+| SCP-227 (Broadcast subscriber) | a4c61f88 | SUCCESS | subscribe_broadcast with open/gated, UCAN validation, block_broadcast_author with key rotation. 804 lines, 21 tests. |
+| SCP-092 (Signaling) | a384eb78 | SUCCESS | SessionDescription, Candidate, SignalingMessage types. create_offer/answer/ice_candidate constructors. MessageType::Signaling variant. send_signaling routing. |
 
 ### Review Outcomes
 
-**SCP-222 (ProtocolStore):**
-- Actions: economy.rs bypasses StoredValue envelope (pre-existing from SCP-162, not introduced by this PR — tracked as technical debt). Missing event_log/transport/TOFU methods noted as scope gaps for future stories.
-- Learnings: StoredValue envelope bypass pattern (vestige), ProtocolStore module structure (vestige).
-
-**SCP-224 (Broadcast keys):**
-- Actions: None. All criteria PASS. Clean cryptographic implementation.
-- Learnings: BroadcastEnvelope is intentionally minimal (crypto-layer only) — integration fields deferred to SCP-227. Key material not Zeroize'd (pre-existing for SenderKey). Author DID mismatch not checked in open_broadcast (AEAD catches wrong key anyway).
-
-**SCP-225 (Cover traffic):**
+**SCP-092 (Signaling):**
 - Actions: None. All criteria PASS.
-- Learnings: Deterministic time injection pattern (vestige). Single-slot take() for real-replaces-dummy. SuppressionSuspected is stateless — caller deduplicates.
+- Learnings: None significant.
 
-**SCP-215 (Error codes):**
-- Actions taken: CTX-3001 → CTX-2001 in phase-5.md and phase-6.md (was in PERM range, not CTX range). Added .claude and .docs exclusions to CI script. Fix committed as `6584d5b`.
-- Learnings: Acceptance criteria target codes must be range-checked (vestige). CI scripts need .claude exclusion for worktrees.
+**SCP-216 (Receive lifecycle):**
+- Actions taken: (1) Fixed double-drop overflow to single-drop per spec — commit `72ff4e4`. (2) Fixed silent message loss on mutex contention to return error — commit `72ff4e4`. Both fixes verified green.
+- Learnings: tokio Mutex blocking_lock gotcha documented in lessons.
 
-**SCP-220 (UniFFI bridge):**
-- Actions: None. All criteria PASS. Reviewer noted ucan_revoke uses token_jwt as CID directly rather than computing hash — acceptable interim behavior before full CID infrastructure.
-- Learnings: UniFFI runtime registry pattern with DashMap (vestige). Bridge trait adapters for scp-core UCAN validation traits (vestige).
+**SCP-217 (StorageProvider):**
+- Actions: None. All criteria PASS.
+- Learnings: Storage trait RPITIT dyn-incompatibility (saved to Vestige).
+
+**SCP-227 (Broadcast subscriber):**
+- Actions taken: Added UCAN audience (aud) binding check to validate_messages_read_ucan + test — commit `d7addd0`.
+- Learnings: (1) BroadcastContext duplicates key state from BroadcastKey — should unify (Vestige). (2) UCAN aud validation is a recurring gap across codebase (Vestige). (3) BroadcastAdmission enum diverges from spec §5.14.4 line 820 — spec should be updated (noted, not fixed this iteration). (4) Missing wrapping_pubkey in SubscriberRecord for key distribution — tracked for future story.
 
 ### Operational Notes
-- All 5 subagents completed successfully this iteration (vs 1/5 last iteration). API usage limits not encountered.
-- SCP-222 (P0, ProtocolStore) is the most impactful completion — unblocks persistence-dependent stories.
-- 12 actionable unblocked stories remain in the PRD. Highest priority next: SCP-214 (P0, KeyCustody wiring), SCP-216 (P1, Python receive lifecycle), SCP-217 (P1, StorageProvider wiring).
+- SCP-214 is too large for a single subagent — 17 acceptance criteria across 14 files, 4 FFI bridges. Next iteration should break remaining work into focused sub-tasks or give the subagent stricter prioritization.
+- Worktree branches forked 18 commits behind HEAD. All merges resolved cleanly despite alarming diff stats.
+- 10 actionable unblocked stories remain. SCP-038 is now unblocked (SCP-217 done). Highest priority: SCP-214 (P0, remaining FFI wiring), SCP-218 (P1, WASM bridge), SCP-219 (P1, NAPI bridge), SCP-221 (P1, Swift SDK).
