@@ -336,10 +336,11 @@ pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
 /// Delivers a message to a context's receive channel (SCP-216).
 ///
 /// Implements oldest-drop overflow per sketch.md: when the buffer is full
-/// (1000 events), the oldest unconsumed event is popped from the receiver,
-/// a `BufferOverflow` warning message is injected, and then the new message
-/// is sent. The warning includes a dropped-event count (always 1 per
-/// delivery; consumers track cumulative drops via the warning stream).
+/// (1000 events), exactly 1 oldest unconsumed event is popped from the
+/// receiver, and the new message is sent in the freed slot. If there is
+/// additional capacity after the send (i.e. the consumer drained an item
+/// between the pop and the send), a `BufferOverflow` warning is also
+/// injected so consumers can track drop events.
 ///
 /// The function extracts channel references from the runtime registry (brief
 /// DashMap shard lock), then operates on the channel outside the lock to
@@ -347,8 +348,9 @@ pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` if the context is not found or has no
-/// active receive channel.
+/// Returns `ScpPyError::ContextError` if the context is not found, has no
+/// active receive channel, or if the receiver mutex cannot be acquired
+/// (contention with a consumer) and the buffer is full.
 pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPyError> {
     let (tx, rx_arc) = with_context(context_id, |rt| {
         let tx = rt.message_tx.clone().ok_or_else(|| {
@@ -368,10 +370,22 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
     match tx.try_send(message.clone()) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
-            if let Ok(mut rx_guard) = rx_arc.try_lock() {
-                let _ = rx_guard.try_recv();
-                let _ = rx_guard.try_recv();
-            }
+            let mut rx_guard = rx_arc.try_lock().map_err(|_| {
+                ScpPyError::ContextError(format!(
+                    "cannot deliver message to context '{context_id}': \
+                     receive buffer is full and receiver lock is held by a consumer"
+                ))
+            })?;
+
+            let _ = rx_guard.try_recv();
+            drop(rx_guard);
+
+            tx.try_send(message).map_err(|e| {
+                ScpPyError::ContextError(format!(
+                    "failed to deliver message to context '{context_id}' \
+                     after overflow drop: {e}"
+                ))
+            })?;
 
             let overflow_warning = PyMessage::new(
                 "scp:system".to_owned(),
@@ -382,7 +396,6 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
                 context_id.to_owned(),
             );
             let _ = tx.try_send(overflow_warning);
-            let _ = tx.try_send(message);
             Ok(())
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(ScpPyError::ContextError(format!(

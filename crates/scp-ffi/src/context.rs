@@ -833,9 +833,9 @@ mod tests {
             assert!(oldest.is_ok(), "should be able to pop oldest from full buffer");
             let oldest_msg = oldest.unwrap();
             assert_eq!(oldest_msg.sender_did, "did:test:sender-0");
-            let second = guard.try_recv();
-            assert!(second.is_ok(), "should be able to pop second oldest");
         }
+
+        tx.try_send(make_test_message(capacity, context_id)).unwrap();
 
         let overflow_warning = PyMessage::new(
             "scp:system".to_owned(),
@@ -843,14 +843,13 @@ mod tests {
             0.0,
             context_id.to_owned(),
         );
-        tx.try_send(overflow_warning).unwrap();
-        tx.try_send(make_test_message(capacity, context_id)).unwrap();
+        let _ = tx.try_send(overflow_warning);
 
         let mut guard = rx_arc.lock().await;
         let first = guard.try_recv().unwrap();
         assert_eq!(
-            first.sender_did, "did:test:sender-2",
-            "after oldest-drop of 2, first message should be sender-2"
+            first.sender_did, "did:test:sender-1",
+            "after oldest-drop of 1, first message should be sender-1"
         );
     }
 
@@ -965,8 +964,8 @@ mod tests {
         let mut guard = rx_arc.lock().await;
         let first = guard.try_recv().unwrap();
         assert_eq!(
-            first.sender_did, "did:test:sender-2",
-            "two oldest messages (sender-0, sender-1) should have been dropped"
+            first.sender_did, "did:test:sender-1",
+            "oldest message (sender-0) should have been dropped"
         );
 
         let mut found_warning = false;
