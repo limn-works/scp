@@ -1116,6 +1116,7 @@ mod tests {
     use crate::event_log::tree::{self, GENESIS_PREV_HASH};
     use crate::event_log::{Event, EventLog, EventPayload, EventType};
     use crate::identity::DID;
+    use crate::trust::compute_behavioral_record;
 
     // -------------------------------------------------------------------
     // Test helpers
@@ -2415,7 +2416,274 @@ mod tests {
     // ===================================================================
 
     // -------------------------------------------------------------------
-    // 26. Pruned proofs work for all leaf positions in various tree sizes
+    // 26. Behavioral validation works with checkpointed logs (SCP-125 AC6)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn behavioral_validation_works_with_checkpointed_log() {
+        // Build a non-trivial event log with multiple event types and two
+        // participants. This exercises behavioral record computation against
+        // a checkpoint Merkle root -- the core of SCP-125 AC6.
+        let (vk_alice, sk_alice) = test_keypair();
+        let did_alice = did_from_pubkey(&vk_alice);
+        let (vk_bob, sk_bob) = test_keypair();
+        let did_bob = did_from_pubkey(&vk_bob);
+
+        let mut log = EventLog::new("ctx-behavioral-checkpoint".to_owned());
+        let mut prev_hash = GENESIS_PREV_HASH;
+        let mut all_events = Vec::new();
+
+        // Helper closure: append an event and track it.
+        let append = |log: &mut EventLog,
+                          events: &mut Vec<Event>,
+                          event_type: EventType,
+                          actor_did: &str,
+                          timestamp: u64,
+                          seq: u64,
+                          payload: Vec<u8>,
+                          signing_key: &ed25519_dalek::SigningKey,
+                          prev: [u8; 32]|
+         -> [u8; 32] {
+            let event =
+                sign_event(event_type, actor_did, timestamp, seq, payload, prev, signing_key);
+            tree::append(log, &event).unwrap();
+            let leaf_hash: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event).unwrap());
+                h.finalize().into()
+            };
+            events.push(event);
+            leaf_hash
+        };
+
+        // Event 0: Alice creates context.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ContextCreated,
+            &did_alice,
+            1_000_000,
+            0,
+            vec![],
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 1: Alice joins.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::MemberJoined,
+            &did_alice,
+            1_000_001,
+            1,
+            vec![],
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 2: Bob joins.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::MemberJoined,
+            &did_bob,
+            1_000_002,
+            2,
+            vec![],
+            &sk_bob,
+            prev_hash,
+        );
+
+        // Event 3: Alice assigns role to Bob.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::RoleAssigned,
+            &did_alice,
+            1_000_003,
+            3,
+            did_bob.as_bytes().to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 4: Alice sends a message.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::MessageSent,
+            &did_alice,
+            1_000_004,
+            4,
+            b"hello from alice".to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 5: Bob sends a message.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::MessageSent,
+            &did_bob,
+            1_000_005,
+            5,
+            b"hello from bob".to_vec(),
+            &sk_bob,
+            prev_hash,
+        );
+
+        // Event 6: Alice invokes a tool.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ToolInvoked,
+            &did_alice,
+            1_000_006,
+            6,
+            b"search-tool".to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 7: Alice invokes the same tool again.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ToolInvoked,
+            &did_alice,
+            1_000_007,
+            7,
+            b"search-tool".to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 8: Bob invokes a different tool.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ToolInvoked,
+            &did_bob,
+            1_000_008,
+            8,
+            b"execute-tool".to_vec(),
+            &sk_bob,
+            prev_hash,
+        );
+
+        // Event 9: Alice performs a governance action targeting Bob.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::GovernanceAction,
+            &did_alice,
+            1_000_009,
+            9,
+            did_bob.as_bytes().to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 10: Alice verifies a tool (attestation-adjacent).
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ToolVerified,
+            &did_alice,
+            1_000_010,
+            10,
+            vec![],
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 11: Bob sends another message.
+        let _ = append(
+            &mut log,
+            &mut all_events,
+            EventType::MessageSent,
+            &did_bob,
+            1_000_011,
+            11,
+            b"final message".to_vec(),
+            &sk_bob,
+            prev_hash,
+        );
+
+        assert_eq!(tree::event_count(&log), 12);
+
+        // Create a checkpoint capturing the current Merkle root.
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let checkpoint = generate_checkpoint(&log, &did_alice, 1, &custody, &key)
+            .await
+            .unwrap();
+
+        assert_eq!(checkpoint.event_count, 12);
+        assert_eq!(checkpoint.merkle_root, tree::root(&log));
+
+        // Compute behavioral record for Alice using the checkpoint's Merkle root.
+        // This is the core assertion of SCP-125 AC6: behavioral validation
+        // continues to work with checkpointed logs.
+        let record = compute_behavioral_record(
+            &all_events,
+            &did_alice,
+            "ctx-behavioral-checkpoint",
+            checkpoint.merkle_root,
+            2_000_000,
+        )
+        .unwrap();
+
+        // Alice participated in events 0,1,3,4,6,7,9,10 = 8 events.
+        assert_eq!(record.participation_count, 8);
+        // Duration: 1_000_010 - 1_000_000 = 10 seconds.
+        assert_eq!(record.participation_duration_seconds, 10);
+        // Tool invocations: search-tool x2.
+        assert_eq!(record.tool_invocations.len(), 1);
+        assert_eq!(record.tool_invocations.get("search-tool"), Some(&2));
+        // Governance actions by Alice: 1 (targeting Bob).
+        assert_eq!(record.governance_actions_by.len(), 1);
+        // Governance actions against Alice: 0.
+        assert_eq!(record.governance_actions_against.len(), 0);
+        // Role history for Alice: 0 (Alice assigned Bob, not herself).
+        assert_eq!(record.role_history.len(), 0);
+        // Attestation history: 1 (ToolVerified event).
+        assert_eq!(record.attestation_history.len(), 1);
+        // Context creation: 1.
+        assert_eq!(record.context_creation_count, 1);
+        // Merkle root matches checkpoint.
+        assert_eq!(record.event_log_root, checkpoint.merkle_root);
+
+        // Also verify Bob's behavioral record against the same checkpoint.
+        let bob_record = compute_behavioral_record(
+            &all_events,
+            &did_bob,
+            "ctx-behavioral-checkpoint",
+            checkpoint.merkle_root,
+            2_000_000,
+        )
+        .unwrap();
+
+        // Bob participated in events 2,5,8,11 = 4 events.
+        assert_eq!(bob_record.participation_count, 4);
+        // Duration: 1_000_011 - 1_000_002 = 9 seconds.
+        assert_eq!(bob_record.participation_duration_seconds, 9);
+        // Bob's tool invocations: execute-tool x1.
+        assert_eq!(bob_record.tool_invocations.len(), 1);
+        assert_eq!(bob_record.tool_invocations.get("execute-tool"), Some(&1));
+        // Bob is the target of Alice's governance action.
+        assert_eq!(bob_record.governance_actions_against.len(), 1);
+        // Bob was assigned a role.
+        assert_eq!(bob_record.role_history.len(), 1);
+        assert_eq!(bob_record.event_log_root, checkpoint.merkle_root);
+    }
+
+    // -------------------------------------------------------------------
+    // 27. Pruned proofs work for all leaf positions in various tree sizes
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -2442,7 +2710,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 27. Checkpoint creation does not mutate the log (non-blocking)
+    // 28. Checkpoint creation does not mutate the log (non-blocking)
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -2463,7 +2731,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 28. Manager checkpoint creation with explicit timestamp
+    // 29. Manager checkpoint creation with explicit timestamp
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -2490,7 +2758,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 29. Pruned proof path length is O(log n)
+    // 30. Pruned proof path length is O(log n)
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -2518,7 +2786,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 30. compute_root_from_leaves matches tree::root
+    // 31. compute_root_from_leaves matches tree::root
     // -------------------------------------------------------------------
 
     #[test]
@@ -2529,7 +2797,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 31. compute_root_from_leaves empty returns zero hash
+    // 32. compute_root_from_leaves empty returns zero hash
     // -------------------------------------------------------------------
 
     #[test]
@@ -2539,7 +2807,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 32. compute_root_from_leaves single leaf returns leaf
+    // 33. compute_root_from_leaves single leaf returns leaf
     // -------------------------------------------------------------------
 
     #[test]
@@ -2550,7 +2818,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 33. Truncated log rejects checkpoint with more events than log
+    // 34. Truncated log rejects checkpoint with more events than log
     // -------------------------------------------------------------------
 
     #[test]
