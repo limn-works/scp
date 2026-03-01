@@ -35,17 +35,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from scp_sdk.context import (
-    Context,
-    Membership,
     _DEFAULT_BUFFER_SIZE,
     _MAX_BUFFER_SIZE,
     _MIN_BUFFER_SIZE,
+    Context,
+    Membership,
     _ReceiveIterator,
     _validate_buffer_size,
 )
 from scp_sdk.errors import ContextError
 from scp_sdk.types import Message
-
 
 # ---------------------------------------------------------------------------
 # Helpers -- mock bridge objects
