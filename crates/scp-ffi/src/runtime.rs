@@ -200,6 +200,16 @@ where
     f(entry.value_mut())
 }
 
+/// Returns `true` if the identity registry contains an entry for the given DID.
+///
+/// Used by `py_identity_load` to check whether a loaded identity has live
+/// crypto state before returning it. Without registry presence, a loaded
+/// identity would be a dangling handle (SCP-IDENT-1010).
+#[must_use]
+pub fn identity_registry_contains(did: &str) -> bool {
+    identity_registry().contains_key(did)
+}
+
 /// Removes an identity from the global registry.
 ///
 /// Called when an identity is migrated to a new DID. The old entry is
@@ -451,8 +461,7 @@ pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, has no
-/// active receive channel, or if the receiver mutex cannot be acquired
-/// (contention with a consumer) and the buffer is full.
+/// active receive channel, or if the channel is closed.
 pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPyError> {
     let (tx, rx_arc) = with_context(context_id, |rt| {
         let tx = rt.message_tx.clone().ok_or_else(|| {
@@ -470,12 +479,12 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
     match tx.try_send(message.clone()) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
-            let mut rx_guard = rx_arc.try_lock().map_err(|_| {
-                ScpPyError::ContextError(format!(
-                    "cannot deliver message to context '{context_id}': \
-                     receive buffer is full and receiver lock is held by a consumer"
-                ))
-            })?;
+            // Use blocking_lock() instead of try_lock() to guarantee
+            // oldest-drop semantics. try_lock() would drop the NEW message
+            // on lock contention -- the opposite of documented behavior
+            // (RED-021). The lock is only held for a single try_recv()
+            // (VecDeque pop_front), so blocking is brief and safe.
+            let mut rx_guard = rx_arc.blocking_lock();
 
             let _ = rx_guard.try_recv();
             drop(rx_guard);

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_core::context::roles::Capability;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
@@ -605,12 +606,14 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 /// # Arguments
 ///
 /// * `handle` -- The context to close.
-/// * `identity_did` -- The DID of the identity initiating the close (must be
-///   admin or have close capability).
+/// * `identity_did` -- The DID of the identity initiating the close. Must
+///   hold the `ContextClose` capability (typically the context creator or
+///   an admin).
 ///
 /// # Errors
 ///
 /// Returns `RuntimeError` if the context is not in "active" state.
+/// Returns `ContextError` if the caller lacks the `ContextClose` capability.
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
@@ -625,12 +628,24 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
         )));
     }
 
-    // In the full runtime, this would:
-    // 1. Initiate the closing window.
-    // 2. Notify members.
-    // 3. Wait for summary generation (if memory_scope == "summary").
-    // 4. Destroy keys.
-    let _ = identity_did; // Will be used when connected to scp-core runtime.
+    // Verify the caller has the ContextClose capability before allowing
+    // the close operation. Without this check, any caller could close any
+    // context -- a privilege escalation vulnerability (black-hat finding).
+    let context_id = handle.context_id.clone();
+    crate::runtime::with_context(&context_id, |rt| {
+        if !rt
+            .role_state
+            .member_has_capability(identity_did, &Capability::ContextClose)
+        {
+            return Err(crate::error::ScpPyError::ContextError(format!(
+                "identity '{identity_did}' does not have the ContextClose capability \
+                 for context '{context_id}' -- only admins or members with the \
+                 context:close capability can close a context"
+            )));
+        }
+        Ok(())
+    })
+    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
     // Transition directly to "closed" (skipping "closing" for the bridge
     // layer -- the full runtime will implement the cooperative closing window).

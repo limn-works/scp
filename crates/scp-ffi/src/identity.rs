@@ -375,15 +375,22 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 /// Loads an existing identity from storage.
 ///
 /// Retrieves persisted identity state (DID, custody type) from the storage
-/// provider and reconstructs a fully functional [`PyIdentity`].
+/// provider and returns a [`PyIdentity`] only if the identity has live
+/// crypto state in the runtime registry.
+///
+/// If the identity was created in this process (via `py_identity_create`),
+/// it will be in the registry and this function succeeds. If the identity
+/// was created in a different process, the [`InMemoryKeyCustody`] key
+/// material is lost and this function returns `SCP-IDENT-1010`.
 ///
 /// # Arguments
 ///
-/// * `did` — The DID string to load (e.g., `"did:dht:z6Mk..."`).
+/// * `did` -- The DID string to load (e.g., `"did:dht:z6Mk..."`).
 ///
 /// # Returns
 ///
-/// A [`PyIdentity`] containing the loaded DID string and custody type.
+/// A [`PyIdentity`] containing the loaded DID string and custody type,
+/// but only if the identity has live crypto state in the registry.
 ///
 /// # Errors
 ///
@@ -392,21 +399,24 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 /// - Storage has not been initialized (call `py_init_storage` first).
 /// - The DID is not found in storage.
 /// - The stored state is malformed.
+/// - The identity has no live crypto state in the registry
+///   (`SCP-IDENT-1010`). This happens when loading an identity created
+///   in a different process, since [`InMemoryKeyCustody`] does not
+///   persist key material.
 ///
-/// Does NOT silently fall back to in-memory — an explicit error is raised
+/// Does NOT silently fall back to in-memory -- an explicit error is raised
 /// if the DID is not found (SCP-217 acceptance criterion 4).
 ///
-/// See SCP-217 and spec section 17.3.
+/// See SCP-217, spec section 17.3, and RED-013.
 #[pyfunction]
 fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
     let did_owned = did.to_owned();
     let rt = crate::runtime()?;
 
     py.allow_threads(|| {
-        // Validate the DID format.
         if !did_owned.starts_with("did:dht:") {
             return Err(PyErr::from(ScpPyError::IdentityError(format!(
-                "unsupported DID method: {did_owned} — only did:dht is supported"
+                "unsupported DID method: {did_owned} -- only did:dht is supported"
             ))));
         }
 
@@ -424,24 +434,39 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                 })?
                 .ok_or_else(|| {
                     ScpPyError::IdentityError(format!(
-                        "identity not found in storage: {did_owned} — \
+                        "identity not found in storage: {did_owned} -- \
                      was it created with py_identity_create?"
                     ))
                 })?;
 
-            let (stored_did, custody) = deserialize_identity_state(&data)?;
+            let (stored_did, custody_str) = deserialize_identity_state(&data)?;
 
-            // Sanity check: the stored DID should match the requested DID.
             if stored_did != did_owned {
                 return Err(PyErr::from(ScpPyError::IdentityError(format!(
                     "stored DID mismatch: expected {did_owned}, found {stored_did}"
                 ))));
             }
 
-            Ok(PyIdentity {
-                did: stored_did,
-                custody,
-            })
+            // SCP-IDENT-1010: Verify the identity has live crypto state
+            // in the registry. Without this check, the returned PyIdentity
+            // would be a dangling handle -- subsequent bridge functions
+            // (UCAN minting, signing, pseudonym derivation, key rotation)
+            // would fail with "identity not found in registry" (RED-013).
+            if crate::runtime::identity_registry_contains(&did_owned) {
+                return Ok(PyIdentity {
+                    did: stored_did,
+                    custody: custody_str,
+                });
+            }
+
+            Err(PyErr::from(ScpPyError::IdentityError(format!(
+                "SCP-IDENT-1010: identity '{did_owned}' was found in storage \
+                 but has no live crypto state in the runtime registry. \
+                 InMemoryKeyCustody does not persist key material across \
+                 process boundaries. Use py_identity_create to create a \
+                 new identity, or use platform custody (when available) \
+                 for cross-process identity persistence."
+            ))))
         })
     })
 }
