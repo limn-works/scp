@@ -24,6 +24,7 @@ serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true }
+hex = { workspace = true }
 x25519-dalek = { workspace = true }
 hkdf = { workspace = true }
 percent-encoding = { workspace = true }

@@ -38,15 +38,14 @@ use pyo3::prelude::*;
 
 use scp_core::crypto::ucan::Attenuation;
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
-use scp_core::crypto::ucan::UcanToken;
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::mint::{DelegateParams, MintParams, delegate_ucan, mint_ucan};
 use scp_core::crypto::ucan::revoke::compute_revocation_cid;
-use scp_core::crypto::ucan::validate::{
-    DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
-    ValidationContext, parse_ucan, validate_ucan,
-};
+use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
 
+use crate::bridge_adapters::{
+    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
+};
 use crate::error::ScpPyError;
 
 // ---------------------------------------------------------------------------
@@ -102,107 +101,6 @@ impl PyUcanToken {
             self.capabilities.len(),
             self.expires_at
         )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bridge trait implementations for scp-core validation pipeline
-// ---------------------------------------------------------------------------
-
-/// Bridge [`DidResolver`] that extracts Ed25519 public keys from DID strings.
-///
-/// Supports:
-/// - `did:dht:z{z-base-32-encoded-pubkey}` -- production format.
-/// - `did:key:{hex-encoded-pubkey}` -- testing format.
-///
-/// This resolver operates in-memory with no network calls. `did:dht:` DIDs
-/// encode the public key directly in the DID string using z-base-32, so
-/// resolution is a simple decode operation.
-struct BridgeDidResolver;
-
-impl DidResolver for BridgeDidResolver {
-    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
-        // did:dht:z{z-base-32-encoded-pubkey}
-        if let Some(suffix) = did.strip_prefix("did:dht:z") {
-            let decoded = zbase32::decode(suffix).map_err(|_| {
-                CoreUcanError::MalformedToken(format!("z-base-32 decode failed for DID: {did}"))
-            })?;
-            let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(bytes);
-        }
-
-        // did:key:{hex-encoded-pubkey} (testing format)
-        if let Some(hex_str) = did.strip_prefix("did:key:") {
-            let bytes = decode_hex(hex_str).map_err(|e| {
-                CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
-            })?;
-            let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(pk);
-        }
-
-        Err(CoreUcanError::MalformedToken(format!(
-            "unsupported DID method: {did} (expected did:dht: or did:key:)"
-        )))
-    }
-}
-
-/// Bridge [`RevocationChecker`] that wraps the context's [`RevocationList`].
-///
-/// Holds a reference to the revocation list from the [`ContextRuntime`] and
-/// delegates the `is_revoked` check. This uses the content-hash CID format
-/// from `scp_core::crypto::ucan::revoke::compute_revocation_cid`.
-struct BridgeRevocationChecker<'a> {
-    revocation_list: &'a scp_core::crypto::ucan::revoke::RevocationList,
-}
-
-impl RevocationChecker for BridgeRevocationChecker<'_> {
-    fn is_revoked(&self, token_cid: &str) -> bool {
-        self.revocation_list.is_revoked(token_cid)
-    }
-}
-
-/// Bridge [`ProofResolver`] backed by an in-memory `HashMap`.
-///
-/// Stores parent UCAN tokens by their CID for delegation chain traversal.
-/// In the bridge layer, the caller can supply proof tokens alongside the
-/// token being validated. For now this starts empty -- root tokens (no
-/// delegation chain) are fully supported, and delegated tokens require the
-/// proof chain to be pre-registered.
-struct BridgeProofResolver {
-    proofs: HashMap<String, UcanToken>,
-}
-
-impl ProofResolver for BridgeProofResolver {
-    fn resolve_proof(&self, cid: &str) -> Result<UcanToken, CoreUcanError> {
-        self.proofs.get(cid).cloned().ok_or_else(|| {
-            CoreUcanError::DelegationChainBroken(format!("proof CID not found: {cid}"))
-        })
-    }
-}
-
-/// Adapter that implements the `validate::NonceTracker` trait for
-/// `nonce::NonceTracker<C>`.
-///
-/// The `nonce::NonceTracker` struct and `validate::NonceTracker` trait have
-/// the same `check_and_record` method signature but are separate types. This
-/// adapter bridges the two by wrapping a mutable reference to the struct.
-struct BridgeNonceTracker<'a, C: scp_core::identity::cache::Clock> {
-    inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
-}
-
-impl<C: scp_core::identity::cache::Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
-    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
-        self.inner.check_and_record(nonce, token_expiry)
     }
 }
 
@@ -325,6 +223,7 @@ pub fn py_ucan_mint(
 
     let rt = crate::runtime()?;
     let context_id_owned = context_id.to_owned();
+    let nonce = scp_core::crypto::ucan::nonce::generate_nonce();
 
     // Mint using real scp_core::mint_ucan with Ed25519 signing via
     // the retained KeyCustody. See SCP-214 criterion 7.
@@ -492,22 +391,7 @@ pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Decodes a hex string to bytes.
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length: {}", hex.len()));
-    }
-
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte_str = &hex[i..i + 2];
-        let byte =
-            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
-        bytes.push(byte);
-    }
-    Ok(bytes)
-}
-
+<<<<<<< HEAD
 /// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
 ///
 /// Parses each proof token and indexes it by its CID (SHA-256 of the encoded
@@ -585,13 +469,17 @@ mod tests {
     use super::*;
     use crate::types::encode_hex;
 
+    use scp_core::crypto::ucan::UcanToken;
+    use scp_core::crypto::ucan::validate::{
+        DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
+    };
+
     // -----------------------------------------------------------------------
     // BridgeDidResolver
     // -----------------------------------------------------------------------
 
     #[test]
     fn bridge_did_resolver_resolves_did_dht() {
-        // Generate a known public key and encode it as did:dht:z{zbase32}.
         let pk_bytes: [u8; 32] = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
@@ -607,8 +495,8 @@ mod tests {
     #[test]
     fn bridge_did_resolver_resolves_did_key_hex() {
         let pk_bytes: [u8; 32] = [0xab; 32];
-        let hex = encode_hex(&pk_bytes);
-        let did = format!("did:key:{hex}");
+        let hex_str = hex::encode(pk_bytes);
+        let did = format!("did:key:{hex_str}");
 
         let resolver = BridgeDidResolver;
         let result = resolver.resolve_public_key(&did).unwrap();
@@ -625,7 +513,6 @@ mod tests {
     #[test]
     fn bridge_did_resolver_rejects_invalid_zbase32() {
         let resolver = BridgeDidResolver;
-        // Invalid z-base-32 encoding (wrong length).
         let result = resolver.resolve_public_key("did:dht:zinvalid");
         assert!(result.is_err());
     }
@@ -742,26 +629,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // decode_hex
+    // hex roundtrip (via hex crate, validates bridge_adapters integration)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn decode_hex_roundtrip() {
+    fn hex_encode_decode_roundtrip() {
         let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let hex = encode_hex(&bytes);
-        let decoded = decode_hex(&hex).unwrap();
+        let encoded = hex::encode(bytes);
+        let decoded = hex::decode(&encoded).unwrap();
         assert_eq!(decoded, bytes);
     }
 
     #[test]
-    fn decode_hex_rejects_odd_length() {
-        let result = decode_hex("abc");
+    fn hex_decode_rejects_odd_length() {
+        let result = hex::decode("abc");
         assert!(result.is_err());
     }
 
     #[test]
-    fn decode_hex_rejects_non_hex() {
-        let result = decode_hex("gggg");
+    fn hex_decode_rejects_non_hex() {
+        let result = hex::decode("gggg");
         assert!(result.is_err());
     }
 }

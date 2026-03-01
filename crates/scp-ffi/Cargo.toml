@@ -32,6 +32,7 @@ hmac = { workspace = true }
 rand = { workspace = true }
 dashmap = { workspace = true }
 uuid = { workspace = true }
+hex = { workspace = true }
 z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
