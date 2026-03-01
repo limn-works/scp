@@ -133,6 +133,10 @@ fun rememberScpEventList(
     eventFlow: SharedFlow<String>,
     maxItems: Int = MAX_EVENT_LIST_SIZE,
 ): State<List<String>> {
+    val scope = remember { CoroutineScope(SupervisorJob() + Dispatchers.Default) }
+    DisposableEffect(Unit) {
+        onDispose { scope.cancel() }
+    }
     val stateFlow: StateFlow<List<String>> = remember(eventFlow) {
         val accumulator = mutableListOf<String>()
         eventFlow
@@ -146,7 +150,7 @@ fun rememberScpEventList(
                 }
             }
             .stateIn(
-                scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+                scope = scope,
                 started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
                 initialValue = emptyList(),
             )
