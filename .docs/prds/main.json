@@ -5191,7 +5191,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-media/src/signaling.rs"
       ],
