@@ -420,7 +420,7 @@ pub struct PaymentReceipt {
                                       //   Lightning: preimage
                                       //   SPL: tx signature
     pub timestamp: u64,
-    pub signature: Ed25519Signature,  // signed by payer
+    pub signature: Vec<u8>,           // Ed25519 signature by payer
 }
 ```
 
