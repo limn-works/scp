@@ -8,7 +8,7 @@ This crate is the `_scp_core` Python extension module. It exposes scp-core/scp-m
 
 ### Runtime Registry (`runtime.rs`)
 
-A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live runtime state:
+**Context registry:** A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live runtime state:
 - `ToolRegistry` — tool registration/invocation
 - `EventLog` — event recording, querying, Merkle proofs
 - `RevocationList` — UCAN token revocation tracking
@@ -18,7 +18,14 @@ A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live ru
 - `creator_did` — the DID of the context creator
 - `tool_handlers: HashMap<String, ToolHandler>` — registered tool handler closures keyed by tool ID (SCP-212)
 
-DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpPyError>` with typed errors.
+**Identity registry (SCP-214):** A global `OnceLock<DashMap<String, IdentityEntry>>` maps DID strings to retained identity state:
+- `ScpIdentity` — opaque key handles (`identity_key`, `active_signing_key`), pre-rotation commitment, DID string
+- `Arc<InMemoryKeyCustody>` — the custody provider holding actual key material. Private keys never cross FFI (ADR-006).
+- `DidDocument` — the identity's DID document
+
+`py_identity_create` registers identity state. Bridge functions (`context.rs`, `ucan.rs`, `identity.rs`) look up state by DID via `with_identity` / `with_identity_mut`. `remove_identity` is called during DID migration.
+
+DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpPyError>` with typed errors. The `with_identity` / `with_identity_mut` functions follow the same pattern for identity state.
 
 `py_context_create` in `context.rs` registers runtime state. Other modules (`tools.rs`, `ucan.rs`, `event_log.rs`) look up state by context ID via `with_context`.
 
@@ -26,10 +33,10 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 
 | Module | Delegates to | Functions |
 |--------|-------------|-----------|
-| `identity.rs` | scp-core identity | `py_identity_create`, `py_identity_load` |
+| `identity.rs` | scp-core identity | `py_identity_create`, `py_identity_load`, `py_identity_resolve`, `py_identity_rotate_key`, `py_identity_migrate` |
 | `context.rs` | runtime registry | `py_context_create`, `py_context_join`, `py_context_leave`, `py_context_close`, `py_context_send`, `py_context_receive` |
 | `tools.rs` | scp-core tools | `py_tool_register`, `py_tool_invoke`, `py_tool_verify` |
-| `ucan.rs` | scp-core UCAN | `py_ucan_validate`, `py_ucan_mint`, `py_ucan_revoke` |
+| `ucan.rs` | scp-core UCAN | `py_ucan_validate`, `py_ucan_mint`, `py_ucan_delegate`, `py_ucan_revoke` |
 | `event_log.rs` | scp-core event_log | `py_event_log_query`, `py_event_log_verify` |
 | `mcp.rs` | scp-mcp | `py_mcp_serve`, `py_mcp_client_connect_stdio/sse`, `py_mcp_client_disconnect`, `py_mcp_client_list_tools`, `py_mcp_client_invoke`, `py_mcp_server_stop/wait`, `py_mcp_server_register/deregister_tool`, `py_mcp_server_list_contexts`, `py_register_tool_handler` |
 | `transport.rs` | scp-transport | `py_transport_connect`, `py_transport_disconnect`, `py_transport_status` |
@@ -77,6 +84,8 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - `py_context_create` creates real `ToolRegistry` and `EventLog` objects in the runtime registry. If context creation fails partway, the registry entry must be cleaned up.
 - MCP bridge functions use opaque string handles (cryptographically random hex IDs) for server/client instances. Server and client state tracked in separate `DashMap` registries in `mcp.rs`.
 - `with_context` closures must return `Result<T, ScpPyError>` — use typed error variants (`ScpPyError::ContextError`, `ScpPyError::UcanError`, etc.) not raw strings.
+- **Identity registry (SCP-214)**: `py_identity_create` registers identity state in the global identity registry (`runtime::IDENTITY_REGISTRY`). All crypto bridge functions (`py_ucan_mint`, `py_ucan_delegate`, `py_context_send`, `py_identity_rotate_key`, `py_identity_migrate`) look up the retained `InMemoryKeyCustody` and `KeyHandle`s via `with_identity()`. The `KeyCustody` trait uses RPITIT (return-position impl Trait in trait), making it NOT object-safe — must use concrete `InMemoryKeyCustody` type directly. `parse_custody("platform")` returns an error (criterion 11) to prevent silent fallback.
+- **Nested block_on prevention**: `with_identity` / `with_identity_mut` are sync closures wrapping DashMap access. If a crypto operation inside the closure is async (e.g., `derive_pseudonym`, `create_inner_envelope`), call `rt.block_on()` inside the closure — never nest `block_on` calls or tokio will deadlock. Pattern: `with_identity(did, |entry| { rt.block_on(async { ... }) })`.
 - UCAN validation (SCP-164) now delegates to scp-core's full 11-step ADR-016 pipeline including Ed25519 signature verification. Bridge trait implementations (`BridgeDidResolver`, `BridgeRevocationChecker`, `BridgeProofResolver`, `BridgeNonceTracker`) in `ucan.rs` adapt runtime state to scp-core's validation traits. The `py_ucan_validate` function accepts optional `presenting_agent_did` and `proof_tokens` parameters for delegation chain verification.
 - MCP server async tasks hold `Arc<Mutex<McpServer>>` — when extracting data from the mutex guard for use in async code (e.g. SSE transport), scope the lock to avoid holding `MutexGuard` across `.await` points (the guard is not `Send`).
 - `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. The `context_events` provider method returns event count and Merkle root, not raw events.
