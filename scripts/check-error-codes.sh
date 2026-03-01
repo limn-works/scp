@@ -82,6 +82,8 @@ done < <(
         --include='*.ts' \
         --include='*.js' \
         --exclude-dir='.git' \
+        --exclude-dir='.claude' \
+        --exclude-dir='.docs' \
         --exclude-dir='target' \
         --exclude-dir='build' \
         --exclude-dir='node_modules' \

@@ -792,7 +792,7 @@ public actor SCPContext {
 
     /// Send a message to this context.
     public func send(_ payload: Data) async throws {
-        guard state == .active else { throw ScpError.context(message: "Context is not active", code: "SCP-CTX-3001") }
+        guard state == .active else { throw ScpError.context(message: "Context is not active", code: "SCP-CTX-2001") }
         try await context_send(handle: handle, payload: payload)
     }
 
@@ -1092,7 +1092,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
    - `await scp.createContext(params:)` returns an `SCPContext` with `state == .active`.
    - `await context.send(payload)` delivers an encrypted message (no throw for valid payload).
    - `await context.close()` transitions `state` to `.closed` and finishes the message stream.
-   - After `close()`, `send()` throws `ScpError.context` with code `"SCP-CTX-3001"`.
+   - After `close()`, `send()` throws `ScpError.context` with code `"SCP-CTX-2001"`.
    - `deinit` without `close()` triggers cleanup — verified by allocating a context and setting its reference to nil without calling `close()`, then asserting no resource leak in the test teardown.
 
 5. **Message streaming via `AsyncStream<Message>`:**
