@@ -13,19 +13,23 @@ PHASE 1: SPEC-TO-IMPLEMENTATION DEEP VERIFICATION (iterations 1-N)
 For EVERY spec file in `.docs/specs/`:
 1. READ the full spec file (not headers — the actual content)
 2. FIND every story in `.docs/prds/main.json` that maps to that spec section
-3. For each story marked "done": READ the actual implementation files
-4. VERIFY the implementation matches the spec — not "it exists" but "it does what the spec says"
-5. Cross-reference `.docs/architecture.md`, `.docs/sketch.md`, and relevant ADRs for additional constraints
+3. For EVERY story (done, pending, in_progress — ALL statuses):
+   - If "done": READ the actual implementation files. VERIFY the implementation matches the spec — not "it exists" but "it does what the spec says"
+   - If "pending" or "in_progress": verify the story has correct spec references, concrete testable acceptance criteria, and sufficient direction to be completed correctly
+4. Cross-reference `.docs/architecture.md`, `.docs/sketch.md`, and relevant ADRs for additional constraints
 
-Dispatch parallel subagents — one per spec file or group of related specs. Each subagent must:
+Dispatch parallel subagents — one per spec file. Each subagent must:
 - Read the full spec section, the corresponding ADR(s), and the sketch pseudocode
-- Read the actual implementation code
+- Read ALL stories for that spec (all statuses)
+- For done stories: read actual implementation code and verify correctness
+- For pending/in_progress stories: verify they have complete, correct direction
 - For each mismatch, missing behavior, or incorrect assumption: FIX IT
   - If the implementation is wrong: correct the implementation
   - If the spec is outdated (proven by a more recent ADR or planning session): update the spec, then verify the implementation matches the updated spec
   - If a story is marked "done" but acceptance criteria are unmet: downgrade the story status and document what remains
+  - If a pending story has vague or incorrect acceptance criteria: rewrite them to be concrete and testable
   - If a stub exists without a resolving story or GitHub issue: create the story or issue
-- Commit fixes per spec group before proceeding
+- Commit fixes per spec before proceeding
 
 Do NOT proceed to Phase 2 until all Phase 1 fixes are committed.
 
@@ -37,10 +41,10 @@ PHASE 2: STUB AND STORY INTEGRITY (1-2 iterations)
    - Each stub MUST have a resolving story with acceptance criteria that will eliminate it, OR a GitHub issue
    - If not: create the story or issue. Reference the spec section and acceptance criteria
    - Swift SDK stubs are NOT UniFFI artifacts — 16+ stubs in hand-written SCP code. Do not dismiss them
-2. For every story marked "done": verify acceptance criteria are ACTUALLY met in code
+2. For every story marked "done" (in `main.json`): verify acceptance criteria are ACTUALLY met in code
    - Read the criteria verbatim. Check each one against the code. Not "the file exists" — the behavior exists
    - If any criterion is unmet: downgrade the story and document what's missing
-3. For every story NOT marked "done": verify the story has sufficient direction to be completed correctly
+3. For every story NOT marked "done" (in `main.json`): verify the story has sufficient direction to be completed correctly
    - Does it reference the right spec sections? Are its acceptance criteria concrete and testable?
    - If not: update the story with correct references and criteria
 

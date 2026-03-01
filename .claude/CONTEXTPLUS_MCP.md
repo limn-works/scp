@@ -155,5 +155,3 @@ Strict order within every file:
 Execute ASAP with the least tokens possible.
 Use structural/context tools strategically, then patch and validate.
 Avoid over-planning unless the task is ambiguous or high-risk.
-
-[GitHub](https://github.com/ForLoopCodes/contextplus)

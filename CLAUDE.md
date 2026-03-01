@@ -31,9 +31,9 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — the social layer 
 
 ## Tools
 
-### Context+ MCP — Semantic codebase mapping ([instructions](./.claude/CONTEXT_MCP.md))
+### Context+ MCP — Semantic codebase mapping ([instructions](./.claude/CONTEXTPLUS_MCP.md))
 
-`get_context_tree` → `get_file_skeleton` → `semantic_code_search` / `semantic_identifier_search` → `get_blast_radius` before modifying symbols → `propose_commit` to write → `run_static_analysis` to validate. **Use every time you search code.**
+`get_context_tree` → `get_file_skeleton` → `semantic_identifier_search` → `get_blast_radius` before modifying symbols → `run_static_analysis` to validate. **Use every time you search code.** Always skeleton before full read. `semantic_code_search` is broken on this codebase (context length) — use `semantic_identifier_search` or Grep instead.
 
 ### Vestige MCP — Long-term cognitive memory (instructions in user-scope CLAUDE.md)
 
