@@ -50,6 +50,14 @@ SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure p
 - Protocol-first design; inject through initializers; no singletons
 - APIs: self-evident, one happy path
 
+### Toolchain
+
+All project tools are managed via [mise](https://mise.jdx.dev/) (see `.mise.toml`). The system `python3` is Xcode's Python 3.9 — **do not use it**. Always use `python3.12` for anything Python-related (tests, maturin, pip). Key commands:
+- `cargo test -p scp-ffi` requires: `DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") cargo test -p scp-ffi`
+- `cargo test --workspace` includes scp-ffi — set `DYLD_LIBRARY_PATH` or it will fail to link
+- Kotlin/Android: JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise
+- WASM: `wasm-pack` via cargo, `wasm32-unknown-unknown` target installed
+
 ### Git
 
 - Use worktrees for non trivial changes or when you're not already in one

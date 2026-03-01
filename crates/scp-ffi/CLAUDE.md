@@ -38,7 +38,7 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 
 - `crate-type = ["cdylib", "rlib"]` — cdylib for Python extension module, rlib for test binary linkage
 - `extension-module` is a crate feature (not default) — maturin passes it explicitly via pyproject.toml
-- Rust tests: `./scripts/test.sh rust` (or `DYLD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") cargo test -p scp-ffi`)
+- Rust tests: `DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") cargo test -p scp-ffi` (Python 3.12 available via mise — do NOT skip these tests)
 - Python integration tests: `maturin develop --release` + `pytest bindings/python/tests/`
 - Use `cargo check -p scp-ffi` to verify compilation without Python linkage
 - Full build via `maturin build --features extension-module` or `maturin develop`
