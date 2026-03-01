@@ -27,7 +27,7 @@ import type { UcanToken } from "./types.js";
  * @param ctx - The context the token is presented in.
  * @param token - The encoded UCAN token string (JWT format).
  * @param capability - The required capability URI.
- * @throws {PermissionError} If validation fails.
+ * @throws {UcanPermissionError} If validation fails.
  */
 export async function validateUcan(ctx: Context, token: string, capability: string): Promise<void> {
   try {
@@ -48,7 +48,7 @@ export async function validateUcan(ctx: Context, token: string, capability: stri
  * @param memberDid - The DID of the member receiving the token.
  * @param capabilities - Capability URIs to grant.
  * @returns The minted UCAN token with metadata.
- * @throws {PermissionError} If minting fails.
+ * @throws {UcanPermissionError} If minting fails.
  */
 export async function mintUcan(
   ctx: Context,
@@ -72,7 +72,7 @@ export async function mintUcan(
  *
  * @param ctx - The context the token belongs to.
  * @param tokenId - The unique ID of the token to revoke.
- * @throws {PermissionError} If revocation fails.
+ * @throws {UcanPermissionError} If revocation fails.
  */
 export async function revokeUcan(ctx: Context, tokenId: string): Promise<void> {
   try {
@@ -95,7 +95,7 @@ export async function revokeUcan(ctx: Context, tokenId: string): Promise<void> {
  * @param targetDid - The DID of the delegation target.
  * @param capabilities - Capability URIs to delegate (must be a subset of the original).
  * @returns The delegated UCAN token.
- * @throws {PermissionError} If delegation fails or capabilities exceed the original.
+ * @throws {UcanPermissionError} If delegation fails or capabilities exceed the original.
  */
 export async function delegateUcan(
   ctx: Context,

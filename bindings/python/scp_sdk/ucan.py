@@ -125,7 +125,6 @@ async def validate(context: str, token: str, capability: str) -> None:
 
 
 async def mint(
-    issuer: str,
     audience: str,
     capabilities: Sequence[str],
     context: str,
@@ -135,10 +134,10 @@ async def mint(
 
     Creates a new UCAN token granting the specified capabilities to the
     audience DID, scoped to the given context.  The token is signed by
-    the issuer's key.
+    the context creator's key (the issuer is determined automatically by
+    the Rust bridge from the context's creator DID).
 
     Args:
-        issuer: DID of the entity minting (signing) the token.
         audience: DID of the entity receiving the token.
         capabilities: Capability URIs to grant
             (e.g., ``["messages:write", "tool_invoke:assistant"]``).
@@ -152,6 +151,11 @@ async def mint(
     Raises:
         UcanPermissionError: If minting fails (capabilities outside the
             context ceiling, issuer not authorized, etc.).
+
+    Note:
+        The issuer is always the context creator. The Rust bridge
+        (``_scp_core.ucan_mint``) derives the issuer from the context's
+        ``creator_did`` and does not accept an explicit issuer parameter.
     """
     try:
         bridge_token = await asyncio.to_thread(
@@ -235,9 +239,9 @@ async def delegate(
 
     # Delegate by minting a new token from the delegator to the delegatee
     # with the attenuated capabilities.  The bridge layer handles proof
-    # chain construction and signing.
+    # chain construction and signing.  The issuer (context creator) is
+    # determined automatically by the Rust bridge.
     return await mint(
-        issuer=delegator,
         audience=delegatee,
         capabilities=list(capabilities),
         context=context,
