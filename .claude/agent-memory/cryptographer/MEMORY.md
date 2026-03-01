@@ -88,6 +88,27 @@
 - encode_hex: infallible for String, no truncation bugs
 - extract_implementation_hash: correct 64-char hex validation, byte-by-byte decode
 
+### Android Platform Adapter (PR #118 review)
+- AndroidKeyCustody: Ed25519 via Android Keystore TEE (API 33+), Bouncy Castle software fallback (API 26-32)
+- X25519 always software via Bouncy Castle (Keystore has no X25519)
+- CRITICAL: derivePseudonym uses PUBLIC key as HMAC key material (line 285-288)
+  Rust/Swift use PRIVATE key bytes -- pseudonyms will differ cross-platform
+  Public key as HMAC key destroys unlinkability (anyone can compute pseudonyms)
+- dhAgree missing key type validation -- accepts Ed25519 keys without error
+- No private key zeroing on destroySoftwareKey (only map entry removal)
+- FixedSecureRandom(seed) for deterministic keygen works but fragile; prefer Ed25519PrivateKeyParameters(seed,0)
+- Bouncy Castle Ed25519 seed handling: same as ed25519_dalek (seed -> SHA-512 -> clamp) = COMPATIBLE
+- CryptoKit rawRepresentation: treats input as clamped scalar, NOT seed = INCOMPATIBLE with both BC and dalek
+- AES-GCM storage key: TEE-backed, fixed zero IV, single plaintext -- SOUND
+- SQLCipher passphrase: ByteArray zeroed (line 89), String copy immutable (documented, acceptable)
+- SecureRandom() used for keygen -- correct CSPRNG on Android
+
+### Cross-Platform Pseudonym Compatibility Matrix
+- Rust (ed25519_dalek): HMAC key = private seed bytes, keygen = SigningKey::from_bytes(hmac_output) -- REFERENCE
+- Kotlin/BC: HMAC key = PUBLIC key (WRONG), keygen = FixedSecureRandom(hmac) -> Ed25519KeyPairGenerator -- INCOMPATIBLE
+- Swift/CryptoKit: HMAC key = private key bytes (correct), keygen = PrivateKey(rawRepresentation:) -- INCOMPATIBLE (scalar vs seed)
+- All three produce DIFFERENT pseudonyms for same identity+context. Must be unified per SCP-214.
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs
@@ -101,3 +122,6 @@
 - `crates/scp-core/src/economy/credentials.rs` -- adapter credential management
 - `crates/scp-core/src/store/mod.rs` -- ProtocolStore definition
 - `crates/scp-core/src/store/economy.rs` -- adapter credential storage impl
+- `bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/` -- Android adapters
+- `crates/scp-core/src/envelope/pseudonym.rs` -- pseudonym derivation spec (delegates to KeyCustody)
+- `crates/scp-platform/src/testing/key_custody.rs` -- InMemoryKeyCustody reference impl + golden vectors
