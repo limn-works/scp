@@ -486,19 +486,8 @@ fn resolve_did_public_key(did: &str) -> Result<[u8; 32], String> {
 }
 
 /// Decodes a hex string to bytes.
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length: {}", hex.len()));
-    }
-
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte_str = &hex[i..i + 2];
-        let byte =
-            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
-        bytes.push(byte);
-    }
-    Ok(bytes)
+fn decode_hex(hex_str: &str) -> Result<Vec<u8>, String> {
+    hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))
 }
 
 /// Parses a JWT-format UCAN token and returns the deserialized payload.

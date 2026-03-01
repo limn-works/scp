@@ -304,6 +304,13 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, E
 ///         || generation_BE || sequence_BE || timestamp_BE
 ///         || payload_hash || provenance_hash)
 /// ```
+///
+/// Variable-length fields (`context_id`, `sender_did`, `payload_hash`,
+/// `provenance_hash`) are length-prefixed with a `u32` big-endian byte count
+/// to prevent field-boundary collision attacks (e.g., `context_id="ab"` +
+/// `sender_did="cd"` must hash differently from `context_id="abc"` +
+/// `sender_did="d"`). Fixed-width fields (`epoch`, `generation`, `sequence`,
+/// `timestamp`) need no length prefix.
 fn compute_canonical_hash(
     params: &InnerEnvelopeParams<'_>,
     payload_hash: &[u8],
@@ -311,14 +318,24 @@ fn compute_canonical_hash(
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_SEPARATOR);
-    hasher.update(params.context_id.as_bytes());
-    hasher.update(params.sender_did.as_bytes());
+
+    // Length-prefix variable-length fields to prevent boundary ambiguity.
+    #[allow(clippy::cast_possible_truncation)]
+    let len_prefix = |h: &mut Sha256, data: &[u8]| {
+        h.update((data.len() as u32).to_be_bytes());
+        h.update(data);
+    };
+    len_prefix(&mut hasher, params.context_id.as_bytes());
+    len_prefix(&mut hasher, params.sender_did.as_bytes());
+
+    // Fixed-width u64 fields -- no length prefix needed.
     hasher.update(params.epoch.to_be_bytes());
     hasher.update(params.generation.to_be_bytes());
     hasher.update(params.sequence.to_be_bytes());
     hasher.update(params.timestamp.to_be_bytes());
-    hasher.update(payload_hash);
-    hasher.update(provenance_hash);
+
+    len_prefix(&mut hasher, payload_hash);
+    len_prefix(&mut hasher, provenance_hash);
     hasher.finalize().to_vec()
 }
 

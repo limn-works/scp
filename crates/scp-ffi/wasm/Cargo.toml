@@ -25,6 +25,7 @@ base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 z-base-32 = { workspace = true }
 serde = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

@@ -373,10 +373,7 @@ pub async fn ucan_mint(
     let context_id = handle.context_id();
     let issuer_did = handle.creator_did();
 
-    let nonce = generate_nonce().map_err(|e| ScpNapiError::Permission {
-        message: format!("nonce generation failed: {e}"),
-        code: "SCP-PERM-3004".to_owned(),
-    })?;
+    let nonce = generate_nonce();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -495,29 +492,12 @@ pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Res
 
 /// Encodes a byte slice as a lowercase hex string.
 fn encode_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
+    hex::encode(bytes)
 }
 
 /// Decodes a hex string to bytes.
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length: {}", hex.len()));
-    }
-
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte_str = &hex[i..i + 2];
-        let byte =
-            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
-        bytes.push(byte);
-    }
-    Ok(bytes)
+fn decode_hex(hex_str: &str) -> Result<Vec<u8>, String> {
+    hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +629,7 @@ mod tests {
 
     #[test]
     fn generate_nonce_produces_valid_format() {
-        let nonce = generate_nonce().unwrap();
+        let nonce = generate_nonce();
         let parts: Vec<&str> = nonce.splitn(2, '-').collect();
         assert_eq!(parts.len(), 2);
         assert!(parts[0].parse::<u128>().is_ok());
@@ -675,28 +655,7 @@ mod tests {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
-///
-/// Uses cryptographic randomness via `rand::rngs::OsRng` (backed by the
-/// OS CSPRNG) to produce unpredictable nonces as required by ADR-016 §7.2.
-fn generate_nonce() -> Result<String, String> {
-    use rand::RngCore;
-
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("system clock error: {e}"))?
-        .as_millis();
-
-    let mut random_bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut random_bytes);
-
-    let hex = random_bytes
-        .iter()
-        .fold(String::with_capacity(32), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-
-    Ok(format!("{now_millis}-{hex}"))
+/// Generates a nonce. Delegates to `scp_core::crypto::ucan::nonce::generate_nonce`.
+fn generate_nonce() -> String {
+    scp_core::crypto::ucan::nonce::generate_nonce()
 }

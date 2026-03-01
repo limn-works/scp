@@ -329,29 +329,13 @@ pub async fn event_log_verify(
 
 /// Encodes a byte slice as a lowercase hex string.
 fn encode_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
+    hex::encode(bytes)
 }
 
 /// Decodes a hex string into a 32-byte hash.
-fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!(
-            "expected 64 hex characters (32 bytes), got {}",
-            hex.len()
-        ));
-    }
-
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
-        bytes[i] =
-            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
-    }
-    Ok(bytes)
+fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        format!("expected 32 bytes (64 hex chars), got {}", v.len())
+    })
 }

@@ -267,12 +267,15 @@ impl KeyCustody for KeyCustodyProviderAdapter {
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         let key_id = key.id();
+        // Use InMemory (lowest trust) as fallback -- never Hardware (highest
+        // trust). Returning Hardware on error would be a privilege escalation.
+        // See RED-018.
         let map_guard = match self.handle_to_id.read() {
             Ok(guard) => guard,
-            Err(_) => return CustodyType::Hardware,
+            Err(_) => return CustodyType::InMemory,
         };
         let Some(id) = map_guard.get(&key_id).cloned() else {
-            return CustodyType::Hardware;
+            return CustodyType::InMemory;
         };
         drop(map_guard);
         let type_str = self.provider.custody_type(id);
@@ -280,7 +283,7 @@ impl KeyCustody for KeyCustodyProviderAdapter {
             "hardware" => CustodyType::Hardware,
             "software" => CustodyType::Software,
             "in_memory" => CustodyType::InMemory,
-            _ => CustodyType::Hardware,
+            _ => CustodyType::InMemory,
         }
     }
 }

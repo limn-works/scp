@@ -165,16 +165,6 @@ pub fn deserialize_signaling(bytes: &[u8]) -> Result<SignalingMessage, serde_jso
     serde_json::from_slice(bytes)
 }
 
-/// Returns [`MessageType::Signaling`] for use when constructing inner
-/// envelopes that carry signaling payloads.
-///
-/// This is a convenience accessor so that callers in the media layer do not
-/// need to depend on `scp_core::envelope::MessageType` directly.
-#[must_use]
-pub fn signaling_message_type() -> MessageType {
-    MessageType::Signaling
-}
-
 /// Serializes a signaling message and returns the payload bytes together
 /// with the [`MessageType::Signaling`] discriminator.
 ///
@@ -458,16 +448,6 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(matches!(err, SignalingError::SenderMismatch { .. }));
-    }
-
-    // -- signaling_message_type -----------------------------------------------
-
-    #[test]
-    fn signaling_message_type_returns_signaling_variant() {
-        use scp_core::envelope::MessageType;
-
-        let mt = signaling_message_type();
-        assert_eq!(mt, MessageType::Signaling);
     }
 
     // -- send_signaling -------------------------------------------------------
