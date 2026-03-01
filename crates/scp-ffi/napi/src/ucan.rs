@@ -267,6 +267,11 @@ impl<C: scp_core::identity::cache::Clock> NonceTrackerTrait for BridgeNonceTrack
 /// * `token` — The encoded UCAN token string (JWT format).
 /// * `capability` — The required capability URI
 ///   (e.g., `"scp:ctx:abc123/messages:write"`).
+/// * `proof_tokens` — Optional array of encoded parent UCAN tokens (JWT format)
+///   that form the delegation chain. Each proof token is parsed, its CID is
+///   computed via `compute_revocation_cid`, and it is added to the proof
+///   resolver for delegation chain traversal. Pass `None` (or `null` from JS)
+///   for root tokens that have no delegation chain.
 ///
 /// # Errors
 ///
@@ -280,6 +285,7 @@ pub async fn ucan_validate(
     handle: &NapiContextHandle,
     token: String,
     capability: String,
+    proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
 
@@ -295,9 +301,15 @@ pub async fn ucan_validate(
 
     let agent_did = parsed_token.payload.aud.clone();
 
-    let proof_resolver = BridgeProofResolver {
-        proofs: HashMap::new(),
-    };
+    let mut proofs = HashMap::new();
+    if let Some(tokens) = proof_tokens {
+        for proof_jwt in &tokens {
+            let parsed_proof = parse_ucan(proof_jwt).map_err(ScpNapiError::from)?;
+            let cid = compute_revocation_cid(&parsed_proof.payload);
+            proofs.insert(cid, parsed_proof);
+        }
+    }
+    let proof_resolver = BridgeProofResolver { proofs };
 
     let context_id = handle.context_id();
     crate::runtime::with_context(&context_id, |rt| {

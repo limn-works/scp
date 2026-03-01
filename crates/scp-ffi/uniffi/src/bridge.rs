@@ -42,7 +42,6 @@ use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
     Signature,
 };
-use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::{KeyCustodyProvider, decrement_handle_count, increment_handle_count, runtime};
@@ -62,14 +61,17 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// custody (Secure Enclave, Android Keystore) transparently.
 ///
 /// Maintains a bidirectional mapping between `KeyHandle(u64)` (scp-core) and
-/// `String` key IDs (platform callback interface). Thread-safe via `TokioMutex`.
+/// `String` key IDs (platform callback interface). Thread-safe via `RwLock`.
+/// Uses `std::sync::RwLock` instead of `TokioMutex` so that `custody_type()`
+/// (a sync trait method) can acquire a read lock without requiring an async
+/// runtime context.
 ///
 /// See ADR-006 (Platform Abstraction) and SCP-214 criterion 2.
 pub(crate) struct KeyCustodyProviderAdapter {
     /// The injected platform custody callback.
     provider: Arc<dyn KeyCustodyProvider>,
     /// Mapping from `KeyHandle(u64)` to platform key ID strings.
-    handle_to_id: TokioMutex<HashMap<u64, String>>,
+    handle_to_id: std::sync::RwLock<HashMap<u64, String>>,
     /// Counter for allocating new `KeyHandle` IDs.
     next_id: AtomicU64,
 }
@@ -79,7 +81,7 @@ impl KeyCustodyProviderAdapter {
     pub(crate) fn new(provider: Arc<dyn KeyCustodyProvider>) -> Self {
         Self {
             provider,
-            handle_to_id: TokioMutex::new(HashMap::new()),
+            handle_to_id: std::sync::RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -104,7 +106,12 @@ impl KeyCustody for KeyCustodyProviderAdapter {
 
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let handle = KeyHandle::new(id);
-            self.handle_to_id.lock().await.insert(id, key_id);
+            self.handle_to_id
+                .write()
+                .map_err(|_| {
+                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
+                })?
+                .insert(id, key_id);
             Ok(handle)
         }
     }
@@ -118,7 +125,9 @@ impl KeyCustody for KeyCustodyProviderAdapter {
         let data = data.to_vec();
         async move {
             let id = {
-                let map = self.handle_to_id.lock().await;
+                let map = self.handle_to_id.read().map_err(|_| {
+                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
+                })?;
                 map.get(&key_id)
                     .cloned()
                     .ok_or(PlatformError::KeyNotFound)?
@@ -139,7 +148,9 @@ impl KeyCustody for KeyCustodyProviderAdapter {
         let key_id = key.id();
         async move {
             let id = {
-                let map = self.handle_to_id.lock().await;
+                let map = self.handle_to_id.read().map_err(|_| {
+                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
+                })?;
                 map.get(&key_id)
                     .cloned()
                     .ok_or(PlatformError::KeyNotFound)?
@@ -160,7 +171,9 @@ impl KeyCustody for KeyCustodyProviderAdapter {
         let key_id = key.id();
         async move {
             let id = {
-                let mut map = self.handle_to_id.lock().await;
+                let mut map = self.handle_to_id.write().map_err(|_| {
+                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
+                })?;
                 map.remove(&key_id).ok_or(PlatformError::KeyNotFound)?
             };
             self.provider
@@ -180,7 +193,9 @@ impl KeyCustody for KeyCustodyProviderAdapter {
         let peer = *peer_public;
         async move {
             let id = {
-                let map = self.handle_to_id.lock().await;
+                let map = self.handle_to_id.read().map_err(|_| {
+                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
+                })?;
                 map.get(&key_id)
                     .cloned()
                     .ok_or(PlatformError::KeyNotFound)?
@@ -206,7 +221,9 @@ impl KeyCustody for KeyCustodyProviderAdapter {
         let ctx = context_id.to_vec();
         async move {
             let id = {
-                let map = self.handle_to_id.lock().await;
+                let map = self.handle_to_id.read().map_err(|_| {
+                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
+                })?;
                 map.get(&key_id)
                     .cloned()
                     .ok_or(PlatformError::KeyNotFound)?
@@ -235,8 +252,10 @@ impl KeyCustody for KeyCustodyProviderAdapter {
             let pseudo_handle_id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let pseudo_handle = KeyHandle::new(pseudo_handle_id);
             self.handle_to_id
-                .lock()
-                .await
+                .write()
+                .map_err(|_| {
+                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
+                })?
                 .insert(pseudo_handle_id, pseudo_key_id);
 
             Ok(PseudonymKeypair {
@@ -248,11 +267,7 @@ impl KeyCustody for KeyCustodyProviderAdapter {
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         let key_id = key.id();
-        // We need the key ID string to call provider.custody_type().
-        // Since custody_type is sync and handle_to_id requires async lock,
-        // we use try_lock. If it fails (contended), return Hardware as the
-        // safe default for platform custody.
-        let map_guard = match self.handle_to_id.try_lock() {
+        let map_guard = match self.handle_to_id.read() {
             Ok(guard) => guard,
             Err(_) => return CustodyType::Hardware,
         };
