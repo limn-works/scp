@@ -62,6 +62,7 @@ pub async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl Int
         relay: state.relay_url.clone(),
         contexts,
         relay_config: None,
+        handles: None,
     };
 
     (StatusCode::OK, Json(doc))
