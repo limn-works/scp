@@ -274,7 +274,8 @@
         "SCP-223",
         "SCP-224",
         "SCP-225",
-        "SCP-226"
+        "SCP-226",
+        "SCP-227"
       ]
     }
   ],
@@ -10053,24 +10054,33 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-079",
-        "SCP-214"
+        "SCP-079"
       ],
       "files": [
         "crates/scp-ffi/wasm/src/tools.rs",
         "crates/scp-ffi/wasm/src/ucan.rs",
-        "crates/scp-ffi/wasm/src/event_log.rs",
-        "crates/scp-ffi/wasm/src/identity.rs"
+        "crates/scp-ffi/wasm/src/event_log.rs"
       ],
-      "description": "The WASM bridge (SCP-079) provides typed function signatures and error types but all functions return 'not yet connected to runtime' errors. Wire these to scp-core implementations using the same patterns as the PyO3 bridge (SCP-163).",
+      "description": "The WASM bridge (SCP-079) provides typed function signatures and error types but tool, UCAN, and event log functions return 'not yet connected to runtime' errors. Wire these to scp-core implementations using the same patterns as the PyO3 bridge (SCP-163). Scope: tool_register/invoke/verify, ucan_validate/mint/revoke, event_log_query/verify. Identity and KeyCustody wiring is covered separately by SCP-214.",
       "acceptanceCriteria": [
-        "tool_register, tool_invoke, tool_verify call scp-core tool registration/invocation pipeline",
-        "ucan_validate calls scp-core 11-step UCAN validation pipeline",
-        "ucan_mint and ucan_revoke call real scp-core operations",
-        "event_log_query and event_log_verify call scp-core EventLog operations",
-        "identity_create and identity_resolve wire to scp-core identity operations",
-        "All existing WASM compilation (wasm-pack build) continues to succeed",
-        "No 'not yet connected to runtime' errors remain in bridge functions"
+        "tool_register calls scp-core ToolRegistry::register with schema validation",
+        "tool_invoke calls scp-core tool invocation pipeline and returns structured result",
+        "tool_verify calls scp-core schema verification and returns pass/fail with diagnostics",
+        "ucan_validate calls scp-core 11-step UCAN validation pipeline (verify_ucan_chain)",
+        "ucan_mint calls scp-core mint_ucan (signing deferred to KeyCustody wiring in SCP-214)",
+        "ucan_revoke calls scp-core UCAN revocation",
+        "event_log_query calls scp-core EventLog query with filter parameters",
+        "event_log_verify calls scp-core Merkle verification",
+        "wasm-pack build compiles without errors",
+        "No 'not yet connected to runtime' errors remain in tools.rs, ucan.rs, event_log.rs"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-022: TypeScript SDK (Dual-Target Architecture)"
+        }
       ]
     },
     {
@@ -10079,22 +10089,29 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-080",
-        "SCP-214"
+        "SCP-080"
       ],
       "files": [
         "crates/scp-ffi/napi/src/ucan.rs",
-        "crates/scp-ffi/napi/src/event_log.rs",
-        "crates/scp-ffi/napi/src/transport.rs"
+        "crates/scp-ffi/napi/src/event_log.rs"
       ],
-      "description": "The NAPI bridge (SCP-080) has stub functions for UCAN validation/minting/revocation and event log query/verification that return 'not yet connected to runtime' errors. Wire these to scp-core implementations.",
+      "description": "The NAPI bridge (SCP-080) has stub functions for UCAN validation/minting/revocation and event log query/verification that return 'not yet connected to runtime' errors. Wire these to scp-core implementations. Scope: ucan_validate/mint/revoke, event_log_query/verify. NAPI tools.rs, identity.rs, and transport.rs have no 'not yet connected' stubs and are not in scope. Identity/KeyCustody wiring is SCP-214.",
       "acceptanceCriteria": [
-        "ucan_validate calls scp-core 11-step UCAN validation pipeline",
-        "ucan_mint and ucan_revoke call real scp-core operations",
-        "event_log_query and event_log_verify call scp-core EventLog operations",
-        "transport_send wires to real TransportManager",
-        "All existing NAPI compilation (napi build) continues to succeed",
-        "No 'not yet connected to runtime' errors remain in bridge functions"
+        "ucan_validate calls scp-core 11-step UCAN validation pipeline (verify_ucan_chain)",
+        "ucan_mint calls scp-core mint_ucan (signing deferred to KeyCustody wiring in SCP-214)",
+        "ucan_revoke calls scp-core UCAN revocation",
+        "event_log_query calls scp-core EventLog query with filter parameters",
+        "event_log_verify calls scp-core Merkle verification",
+        "napi build compiles without errors",
+        "No 'not yet connected to runtime' errors remain in ucan.rs, event_log.rs"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-022: TypeScript SDK (Dual-Target Architecture)"
+        }
       ]
     },
     {
@@ -10103,19 +10120,28 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-078",
-        "SCP-214"
+        "SCP-078"
       ],
       "files": [
         "crates/scp-ffi/uniffi/src/bridge.rs"
       ],
-      "description": "The UniFFI bridge (SCP-078) has stub functions for UCAN validation/minting/revocation and event log query/verification that return 'not yet connected to runtime' errors. Wire these to scp-core implementations.",
+      "description": "The UniFFI bridge (SCP-078) has stub functions for UCAN validation/minting/revocation and event log query/verification that return 'not yet connected to runtime' errors. Wire these to scp-core implementations. Scope: ucan_validate/mint/revoke, event_log_query/verify (5 stubs in bridge.rs). Identity/KeyCustody wiring is SCP-214.",
       "acceptanceCriteria": [
-        "ucan_validate calls scp-core 11-step UCAN validation pipeline",
-        "ucan_mint and ucan_revoke call real scp-core operations",
-        "event_log_query and event_log_verify call scp-core EventLog operations",
-        "All existing UniFFI compilation (cargo build -p scp-ffi-uniffi) continues to succeed",
-        "No 'not yet connected to runtime' errors remain in bridge functions"
+        "ucan_validate calls scp-core 11-step UCAN validation pipeline (verify_ucan_chain)",
+        "ucan_mint calls scp-core mint_ucan (signing deferred to KeyCustody wiring in SCP-214)",
+        "ucan_revoke calls scp-core UCAN revocation",
+        "event_log_query calls scp-core EventLog query with filter parameters",
+        "event_log_verify calls scp-core Merkle verification",
+        "cargo build -p scp-ffi-uniffi compiles without errors",
+        "No 'not yet connected to runtime' errors remain in bridge.rs"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-021: UniFFI Bridge Definitions"
+        }
       ]
     },
     {
@@ -10137,10 +10163,22 @@
       ],
       "description": "The Swift SDK wrappers (SCP-103) contain placeholder functions that return 'not yet available' errors across Mcp.swift, Tools.swift, Ucan.swift, Transport.swift, EventLog.swift, and Trust.swift. Wire these to the UniFFI bridge layer.",
       "acceptanceCriteria": [
-        "All Swift wrapper functions delegate to the UniFFI bridge (ScpBindings)",
-        "No 'not yet available' placeholder errors remain",
-        "Swift SDK conformance tests (SCP-102) pass with wired implementations",
-        "async/await bridging works correctly for all async operations"
+        "Mcp.swift functions delegate to ScpBindings (UniFFI bridge) for MCP tool operations",
+        "Tools.swift functions delegate to ScpBindings for tool registration, invocation, and verification",
+        "Ucan.swift functions delegate to ScpBindings for UCAN validation, minting, and revocation",
+        "Transport.swift functions delegate to ScpBindings for transport send/receive",
+        "EventLog.swift functions delegate to ScpBindings for event log query and verification",
+        "Trust.swift functions delegate to ScpBindings for attestation verification and trust evaluation",
+        "No 'not yet available' placeholder errors remain in any Swift wrapper file",
+        "At least one async roundtrip test per module (Tools, Ucan, EventLog, Transport, Trust) verifies async/await bridging compiles and executes"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-026: Swift SDK"
+        }
       ]
     },
     {
@@ -10149,14 +10187,13 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-001",
-        "SCP-135"
+        "SCP-001"
       ],
       "files": [
         "crates/scp-core/src/store/mod.rs",
         "crates/scp-core/src/store/protocol_store.rs"
       ],
-      "description": "Spec \u00a717.4 defines a ProtocolStore that provides typed domain methods (60+) wrapping the raw Storage trait. This is the persistence layer that all higher-level code uses. Currently not implemented \u2014 higher-level code works with in-memory state only.",
+      "description": "Spec \u00a717.4 defines a ProtocolStore that provides typed domain methods (60+) wrapping the raw Storage trait (SCP-001). This is the persistence layer that all higher-level code uses. Currently not implemented \u2014 higher-level code works with in-memory state only. Note: SCP-135 (auto-accept policy persistence) is a consumer of Storage, not a prerequisite.",
       "acceptanceCriteria": [
         "ProtocolStore struct wraps a Box<dyn Storage> with typed accessor methods",
         "Identity state CRUD: store/load/delete identity, key handles, DID documents",
@@ -10166,6 +10203,18 @@
         "Key convention follows \u00a717.3 namespace pattern (e.g., identity/{did}/state)",
         "StoredValue<T> version envelope per \u00a717.5 for forward compatibility",
         "All methods use MessagePack serialization via rmp-serde"
+      ],
+      "priority": "P0",
+      "severity": "critical",
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.5 Serialization"
+        }
       ]
     },
     {
@@ -10180,22 +10229,35 @@
       "files": [
         "crates/scp-core/src/discovery/addressing.rs",
         "crates/scp-core/src/discovery/handles.rs",
-        "crates/scp-core/src/discovery/petnames.rs"
+        "crates/scp-core/src/discovery/petnames.rs",
+        "crates/scp-core/src/discovery/mod.rs"
       ],
       "description": "Spec \u00a722 defines a human-readable addressing layer with 5 mechanisms: petnames (local), discovery context handles, attestation-backed handles, domain handles, and unified resolution. Currently zero implementation exists.",
       "acceptanceCriteria": [
-        "Address format types: Petname, DiscoveryHandle, AttestationHandle, DomainHandle",
-        "TrustLevel enum: Self, Attestation, Context, Community per \u00a722.2",
+        "Address format types: Petname, DiscoveryHandle, AttestationHandle, DomainHandle per \u00a722.2",
+        "TrustLevel enum: Self, Attestation, Context, Community per \u00a722.7",
         "handle_register, handle_lookup, handle_deregister discovery context tools per \u00a722.5",
-        "AddressResolver with resolve() returning ranked results with trust levels",
+        "AddressResolver with resolve() returning results ranked by TrustLevel (Self > Attestation > Context > Community)",
         "Petname storage in identity private state per \u00a722.3",
         "Resolution caching with TTL per \u00a722.8",
-        "Unit tests covering all 5 addressing mechanisms"
+        "Unit tests: at least one test per addressing mechanism (petname, discovery, attestation, domain, unified resolution)"
+      ],
+      "priority": "P2",
+      "severity": "moderate",
+      "sources": [
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "## 22.2 Address Format"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "## 22.8 Unified Resolution Protocol"
+        }
       ]
     },
     {
       "id": "SCP-224",
-      "title": "Implement broadcast context runtime behavior",
+      "title": "Implement broadcast key lifecycle and BroadcastEnvelope seal/open",
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
@@ -10204,18 +10266,30 @@
         "SCP-013"
       ],
       "files": [
-        "crates/scp-core/src/context/broadcast.rs",
-        "crates/scp-core/src/crypto/sender_keys/broadcast.rs"
+        "crates/scp-core/src/crypto/sender_keys/broadcast.rs",
+        "crates/scp-core/src/crypto/sender_keys/mod.rs"
       ],
-      "description": "ContextMode::Broadcast is type-defined (SCP-018) but has no runtime behavior. Spec \u00a75.14.2-12 defines subscriber registration, per-author broadcast keys, BroadcastEnvelope processing, and broadcast-specific blocking.",
+      "description": "ContextMode::Broadcast is type-defined (SCP-018) but has no runtime behavior. This story implements the core crypto layer: per-author AES-256 broadcast keys (\u00a75.14.2), BroadcastEnvelope seal/open (\u00a75.14.5), and KeyEpochAdvance event type. Subscriber registration, blocking, and integration testing are SCP-227.",
       "acceptanceCriteria": [
-        "Subscriber registration protocol for broadcast contexts",
-        "Per-author AES-256 broadcast key lifecycle (generation, rotation, distribution)",
-        "BroadcastEnvelope seal/open using author broadcast keys",
-        "Broadcast blocking using sender key revocation",
-        "KeyEpochAdvance event type for broadcast key rotation",
-        "validate_memory_scope_for_broadcast rejects Ephemeral/Summary",
-        "Integration test: author publishes, N subscribers receive"
+        "generate_broadcast_key() creates per-author AES-256 key with epoch counter per \u00a75.14.2",
+        "rotate_broadcast_key() increments epoch, generates new key, emits KeyEpochAdvance event",
+        "BroadcastEnvelope seal: encrypts payload with author's current broadcast key, includes epoch in header",
+        "BroadcastEnvelope open: decrypts payload using author's broadcast key at the specified epoch",
+        "KeyEpochAdvance event type defined and serializable",
+        "validate_memory_scope_for_broadcast rejects Ephemeral and Summary (only Full allowed per \u00a75.14.10)",
+        "Unit tests: key generation, rotation, seal/open roundtrip, epoch mismatch rejected, memory scope validation"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.14 Broadcast Contexts"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-007: Sender-Side Key Layer"
+        }
       ]
     },
     {
@@ -10232,11 +10306,26 @@
       ],
       "description": "Spec \u00a79.10.6 mandates constant-rate cover traffic on persistent connections. \u00a79.9.2 specifies periodic heartbeat messages for relay suppression detection. Neither is implemented.",
       "acceptanceCriteria": [
-        "CoverTrafficGenerator produces dummy messages at configurable interval (default 30s per \u00a79.10.6)",
-        "Dummy messages are single-byte flag inside encrypted payload, indistinguishable from real messages",
-        "HeartbeatMonitor sends periodic heartbeats and detects suppression (missing heartbeat responses)",
-        "Cover traffic and heartbeats are configurable (enabled/disabled, interval)",
-        "Unit tests verify timing, format, and suppression detection"
+        "CoverTrafficGenerator produces padded dummy messages at configurable interval (default 30s per \u00a79.10.6)",
+        "Dummy messages are single-byte flag inside encrypted payload, indistinguishable from real messages after encryption",
+        "Real messages replace dummy messages in the schedule (no double-send within a window)",
+        "Cover traffic rate is per relay connection, not per context \u2014 a single timer per connection (\u00a79.10.6 item 4)",
+        "HeartbeatMonitor sends heartbeats at configurable interval (default 60s per \u00a79.9.2)",
+        "HeartbeatMonitor raises SuppressionSuspected event when expected heartbeats are missing for > 2x the heartbeat interval",
+        "Cover traffic and heartbeats are independently configurable (enabled/disabled, interval)",
+        "Unit tests verify: timing intervals, message format, real-replaces-dummy behavior, suppression detection threshold"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.6 Cover Traffic"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.9.2 Suppression Detection"
+        }
       ]
     },
     {
@@ -10267,6 +10356,41 @@
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
           "section": "### 7.3.6 Time-Locked Attestation Renewal"
+        }
+      ]
+    },
+    {
+      "id": "SCP-227",
+      "title": "Implement broadcast subscriber registration, blocking, and integration",
+      "gate": "gate-audit",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "blockedBy": [
+        "SCP-224"
+      ],
+      "files": [
+        "crates/scp-core/src/context/broadcast.rs",
+        "crates/scp-core/src/context/mod.rs"
+      ],
+      "description": "With broadcast key lifecycle implemented (SCP-224), this story adds subscriber registration (\u00a75.14.3), open vs. gated admission (\u00a75.14.4), broadcast-specific blocking via sender key revocation (\u00a75.14.8), broadcast capabilities and routing (\u00a75.14.6, \u00a75.14.9), and an integration test proving end-to-end: author publishes, N subscribers receive.",
+      "acceptanceCriteria": [
+        "subscribe_broadcast(context_id, subscriber_did) registers subscriber and returns current author key epoch",
+        "Open broadcast: any DID can subscribe without UCAN per \u00a75.14.4",
+        "Gated broadcast: subscription requires valid UCAN with MessagesRead capability per \u00a75.14.4",
+        "block_broadcast_author(author_did) revokes sender key, preventing decryption of future messages per \u00a75.14.8",
+        "Broadcast capabilities enforce MessagesWrite restricted to authors, MessagesRead open to subscribers per \u00a75.14.9",
+        "Integration test: author publishes message, 3 subscribers receive and decrypt successfully",
+        "Integration test: blocked author's subsequent messages are undecryptable by subscribers"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.3 Subscriber Registration"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.8 Blocking"
         }
       ]
     }
