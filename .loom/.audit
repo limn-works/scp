@@ -1,0 +1,110 @@
+COMPREHENSIVE SPEC-STORY-IMPLEMENTATION AUDIT
+
+This audit does not produce reports. It fixes problems. Every phase ends with committed corrections — to specs, stories, ADRs, open questions, standards, and implementation code. You MUST NOT declare DONE until ALL phases are complete and committed.
+
+ARTIFACT FLOW REMINDER: plans → specs → ADRs → stories → source code. Never reverse. If implementation contradicts a spec, fix the implementation (or, if the spec is genuinely wrong, fix the spec first, propagate downstream, then fix the implementation). The spec is the source of truth unless an ADR, planning session, or GitHub issue records a more recent consensus — in which case, propagate that consensus into the spec before acting on it.
+
+Implementation is incomplete. That is expected. Your job is not to finish it — it is to ensure that (1) everything built so far is correct, (2) everything remaining has clear, correct, complete direction, and (3) there are no gaps, contradictions, or phantom provenance anywhere in the chain.
+
+---
+
+PHASE 1: SPEC-TO-IMPLEMENTATION DEEP VERIFICATION (iterations 1-N)
+
+For EVERY spec file in `.docs/specs/`:
+1. READ the full spec file (not headers — the actual content)
+2. FIND every story in `.docs/prds/main.json` that maps to that spec section
+3. For each story marked "done": READ the actual implementation files
+4. VERIFY the implementation matches the spec — not "it exists" but "it does what the spec says"
+5. Cross-reference `.docs/architecture.md`, `.docs/sketch.md`, and relevant ADRs for additional constraints
+
+Dispatch parallel subagents — one per spec file or group of related specs. Each subagent must:
+- Read the full spec section, the corresponding ADR(s), and the sketch pseudocode
+- Read the actual implementation code
+- For each mismatch, missing behavior, or incorrect assumption: FIX IT
+  - If the implementation is wrong: correct the implementation
+  - If the spec is outdated (proven by a more recent ADR or planning session): update the spec, then verify the implementation matches the updated spec
+  - If a story is marked "done" but acceptance criteria are unmet: downgrade the story status and document what remains
+  - If a stub exists without a resolving story or GitHub issue: create the story or issue
+- Commit fixes per spec group before proceeding
+
+Do NOT proceed to Phase 2 until all Phase 1 fixes are committed.
+
+---
+
+PHASE 2: STUB AND STORY INTEGRITY (1-2 iterations)
+
+1. Find every stub in the codebase (`Stub`, `todo`, `unimplemented`, `not yet`, `placeholder`, `bridge-unavailable`):
+   - Each stub MUST have a resolving story with acceptance criteria that will eliminate it, OR a GitHub issue
+   - If not: create the story or issue. Reference the spec section and acceptance criteria
+   - Swift SDK stubs are NOT UniFFI artifacts — 16+ stubs in hand-written SCP code. Do not dismiss them
+2. For every story marked "done": verify acceptance criteria are ACTUALLY met in code
+   - Read the criteria verbatim. Check each one against the code. Not "the file exists" — the behavior exists
+   - If any criterion is unmet: downgrade the story and document what's missing
+3. For every story NOT marked "done": verify the story has sufficient direction to be completed correctly
+   - Does it reference the right spec sections? Are its acceptance criteria concrete and testable?
+   - If not: update the story with correct references and criteria
+
+Output is not a report. Output is corrected story statuses, new stories for uncovered stubs, and updated acceptance criteria. Commit before proceeding.
+
+---
+
+PHASE 3: OPEN QUESTION RESOLUTION (1-2 iterations)
+
+For each open question in `.docs/specs/00-open-questions.md`:
+1. READ the spec section it references
+2. READ related ADRs, GitHub issues, planning session notes, and commit messages
+3. CHECK if consensus already exists somewhere in the artifact chain
+
+Then resolve:
+- If consensus exists elsewhere: write it into 00-open-questions.md with citation, update the spec section to reflect it
+- If no consensus exists but the answer is clear from architecture/specs/ADRs: establish consensus — write the resolution with rationale, update the spec, mark as resolved
+- If genuinely undecided: document what's blocking the decision, what information is needed, and what the leading candidates are
+
+Priority: P0 security-critical questions first:
+- Sybil resistance enforcement (§9.3)
+- Pseudonym rotation and traffic analysis resistance
+- Commit delivery assurance under adversarial relays
+- UCAN revocation mechanism specifics (§9.5)
+
+Every resolved question must be propagated: spec updated, downstream stories checked for consistency. Commit before proceeding.
+
+---
+
+PHASE 4: STANDARDS AND ADR COMPLIANCE (1 iteration)
+
+1. Read every file in `.docs/standards/` — actually read them, not skim
+2. Check implementation against each standard. Fix violations, not "log" them
+3. Verify all ADRs are consistent with current specs and implementation:
+   - ADR decisions that were never implemented: create stories or update existing ones
+   - ADR decisions implemented differently than decided: fix the implementation or update the ADR (with rationale)
+   - ADR decisions superseded by later consensus: mark the ADR as superseded, cite the replacement
+4. Verify CI enforcement matches CLAUDE.md rules (e.g., `clippy::todo/unimplemented = "deny"` in Cargo.toml)
+
+Commit all fixes before proceeding.
+
+---
+
+PHASE 5: COMPLETENESS VERIFICATION (1 iteration)
+
+This phase produces no new fixes — it verifies that phases 1-4 left nothing behind.
+
+1. Re-scan for stubs without resolving stories (should be ZERO)
+2. Re-scan for "done" stories with unmet acceptance criteria (should be ZERO)
+3. Re-scan for open questions without resolution or explicit blocker documentation (should be ZERO)
+4. Verify every open GitHub issue maps to a story or is explicitly noted as out-of-scope
+5. Verify the artifact chain is intact: every spec section has stories, every story references its spec, every implementation file traces to a story
+
+If any check fails: go back and fix it. Do not declare DONE with known gaps.
+Only when all checks pass: declare DONE.
+
+---
+
+RULES:
+- This audit FIXES problems. It does not produce reports, summaries, or checklists. Every finding becomes a committed correction.
+- Use subagents aggressively. One per spec file, one per bridge language, etc.
+- Actually READ files. Do not infer from names, grep output, or file existence. Read the code. Read the spec. Compare them.
+- Do not fabricate coverage numbers or claim verification you didn't perform.
+- Each phase must produce a commit before the next phase begins. Quality over speed — split phases across iterations if needed.
+- The spec is the source of truth. When spec and implementation conflict, the spec wins unless a documented decision (ADR, planning session, GitHub issue) overrides it. If it does, propagate the override into the spec first.
+- When you find conflicting info between artifacts, trace the full provenance chain to find the most recent consensus. If valid consensus exists, propagate it through all downstream artifacts. If no valid consensus exists, use your judgment to establish one — document the rationale and commit it.
+- Do not cut corners. Do not skip files because they "look fine." Do not dismiss stubs as trivial. Be as thorough, nuanced, and principled as the protocol demands.
