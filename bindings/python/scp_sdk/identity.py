@@ -122,16 +122,21 @@ class Identity:
         """Create a new SCP identity with the specified key custody method.
 
         Args:
-            custody: Key custody type.  ``"platform"`` (default) uses
-                platform-native secure storage; ``"in_memory"`` uses an
-                ephemeral in-memory key store.
+            custody: Key custody type.  Valid values:
+
+                - ``"platform"`` (default) -- platform-native secure
+                  storage (Keychain on macOS/iOS, Keystore on Android,
+                  credential manager on Windows/Linux).
+                - ``"in_memory"`` -- ephemeral in-memory key store,
+                  suitable for testing or short-lived agents.
 
         Returns:
             A new :class:`Identity` instance.
 
         Raises:
             scp_sdk.IdentityError: If key generation or DID creation fails.
-            scp_sdk.ValidationError: If *custody* is not recognised.
+            scp_sdk.ValidationError: If *custody* is not a recognised
+                value.
         """
         import _scp_core
 

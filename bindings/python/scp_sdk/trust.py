@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import ContextError, ScpError, UcanPermissionError
 
 logger = logging.getLogger("scp_sdk")
 
@@ -250,7 +250,7 @@ async def evaluate_trust(
         for token in capability_tokens:
             try:
                 bridge.ucan_validate(context_id, token, "*")
-            except Exception:
+            except UcanPermissionError:
                 all_valid = False
                 break
         cap_validation.tokens_valid = all_valid
@@ -271,7 +271,7 @@ async def evaluate_trust(
                 {"type": e.event_type, "count": 1} for e in events if e.event_type == "ToolInvoked"
             ],
         )
-    except Exception:
+    except ContextError:
         logger.debug(
             "Could not retrieve behavioral record for %s",
             subject_did,
