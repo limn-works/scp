@@ -24,15 +24,18 @@
 //! - [`DataProvenance`] -- Placeholder provenance metadata (replaced by SCP-070).
 //! - [`DiscoveryError`] -- Error type for discovery operations.
 
+pub mod addressing;
 pub mod bootstrap;
 pub mod context;
 pub mod did_capabilities;
+pub mod handles;
 pub mod search;
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub use addressing::ResolutionCache;
 pub use bootstrap::{BootstrapConfig, BootstrapResolver, WellKnownBootstrapError};
 pub use context::{
     AgentDeregisterParams, AgentDeregisterResult, AgentRegisterParams, AgentRegisterResult,
@@ -41,6 +44,7 @@ pub use context::{
     TOOL_AGENT_SEARCH,
 };
 pub use did_capabilities::{CapabilityEntry, resolve_capabilities};
+pub use handles::{HandleError, HandleRecord, HandleRegistry, HandleTarget};
 pub use search::{ContactCache, ContextQuerier, unified_search};
 
 // ---------------------------------------------------------------------------

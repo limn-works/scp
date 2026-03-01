@@ -31,6 +31,7 @@ base64 = { workspace = true }
 bs58 = { workspace = true }
 uuid = { workspace = true }
 jsonschema = { workspace = true }
+lru = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

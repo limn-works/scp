@@ -19,6 +19,7 @@
 //! See spec section 17.4 and ADR-006.
 
 pub mod economy;
+pub mod ucan;
 
 use scp_platform::traits::Storage;
 
@@ -46,6 +47,32 @@ pub enum StoreError {
 }
 
 // ---------------------------------------------------------------------------
+// Key sanitization
+// ---------------------------------------------------------------------------
+
+/// Validates that a string is safe to use as a storage key path component.
+///
+/// Rejects strings containing `/`, `\`, `..`, or null bytes (`\0`) to
+/// prevent path traversal attacks when constructing hierarchical storage
+/// keys like `"ucan/{context_id}/tokens/{token_id}"`.
+///
+/// Returns the input string unchanged if valid, or a [`StoreError`] if the
+/// string contains forbidden characters.
+///
+/// # Errors
+///
+/// Returns [`StoreError::SerializationFailed`] if `s` contains any of the
+/// forbidden patterns: `/`, `\`, `..`, or `\0`.
+pub fn sanitize_key_component(s: &str) -> Result<&str, StoreError> {
+    if s.contains('/') || s.contains('\\') || s.contains("..") || s.contains('\0') {
+        return Err(StoreError::SerializationFailed(format!(
+            "invalid key component: contains forbidden characters: {s:?}"
+        )));
+    }
+    Ok(s)
+}
+
+// ---------------------------------------------------------------------------
 // ProtocolStore
 // ---------------------------------------------------------------------------
 
@@ -70,5 +97,72 @@ impl<S: Storage> ProtocolStore<S> {
     #[must_use]
     pub const fn new(storage: S) -> Self {
         Self { storage }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_accepts_normal_string() {
+        assert_eq!(
+            sanitize_key_component("ctx-abc-123").unwrap(),
+            "ctx-abc-123"
+        );
+    }
+
+    #[test]
+    fn sanitize_accepts_alphanumeric() {
+        assert_eq!(sanitize_key_component("abc123").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn sanitize_accepts_dashes_and_underscores() {
+        assert_eq!(
+            sanitize_key_component("my-context_id").unwrap(),
+            "my-context_id"
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_forward_slash() {
+        let err = sanitize_key_component("../../secrets").unwrap_err();
+        assert!(err.to_string().contains("forbidden characters"));
+    }
+
+    #[test]
+    fn sanitize_rejects_backslash() {
+        let err = sanitize_key_component("..\\secrets").unwrap_err();
+        assert!(err.to_string().contains("forbidden characters"));
+    }
+
+    #[test]
+    fn sanitize_rejects_dot_dot() {
+        let err = sanitize_key_component("..").unwrap_err();
+        assert!(err.to_string().contains("forbidden characters"));
+    }
+
+    #[test]
+    fn sanitize_rejects_null_byte() {
+        let err = sanitize_key_component("ctx\0evil").unwrap_err();
+        assert!(err.to_string().contains("forbidden characters"));
+    }
+
+    #[test]
+    fn sanitize_rejects_embedded_slash() {
+        let err = sanitize_key_component("ctx/evil").unwrap_err();
+        assert!(err.to_string().contains("forbidden characters"));
+    }
+
+    #[test]
+    fn sanitize_accepts_single_dot() {
+        // Single dot is fine; only ".." is dangerous.
+        assert_eq!(sanitize_key_component(".hidden").unwrap(), ".hidden");
     }
 }
