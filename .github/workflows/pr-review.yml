@@ -199,10 +199,16 @@ jobs:
 
             ONLY comment on files listed in /tmp/changed-files.txt.
 
-            Then submit your review verdict. If there are no critical or warning-level issues:
-            ```bash
-            gh pr review ${{ github.event.pull_request.number }} --approve --body "<summary>"
-            ```
+            ## When to post a review verdict
+
+            **In incremental mode**: Only post a verdict if you have new findings (inline comments,
+            newly resolved requested-changes, or status changes worth reporting). If the incremental
+            diff introduces no new issues and there are no previous requested-changes to clear,
+            exit silently — do not post an empty approval or "no issues" comment.
+
+            **In full mode**: Always post a verdict (this is the first review).
+
+            ## Verdict format
 
             If there are critical issues that must be fixed:
             ```bash
@@ -212,6 +218,11 @@ jobs:
             If there are only notes/suggestions (no critical or warning):
             ```bash
             gh pr review ${{ github.event.pull_request.number }} --comment --body "<summary>"
+            ```
+
+            If there are no issues and you need to clear a previous request-changes, or this is a full review:
+            ```bash
+            gh pr review ${{ github.event.pull_request.number }} --approve --body "<summary>"
             ```
 
             The summary must include:
