@@ -961,6 +961,92 @@ mod tests {
     }
 
     #[test]
+    fn freshness_uses_renewed_at_when_present_and_still_fresh() {
+        // issued_at=900, renewed_at=950, renewal_interval=200s
+        // -> renewal_deadline = 950 + 200 = 1150
+        // now=1000 -> before deadline -> Fresh
+        let clock = TestClock::new(1000);
+        let attestation = Attestation {
+            id: "att-1".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
+            claim: serde_json::json!({}),
+            evidence: None,
+            issued_at: 900,
+            expires_at: Some(2000),
+            renewal_interval: Some(Duration::from_secs(200)),
+            revocation_status: RevocationStatus::Active,
+            signature: vec![0u8; 64],
+            renewed_at: Some(950),
+        };
+
+        assert_eq!(
+            check_attestation_freshness(&attestation, &clock),
+            FreshnessStatus::Fresh
+        );
+    }
+
+    #[test]
+    fn freshness_uses_renewed_at_for_stale_calculation() {
+        // issued_at=900, renewed_at=950, renewal_interval=30s
+        // -> renewal_deadline = 950 + 30 = 980
+        // now=1000 -> past deadline but not expired -> Stale { since: 980 }
+        //
+        // Without renewed_at, deadline would be 900 + 30 = 930, also stale.
+        // This test verifies the deadline is based on renewed_at (980), not
+        // issued_at (930).
+        let clock = TestClock::new(1000);
+        let attestation = Attestation {
+            id: "att-1".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
+            claim: serde_json::json!({}),
+            evidence: None,
+            issued_at: 900,
+            expires_at: Some(2000),
+            renewal_interval: Some(Duration::from_secs(30)),
+            revocation_status: RevocationStatus::Active,
+            signature: vec![0u8; 64],
+            renewed_at: Some(950),
+        };
+
+        assert_eq!(
+            check_attestation_freshness(&attestation, &clock),
+            FreshnessStatus::Stale { since: 980 }
+        );
+    }
+
+    #[test]
+    fn freshness_renewed_at_makes_stale_attestation_fresh_again() {
+        // issued_at=900, renewal_interval=50s
+        // Without renewal: deadline = 900 + 50 = 950, now=1000 -> stale
+        // With renewed_at=980: deadline = 980 + 50 = 1030, now=1000 -> fresh
+        let clock = TestClock::new(1000);
+        let attestation = Attestation {
+            id: "att-1".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
+            claim: serde_json::json!({}),
+            evidence: None,
+            issued_at: 900,
+            expires_at: Some(2000),
+            renewal_interval: Some(Duration::from_secs(50)),
+            revocation_status: RevocationStatus::Active,
+            signature: vec![0u8; 64],
+            renewed_at: Some(980),
+        };
+
+        // Would be stale without renewed_at, but fresh with it
+        assert_eq!(
+            check_attestation_freshness(&attestation, &clock),
+            FreshnessStatus::Fresh
+        );
+    }
+
+    #[test]
     fn freshness_returns_fresh_when_no_renewal_interval() {
         let clock = TestClock::new(1500);
         let attestation = Attestation {

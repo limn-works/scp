@@ -315,6 +315,9 @@ where
     F: FnOnce(&serde_json::Value) -> Result<serde_json::Value, String>,
 {
     // 0. Enforce chain depth limit (spec section 6.2, default max 3).
+    // Depth is 0-indexed: 0 = first hop, 3 = third hop. Values 0..=3 are
+    // allowed; depth 4+ is rejected. This matches check_chain_depth() in
+    // provenance/attach.rs.
     if chain_depth > DEFAULT_MAX_CHAIN_DEPTH {
         return Err(ToolError::ChainDepthExceeded {
             depth: chain_depth,

@@ -118,23 +118,9 @@ fn messaging_tool_invoke_ceiling() -> Vec<Capability> {
 /// Returns the messaging + full tools ceiling: messaging + `tool:invoke_all` +
 /// `tool:register`.
 ///
-/// Used by broadcast templates (spec section 5.12.1) where authors can both
-/// invoke and register tools.
+/// Used by broadcast templates and the tool-interface template (spec section
+/// 5.12.1) where participants can both invoke and register tools.
 fn messaging_tools_ceiling() -> Vec<Capability> {
-    vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_TOOL_INVOKE_ALL),
-        Capability::new(CAP_TOOL_REGISTER),
-    ]
-}
-
-/// Returns the tool-interface template ceiling (spec section 5.12.1).
-///
-/// The spec defines this as: `[messagesRead, messagesWrite, toolRegister,
-/// toolInvokeAll]`. Agents can invoke tools and register new ones within
-/// the context.
-fn messaging_tool_registration_ceiling() -> Vec<Capability> {
     vec![
         Capability::new(CAP_MESSAGES_READ),
         Capability::new(CAP_MESSAGES_WRITE),
@@ -257,7 +243,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tool_registration_ceiling(),
+            ceiling: messaging_tools_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
