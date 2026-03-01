@@ -337,7 +337,7 @@ pub trait KeyCustody: Send + Sync {
     ///
     /// For hardware-backed keys: the HMAC is computed inside the HSM using an
     /// associated symmetric key derived during [`generate_keypair`](KeyCustody::generate_keypair).
-    /// For software keys: the HMAC uses the raw Ed25519 private key bytes.
+    /// For software keys: the HMAC uses the raw Ed25519 public key bytes (ADR-027 amendment).
     ///
     /// The returned [`PseudonymKeypair`] is always software-managed (derived
     /// output).

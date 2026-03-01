@@ -88,7 +88,9 @@
         "SCP-163",
         "SCP-164",
         "SCP-165",
-        "SCP-210"
+        "SCP-210",
+        "SCP-216",
+        "SCP-217"
       ]
     },
     {
@@ -214,7 +216,9 @@
         "SCP-132",
         "SCP-133",
         "SCP-136",
-        "SCP-139"
+        "SCP-139",
+        "SCP-214",
+        "SCP-215"
       ]
     },
     {
@@ -2385,7 +2389,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in_progress",
       "files": [
         "crates/scp-ffi/pyo3/identity.rs"
       ],
@@ -2407,8 +2411,7 @@
         "Register all functions and classes in the module."
       ],
       "blockedBy": [
-        "SCP-036",
-        "SCP-037"
+        "SCP-217"
       ],
       "sources": [
         {
@@ -6185,7 +6188,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
@@ -6238,7 +6241,8 @@
           "§9.15 — Key destruction verification",
           "ADR-025 — Apple adapter as parallel reference"
         ]
-      }
+      },
+      "result": "AndroidKeyCustody.kt + Types.kt implemented. TEE-backed Ed25519 on API 33+, Bouncy Castle fallback for API 26-32, software X25519. 32 JVM unit tests. Commits: 77f48a0, 87fc586."
     },
     {
       "id": "SCP-111",
@@ -6246,7 +6250,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
@@ -6286,7 +6290,8 @@
         "references": [
           "ADR-025 — Apple adapter as parallel reference"
         ]
-      }
+      },
+      "result": "AndroidDeviceAttestation.kt implemented. Play Integrity Standard API, SHA-256 nonce, JWT token return. 14 JVM unit tests. Commits: bd4e2f7, 87fc586."
     },
     {
       "id": "SCP-112",
@@ -6294,7 +6299,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidPushProvider.kt"
       ],
@@ -6334,7 +6339,8 @@
         "references": [
           "ADR-025 — Apple adapter as parallel reference"
         ]
-      }
+      },
+      "result": "AndroidPushProvider.kt implemented. FCM data-only opaque payload, SCP-PUSH-5001/5002 error codes. 10 JVM unit tests. Commits: b37d2f0, 87fc586."
     },
     {
       "id": "SCP-113",
@@ -6342,7 +6348,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidStorage.kt"
       ],
@@ -6384,7 +6390,8 @@
           "§17.8 — Android Keystore",
           "ADR-025 — Apple adapter as parallel reference"
         ]
-      }
+      },
+      "result": "AndroidStorage.kt implemented with TEE-backed AES-256 key derivation via Android Keystore. InMemoryStorageProvider for testing. 548-line test suite. Commit 775403b."
     },
     {
       "id": "SCP-114",
@@ -6437,7 +6444,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/src/main/kotlin/com/limn/scp/bridge/CoroutineBridge.kt"
       ],
@@ -6481,7 +6488,8 @@
           "standards/kotlin.md — kotlinx.coroutines, Dispatchers.IO for FFI, JVM 11+",
           "ADR-026 (Swift SDK) as parallel reference"
         ]
-      }
+      },
+      "result": "CoroutineBridge.kt wrapping UniFFI bindings with Dispatchers.IO for FFI, Dispatchers.Default for CPU-bound. CancellationToken propagation, callbackFlow streaming. JUnit 5 tests. Commits 40cdb51, ac4d172."
     },
     {
       "id": "SCP-116",
@@ -9527,7 +9535,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/build.gradle.kts",
         "bindings/kotlin/settings.gradle.kts",
@@ -9565,7 +9573,8 @@
           "ADR-028 — Kotlin SDK layout and conventions",
           "scaffold/kotlin.md — Build infrastructure blueprint"
         ]
-      }
+      },
+      "result": "Android module scaffold complete. Both :scp-sdk-kotlin:build and :scp-sdk-kotlin-android:build succeed. Commit 9c0ff7d."
     },
     {
       "id": "SCP-212",
@@ -9573,7 +9582,7 @@
       "gate": "gate-3",
       "priority": "P2",
       "severity": "moderate",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/mcp.rs",
         "crates/scp-core/src/context/tools/invoke.rs"
@@ -9608,7 +9617,8 @@
           "file": "https://github.com/limn-works/scp/issues/104",
           "section": "GitHub issue #104 — input validation at bridge boundary"
         }
-      ]
+      ],
+      "result": "Tool handler registration and dispatch wired. Python callables stored as closures in runtime registry. FfiBridgeProvider dispatches to handlers. Commit 8d4c405."
     },
     {
       "id": "SCP-213",
@@ -9616,7 +9626,7 @@
       "gate": "gate-3",
       "priority": "P2",
       "severity": "moderate",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/mcp.rs",
         "crates/scp-transport/src/native/protocol.rs",
@@ -9652,7 +9662,373 @@
           "file": "https://github.com/limn-works/scp/issues/109",
           "section": "GitHub issue #109 — expose missing ContextParams fields in PyO3 bridge"
         }
-      ]
+      ],
+      "result": "Client-side context discovery via KnownContext registry + relay QUERY probing. Falls back to local registry when relay unavailable. Commit 3d8016f."
+    },
+    {
+      "id": "SCP-214",
+      "title": "Wire KeyCustodyProvider callbacks into scp-core crypto operations across all FFI bridges",
+      "gate": "gate-6",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/src/ucan.rs",
+        "crates/scp-ffi/uniffi/src/lib.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/wasm/src/custody.rs",
+        "crates/scp-ffi/wasm/src/context.rs",
+        "crates/scp-ffi/wasm/src/identity.rs",
+        "crates/scp-platform/src/traits.rs",
+        "crates/scp-platform/src/testing/key_custody.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        ".docs/specs/09-security-model.md"
+      ],
+      "description": "Wire platform-injected KeyCustodyProvider callbacks through all three FFI bridges (PyO3, UniFFI, WASM/NAPI) into scp-core crypto operations. Currently, all bridges use InMemoryKeyCustody unconditionally — platform custody (Secure Enclave, Android Keystore) is implemented (SCP-093, SCP-110) but unreachable from Rust. KeyHandle references are not retained across FFI boundaries, making all cryptographic operations impossible with real key material.\n\nWithout this wiring, 14 scp-core public functions that take &impl KeyCustody are unreachable from production FFI code:\n- Identity: DidMethod::create, DidMethod::rotate (trait methods called by FFI bridges)\n- Envelope: create_inner_envelope (message signing), derive_pseudonym (routing IDs)\n- Event log: CheckpointManager::maybe_create_checkpoint, CheckpointManager::force_create_checkpoint, generate_checkpoint (checkpoint signing)\n- UCAN: mint_ucan (token signing — py_ucan_mint is a stub that doesn't call scp-core yet), delegate_ucan (delegation chain signing — no FFI bridge function exists)\n- Sender keys: publish_sender_key_epoch_advance, request_sender_key, open_sender_key_response, send_block_notification, rotate_sender_key_for_block\n\nAdditionally, 5 internal functions (DidDht::make_sign_fn, rotate_active_key, create_new_identity_keys, build_migration_proof, generate_checkpoint_at) take KeyCustody but are called by the above — they don't need separate FFI wiring. One more public function, DidDht::migrate_identity, has no FFI bridge function yet and should be added in this story.\n\nseal_envelope takes a pre-computed routing_id: &[u8] parameter, so it does not take KeyCustody directly — but its two inputs (routing_id from derive_pseudonym and InnerEnvelope from create_inner_envelope) both require KeyCustody upstream. The entire message send path is blocked.\n\nAdditionally, the InMemoryKeyCustody implementation has a code bug: derive_pseudonym at key_custody.rs:333 uses signing_key.to_bytes() (private key bytes) as the HMAC key, but ADR-027 amendment requires public key bytes for cross-platform determinism with hardware TEE keys. This means pseudonym derivation will produce different results between InMemoryKeyCustody and platform adapters (AndroidKeyCustody, AppleKeyCustody) which correctly use public key bytes. The golden vector test at key_custody.rs:626 is keyed to the wrong (private-key) derivation.\n\nThis is a P0 blocker because:\n1. Routing IDs use a stub HMAC derivation (context.rs) instead of KeyCustody::derive_pseudonym — relay probes never match real envelopes\n2. InMemoryKeyCustody stores private keys in unprotected heap memory on mobile devices — the entire TEE/Secure Enclave security model is dead code\n3. Key rotation always errors (\"requires wired KeyCustodyProvider\")\n4. UniFFI KeyCustodyProvider callback interface is incomplete — missing derive_pseudonym and dh_agree methods vs the full KeyCustody trait (7 methods)\n5. Inner envelope signing, UCAN minting/delegation, checkpoint signing, and all sender key protocol operations are unreachable with platform key material\n6. py_ucan_mint (ucan.rs:320) is a stub that builds a local PyUcanToken without calling scp-core::mint_ucan — no real signing occurs\n7. No py_ucan_delegate or py_identity_migrate bridge functions exist despite scp-core implementations being complete (SCP-056, SCP-008)\n8. InMemoryKeyCustody uses private key bytes for pseudonym HMAC (key_custody.rs:333) but ADR-027 mandates public key bytes — cross-platform pseudonym determinism is broken\n\nThe architecture is fully specified in ADR-006, ADR-021, ADR-022, ADR-025, ADR-027. Platform adapters are implemented. Only the wiring is missing.",
+      "acceptanceCriteria": [
+        "UniFFI KeyCustodyProvider callback interface includes all 7 KeyCustody trait methods: generate_keypair, sign, get_public_key, destroy_key, dh_agree, derive_pseudonym, custody_type",
+        "UniFFI identity_create with CustodyMethod::Platform accepts an injected KeyCustodyProvider and creates identity using it",
+        "Identity handle retains Arc<dyn KeyCustody> (or adapter wrapper) and KeyHandle references so all subsequent crypto operations use the same provider",
+        "py_context_create routing ID derivation calls KeyCustody::derive_pseudonym with real key material instead of HMAC-SHA256(random_secret, ...)",
+        "UniFFI and NAPI/WASM context creation derive routing IDs via the injected KeyCustodyProvider",
+        "create_inner_envelope called from FFI bridges uses the retained KeyCustody for message signing",
+        "py_ucan_mint replaced with real scp-core::mint_ucan call using retained KeyCustody for token signing",
+        "New py_ucan_delegate bridge function added, calling scp-core::delegate_ucan with retained KeyCustody",
+        "py_identity_rotate_key performs real key rotation via retained KeyCustodyProvider (calls DidMethod::rotate which delegates to DidDht::rotate_active_key internally)",
+        "New py_identity_migrate bridge function added, calling DidDht::migrate_identity with retained KeyCustody for Layer 2 DID migration",
+        "InMemoryKeyCustody is only used when custody==\"in_memory\" — never as a fallback for platform custody",
+        "InMemoryKeyCustody::derive_pseudonym uses public key bytes (verifying_key.to_bytes()) as HMAC key, not private key bytes — matching ADR-027 amendment and platform adapter behavior",
+        "Golden vector test at key_custody.rs:626 updated to match public-key-based HMAC derivation",
+        "Private key material never crosses any FFI boundary (invariant from ADR-006)",
+        "All existing tests pass (cargo test --workspace --exclude scp-ffi)",
+        "Cross-platform pseudonym derivation test: same identity key + same context_id produces identical routing_id across PyO3, UniFFI, WASM bridges and across InMemoryKeyCustody / AndroidKeyCustody / AppleKeyCustody",
+        "runtime.rs get_or_create_routing_secret() and IDENTITY_ROUTING_SECRETS static removed (replaced by real KeyCustody::derive_pseudonym calls)"
+      ],
+      "actionItems": [
+        "Add derive_pseudonym(key_id: String, context_id: Vec<u8>) -> Result<PseudonymResult, ScpError> to UniFFI KeyCustodyProvider callback interface",
+        "Add dh_agree(key_id: String, peer_public: Vec<u8>) -> Result<Vec<u8>, ScpError> to UniFFI KeyCustodyProvider callback interface",
+        "Create KeyCustodyAdapter struct that wraps a KeyCustodyProvider callback and implements the scp-platform KeyCustody trait via delegation",
+        "Update PyO3 PyIdentity to store Arc<dyn KeyCustody> (or typed enum dispatch) alongside did/custody strings, retaining the KeyHandle from identity creation",
+        "Update PyO3 parse_custody to accept optional platform custody injection",
+        "Update UniFFI Identity handle to wire injected KeyCustodyProvider into Platform/Software custody paths (currently errors at bridge.rs:953)",
+        "Update NAPI identity_create to wire JsKeyCustody into scp-core identity creation",
+        "Replace HMAC-SHA256(random_secret, ...) stub in PyO3 context.rs:462-486 with KeyCustody::derive_pseudonym using retained identity KeyHandle; remove get_or_create_routing_secret and IDENTITY_ROUTING_SECRETS from runtime.rs",
+        "Wire pseudonym derivation into UniFFI and NAPI/WASM context creation paths",
+        "Wire create_inner_envelope signing through retained KeyCustody in all bridge send paths",
+        "Replace py_ucan_mint stub (ucan.rs:320) with real scp_core::mint_ucan call using retained KeyCustody",
+        "Add py_ucan_delegate bridge function (new) calling scp_core::delegate_ucan with retained KeyCustody — no bridge function exists today despite SCP-056/SCP-057 implementing scp-core and Python wrapper",
+        "Add py_identity_migrate bridge function (new) calling DidDht::migrate_identity with retained KeyCustody — no bridge function exists today despite SCP-008 implementing scp-core",
+        "Implement py_identity_rotate_key using retained KeyCustodyProvider (calls DidMethod::rotate trait method which delegates to DidDht::rotate_active_key internally)",
+        "Fix InMemoryKeyCustody::derive_pseudonym (key_custody.rs:333): change signing_key.to_bytes() to verifying_key.to_bytes() so HMAC uses public key bytes per ADR-027 amendment",
+        "Update golden vector test (key_custody.rs:626) expected values to match public-key-based HMAC derivation",
+        "Remove get_or_create_routing_secret() and IDENTITY_ROUTING_SECRETS static from runtime.rs (interim routing secret infrastructure replaced by real KeyCustody::derive_pseudonym)",
+        "Add integration test verifying cross-bridge pseudonym determinism with shared key material"
+      ],
+      "blockedBy": [
+        "SCP-110",
+        "SCP-093"
+      ],
+      "tools": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "ADR-006: Platform Abstraction Traits — KeyCustody trait with 7 methods including derive_pseudonym"
+        },
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "ADR-021: UniFFI Bridge — KeyCustodyProvider callback interface (currently incomplete: 5 of 7 methods)"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "ADR-025: Apple Platform Adapter — AppleKeyCustody as KeyCustodyProvider, Secure Enclave wiring (lines 334-578)"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "ADR-027: Android Platform Adapter — key_material = public key bytes amendment for cross-platform determinism"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "§9.10.4 — Per-context pseudonym derivation via HMAC-SHA256(identity_key_material, context_id || \"scp-pseudonym\"); line 530 stale text fixed to say public key bytes per ADR-027"
+        },
+        {
+          "file": "crates/scp-ffi/src/runtime.rs",
+          "section": "Lines 358-363 — get_or_create_routing_secret() generates random 32-byte per-identity secrets for interim routing ID derivation; IDENTITY_ROUTING_SECRETS static. Both will be removed when KeyCustody::derive_pseudonym is wired"
+        },
+        {
+          "file": "crates/scp-ffi/src/identity.rs",
+          "section": "Lines 198-219 — parse_custody stub always returns InMemoryKeyCustody; lines 16-21 — KeyHandles unsafe across GIL; lines 349-367 — rotate_key always errors"
+        },
+        {
+          "file": "crates/scp-ffi/uniffi/src/bridge.rs",
+          "section": "Lines 930-968 — InMemory path retains core_id+custody in handle; Platform/Software paths error"
+        },
+        {
+          "file": "crates/scp-ffi/uniffi/src/lib.rs",
+          "section": "Lines 295-317 — KeyCustodyProvider callback interface missing derive_pseudonym and dh_agree"
+        },
+        {
+          "file": "crates/scp-ffi/src/context.rs",
+          "section": "Lines 465-500 — HMAC-SHA256(random_secret, ...) stub routing ID derivation"
+        },
+        {
+          "file": "crates/scp-platform/src/traits.rs",
+          "section": "Lines 332-354 — KeyCustody::derive_pseudonym trait definition; line 340 doc fixed to say public key bytes per ADR-027"
+        },
+        {
+          "file": "crates/scp-platform/src/testing/key_custody.rs",
+          "section": "Line 333 — InMemoryKeyCustody::derive_pseudonym uses signing_key.to_bytes() (private key bytes) as HMAC key; must change to verifying_key.to_bytes() (public key bytes) per ADR-027. Golden vector test at line 626 will need new expected values"
+        },
+        {
+          "file": "crates/scp-core/src/envelope/inner.rs",
+          "section": "Line 122 — create_inner_envelope takes key_custody for message signing"
+        },
+        {
+          "file": "crates/scp-core/src/crypto/ucan/mint.rs",
+          "section": "Line 129 — mint_ucan takes key_custody for token signing; line 292 — delegate_ucan takes key_custody for delegation chain signing"
+        },
+        {
+          "file": "crates/scp-core/src/identity/dht.rs",
+          "section": "Line 155 — make_sign_fn captures Arc<K: KeyCustody>; line 459 — rotate_active_key takes key_custody; line 531 — migrate_identity takes key_custody"
+        },
+        {
+          "file": "crates/scp-core/src/event_log/checkpoint.rs",
+          "section": "Line 319 — CheckpointManager::maybe_create_checkpoint; line 358 — force_create_checkpoint; line 794 — generate_checkpoint (all take key_custody)"
+        },
+        {
+          "file": "crates/scp-core/src/crypto/sender_keys/key_protocol.rs",
+          "section": "Lines 205, 263, 429, 483, 579 — all sender key protocol functions take key_custody"
+        },
+        {
+          "file": "crates/scp-ffi/wasm/src/custody.rs",
+          "section": "Lines 1-32 — JsKeyCustody extern type with derive_pseudonym; line 97 doc fixed to say public_key_bytes per ADR-027"
+        }
+      ],
+      "details": {
+        "designInvariant": "Private key material MUST NOT cross any FFI boundary (ADR-006). All signing, pseudonym derivation, and DH agreement happens inside the custody boundary. FFI bridges pass data-to-sign across the boundary and receive signatures back. KeyHandle is an opaque u64 index into the custody provider's internal store.",
+        "adr027Amendment": "ADR-027 amended key_material for HMAC pseudonym derivation from private key bytes to public key bytes for cross-platform determinism (hardware TEE keys have no extractable private bytes). All adapters (Apple, Android, in-memory) MUST use publicKey(keyHandle) bytes as the HMAC key. Three doc inconsistencies were found and already fixed: (1) traits.rs:340, (2) wasm/custody.rs:97, (3) 09-security-model.md:530. One code bug remains: InMemoryKeyCustody at key_custody.rs:333 uses signing_key.to_bytes() (private key) — must change to verifying_key.to_bytes() (public key). Golden vector test at key_custody.rs:626 will need updated expected values.",
+        "keyCustodyConsumers": {
+          "identity": [
+            "DidMethod::create — trait method (identity/mod.rs:231) — called by all identity_create bridge functions",
+            "DidMethod::rotate — trait method (identity/mod.rs:277) — called by py_identity_rotate_key (currently errors)"
+          ],
+          "envelope": [
+            "create_inner_envelope (inner.rs:122) — message signing, called by context send paths",
+            "derive_pseudonym (pseudonym.rs:39) — routing ID derivation, called by context create paths"
+          ],
+          "eventLog": [
+            "CheckpointManager::maybe_create_checkpoint (checkpoint.rs:319) — conditional checkpoint",
+            "CheckpointManager::force_create_checkpoint (checkpoint.rs:358) — unconditional checkpoint",
+            "generate_checkpoint (checkpoint.rs:794) — public free function"
+          ],
+          "ucan": [
+            "mint_ucan (mint.rs:129) — token signing (py_ucan_mint is a stub that doesn't call this yet)",
+            "delegate_ucan (mint.rs:292) — delegation chain signing (no FFI bridge function exists yet; SCP-056/SCP-057 defined the scp-core impl and Python wrapper but bridge wiring is missing)"
+          ],
+          "senderKeys": [
+            "publish_sender_key_epoch_advance (key_protocol.rs:205)",
+            "request_sender_key (key_protocol.rs:263)",
+            "open_sender_key_response (key_protocol.rs:429)",
+            "send_block_notification (key_protocol.rs:483)",
+            "rotate_sender_key_for_block (key_protocol.rs:579)"
+          ]
+        },
+        "internalConsumers": "Functions that take KeyCustody but are called internally by the above (don't need separate FFI wiring): DidDht::make_sign_fn (dht.rs:155, captures Arc<K> for signing closure), DidDht::rotate_active_key (dht.rs:459, called by DidMethod::rotate at line 914), DidDht::create_new_identity_keys (dht.rs:597, called by migrate_identity), DidDht::build_migration_proof (dht.rs:646, called by migrate_identity), generate_checkpoint_at (checkpoint.rs:882, called by CheckpointManager methods).",
+        "notYetExposedViaFFI": "Two scp-core functions take KeyCustody but have no corresponding FFI bridge function: (1) delegate_ucan (mint.rs:292) — SCP-056 implemented the scp-core function and SCP-057 defined a Python wrapper, but no py_ucan_delegate bridge function exists in crates/scp-ffi/src/ucan.rs. (2) DidDht::migrate_identity (dht.rs:531) — SCP-008 implemented scp-core but no py_identity_migrate bridge function exists. This story should add bridge functions for both, since they require KeyCustody and are part of the complete FFI surface.",
+        "sealEnvelopeNote": "seal_envelope (outer.rs:169) takes routing_id: &[u8] and InnerEnvelope as pre-computed inputs. It does not take KeyCustody directly, but both inputs require KeyCustody upstream: routing_id comes from derive_pseudonym, and InnerEnvelope comes from create_inner_envelope which signs with KeyCustody. The entire message send path is blocked without this wiring.",
+        "inMemoryCodeBug": "InMemoryKeyCustody::derive_pseudonym at key_custody.rs:333 uses signing_key.to_bytes() (Ed25519 private/secret key bytes, 32 bytes) as the HMAC key. ADR-027 mandates verifying_key.to_bytes() (Ed25519 public key bytes, 32 bytes) for cross-platform determinism — hardware TEE keys (Android Keystore, Secure Enclave) cannot export private bytes. AndroidKeyCustody.kt correctly uses publicKey(keyHandle) at line 178. AppleKeyCustody.swift correctly uses publicKey(). InMemoryKeyCustody is the outlier. The golden vector test at key_custody.rs:626 will need updated expected values after the fix."
+      }
+    },
+    {
+      "id": "SCP-215",
+      "title": "Error code range audit and normalization across all SDKs",
+      "gate": "gate-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/standards/sdk-common.md",
+        "crates/scp-ffi/src/mcp.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/src/ucan.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/wasm/src/identity.rs",
+        "crates/scp-ffi/wasm/src/context.rs",
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/Types.kt",
+        ".docs/adrs/phase-5.md",
+        ".docs/adrs/phase-6.md"
+      ],
+      "description": "Audit and normalize every error code across all SDKs to conform to the SCP-{PREFIX}-{NUMBER} standard defined in .docs/standards/sdk-common.md.\n\nPR #118 agent review revealed systematic non-conformance: 18+ distinct prefixes in the codebase versus 9 defined ranges, three numbering conventions (bare 3-digit, correct 4-digit, wrong-range 4-digit), prefix spelling variants (PERM/PRM, VALID/VAL, TRANS/TRANSPORT/TXP), and an outright range swap in NAPI (TOOL codes in TRANS range and vice versa). Root cause: the standard existed (Feb 23) but implementing agents did not read it.\n\nAdditionally, SCP-MCP- codes (8001-8008 in Python mcp.py) now collide with the SCP-STORAGE- range (8000-8999) allocated during the PR #118 fix. SCP-MCP- needs its own range.",
+      "acceptanceCriteria": [
+        "Every SCP-{PREFIX}-{NUMBER} code in the codebase falls within its sdk-common.md allocated range",
+        "No two prefixes share a numeric range — each prefix has an exclusive range",
+        "SCP-MCP- has its own allocated range in sdk-common.md (not colliding with SCP-STORAGE- 8000-8999)",
+        "Python mcp.py codes (SCP-MCP-8001..8008) updated to the new SCP-MCP- range",
+        "NAPI TOOL/TRANS range swap corrected — SCP-TOOL- codes are in 6000-6999, SCP-TRANS- codes are in 5000-5999",
+        "All bare 3-digit codes normalized to 4-digit within their correct range",
+        "Prefix spellings unified: PERM not PRM, VALID not VAL, TRANS not TRANSPORT or TXP",
+        "ADR phase-5.md code examples use conformant codes (SCP-CTX-001 → SCP-CTX-3001)",
+        "ADR phase-6.md code examples use conformant codes (SCP-PUSH- → SCP-TRANS-, SCP-IDENTITY- → SCP-IDENT-, SCP-CTX-001 → SCP-CTX-3001)",
+        "CI conformance test (grep-based) prevents future drift from sdk-common.md ranges"
+      ],
+      "actionItems": [
+        "Allocate SCP-MCP- range in sdk-common.md (10000-10999)",
+        "Update Python mcp.py SCP-MCP-8001..8008 to new range (SCP-MCP-10001..10008)",
+        "Fix NAPI error codes: swap TOOL and TRANS codes back to correct ranges",
+        "Normalize bare 3-digit codes to 4-digit in all SDKs",
+        "Unify prefix spellings across all SDKs (PERM, VALID, TRANS)",
+        "Fix ADR phase-5.md examples: SCP-CTX-001 → SCP-CTX-3001 (2 occurrences)",
+        "Fix ADR phase-6.md examples: SCP-PUSH-5001/5002 → SCP-TRANS-5001/5002, SCP-IDENTITY-1001 → SCP-IDENT-1001, SCP-CTX-001 → SCP-CTX-3001",
+        "Add CI grep test that validates all SCP-{PREFIX}-{NUMBER} codes against sdk-common.md ranges"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "Error code format table — 9 defined ranges (IDENT, DID, CTX, CRYPTO, TRANS, TOOL, VALID, STORAGE, ATTEST)"
+        },
+        {
+          "file": "PR #118",
+          "section": "7-agent review finding #3 — SCP-STORAGE-/SCP-ATTEST- collision with SCP-TOOL- 6000-6999 range"
+        },
+        {
+          "file": "PR #118",
+          "section": "Comprehensive error code audit — 18+ distinct prefixes, range swaps, spelling variants"
+        }
+      ],
+      "details": {
+        "currentChaos": "18+ distinct prefixes found: SCP-IDENT, SCP-DID, SCP-CTX, SCP-CRYPTO, SCP-TRANS, SCP-TOOL, SCP-VALID, SCP-STORAGE, SCP-ATTEST, SCP-MCP, SCP-PRM, SCP-PERM, SCP-VAL, SCP-TRANSPORT, SCP-TXP, SCP-KEY, SCP-PUSH, SCP-IDENTITY. Three numbering conventions: bare 3-digit (001, 002), correct 4-digit (1001, 2001), wrong-range 4-digit (6001 in STORAGE). NAPI has TOOL codes SCP-TOOL-5001..5004 in TRANS range and TRANS codes SCP-TRANS-6001 in TOOL range.",
+        "rangeCollision": "SCP-MCP- codes 8001-8008 (Python mcp.py) now land in SCP-STORAGE- range 8000-8999 (allocated during PR #118 fix). Need separate range allocation."
+      }
+    },
+    {
+      "id": "SCP-216",
+      "title": "Specify and implement Python receive() iterator lifecycle semantics",
+      "gate": "gate-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/context.rs",
+        ".docs/adrs/phase-3.md",
+        ".docs/sketch.md"
+      ],
+      "description": "The Python receive() iterator (py_context_receive / PyMessageReceiver.__anext__) has placeholder semantics that conflate empty and closed channels. The __anext__ method uses sync try_recv() and maps both TryRecvError::Empty and TryRecvError::Disconnected to StopAsyncIteration. The sender _tx is dropped immediately after channel creation, meaning the channel is always disconnected.\n\nNo spec, ADR, or PRD story captures the intended lifecycle semantics. ADR-014 has only a function signature (line 291-293). By contrast, TypeScript (ADR-019 phase-4.md) specifies full onMessage/onError/onComplete callbacks, Swift (ADR-023 phase-5.md) specifies AsyncStream with continuation.yield/finish, and Kotlin (ADR-027 phase-6.md) specifies callbackFlow/awaitClose. sketch.md (lines 371-389) specifies AsyncStream<ContextEvent>, 1000-event buffer, oldest-drop overflow, and BufferOverflow warning event.\n\nThis story adds the missing lifecycle specification to ADR-014 and implements it.",
+      "acceptanceCriteria": [
+        "ADR-014 specifies receive() lifecycle: async channel receive (not sync try_recv), empty vs closed distinction, transport wiring, buffer overflow, shutdown triggers",
+        "__anext__ uses async recv() and distinguishes empty channel (await more) from closed channel (StopAsyncIteration)",
+        "Sender handle (_tx) wired to transport adapter message delivery pipeline — not immediately dropped",
+        "Buffer capacity is 1000 events with oldest-drop overflow behavior per sketch.md",
+        "BufferOverflow warning event emitted when buffer is full and oldest event is dropped",
+        "Channel closes deterministically on leave(), eviction, or context close",
+        "Tests cover: empty-then-message delivery, graceful close, buffer overflow with oldest-drop, concurrent receive"
+      ],
+      "actionItems": [
+        "Add receive lifecycle semantics section to ADR-014 in .docs/adrs/phase-3.md matching detail level of TypeScript/Swift/Kotlin ADRs",
+        "Replace try_recv() with async channel receive in PyMessageReceiver.__anext__ (context.rs)",
+        "Wire sender (_tx) to transport adapter message delivery instead of dropping immediately",
+        "Implement bounded buffer with 1000-event capacity and oldest-drop overflow policy",
+        "Add BufferOverflow warning event type",
+        "Add shutdown signal on membership loss (leave/evict/context-close)",
+        "Add unit tests for lifecycle transitions"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        {
+          "file": ".docs/sketch.md",
+          "section": "Lines 371-389 — receive() returns AsyncStream<ContextEvent>, buffer 1000 events, oldest-drop, BufferOverflow warning"
+        },
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "ADR-014 line 291-293 — receive() signature only, no lifecycle semantics"
+        },
+        {
+          "file": "crates/scp-ffi/src/context.rs",
+          "section": "Lines 388-408 — PyMessageReceiver.__anext__ uses sync try_recv(), conflates Empty/Disconnected"
+        },
+        {
+          "file": "crates/scp-ffi/src/context.rs",
+          "section": "Lines 719-727 — py_context_receive creates channel, immediately drops sender _tx"
+        },
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "ADR-019 — TypeScript receive pattern with onMessage/onError/onComplete callbacks (reference for detail level)"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "ADR-023 — Swift AsyncStream<Message> with continuation.yield/finish (reference for detail level)"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "ADR-027 — Kotlin callbackFlow/awaitClose (reference for detail level)"
+        }
+      ],
+      "details": {
+        "currentBehavior": "PyMessageReceiver.__anext__ at context.rs:388-408 uses sync try_recv(). TryRecvError::Empty and TryRecvError::Disconnected both map to StopAsyncIteration. py_context_receive at lines 719-727 creates an mpsc::channel(32) but immediately drops the sender _tx, so the channel is always in Disconnected state. Three inline comments document this as placeholder behavior.",
+        "intendedBehavior": "Per sketch.md: receive() returns AsyncStream<ContextEvent>. Stream stays open as long as membership is active. Buffer holds 1000 events. On overflow, oldest event is dropped and BufferOverflow warning is injected. Stream ends on leave/eviction/context-close."
+      }
+    },
+    {
+      "id": "SCP-217",
+      "title": "Wire StorageProvider into Python FFI bridge for identity persistence",
+      "gate": "gate-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        "crates/scp-ffi/src/lib.rs"
+      ],
+      "description": "py_identity_load (identity.rs:278) is a stub that reconstructs a PyIdentity from the DID string with in_memory custody instead of loading from persistent storage. The inline comment says \"full storage integration is a future story\" but no story was ever created.\n\nSCP-038 acceptance criterion 2 requires: \"py_identity_load(did) -> loads an existing identity from storage.\" This criterion is unmet. The Storage trait (scp-platform) and ProtocolStore (scp-core/store) exist, and platform implementations are done (SCP-113 Android, SCP-093 Apple). What is missing is:\n\n1. A StorageProvider injection point in the Python FFI bridge (analogous to SCP-214 for KeyCustody)\n2. py_identity_load calling ProtocolStore to retrieve persisted identity state\n3. py_identity_create persisting identity state after creation\n\nThis is the Storage counterpart to SCP-214 (KeyCustody wiring). Both are required for a functional production FFI bridge.",
+      "acceptanceCriteria": [
+        "Python FFI bridge accepts a StorageProvider at initialization (analogous to KeyCustody injection in SCP-214)",
+        "py_identity_create persists identity state (DID, custody type, key handles) via StorageProvider after successful creation",
+        "py_identity_load retrieves persisted identity state from StorageProvider and reconstructs a fully functional PyIdentity",
+        "py_identity_load returns an error if the DID is not found in storage (not a silent fallback to in_memory)",
+        "Identity state survives process restart when backed by persistent storage (SQLite, Keychain, etc.)",
+        "In-memory storage works for testing (InMemoryStorage from scp-platform/testing)",
+        "Storage key convention follows ProtocolStore patterns (e.g., identity/{did}/state)"
+      ],
+      "actionItems": [
+        "Add StorageProvider injection to Python FFI initialization (py_init or module-level registration)",
+        "Implement identity persistence in py_identity_create — store DID, custody type, key handle references",
+        "Implement real py_identity_load — retrieve from StorageProvider, reconstruct PyIdentity with correct custody",
+        "Add error path for missing identity in storage",
+        "Add integration test: create identity, restart (re-init bridge), load identity, verify DID matches"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        {
+          "file": "crates/scp-ffi/src/identity.rs",
+          "section": "Lines 278-299 — py_identity_load stub with inline comment referencing ADR-013 criterion 2"
+        },
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "ADR-013 — py_identity_load acceptance criterion"
+        },
+        {
+          "file": "crates/scp-platform/src/traits.rs",
+          "section": "Storage trait definition (6 methods: set, get, delete, list_keys, delete_prefix, exists)"
+        },
+        {
+          "file": ".docs/specs/17-persistence.md",
+          "section": "Persistence architecture — ProtocolStore layer, Storage trait"
+        }
+      ],
+      "details": {
+        "currentStub": "py_identity_load at identity.rs:278-299 validates DID format (did:dht: prefix) then returns PyIdentity { did, custody: \"in_memory\" } without any storage interaction. The inline comment says \"See ADR-013 acceptance criterion 2\" — the criterion exists but was never wired.",
+        "relationship": "This is the Storage analog of SCP-214 (KeyCustody wiring). SCP-214 wires KeyCustodyProvider for crypto operations; SCP-217 wires StorageProvider for identity persistence. Both are required for a production-ready Python FFI bridge."
+      }
     }
   ]
 }

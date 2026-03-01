@@ -110,3 +110,24 @@ Deep verification of SCP-036 through SCP-058. 23 stories, all marked "done". Ver
 - Bridge layers need function-by-function verification -- stub signatures look correct but return errors
 - Python wrappers that call non-existent bridge functions compile fine (dynamic dispatch) -- must cross-reference against bridge lib.rs module registration
 - Mock-based integration tests provide false confidence -- verify what the mocks are replacing
+
+## PR #118 Review: Android Platform Adapters + Kotlin Bridge (2026-02-28)
+Verdict: NEEDS REVISION (1 blocking finding).
+8 stories: SCP-110, SCP-111, SCP-112, SCP-113, SCP-115, SCP-211, SCP-212, SCP-213.
+
+### Blocking:
+- **PlatformAdapter.kt missing**: ADR-027 specifies 5 files, only 4 delivered. The factory `AndroidPlatformAdapter.make(context)` that wires adapters into `Scp.create()` does not exist.
+
+### Non-blocking:
+- `assertRequest()` vs ADR-027 spec `assert()` -- correct name per UniFFI, ADR needs update
+- `verify()` and `custodyType()` listed in ADR-027 scope but absent from Kotlin interface -- Rust trait also omits verify, custodyType redundant with KeyHandle.custodyType field
+- `softwareKeys` is `internal` not `private` -- exposes private key material within module
+- SQLCipher dependency uses `sqlcipher-android:4.6.1` not `android-database-sqlcipher:4.5.4` (different artifact)
+- `py_mcp_load_contexts` ignores `relay_url` param (prefixed with `_`)
+
+### Patterns (reusable):
+- ADR code samples diverge from implementation: method names, dependency versions, artifact IDs. Always verify actual code against ADR pseudocode.
+- When checking platform adapters against Rust traits, compare method-by-method including return types -- Kotlin interfaces may simplify (e.g. returning DestructionAttestation instead of `()`)
+- Android JVM unit tests cannot exercise hardware paths (Keystore, Play Integrity). Tests correctly scope to software/deterministic paths.
+- `internal` visibility in Kotlin leaks key material within module -- prefer `private` with API-only test assertions
+- PlatformAdapter factory is the critical glue between platform adapters and SDK entry point -- always verify it exists

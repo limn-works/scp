@@ -170,9 +170,12 @@ class AndroidKeyCustody : KeyCustodyProvider {
     }
 
     override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle {
-        // Algorithm: seed = HMAC-SHA256(identity_key_material, contextId || "scp-pseudonym")
+        // Algorithm: seed = HMAC-SHA256(ed25519_public_key_bytes, contextId || "scp-pseudonym")
         // pseudonym_keypair = Ed25519_keygen(seed[0..32])
-        val keyMaterial = publicKey(keyHandle)  // use public key as HMAC key material for hardware keys
+        // identity_key_material is the 32-byte public key for ALL adapter types (ADR-006 amendment,
+        // ADR-027): Android Keystore TEE on API 33+ cannot export private bytes. Using the public
+        // key as the HMAC key ensures cross-platform determinism across hardware and software adapters.
+        val keyMaterial = publicKey(keyHandle)  // 32-byte Ed25519 public key (canonical for all adapters)
         val mac = Mac.getInstance("HmacSHA256").apply {
             init(SecretKeySpec(keyMaterial, "HmacSHA256"))
             update(contextId)
@@ -238,9 +241,9 @@ class AndroidPushProvider(private val context: Context) : PushProvider {
         // FCM data payload: {"scp": "1"}
         // The value "1" is the wake signal. No context ID or sender information is present.
         val scpField = payload["scp"]
-            ?: throw ScpException("FCM payload missing 'scp' field", "SCP-PUSH-5001")
+            ?: throw ScpException("FCM payload missing 'scp' field", "SCP-TRANS-5001")
         if (scpField != "1") {
-            throw ScpException("FCM payload 'scp' field has unexpected value: $scpField", "SCP-PUSH-5002")
+            throw ScpException("FCM payload 'scp' field has unexpected value: $scpField", "SCP-TRANS-5002")
         }
         return WakeSignal.Pull  // connect to relay and pull pending envelopes
     }
@@ -363,7 +366,7 @@ suspend fun SCP.Companion.create(
     val adapter = when (custody) {
         "platform" -> AndroidPlatformAdapter.make(context)
         "in_memory" -> InMemoryPlatformAdapter.make()
-        else -> throw ScpException("Unknown custody type: $custody", "SCP-IDENTITY-1001")
+        else -> throw ScpException("Unknown custody type: $custody", "SCP-IDENT-1001")
     }
     return SCP(NativeLib.scpCreate(adapter))
 }
@@ -418,7 +421,7 @@ dependencies {
 6. **`AndroidKeyCustody.derivePseudonym(keyHandle, contextId)`:**
    - Computes `HMAC-SHA256(key_material, contextId || "scp-pseudonym")`. Derives Ed25519 keypair from first 32 bytes.
    - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE`.
-   - Identical derivation algorithm to ADR-006 in-memory adapter — cross-platform test vectors apply.
+   - **key_material definition (IMPORTANT):** For hardware-backed keys (API 33+), private key bytes are inaccessible inside the TEE and cannot be used as HMAC key material. `key_material` is therefore defined as the **raw 32-byte Ed25519 public key** for ALL adapters (hardware and software alike). This ensures cross-platform determinism: a given SCP identity always derives the same pseudonym for a given contextId regardless of whether the key is TEE-backed or software-backed. ADR-006 acceptance criterion 6 must be updated to reflect this definition. All adapters (Apple, Android, in-memory) MUST use `publicKey(keyHandle)` bytes as the HMAC key, not private key bytes. Cross-platform test vectors are defined using public key bytes.
 
 7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
    - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
@@ -436,8 +439,8 @@ dependencies {
 10. **`AndroidPushProvider.handleNotification(payload)`:**
     - Validates `payload["scp"] == "1"`.
     - Returns `WakeSignal.Pull` on valid payload.
-    - Throws `ScpException("SCP-PUSH-5001")` if `scp` field is absent.
-    - Throws `ScpException("SCP-PUSH-5002")` if `scp` field has unexpected value.
+    - Throws `ScpException("SCP-TRANS-5001")` if `scp` field is absent.
+    - Throws `ScpException("SCP-TRANS-5002")` if `scp` field has unexpected value.
     - No context ID, sender DID, or message content is present in or extracted from the payload.
 
 11. **`AndroidStorage.store(key, data)` / `retrieve(key)` / `delete(key)` / `listKeys(prefix)` / `deletePrefix(prefix)` / `exists(key)`:**
@@ -746,7 +749,7 @@ class Context internal constructor(internal val handle: ContextHandle) : AutoClo
 
     /** Send a message to this context. */
     suspend fun send(payload: ByteArray): Unit = withContext(Dispatchers.IO) {
-        if (state != "active") throw ContextException("Context is not active", "SCP-CTX-001")
+        if (state != "active") throw ContextException("Context is not active", "SCP-CTX-3001")
         handle.send(payload)
     }
 
@@ -1079,7 +1082,7 @@ dependencies {
 2. **`Scp.create()` factory:**
    - `Scp.create(custody = "in_memory")` returns an `Scp` instance with `identity.did` starting with `"did:dht:"`.
    - `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` returns an `Scp` instance with hardware-backed identity on API 33+.
-   - `Scp.create()` with an unknown custody string throws `IdentityException` with code `"SCP-IDENTITY-1001"`.
+   - `Scp.create()` with an unknown custody string throws `IdentityException` with code `"SCP-IDENT-1001"`.
 
 3. **`Identity` operations:**
 
@@ -1099,7 +1102,7 @@ dependencies {
    - `scp.createContext(params)` returns a `Context` with `state == "active"`.
    - `context.send(payload)` delivers an encrypted message (no throw for valid payload and active state).
    - `context.leave()` completes without throwing for a valid active context.
-   - After `close()`, `send()` throws `ContextException` with code `"SCP-CTX-001"`.
+   - After `close()`, `send()` throws `ContextException` with code `"SCP-CTX-3001"`.
    - `context.use { }` block calls `AutoCloseable.close()` on exit — verified by collecting the flow and asserting it completes after the block exits.
 
 5. **Message streaming via `Flow<Message>`:**

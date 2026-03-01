@@ -309,6 +309,28 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
    - `send()` and `invoke()` optionally accept an identity parameter (defaults to the creator if a single identity is active).
    - `receive()` returns an `AsyncIterator[Message]` for streaming incoming messages.
 
+   **`receive()` lifecycle semantics:**
+
+   The receive iterator uses an async bounded channel internally (capacity: 1000 events).
+   Transport adapter message delivery wires into the channel sender; the iterator reads
+   from the channel receiver.
+
+   - **Awaiting:** `__anext__` performs an async `recv()` (not sync `try_recv()`). When the
+     channel is empty, the coroutine suspends until a message arrives — it does **not** raise
+     `StopAsyncIteration` for an empty channel.
+   - **Completion:** `StopAsyncIteration` is raised only when the channel is closed (sender
+     dropped). The channel closes on: `leave()`, eviction, or context close.
+   - **Buffer overflow:** When the buffer is full (1000 events), the oldest event is dropped
+     and a `BufferOverflow` warning event is injected into the stream. This matches the
+     oldest-drop policy defined in `sketch.md` §receive.
+   - **Concurrency:** Multiple concurrent `async for` loops on the same iterator race for
+     messages — each message is delivered to exactly one consumer.
+
+   This matches the detail level of the TypeScript (ADR-019: `onMessage`/`onError`/`onComplete`
+   callbacks → async generator), Swift (ADR-023: `AsyncStream<Message>` with
+   `continuation.yield`/`finish`), and Kotlin (ADR-027: `callbackFlow`/`awaitClose`) receive
+   specifications.
+
 3. **`ToolDefinition` dataclass:**
 
    ```python

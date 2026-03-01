@@ -53,6 +53,38 @@ use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
 
 // ---------------------------------------------------------------------------
+// Bounded read_line — prevents OOM from unbounded line reads
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes to read for a single line from an MCP transport.
+/// 10 MiB is generous for JSON-RPC messages (typical MCP responses are < 1 MiB)
+/// while still preventing unbounded allocation from a malicious peer.
+const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Read a line from `reader` into `buf`, bounded to [`MAX_LINE_BYTES`].
+///
+/// Returns the number of bytes read (0 on EOF), like [`BufRead::read_line`].
+/// If the line exceeds the limit before a newline is found, returns an error.
+fn read_line_bounded<R: BufRead>(reader: &mut R, buf: &mut String) -> Result<usize, String> {
+    use std::io::Read;
+    // `Read::take` consumes `self`, but `Read` is implemented for `&mut R`
+    // so we pass `&mut *reader` which is `&mut R` — `take()` consumes the
+    // temporary reference, not the reader itself.
+    let mut bounded = (&mut *reader).take(MAX_LINE_BYTES);
+    let n = bounded
+        .read_line(buf)
+        .map_err(|e| format!("read error: {e}"))?;
+    // If we read exactly MAX_LINE_BYTES and there's no newline, the line
+    // was truncated — reject it rather than silently returning partial data.
+    if n as u64 == MAX_LINE_BYTES && !buf.ends_with('\n') {
+        return Err(format!(
+            "line exceeds {MAX_LINE_BYTES} byte limit — possible denial-of-service"
+        ));
+    }
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
 // Stdio client transport
 // ---------------------------------------------------------------------------
 
@@ -159,9 +191,7 @@ impl McpTransport for StdioClientTransport {
 
         // Read the response as a single line from stdout.
         let mut line = String::new();
-        let bytes_read = inner
-            .reader
-            .read_line(&mut line)
+        let bytes_read = read_line_bounded(&mut inner.reader, &mut line)
             .map_err(|e| format!("failed to read from subprocess stdout: {e}"))?;
         drop(inner);
 
@@ -276,8 +306,7 @@ impl SseClientTransport {
 
         // Read the HTTP status line and validate.
         let mut status_line = String::new();
-        let n = reader
-            .read_line(&mut status_line)
+        let n = read_line_bounded(&mut reader, &mut status_line)
             .map_err(|e| format!("failed to read HTTP status line: {e}"))?;
         if n == 0 {
             return Err("connection closed before HTTP status line".to_owned());
@@ -299,8 +328,7 @@ impl SseClientTransport {
         let mut header_line = String::new();
         loop {
             header_line.clear();
-            let n = reader
-                .read_line(&mut header_line)
+            let n = read_line_bounded(&mut reader, &mut header_line)
                 .map_err(|e| format!("failed to read SSE headers: {e}"))?;
             if n == 0 {
                 return Err("connection closed while reading SSE headers".to_owned());
@@ -314,8 +342,7 @@ impl SseClientTransport {
         let post_path;
         loop {
             let mut event_line = String::new();
-            let n = reader
-                .read_line(&mut event_line)
+            let n = read_line_bounded(&mut reader, &mut event_line)
                 .map_err(|e| format!("failed to read SSE event: {e}"))?;
             if n == 0 {
                 return Err("connection closed while waiting for endpoint event".to_owned());
@@ -407,8 +434,7 @@ impl McpTransport for SseClientTransport {
         // Read SSE events until we find a `message` event with our response.
         for _ in 0..MAX_SSE_EVENTS {
             let mut line = String::new();
-            let n = reader
-                .read_line(&mut line)
+            let n = read_line_bounded(reader, &mut line)
                 .map_err(|e| format!("failed to read SSE event: {e}"))?;
             if n == 0 {
                 return Err("SSE connection closed while waiting for response".to_owned());
@@ -625,11 +651,14 @@ impl ContextProvider for FfiBridgeProvider {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // Validates tool existence and input schema. No runtime handler
-        // dispatch is available at the FFI layer (tools are registered with
-        // metadata only), so validated input is echoed back. This is a
-        // meaningful improvement over the previous stub: the MCP client now
-        // gets schema enforcement. See ADR-010 and ADR-015.
+        // Validates tool existence and input schema, then dispatches to a
+        // registered handler if one exists. If no handler is registered, falls
+        // back to echoing the validated input with metadata (schema-only mode).
+        //
+        // The handler dispatch is sync because ContextProvider::invoke_tool is
+        // sync and Python handlers are GIL-bound (inherently sync). The async
+        // invoke_tool in scp-core is for contexts where Rust itself executes
+        // tools. See SCP-212, ADR-010, ADR-015.
         crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::ContextError(format!(
@@ -648,6 +677,30 @@ impl ContextProvider for FfiBridgeProvider {
                 ))
             })?;
 
+            // Dispatch to registered handler if available.
+            if let Some(handler) = rt.tool_handlers.get(tool_name) {
+                let handler = handler.clone();
+                // Call the handler with validated input. The handler is a sync
+                // closure wrapping a Python callable (acquired via GIL).
+                let output = handler(arguments).map_err(|e| {
+                    ScpPyError::ContextError(format!("tool handler for '{tool_name}' failed: {e}"))
+                })?;
+
+                // Validate output against the tool's output schema (defense-in-depth).
+                scp_core::context::tools::schema::validate_value_against_schema(
+                    &output,
+                    &registration.schema.output_schema,
+                )
+                .map_err(|msg| {
+                    ScpPyError::ValidationError(format!(
+                        "output validation failed for tool '{tool_name}': {msg}"
+                    ))
+                })?;
+
+                return Ok(output);
+            }
+
+            // No handler registered -- fall back to echo mode.
             Ok(serde_json::json!({
                 "tool": tool_name,
                 "context": context_id,
@@ -860,6 +913,13 @@ pub fn py_mcp_serve(
                             match reader.read_line(&mut line).await {
                                 Ok(0) | Err(_) => break, // EOF or read error
                                 Ok(_) => {}
+                            }
+                            // Bound check after read — server-side stdin comes
+                            // from the local parent process, not a remote peer,
+                            // so the risk is lower. This guards against oversized
+                            // payloads from a misbehaving MCP client.
+                            if line.len() as u64 > MAX_LINE_BYTES {
+                                break;
                             }
 
                             let trimmed = line.trim();
@@ -1344,25 +1404,41 @@ pub fn py_mcp_client_invoke(
     json_to_py_dict(py, &result_json)
 }
 
-/// Loads active contexts for a DID from a relay.
+/// Loads active contexts for a DID, combining local registry and relay discovery.
 ///
-/// Discovers the contexts that the given identity is a member of by
-/// querying the relay. Used during CLI startup to populate the MCP
-/// server with the agent's active contexts.
+/// Context discovery is **client-side** because the SCP relay is a dumb blob
+/// store with no identity-to-context mapping. This function:
+///
+/// 1. Collects contexts from the local runtime registry (always available).
+/// 2. Collects contexts from the known-contexts registry (SCP-213).
+/// 3. If a relay connection is active, probes known routing IDs via QUERY
+///    to determine which contexts have recent activity on the relay.
+/// 4. Falls back gracefully to local-only when the relay is unreachable.
+///
+/// Results are deduplicated by context ID. Each result dict contains:
+/// - `context_id` -- The context identifier.
+/// - `source` -- `"local"`, `"relay"`, or `"local+relay"`.
+/// - `creator_did` -- The context creator's DID (if available from runtime).
+/// - `member_count` -- Number of members (if available from runtime).
+/// - `tool_count` -- Number of registered tools (if available from runtime).
+/// - `relay_active` -- `True` if the relay returned blobs for this context.
 ///
 /// # Arguments
 ///
 /// * `identity_did` -- The DID to look up contexts for.
-/// * `relay_url` -- The relay URL to query.
+/// * `relay_url` -- The relay URL to query (used as a hint; the active
+///   transport connection is preferred if available).
 ///
 /// # Returns
 ///
-/// A list of context handle objects. Returns an empty list if no relay
-/// connection is available (no active transport connection).
+/// A list of context dicts. Returns an empty list if no contexts are found.
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the relay query fails.
+/// Raises `TransportError` if the relay query fails fatally (transient
+/// failures are handled by falling back to local-only).
+///
+/// See SCP-213, ADR-015 in `.docs/adrs/phase-3.md`.
 #[pyfunction]
 #[pyo3(name = "py_mcp_load_contexts")]
 pub fn py_mcp_load_contexts(
@@ -1370,17 +1446,32 @@ pub fn py_mcp_load_contexts(
     identity_did: &str,
     _relay_url: &str,
 ) -> PyResult<Vec<PyObject>> {
-    // Full relay discovery requires scp-transport wiring (not yet available).
-    // Return contexts from the local runtime registry that this identity is a
-    // member of. This is a meaningful improvement: locally created/joined
-    // contexts are now visible to MCP clients.
-    let context_ids = crate::runtime::context_ids_for_member(identity_did);
+    // Step 1: Collect contexts from the local runtime registry.
+    let local_context_ids = crate::runtime::context_ids_for_member(identity_did);
 
-    let mut results = Vec::with_capacity(context_ids.len());
-    for ctx_id in &context_ids {
+    // Step 2: Collect contexts from the known-contexts registry.
+    let known = crate::runtime::known_contexts_for_member(identity_did);
+
+    // Step 3: Probe relay for known routing IDs (if connected).
+    let relay_active_set = probe_relay_for_known_contexts(&known);
+
+    // Step 4: Build deduplicated result set.
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+
+    // Add local contexts first.
+    for ctx_id in &local_context_ids {
+        seen.insert(ctx_id.clone());
         let dict = PyDict::new(py);
         dict.set_item("context_id", ctx_id)?;
-        dict.set_item("source", "local")?;
+
+        let relay_active = relay_active_set.contains(ctx_id);
+        if relay_active {
+            dict.set_item("source", "local+relay")?;
+        } else {
+            dict.set_item("source", "local")?;
+        }
+        dict.set_item("relay_active", relay_active)?;
 
         // Enrich with creator DID and member count from runtime state.
         if let Ok(info) = crate::runtime::with_context(ctx_id, |rt| {
@@ -1398,7 +1489,78 @@ pub fn py_mcp_load_contexts(
         results.push(dict.into());
     }
 
+    // Add relay-only contexts (known but not in local registry).
+    for (ctx_id, known_ctx) in &known {
+        if seen.contains(ctx_id) {
+            continue;
+        }
+        seen.insert(ctx_id.clone());
+        let dict = PyDict::new(py);
+        dict.set_item("context_id", ctx_id)?;
+
+        let relay_active = relay_active_set.contains(ctx_id);
+        dict.set_item("source", "relay")?;
+        dict.set_item("relay_active", relay_active)?;
+        dict.set_item("relay_url", &known_ctx.relay_url)?;
+
+        results.push(dict.into());
+    }
+
     Ok(results)
+}
+
+/// Probes the relay for activity on known context routing IDs.
+///
+/// For each known context, sends a QUERY with `limit=1` to check if any
+/// blobs exist for that routing ID. Returns the set of context IDs that
+/// have activity on the relay.
+///
+/// Falls back to an empty set if no relay connection is available or if
+/// queries fail (graceful degradation).
+fn probe_relay_for_known_contexts(
+    known: &[(String, crate::runtime::KnownContext)],
+) -> std::collections::HashSet<String> {
+    use scp_transport::TransportAdapter;
+    use scp_transport::traits::RoutingId;
+
+    let mut active = std::collections::HashSet::new();
+
+    if known.is_empty() {
+        return active;
+    }
+
+    // Get the relay adapter. If none is connected, return empty set.
+    let Ok(Some(adapter)) = crate::runtime::get_relay_connection() else {
+        return active;
+    };
+
+    // Get the tokio runtime for blocking on async queries.
+    let Ok(rt) = crate::runtime() else {
+        return active;
+    };
+
+    // Probe each known context's routing ID on the relay.
+    for (ctx_id, known_ctx) in known {
+        let routing_id = RoutingId::new(known_ctx.routing_id);
+        let query_result = rt.block_on(async {
+            // Use query() from the TransportAdapter trait with limit-like
+            // behavior: we only need to know if any blobs exist. The QUERY
+            // message returns all matching blobs up to the default limit, but
+            // we only check if the result is non-empty.
+            adapter.query(&routing_id, None).await
+        });
+
+        match query_result {
+            Ok(envelopes) if !envelopes.is_empty() => {
+                active.insert(ctx_id.clone());
+            }
+            // Empty result (no activity) or query failure (relay error,
+            // timeout, etc.) — skip gracefully; other contexts may succeed.
+            _ => {}
+        }
+    }
+
+    active
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,6 +1667,73 @@ pub fn py_mcp_get_stdio_allowlist(py: Python<'_>) -> PyResult<PyObject> {
 }
 
 // ---------------------------------------------------------------------------
+// Tool handler registration
+// ---------------------------------------------------------------------------
+
+/// Registers a Python callable as the handler for a tool in a context.
+///
+/// The handler is called when the tool is invoked via MCP
+/// (`FfiBridgeProvider::invoke_tool`). It receives the tool's validated
+/// JSON input as a Python dict and must return a Python dict representing
+/// the JSON output.
+///
+/// The tool must already be registered in the context's tool registry
+/// (via `py_tool_register`) before a handler can be attached.
+///
+/// # Arguments
+///
+/// * `context_id` -- The context containing the tool.
+/// * `tool_name` -- The tool ID to attach the handler to.
+/// * `handler` -- A Python callable `(dict) -> dict`.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the context or tool is not found.
+///
+/// See SCP-212 and ADR-010 for the handler registration design.
+#[pyfunction]
+#[pyo3(name = "mcp_register_tool_handler")]
+#[allow(clippy::needless_pass_by_value)] // PyObject must be owned to clone_ref into the closure.
+pub fn py_register_tool_handler(
+    py: Python<'_>,
+    context_id: &str,
+    tool_name: &str,
+    handler: PyObject,
+) -> PyResult<()> {
+    // Verify the handler is callable before storing it.
+    if !handler.bind(py).is_callable() {
+        return Err(ScpPyError::ValidationError("handler must be callable".to_owned()).into());
+    }
+
+    // Wrap the Python callable in a Rust closure that acquires the GIL,
+    // converts JSON -> Python dict, calls the handler, and converts back.
+    let handler_ref = handler.clone_ref(py);
+    let rust_handler: crate::runtime::ToolHandler =
+        std::sync::Arc::new(move |input: serde_json::Value| {
+            Python::with_gil(|py| {
+                // Convert serde_json::Value -> Python dict.
+                let py_input = crate::types::json_to_py_dict(py, &input)
+                    .map_err(|e| format!("failed to convert input to Python dict: {e}"))?;
+
+                // Call the Python handler.
+                let py_result = handler_ref
+                    .call1(py, (py_input,))
+                    .map_err(|e| format!("Python handler raised an exception: {e}"))?;
+
+                // Convert Python result back to serde_json::Value.
+                let result_dict = py_result
+                    .downcast_bound::<PyDict>(py)
+                    .map_err(|_| "tool handler must return a dict".to_owned())?;
+                crate::types::py_dict_to_json(result_dict)
+                    .map_err(|e| format!("failed to convert handler output to JSON: {e}"))
+            })
+        });
+
+    crate::runtime::register_tool_handler(context_id, tool_name, rust_handler)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1531,6 +1760,7 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_mcp_disable_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_reset_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_get_stdio_allowlist, m)?)?;
+    m.add_function(wrap_pyfunction!(py_register_tool_handler, m)?)?;
     Ok(())
 }
 
@@ -1770,11 +2000,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_tool — validates schema and returns real output
+    // FfiBridgeProvider::invoke_tool — echo fallback when no handler
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ffi_bridge_provider_invoke_tool_returns_real_output() {
+    fn ffi_bridge_provider_invoke_tool_echo_fallback_without_handler() {
         let creator = "did:dht:z6MkCreatorInvokeTool";
         let ctx_id = setup_test_context(creator, true);
 
@@ -1790,7 +2020,7 @@ mod tests {
         let output = result.unwrap();
         assert_eq!(
             output["status"], "validated",
-            "status should be 'validated' (schema-only, no handler dispatch)"
+            "without handler, status should be 'validated' (echo mode)"
         );
         assert_eq!(output["tool"], "calculator");
         assert_eq!(output["context"], ctx_id);
@@ -1892,6 +2122,75 @@ mod tests {
         crate::runtime::remove_context(&ctx_id);
     }
 
+    // -----------------------------------------------------------------------
+    // Known context registry (SCP-213)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn known_context_registration_and_lookup() {
+        let creator = "did:dht:z6MkCreatorKnownCtx";
+        let ctx_id = crate::types::generate_random_id("known-ctx");
+        let routing_id = [0xAA; 32];
+
+        let known = crate::runtime::KnownContext {
+            routing_id,
+            relay_url: Some("ws://127.0.0.1:9000/scp/v1".to_owned()),
+            member_did: creator.to_owned(),
+            last_seen: 1_700_000_000,
+        };
+
+        crate::runtime::register_known_context(&ctx_id, known);
+
+        // Should be discoverable by member DID.
+        let found = crate::runtime::known_contexts_for_member(creator);
+        assert!(
+            found.iter().any(|(id, _)| id == &ctx_id),
+            "known context should be found by member DID"
+        );
+
+        // Should not be found for a different DID.
+        let not_found = crate::runtime::known_contexts_for_member("did:dht:z6MkSomeoneElse");
+        assert!(
+            !not_found.iter().any(|(id, _)| id == &ctx_id),
+            "known context should not be found for a different DID"
+        );
+
+        // Cleanup: remove_context also removes from known-contexts.
+        crate::runtime::remove_context(&ctx_id);
+        let after_remove = crate::runtime::known_contexts_for_member(creator);
+        assert!(
+            !after_remove.iter().any(|(id, _)| id == &ctx_id),
+            "known context should be removed after remove_context"
+        );
+    }
+
+    #[test]
+    fn probe_relay_with_no_connection_returns_empty() {
+        // When no relay connection is active, probing should return an empty set.
+        let known = vec![(
+            "test-ctx".to_owned(),
+            crate::runtime::KnownContext {
+                routing_id: [0xBB; 32],
+                relay_url: Some("ws://127.0.0.1:9000/scp/v1".to_owned()),
+                member_did: "did:dht:z6MkTest".to_owned(),
+                last_seen: 1_700_000_000,
+            },
+        )];
+
+        let active = probe_relay_for_known_contexts(&known);
+        assert!(
+            active.is_empty(),
+            "should return empty set when no relay is connected"
+        );
+    }
+
+    #[test]
+    fn probe_relay_with_empty_known_returns_empty() {
+        let known: Vec<(String, crate::runtime::KnownContext)> = vec![];
+        let active = probe_relay_for_known_contexts(&known);
+        assert!(active.is_empty(), "should return empty set for empty input");
+    }
+
     #[test]
     fn ffi_bridge_provider_subscribe_resource_accepts() {
         let provider = FfiBridgeProvider {
@@ -1899,6 +2198,138 @@ mod tests {
             context_ids: vec![],
         };
         assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool handler registration and dispatch (SCP-212)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_tool_handler_and_invoke_dispatches_through_handler() {
+        let creator = "did:dht:z6MkCreatorHandler";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a Rust handler that adds two numbers (simulates a Python handler).
+        let handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|input: serde_json::Value| {
+                let a = input
+                    .get("a")
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| "missing 'a'".to_owned())?;
+                let b = input
+                    .get("b")
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| "missing 'b'".to_owned())?;
+                Ok(serde_json::json!({"result": a + b}))
+            });
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        let input = serde_json::json!({"a": 3, "b": 4});
+        let result = provider.invoke_tool(&ctx_id, "calculator", input);
+        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+
+        let output = result.unwrap();
+        // Handler returns computed output, not echoed input.
+        assert_eq!(
+            output,
+            serde_json::json!({"result": 7.0}),
+            "handler should compute a + b = 7"
+        );
+        // Should NOT have the echo-mode "status" field.
+        assert!(
+            output.get("status").is_none(),
+            "handler output should not contain echo-mode 'status' field"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn register_tool_handler_rejects_unregistered_tool() {
+        let creator = "did:dht:z6MkCreatorHandlerReject";
+        let ctx_id = setup_test_context(creator, false); // No tool registered.
+
+        let handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|_input| Ok(serde_json::json!({})));
+
+        let result = crate::runtime::register_tool_handler(&ctx_id, "nonexistent", handler);
+        assert!(
+            result.is_err(),
+            "should reject handler for unregistered tool"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("not found"),
+            "error should mention tool not found: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_with_handler_validates_output_schema() {
+        let creator = "did:dht:z6MkCreatorOutVal";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a handler that returns a string instead of an object
+        // (violates the output schema which requires an object).
+        let bad_handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|_input| Ok(serde_json::json!("not an object")));
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", bad_handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        assert!(
+            result.is_err(),
+            "handler returning invalid output should be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("output validation"),
+            "error should mention output validation: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_handler_error_is_propagated() {
+        let creator = "did:dht:z6MkCreatorHandlerErr";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a handler that always fails.
+        let failing_handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|_input| Err("computation exploded".to_owned()));
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", failing_handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        assert!(result.is_err(), "failing handler should propagate error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("computation exploded"),
+            "error should contain handler error message: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
     }
 
     // -----------------------------------------------------------------------

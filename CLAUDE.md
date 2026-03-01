@@ -50,6 +50,20 @@ SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure p
 - Protocol-first design; inject through initializers; no singletons
 - APIs: self-evident, one happy path
 
+**Stubs:**
+- Every stub must reference a PRD story ID (`// Stub — see SCP-NNN`)
+- Stories marked "done" must have zero stubs against their acceptance criteria
+- Each language enforces via CI: Rust (`clippy::todo/unimplemented = "deny"`), Kotlin (detekt `ForbiddenComment`), Python (ruff `FIX`), Swift (SwiftLint `todo`), TypeScript (ESLint `no-warning-comments`)
+- See `.docs/standards/sdk-common.md` §Stub and Placeholder Policy
+
+### Toolchain
+
+All project tools are managed via [mise](https://mise.jdx.dev/) (see `.mise.toml`). The system `python3` is Xcode's Python 3.9 — **do not use it**. Always use `python3.12` for anything Python-related (tests, maturin, pip). Key commands:
+- `cargo test -p scp-ffi` requires: `DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") cargo test -p scp-ffi`
+- `cargo test --workspace` includes scp-ffi — set `DYLD_LIBRARY_PATH` or it will fail to link
+- Kotlin/Android: JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise
+- WASM: `wasm-pack` via cargo, `wasm32-unknown-unknown` target installed
+
 ### Git
 
 - Use worktrees for non trivial changes or when you're not already in one

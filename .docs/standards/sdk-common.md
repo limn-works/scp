@@ -37,6 +37,30 @@ ScpError (root)
 | `SCP-TRANS-` | 5000-5999 |
 | `SCP-TOOL-` | 6000-6999 |
 | `SCP-VALID-` | 7000-7999 |
+| `SCP-STORAGE-` | 8000-8999 |
+| `SCP-ATTEST-` | 9000-9999 |
+
+## Stub and Placeholder Policy
+
+Code that does not fully implement its documented contract (acceptance criterion, ADR spec, or trait method) is a **stub**. Stubs are tolerated during phased implementation but must be traceable to the planning system.
+
+### Requirements
+
+1. **Every stub must reference a PRD story ID** in its doc comment or inline comment. The story must have acceptance criteria that, when met, will remove the stub. Example: `// Stub — see SCP-217 for storage wiring`.
+2. **No silent stubs.** A function that returns a placeholder value (e.g., hardcoded default, empty result, reconstructed-from-args) without documenting the gap is a bug, not a stub.
+3. **Stories marked "done" must have zero stubs** against their acceptance criteria. If a criterion is unmet, the story status must be `in_progress` or `pending` with a `blockedBy` reference.
+
+### Enforcement
+
+| Language | Mechanism |
+|----------|-----------|
+| Rust | `clippy::todo = "deny"`, `clippy::unimplemented = "deny"` (compile-time). Inline `// Stub —` comments reference story IDs (review-time). |
+| Kotlin | detekt `ForbiddenComment` rule with `TODO`, `FIXME`, `HACK` values (CI). |
+| Python | ruff `FIX` rules (`FIX001` through `FIX004`) for `TODO`, `FIXME`, `HACK`, `XXX` (CI). |
+| Swift | SwiftLint `todo` rule (CI). |
+| TypeScript | ESLint `no-warning-comments` rule (CI). |
+
+All languages: PR review must verify that any function described as a stub in code comments has a corresponding PRD story with `status != "done"`.
 
 ## Async Patterns
 

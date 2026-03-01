@@ -477,7 +477,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - `publicKey(keyHandle: String) -> Data`: Returns the 32-byte public key for a handle. Derived from the stored private key bytes.
    - `destroyKey(keyHandle: String)`: Deletes the Keychain item. Verifies deletion by confirming `errSecItemNotFound` on re-fetch. Returns `PlatformError.destructionFailed` if the item persists.
    - `dhAgree(keyHandle: String, peerPublic: Data) -> Data`: Performs X25519 ECDH. Returns the 32-byte shared secret. Private key never leaves the `AppleKeyCustody` implementation boundary. Returns `PlatformError.wrongKeyType` for Ed25519 handles.
-   - `derivePseudonym(keyHandle: String, contextId: Data) -> PseudonymKeypair`: Computes `HMAC-SHA256(ed25519_private_key_bytes, contextId || "scp-pseudonym")`, derives Ed25519 keypair from the first 32 bytes. Algorithm is identical to `InMemoryKeyCustody` per ADR-006. Returns `PlatformError.wrongKeyType` for X25519 handles.
+   - `derivePseudonym(keyHandle: String, contextId: Data) -> PseudonymKeypair`: Computes `HMAC-SHA256(ed25519_public_key_bytes, contextId || "scp-pseudonym")`, derives Ed25519 keypair from the first 32 bytes. **Amendment (ADR-027):** Originally `ed25519_private_key_bytes`; corrected to `ed25519_public_key_bytes` to match the canonical cross-platform definition (Android Keystore TEE cannot export private bytes). The Apple Keychain adapter must be updated to use public key bytes to maintain cross-platform test vector compatibility. Returns `PlatformError.wrongKeyType` for X25519 handles.
    - `custodyType(keyHandle: String) -> CustodyType`: Returns `CustodyType.keychain`.
 
 2. **`AppleKeyCustody` — Keychain access:**
@@ -792,7 +792,7 @@ public actor SCPContext {
 
     /// Send a message to this context.
     public func send(_ payload: Data) async throws {
-        guard state == .active else { throw ScpError.context(message: "Context is not active", code: "SCP-CTX-001") }
+        guard state == .active else { throw ScpError.context(message: "Context is not active", code: "SCP-CTX-3001") }
         try await context_send(handle: handle, payload: payload)
     }
 
@@ -1092,7 +1092,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
    - `await scp.createContext(params:)` returns an `SCPContext` with `state == .active`.
    - `await context.send(payload)` delivers an encrypted message (no throw for valid payload).
    - `await context.close()` transitions `state` to `.closed` and finishes the message stream.
-   - After `close()`, `send()` throws `ScpError.context` with code `"SCP-CTX-001"`.
+   - After `close()`, `send()` throws `ScpError.context` with code `"SCP-CTX-3001"`.
    - `deinit` without `close()` triggers cleanup — verified by allocating a context and setting its reference to nil without calling `close()`, then asserting no resource leak in the test teardown.
 
 5. **Message streaming via `AsyncStream<Message>`:**

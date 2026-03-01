@@ -52,6 +52,8 @@ cargo = "warn"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+todo = "deny"
+unimplemented = "deny"
 ```
 
 ## Rustfmt Configuration

@@ -16,6 +16,7 @@ A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live ru
 - `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9)
 - `ceiling_strings: HashSet<String>` — capability ceiling as `{resource}:{action}` strings (ADR-016 step 8)
 - `creator_did` — the DID of the context creator
+- `tool_handlers: HashMap<String, ToolHandler>` — registered tool handler closures keyed by tool ID (SCP-212)
 
 DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpPyError>` with typed errors.
 
@@ -30,14 +31,14 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 | `tools.rs` | scp-core tools | `py_tool_register`, `py_tool_invoke`, `py_tool_verify` |
 | `ucan.rs` | scp-core UCAN | `py_ucan_validate`, `py_ucan_mint`, `py_ucan_revoke` |
 | `event_log.rs` | scp-core event_log | `py_event_log_query`, `py_event_log_verify` |
-| `mcp.rs` | scp-mcp | `py_mcp_serve`, `py_mcp_client_connect_stdio/sse`, `py_mcp_client_disconnect`, `py_mcp_client_list_tools`, `py_mcp_client_invoke`, `py_mcp_server_stop/wait`, `py_mcp_server_register/deregister_tool`, `py_mcp_server_list_contexts` |
-| `transport.rs` | scp-transport | `py_transport_connect`, `py_transport_disconnect` |
+| `mcp.rs` | scp-mcp | `py_mcp_serve`, `py_mcp_client_connect_stdio/sse`, `py_mcp_client_disconnect`, `py_mcp_client_list_tools`, `py_mcp_client_invoke`, `py_mcp_server_stop/wait`, `py_mcp_server_register/deregister_tool`, `py_mcp_server_list_contexts`, `py_register_tool_handler` |
+| `transport.rs` | scp-transport | `py_transport_connect`, `py_transport_disconnect`, `py_transport_status` |
 
 ### Build
 
 - `crate-type = ["cdylib", "rlib"]` — cdylib for Python extension module, rlib for test binary linkage
 - `extension-module` is a crate feature (not default) — maturin passes it explicitly via pyproject.toml
-- Rust tests: `./scripts/test.sh rust` (or `DYLD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") cargo test -p scp-ffi`)
+- Rust tests: `DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") cargo test -p scp-ffi` (Python 3.12 available via mise — do NOT skip these tests)
 - Python integration tests: `maturin develop --release` + `pytest bindings/python/tests/`
 - Use `cargo check -p scp-ffi` to verify compilation without Python linkage
 - Full build via `maturin build --features extension-module` or `maturin develop`
@@ -81,7 +82,8 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. The `context_events` provider method returns event count and Merkle root, not raw events.
 - `ToolRegistry::registrations()` returns an iterator, not a Vec. There is no `invoke()` method — tool invocation checks tool existence and returns a JSON status response.
 - `SseClientTransport` uses raw `TcpStream` — `https://` URLs are explicitly rejected (no TLS). Only `http://` is supported; add `rustls` dependency for HTTPS.
-- `FfiBridgeProvider::validate_capability` performs real capability checking via `has_tool_invoke_capability` against the context's role state (SCP-210). Defense-in-depth alongside the UCAN layer. `invoke_tool` validates input against the tool's JSON schema and returns a response with `"status": "validated"` (no runtime handler dispatch at the FFI layer — tools are registered with metadata only).
+- `FfiBridgeProvider::validate_capability` performs real capability checking via `has_tool_invoke_capability` against the context's role state (SCP-210). Defense-in-depth alongside the UCAN layer. `invoke_tool` validates input against the tool's JSON schema and dispatches to a registered handler if one exists (SCP-212). If no handler is registered, falls back to echo mode with `"status": "validated"`. Handler output is also validated against the tool's output schema (defense-in-depth).
+- **Tool handler registration (SCP-212)**: `py_register_tool_handler(context_id, tool_name, handler)` wraps a Python callable in a Rust closure and stores it in `ContextRuntime::tool_handlers`. The handler is called by `FfiBridgeProvider::invoke_tool` when the tool is invoked via MCP. The tool must be registered in the `ToolRegistry` first. `ContextProvider::invoke_tool` is sync, and Python handlers are GIL-bound (inherently sync), so no async boundary crossing is needed at the FFI layer. Python SDK wrapper: `scp_sdk.mcp.register_tool_handler(context, tool_name, handler)`.
 - `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
 - SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
 - **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Only bare binary names are accepted — paths (absolute or relative) are rejected to prevent basename-spoofing bypasses. The OS resolves the binary via `PATH`. Per MCP Security Best Practices.
@@ -90,4 +92,13 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
   - `py_mcp_reset_stdio_allowlist()` — restore defaults and re-enable enforcement.
   - `py_mcp_get_stdio_allowlist()` — introspect current state (`{"allowed": [...], "unrestricted": bool}`).
   - Python SDK exposes these as module-level functions: `configure_stdio_allowlist()`, `disable_stdio_allowlist(i_trust_all_commands=True)`, `reset_stdio_allowlist()`, `get_stdio_allowlist()`. Pre-validation in `McpClient.connect()` catches path and allowlist issues before crossing FFI, raising `ValidationError` with actionable messages.
-- `py_mcp_load_contexts` returns locally registered contexts where the identity is a member (SCP-210). Full relay discovery requires scp-transport wiring (not yet available). Uses `runtime::context_ids_for_member()` to iterate the registry.
+- **Context discovery (SCP-213)**: `py_mcp_load_contexts` performs client-side context discovery combining three sources:
+  1. **Local runtime registry** (`runtime::context_ids_for_member()`) — always available
+  2. **Known-contexts registry** (`runtime::known_contexts_for_member()`) — tracks context-to-routing-id-to-relay mappings
+  3. **Relay probe** — if a relay connection is active (via `py_transport_connect`), probes known routing IDs via QUERY to detect active contexts
+  - Falls back gracefully to local-only when relay is unreachable. Results are deduplicated by context ID.
+  - The relay is a dumb blob store with no identity-to-context mapping; discovery is purely client-side.
+  - `py_transport_connect(relay_url)` creates a `NativeRelayAdapter` and stores it in `runtime::RELAY_CONNECTION`. `py_transport_disconnect()` clears it.
+  - `runtime::KnownContext` stores `routing_id`, `relay_url`, `member_did`, `last_seen` for each tracked context.
+  - Each result dict contains: `context_id`, `source` ("local"/"relay"/"local+relay"), `relay_active` (bool), plus optional `creator_did`/`member_count`/`tool_count`.
+  - Result dicts from bridge functions must be consumed with `h["key"]` syntax in Python — NOT `h.key`. Prefer returning a `#[pyclass]` struct for new structured return types.

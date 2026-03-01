@@ -391,6 +391,53 @@ def get_stdio_allowlist() -> dict[str, Any]:
     return bridge.py_mcp_get_stdio_allowlist()
 
 
+def register_tool_handler(
+    context: Context,
+    tool_name: str,
+    handler: Any,
+) -> None:
+    """Register a Python callable as the handler for an SCP tool.
+
+    When the tool is invoked via MCP, the handler is called with the
+    validated JSON input (as a Python dict) and must return a dict.
+
+    The tool must already be registered in the context's tool registry
+    (via ``context.register_tool()``) before a handler can be attached.
+
+    Args:
+        context: The SCP context containing the tool.
+        tool_name: The tool ID to attach the handler to.
+        handler: A callable ``(dict) -> dict`` that processes tool input
+            and returns tool output.
+
+    Raises:
+        ValidationError: If *handler* is not callable.
+        ContextError: If the context or tool is not found.
+
+    Example::
+
+        def my_handler(input: dict) -> dict:
+            return {"result": input["query"].upper()}
+
+        register_tool_handler(context, "my_tool", my_handler)
+
+    See SCP-212 and ADR-010 for the handler registration design.
+    """
+    if not callable(handler):
+        raise ValidationError(
+            "handler must be callable",
+            code="SCP-MCP-8008",
+        )
+
+    bridge = _bridge()
+    bridge.mcp_register_tool_handler(context.context_id, tool_name, handler)
+    logger.debug(
+        "Registered tool handler: context=%s, tool=%s",
+        context.context_id,
+        tool_name,
+    )
+
+
 class McpClient:
     """Client for consuming external MCP servers with SCP provenance wrapping.
 
@@ -684,7 +731,7 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
     context_handles = bridge.py_mcp_load_contexts(did, relay_url)
 
     # Step 4: Start the MCP server.
-    context_ids = [h.context_id for h in context_handles]
+    context_ids = [h["context_id"] for h in context_handles]
     handle = bridge.py_mcp_serve(did, context_ids, transport)
 
     logger.info(
@@ -727,6 +774,7 @@ __all__ = [
     "configure_stdio_allowlist",
     "disable_stdio_allowlist",
     "get_stdio_allowlist",
+    "register_tool_handler",
     "reset_stdio_allowlist",
     "serve_mcp",
 ]

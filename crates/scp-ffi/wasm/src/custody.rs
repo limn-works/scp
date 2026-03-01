@@ -94,7 +94,7 @@ extern "C" {
     ) -> Result<Vec<u8>, JsValue>;
 
     /// Derive a context-scoped Ed25519 pseudonym keypair.
-    /// Algorithm: seed = HMAC-SHA256(sk_bytes, context_id || "scp-pseudonym"), Ed25519_keygen(seed[0..32])
+    /// Algorithm: seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym"), Ed25519_keygen(seed[0..32])
     /// Returns a JS object: { publicKeyBytes: Uint8Array, keyId: string }
     #[wasm_bindgen(method, catch, js_name = "derivePseudonym")]
     pub fn derive_pseudonym(

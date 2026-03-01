@@ -145,5 +145,7 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew test

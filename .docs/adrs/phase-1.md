@@ -197,7 +197,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Delegates to `key_custody.derive_pseudonym(identity_key_handle, context_id)`.
    - Deterministic: same identity key + same context_id always produces the same pseudonym keypair.
    - Different `context_id` produces a different, unlinkable pseudonym.
-   - Uses `HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")` then `Ed25519_keygen(seed[0..32])`. The HMAC computation happens inside the custody boundary (HSM or software). The resulting PseudonymKeypair is software-managed.
+   - Uses `HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")` then `Ed25519_keygen(seed[0..32])`. `identity_key_material` is the raw 32-byte Ed25519 public key for all adapter types — this is the cross-platform canonical definition (see ADR-027 amendment). The resulting PseudonymKeypair is software-managed.
    - The pseudonym keypair's public key is the routing identifier used in outer envelopes.
 
 2. **`create_inner_envelope(context_id, sender_did, epoch, generation, sequence, timestamp, payload, provenance, signing_key) -> InnerEnvelope`**
@@ -779,7 +779,7 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
    - `public_key(key_handle) -> PublicKey`: Returns the public key for a handle (Ed25519 or X25519).
    - `destroy_key(key_handle) -> ()`: Removes the private key from the internal map. Subsequent operations with this handle fail.
    - `dh_agree(key_handle, peer_public) -> SharedSecret`: Performs X25519 ECDH. Returns error for Ed25519 handles.
-   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(ed25519_private_key_bytes, context_id || "scp-pseudonym")`, derives Ed25519 keypair from the first 32 bytes of the HMAC output. Returns error for X25519 handles.
+   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")`, derives Ed25519 keypair from the first 32 bytes of the HMAC output. Returns error for X25519 handles. **Amendment (ADR-027):** Originally specified as `ed25519_private_key_bytes`, but Android Keystore TEE on API 33+ does not permit private key export. All adapters (InMemory, Apple/Keychain, Android Keystore, Android software) MUST use the raw 32-byte public key as the HMAC key to ensure cross-platform determinism. See `.docs/lessons/kotlin/android-tee-pseudonym-derivation.md`.
    - `custody_type(key_handle) -> CustodyType::InMemory`.
    - Optionally accepts a seed for deterministic key generation in tests.
 
@@ -838,12 +838,15 @@ pub trait KeyCustody: Send + Sync {
     /// Derive a deterministic, context-scoped pseudonym keypair.
     ///
     /// Algorithm (all implementations MUST produce identical output):
-    ///   1. seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")
+    ///   1. seed = HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")
     ///   2. pseudonym_keypair = Ed25519_keygen(seed[0..32])
     ///
-    /// For hardware-backed keys: the HMAC is computed inside the HSM using
-    /// an associated symmetric key derived during generate_keypair.
-    /// For software keys: the HMAC uses the raw Ed25519 private key bytes.
+    /// identity_key_material is defined as the raw 32-byte Ed25519 PUBLIC key for ALL
+    /// adapters (hardware-backed and software alike). This is the only definition that
+    /// works uniformly: Android Keystore TEE (API 33+) does not permit private key export.
+    /// Amendment from ADR-027: original spec said "private key bytes" — corrected to
+    /// "public key bytes" to support TEE-backed adapters without cross-platform divergence.
+    /// See .docs/lessons/kotlin/android-tee-pseudonym-derivation.md.
     ///
     /// The returned PseudonymKeypair is always software-managed (derived output).
     /// Returns an error if the key handle refers to an X25519 key.

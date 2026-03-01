@@ -459,6 +459,51 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     crate::runtime::register_context(&context_id, identity_did)
         .map_err(|e| PyRuntimeError::new_err(format!("failed to register context runtime: {e}")))?;
 
+    // Register in the known-contexts registry for discovery via
+    // py_mcp_load_contexts. Derive a per-identity routing ID using
+    // HMAC-SHA256(random_secret, context_id || "scp-pseudonym") to preserve
+    // participant unlinkability. The random secret is per-identity and
+    // in-memory only — see runtime::get_or_create_routing_secret.
+    {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        type HmacSha256 = Hmac<Sha256>;
+
+        // Stub — see SCP-214 for KeyCustody wiring. Uses a per-identity random
+        // secret as the HMAC key (provides unlinkability but doesn't persist across
+        // restarts). Replace with scp_core::envelope::pseudonym::derive_pseudonym
+        // using real key material (§9.10.4).
+        let routing_secret = crate::runtime::get_or_create_routing_secret(identity_did);
+        let mut mac = HmacSha256::new_from_slice(&routing_secret)
+            .map_err(|e| PyRuntimeError::new_err(format!("HMAC initialization failed: {e}")))?;
+        mac.update(context_id.as_bytes());
+        mac.update(b"scp-pseudonym");
+        let routing_id: [u8; 32] = mac.finalize().into_bytes().into();
+
+        // Get the relay URL from transport status if a relay is connected.
+        let relay_url = match crate::transport::py_transport_status() {
+            Ok(status) => status.relay_url,
+            Err(e) => {
+                tracing::warn!("failed to query transport status during context registration: {e}");
+                None
+            }
+        };
+
+        let last_seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| PyRuntimeError::new_err(format!("system clock error: {e}")))?
+            .as_secs();
+
+        let known = crate::runtime::KnownContext {
+            routing_id,
+            relay_url,
+            member_did: identity_did.to_owned(),
+            last_seen,
+        };
+        crate::runtime::register_known_context(&context_id, known);
+    }
+
     // Transition to "active" -- in the full runtime this happens after MLS
     // group formation and parameter validation complete.
     {
