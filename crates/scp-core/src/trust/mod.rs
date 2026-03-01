@@ -50,12 +50,16 @@
 //! - [`ChallengeType`] -- Standard and custom challenge types.
 //! - [`VerificationMethod`] -- Self-attested vs challenge-verified.
 //! - [`ChallengeSigner`] -- Trait for signing challenge requests.
+//! - [`RenewalError`] -- Error type for attestation renewal.
+//! - [`RenewalChecker`] -- Trait for platform-specific renewal scheduling.
+//! - [`DefaultRenewalChecker`] -- Default renewal checker implementation.
 
 pub mod aggregate;
 pub mod attestation;
 pub mod behavioral;
 pub mod challenge;
 pub mod consequence;
+pub mod renewal;
 
 use std::collections::HashMap;
 
@@ -77,6 +81,9 @@ pub use challenge::{
 pub use consequence::{
     ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
     TriggeredConsequence, evaluate_consequence_rules,
+};
+pub use renewal::{
+    DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation,
 };
 
 // ---------------------------------------------------------------------------
