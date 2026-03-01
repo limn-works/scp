@@ -125,3 +125,109 @@ pub async fn event_log_verify(
     }
     .into())
 }
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Decodes a hex string into a 32-byte hash.
+///
+/// Used by absence proof verification to decode the `event_hash` field from
+/// the claim JSON. Rejects strings that are not exactly 64 hex characters
+/// (32 bytes).
+#[allow(dead_code)] // Will be used when event_log_verify is wired to scp-core.
+pub(crate) fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "expected 64 hex characters (32 bytes), got {}",
+            hex.len()
+        ));
+    }
+
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
+        bytes[i] =
+            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
+    }
+    Ok(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // decode_hex_hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_hex_hash_valid_32_bytes() {
+        // 64 hex characters representing 32 zero bytes.
+        let hex = "0".repeat(64);
+        let result = decode_hex_hash(&hex).unwrap();
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    #[test]
+    fn decode_hex_hash_valid_nonzero() {
+        // Known 32-byte value encoded as hex.
+        let mut expected = [0u8; 32];
+        expected[0] = 0xab;
+        expected[1] = 0xcd;
+        expected[31] = 0xef;
+        let hex = format!("abcd{}ef", "00".repeat(29));
+        let result = decode_hex_hash(&hex).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn decode_hex_hash_rejects_short_input() {
+        // 62 hex chars (31 bytes) — too short.
+        let hex = "ab".repeat(31);
+        let result = decode_hex_hash(&hex);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("expected 64 hex characters"),
+            "error should mention expected length, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_hex_hash_rejects_long_input() {
+        // 66 hex chars (33 bytes) — too long.
+        let hex = "ab".repeat(33);
+        let result = decode_hex_hash(&hex);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("expected 64 hex characters"),
+            "error should mention expected length, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_hex_hash_rejects_non_hex_characters() {
+        // 64 characters but containing 'gg' which is not valid hex.
+        let hex = format!("gg{}", "00".repeat(31));
+        let result = decode_hex_hash(&hex);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("hex decode error"),
+            "error should mention hex decode failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_hex_hash_rejects_empty_input() {
+        let result = decode_hex_hash("");
+        assert!(result.is_err());
+    }
+}
