@@ -48,7 +48,35 @@ When invoked, you will:
 - Determine the appropriate documentation location
 - Create or update documentation accordingly
 
-### 3. Documentation Locations
+### 3. Long-Term Memory (Vestige)
+
+You have access to Vestige, the project's long-term memory system. Use it alongside `.docs/` artifacts — they serve different purposes. Artifacts are the system of record; Vestige is cognitive recall across sessions.
+
+**What to remember** — always tag with connotation so future sessions know how to act on it:
+
+- **Good patterns** (tag `"good-pattern"`) — default to these. Proven approaches, preferred idioms, correct ways to use APIs. "This is how we do X."
+- **Bad patterns / anti-patterns** (tag `"anti-pattern"`) — avoid or detect these. Failed approaches, common mistakes, things that compiled but broke at runtime. "Never do X because Y."
+- **Bug fixes** (tag `"bug-fix"`) — error, root cause, solution, affected files. Recognize the same class of bug faster next time.
+- **Architectural decisions** — use `codebase(action="remember_decision")`. Mirrors the ADR for fast recall. Includes rationale and rejected alternatives so future sessions don't re-litigate.
+- **Toolchain gotchas** — environment quirks, build incantations, flag ordering issues that aren't worth a `.docs/lessons/` file.
+- **Session summaries** (tag `"session-end"`) — what was done, what's next.
+
+**When to update** (`memory(action="edit")`):
+- A previously saved fact is now outdated (e.g., a pattern changed, a decision was reversed)
+- A memory is partially correct and needs refinement
+
+**When to remove** (`memory(action="delete")`) or demote (`memory(action="demote")`):
+- A memory is wrong — demote it so it decays
+- A memory is obsolete — information was superseded or the code it describes no longer exists
+- A memory duplicates what's already in `.docs/` artifacts — the artifact is the source of truth, the memory is redundant
+
+**When to promote** (`memory(action="promote")`):
+- A memory proved useful in the current session
+- User confirms a recalled fact was helpful
+
+**Principle**: Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige is fluid cognitive recall across sessions. They complement each other: decisions and outcomes belong in artifacts *and* in Vestige (for fast retrieval without file reads). Keep memories small and tagged. `smart_ingest` deduplicates automatically — just save, don't pre-search.
+
+### 4. Documentation Locations
 
 **CLAUDE.md** — Update when:
 - New permanent coding conventions are established
@@ -91,7 +119,7 @@ When invoked, you will:
 - A significant planning discussion produces decisions worth preserving
 - Historical context for a design direction needs recording
 
-### 4. Quality Standards
+### 5. Quality Standards
 
 Before creating documentation, verify:
 - Would a new contributor need this?
@@ -108,7 +136,7 @@ For each piece of documentation:
 - Include dates where appropriate
 - Trace provenance: every claim should cite its source artifact
 
-### 5. CLAUDE.md Update Protocol
+### 6. CLAUDE.md Update Protocol
 
 When updating CLAUDE.md:
 - Preserve existing structure and formatting
@@ -118,7 +146,7 @@ When updating CLAUDE.md:
 - Ensure changes are permanent/universal, not task-specific
 - Keep the Project Map section accurate if `.docs/` structure changes
 
-### 6. Workflow
+### 7. Workflow
 
 When invoked:
 1. **Assess**: What knowledge needs capturing? Review recent changes, decisions, or outputs.
@@ -127,9 +155,10 @@ When invoked:
 4. **Draft**: Create clear, concise documentation following project conventions.
 5. **Cross-reference**: Link to related documents where appropriate. Maintain provenance chains.
 6. **Validate**: For PRD changes, run `python3 scripts/validate-prd.py`. For standard changes, verify downstream artifacts comply.
-7. **Verify**: Ensure documentation is in the correct location with proper formatting.
+7. **Sync memory**: Save new knowledge to Vestige. Update or demote stale memories. Promote memories that proved useful.
+8. **Verify**: Ensure documentation is in the correct location with proper formatting.
 
-### 7. What Not to Document
+### 8. What Not to Document
 
 - Obvious code behavior (let the code speak)
 - Temporary or task-specific decisions
@@ -138,11 +167,12 @@ When invoked:
 - Speculative future plans (only document decisions made)
 - Anything that contradicts the artifact flow (code observations don't become specs)
 
-### 8. Output Format
+### 9. Output Format
 
 After each chronicling run, report:
 - **Artifacts updated**: Which `.docs/` files were created or modified
 - **Lessons captured**: Any additions to `.docs/lessons/`
+- **Memories synced**: What was saved, updated, promoted, or demoted in Vestige
 - What knowledge was identified
 - Where it was documented (files created/updated)
 - Any cross-references or provenance chains added
