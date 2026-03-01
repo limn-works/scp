@@ -30,18 +30,23 @@ All shared types (`ScpException`, `WakeSignal`, `KeyType`, `CustodyType`, `KeyHa
 
 ### android.util.Base64 in unit tests
 
-`android.util.Base64` is not available in pure JVM unit tests. Tests that call `buildClientDataJSON()` or `computeNonce()` require either:
-- Robolectric (provides Android framework stubs)
-- Moving to `androidTest/` for instrumentation execution
-- A Base64 shim
+`android.util.Base64` is not available in pure JVM unit tests. `AndroidDeviceAttestationTest` uses Robolectric (`@RunWith(RobolectricTestRunner::class)` + JUnit 4) to provide real `android.util.Base64` implementations on the host JVM. Other test files that don't need Android framework classes stay on JUnit 5.
 
-### Null Context in unit tests
+### Context in unit tests
 
-The `AndroidDeviceAttestation` constructor requires a non-null `android.content.Context`. For unit testing deterministic helpers (`buildClientDataJSON`, `computeNonce`) that don't use the context, an unsafe null cast (`(null as Any?) as Context`) works at the JVM level. Integration tests on real devices should use `ApplicationProvider.getApplicationContext()`.
+`AndroidDeviceAttestationTest` uses `ApplicationProvider.getApplicationContext()` from `androidx.test:core` (provided by Robolectric) for a real application context. `AndroidPushProviderTest` uses a null cast (`(null as Any?) as Context`) because it only needs the type, not a real context — this works with `isReturnDefaultValues = true` in testOptions. Integration tests on real devices should use `ApplicationProvider.getApplicationContext()`.
 
 ### Play Integrity requires real device
 
 Play Integrity API calls fail on emulators and devices without Google Play Services. Unit tests cover deterministic logic only; integration tests require physical hardware.
+
+### SQLCipher 4.6+ package rename
+
+The dependency `net.zetetic:sqlcipher-android:4.6.x` uses package `net.zetetic.database.sqlcipher.*`. The old artifact `net.zetetic:android-database-sqlcipher:4.5.x` used `net.sqlcipher.database.*`. Key API differences: no `SQLiteDatabase.loadLibs()` (use `System.loadLibrary("sqlcipher")` instead), passphrase passed via `SQLiteOpenHelper` constructor (not `getWritableDatabase(String)`), and `SQLiteOpenHelper` implements `androidx.sqlite.db.SupportSQLiteOpenHelper` (requires `androidx.sqlite:sqlite:2.2.0`).
+
+### EdDSA key generation uses NamedParameterSpec, not EdDSAParameterSpec
+
+For Android Keystore Ed25519 key generation (API 33+), use `NamedParameterSpec.ED25519` as the algorithm parameter spec. `EdDSAParameterSpec` is for specifying prehash mode and context bytes, not the curve. The constant `Ed25519` lives on `NamedParameterSpec`, not `EdDSAParameterSpec`.
 
 ### Android Keystore AES-GCM requires setRandomizedEncryptionRequired(false) for deterministic IV
 
@@ -70,7 +75,8 @@ The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matchi
 - `com.google.android.play:integrity:1.4.0` — Play Integrity API
 - `org.bouncycastle:bcprov-jdk18on:1.80` — Software Ed25519 fallback
 - `com.google.firebase:firebase-messaging:24.1.0` — FCM push
-- `net.zetetic:sqlcipher-android:4.6.1` — Encrypted storage
+- `net.zetetic:sqlcipher-android:4.6.1` — Encrypted storage (package: `net.zetetic.database.sqlcipher.*`)
+- `androidx.sqlite:sqlite:2.2.0` — Required companion for sqlcipher-android 4.6+
 - `androidx.security:security-crypto:1.1.0-alpha06` — EncryptedSharedPreferences
 - `org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0` — Coroutines
 - `org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0` — Android dispatcher
@@ -80,5 +86,5 @@ The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matchi
 Follow `.docs/standards/kotlin.md` for code style, naming, and testing conventions. Key rules:
 - All I/O operations are `suspend` functions
 - Blocking FFI calls wrapped in `withContext(Dispatchers.IO)`
-- JUnit 5 with backtick-quoted test names
+- JUnit 5 with backtick-quoted test names (except Robolectric tests which require JUnit 4 `@RunWith`)
 - `kotlinx.coroutines.test.runTest` for suspend function tests
