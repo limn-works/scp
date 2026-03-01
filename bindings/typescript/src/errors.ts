@@ -7,15 +7,18 @@
  *
  * Error codes follow the `SCP-{CATEGORY}-{NUMBER}` format:
  *
- * | Category prefix | Range       | Category          |
- * |-----------------|-------------|-------------------|
- * | `SCP-IDENT-`    | 1000-1999   | Identity errors   |
- * | `SCP-CTX-`      | 2000-2999   | Context errors    |
- * | `SCP-PERM-`     | 3000-3999   | Permission errors |
- * | `SCP-CRYPTO-`   | 4000-4999   | Crypto errors     |
- * | `SCP-TRANS-`    | 5000-5999   | Transport errors  |
- * | `SCP-TOOL-`     | 6000-6999   | Tool errors       |
- * | `SCP-VALID-`    | 7000-7999   | Validation errors |
+ * | Category prefix | Range       | Category            |
+ * |-----------------|-------------|---------------------|
+ * | `SCP-IDENT-`    | 1000-1999   | Identity errors     |
+ * | `SCP-CTX-`      | 2000-2999   | Context errors      |
+ * | `SCP-PERM-`     | 3000-3999   | Permission errors   |
+ * | `SCP-CRYPTO-`   | 4000-4999   | Crypto errors       |
+ * | `SCP-TRANS-`    | 5000-5999   | Transport errors    |
+ * | `SCP-TOOL-`     | 6000-6999   | Tool errors         |
+ * | `SCP-VALID-`    | 7000-7999   | Validation errors   |
+ * | `SCP-STORAGE-`  | 8000-8999   | Storage errors      |
+ * | `SCP-ATTEST-`   | 9000-9999   | Attestation errors  |
+ * | `SCP-MCP-`      | 10000-10999 | MCP errors          |
  *
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
@@ -66,13 +69,25 @@ export class ContextError extends ScpError {
   }
 }
 
-/** UCAN capability validation failures. */
-export class PermissionError extends ScpError {
+/**
+ * UCAN capability validation failures.
+ *
+ * Named `UcanPermissionError` to avoid shadowing the global `PermissionError`
+ * in environments that define it (consistent with Python SDK naming convention
+ * per `.docs/standards/sdk-common.md`).
+ */
+export class UcanPermissionError extends ScpError {
   constructor(message: string, code: string) {
     super(message, code);
-    this.name = "PermissionError";
+    this.name = "UcanPermissionError";
   }
 }
+
+/**
+ * @deprecated Use `UcanPermissionError` instead. This alias exists for
+ * backward compatibility during the rename transition.
+ */
+export const PermissionError = UcanPermissionError;
 
 /** Encryption, decryption, signature failures. */
 export class CryptoError extends ScpError {
@@ -106,6 +121,30 @@ export class ValidationError extends ScpError {
   }
 }
 
+/** Storage read, write, or serialization failures. */
+export class StorageError extends ScpError {
+  constructor(message: string, code: string) {
+    super(message, code);
+    this.name = "StorageError";
+  }
+}
+
+/** Device attestation or attestation chain verification failures. */
+export class AttestationError extends ScpError {
+  constructor(message: string, code: string) {
+    super(message, code);
+    this.name = "AttestationError";
+  }
+}
+
+/** MCP server, client, or protocol failures. */
+export class McpError extends ScpError {
+  constructor(message: string, code: string) {
+    super(message, code);
+    this.name = "McpError";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Error parsing — bridge error message to typed ScpError
 // ---------------------------------------------------------------------------
@@ -122,11 +161,16 @@ type ScpErrorConstructor = new (message: string, code: string) => ScpError;
 const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = [
   ["SCP-IDENT-", IdentityError],
   ["SCP-CTX-", ContextError],
-  ["SCP-PERM-", PermissionError],
+  ["SCP-PERM-", UcanPermissionError],
+  ["SCP-PRM-", UcanPermissionError],
   ["SCP-CRYPTO-", CryptoError],
   ["SCP-TRANS-", TransportError],
   ["SCP-TOOL-", ToolError],
   ["SCP-VALID-", ValidationError],
+  ["SCP-VAL-", ValidationError],
+  ["SCP-STORAGE-", StorageError],
+  ["SCP-ATTEST-", AttestationError],
+  ["SCP-MCP-", McpError],
 ];
 
 /**

@@ -83,14 +83,18 @@ export { connectMcp, serveMcp } from "./mcp.js";
 // ---------------------------------------------------------------------------
 
 export {
+  AttestationError,
   ContextError,
   CryptoError,
   IdentityError,
   mapBridgeError,
+  McpError,
   PermissionError,
   ScpError,
+  StorageError,
   ToolError,
   TransportError,
+  UcanPermissionError,
   ValidationError,
 } from "./errors.js";
 

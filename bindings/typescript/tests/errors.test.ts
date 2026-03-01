@@ -6,25 +6,29 @@
 
 import { describe, expect, it } from "bun:test";
 import {
+  AttestationError,
   ContextError,
   CryptoError,
   IdentityError,
   mapBridgeError,
+  McpError,
   PermissionError,
   ScpError,
+  StorageError,
   ToolError,
   TransportError,
+  UcanPermissionError,
   ValidationError,
 } from "../src/errors.js";
 
 describe("ScpError hierarchy", () => {
   it("ScpError is the root error class", () => {
-    const err = new ScpError("test", "SCP-CTX-2999");
+    const err = new ScpError("test", "SCP-TEST-0000");
     expect(err).toBeInstanceOf(Error);
     expect(err).toBeInstanceOf(ScpError);
     expect(err.name).toBe("ScpError");
     expect(err.message).toBe("test");
-    expect(err.code).toBe("SCP-CTX-2999");
+    expect(err.code).toBe("SCP-TEST-0000");
   });
 
   it("IdentityError extends ScpError", () => {
@@ -42,11 +46,17 @@ describe("ScpError hierarchy", () => {
     expect(err.name).toBe("ContextError");
   });
 
-  it("PermissionError extends ScpError", () => {
-    const err = new PermissionError("denied", "SCP-PERM-3001");
+  it("UcanPermissionError extends ScpError", () => {
+    const err = new UcanPermissionError("denied", "SCP-PERM-3001");
     expect(err).toBeInstanceOf(ScpError);
-    expect(err).toBeInstanceOf(PermissionError);
-    expect(err.name).toBe("PermissionError");
+    expect(err).toBeInstanceOf(UcanPermissionError);
+    expect(err.name).toBe("UcanPermissionError");
+  });
+
+  it("PermissionError alias points to UcanPermissionError", () => {
+    expect(PermissionError).toBe(UcanPermissionError);
+    const err = new PermissionError("denied", "SCP-PERM-3001");
+    expect(err).toBeInstanceOf(UcanPermissionError);
   });
 
   it("CryptoError extends ScpError", () => {
@@ -76,6 +86,27 @@ describe("ScpError hierarchy", () => {
     expect(err).toBeInstanceOf(ValidationError);
     expect(err.name).toBe("ValidationError");
   });
+
+  it("StorageError extends ScpError", () => {
+    const err = new StorageError("write failed", "SCP-STORAGE-8001");
+    expect(err).toBeInstanceOf(ScpError);
+    expect(err).toBeInstanceOf(StorageError);
+    expect(err.name).toBe("StorageError");
+  });
+
+  it("AttestationError extends ScpError", () => {
+    const err = new AttestationError("attestation failed", "SCP-ATTEST-9001");
+    expect(err).toBeInstanceOf(ScpError);
+    expect(err).toBeInstanceOf(AttestationError);
+    expect(err.name).toBe("AttestationError");
+  });
+
+  it("McpError extends ScpError", () => {
+    const err = new McpError("mcp failed", "SCP-MCP-10001");
+    expect(err).toBeInstanceOf(ScpError);
+    expect(err).toBeInstanceOf(McpError);
+    expect(err.name).toBe("McpError");
+  });
 });
 
 describe("mapBridgeError", () => {
@@ -91,10 +122,16 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-CTX-2001");
   });
 
-  it("maps permission error codes to PermissionError", () => {
+  it("maps permission error codes to UcanPermissionError", () => {
     const err = mapBridgeError(new Error("[SCP-PERM-3001] permission error: denied"));
-    expect(err).toBeInstanceOf(PermissionError);
+    expect(err).toBeInstanceOf(UcanPermissionError);
     expect(err.code).toBe("SCP-PERM-3001");
+  });
+
+  it("maps PRM prefix to UcanPermissionError", () => {
+    const err = mapBridgeError(new Error("[SCP-PRM-4002] permission error: denied"));
+    expect(err).toBeInstanceOf(UcanPermissionError);
+    expect(err.code).toBe("SCP-PRM-4002");
   });
 
   it("maps crypto error codes to CryptoError", () => {
@@ -119,6 +156,30 @@ describe("mapBridgeError", () => {
     const err = mapBridgeError(new Error("[SCP-VALID-7001] validation error: failed"));
     expect(err).toBeInstanceOf(ValidationError);
     expect(err.code).toBe("SCP-VALID-7001");
+  });
+
+  it("maps VAL prefix to ValidationError", () => {
+    const err = mapBridgeError(new Error("[SCP-VAL-7000] validation error: failed"));
+    expect(err).toBeInstanceOf(ValidationError);
+    expect(err.code).toBe("SCP-VAL-7000");
+  });
+
+  it("maps storage error codes to StorageError", () => {
+    const err = mapBridgeError(new Error("[SCP-STORAGE-8001] storage error: write failed"));
+    expect(err).toBeInstanceOf(StorageError);
+    expect(err.code).toBe("SCP-STORAGE-8001");
+  });
+
+  it("maps attestation error codes to AttestationError", () => {
+    const err = mapBridgeError(new Error("[SCP-ATTEST-9001] attestation error: failed"));
+    expect(err).toBeInstanceOf(AttestationError);
+    expect(err.code).toBe("SCP-ATTEST-9001");
+  });
+
+  it("maps MCP error codes to McpError", () => {
+    const err = mapBridgeError(new Error("[SCP-MCP-10001] mcp error: connection failed"));
+    expect(err).toBeInstanceOf(McpError);
+    expect(err.code).toBe("SCP-MCP-10001");
   });
 
   it("falls back to ScpError for unknown error codes", () => {
