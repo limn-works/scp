@@ -299,20 +299,24 @@ interface StorageProvider {
     /**
      * Store a key-value pair, replacing any existing value for the key.
      *
+     * Named `set` to match the UniFFI `StorageProvider` callback interface.
+     *
      * @param key The storage key (UTF-8 string).
      * @param data The value to store (opaque bytes).
      * @throws ScpException with code `SCP-STORAGE-6002` if the store operation fails.
      */
-    fun store(key: String, data: ByteArray)
+    fun set(key: String, data: ByteArray)
 
     /**
      * Retrieve the value associated with a key.
+     *
+     * Named `get` to match the UniFFI `StorageProvider` callback interface.
      *
      * @param key The storage key to look up.
      * @return The stored bytes, or `null` if the key does not exist.
      * @throws ScpException with code `SCP-STORAGE-6002` if the read operation fails.
      */
-    fun retrieve(key: String): ByteArray?
+    fun get(key: String): ByteArray?
 
     /**
      * Delete the value associated with a key.

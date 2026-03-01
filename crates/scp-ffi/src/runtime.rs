@@ -301,8 +301,9 @@ pub fn remove_context(context_id: &str) {
 pub struct KnownContext {
     /// The context's routing ID (32-byte pseudonym for relay routing).
     pub routing_id: [u8; 32],
-    /// The relay URL where this context's blobs are stored.
-    pub relay_url: String,
+    /// The relay URL where this context's blobs are stored. `None` if no relay
+    /// was connected at registration time.
+    pub relay_url: Option<String>,
     /// The DID of the member who registered this known context.
     pub member_did: String,
     /// Unix timestamp (seconds) when this context was last seen active.

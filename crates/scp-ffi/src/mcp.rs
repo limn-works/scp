@@ -2103,7 +2103,7 @@ mod tests {
 
         let known = crate::runtime::KnownContext {
             routing_id,
-            relay_url: "ws://127.0.0.1:9000/scp/v1".to_owned(),
+            relay_url: Some("ws://127.0.0.1:9000/scp/v1".to_owned()),
             member_did: creator.to_owned(),
             last_seen: 1_700_000_000,
         };
@@ -2140,7 +2140,7 @@ mod tests {
             "test-ctx".to_owned(),
             crate::runtime::KnownContext {
                 routing_id: [0xBB; 32],
-                relay_url: "ws://127.0.0.1:9000/scp/v1".to_owned(),
+                relay_url: Some("ws://127.0.0.1:9000/scp/v1".to_owned()),
                 member_did: "did:dht:z6MkTest".to_owned(),
                 last_seen: 1_700_000_000,
             },

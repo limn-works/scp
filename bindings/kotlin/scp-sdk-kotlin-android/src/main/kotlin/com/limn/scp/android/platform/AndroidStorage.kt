@@ -75,14 +75,19 @@ class AndroidStorage(private val context: Context) : StorageProvider {
     private fun openEncryptedDatabase(): SQLiteDatabase {
         SQLiteDatabase.loadLibs(context)
         val encryptionKey = getOrCreateStorageKey()
-        // NOTE: The String copy of the passphrase cannot be zeroed due to JVM String
-        // immutability. The ByteArray source (encryptionKey) is zeroed in the finally
-        // block. The real protection is TEE-backed key derivation — the passphrase is
-        // useless without the Android Keystore key. If SQLCipher adds a char[] or
-        // ByteArray overload for getWritableDatabase, prefer that and zero after use.
-        val passphrase = String(encryptionKey, Charsets.ISO_8859_1)
-        val helper = ScpDatabaseHelper(context)
-        return helper.getWritableDatabase(passphrase)
+        try {
+            // NOTE: The String copy of the passphrase cannot be zeroed due to JVM String
+            // immutability. The ByteArray source (encryptionKey) is zeroed in the finally
+            // block. The real protection is TEE-backed key derivation — the passphrase is
+            // useless without the Android Keystore key. If SQLCipher adds a char[] or
+            // ByteArray overload for getWritableDatabase, prefer that and zero after use.
+            val passphrase = String(encryptionKey, Charsets.ISO_8859_1)
+            val helper = ScpDatabaseHelper(context)
+            return helper.getWritableDatabase(passphrase)
+        } finally {
+            // Zero key material immediately after use to limit exposure window.
+            encryptionKey.fill(0)
+        }
     }
 
     /**
@@ -107,6 +112,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
                     .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                     .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                     .setKeySize(KEY_SIZE_BITS)
+                    .setRandomizedEncryptionRequired(false) // required for caller-supplied IV with GCM
                     .setUserAuthenticationRequired(false) // background access required
                     .build()
                 KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
@@ -131,13 +137,13 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         } catch (e: Exception) {
             if (e is ScpException) throw e
             throw ScpException(
-                "Failed to derive storage encryption key: ${e.message}",
+                "Storage encryption key derivation failed",
                 ERROR_KEY_DERIVATION_FAILED
             )
         }
     }
 
-    override fun store(key: String, data: ByteArray) {
+    override fun set(key: String, data: ByteArray) {
         try {
             db.execSQL(
                 "INSERT OR REPLACE INTO $TABLE_NAME ($COLUMN_KEY, $COLUMN_VALUE) VALUES (?, ?)",
@@ -146,13 +152,13 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         } catch (e: Exception) {
             if (e is ScpException) throw e
             throw ScpException(
-                "Storage store failed for key '$key': ${e.message}",
+                "Storage set operation failed",
                 ERROR_STORAGE_OPERATION_FAILED
             )
         }
     }
 
-    override fun retrieve(key: String): ByteArray? {
+    override fun get(key: String): ByteArray? {
         try {
             val cursor = db.rawQuery(
                 "SELECT $COLUMN_VALUE FROM $TABLE_NAME WHERE $COLUMN_KEY = ?",
@@ -164,7 +170,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         } catch (e: Exception) {
             if (e is ScpException) throw e
             throw ScpException(
-                "Storage retrieve failed for key '$key': ${e.message}",
+                "Storage get operation failed",
                 ERROR_STORAGE_OPERATION_FAILED
             )
         }
@@ -179,7 +185,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         } catch (e: Exception) {
             if (e is ScpException) throw e
             throw ScpException(
-                "Storage delete failed for key '$key': ${e.message}",
+                "Storage delete operation failed",
                 ERROR_STORAGE_OPERATION_FAILED
             )
         }
@@ -187,9 +193,10 @@ class AndroidStorage(private val context: Context) : StorageProvider {
 
     override fun listKeys(prefix: String): List<String> {
         try {
+            val escaped = escapeLikePrefix(prefix)
             val cursor = db.rawQuery(
-                "SELECT $COLUMN_KEY FROM $TABLE_NAME WHERE $COLUMN_KEY LIKE ? ORDER BY $COLUMN_KEY ASC",
-                arrayOf("$prefix%")
+                "SELECT $COLUMN_KEY FROM $TABLE_NAME WHERE $COLUMN_KEY LIKE ? ESCAPE '\\' ORDER BY $COLUMN_KEY ASC",
+                arrayOf("$escaped%")
             )
             return cursor.use {
                 buildList {
@@ -201,7 +208,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         } catch (e: Exception) {
             if (e is ScpException) throw e
             throw ScpException(
-                "Storage listKeys failed for prefix '$prefix': ${e.message}",
+                "Storage listKeys failed",
                 ERROR_STORAGE_OPERATION_FAILED
             )
         }
@@ -209,18 +216,26 @@ class AndroidStorage(private val context: Context) : StorageProvider {
 
     override fun deletePrefix(prefix: String): Long {
         try {
-            db.execSQL(
-                "DELETE FROM $TABLE_NAME WHERE $COLUMN_KEY LIKE ?",
-                arrayOf<Any>("$prefix%")
-            )
-            val cursor = db.rawQuery("SELECT changes()", emptyArray())
-            return cursor.use {
-                if (it.moveToFirst()) it.getLong(0) else 0L
+            val escaped = escapeLikePrefix(prefix)
+            db.beginTransaction()
+            try {
+                db.execSQL(
+                    "DELETE FROM $TABLE_NAME WHERE $COLUMN_KEY LIKE ? ESCAPE '\\'",
+                    arrayOf<Any>("$escaped%")
+                )
+                val cursor = db.rawQuery("SELECT changes()", emptyArray())
+                val count = cursor.use {
+                    if (it.moveToFirst()) it.getLong(0) else 0L
+                }
+                db.setTransactionSuccessful()
+                return count
+            } finally {
+                db.endTransaction()
             }
         } catch (e: Exception) {
             if (e is ScpException) throw e
             throw ScpException(
-                "Storage deletePrefix failed for prefix '$prefix': ${e.message}",
+                "Storage deletePrefix failed",
                 ERROR_STORAGE_OPERATION_FAILED
             )
         }
@@ -236,13 +251,23 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         } catch (e: Exception) {
             if (e is ScpException) throw e
             throw ScpException(
-                "Storage exists check failed for key '$key': ${e.message}",
+                "Storage exists check failed",
                 ERROR_STORAGE_OPERATION_FAILED
             )
         }
     }
 
     companion object {
+        /**
+         * Escape SQL LIKE wildcard characters in a prefix string.
+         *
+         * `%` and `_` are LIKE wildcards in SQLite and must be escaped with `\`
+         * when used as literal characters in prefix queries.
+         */
+        private fun escapeLikePrefix(prefix: String): String =
+            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
         /** Android Keystore provider name. */
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
 

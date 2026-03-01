@@ -486,19 +486,24 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
         let routing_id: [u8; 32] = mac.finalize().into_bytes().into();
 
         // Get the relay URL from transport status if a relay is connected.
-        let relay_url = crate::transport::py_transport_status()
-            .ok()
-            .and_then(|status| status.relay_url)
-            .unwrap_or_default();
+        let relay_url = match crate::transport::py_transport_status() {
+            Ok(status) => status.relay_url,
+            Err(e) => {
+                tracing::warn!("failed to query transport status during context registration: {e}");
+                None
+            }
+        };
+
+        let last_seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| PyRuntimeError::new_err(format!("system clock error: {e}")))?
+            .as_secs();
 
         let known = crate::runtime::KnownContext {
             routing_id,
             relay_url,
             member_did: identity_did.to_owned(),
-            last_seen: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            last_seen,
         };
         crate::runtime::register_known_context(&context_id, known);
     }
