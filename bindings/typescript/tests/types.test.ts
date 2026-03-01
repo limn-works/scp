@@ -122,10 +122,10 @@ describe("type definitions", () => {
 
   it("Proof has all required fields", () => {
     const proof: Proof = {
-      valid: true,
+      verified: true,
       proofType: "inclusion",
       details: { path: [] },
     };
-    expect(proof.valid).toBe(true);
+    expect(proof.verified).toBe(true);
   });
 });
