@@ -718,15 +718,18 @@ fn py_context_send(
             .as_millis() as u64;
 
         let inner_result = rt.block_on(async {
+            let params = scp_core::envelope::InnerEnvelopeParams {
+                context_id: &context_id,
+                sender_did: &identity_did_owned,
+                epoch: 0,
+                generation: 0,
+                sequence: 0,
+                timestamp: now_ms,
+                payload: &payload_bytes,
+                provenance: None,
+            };
             scp_core::envelope::create_inner_envelope(
-                &context_id,
-                &identity_did_owned,
-                0,
-                0,
-                0,
-                now_ms,
-                &payload_bytes,
-                None,
+                &params,
                 entry.custody.as_ref(),
                 &entry.identity.active_signing_key,
             )

@@ -391,7 +391,6 @@ pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-<<<<<<< HEAD
 /// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
 ///
 /// Parses each proof token and indexes it by its CID (SHA-256 of the encoded
