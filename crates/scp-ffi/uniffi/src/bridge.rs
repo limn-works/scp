@@ -24,9 +24,16 @@
 //!
 //! See ADR-021 in `.docs/adrs/phase-4.md`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use scp_core::crypto::ucan::UcanError as CoreUcanError;
+use scp_core::crypto::ucan::capability::CapabilityUri;
+use scp_core::crypto::ucan::validate::{
+    DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
+    ValidationContext, parse_ucan, validate_ucan,
+};
 use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use uuid::Uuid;
@@ -357,6 +364,159 @@ impl From<serde_json::Error> for ScpError {
             code: "SCP-VALID-7006".to_owned(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge trait implementations for scp-core UCAN validation pipeline
+//
+// These adapters bridge the UniFFI runtime state to scp-core's validation
+// traits. Follows the same pattern as the PyO3 bridge in
+// crates/scp-ffi/src/ucan.rs.
+// ---------------------------------------------------------------------------
+
+/// Bridge [`DidResolver`] that extracts Ed25519 public keys from DID strings.
+///
+/// Supports `did:dht:z{z-base-32-encoded-pubkey}` (production) and
+/// `did:key:{hex-encoded-pubkey}` (testing).
+struct BridgeDidResolver;
+
+impl DidResolver for BridgeDidResolver {
+    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
+        if let Some(suffix) = did.strip_prefix("did:dht:z") {
+            let decoded = zbase32::decode(suffix).map_err(|_| {
+                CoreUcanError::MalformedToken(format!("z-base-32 decode failed for DID: {did}"))
+            })?;
+            let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+                CoreUcanError::MalformedToken(format!(
+                    "DID public key must be 32 bytes, got {}",
+                    v.len()
+                ))
+            })?;
+            return Ok(bytes);
+        }
+
+        if let Some(hex_str) = did.strip_prefix("did:key:") {
+            let bytes = decode_hex(hex_str).map_err(|e| {
+                CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
+            })?;
+            let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+                CoreUcanError::MalformedToken(format!(
+                    "DID public key must be 32 bytes, got {}",
+                    v.len()
+                ))
+            })?;
+            return Ok(pk);
+        }
+
+        Err(CoreUcanError::MalformedToken(format!(
+            "unsupported DID method: {did} (expected did:dht: or did:key:)"
+        )))
+    }
+}
+
+/// Bridge [`RevocationChecker`] wrapping the context's [`RevocationList`].
+struct BridgeRevocationChecker<'a> {
+    revocation_list: &'a scp_core::crypto::ucan::revoke::RevocationList,
+}
+
+impl RevocationChecker for BridgeRevocationChecker<'_> {
+    fn is_revoked(&self, token_cid: &str) -> bool {
+        self.revocation_list.is_revoked(token_cid)
+    }
+}
+
+/// Bridge [`ProofResolver`] backed by an in-memory `HashMap`.
+struct BridgeProofResolver {
+    proofs: HashMap<String, scp_core::crypto::ucan::UcanToken>,
+}
+
+impl ProofResolver for BridgeProofResolver {
+    fn resolve_proof(
+        &self,
+        cid: &str,
+    ) -> Result<scp_core::crypto::ucan::UcanToken, CoreUcanError> {
+        self.proofs.get(cid).cloned().ok_or_else(|| {
+            CoreUcanError::DelegationChainBroken(format!("proof CID not found: {cid}"))
+        })
+    }
+}
+
+/// Adapter bridging `nonce::NonceTracker<C>` struct to `validate::NonceTracker`
+/// trait.
+struct BridgeNonceTracker<'a, C: scp_core::identity::cache::Clock> {
+    inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+}
+
+impl<C: scp_core::identity::cache::Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
+    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
+        self.inner.check_and_record(nonce, token_expiry)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Decodes a hex string to bytes.
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!("hex string has odd length: {}", hex.len()));
+    }
+
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte_str = &hex[i..i + 2];
+        let byte =
+            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+/// Encodes bytes as a lowercase hex string.
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
+
+/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
+fn generate_nonce() -> Result<String, ScpError> {
+    use rand::Rng;
+
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ScpError::Permission {
+            message: format!("system clock error: {e}"),
+            code: "SCP-PERM-3010".to_owned(),
+        })?
+        .as_millis();
+
+    let mut random_bytes = [0u8; 16];
+    rand::thread_rng().fill(&mut random_bytes);
+
+    let hex = encode_hex(&random_bytes);
+    Ok(format!("{now_millis}-{hex}"))
+}
+
+/// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
+fn build_proof_resolver(
+    proof_tokens: Option<&[String]>,
+) -> Result<BridgeProofResolver, ScpError> {
+    let mut proofs = HashMap::new();
+
+    if let Some(tokens) = proof_tokens {
+        for encoded in tokens {
+            let token = parse_ucan(encoded).map_err(ScpError::from)?;
+            let cid = scp_core::crypto::ucan::mint::compute_cid(&token);
+            proofs.insert(cid, token);
+        }
+    }
+
+    Ok(BridgeProofResolver { proofs })
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1262,8 @@ pub async fn context_create(
             let _ = params;
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
+            crate::runtime::register_context(&context_id, &identity.did)?;
+
             let handle = Arc::new(ContextHandle {
                 context_id,
                 state: tokio::sync::Mutex::new(ContextState::Active),
@@ -1235,6 +1397,8 @@ pub async fn context_close(
             let _ = identity;
             *state = ContextState::Closed;
             drop(state);
+
+            crate::runtime::remove_context(&handle.context_id);
 
             Ok(())
         })
@@ -1571,12 +1735,41 @@ pub async fn ucan_validate(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, token, capability);
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN validation requires a live context"
-                    .to_owned(),
-                code: "SCP-PERM-3002".to_owned(),
-            })
+            let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
+
+            let required_cap: CapabilityUri =
+                capability.parse().map_err(|e: CoreUcanError| ScpError::Permission {
+                    message: format!("invalid capability URI '{capability}': {e}"),
+                    code: "SCP-PERM-3002".to_owned(),
+                })?;
+
+            let agent_did = parsed_token.payload.aud.clone();
+
+            let proof_resolver = build_proof_resolver(None)?;
+
+            crate::runtime::with_context(&handle.context_id, |rt| {
+                let did_resolver = BridgeDidResolver;
+                let revocation_checker = BridgeRevocationChecker {
+                    revocation_list: &rt.revocation_list,
+                };
+                let mut nonce_adapter = BridgeNonceTracker {
+                    inner: &mut rt.nonce_tracker,
+                };
+
+                let mut ctx = ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &rt.ceiling_strings,
+                    context_creator_did: &rt.creator_did,
+                    presenting_agent_did: &agent_did,
+                };
+
+                validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpError::from)
+            })?;
+
+            Ok(())
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -1609,12 +1802,66 @@ pub async fn ucan_mint(
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, member_did, capabilities);
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN minting requires a live context"
-                    .to_owned(),
-                code: "SCP-PERM-3004".to_owned(),
-            })
+            let creator_did =
+                crate::runtime::with_context(&handle.context_id, |rt| Ok(rt.creator_did.clone()))?;
+
+            let nonce = generate_nonce()?;
+
+            let capability_uris: Vec<String> = capabilities
+                .iter()
+                .map(|cap| {
+                    if cap.starts_with("scp:ctx:") {
+                        cap.clone()
+                    } else {
+                        format!("scp:ctx:{}/{cap}", handle.context_id)
+                    }
+                })
+                .collect();
+
+            #[allow(clippy::cast_possible_truncation)]
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| ScpError::Permission {
+                    message: format!("system clock error: {e}"),
+                    code: "SCP-PERM-3004".to_owned(),
+                })?
+                .as_secs();
+            let exp = now + 3600;
+
+            let key_custody = InMemoryKeyCustody::new();
+            let (signing_key, _doc) = DidDht::new()
+                .create(&key_custody)
+                .await
+                .map_err(ScpError::from)?;
+
+            let mint_params = scp_core::crypto::ucan::mint::MintParams {
+                issuer_did: &creator_did,
+                issuer_key: &signing_key.active_signing_key,
+                audience_did: &member_did,
+                context_id: &handle.context_id,
+                capabilities: &capabilities,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: Vec::new(),
+                facts: None,
+            };
+
+            let minted = scp_core::crypto::ucan::mint::mint_ucan(&mint_params, &key_custody)
+                .await
+                .map_err(ScpError::from)?;
+
+            let token_handle = Arc::new(UcanToken {
+                data: UcanTokenData {
+                    token_id: nonce,
+                    issuer: creator_did,
+                    audience: member_did,
+                    capabilities: capability_uris,
+                    expires_at: Some(exp),
+                },
+                encoded: minted.encoded,
+            });
+            increment_handle_count();
+            Ok(token_handle)
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -1642,12 +1889,12 @@ pub async fn ucan_mint(
 pub async fn ucan_revoke(handle: Arc<ContextHandle>, token_id: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, token_id);
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN revocation requires a live context"
-                    .to_owned(),
-                code: "SCP-PERM-3006".to_owned(),
-            })
+            crate::runtime::with_context(&handle.context_id, |rt| {
+                rt.revocation_list.revoke(token_id.clone());
+                Ok(())
+            })?;
+
+            Ok(())
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -1686,12 +1933,59 @@ pub async fn event_log_query(
 ) -> Result<Vec<Event>, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, filter_json);
-            Err(ScpError::Context {
-                message: "not yet connected to runtime — event log query requires a live context"
-                    .to_owned(),
-                code: "SCP-CTX-2023".to_owned(),
-            })
+            let (event_count, merkle_root_hex) =
+                crate::runtime::with_context(&handle.context_id, |rt| {
+                    let count = scp_core::event_log::tree::event_count(&rt.event_log);
+                    let root = scp_core::event_log::tree::root(&rt.event_log);
+                    Ok((count, encode_hex(&root)))
+                })?;
+
+            let limit = if let Some(ref json) = filter_json {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(json).map_err(ScpError::from)?;
+                #[allow(clippy::cast_possible_truncation)]
+                // Limit value is a small integer; u64→usize is safe for realistic filter values.
+                parsed
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|v| v as usize)
+            } else {
+                None
+            };
+
+            if event_count == 0 {
+                return Ok(Vec::new());
+            }
+
+            let payload_json = serde_json::json!({
+                "event_count": event_count,
+                "merkle_root": merkle_root_hex,
+            });
+
+            #[allow(clippy::cast_possible_truncation)]
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| ScpError::Context {
+                    message: format!("system clock error: {e}"),
+                    code: "SCP-CTX-2023".to_owned(),
+                })?
+                .as_secs();
+
+            let summary_event = Event {
+                event_type: "LogSummary".to_owned(),
+                actor_did: String::new(),
+                timestamp: now,
+                payload_json: serde_json::to_string(&payload_json).map_err(ScpError::from)?,
+                sequence: event_count.saturating_sub(1),
+            };
+
+            let events = vec![summary_event];
+
+            if let Some(lim) = limit {
+                Ok(events.into_iter().take(lim).collect())
+            } else {
+                Ok(events)
+            }
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -1721,19 +2015,149 @@ pub async fn event_log_query(
 /// Returns `ScpError::Context` if the context is not active or the
 /// verification fails (empty log, invalid index, etc.).
 #[uniffi::export]
+#[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
 pub async fn event_log_verify(
     handle: Arc<ContextHandle>,
     claim_json: String,
 ) -> Result<Proof, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, claim_json);
-            Err(ScpError::Context {
-                message:
-                    "not yet connected to runtime — event log verification requires a live context"
-                        .to_owned(),
-                code: "SCP-CTX-2025".to_owned(),
-            })
+            let claim: serde_json::Value =
+                serde_json::from_str(&claim_json).map_err(ScpError::from)?;
+
+            let claim_type = claim
+                .get("type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ScpError::Validation {
+                    message: "claim must include 'type' field ('inclusion' or 'absence')".to_owned(),
+                    code: "SCP-VALID-7010".to_owned(),
+                })?;
+
+            match claim_type {
+                "inclusion" => {
+                    let leaf_index = claim
+                        .get("leaf_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| ScpError::Validation {
+                            message: "inclusion claim must include 'leaf_index' (integer)"
+                                .to_owned(),
+                            code: "SCP-VALID-7011".to_owned(),
+                        })?;
+
+                    let (verified, details_json) =
+                        crate::runtime::with_context(&handle.context_id, |rt| {
+                            let proof = scp_core::event_log::proof::prove_inclusion(
+                                &rt.event_log,
+                                leaf_index,
+                            )
+                            .map_err(ScpError::from)?;
+                            let verified = scp_core::event_log::proof::verify_inclusion(&proof);
+
+                            let path_steps: Vec<serde_json::Value> = proof
+                                .path
+                                .iter()
+                                .map(|step| {
+                                    let direction = match step.direction {
+                                        scp_core::event_log::proof::Direction::Left => "left",
+                                        scp_core::event_log::proof::Direction::Right => "right",
+                                    };
+                                    serde_json::json!({
+                                        "sibling_hash": encode_hex(&step.sibling_hash),
+                                        "direction": direction,
+                                    })
+                                })
+                                .collect();
+
+                            let details = serde_json::json!({
+                                "leaf_index": proof.leaf_index,
+                                "leaf_hash": encode_hex(&proof.leaf_hash),
+                                "root": encode_hex(&proof.root),
+                                "path": path_steps,
+                                "path_length": proof.path.len(),
+                            });
+
+                            Ok((verified, details))
+                        })?;
+
+                    Ok(Proof {
+                        verified,
+                        proof_type: "inclusion".to_owned(),
+                        details_json: serde_json::to_string(&details_json)
+                            .map_err(ScpError::from)?,
+                    })
+                }
+                "absence" => {
+                    let event_hash_hex = claim
+                        .get("event_hash")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ScpError::Validation {
+                            message: "absence claim must include 'event_hash' (hex string)"
+                                .to_owned(),
+                            code: "SCP-VALID-7012".to_owned(),
+                        })?;
+
+                    let event_hash = decode_hex_hash(event_hash_hex).map_err(|e| {
+                        ScpError::Validation {
+                            message: format!("invalid event_hash: {e}"),
+                            code: "SCP-VALID-7013".to_owned(),
+                        }
+                    })?;
+
+                    let (verified, details_json) =
+                        crate::runtime::with_context(&handle.context_id, |rt| {
+                            let proof = scp_core::event_log::proof::prove_absence(
+                                &rt.event_log,
+                                &event_hash,
+                            )
+                            .map_err(ScpError::from)?;
+
+                            let lower = proof.lower.as_ref().map(|lwp| {
+                                serde_json::json!({
+                                    "leaf_hash": encode_hex(&lwp.leaf_hash),
+                                    "leaf_index": lwp.leaf_index,
+                                })
+                            });
+
+                            let upper = proof.upper.as_ref().map(|uwp| {
+                                serde_json::json!({
+                                    "leaf_hash": encode_hex(&uwp.leaf_hash),
+                                    "leaf_index": uwp.leaf_index,
+                                })
+                            });
+
+                            let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
+                                scp_core::event_log::proof::verify_inclusion(&lwp.inclusion_proof)
+                            });
+                            let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
+                                scp_core::event_log::proof::verify_inclusion(&uwp.inclusion_proof)
+                            });
+                            let verified = lower_verified && upper_verified;
+
+                            let details = serde_json::json!({
+                                "query_hash": encode_hex(&proof.query_hash),
+                                "root": encode_hex(&proof.root),
+                                "leaf_count": proof.leaf_count,
+                                "lower": lower,
+                                "upper": upper,
+                            });
+
+                            Ok((verified, details))
+                        })?;
+
+                    Ok(Proof {
+                        verified,
+                        proof_type: "absence".to_owned(),
+                        details_json: serde_json::to_string(&details_json)
+                            .map_err(ScpError::from)?,
+                    })
+                }
+                other => Err(ScpError::Validation {
+                    message: format!(
+                        "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
+                    ),
+                    code: "SCP-VALID-7014".to_owned(),
+                }),
+            }
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -1759,4 +2183,22 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
             code: "SCP-VALID-7007".to_owned(),
         }),
     }
+}
+
+/// Decodes a hex string into a 32-byte hash.
+fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "expected 64 hex characters (32 bytes), got {}",
+            hex.len()
+        ));
+    }
+
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
+        bytes[i] =
+            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
+    }
+    Ok(bytes)
 }
