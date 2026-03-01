@@ -307,6 +307,7 @@ class UcanToken:
     audience: str
     capabilities: list[str]
     expires_at: float | None
+    proofs: list[str]
 
     def __repr__(self) -> str: ...
 
@@ -622,6 +623,7 @@ def ucan_mint(
     context_id: str,
     member_did: str,
     capabilities: list[str],
+    proofs: list[str] | None = None,
 ) -> UcanToken:
     """Mint a new UCAN token for a context member.
 
@@ -629,6 +631,8 @@ def ucan_mint(
         context_id: The ID of the context to mint the token for.
         member_did: The DID of the member receiving the token.
         capabilities: List of capability URIs to grant.
+        proofs: Optional list of parent UCAN token IDs forming the
+            delegation proof chain.
 
     Returns:
         A ``UcanToken`` with the minted token's metadata.
