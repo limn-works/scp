@@ -406,9 +406,14 @@ where
     verify_signature(token, ctx.did_resolver)?;
 
     // Step 3: Chain verification (delegation proofs).
-    // Verifies signatures on all parent tokens, aud/iss linkage, and
-    // returns the root issuer DID.
-    let root_issuer = verify_delegation_chain(token, ctx.did_resolver, ctx.proof_resolver)?;
+    // Verifies signatures, expiry, revocation, and aud/iss linkage on all
+    // parent tokens. Returns the root issuer DID.
+    let root_issuer = verify_delegation_chain(
+        token,
+        ctx.did_resolver,
+        ctx.proof_resolver,
+        ctx.revocation_checker,
+    )?;
 
     // Step 4: Root issuer — verify root token's iss is context creator.
     if root_issuer != ctx.context_creator_did {
@@ -587,6 +592,9 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
 /// signature, and verifies that the parent's `aud` matches this token's `iss`.
 /// Recurses up the chain until reaching a root token (empty `prf`).
 ///
+/// Each parent token is also checked for expiry and revocation (spec section
+/// 7.2): an expired or revoked parent invalidates the entire chain.
+///
 /// Returns the root issuer DID (the `iss` of the root token at the top of the
 /// chain). For root tokens (empty `prf`), returns the token's own `iss`.
 ///
@@ -595,10 +603,13 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
 /// Returns [`UcanError::DelegationChainBroken`] if any link is invalid.
 /// Returns [`UcanError::CircularDelegation`] if the chain contains a cycle.
 /// Returns [`UcanError::SignatureInvalid`] if any parent signature is invalid.
+/// Returns [`UcanError::TokenExpired`] if any parent token has expired.
+/// Returns [`UcanError::TokenRevoked`] if any parent token has been revoked.
 fn verify_delegation_chain(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
+    revocation_checker: &impl RevocationChecker,
 ) -> Result<String, UcanError> {
     if token.payload.prf.is_empty() {
         return Ok(token.payload.iss.clone());
@@ -606,13 +617,25 @@ fn verify_delegation_chain(
 
     let mut seen_issuers = HashSet::new();
     seen_issuers.insert(token.payload.iss.clone());
-    verify_chain_recursive(token, did_resolver, proof_resolver, 0, &mut seen_issuers)
+    verify_chain_recursive(
+        token,
+        did_resolver,
+        proof_resolver,
+        revocation_checker,
+        0,
+        &mut seen_issuers,
+    )
 }
 
 /// Recursive helper for delegation chain verification.
 ///
-/// Walks the proof chain from child to root, verifying signatures and
-/// `aud`/`iss` linkage at each step. Returns the root issuer DID.
+/// Walks the proof chain from child to root, verifying signatures, expiry,
+/// revocation, and `aud`/`iss` linkage at each step. Returns the root issuer
+/// DID.
+///
+/// Per spec section 7.2, every token in the delegation chain must be valid:
+/// not expired, not revoked, and properly signed. An expired or revoked
+/// parent invalidates the entire delegation.
 ///
 /// `seen_issuers` tracks all issuer DIDs encountered during the chain walk
 /// to detect circular delegations (e.g., A->B->A).
@@ -620,6 +643,7 @@ fn verify_chain_recursive(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
+    revocation_checker: &impl RevocationChecker,
     depth: usize,
     seen_issuers: &mut HashSet<String>,
 ) -> Result<String, UcanError> {
@@ -660,11 +684,21 @@ fn verify_chain_recursive(
         // Verify parent's signature.
         verify_signature(&parent, did_resolver)?;
 
+        // Verify parent token has not expired (spec 7.2).
+        verify_expiry(&parent)?;
+
+        // Verify parent token has not been revoked (spec 7.2).
+        let parent_revocation_cid = compute_revocation_cid(&parent.payload);
+        if revocation_checker.is_revoked(&parent_revocation_cid) {
+            return Err(UcanError::TokenRevoked(parent_revocation_cid));
+        }
+
         // Recurse to find the root.
         let found_root = verify_chain_recursive(
             &parent,
             did_resolver,
             proof_resolver,
+            revocation_checker,
             depth + 1,
             seen_issuers,
         )?;
@@ -2505,7 +2539,13 @@ mod tests {
             ]),
         };
 
-        let result = verify_delegation_chain(&token_presenting, &resolver, &proof_resolver);
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let result = verify_delegation_chain(
+            &token_presenting,
+            &resolver,
+            &proof_resolver,
+            &revocation_checker,
+        );
         assert!(
             matches!(result, Err(UcanError::CircularDelegation(_))),
             "A->B->C->A cycle must be rejected with CircularDelegation: {result:?}"
@@ -2570,7 +2610,13 @@ mod tests {
             proofs: std::collections::HashMap::from([(root_cid, root_token)]),
         };
 
-        let result = verify_delegation_chain(&delegated_token, &resolver, &proof_resolver);
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let result = verify_delegation_chain(
+            &delegated_token,
+            &resolver,
+            &proof_resolver,
+            &revocation_checker,
+        );
         assert!(result.is_ok(), "linear chain A->B->C must pass: {result:?}");
         assert_eq!(result.unwrap(), did_a);
     }
@@ -2625,7 +2671,13 @@ mod tests {
             proofs: std::collections::HashMap::from([(root_cid, root_token)]),
         };
 
-        let result = verify_delegation_chain(&child_token, &resolver, &proof_resolver);
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let result = verify_delegation_chain(
+            &child_token,
+            &resolver,
+            &proof_resolver,
+            &revocation_checker,
+        );
         assert!(
             matches!(result, Err(UcanError::CircularDelegation(_))),
             "self-delegation A->A must be rejected with CircularDelegation: {result:?}"
@@ -2655,12 +2707,14 @@ mod tests {
             keys: std::collections::HashMap::new(),
         };
         let proof_resolver = InMemoryProofResolver::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
         let mut seen = HashSet::new();
 
         let result = verify_chain_recursive(
             &token,
             &resolver,
             &proof_resolver,
+            &revocation_checker,
             MAX_CHAIN_DEPTH + 1,
             &mut seen,
         );
