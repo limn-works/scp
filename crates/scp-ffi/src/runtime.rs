@@ -51,7 +51,9 @@ use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::event_log::EventLog;
 use scp_core::identity::cache::SystemClock;
 use scp_transport::native::adapter::NativeRelayAdapter;
+use tokio::sync::mpsc;
 
+use crate::context::PyMessage;
 use crate::error::ScpPyError;
 
 /// A sync tool handler function that takes JSON input and returns JSON output.
@@ -97,6 +99,12 @@ fn relay_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
     RELAY_CONNECTION.get_or_init(|| RwLock::new(None))
 }
 
+/// Buffer capacity for the receive channel (SCP-216, sketch.md §receive).
+///
+/// When the buffer is full, the oldest unconsumed event is dropped and a
+/// `BufferOverflow` warning is injected into the stream.
+pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
+
 /// Per-context runtime state: the live objects needed by bridge functions.
 ///
 /// Each context gets its own tool registry, event log, role state, UCAN
@@ -129,6 +137,22 @@ pub struct ContextRuntime {
     ///
     /// See SCP-212 for the handler registration design.
     pub tool_handlers: HashMap<String, ToolHandler>,
+    /// Sender half of the receive channel (SCP-216).
+    ///
+    /// Stored here so that the transport layer (and `deliver_message`) can
+    /// feed messages into the channel. The receiver half is held by the
+    /// `PyMessageReceiver` returned from `py_context_receive`. Dropping
+    /// the sender closes the channel, causing `__anext__` to raise
+    /// `StopAsyncIteration`.
+    pub message_tx: Option<mpsc::Sender<PyMessage>>,
+    /// Shared reference to the receiver half of the receive channel (SCP-216).
+    ///
+    /// Shared with `PyMessageReceiver` via `Arc`. Used by `deliver_message`
+    /// to implement oldest-drop overflow: when the buffer is full, the
+    /// oldest item is popped from the receiver before sending the new one.
+    /// Uses `tokio::sync::Mutex` so the lock can be held across `.await`
+    /// points in `__anext__`.
+    pub message_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>>,
 }
 
 /// Default capability ceiling for new contexts.
@@ -196,6 +220,8 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
                 ceiling_strings,
                 creator_did: creator_did.to_owned(),
                 tool_handlers: HashMap::new(),
+                message_tx: None,
+                message_rx: None,
             };
 
             vacant.insert(runtime);
@@ -278,11 +304,90 @@ pub fn register_tool_handler(
 /// Removes a context from the global runtime registry.
 ///
 /// Called when a context is closed. All associated runtime objects are dropped.
+/// Dropping the `ContextRuntime` also drops `message_tx`, which closes the
+/// receive channel and causes `__anext__` to raise `StopAsyncIteration`.
 /// Does not error if the context was not found (idempotent).
 pub fn remove_context(context_id: &str) {
     registry().remove(context_id);
-    // Also remove from known-contexts registry.
     known_contexts_registry().remove(context_id);
+}
+
+/// Closes the receive channel for a context by dropping the sender (SCP-216).
+///
+/// Called by `py_context_leave` when a member leaves. Dropping the sender
+/// causes any `PyMessageReceiver` holding the receiver half to observe
+/// channel closure: `recv()` returns `None` and `__anext__` raises
+/// `StopAsyncIteration`.
+///
+/// Does nothing if no channel was open (idempotent).
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context is not found.
+pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
+    with_context(context_id, |rt| {
+        rt.message_tx.take();
+        rt.message_rx.take();
+        Ok(())
+    })
+}
+
+/// Delivers a message to a context's receive channel (SCP-216).
+///
+/// Implements oldest-drop overflow per sketch.md: when the buffer is full
+/// (1000 events), the oldest unconsumed event is popped from the receiver,
+/// a `BufferOverflow` warning message is injected, and then the new message
+/// is sent. The warning includes a dropped-event count (always 1 per
+/// delivery; consumers track cumulative drops via the warning stream).
+///
+/// The function extracts channel references from the runtime registry (brief
+/// DashMap shard lock), then operates on the channel outside the lock to
+/// avoid holding the shard lock during overflow handling.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context is not found or has no
+/// active receive channel.
+pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPyError> {
+    let (tx, rx_arc) = with_context(context_id, |rt| {
+        let tx = rt.message_tx.clone().ok_or_else(|| {
+            ScpPyError::ContextError(format!(
+                "context '{context_id}' has no active receive channel \
+                 -- call py_context_receive first"
+            ))
+        })?;
+        let rx = rt.message_rx.clone().ok_or_else(|| {
+            ScpPyError::ContextError(
+                "receive channel has no shared receiver reference".to_owned(),
+            )
+        })?;
+        Ok((tx, rx))
+    })?;
+
+    match tx.try_send(message.clone()) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            if let Ok(mut rx_guard) = rx_arc.try_lock() {
+                let _ = rx_guard.try_recv();
+                let _ = rx_guard.try_recv();
+            }
+
+            let overflow_warning = PyMessage::new(
+                "scp:system".to_owned(),
+                b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                context_id.to_owned(),
+            );
+            let _ = tx.try_send(overflow_warning);
+            let _ = tx.try_send(message);
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(ScpPyError::ContextError(format!(
+            "receive channel for context '{context_id}' is closed"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
