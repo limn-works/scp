@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -195,8 +196,8 @@ class HotStreamFactory(
     private val contextBindings: EventContextBindings,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
-    private val activeEventSubscriptions = mutableMapOf<Long, HotStreamState>()
-    private val activeMessageSubscriptions = mutableMapOf<Long, HotStreamState>()
+    private val activeEventSubscriptions = ConcurrentHashMap<Long, HotStreamState>()
+    private val activeMessageSubscriptions = ConcurrentHashMap<Long, HotStreamState>()
 
     /**
      * Start a hot [SharedFlow] of real-time context events.

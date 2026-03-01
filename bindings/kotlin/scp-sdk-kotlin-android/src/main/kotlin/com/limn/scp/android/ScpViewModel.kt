@@ -9,13 +9,11 @@
 package com.limn.scp.android
 
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
 import com.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -85,9 +83,7 @@ abstract class ScpViewModel : ViewModel() {
      * @return The same [context] passed in, for chaining.
      */
     fun trackContext(context: TrackedContext): TrackedContext {
-        viewModelScope.launch {
-            mutex.withLock { activeContexts.add(context) }
-        }
+        runBlocking { mutex.withLock { activeContexts.add(context) } }
         return context
     }
 
@@ -100,9 +96,7 @@ abstract class ScpViewModel : ViewModel() {
      * @param context The [TrackedContext] to stop tracking.
      */
     fun untrackContext(context: TrackedContext) {
-        viewModelScope.launch {
-            mutex.withLock { activeContexts.remove(context) }
-        }
+        runBlocking { mutex.withLock { activeContexts.remove(context) } }
     }
 
     /**
