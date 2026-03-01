@@ -368,18 +368,18 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `error code SCP-STORAGE-6001 is key not found`() {
-            assertEquals("SCP-STORAGE-6001", AndroidStorage.ERROR_KEY_NOT_FOUND)
+        fun `error code SCP-STORAGE-8001 is key not found`() {
+            assertEquals("SCP-STORAGE-8001", AndroidStorage.ERROR_KEY_NOT_FOUND)
         }
 
         @Test
-        fun `error code SCP-STORAGE-6002 is storage operation failed`() {
-            assertEquals("SCP-STORAGE-6002", AndroidStorage.ERROR_STORAGE_OPERATION_FAILED)
+        fun `error code SCP-STORAGE-8002 is storage operation failed`() {
+            assertEquals("SCP-STORAGE-8002", AndroidStorage.ERROR_STORAGE_OPERATION_FAILED)
         }
 
         @Test
-        fun `error code SCP-STORAGE-6003 is key derivation failed`() {
-            assertEquals("SCP-STORAGE-6003", AndroidStorage.ERROR_KEY_DERIVATION_FAILED)
+        fun `error code SCP-STORAGE-8003 is key derivation failed`() {
+            assertEquals("SCP-STORAGE-8003", AndroidStorage.ERROR_KEY_DERIVATION_FAILED)
         }
     }
 
@@ -482,7 +482,7 @@ class AndroidStorageTest {
                 "Failed to derive storage encryption key: test",
                 AndroidStorage.ERROR_KEY_DERIVATION_FAILED
             )
-            assertEquals("SCP-STORAGE-6003", exception.code)
+            assertEquals("SCP-STORAGE-8003", exception.code)
             assertTrue(exception.message!!.contains("derive storage encryption key"))
         }
 
@@ -492,7 +492,7 @@ class AndroidStorageTest {
                 "Storage set operation failed",
                 AndroidStorage.ERROR_STORAGE_OPERATION_FAILED
             )
-            assertEquals("SCP-STORAGE-6002", exception.code)
+            assertEquals("SCP-STORAGE-8002", exception.code)
             assertTrue(exception.message!!.contains("Storage set operation failed"))
         }
     }

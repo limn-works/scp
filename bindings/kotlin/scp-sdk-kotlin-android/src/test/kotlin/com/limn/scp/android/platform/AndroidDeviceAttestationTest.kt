@@ -207,7 +207,7 @@ class AndroidDeviceAttestationTest {
 
     @Test
     fun `error code is correctly defined`() {
-        assertEquals("SCP-ATTEST-6001", AndroidDeviceAttestation.CODE_ATTESTATION_FAILED)
+        assertEquals("SCP-ATTEST-9001", AndroidDeviceAttestation.CODE_ATTESTATION_FAILED)
     }
 
     // -----------------------------------------------------------------------

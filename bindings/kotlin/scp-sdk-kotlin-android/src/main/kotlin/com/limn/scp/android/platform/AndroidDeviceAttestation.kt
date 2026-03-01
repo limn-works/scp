@@ -159,6 +159,6 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
         const val ATTESTATION_TYPE = "scp-device-attestation-v1"
 
         /** Error code for Play Integrity attestation failure. */
-        internal const val CODE_ATTESTATION_FAILED = "SCP-ATTEST-6001"
+        internal const val CODE_ATTESTATION_FAILED = "SCP-ATTEST-9001"
     }
 }

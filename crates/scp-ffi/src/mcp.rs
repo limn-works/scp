@@ -53,6 +53,38 @@ use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
 
 // ---------------------------------------------------------------------------
+// Bounded read_line — prevents OOM from unbounded line reads
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes to read for a single line from an MCP transport.
+/// 10 MiB is generous for JSON-RPC messages (typical MCP responses are < 1 MiB)
+/// while still preventing unbounded allocation from a malicious peer.
+const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Read a line from `reader` into `buf`, bounded to [`MAX_LINE_BYTES`].
+///
+/// Returns the number of bytes read (0 on EOF), like [`BufRead::read_line`].
+/// If the line exceeds the limit before a newline is found, returns an error.
+fn read_line_bounded<R: BufRead>(reader: &mut R, buf: &mut String) -> Result<usize, String> {
+    use std::io::Read;
+    // `Read::take` consumes `self`, but `Read` is implemented for `&mut R`
+    // so we pass `&mut *reader` which is `&mut R` — `take()` consumes the
+    // temporary reference, not the reader itself.
+    let mut bounded = (&mut *reader).take(MAX_LINE_BYTES);
+    let n = bounded
+        .read_line(buf)
+        .map_err(|e| format!("read error: {e}"))?;
+    // If we read exactly MAX_LINE_BYTES and there's no newline, the line
+    // was truncated — reject it rather than silently returning partial data.
+    if n as u64 == MAX_LINE_BYTES && !buf.ends_with('\n') {
+        return Err(format!(
+            "line exceeds {MAX_LINE_BYTES} byte limit — possible denial-of-service"
+        ));
+    }
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
 // Stdio client transport
 // ---------------------------------------------------------------------------
 
@@ -159,9 +191,7 @@ impl McpTransport for StdioClientTransport {
 
         // Read the response as a single line from stdout.
         let mut line = String::new();
-        let bytes_read = inner
-            .reader
-            .read_line(&mut line)
+        let bytes_read = read_line_bounded(&mut inner.reader, &mut line)
             .map_err(|e| format!("failed to read from subprocess stdout: {e}"))?;
         drop(inner);
 
@@ -276,8 +306,7 @@ impl SseClientTransport {
 
         // Read the HTTP status line and validate.
         let mut status_line = String::new();
-        let n = reader
-            .read_line(&mut status_line)
+        let n = read_line_bounded(&mut reader, &mut status_line)
             .map_err(|e| format!("failed to read HTTP status line: {e}"))?;
         if n == 0 {
             return Err("connection closed before HTTP status line".to_owned());
@@ -299,8 +328,7 @@ impl SseClientTransport {
         let mut header_line = String::new();
         loop {
             header_line.clear();
-            let n = reader
-                .read_line(&mut header_line)
+            let n = read_line_bounded(&mut reader, &mut header_line)
                 .map_err(|e| format!("failed to read SSE headers: {e}"))?;
             if n == 0 {
                 return Err("connection closed while reading SSE headers".to_owned());
@@ -314,8 +342,7 @@ impl SseClientTransport {
         let post_path;
         loop {
             let mut event_line = String::new();
-            let n = reader
-                .read_line(&mut event_line)
+            let n = read_line_bounded(&mut reader, &mut event_line)
                 .map_err(|e| format!("failed to read SSE event: {e}"))?;
             if n == 0 {
                 return Err("connection closed while waiting for endpoint event".to_owned());
@@ -407,8 +434,7 @@ impl McpTransport for SseClientTransport {
         // Read SSE events until we find a `message` event with our response.
         for _ in 0..MAX_SSE_EVENTS {
             let mut line = String::new();
-            let n = reader
-                .read_line(&mut line)
+            let n = read_line_bounded(reader, &mut line)
                 .map_err(|e| format!("failed to read SSE event: {e}"))?;
             if n == 0 {
                 return Err("SSE connection closed while waiting for response".to_owned());
@@ -887,6 +913,13 @@ pub fn py_mcp_serve(
                             match reader.read_line(&mut line).await {
                                 Ok(0) | Err(_) => break, // EOF or read error
                                 Ok(_) => {}
+                            }
+                            // Bound check after read — server-side stdin comes
+                            // from the local parent process, not a remote peer,
+                            // so the risk is lower. This guards against oversized
+                            // payloads from a misbehaving MCP client.
+                            if line.len() as u64 > MAX_LINE_BYTES {
+                                break;
                             }
 
                             let trimmed = line.trim();

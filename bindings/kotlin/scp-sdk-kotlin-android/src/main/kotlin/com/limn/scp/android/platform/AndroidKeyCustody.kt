@@ -229,6 +229,18 @@ class AndroidKeyCustody : KeyCustodyProvider {
                 "SCP-CRYPTO-4003",
             )
         }
+
+        // Enforce X25519 type — passing an Ed25519 handle would cause a
+        // Bouncy Castle ClassCastException when interpreting Ed25519PrivateKeyParameters
+        // as X25519PrivateKeyParameters.
+        val storedType = softwareKeyTypes[keyHandle.id]
+        if (storedType != null && storedType != KeyType.X25519) {
+            throw ScpException(
+                "dhAgree requires an X25519 key; handle '${keyHandle.id}' is Ed25519",
+                "SCP-CRYPTO-4003",
+            )
+        }
+
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "X25519 key not found: ${keyHandle.id}",

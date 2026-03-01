@@ -98,7 +98,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
      * key (fixed IV, fixed plaintext label).
      *
      * @return 32-byte SQLCipher passphrase derived from the TEE key.
-     * @throws ScpException with code `SCP-STORAGE-6003` if key derivation fails.
+     * @throws ScpException with code `SCP-STORAGE-8003` if key derivation fails.
      */
     internal fun getOrCreateStorageKey(): ByteArray {
         try {
@@ -308,13 +308,13 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         internal const val COLUMN_VALUE = "value"
 
         /** Error code: storage key not found. */
-        internal const val ERROR_KEY_NOT_FOUND = "SCP-STORAGE-6001"
+        internal const val ERROR_KEY_NOT_FOUND = "SCP-STORAGE-8001"
 
         /** Error code: storage operation failed. */
-        internal const val ERROR_STORAGE_OPERATION_FAILED = "SCP-STORAGE-6002"
+        internal const val ERROR_STORAGE_OPERATION_FAILED = "SCP-STORAGE-8002"
 
         /** Error code: storage encryption key derivation failed. */
-        internal const val ERROR_KEY_DERIVATION_FAILED = "SCP-STORAGE-6003"
+        internal const val ERROR_KEY_DERIVATION_FAILED = "SCP-STORAGE-8003"
     }
 }
 

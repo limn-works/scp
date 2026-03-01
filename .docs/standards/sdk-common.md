@@ -37,6 +37,8 @@ ScpError (root)
 | `SCP-TRANS-` | 5000-5999 |
 | `SCP-TOOL-` | 6000-6999 |
 | `SCP-VALID-` | 7000-7999 |
+| `SCP-STORAGE-` | 8000-8999 |
+| `SCP-ATTEST-` | 9000-9999 |
 
 ## Async Patterns
 

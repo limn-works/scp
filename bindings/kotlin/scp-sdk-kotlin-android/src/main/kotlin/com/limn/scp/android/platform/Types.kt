@@ -108,9 +108,9 @@ enum class DestructionMethod {
  * - `SCP-CRYPTO-4003`: Wrong key type for operation
  * - `SCP-CRYPTO-4004`: Key destruction failed
  * - `SCP-CRYPTO-4005`: Cryptographic operation failed
- * - `SCP-STORAGE-6001`: Storage key not found
- * - `SCP-STORAGE-6002`: Storage operation failed
- * - `SCP-STORAGE-6003`: Storage encryption key derivation failed
+ * - `SCP-STORAGE-8001`: Storage key not found
+ * - `SCP-STORAGE-8002`: Storage operation failed
+ * - `SCP-STORAGE-8003`: Storage encryption key derivation failed
  *
  * @property code Structured SCP error code.
  */
@@ -303,7 +303,7 @@ interface StorageProvider {
      *
      * @param key The storage key (UTF-8 string).
      * @param data The value to store (opaque bytes).
-     * @throws ScpException with code `SCP-STORAGE-6002` if the store operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8002` if the store operation fails.
      */
     fun set(key: String, data: ByteArray)
 
@@ -314,7 +314,7 @@ interface StorageProvider {
      *
      * @param key The storage key to look up.
      * @return The stored bytes, or `null` if the key does not exist.
-     * @throws ScpException with code `SCP-STORAGE-6002` if the read operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8002` if the read operation fails.
      */
     fun get(key: String): ByteArray?
 
@@ -324,7 +324,7 @@ interface StorageProvider {
      * Deleting a non-existent key is a no-op (no exception thrown).
      *
      * @param key The storage key to delete.
-     * @throws ScpException with code `SCP-STORAGE-6002` if the delete operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8002` if the delete operation fails.
      */
     fun delete(key: String)
 
@@ -336,7 +336,7 @@ interface StorageProvider {
      *
      * @param prefix The key prefix to match. Use `""` for all keys.
      * @return Keys matching the prefix, sorted in ascending lexicographic order.
-     * @throws ScpException with code `SCP-STORAGE-6002` if the list operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8002` if the list operation fails.
      */
     fun listKeys(prefix: String): List<String>
 
@@ -345,7 +345,7 @@ interface StorageProvider {
      *
      * @param prefix The key prefix to match.
      * @return The number of keys deleted.
-     * @throws ScpException with code `SCP-STORAGE-6002` if the delete operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8002` if the delete operation fails.
      */
     fun deletePrefix(prefix: String): Long
 
@@ -354,7 +354,7 @@ interface StorageProvider {
      *
      * @param key The storage key to check.
      * @return `true` if the key exists, `false` otherwise.
-     * @throws ScpException with code `SCP-STORAGE-6002` if the check operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8002` if the check operation fails.
      */
     fun exists(key: String): Boolean
 }
