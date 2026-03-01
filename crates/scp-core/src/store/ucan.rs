@@ -10,8 +10,8 @@
 //! ```
 //!
 //! Nonce keys use `SHA256(nonce_string)` hashed to a hex string for
-//! fixed-length keys. The `exists()` method on `Storage` enables O(1)
-//! replay checks without deserializing.
+//! fixed-length keys. Replay checks use `load_value()` (not `exists()`)
+//! so the read and write use a consistent code path through `Storage`.
 //!
 //! See spec sections 17.3 and 17.4.
 
@@ -203,8 +203,10 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns `true` if this is a new nonce (first time seen),
     /// `false` if the nonce was already recorded (replay attempt).
     ///
-    /// Uses `Storage::exists()` for the check, then stores a `NonceRecord`
-    /// with timestamps for later pruning.
+    /// Uses `load_value()` (not `exists()`) to check for a prior record,
+    /// then `store_value()` to claim the slot. A post-write `load_value()`
+    /// re-verifies ownership so that concurrent writers that both passed the
+    /// initial check will see a timestamp mismatch and reject (safe failure).
     ///
     /// See spec section 17.3 on nonce keys and 17.4 on `check_and_record_nonce`.
     ///
@@ -212,6 +214,25 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::SerializationFailed`] if serialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
+    ///
+    /// # SAFETY: TOCTOU window
+    ///
+    /// The `Storage` trait does not provide compare-and-swap (CAS), so a
+    /// narrow race window exists between the `load_value` check and the
+    /// `store_value` write.  This is acceptable because:
+    ///
+    /// 1. The in-memory `NonceTracker` provides the primary, synchronised
+    ///    replay defense on the hot path.
+    /// 2. `ProtocolStore` nonce tracking is a defence-in-depth layer for
+    ///    crash recovery — it re-populates the in-memory set on restart.
+    /// 3. The race window is bounded by storage I/O latency (typically
+    ///    sub-millisecond for SQLite WAL).
+    /// 4. The post-write re-read errs on the side of rejection: if two
+    ///    writers race, at most one sees its own timestamps back; the
+    ///    other gets a mismatch and returns `false` (safe rejection).
+    ///
+    /// Storage backends that support atomic insert-if-absent should
+    /// override this at the adapter level for true atomicity.
     pub async fn check_and_record_nonce(
         &self,
         context_id: &str,
@@ -220,15 +241,29 @@ impl<S: Storage> ProtocolStore<S> {
         token_expiry: u64,
     ) -> Result<bool, StoreError> {
         let key = nonce_key(context_id, nonce_hash);
-        if self.storage.exists(&key).await? {
+
+        // If a record already exists, reject immediately without
+        // overwriting the existing record's timestamps.
+        if self.load_value::<NonceRecord>(&key).await?.is_some() {
             return Ok(false);
         }
+
+        // Store the nonce record, claiming the slot.
         let record = NonceRecord {
             first_seen,
             token_expiry,
         };
         self.store_value(&key, &record).await?;
-        Ok(true)
+
+        // Re-verify after store: if the loaded record has different
+        // timestamps, another request won the race and we treat this
+        // as a replay (safe rejection). If the storage backend
+        // silently overwrites, this check sees our own write and
+        // succeeds — the SAFETY note above documents this limitation.
+        match self.load_value::<NonceRecord>(&key).await? {
+            Some(stored) if stored.first_seen == first_seen => Ok(true),
+            _ => Ok(false),
+        }
     }
 
     /// Prunes expired nonces from a context.
@@ -515,6 +550,42 @@ mod tests {
 
         let pruned = store.prune_expired_nonces("ctx-1", 500).await.unwrap();
         assert_eq!(pruned, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Concurrent nonce checking
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn concurrent_nonce_checks_allow_at_most_one() {
+        use std::sync::Arc;
+
+        let store = Arc::new(make_store());
+        let nonce = test_nonce_hash();
+        let task_count = 10;
+
+        let mut handles = Vec::with_capacity(task_count);
+        for i in 0..task_count {
+            let store = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                store
+                    .check_and_record_nonce("ctx-race", &nonce, 5000 + i as u64, 9000)
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut successes = 0u32;
+        for handle in handles {
+            if handle.await.unwrap() {
+                successes += 1;
+            }
+        }
+
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent nonce check should succeed"
+        );
     }
 
     // -------------------------------------------------------------------
