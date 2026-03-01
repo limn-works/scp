@@ -457,7 +457,13 @@ class ContextBridge internal constructor(
                 }
 
             awaitClose {
-                runBlocking(bridge.ioDispatcher) {
+                // Use Dispatchers.IO directly — NOT bridge.ioDispatcher — because
+                // awaitClose is a non-suspend lambda that blocks its thread via
+                // runBlocking. If bridge.ioDispatcher is a single-threaded test
+                // dispatcher, runBlocking would deadlock (blocking the only thread
+                // that the dispatcher can schedule work on). Dispatchers.IO is an
+                // unbounded thread pool that always has capacity.
+                runBlocking(kotlinx.coroutines.Dispatchers.IO) {
                     bindings.contextUnsubscribe(subscriptionHandle)
                 }
             }
