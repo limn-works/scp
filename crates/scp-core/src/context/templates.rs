@@ -322,8 +322,7 @@ enum TtlPolicy {
 /// Returns the TTL policy for a given template.
 const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
     match template_id {
-        TemplateId::BilateralEphemeral
-        | TemplateId::Coordination => TtlPolicy::Required,
+        TemplateId::BilateralEphemeral | TemplateId::Coordination => TtlPolicy::Required,
         TemplateId::BilateralPersistent => TtlPolicy::Forbidden,
         TemplateId::GroupDiscussion
         | TemplateId::PublicBroadcast

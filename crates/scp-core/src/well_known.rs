@@ -804,10 +804,7 @@ mod tests {
                 context_id, relay, ..
             } => {
                 assert_eq!(context_id, "a1b2c3d4e5f6");
-                assert_eq!(
-                    relay.as_deref(),
-                    Some("wss://relay.example.com/scp/v1")
-                );
+                assert_eq!(relay.as_deref(), Some("wss://relay.example.com/scp/v1"));
             }
             other @ WellKnownHandle::Identity { .. } => {
                 panic!("expected Context, got: {other:?}")

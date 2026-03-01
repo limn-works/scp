@@ -270,7 +270,9 @@ pub enum ToolError {
     },
 
     /// The tool schema does not meet the specificity floor (spec section 6.2, 9.2.1).
-    #[error("schema specificity floor not met: {side} schema has {field_count} distinct fields, minimum {min_fields} required")]
+    #[error(
+        "schema specificity floor not met: {side} schema has {field_count} distinct fields, minimum {min_fields} required"
+    )]
     SchemaSpecificityFloor {
         /// Which schema failed: "input" or "output".
         side: String,

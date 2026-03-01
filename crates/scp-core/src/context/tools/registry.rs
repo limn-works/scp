@@ -667,13 +667,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                ToolError::SchemaSpecificityFloor {
-                    min_fields: 2,
-                    ..
-                }
-            ),
+            matches!(err, ToolError::SchemaSpecificityFloor { min_fields: 2, .. }),
             "expected SchemaSpecificityFloor, got {err:?}"
         );
     }
