@@ -88,18 +88,24 @@ pub struct PyUcanToken {
     /// does not expire (not recommended).
     #[pyo3(get)]
     pub expires_at: Option<f64>,
+
+    /// Proof chain -- CIDs of parent UCAN tokens forming the delegation
+    /// chain. Empty for root tokens issued by the context creator.
+    #[pyo3(get)]
+    pub proofs: Vec<String>,
 }
 
 #[pymethods]
 impl PyUcanToken {
     fn __repr__(&self) -> String {
         format!(
-            "UcanToken(token_id={:?}, issuer={:?}, audience={:?}, capabilities={}, expires_at={:?})",
+            "UcanToken(token_id={:?}, issuer={:?}, audience={:?}, capabilities={}, expires_at={:?}, proofs={})",
             self.token_id,
             self.issuer,
             self.audience,
             self.capabilities.len(),
-            self.expires_at
+            self.expires_at,
+            self.proofs.len()
         )
     }
 }
@@ -212,11 +218,13 @@ pub fn py_ucan_validate(
 /// See ADR-013 §6 and SCP-214 criterion 7.
 #[pyfunction]
 #[pyo3(name = "ucan_mint")]
-#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
+#[pyo3(signature = (context_id, member_did, capabilities, proofs=None))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec/Option<Vec> for #[pyfunction] arguments.
 pub fn py_ucan_mint(
     context_id: &str,
     member_did: &str,
     capabilities: Vec<String>,
+    proofs: Option<Vec<String>>,
 ) -> PyResult<PyUcanToken> {
     // Look up the context to get the creator DID (issuer).
     let creator_did = crate::runtime::with_context(context_id, |rt| Ok(rt.creator_did.clone()))?;
@@ -346,6 +354,7 @@ pub fn py_ucan_delegate(
         capabilities: capability_uris,
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),
+        proofs: proofs.unwrap_or_default(),
     })
 }
 
