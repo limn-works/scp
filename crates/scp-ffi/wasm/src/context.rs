@@ -489,11 +489,17 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 /// destruction). In the bridge layer, the context transitions to `"closed"`
 /// immediately.
 ///
+/// # Authorization
+///
+/// Only the context creator (the DID that created the context) is authorized
+/// to close it. This is enforced locally in the bridge layer by comparing
+/// `identity_did` against the creator DID stored in the context handle.
+///
 /// # Arguments
 ///
 /// * `handle` — The context to close (must be in `"active"` state).
 /// * `identity_did` — The DID of the identity initiating the close (must be
-///   admin or hold a close capability).
+///   the context creator or an admin).
 ///
 /// # Returns
 ///
@@ -501,15 +507,27 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 ///
 /// # Errors
 ///
-/// Rejects with `[SCP-CTX-2000]` if the context is not in `"active"` state.
+/// - Rejects with `[SCP-PERM-3000]` if `identity_did` is not the context
+///   creator.
+/// - Rejects with `[SCP-CTX-2000]` if the context is not in `"active"` state.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
 pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promise {
     let state = handle.state.clone();
-    let _ = identity_did; // Used when full runtime is wired.
+    let creator_did = handle.creator_did.clone();
 
     future_to_promise(async move {
+        // Authorization: only the context creator can close the context.
+        if identity_did != creator_did {
+            return Err(ScpWasmError::Permission(format!(
+                "identity '{identity_did}' is not authorized to close this context \
+                 — only the context creator ('{creator_did}') can close it"
+            ))
+            .into_js()
+            .into());
+        }
+
         if state != "active" {
             return Err(ScpWasmError::Context(format!(
                 "cannot close context in '{state}' state — context must be 'active'"
