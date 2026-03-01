@@ -146,8 +146,8 @@ mod tests {
 
     use super::*;
     use crate::identity::cache::TestClock;
-    use crate::trust::attestation::RevocationStatus;
     use crate::trust::AttestationType;
+    use crate::trust::attestation::RevocationStatus;
 
     fn make_renewable_attestation(
         issued_at: u64,
@@ -250,8 +250,7 @@ mod tests {
     #[test]
     fn renew_succeeds_without_expiry() {
         let clock = TestClock::new(999_999);
-        let attestation =
-            make_renewable_attestation(1000, None, Duration::from_secs(600), None);
+        let attestation = make_renewable_attestation(1000, None, Duration::from_secs(600), None);
 
         let renewed = renew_attestation(&attestation, &clock).unwrap();
         assert_eq!(renewed.renewed_at, Some(999_999));

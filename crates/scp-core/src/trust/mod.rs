@@ -82,9 +82,7 @@ pub use consequence::{
     ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
     TriggeredConsequence, evaluate_consequence_rules,
 };
-pub use renewal::{
-    DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation,
-};
+pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 
 // ---------------------------------------------------------------------------
 // Type aliases

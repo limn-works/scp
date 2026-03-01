@@ -111,7 +111,8 @@ impl ToolRegistry {
                 registration.tool_id
             ));
         }
-        self.tools.insert(registration.tool_id.clone(), registration);
+        self.tools
+            .insert(registration.tool_id.clone(), registration);
         Ok(())
     }
 }
@@ -341,10 +342,7 @@ pub struct AbsenceProof {
 /// # Errors
 ///
 /// Returns an error if the log is empty or `leaf_index` is out of bounds.
-pub fn prove_inclusion(
-    log: &WasmEventLog,
-    leaf_index: u64,
-) -> Result<InclusionProof, String> {
+pub fn prove_inclusion(log: &WasmEventLog, leaf_index: u64) -> Result<InclusionProof, String> {
     let leaf_count = log.event_count();
 
     if leaf_count == 0 {
@@ -432,10 +430,7 @@ pub fn prove_inclusion(
 /// # Errors
 ///
 /// Returns an error if the log is empty or the hash is present in the log.
-pub fn prove_absence(
-    log: &WasmEventLog,
-    event_hash: &[u8; 32],
-) -> Result<AbsenceProof, String> {
+pub fn prove_absence(log: &WasmEventLog, event_hash: &[u8; 32]) -> Result<AbsenceProof, String> {
     let leaf_count = log.event_count();
 
     if leaf_count == 0 {
@@ -610,10 +605,9 @@ pub fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
 
     let mut bytes = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk)
-            .map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
-        bytes[i] = u8::from_str_radix(s, 16)
-            .map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
+        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
+        bytes[i] =
+            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
     }
     Ok(bytes)
 }

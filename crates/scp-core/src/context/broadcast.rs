@@ -11,9 +11,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::ContextError;
 use crate::context::params::ContextMode;
 use crate::context::roles::UcanToken;
-use crate::context::ContextError;
 use crate::crypto::sender_keys::{SenderKey, generate_sender_key};
 
 // ---------------------------------------------------------------------------
@@ -210,8 +210,10 @@ impl BroadcastContext {
                 "author already registered: {author_did}"
             )));
         }
-        self.authors
-            .insert(author_did.to_owned(), AuthorState::new(author_did.to_owned()));
+        self.authors.insert(
+            author_did.to_owned(),
+            AuthorState::new(author_did.to_owned()),
+        );
         Ok(self.authors.get(author_did).expect("just inserted"))
     }
 
@@ -260,9 +262,7 @@ impl BroadcastContext {
         }
 
         let has_ucan = match self.admission {
-            BroadcastAdmission::Open => {
-                ucan.is_some()
-            }
+            BroadcastAdmission::Open => ucan.is_some(),
             BroadcastAdmission::Gated => {
                 let token = ucan.ok_or_else(|| {
                     ContextError::PermissionDenied(
@@ -322,18 +322,16 @@ impl BroadcastContext {
 
         author.block_list.insert(blocked_did.to_owned());
 
-        let new_epoch = author.epoch.checked_add(1).ok_or_else(|| {
-            ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
-        })?;
+        let new_epoch = author
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| ContextError::CryptoFailed("broadcast key epoch overflow".to_owned()))?;
 
         let new_key = generate_sender_key();
         author.epoch = new_epoch;
         author.broadcast_key = new_key.clone();
 
-        Ok(BlockResult {
-            new_key,
-            new_epoch,
-        })
+        Ok(BlockResult { new_key, new_epoch })
     }
 
     /// Returns `true` if the given subscriber DID is blocked by the given
@@ -499,9 +497,7 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        let result = ctx
-            .subscribe("did:example:bob", None, 1000)
-            .unwrap();
+        let result = ctx.subscribe("did:example:bob", None, 1000).unwrap();
 
         assert_eq!(result.author_epochs.len(), 1);
         assert_eq!(result.author_epochs["did:example:alice"], 0);
@@ -515,9 +511,7 @@ mod tests {
         ctx.add_author("did:example:alice").unwrap();
         let ucan = make_messages_read_ucan("ctx-broadcast-1", "did:example:bob");
 
-        let result = ctx
-            .subscribe("did:example:bob", Some(&ucan), 1000)
-            .unwrap();
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000).unwrap();
 
         assert_eq!(result.author_epochs.len(), 1);
         assert!(ctx.is_subscriber("did:example:bob"));
@@ -529,9 +523,7 @@ mod tests {
         ctx.add_author("did:example:alice").unwrap();
         ctx.add_author("did:example:carol").unwrap();
 
-        let result = ctx
-            .subscribe("did:example:bob", None, 1000)
-            .unwrap();
+        let result = ctx.subscribe("did:example:bob", None, 1000).unwrap();
 
         assert_eq!(result.author_epochs.len(), 2);
         assert_eq!(result.author_epochs["did:example:alice"], 0);
@@ -567,9 +559,7 @@ mod tests {
         ctx.add_author("did:example:alice").unwrap();
         let ucan = make_messages_read_ucan("ctx-gated-1", "did:example:bob");
 
-        let result = ctx
-            .subscribe("did:example:bob", Some(&ucan), 1000)
-            .unwrap();
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000).unwrap();
 
         assert_eq!(result.author_epochs.len(), 1);
         assert!(ctx.is_subscriber("did:example:bob"));
@@ -709,8 +699,7 @@ mod tests {
 
         for sub_did in &["did:example:sub1", "did:example:sub2", "did:example:sub3"] {
             assert!(ctx.can_read(sub_did));
-            let decrypted =
-                decrypt_sender_layer(&author.broadcast_key, &ciphertext).unwrap();
+            let decrypted = decrypt_sender_layer(&author.broadcast_key, &ciphertext).unwrap();
             assert_eq!(decrypted, plaintext);
         }
     }
@@ -746,8 +735,7 @@ mod tests {
             .unwrap();
 
         let post_block_msg = b"message after block";
-        let post_block_ct =
-            encrypt_sender_layer(&block_result.new_key, post_block_msg).unwrap();
+        let post_block_ct = encrypt_sender_layer(&block_result.new_key, post_block_msg).unwrap();
 
         let non_blocked_decrypted =
             decrypt_sender_layer(&block_result.new_key, &post_block_ct).unwrap();
@@ -779,8 +767,7 @@ mod tests {
         let carol_msg = b"Carol's message";
         let carol_ct = encrypt_sender_layer(&carol_author.broadcast_key, carol_msg).unwrap();
 
-        let decrypted =
-            decrypt_sender_layer(&carol_author.broadcast_key, &carol_ct).unwrap();
+        let decrypted = decrypt_sender_layer(&carol_author.broadcast_key, &carol_ct).unwrap();
         assert_eq!(decrypted, carol_msg);
     }
 
@@ -813,8 +800,7 @@ mod tests {
             .unwrap();
 
         let msg_after = b"gated message after block";
-        let ct_after =
-            encrypt_sender_layer(&block_result.new_key, msg_after).unwrap();
+        let ct_after = encrypt_sender_layer(&block_result.new_key, msg_after).unwrap();
 
         let blocked_result = decrypt_sender_layer(&old_key, &ct_after);
         assert!(

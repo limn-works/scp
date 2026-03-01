@@ -49,10 +49,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub use addressing::{
-    AddressResolution, AddressResolver, AddressType, AddressingError, HandleQuerier, HandleTarget,
-    ParsedAddress, PetnameStore, ResolutionCache, ResolutionLayer, ResolutionPath, TrustLevel,
-    normalize_address, parse_address, DISCOVERY_HANDLE_CACHE_TTL, DOMAIN_HANDLE_CACHE_TTL,
-    MAX_LOCAL_PART_LENGTH,
+    AddressResolution, AddressResolver, AddressType, AddressingError, DISCOVERY_HANDLE_CACHE_TTL,
+    DOMAIN_HANDLE_CACHE_TTL, HandleQuerier, HandleTarget, MAX_LOCAL_PART_LENGTH, ParsedAddress,
+    PetnameStore, ResolutionCache, ResolutionLayer, ResolutionPath, TrustLevel, normalize_address,
+    parse_address,
 };
 pub use bootstrap::{BootstrapConfig, BootstrapResolver, WellKnownBootstrapError};
 pub use context::{

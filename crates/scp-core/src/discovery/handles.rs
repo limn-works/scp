@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::DID;
 
-use super::addressing::HandleTarget;
 use super::ContextId;
+use super::addressing::HandleTarget;
 
 // ---------------------------------------------------------------------------
 // Constants

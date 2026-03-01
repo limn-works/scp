@@ -98,13 +98,12 @@ pub async fn event_log_query(
     };
 
     let context_id = handle.context_id();
-    let (event_count, merkle_root_hex) =
-        crate::runtime::with_context(&context_id, |rt| {
-            let count = scp_core::event_log::tree::event_count(&rt.event_log);
-            let root = scp_core::event_log::tree::root(&rt.event_log);
-            Ok((count, encode_hex(&root)))
-        })
-        .map_err(napi::Error::from)?;
+    let (event_count, merkle_root_hex) = crate::runtime::with_context(&context_id, |rt| {
+        let count = scp_core::event_log::tree::event_count(&rt.event_log);
+        let root = scp_core::event_log::tree::root(&rt.event_log);
+        Ok((count, encode_hex(&root)))
+    })
+    .map_err(napi::Error::from)?;
 
     #[allow(clippy::cast_possible_truncation)] // Event limit is always small; truncation is safe.
     let limit = filter
@@ -270,12 +269,11 @@ pub async fn event_log_verify(
             })?;
 
             let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
-                let proof =
-                    scp_core::event_log::proof::prove_absence(&rt.event_log, &event_hash)
-                        .map_err(|e| ScpNapiError::Context {
-                            message: format!("absence proof failed: {e}"),
-                            code: "SCP-CTX-2025".to_owned(),
-                        })?;
+                let proof = scp_core::event_log::proof::prove_absence(&rt.event_log, &event_hash)
+                    .map_err(|e| ScpNapiError::Context {
+                    message: format!("absence proof failed: {e}"),
+                    code: "SCP-CTX-2025".to_owned(),
+                })?;
 
                 let lower = proof.lower.as_ref().map(|lwp| {
                     serde_json::json!({

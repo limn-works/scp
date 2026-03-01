@@ -146,7 +146,11 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Wraps the value in a `StoredValue` envelope and writes it to
     /// the underlying storage backend.
-    async fn store_value<T: Serialize + Sync>(&self, key: &str, value: &T) -> Result<(), StoreError> {
+    async fn store_value<T: Serialize + Sync>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), StoreError> {
         let bytes = Self::serialize(value)?;
         self.storage.store(key, &bytes).await?;
         Ok(())
@@ -187,8 +191,8 @@ mod tests {
     #[test]
     fn serialize_deserialize_roundtrip() {
         let value = vec![1u32, 2, 3, 4, 5];
-        let bytes = ProtocolStore::<scp_platform::testing::InMemoryStorage>::serialize(&value)
-            .unwrap();
+        let bytes =
+            ProtocolStore::<scp_platform::testing::InMemoryStorage>::serialize(&value).unwrap();
         let decoded: Vec<u32> =
             ProtocolStore::<scp_platform::testing::InMemoryStorage>::deserialize(&bytes).unwrap();
         assert_eq!(decoded, value);
@@ -211,8 +215,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_value_and_load_value_roundtrip() {
-        let store =
-            ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
         let value = vec![42u64, 100, 999];
         store.store_value("test/key", &value).await.unwrap();
         let loaded: Option<Vec<u64>> = store.load_value("test/key").await.unwrap();
@@ -221,8 +224,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_value_returns_none_for_missing_key() {
-        let store =
-            ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
         let loaded: Option<String> = store.load_value("nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }

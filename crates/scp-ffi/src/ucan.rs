@@ -36,16 +36,16 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
+use scp_core::crypto::ucan::Attenuation;
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 use scp_core::crypto::ucan::UcanToken;
 use scp_core::crypto::ucan::capability::CapabilityUri;
-use scp_core::crypto::ucan::mint::{DelegateParams, MintParams, mint_ucan, delegate_ucan};
+use scp_core::crypto::ucan::mint::{DelegateParams, MintParams, delegate_ucan, mint_ucan};
 use scp_core::crypto::ucan::revoke::compute_revocation_cid;
 use scp_core::crypto::ucan::validate::{
     DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     ValidationContext, parse_ucan, validate_ucan,
 };
-use scp_core::crypto::ucan::Attenuation;
 
 use crate::error::ScpPyError;
 

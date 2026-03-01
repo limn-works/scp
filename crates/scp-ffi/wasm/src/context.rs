@@ -447,13 +447,15 @@ pub fn context_create(
 
                 // The JS return value is { publicKeyBytes: Uint8Array, keyId: string }.
                 // Extract publicKeyBytes.
-                let public_key_val = js_sys::Reflect::get(&result, &JsValue::from_str("publicKeyBytes"))
-                    .map_err(|e| {
-                        ScpWasmError::Crypto(format!(
-                            "derivePseudonym result missing publicKeyBytes field: {e:?}"
-                        ))
-                        .into_js()
-                    })?;
+                let public_key_val =
+                    js_sys::Reflect::get(&result, &JsValue::from_str("publicKeyBytes")).map_err(
+                        |e| {
+                            ScpWasmError::Crypto(format!(
+                                "derivePseudonym result missing publicKeyBytes field: {e:?}"
+                            ))
+                            .into_js()
+                        },
+                    )?;
                 let public_key_array = js_sys::Uint8Array::new(&public_key_val);
                 Some(public_key_array.to_vec())
             }

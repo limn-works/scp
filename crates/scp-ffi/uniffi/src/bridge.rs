@@ -36,12 +36,12 @@ use scp_core::crypto::ucan::validate::{
     ValidationContext, parse_ucan, validate_ucan,
 };
 use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
+use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
     Signature,
 };
-use scp_platform::PlatformError;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -83,7 +83,6 @@ impl KeyCustodyProviderAdapter {
             next_id: AtomicU64::new(1),
         }
     }
-
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -162,8 +161,7 @@ impl KeyCustody for KeyCustodyProviderAdapter {
         async move {
             let id = {
                 let mut map = self.handle_to_id.lock().await;
-                map.remove(&key_id)
-                    .ok_or(PlatformError::KeyNotFound)?
+                map.remove(&key_id).ok_or(PlatformError::KeyNotFound)?
             };
             self.provider
                 .destroy_key(id)
@@ -653,10 +651,7 @@ struct BridgeProofResolver {
 }
 
 impl ProofResolver for BridgeProofResolver {
-    fn resolve_proof(
-        &self,
-        cid: &str,
-    ) -> Result<scp_core::crypto::ucan::UcanToken, CoreUcanError> {
+    fn resolve_proof(&self, cid: &str) -> Result<scp_core::crypto::ucan::UcanToken, CoreUcanError> {
         self.proofs.get(cid).cloned().ok_or_else(|| {
             CoreUcanError::DelegationChainBroken(format!("proof CID not found: {cid}"))
         })
@@ -725,9 +720,7 @@ fn generate_nonce() -> Result<String, ScpError> {
 }
 
 /// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
-fn build_proof_resolver(
-    proof_tokens: Option<&[String]>,
-) -> Result<BridgeProofResolver, ScpError> {
+fn build_proof_resolver(proof_tokens: Option<&[String]>) -> Result<BridgeProofResolver, ScpError> {
     let mut proofs = HashMap::new();
 
     if let Some(tokens) = proof_tokens {
@@ -1410,8 +1403,7 @@ pub async fn identity_create_platform(
         .spawn(async move {
             let adapter = KeyCustodyProviderAdapter::new(provider);
             let dht = DidDht::new();
-            let (identity, _document) =
-                dht.create(&adapter).await.map_err(ScpError::from)?;
+            let (identity, _document) = dht.create(&adapter).await.map_err(ScpError::from)?;
 
             let handle = Arc::new(Identity {
                 did: identity.did.clone(),
@@ -1556,9 +1548,7 @@ pub async fn context_create(
                         .derive_pseudonym(&core_id.identity_key, context_id.as_bytes())
                         .await
                         .map_err(|e| ScpError::Crypto {
-                            message: format!(
-                                "failed to derive pseudonym routing ID: {e}"
-                            ),
+                            message: format!("failed to derive pseudonym routing ID: {e}"),
                             code: "SCP-CRYPTO-3010".to_owned(),
                         })?;
                     Some(pseudonym.public_key.as_bytes().to_vec())
@@ -2041,10 +2031,12 @@ pub async fn ucan_validate(
             let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
 
             let required_cap: CapabilityUri =
-                capability.parse().map_err(|e: CoreUcanError| ScpError::Permission {
-                    message: format!("invalid capability URI '{capability}': {e}"),
-                    code: "SCP-PERM-3002".to_owned(),
-                })?;
+                capability
+                    .parse()
+                    .map_err(|e: CoreUcanError| ScpError::Permission {
+                        message: format!("invalid capability URI '{capability}': {e}"),
+                        code: "SCP-PERM-3002".to_owned(),
+                    })?;
 
             let agent_did = parsed_token.payload.aud.clone();
 
@@ -2328,13 +2320,15 @@ pub async fn event_log_verify(
             let claim: serde_json::Value =
                 serde_json::from_str(&claim_json).map_err(ScpError::from)?;
 
-            let claim_type = claim
-                .get("type")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ScpError::Validation {
-                    message: "claim must include 'type' field ('inclusion' or 'absence')".to_owned(),
-                    code: "SCP-VALID-7010".to_owned(),
-                })?;
+            let claim_type =
+                claim
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ScpError::Validation {
+                        message: "claim must include 'type' field ('inclusion' or 'absence')"
+                            .to_owned(),
+                        code: "SCP-VALID-7010".to_owned(),
+                    })?;
 
             match claim_type {
                 "inclusion" => {
@@ -2399,12 +2393,11 @@ pub async fn event_log_verify(
                             code: "SCP-VALID-7012".to_owned(),
                         })?;
 
-                    let event_hash = decode_hex_hash(event_hash_hex).map_err(|e| {
-                        ScpError::Validation {
+                    let event_hash =
+                        decode_hex_hash(event_hash_hex).map_err(|e| ScpError::Validation {
                             message: format!("invalid event_hash: {e}"),
                             code: "SCP-VALID-7013".to_owned(),
-                        }
-                    })?;
+                        })?;
 
                     let (verified, details_json) =
                         crate::runtime::with_context(&handle.context_id, |rt| {

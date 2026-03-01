@@ -166,11 +166,9 @@ pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: Str
                 .into_js()
         })?;
 
-        let payload: serde_json::Value =
-            serde_json::from_slice(&payload_bytes).map_err(|e| {
-                ScpWasmError::Permission(format!("malformed UCAN payload (JSON parse): {e}"))
-                    .into_js()
-            })?;
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).map_err(|e| {
+            ScpWasmError::Permission(format!("malformed UCAN payload (JSON parse): {e}")).into_js()
+        })?;
 
         let token_exp = payload["exp"].as_u64().ok_or_else(|| {
             ScpWasmError::Permission("UCAN payload missing 'exp' field".to_owned()).into_js()
@@ -264,9 +262,8 @@ pub fn ucan_mint(
             .into_js()
         })?;
 
-        let creator_did =
-            runtime::with_context(&context_id, |rt| Ok(rt.creator_did.clone()))
-                .map_err(ScpWasmError::into_js)?;
+        let creator_did = runtime::with_context(&context_id, |rt| Ok(rt.creator_did.clone()))
+            .map_err(ScpWasmError::into_js)?;
 
         let nonce = format!("tk-{}", uuid::Uuid::new_v4().as_hyphenated());
 

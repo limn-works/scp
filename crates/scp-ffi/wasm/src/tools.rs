@@ -152,8 +152,9 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"type": "object"}));
 
-        runtime::validate_schema(&input_schema)
-            .map_err(|e| ScpWasmError::Validation(format!("invalid input schema: {e}")).into_js())?;
+        runtime::validate_schema(&input_schema).map_err(|e| {
+            ScpWasmError::Validation(format!("invalid input schema: {e}")).into_js()
+        })?;
         runtime::validate_schema(&output_schema).map_err(|e| {
             ScpWasmError::Validation(format!("invalid output schema: {e}")).into_js()
         })?;
@@ -225,9 +226,8 @@ pub fn tool_invoke(
                 ))
             })?;
 
-            runtime::validate_value_against_schema(&input, &registration.input_schema).map_err(
-                |e| ScpWasmError::Validation(format!("input validation failed: {e}")),
-            )?;
+            runtime::validate_value_against_schema(&input, &registration.input_schema)
+                .map_err(|e| ScpWasmError::Validation(format!("input validation failed: {e}")))?;
 
             let _ = &identity_did;
 
@@ -235,8 +235,9 @@ pub fn tool_invoke(
         })
         .map_err(ScpWasmError::into_js)?;
 
-        let result_str = serde_json::to_string(&output_json)
-            .map_err(|e| ScpWasmError::Tool(format!("failed to serialize output: {e}")).into_js())?;
+        let result_str = serde_json::to_string(&output_json).map_err(|e| {
+            ScpWasmError::Tool(format!("failed to serialize output: {e}")).into_js()
+        })?;
 
         Ok(JsValue::from_str(&result_str))
     })

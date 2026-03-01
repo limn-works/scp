@@ -21,10 +21,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::DID;
 
+use super::ContextId;
 use super::addressing::{
     AddressResolution, PetnameStore, ResolutionLayer, ResolutionPath, TrustLevel,
 };
-use super::ContextId;
 
 // ---------------------------------------------------------------------------
 // PetnameEvent (§22.9.2)
@@ -120,8 +120,7 @@ impl PetnameMap {
                     .entry(name.clone())
                     .or_default()
                     .push(did.clone());
-                self.did_to_petname
-                    .insert(did.to_string(), name.clone());
+                self.did_to_petname.insert(did.to_string(), name.clone());
             }
             PetnameEvent::RemovePetname { did } => {
                 if let Some(name) = self.did_to_petname.remove(did.as_ref())
@@ -201,10 +200,7 @@ impl PetnameMap {
     /// indicate ambiguity (§22.4).
     #[must_use]
     pub fn resolve_did(&self, name: &str) -> Vec<DID> {
-        self.did_petnames
-            .get(name)
-            .cloned()
-            .unwrap_or_default()
+        self.did_petnames.get(name).cloned().unwrap_or_default()
     }
 
     /// Resolves a petname to context IDs.
@@ -212,10 +208,7 @@ impl PetnameMap {
     /// Returns all context IDs associated with this petname.
     #[must_use]
     pub fn resolve_context(&self, name: &str) -> Vec<ContextId> {
-        self.context_petnames
-            .get(name)
-            .cloned()
-            .unwrap_or_default()
+        self.context_petnames.get(name).cloned().unwrap_or_default()
     }
 
     /// Looks up the petname for a given DID.
@@ -231,9 +224,7 @@ impl PetnameMap {
     /// Returns `None` if no petname is assigned.
     #[must_use]
     pub fn petname_for_context(&self, context_id: &ContextId) -> Option<&str> {
-        self.context_to_petname
-            .get(context_id)
-            .map(String::as_str)
+        self.context_to_petname.get(context_id).map(String::as_str)
     }
 
     /// Returns the total number of DID petnames.

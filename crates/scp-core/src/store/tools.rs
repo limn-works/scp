@@ -114,11 +114,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
-    pub async fn delete_tool(
-        &self,
-        context_id: &str,
-        tool_id: &str,
-    ) -> Result<(), StoreError> {
+    pub async fn delete_tool(&self, context_id: &str, tool_id: &str) -> Result<(), StoreError> {
         let key = tool_key(context_id, tool_id);
         self.storage.delete(&key).await?;
         Ok(())
@@ -284,10 +280,7 @@ mod tests {
             .store_tool_session("ctx-1", "sess-123", &session)
             .await
             .unwrap();
-        let loaded = store
-            .load_tool_session("ctx-1", "sess-123")
-            .await
-            .unwrap();
+        let loaded = store.load_tool_session("ctx-1", "sess-123").await.unwrap();
         assert_eq!(loaded, Some(session));
     }
 
@@ -314,10 +307,7 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = store
-            .load_tool_session("ctx-1", "sess-123")
-            .await
-            .unwrap();
+        let loaded = store.load_tool_session("ctx-1", "sess-123").await.unwrap();
         assert!(loaded.is_none());
     }
 

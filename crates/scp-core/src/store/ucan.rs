@@ -67,11 +67,13 @@ fn nonce_prefix(context_id: &str) -> String {
 
 /// Encodes a byte slice as lowercase hexadecimal.
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -104,11 +106,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
-    pub async fn is_revoked(
-        &self,
-        context_id: &str,
-        token_id: &str,
-    ) -> Result<bool, StoreError> {
+    pub async fn is_revoked(&self, context_id: &str, token_id: &str) -> Result<bool, StoreError> {
         let key = revocation_key(context_id, token_id);
         Ok(self.storage.exists(&key).await?)
     }
@@ -211,10 +209,7 @@ mod tests {
 
         assert!(!store.is_revoked("ctx-1", "token-abc").await.unwrap());
 
-        store
-            .store_revocation("ctx-1", "token-abc")
-            .await
-            .unwrap();
+        store.store_revocation("ctx-1", "token-abc").await.unwrap();
         assert!(store.is_revoked("ctx-1", "token-abc").await.unwrap());
     }
 
@@ -228,10 +223,7 @@ mod tests {
     async fn revocation_is_context_scoped() {
         let store = make_store();
 
-        store
-            .store_revocation("ctx-1", "token-xyz")
-            .await
-            .unwrap();
+        store.store_revocation("ctx-1", "token-xyz").await.unwrap();
         assert!(store.is_revoked("ctx-1", "token-xyz").await.unwrap());
         assert!(!store.is_revoked("ctx-2", "token-xyz").await.unwrap());
     }

@@ -462,9 +462,7 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
             ))
         })?;
         let rx = rt.message_rx.clone().ok_or_else(|| {
-            ScpPyError::ContextError(
-                "receive channel has no shared receiver reference".to_owned(),
-            )
+            ScpPyError::ContextError("receive channel has no shared receiver reference".to_owned())
         })?;
         Ok((tx, rx))
     })?;

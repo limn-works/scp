@@ -67,11 +67,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::SerializationFailed`] if serialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage write fails.
-    pub async fn store_identity_document(
-        &self,
-        did: &DID,
-        doc: &[u8],
-    ) -> Result<(), StoreError> {
+    pub async fn store_identity_document(&self, did: &DID, doc: &[u8]) -> Result<(), StoreError> {
         let key = identity_document_key(did);
         self.store_value(&key, &doc.to_vec()).await
     }
@@ -84,10 +80,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage read fails.
-    pub async fn load_identity_document(
-        &self,
-        did: &DID,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    pub async fn load_identity_document(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError> {
         let key = identity_document_key(did);
         self.load_value(&key).await
     }
@@ -118,10 +111,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage read fails.
-    pub async fn load_active_signing_key(
-        &self,
-        did: &DID,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    pub async fn load_active_signing_key(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError> {
         let key = active_signing_key_key(did);
         self.load_value(&key).await
     }
@@ -261,14 +251,8 @@ mod tests {
         let store = make_store();
         let did = test_did();
 
-        store
-            .store_identity_document(&did, b"doc")
-            .await
-            .unwrap();
-        store
-            .store_active_signing_key(&did, b"key")
-            .await
-            .unwrap();
+        store.store_identity_document(&did, b"doc").await.unwrap();
+        store.store_active_signing_key(&did, b"key").await.unwrap();
         store
             .store_identity_private_state(&did, 0, b"state")
             .await

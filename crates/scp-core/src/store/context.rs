@@ -244,10 +244,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     /// Returns [`StoreError::DeserializationFailed`] if any member record fails
     /// to deserialize.
-    pub async fn list_members(
-        &self,
-        context_id: &str,
-    ) -> Result<Vec<(DID, String)>, StoreError> {
+    pub async fn list_members(&self, context_id: &str) -> Result<Vec<(DID, String)>, StoreError> {
         let prefix = membership_prefix(context_id);
         let keys = self.storage.list_keys(&prefix).await?;
         let mut members = Vec::with_capacity(keys.len());
@@ -269,11 +266,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
-    pub async fn remove_membership(
-        &self,
-        context_id: &str,
-        did: &DID,
-    ) -> Result<(), StoreError> {
+    pub async fn remove_membership(&self, context_id: &str, did: &DID) -> Result<(), StoreError> {
         let key = membership_key(context_id, did);
         self.storage.delete(&key).await?;
         Ok(())
@@ -403,10 +396,7 @@ mod tests {
         let store = make_store();
         let did = test_did();
 
-        store
-            .store_context_state("ctx-1", b"state")
-            .await
-            .unwrap();
+        store.store_context_state("ctx-1", b"state").await.unwrap();
         store
             .store_context_params("ctx-1", b"params")
             .await

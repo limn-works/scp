@@ -204,13 +204,12 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
             })?;
         }
 
-        let (event_count, merkle_root_hex) =
-            runtime::with_context(&context_id, |rt| {
-                let count = rt.event_log.event_count();
-                let root = rt.event_log.root();
-                Ok((count, runtime::encode_hex(&root)))
-            })
-            .map_err(ScpWasmError::into_js)?;
+        let (event_count, merkle_root_hex) = runtime::with_context(&context_id, |rt| {
+            let count = rt.event_log.event_count();
+            let root = rt.event_log.root();
+            Ok((count, runtime::encode_hex(&root)))
+        })
+        .map_err(ScpWasmError::into_js)?;
 
         if event_count == 0 {
             return Ok(JsValue::from_str("[]"));
@@ -290,43 +289,42 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
                     .into_js()
                 })?;
 
-                let (verified, details_json) =
-                    runtime::with_context(&context_id, |rt| {
-                        let proof = runtime::prove_inclusion(&rt.event_log, leaf_index)
-                            .map_err(|e| {
-                                ScpWasmError::Context(format!("inclusion proof failed: {e}"))
-                            })?;
-                        let verified = runtime::verify_inclusion(&proof);
+                let (verified, details_json) = runtime::with_context(&context_id, |rt| {
+                    let proof =
+                        runtime::prove_inclusion(&rt.event_log, leaf_index).map_err(|e| {
+                            ScpWasmError::Context(format!("inclusion proof failed: {e}"))
+                        })?;
+                    let verified = runtime::verify_inclusion(&proof);
 
-                        let path_steps: Vec<serde_json::Value> = proof
-                            .path
-                            .iter()
-                            .map(|step| {
-                                let direction = match step.direction {
-                                    runtime::Direction::Left => "left",
-                                    runtime::Direction::Right => "right",
-                                };
-                                serde_json::json!({
-                                    "sibling_hash": runtime::encode_hex(&step.sibling_hash),
-                                    "direction": direction,
-                                })
+                    let path_steps: Vec<serde_json::Value> = proof
+                        .path
+                        .iter()
+                        .map(|step| {
+                            let direction = match step.direction {
+                                runtime::Direction::Left => "left",
+                                runtime::Direction::Right => "right",
+                            };
+                            serde_json::json!({
+                                "sibling_hash": runtime::encode_hex(&step.sibling_hash),
+                                "direction": direction,
                             })
-                            .collect();
+                        })
+                        .collect();
 
-                        let details = serde_json::json!({
-                            "leaf_index": proof.leaf_index,
-                            "leaf_hash": runtime::encode_hex(&proof.leaf_hash),
-                            "root": runtime::encode_hex(&proof.root),
-                            "path": path_steps,
-                            "path_length": proof.path.len(),
-                        });
+                    let details = serde_json::json!({
+                        "leaf_index": proof.leaf_index,
+                        "leaf_hash": runtime::encode_hex(&proof.leaf_hash),
+                        "root": runtime::encode_hex(&proof.root),
+                        "path": path_steps,
+                        "path_length": proof.path.len(),
+                    });
 
-                        Ok((verified, details))
-                    })
-                    .map_err(ScpWasmError::into_js)?;
+                    Ok((verified, details))
+                })
+                .map_err(ScpWasmError::into_js)?;
 
-                let details_str = serde_json::to_string(&details_json)
-                    .unwrap_or_else(|_| "{}".to_owned());
+                let details_str =
+                    serde_json::to_string(&details_json).unwrap_or_else(|_| "{}".to_owned());
 
                 let proof = WasmProof {
                     verified,
@@ -347,55 +345,51 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
                     })?
                     .to_owned();
 
-                let event_hash = runtime::decode_hex_hash(&event_hash_hex)
-                    .map_err(|e| {
-                        ScpWasmError::Validation(format!("invalid eventHash: {e}")).into_js()
-                    })?;
+                let event_hash = runtime::decode_hex_hash(&event_hash_hex).map_err(|e| {
+                    ScpWasmError::Validation(format!("invalid eventHash: {e}")).into_js()
+                })?;
 
-                let (verified, details_json) =
-                    runtime::with_context(&context_id, |rt| {
-                        let proof =
-                            runtime::prove_absence(&rt.event_log, &event_hash).map_err(|e| {
-                                ScpWasmError::Context(format!("absence proof failed: {e}"))
-                            })?;
+                let (verified, details_json) = runtime::with_context(&context_id, |rt| {
+                    let proof = runtime::prove_absence(&rt.event_log, &event_hash)
+                        .map_err(|e| ScpWasmError::Context(format!("absence proof failed: {e}")))?;
 
-                        let lower = proof.lower.as_ref().map(|lwp| {
-                            serde_json::json!({
-                                "leaf_hash": runtime::encode_hex(&lwp.leaf_hash),
-                                "leaf_index": lwp.leaf_index,
-                            })
-                        });
-                        let upper = proof.upper.as_ref().map(|uwp| {
-                            serde_json::json!({
-                                "leaf_hash": runtime::encode_hex(&uwp.leaf_hash),
-                                "leaf_index": uwp.leaf_index,
-                            })
-                        });
+                    let lower = proof.lower.as_ref().map(|lwp| {
+                        serde_json::json!({
+                            "leaf_hash": runtime::encode_hex(&lwp.leaf_hash),
+                            "leaf_index": lwp.leaf_index,
+                        })
+                    });
+                    let upper = proof.upper.as_ref().map(|uwp| {
+                        serde_json::json!({
+                            "leaf_hash": runtime::encode_hex(&uwp.leaf_hash),
+                            "leaf_index": uwp.leaf_index,
+                        })
+                    });
 
-                        let lower_verified = proof
-                            .lower
-                            .as_ref()
-                            .is_none_or(|lwp| runtime::verify_inclusion(&lwp.inclusion_proof));
-                        let upper_verified = proof
-                            .upper
-                            .as_ref()
-                            .is_none_or(|uwp| runtime::verify_inclusion(&uwp.inclusion_proof));
-                        let verified = lower_verified && upper_verified;
+                    let lower_verified = proof
+                        .lower
+                        .as_ref()
+                        .is_none_or(|lwp| runtime::verify_inclusion(&lwp.inclusion_proof));
+                    let upper_verified = proof
+                        .upper
+                        .as_ref()
+                        .is_none_or(|uwp| runtime::verify_inclusion(&uwp.inclusion_proof));
+                    let verified = lower_verified && upper_verified;
 
-                        let details = serde_json::json!({
-                            "query_hash": runtime::encode_hex(&proof.query_hash),
-                            "root": runtime::encode_hex(&proof.root),
-                            "leaf_count": proof.leaf_count,
-                            "lower": lower,
-                            "upper": upper,
-                        });
+                    let details = serde_json::json!({
+                        "query_hash": runtime::encode_hex(&proof.query_hash),
+                        "root": runtime::encode_hex(&proof.root),
+                        "leaf_count": proof.leaf_count,
+                        "lower": lower,
+                        "upper": upper,
+                    });
 
-                        Ok((verified, details))
-                    })
-                    .map_err(ScpWasmError::into_js)?;
+                    Ok((verified, details))
+                })
+                .map_err(ScpWasmError::into_js)?;
 
-                let details_str = serde_json::to_string(&details_json)
-                    .unwrap_or_else(|_| "{}".to_owned());
+                let details_str =
+                    serde_json::to_string(&details_json).unwrap_or_else(|_| "{}".to_owned());
 
                 let proof = WasmProof {
                     verified,

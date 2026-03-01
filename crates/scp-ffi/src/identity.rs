@@ -271,9 +271,7 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
     let custody = lines
         .next()
         .ok_or_else(|| {
-            ScpPyError::IdentityError(
-                "stored identity state is missing custody type".to_owned(),
-            )
+            ScpPyError::IdentityError("stored identity state is missing custody type".to_owned())
         })?
         .to_owned();
     Ok((did, custody))
@@ -361,12 +359,9 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
             if let Ok(storage) = crate::runtime::get_storage() {
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
-                storage
-                    .store(&key, &data)
-                    .await
-                    .map_err(|e| ScpPyError::IdentityError(format!(
-                        "failed to persist identity state: {e}"
-                    )))?;
+                storage.store(&key, &data).await.map_err(|e| {
+                    ScpPyError::IdentityError(format!("failed to persist identity state: {e}"))
+                })?;
             }
 
             Ok(PyIdentity {
@@ -422,13 +417,17 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
             let data = storage
                 .retrieve(&key)
                 .await
-                .map_err(|e| ScpPyError::IdentityError(format!(
-                    "failed to read identity state from storage: {e}"
-                )))?
-                .ok_or_else(|| ScpPyError::IdentityError(format!(
-                    "identity not found in storage: {did_owned} — \
+                .map_err(|e| {
+                    ScpPyError::IdentityError(format!(
+                        "failed to read identity state from storage: {e}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ScpPyError::IdentityError(format!(
+                        "identity not found in storage: {did_owned} — \
                      was it created with py_identity_create?"
-                )))?;
+                    ))
+                })?;
 
             let (stored_did, custody) = deserialize_identity_state(&data)?;
 
@@ -513,11 +512,7 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
 
             let rotation_result = rt.block_on(async {
                 did_method
-                    .rotate_active_key(
-                        &entry.identity,
-                        &entry.document,
-                        entry.custody.as_ref(),
-                    )
+                    .rotate_active_key(&entry.identity, &entry.document, entry.custody.as_ref())
                     .await
             });
 

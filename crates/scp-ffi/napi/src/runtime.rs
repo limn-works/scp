@@ -134,13 +134,15 @@ where
 {
     let map = registry();
 
-    let mut entry = map.get_mut(context_id).ok_or_else(|| ScpNapiError::Context {
-        message: format!(
-            "context '{context_id}' not found in runtime registry \
+    let mut entry = map
+        .get_mut(context_id)
+        .ok_or_else(|| ScpNapiError::Context {
+            message: format!(
+                "context '{context_id}' not found in runtime registry \
              -- call a UCAN or event log function with the context handle first"
-        ),
-        code: "SCP-CTX-2023".to_owned(),
-    })?;
+            ),
+            code: "SCP-CTX-2023".to_owned(),
+        })?;
 
     f(entry.value_mut())
 }

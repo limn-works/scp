@@ -285,12 +285,13 @@ pub async fn ucan_validate(
 
     let parsed_token = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
-    let required_cap: CapabilityUri = capability.parse().map_err(|e: CoreUcanError| {
-        ScpNapiError::Permission {
-            message: format!("invalid capability URI '{capability}': {e}"),
-            code: "SCP-PERM-3001".to_owned(),
-        }
-    })?;
+    let required_cap: CapabilityUri =
+        capability
+            .parse()
+            .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                message: format!("invalid capability URI '{capability}': {e}"),
+                code: "SCP-PERM-3001".to_owned(),
+            })?;
 
     let agent_did = parsed_token.payload.aud.clone();
 
@@ -565,8 +566,7 @@ mod tests {
 
     #[test]
     fn bridge_revocation_checker_detects_revoked() {
-        let mut list =
-            scp_core::crypto::ucan::revoke::RevocationList::new("ctx-test".to_owned());
+        let mut list = scp_core::crypto::ucan::revoke::RevocationList::new("ctx-test".to_owned());
         list.revoke("revoked-cid".to_owned());
         let checker = BridgeRevocationChecker {
             revocation_list: &list,

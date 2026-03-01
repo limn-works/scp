@@ -719,9 +719,7 @@ fn py_context_send(
         });
 
         inner_result.map_err(|e| {
-            crate::error::ScpPyError::ContextError(format!(
-                "inner envelope creation failed: {e}"
-            ))
+            crate::error::ScpPyError::ContextError(format!("inner envelope creation failed: {e}"))
         })?;
 
         Ok(())
@@ -859,7 +857,10 @@ mod tests {
         drop(tx);
 
         let result = handle.await.unwrap();
-        assert!(result.is_none(), "recv should return None when sender is dropped");
+        assert!(
+            result.is_none(),
+            "recv should return None when sender is dropped"
+        );
     }
 
     #[tokio::test]
@@ -874,19 +875,24 @@ mod tests {
         }
 
         assert!(
-            tx.try_send(make_test_message(capacity, context_id)).is_err(),
+            tx.try_send(make_test_message(capacity, context_id))
+                .is_err(),
             "channel should be full at capacity"
         );
 
         {
             let mut guard = rx_arc.lock().await;
             let oldest = guard.try_recv();
-            assert!(oldest.is_ok(), "should be able to pop oldest from full buffer");
+            assert!(
+                oldest.is_ok(),
+                "should be able to pop oldest from full buffer"
+            );
             let oldest_msg = oldest.unwrap();
             assert_eq!(oldest_msg.sender_did, "did:test:sender-0");
         }
 
-        tx.try_send(make_test_message(capacity, context_id)).unwrap();
+        tx.try_send(make_test_message(capacity, context_id))
+            .unwrap();
 
         let overflow_warning = PyMessage::new(
             "scp:system".to_owned(),
@@ -975,10 +981,7 @@ mod tests {
 
         crate::runtime::close_receive_channel(context_id).unwrap();
 
-        let result = crate::runtime::deliver_message(
-            context_id,
-            make_test_message(43, context_id),
-        );
+        let result = crate::runtime::deliver_message(context_id, make_test_message(43, context_id));
         assert!(result.is_err(), "should fail after channel is closed");
 
         crate::runtime::remove_context(context_id);
@@ -1002,15 +1005,11 @@ mod tests {
         .unwrap();
 
         for i in 0..capacity {
-            crate::runtime::deliver_message(context_id, make_test_message(i, context_id))
-                .unwrap();
+            crate::runtime::deliver_message(context_id, make_test_message(i, context_id)).unwrap();
         }
 
-        crate::runtime::deliver_message(
-            context_id,
-            make_test_message(capacity, context_id),
-        )
-        .unwrap();
+        crate::runtime::deliver_message(context_id, make_test_message(capacity, context_id))
+            .unwrap();
 
         let mut guard = rx_arc.lock().await;
         let first = guard.try_recv().unwrap();
@@ -1031,7 +1030,10 @@ mod tests {
                 found_new_msg = true;
             }
         }
-        assert!(found_warning, "should find BufferOverflow warning in stream");
+        assert!(
+            found_warning,
+            "should find BufferOverflow warning in stream"
+        );
         assert!(found_new_msg, "should find the overflow-triggering message");
 
         drop(guard);
@@ -1057,11 +1059,11 @@ mod tests {
 
         crate::runtime::close_receive_channel(context_id).unwrap();
 
-        let result = crate::runtime::deliver_message(
-            context_id,
-            make_test_message(0, context_id),
+        let result = crate::runtime::deliver_message(context_id, make_test_message(0, context_id));
+        assert!(
+            result.is_err(),
+            "deliver should fail after close_receive_channel"
         );
-        assert!(result.is_err(), "deliver should fail after close_receive_channel");
 
         crate::runtime::remove_context(context_id);
     }

@@ -379,8 +379,7 @@ mod tests {
 
     #[test]
     fn relay_url_accessor_returns_configured_value() {
-        let monitor =
-            HeartbeatMonitor::new(HeartbeatConfig::default(), "wss://test.relay".into());
+        let monitor = HeartbeatMonitor::new(HeartbeatConfig::default(), "wss://test.relay".into());
         assert_eq!(monitor.relay_url(), "wss://test.relay");
     }
 

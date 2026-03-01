@@ -427,9 +427,7 @@ pub fn parse_address(address: &str) -> Result<ParsedAddress, AddressingError> {
     }
 
     // Bare name: unscoped
-    Ok(ParsedAddress::Unscoped {
-        name: normalized,
-    })
+    Ok(ParsedAddress::Unscoped { name: normalized })
 }
 
 // ---------------------------------------------------------------------------
@@ -599,10 +597,7 @@ impl AddressResolver {
                     results.extend(handle_results);
                 }
             }
-            ParsedAddress::DomainHandle {
-                local_part,
-                domain,
-            } => {
+            ParsedAddress::DomainHandle { local_part, domain } => {
                 let domain_results = handle_querier
                     .lookup_domain_handle(&domain, &local_part)
                     .await;
@@ -633,25 +628,21 @@ impl AddressResolver {
 
                 // Then check all discovery contexts.
                 for (scope, context_id) in known_contexts {
-                    let handle_results = handle_querier
-                        .lookup_handle(context_id, &name, None)
-                        .await;
+                    let handle_results =
+                        handle_querier.lookup_handle(context_id, &name, None).await;
                     results.extend(handle_results);
                     let _ = scope;
                 }
 
                 // Then check domain handles for each configured domain (§22.8.2 step 2a).
                 for domain in known_domains {
-                    let domain_results = handle_querier
-                        .lookup_domain_handle(domain, &name)
-                        .await;
+                    let domain_results = handle_querier.lookup_domain_handle(domain, &name).await;
                     results.extend(domain_results);
                 }
 
                 // Then check attestation.
-                let attestation_results = handle_querier
-                    .lookup_attestation_handle(&name, None)
-                    .await;
+                let attestation_results =
+                    handle_querier.lookup_attestation_handle(&name, None).await;
                 results.extend(attestation_results);
             }
         }
@@ -720,11 +711,7 @@ pub trait HandleQuerier {
     /// Looks up a domain handle via `.well-known/scp`.
     ///
     /// Returns resolution results from the domain's handles map.
-    async fn lookup_domain_handle(
-        &self,
-        domain: &str,
-        handle: &str,
-    ) -> Vec<AddressResolution>;
+    async fn lookup_domain_handle(&self, domain: &str, handle: &str) -> Vec<AddressResolution>;
 
     /// Looks up an attestation-backed handle via reverse-lookup.
     ///
@@ -750,10 +737,7 @@ fn corroborate_results(results: Vec<AddressResolution>) -> Vec<AddressResolution
     for result in results {
         match &result {
             AddressResolution::Identity { did, .. } => {
-                by_did
-                    .entry(did.to_string())
-                    .or_default()
-                    .push(result);
+                by_did.entry(did.to_string()).or_default().push(result);
             }
             AddressResolution::Context { .. } => {
                 non_identity.push(result);
@@ -770,9 +754,7 @@ fn corroborate_results(results: Vec<AddressResolution>) -> Vec<AddressResolution
                 .iter()
                 .map(|e| e.resolution_path().clone())
                 .collect();
-            if let Some(AddressResolution::Identity { did, .. }) =
-                entries.into_iter().next()
-            {
+            if let Some(AddressResolution::Identity { did, .. }) = entries.into_iter().next() {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -989,19 +971,15 @@ mod tests {
 
     #[test]
     fn trust_level_default_rank_ordering() {
-        assert!(TrustLevel::DirectExchange.default_rank() > TrustLevel::LocalPetname.default_rank());
         assert!(
-            TrustLevel::LocalPetname.default_rank()
-                > TrustLevel::MultiLayerCorroborated {
-                    sources: vec![]
-                }
-                .default_rank()
+            TrustLevel::DirectExchange.default_rank() > TrustLevel::LocalPetname.default_rank()
         );
         assert!(
-            TrustLevel::MultiLayerCorroborated {
-                sources: vec![]
-            }
-            .default_rank()
+            TrustLevel::LocalPetname.default_rank()
+                > TrustLevel::MultiLayerCorroborated { sources: vec![] }.default_rank()
+        );
+        assert!(
+            TrustLevel::MultiLayerCorroborated { sources: vec![] }.default_rank()
                 > TrustLevel::DomainVerified.default_rank()
         );
         assert!(
@@ -1049,16 +1027,8 @@ mod tests {
     #[test]
     fn cache_evict_expired_removes_old_entries() {
         let mut cache = ResolutionCache::new();
-        cache.insert(
-            "expired".to_owned(),
-            vec![],
-            Duration::from_secs(0),
-        );
-        cache.insert(
-            "alive".to_owned(),
-            vec![],
-            Duration::from_secs(3600),
-        );
+        cache.insert("expired".to_owned(), vec![], Duration::from_secs(0));
+        cache.insert("alive".to_owned(), vec![], Duration::from_secs(3600));
 
         // The expired entry might or might not be stale yet (depends on timing).
         // Force eviction.
@@ -1294,11 +1264,7 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        async fn lookup_domain_handle(
-            &self,
-            domain: &str,
-            handle: &str,
-        ) -> Vec<AddressResolution> {
+        async fn lookup_domain_handle(&self, domain: &str, handle: &str) -> Vec<AddressResolution> {
             self.domain_handles
                 .get(&(domain.to_owned(), handle.to_owned()))
                 .cloned()
@@ -1321,7 +1287,12 @@ mod tests {
     async fn resolve_discovery_handle_returns_result() {
         let petnames = TestPetnameStore::new();
         let mut querier = TestHandleQuerier::new();
-        querier.add_discovery_handle("ctx-cooking", "alice", "did:dht:zAlice", "cooking-community");
+        querier.add_discovery_handle(
+            "ctx-cooking",
+            "alice",
+            "did:dht:zAlice",
+            "cooking-community",
+        );
 
         let mut known = HashMap::new();
         known.insert("cooking-community".to_owned(), "ctx-cooking".to_owned());
@@ -1436,7 +1407,12 @@ mod tests {
     async fn resolve_unscoped_multi_layer_corroboration() {
         let petnames = TestPetnameStore::new();
         let mut querier = TestHandleQuerier::new();
-        querier.add_discovery_handle("ctx-cooking", "alice", "did:dht:zAlice", "cooking-community");
+        querier.add_discovery_handle(
+            "ctx-cooking",
+            "alice",
+            "did:dht:zAlice",
+            "cooking-community",
+        );
         querier.add_attestation_handle("alice", "did:dht:zAlice");
 
         let mut known = HashMap::new();
@@ -1496,7 +1472,12 @@ mod tests {
     async fn resolve_caches_results() {
         let petnames = TestPetnameStore::new();
         let mut querier = TestHandleQuerier::new();
-        querier.add_discovery_handle("ctx-cooking", "alice", "did:dht:zAlice", "cooking-community");
+        querier.add_discovery_handle(
+            "ctx-cooking",
+            "alice",
+            "did:dht:zAlice",
+            "cooking-community",
+        );
 
         let mut known = HashMap::new();
         known.insert("cooking-community".to_owned(), "ctx-cooking".to_owned());
