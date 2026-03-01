@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
@@ -457,25 +458,35 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
 
     // Register in the known-contexts registry for discovery via
     // py_mcp_load_contexts. Derive a per-identity routing ID using
-    // HMAC-SHA256(random_secret, context_id || "scp-pseudonym") to preserve
-    // participant unlinkability. The random secret is per-identity and
-    // in-memory only — see runtime::get_or_create_routing_secret.
+    // KeyCustody::derive_pseudonym with real key material (§9.10.4).
+    // The pseudonym is deterministic for the same identity + context pair,
+    // providing unlinkability across contexts. See SCP-214 criterion 4.
     {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        type HmacSha256 = Hmac<Sha256>;
-
-        // Stub — see SCP-214 for KeyCustody wiring. Uses a per-identity random
-        // secret as the HMAC key (provides unlinkability but doesn't persist across
-        // restarts). Replace with scp_core::envelope::pseudonym::derive_pseudonym
-        // using real key material (§9.10.4).
-        let routing_secret = crate::runtime::get_or_create_routing_secret(identity_did);
-        let mut mac = HmacSha256::new_from_slice(&routing_secret)
-            .map_err(|e| PyRuntimeError::new_err(format!("HMAC initialization failed: {e}")))?;
-        mac.update(context_id.as_bytes());
-        mac.update(b"scp-pseudonym");
-        let routing_id: [u8; 32] = mac.finalize().into_bytes().into();
+        let routing_id = crate::runtime::with_identity(identity_did, |entry| {
+            let rt = crate::runtime().map_err(|e| {
+                crate::error::ScpPyError::IdentityError(format!("runtime not available: {e}"))
+            })?;
+            let pseudonym = rt.block_on(async {
+                entry
+                    .custody
+                    .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                    .await
+            });
+            let pk = pseudonym
+                .map_err(|e| {
+                    crate::error::ScpPyError::IdentityError(format!(
+                        "pseudonym derivation failed: {e}"
+                    ))
+                })?
+                .public_key;
+            let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+                crate::error::ScpPyError::IdentityError(
+                    "pseudonym public key must be 32 bytes".to_owned(),
+                )
+            })?;
+            Ok(bytes)
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("routing ID derivation failed: {e}")))?;
 
         // Get the relay URL from transport status if a relay is connected.
         let relay_url = match crate::transport::py_transport_status() {
@@ -663,19 +674,59 @@ fn py_context_send(
     }
     drop(state);
 
-    // Validate payload type: must be bytes or str.
-    let is_bytes = payload.is_instance_of::<pyo3::types::PyBytes>();
-    let is_str = payload.is_instance_of::<pyo3::types::PyString>();
-    if !is_bytes && !is_str {
+    // Extract payload bytes: must be bytes or str.
+    let payload_bytes: Vec<u8> = if payload.is_instance_of::<pyo3::types::PyBytes>() {
+        payload.extract::<Vec<u8>>()?
+    } else if payload.is_instance_of::<pyo3::types::PyString>() {
+        let s: String = payload.extract()?;
+        s.into_bytes()
+    } else {
         return Err(PyTypeError::new_err("payload must be bytes or str"));
-    }
+    };
 
-    // In the full runtime, this would:
-    // 1. Encrypt the payload via MLS/sender keys.
-    // 2. Create an OuterEnvelope with provenance metadata.
-    // 3. Send via the transport layer.
-    // 4. Log the send event.
-    let _ = identity_did; // Will be used when connected to scp-core runtime.
+    // Create a real inner envelope using the retained KeyCustody for signing.
+    // This validates that the identity's active signing key can produce a
+    // valid Ed25519 signature over the message. The inner envelope is not
+    // yet transmitted (MLS encryption and transport are future stories) but
+    // the signing path exercises real KeyCustody. See SCP-214 criterion 6.
+    let context_id = handle.context_id.clone();
+    let identity_did_owned = identity_did.to_owned();
+
+    let rt = crate::runtime()?;
+    crate::runtime::with_identity(&identity_did_owned, |entry| {
+        #[allow(clippy::cast_possible_truncation)] // Unix ms timestamps fit in u64 for centuries.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                crate::error::ScpPyError::ContextError(format!("system clock error: {e}"))
+            })?
+            .as_millis() as u64;
+
+        let inner_result = rt.block_on(async {
+            scp_core::envelope::create_inner_envelope(
+                &context_id,
+                &identity_did_owned,
+                0,
+                0,
+                0,
+                now_ms,
+                &payload_bytes,
+                None,
+                entry.custody.as_ref(),
+                &entry.identity.active_signing_key,
+            )
+            .await
+        });
+
+        inner_result.map_err(|e| {
+            crate::error::ScpPyError::ContextError(format!(
+                "inner envelope creation failed: {e}"
+            ))
+        })?;
+
+        Ok(())
+    })
+    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
     Ok(())
 }

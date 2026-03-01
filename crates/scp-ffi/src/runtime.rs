@@ -50,7 +50,8 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::event_log::EventLog;
 use scp_core::identity::cache::SystemClock;
-use scp_platform::testing::InMemoryStorage;
+use scp_core::identity::{DidDocument, ScpIdentity};
+use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::adapter::NativeRelayAdapter;
 use tokio::sync::mpsc;
 
@@ -85,6 +86,18 @@ static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new()
 /// Uses `RwLock` for infrequent writes (connect) and concurrent reads (probe).
 static RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>> = OnceLock::new();
 
+/// Global identity registry mapping DID strings to retained identity state.
+///
+/// Stores the [`ScpIdentity`] (with opaque [`KeyHandle`]s), the
+/// [`Arc<InMemoryKeyCustody>`] that owns the key material, and the
+/// [`DidDocument`]. This allows bridge functions to perform crypto
+/// operations (signing, pseudonym derivation, key rotation) without private
+/// key material crossing the FFI boundary (ADR-006).
+///
+/// Uses [`DashMap`] for lock-free concurrent access matching the context
+/// registry pattern.
+static IDENTITY_REGISTRY: OnceLock<DashMap<String, IdentityEntry>> = OnceLock::new();
+
 /// Returns a reference to the global context registry.
 fn registry() -> &'static DashMap<String, ContextRuntime> {
     CONTEXT_REGISTRY.get_or_init(DashMap::new)
@@ -105,6 +118,95 @@ fn relay_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
 /// When the buffer is full, the oldest unconsumed event is dropped and a
 /// `BufferOverflow` warning is injected into the stream.
 pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
+
+/// Returns a reference to the global identity registry.
+fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
+    IDENTITY_REGISTRY.get_or_init(DashMap::new)
+}
+
+// ---------------------------------------------------------------------------
+// Identity registry (SCP-214: KeyCustody wiring)
+// ---------------------------------------------------------------------------
+
+/// Retained identity state for a single DID.
+///
+/// Stores the [`ScpIdentity`] (opaque key handles), the [`InMemoryKeyCustody`]
+/// that owns the key material, and the [`DidDocument`]. The custody provider
+/// is behind an `Arc` so it can be shared with context-scoped operations
+/// (pseudonym derivation, signing, UCAN minting) without moving or cloning
+/// the key material.
+///
+/// See ADR-006 and SCP-214 criterion 3.
+pub struct IdentityEntry {
+    /// The scp-core identity handle (DID string, key handles, pre-rotation).
+    pub identity: ScpIdentity,
+    /// The key custody provider that manages the actual key material.
+    pub custody: Arc<InMemoryKeyCustody>,
+    /// The DID document for this identity.
+    pub document: DidDocument,
+}
+
+/// Registers an identity in the global identity registry.
+///
+/// Called by `py_identity_create` after successfully creating an identity.
+/// Subsequent bridge functions (UCAN minting, pseudonym derivation, key
+/// rotation) look up the identity by DID to access the retained custody
+/// provider and key handles.
+///
+/// Overwrites any existing entry for the same DID (idempotent).
+pub fn register_identity(did: &str, entry: IdentityEntry) {
+    identity_registry().insert(did.to_owned(), entry);
+}
+
+/// Executes a closure with a reference to an identity's retained state.
+///
+/// Looks up the identity by DID in the global registry and calls `f` with
+/// a reference to the [`IdentityEntry`]. Uses `DashMap::get` for fine-grained
+/// per-key locking.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if the DID is not found.
+pub fn with_identity<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+where
+    F: FnOnce(&IdentityEntry) -> Result<T, ScpPyError>,
+{
+    let entry = identity_registry().get(did).ok_or_else(|| {
+        ScpPyError::IdentityError(format!(
+            "identity '{did}' not found in registry \
+             -- was it created with py_identity_create?"
+        ))
+    })?;
+
+    f(entry.value())
+}
+
+/// Executes a closure with mutable access to an identity's retained state.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if the DID is not found.
+pub fn with_identity_mut<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+where
+    F: FnOnce(&mut IdentityEntry) -> Result<T, ScpPyError>,
+{
+    let mut entry = identity_registry().get_mut(did).ok_or_else(|| {
+        ScpPyError::IdentityError(format!(
+            "identity '{did}' not found in registry \
+             -- was it created with py_identity_create?"
+        ))
+    })?;
+
+    f(entry.value_mut())
+}
+
+/// Removes an identity from the global registry.
+///
+/// Called when an identity is migrated to a new DID. The old entry is
+/// removed and the new entry is registered under the new DID.
+pub fn remove_identity(did: &str) {
+    identity_registry().remove(did);
+}
 
 /// Per-context runtime state: the live objects needed by bridge functions.
 ///
@@ -517,35 +619,6 @@ pub fn get_storage() -> Result<&'static Arc<InMemoryStorage>, ScpPyError> {
         ScpPyError::IdentityError(
             "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
         )
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Stub — see SCP-214 for KeyCustody wiring (interim pseudonym derivation)
-// ---------------------------------------------------------------------------
-
-/// Returns a 32-byte random secret for the given identity DID, creating one
-/// if none exists.
-///
-/// This is an interim mechanism for pseudonym derivation until `KeyCustody`
-/// is wired into the FFI bridge. The secret provides actual unlinkability
-/// (unlike using the public DID as the HMAC key). The secret is in-memory
-/// only and will not match across process restarts.
-///
-/// **Note:** The internal `IDENTITY_ROUTING_SECRETS` map grows without eviction,
-/// but is bounded by unique identity DIDs (typically 1–2 per process). This
-/// entire function is removed when `KeyCustody` is wired in (SCP-214).
-///
-/// When `KeyCustody` is wired in, replace callers with
-/// `scp_core::envelope::pseudonym::derive_pseudonym` using real key material.
-pub fn get_or_create_routing_secret(identity_did: &str) -> [u8; 32] {
-    static IDENTITY_ROUTING_SECRETS: OnceLock<DashMap<String, [u8; 32]>> = OnceLock::new();
-
-    let map = IDENTITY_ROUTING_SECRETS.get_or_init(DashMap::new);
-    *map.entry(identity_did.to_owned()).or_insert_with(|| {
-        let mut secret = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
-        secret
     })
 }
 

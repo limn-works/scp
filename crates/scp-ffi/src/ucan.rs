@@ -39,14 +39,15 @@ use pyo3::prelude::*;
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 use scp_core::crypto::ucan::UcanToken;
 use scp_core::crypto::ucan::capability::CapabilityUri;
+use scp_core::crypto::ucan::mint::{DelegateParams, MintParams, mint_ucan, delegate_ucan};
 use scp_core::crypto::ucan::revoke::compute_revocation_cid;
 use scp_core::crypto::ucan::validate::{
     DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     ValidationContext, parse_ucan, validate_ucan,
 };
+use scp_core::crypto::ucan::Attenuation;
 
 use crate::error::ScpPyError;
-use crate::types::encode_hex;
 
 // ---------------------------------------------------------------------------
 // PyUcanToken
@@ -291,18 +292,14 @@ pub fn py_ucan_validate(
 /// Mints a new UCAN token for a context member.
 ///
 /// Creates a new UCAN token granting the specified capabilities to the
-/// given member DID. The token is structured with proper SCP capability
-/// URIs scoped to the context.
-///
-/// Stub — see SCP-214 for `KeyCustody` wiring. Currently creates a properly
-/// formatted token with a placeholder signature. Real Ed25519 signing
-/// requires `KeyCustody` integration.
+/// given member DID. The token is signed with a real Ed25519 signature
+/// using the context creator's retained [`KeyCustody`] provider.
 ///
 /// # Arguments
 ///
 /// * `context_id` -- The ID of the context to mint the token for.
 /// * `member_did` -- The DID of the member receiving the token.
-/// * `capabilities` -- List of capability URIs to grant.
+/// * `capabilities` -- List of capability strings (e.g., `"messages:write"`).
 ///
 /// # Returns
 ///
@@ -311,9 +308,9 @@ pub fn py_ucan_validate(
 /// # Errors
 ///
 /// Raises `UcanError` if minting fails: capabilities outside the context
-/// ceiling, issuer not authorized, etc.
+/// ceiling, issuer not authorized, signing fails, etc.
 ///
-/// See ADR-013 §6: `py_ucan_mint(handle, member_did, capabilities) -> PyUcanToken`.
+/// See ADR-013 §6 and SCP-214 criterion 7.
 #[pyfunction]
 #[pyo3(name = "ucan_mint")]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
@@ -325,35 +322,130 @@ pub fn py_ucan_mint(
     // Look up the context to get the creator DID (issuer).
     let creator_did = crate::runtime::with_context(context_id, |rt| Ok(rt.creator_did.clone()))?;
 
-    // Generate a unique nonce for the token ID.
-    let nonce = generate_nonce()?;
+    let rt = crate::runtime()?;
+    let context_id_owned = context_id.to_owned();
 
-    // Build capability attestations scoped to the context.
-    let capability_uris: Vec<String> = capabilities
+    // Mint using real scp_core::mint_ucan with Ed25519 signing via
+    // the retained KeyCustody. See SCP-214 criterion 7.
+    let token = crate::runtime::with_identity(&creator_did, |entry| {
+        let params = MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &entry.identity.active_signing_key,
+            audience_did: member_did,
+            context_id: &context_id_owned,
+            capabilities: &capabilities,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: Vec::new(),
+            facts: None,
+        };
+
+        let result = rt.block_on(async { mint_ucan(&params, entry.custody.as_ref()).await });
+        result.map_err(ScpPyError::from)
+    })?;
+
+    // Convert capability attestations to URI strings for Python.
+    let capability_uris: Vec<String> = token.payload.att.iter().map(|a| a.with.clone()).collect();
+
+    Ok(PyUcanToken {
+        token_id: token.payload.nnc.clone(),
+        issuer: token.payload.iss.clone(),
+        audience: token.payload.aud.clone(),
+        capabilities: capability_uris,
+        #[allow(clippy::cast_precision_loss)]
+        expires_at: Some(token.payload.exp as f64),
+    })
+}
+
+/// Delegates a UCAN token to another member.
+///
+/// Creates a delegated UCAN from an existing parent token, signed with the
+/// delegator's Ed25519 key via the retained [`KeyCustody`] provider.
+/// Delegation enforces attenuation (capabilities can only narrow, never
+/// widen).
+///
+/// # Arguments
+///
+/// * `context_id` -- The ID of the context.
+/// * `delegator_did` -- The DID of the entity delegating (must match
+///   parent token's audience).
+/// * `delegatee_did` -- The DID of the entity receiving the delegation.
+/// * `parent_token` -- The encoded parent UCAN token (JWT format).
+/// * `capabilities` -- List of capability URI strings to delegate (must be
+///   subset of parent's capabilities).
+///
+/// # Returns
+///
+/// A [`PyUcanToken`] with the delegated token's metadata.
+///
+/// # Errors
+///
+/// Raises `UcanError` if delegation fails: delegator not matching parent
+/// audience, capabilities wider than parent, signing failure, etc.
+///
+/// See ADR-016 criterion 4 and SCP-214 criterion 8.
+#[pyfunction]
+#[pyo3(name = "ucan_delegate")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn py_ucan_delegate(
+    context_id: &str,
+    delegator_did: &str,
+    delegatee_did: &str,
+    parent_token: &str,
+    capabilities: Vec<String>,
+) -> PyResult<PyUcanToken> {
+    // Parse the parent token.
+    let parsed_parent = parse_ucan(parent_token).map_err(ScpPyError::from)?;
+
+    // Build attenuated capabilities from the capability URI strings.
+    let attenuations: Vec<Attenuation> = capabilities
         .iter()
         .map(|cap| {
-            if cap.starts_with("scp:ctx:") {
+            let cap_uri = if cap.starts_with("scp:ctx:") {
                 cap.clone()
             } else {
                 format!("scp:ctx:{context_id}/{cap}")
+            };
+            let action = cap_uri.rsplit_once('/').map_or_else(
+                || cap.clone(),
+                |(_, a)| {
+                    a.split_once(':')
+                        .map_or_else(|| a.to_owned(), |(_, act)| act.to_owned())
+                },
+            );
+            Attenuation {
+                with: cap_uri,
+                can: action,
             }
         })
         .collect();
 
-    // Calculate expiry: 1 hour from now (default, within 24h max).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ScpPyError::UcanError(format!("system clock error: {e}")))?
-        .as_secs();
-    let exp = now + 3600; // 1 hour
+    let rt = crate::runtime()?;
+
+    let token = crate::runtime::with_identity(delegator_did, |entry| {
+        let params = DelegateParams {
+            parent_token: &parsed_parent,
+            delegator_did,
+            delegator_key: &entry.identity.active_signing_key,
+            delegatee_did,
+            attenuated_capabilities: &attenuations,
+            lifetime_secs: 3600,
+            facts: None,
+        };
+
+        let result = rt.block_on(async { delegate_ucan(&params, entry.custody.as_ref()).await });
+        result.map_err(ScpPyError::from)
+    })?;
+
+    let capability_uris: Vec<String> = token.payload.att.iter().map(|a| a.with.clone()).collect();
 
     Ok(PyUcanToken {
-        token_id: nonce,
-        issuer: creator_did,
-        audience: member_did.to_owned(),
+        token_id: token.payload.nnc.clone(),
+        issuer: token.payload.iss.clone(),
+        audience: token.payload.aud.clone(),
         capabilities: capability_uris,
-        #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
-        expires_at: Some(exp as f64),
+        #[allow(clippy::cast_precision_loss)]
+        expires_at: Some(token.payload.exp as f64),
     })
 }
 
@@ -398,25 +490,6 @@ pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
-///
-/// Uses cryptographic randomness via `rand::thread_rng()` (backed by `OsRng`)
-/// to produce unpredictable nonces as required by ADR-016 §7.2.
-fn generate_nonce() -> Result<String, ScpPyError> {
-    use rand::Rng;
-
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ScpPyError::UcanError(format!("system clock error: {e}")))?
-        .as_millis();
-
-    let mut random_bytes = [0u8; 16];
-    rand::thread_rng().fill(&mut random_bytes);
-
-    let hex = encode_hex(&random_bytes);
-    Ok(format!("{now_millis}-{hex}"))
-}
 
 /// Decodes a hex string to bytes.
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
@@ -469,6 +542,7 @@ pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyUcanToken>()?;
     m.add_function(wrap_pyfunction!(py_ucan_validate, m)?)?;
     m.add_function(wrap_pyfunction!(py_ucan_mint, m)?)?;
+    m.add_function(wrap_pyfunction!(py_ucan_delegate, m)?)?;
     m.add_function(wrap_pyfunction!(py_ucan_revoke, m)?)?;
     Ok(())
 }
@@ -508,6 +582,7 @@ pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
 )]
 mod tests {
     use super::*;
+    use crate::types::encode_hex;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver
