@@ -14,18 +14,14 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console", "Window", "Crypto", "SubtleCrypto"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { version = "1", features = ["v4", "js"] }
 getrandom = { version = "0.2", features = ["js"] }
-getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-sha2 = { workspace = true }
-jsonschema = { workspace = true }
-base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
-z-base-32 = { workspace = true }
-serde = { workspace = true }
-hex = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
