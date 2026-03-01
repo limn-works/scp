@@ -12,39 +12,25 @@
 
 package com.limn.scp.android.platform
 
+import android.content.Context
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import kotlin.test.assertEquals
 
 class AndroidPushProviderTest {
 
-    // AndroidPushProvider requires an Android Context for Firebase initialisation.
-    // For handleNotification tests, we use a TestPushHandler that exercises the
-    // same validation logic without requiring a real Android Context or Firebase.
-    //
-    // This approach tests the contract: given a payload map, the handler must
-    // validate the "scp" field and return the correct WakeSignal or throw
-    // ScpException with the correct error code.
+    private lateinit var provider: AndroidPushProvider
 
-    /**
-     * Test helper that delegates to [AndroidPushProvider.handleNotification]
-     * validation logic. Since AndroidPushProvider requires an Android Context
-     * (unavailable in JVM unit tests), we extract the validation into a
-     * standalone function that mirrors the production code exactly.
-     */
-    private fun handleNotification(payload: Map<String, String>): WakeSignal {
-        val scpField = payload["scp"]
-            ?: throw ScpException(
-                "FCM payload missing 'scp' field",
-                "SCP-PUSH-5001"
-            )
-        if (scpField != "1") {
-            throw ScpException(
-                "FCM payload 'scp' field has unexpected value: $scpField",
-                "SCP-PUSH-5002"
-            )
-        }
-        return WakeSignal.PULL
+    @BeforeEach
+    fun setUp() {
+        // handleNotification() is a pure function that does not use the Android
+        // Context. An unsafe null cast works at the JVM level for unit tests.
+        // Integration tests on a real device should use an actual Context.
+        provider = AndroidPushProvider(
+            @Suppress("CAST_NEVER_SUCCEEDS")
+            (null as Any?) as Context
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -54,7 +40,7 @@ class AndroidPushProviderTest {
     @Test
     fun `valid scp payload returns WakeSignal Pull`() {
         val payload = mapOf("scp" to "1")
-        val signal = handleNotification(payload)
+        val signal = provider.handleNotification(payload)
         assertEquals(WakeSignal.PULL, signal)
     }
 
@@ -62,7 +48,7 @@ class AndroidPushProviderTest {
     fun `valid scp payload with only scp field returns Pull`() {
         // The opaque payload format: {"scp": "1"} — exactly one field.
         val payload = mapOf("scp" to "1")
-        val signal = handleNotification(payload)
+        val signal = provider.handleNotification(payload)
         assertEquals(WakeSignal.PULL, signal)
     }
 
@@ -74,7 +60,7 @@ class AndroidPushProviderTest {
     fun `empty payload throws ScpException with code SCP-PUSH-5001`() {
         val payload = emptyMap<String, String>()
         val exception = assertThrows<ScpException> {
-            handleNotification(payload)
+            provider.handleNotification(payload)
         }
         assertEquals("SCP-PUSH-5001", exception.code)
         assertEquals("FCM payload missing 'scp' field", exception.message)
@@ -84,7 +70,7 @@ class AndroidPushProviderTest {
     fun `payload without scp field throws ScpException with code SCP-PUSH-5001`() {
         val payload = mapOf("other" to "value")
         val exception = assertThrows<ScpException> {
-            handleNotification(payload)
+            provider.handleNotification(payload)
         }
         assertEquals("SCP-PUSH-5001", exception.code)
     }
@@ -94,7 +80,7 @@ class AndroidPushProviderTest {
         // Case-sensitive: "SCP" is not "scp"
         val payload = mapOf("SCP" to "1")
         val exception = assertThrows<ScpException> {
-            handleNotification(payload)
+            provider.handleNotification(payload)
         }
         assertEquals("SCP-PUSH-5001", exception.code)
     }
@@ -107,7 +93,7 @@ class AndroidPushProviderTest {
     fun `scp field with value 0 throws ScpException with code SCP-PUSH-5002`() {
         val payload = mapOf("scp" to "0")
         val exception = assertThrows<ScpException> {
-            handleNotification(payload)
+            provider.handleNotification(payload)
         }
         assertEquals("SCP-PUSH-5002", exception.code)
         assertEquals("FCM payload 'scp' field has unexpected value: 0", exception.message)
@@ -117,7 +103,7 @@ class AndroidPushProviderTest {
     fun `scp field with value 2 throws ScpException with code SCP-PUSH-5002`() {
         val payload = mapOf("scp" to "2")
         val exception = assertThrows<ScpException> {
-            handleNotification(payload)
+            provider.handleNotification(payload)
         }
         assertEquals("SCP-PUSH-5002", exception.code)
     }
@@ -126,7 +112,7 @@ class AndroidPushProviderTest {
     fun `scp field with empty value throws ScpException with code SCP-PUSH-5002`() {
         val payload = mapOf("scp" to "")
         val exception = assertThrows<ScpException> {
-            handleNotification(payload)
+            provider.handleNotification(payload)
         }
         assertEquals("SCP-PUSH-5002", exception.code)
     }
@@ -135,7 +121,7 @@ class AndroidPushProviderTest {
     fun `scp field with arbitrary string throws ScpException with code SCP-PUSH-5002`() {
         val payload = mapOf("scp" to "wake")
         val exception = assertThrows<ScpException> {
-            handleNotification(payload)
+            provider.handleNotification(payload)
         }
         assertEquals("SCP-PUSH-5002", exception.code)
         assertEquals("FCM payload 'scp' field has unexpected value: wake", exception.message)
@@ -146,7 +132,7 @@ class AndroidPushProviderTest {
         // "1 " is not "1"
         val payload = mapOf("scp" to " 1")
         val exception = assertThrows<ScpException> {
-            handleNotification(payload)
+            provider.handleNotification(payload)
         }
         assertEquals("SCP-PUSH-5002", exception.code)
     }
@@ -187,7 +173,7 @@ class AndroidPushProviderTest {
         // requirement (§10.7) is enforced at the relay side — the client
         // validates only the wake signal field.
         val payload = mapOf("scp" to "1", "extra" to "ignored")
-        val signal = handleNotification(payload)
+        val signal = provider.handleNotification(payload)
         assertEquals(WakeSignal.PULL, signal)
     }
 }

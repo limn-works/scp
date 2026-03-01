@@ -661,17 +661,15 @@ impl ContextProvider for FfiBridgeProvider {
                 })?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
-                if let Some(reg) = rt.tool_registry.get(tool_name) {
-                    scp_core::context::tools::schema::validate_value_against_schema(
-                        &output,
-                        &reg.schema.output_schema,
-                    )
-                    .map_err(|msg| {
-                        ScpPyError::ValidationError(format!(
-                            "output validation failed for tool '{tool_name}': {msg}"
-                        ))
-                    })?;
-                }
+                scp_core::context::tools::schema::validate_value_against_schema(
+                    &output,
+                    &registration.schema.output_schema,
+                )
+                .map_err(|msg| {
+                    ScpPyError::ValidationError(format!(
+                        "output validation failed for tool '{tool_name}': {msg}"
+                    ))
+                })?;
 
                 return Ok(output);
             }
