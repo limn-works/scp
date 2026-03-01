@@ -3526,9 +3526,11 @@ dependencies = [
 name = "scp-ffi-napi"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "napi",
  "napi-build",
  "napi-derive",
+ "rand 0.8.5",
  "scp-core",
  "scp-platform",
  "serde_json",
@@ -3536,6 +3538,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "z-base-32",
 ]
 
 [[package]]
