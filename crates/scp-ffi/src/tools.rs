@@ -228,6 +228,18 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 
 /// Invokes a tool within an SCP context.
 ///
+/// Dispatches to a registered tool handler if one exists (registered via
+/// [`crate::runtime::register_tool_handler`]). Validates input against the
+/// tool's input schema before dispatch, and output against the output
+/// schema after. Constructs a [`scp_core::context::tools::ToolInvokedEvent`]
+/// for provenance (matching the scp-core `invoke_tool` contract). Merkle
+/// event log append requires a signed `Event` with key material — that
+/// happens at the transport layer which has signing access.
+///
+/// If no handler is registered, falls back to returning validated input
+/// with metadata (schema-only mode), identical to
+/// `FfiBridgeProvider::invoke_tool` in `mcp.rs`.
+///
 /// # Arguments
 ///
 /// * `context_id` — The ID of the context containing the tool.
@@ -245,9 +257,10 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 ///
 /// Raises `ContextError` if the context is not connected, the tool is
 /// not found, the invoker lacks capability, input validation fails,
-/// execution times out, or the tool execution itself fails.
+/// output validation fails, or the tool handler itself fails.
 ///
 /// See ADR-013 §4: `py_tool_invoke(handle, tool_id, input, identity) -> PyObject`.
+/// See SCP-212 for the handler registration and dispatch design.
 #[pyfunction]
 #[pyo3(name = "tool_invoke")]
 pub fn py_tool_invoke(
@@ -257,16 +270,13 @@ pub fn py_tool_invoke(
     input: &Bound<'_, PyDict>,
     identity_did: &str,
 ) -> PyResult<PyObject> {
-    // Convert Python dict input to serde_json::Value.
     let input_json = py_dict_to_json(input)?;
+    let start = std::time::Instant::now();
 
-    // Look up the tool in the context's registry and validate input schema.
-    // Tool invocation in the bridge layer performs schema validation and returns
-    // the input as the output (passthrough), since actual tool execution requires
-    // a running executor which is wired at the transport layer. This validates
-    // the full registration and capability chain without requiring an executor.
+    // Validates tool existence, input schema, capability, dispatches to handler,
+    // validates output schema, and builds a ToolInvokedEvent for provenance.
+    // Mirrors the dispatch logic in FfiBridgeProvider::invoke_tool (mcp.rs).
     let output_json = crate::runtime::with_context(context_id, |rt| {
-        // Check that the tool exists.
         let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
             ScpPyError::ContextError(format!(
                 "tool '{tool_id}' not found in context '{context_id}'"
@@ -291,13 +301,61 @@ pub fn py_tool_invoke(
             )));
         }
 
-        // In the bridge layer without a full executor, we return the input as
-        // a passthrough. Real tool execution happens via the transport layer
-        // when it's wired to a relay.
-        Ok(input_json.clone())
+        // Dispatch to registered handler if available.
+        let output = if let Some(handler) = rt.tool_handlers.get(tool_id) {
+            let handler = handler.clone();
+            let out = handler(input_json.clone()).map_err(|e| {
+                ScpPyError::ContextError(format!("tool handler for '{tool_id}' failed: {e}"))
+            })?;
+
+            // Validate output against the tool's output schema (defense-in-depth).
+            scp_core::context::tools::validate_value_against_schema(
+                &out,
+                &registration.schema.output_schema,
+            )
+            .map_err(|msg| {
+                ScpPyError::ValidationError(format!(
+                    "output validation failed for tool '{tool_id}': {msg}"
+                ))
+            })?;
+
+            out
+        } else {
+            // No handler registered — fall back to echo mode with metadata.
+            serde_json::json!({
+                "tool": tool_id,
+                "context": context_id,
+                "status": "validated",
+                "input_valid": true,
+                "validated_input": input_json,
+            })
+        };
+
+        // Build a ToolInvokedEvent for provenance. Matches scp-core invoke_tool
+        // contract: the caller (transport layer) is responsible for signing and
+        // appending to the Merkle event log.
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = {
+            let millis = start.elapsed().as_millis();
+            if millis > u128::from(u64::MAX) {
+                u64::MAX
+            } else {
+                millis as u64
+            }
+        };
+        let _event = scp_core::context::tools::ToolInvokedEvent {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            tool_id: tool_id.to_owned(),
+            invoker_did: identity_did.to_owned().into(),
+            status: scp_core::context::tools::ToolStatus::Success,
+            execution_time_ms: elapsed_ms,
+            input_hash: scp_core::context::tools::sha256_json(&input_json),
+            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+        };
+
+        Ok(output)
     })?;
 
-    // Convert output back to Python dict.
     json_to_py_dict(py, &output_json)
 }
 

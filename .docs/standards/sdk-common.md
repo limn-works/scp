@@ -358,7 +358,7 @@ Cross-language async bridging introduces subtle failure modes. All SDK binding i
 
 ### 1. Tokio runtime must never block on Python GIL acquisition
 
-PyO3 async functions execute on tokio threads. If a tokio thread attempts to acquire the Python GIL (e.g., to call a Python callback) while the GIL-holding Python thread is blocked waiting for a tokio future, deadlock occurs. **Rule:** Rust-side tokio tasks must never call into Python synchronously. Use `Python::with_gil()` only from PyO3's async bridge path, which handles GIL acquisition safely via `pyo3-asyncio` / native async.
+PyO3 bridge functions use `py.allow_threads(|| rt.block_on(...))` which releases the GIL before entering the tokio runtime. If a tokio task attempts to acquire the Python GIL (e.g., via `Python::with_gil()`) while another thread holds the GIL and is blocked waiting for a tokio future, deadlock occurs. **Rule:** Rust-side tokio tasks must never call into Python synchronously. `Python::with_gil()` is only safe from non-async contexts where no GIL contention exists.
 
 ### 2. UniFFI callbacks execute on Rust threads
 
