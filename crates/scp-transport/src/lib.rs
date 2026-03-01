@@ -29,7 +29,9 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod cover_traffic;
 pub mod error;
+pub mod heartbeat;
 pub mod manager;
 pub mod native;
 pub mod relay;
@@ -38,7 +40,11 @@ pub mod traits;
 
 // Re-export primary types at the crate level for convenience.
 pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
+pub use cover_traffic::{
+    CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender,
+};
 pub use error::TransportError;
+pub use heartbeat::{HeartbeatConfig, HeartbeatMonitor, SuppressionSuspected};
 pub use manager::TransportManager;
 pub use scoring::SuppressionWarning;
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
