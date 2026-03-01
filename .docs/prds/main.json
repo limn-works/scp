@@ -2410,7 +2410,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-ffi/pyo3/identity.rs"
       ],
@@ -2443,7 +2443,7 @@
       "details": {
         "function_signatures": "py_identity_create(custody: &str) -> PyResult<PyIdentity>\npy_identity_load(did: &str) -> PyResult<PyIdentity>\npy_identity_resolve(py: Python<'py>, did: &str) -> PyResult<Bound<'py, PyAny>>\npy_identity_rotate_key(identity: &PyIdentity) -> PyResult<PyIdentity>"
       },
-      "result": "PyIdentity with Arc<InMemoryKeyCustody> retention implemented via SCP-214 identity registry. py_identity_create, py_identity_load, py_identity_resolve, py_identity_rotate_key, py_identity_migrate all wired. Remaining: verify all 5 acceptance criteria explicitly pass."
+      "result": "All 5 acceptance criteria verified: py_identity_create, py_identity_load, py_identity_resolve, py_identity_rotate_key exist with correct signatures. PyIdentity and PyDIDDocument are opaque with getter methods. All functions registered in module."
     },
     {
       "id": "SCP-039",
@@ -6615,7 +6615,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/src/main/kotlin/com/limn/scp/compose/StateHolders.kt"
       ],
@@ -6656,7 +6656,8 @@
           "scaffold/kotlin.md",
           "ADR-026 (Swift SDK) as parallel reference"
         ]
-      }
+      },
+      "result": "Jetpack Compose state holders implemented: rememberContextState, rememberMessages, rememberMembers composable functions with DisposableEffect cleanup. StateHolders.kt in scp-sdk-kotlin-android module. Unit tests with Compose test utilities."
     },
     {
       "id": "SCP-119",
@@ -6715,7 +6716,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/src/test/kotlin/com/limn/scp/conformance/ConformanceTests.kt"
       ],
@@ -6754,7 +6755,8 @@
           "ADR-026 (Swift SDK) as parallel reference",
           "ADR-014 (Python SDK) as pattern"
         ]
-      }
+      },
+      "result": "Cross-platform conformance test suite implemented in Kotlin JUnit 5 with coroutine test support. Covers identity, context lifecycle, messaging, encryption, governance operations. ConformanceTests.kt in scp-sdk-kotlin module."
     },
     {
       "id": "SCP-121",
@@ -9655,7 +9657,7 @@
       "gate": "gate-6",
       "priority": "P0",
       "severity": "critical",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/identity.rs",
         "crates/scp-ffi/src/context.rs",
@@ -9773,7 +9775,7 @@
         "sealEnvelopeNote": "seal_envelope (outer.rs:169) takes routing_id: &[u8] and InnerEnvelope as pre-computed inputs. It does not take KeyCustody directly, but both inputs require KeyCustody upstream: routing_id comes from derive_pseudonym, and InnerEnvelope comes from create_inner_envelope which signs with KeyCustody. The entire message send path is blocked without this wiring.",
         "inMemoryCodeBug": "InMemoryKeyCustody::derive_pseudonym at key_custody.rs:333 uses signing_key.to_bytes() (Ed25519 private/secret key bytes, 32 bytes) as the HMAC key. ADR-027 mandates verifying_key.to_bytes() (Ed25519 public key bytes, 32 bytes) for cross-platform determinism — hardware TEE keys (Android Keystore, Secure Enclave) cannot export private bytes. AndroidKeyCustody.kt correctly uses publicKey(keyHandle) at line 178. AppleKeyCustody.swift correctly uses publicKey(). InMemoryKeyCustody is the outlier. The golden vector test at key_custody.rs:626 will need updated expected values after the fix."
       },
-      "result": "PARTIAL: Iteration 4 added PyO3 identity registry (Arc<InMemoryKeyCustody> retained), KeyCustody::derive_pseudonym wiring in context.rs, py_ucan_mint/delegate real wiring, py_identity_rotate_key/migrate bridge functions, routing secret stubs removed. Remaining: UniFFI callback interface (criterion 1-2), NAPI/WASM context routing (criterion 5), cross-platform pseudonym test (criterion 16)."
+      "result": "All 17 acceptance criteria complete. PyO3 identity registry with Arc<InMemoryKeyCustody>, real derive_pseudonym/create_inner_envelope/mint_ucan/delegate_ucan/rotate_key/migrate wiring, UniFFI callback interface with all 7 KeyCustody methods, NAPI/WASM routing ID derivation, InMemoryKeyCustody HMAC fixed to public key bytes, golden vector test updated, cross-platform pseudonym test added."
     },
     {
       "id": "SCP-215",
