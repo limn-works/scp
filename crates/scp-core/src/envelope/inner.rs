@@ -28,6 +28,31 @@ use super::padding::pad_to_bucket;
 
 /// Provenance metadata attached to an inner envelope.
 ///
+/// The type of message carried in the inner envelope.
+///
+/// Used as a discriminator byte in the canonical hash to prevent type-flipping
+/// attacks (changing a content message to a signaling message after signing).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageType {
+    /// Regular content message (chat, tool output, etc.).
+    #[default]
+    Content,
+
+    /// WebRTC signaling message (SDP offer/answer, ICE candidate).
+    Signaling,
+}
+
+impl MessageType {
+    /// Returns a single-byte discriminator for inclusion in canonical hashes.
+    #[must_use]
+    pub fn as_discriminator_byte(&self) -> u8 {
+        match self {
+            Self::Content => 0,
+            Self::Signaling => 1,
+        }
+    }
+}
+
 /// Provenance tracks the origin of message content — which tool generated it,
 /// which agent produced it, and any upstream references. The exact structure
 /// will be expanded in later phases; this provides a serializable placeholder.

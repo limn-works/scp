@@ -28,7 +28,8 @@ pub mod pseudonym;
 
 // Re-export primary types and functions at the envelope module level.
 pub use inner::{
-    InnerEnvelope, InnerEnvelopeParams, Provenance, create_inner_envelope, verify_inner_signature,
+    InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
+    verify_inner_signature,
 };
 pub use outer::{OuterEnvelope, create_outer_envelope, open_envelope, seal_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
