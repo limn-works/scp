@@ -25,7 +25,9 @@ All project knowledge lives under `.docs/` (root instance). Some features may ha
 └── planning-sessions/   # Historical planning session records
 ```
 
-**Artifact flow is strictly one-way:** plans → specs → ADRs → stories → source code. Upstream governs downstream, never the reverse. If code reveals a spec is wrong, fix the spec first.
+**Artifact flow is strictly one-way:** specs → ADRs → stories → source code. Upstream governs downstream, never the reverse. If code reveals a spec is wrong, fix the spec first.
+
+Plans unique: they are genesis artifacts and come before everything else in the provenance chain, but specs and ADRs are more refined, are considered to be the sources of truth, and supersede them in the event of a conflict.
 
 ## Your Responsibilities
 
