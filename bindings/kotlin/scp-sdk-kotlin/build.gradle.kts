@@ -42,6 +42,29 @@ detekt {
     buildUponDefaultConfig = true
 }
 
+// ---------------------------------------------------------------------------
+// UniFFI Kotlin binding generation
+//
+// UniFFI proc-macro bindings require the compiled Rust cdylib because metadata
+// is embedded at compile time via uniffi::include_scaffolding!. The generation
+// script builds the Rust library then invokes uniffi-bindgen to produce Kotlin
+// source files into src/main/kotlin/com/limn/scp/internal/.
+//
+// Run manually: ./scripts/generate-uniffi-kotlin.sh
+// Run via Gradle: ./gradlew :scp-sdk-kotlin:generateUniffiBindings
+//
+// The generated files are NOT checked into version control. They must be
+// regenerated after any change to the UniFFI bridge (crates/scp-ffi/uniffi/).
+//
+// See ADR-021 (UniFFI Bridge) and .docs/scaffold/kotlin.md.
+// ---------------------------------------------------------------------------
+tasks.register<Exec>("generateUniffiBindings") {
+    group = "codegen"
+    description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
+    workingDir = rootProject.projectDir.parentFile.parentFile
+    commandLine("./scripts/generate-uniffi-kotlin.sh")
+}
+
 publishing {
     publications {
         create<MavenPublication>("mavenJava") {

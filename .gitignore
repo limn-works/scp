@@ -24,6 +24,8 @@ bindings/swift/.build/
 # Kotlin
 bindings/kotlin/.gradle/
 bindings/kotlin/**/build/
+# UniFFI-generated Kotlin bindings (regenerated from Rust source)
+bindings/kotlin/scp-sdk-kotlin/src/main/kotlin/com/limn/scp/internal/*.kt
 
 # Native build artifacts
 *.node

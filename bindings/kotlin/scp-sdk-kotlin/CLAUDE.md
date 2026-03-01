@@ -82,9 +82,29 @@ Rust callbacks (`onMessage`, `onEvent`) run on non-coroutine threads. You cannot
 
 `HotStreamFactory.contextEvents()` and `incomingMessages()` are synchronous (non-`suspend`) and use `runBlocking(Dispatchers.IO)` internally to call the subscribe FFI. This is correct when called from a non-coroutine context (e.g., ViewModel init). If called from a coroutine running on a single-threaded dispatcher (e.g., `Dispatchers.Main`), `runBlocking` will block that thread for the duration of the FFI call. Always call these from a non-constrained context or from within a `withContext(Dispatchers.IO)` block.
 
-### UniFFI NativeLib.kt does not exist yet
+### UniFFI NativeLib.kt generation configured but requires compiled Rust binary
 
-The `NativeBindings` interface defines placeholder signatures matching ADR-028. When UniFFI generates `internal/NativeLib.kt`, create a concrete `NativeBindings` implementation that delegates to it.
+UniFFI binding generation requires the compiled Rust `cdylib` because metadata is embedded at compile time via `uniffi::include_scaffolding!`. Generation is configured via:
+
+- **Shell script:** `scripts/generate-uniffi-kotlin.sh` (builds Rust lib, runs `uniffi-bindgen generate`)
+- **Gradle task:** `./gradlew :scp-sdk-kotlin:generateUniffiBindings`
+- **Output directory:** `src/main/kotlin/com/limn/scp/internal/` (gitignored, regenerated)
+- **Rust binary:** `crates/scp-ffi/uniffi/src/bin/uniffi-bindgen.rs` (already exists)
+
+The `NativeBindings` interface is a flat-function abstraction (Long handles, JSON strings) that does NOT match the UniFFI-generated output. UniFFI generates idiomatic Kotlin: opaque `class Identity` / `class ContextHandle` / `class TransportManager` / `class UcanToken` with methods, `data class` records (`ContextParams`, `Message`, `DIDDocument`, etc.), `sealed class ScpError`, and `suspend` functions. When generation works, a concrete `NativeBindings` adapter must translate between the flat-function calling convention and the UniFFI class-based API. The Rust bridge exports:
+
+| UniFFI export | Kotlin generated type |
+|---|---|
+| `Identity` (opaque object with `did()`, `custody_type()`, `rotate_key()`) | `class Identity` |
+| `ContextHandle` (opaque object with `context_id()`, `state()`, `routing_id()`) | `class ContextHandle` |
+| `TransportManager` (opaque object with `status()`, `is_connected()`) | `class TransportManager` |
+| `UcanToken` (opaque object with `token_data()`, `token_id()`, etc.) | `class UcanToken` |
+| `identity_create(custody: String)` | `suspend fun identityCreate(custody: String): Identity` |
+| `identity_create_platform(provider: KeyCustodyProvider)` | `suspend fun identityCreatePlatform(...)` |
+| `context_create(identity, params)` | `suspend fun contextCreate(identity: Identity, params: ContextParams): ContextHandle` |
+| `ScpError` (enum with 7 variants) | `sealed class ScpException` |
+| `ContextParams`, `Message`, `DIDDocument`, etc. (records) | `data class` |
+| `MessageListener`, `KeyCustodyProvider`, etc. (callback interfaces) | Kotlin `interface` |
 
 ## Conformance Tests (`conformance/`)
 
