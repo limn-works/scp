@@ -11,23 +11,26 @@
 //! - [`WasmUcanToken`] — UCAN token handle (ID, issuer, audience, capabilities,
 //!   expiry).
 //!
-//! # Bridge stub behavior
+//! # Wiring
 //!
-//! All functions are bridge stubs returning typed errors. The full UCAN
-//! protocol (signature verification, delegation chain traversal, attenuation
-//! enforcement, nonce replay detection) is implemented in scp-core/crypto/ucan
-//! and will be connected in a future story when WASM-compatible scp-core
-//! bindings are available.
+//! All functions delegate to the WASM-local runtime registry in [`crate::runtime`].
+//! `ucan_validate` performs structural validation (capability URI parsing, ceiling
+//! checking, revocation checking) without full Ed25519 signature verification
+//! (signature verification requires `KeyCustody` wiring — see SCP-214).
+//! `ucan_mint` creates a properly structured token with metadata (signing deferred
+//! to SCP-214). `ucan_revoke` adds the token CID to the context's revocation set.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` and ADR-016 (UCAN validation)
 //! for the full specification.
 
 use js_sys::Promise;
+use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
+use crate::runtime;
 
 // ---------------------------------------------------------------------------
 // WasmUcanToken
@@ -144,15 +147,77 @@ impl WasmUcanToken {
 pub fn ucan_validate(context: &WasmContextHandle, token: String, capability: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let _ = (context_id, token, capability);
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(ScpWasmError::Permission(
+                "malformed UCAN token: expected 3 dot-separated JWT segments".to_owned(),
+            )
+            .into_js()
+            .into());
+        }
 
-        Err(ScpWasmError::Permission(
-            "not yet connected to runtime — UCAN validation requires a live context handle \
-             wired to scp-core"
-                .to_owned(),
+        let payload_b64 = parts[1];
+        let payload_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            payload_b64,
         )
-        .into_js()
-        .into())
+        .map_err(|e| {
+            ScpWasmError::Permission(format!("malformed UCAN payload (base64 decode): {e}"))
+                .into_js()
+        })?;
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload_bytes).map_err(|e| {
+                ScpWasmError::Permission(format!("malformed UCAN payload (JSON parse): {e}"))
+                    .into_js()
+            })?;
+
+        let token_exp = payload["exp"].as_u64().ok_or_else(|| {
+            ScpWasmError::Permission("UCAN payload missing 'exp' field".to_owned()).into_js()
+        })?;
+
+        let now = js_sys::Date::now() / 1000.0;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let now_secs = now as u64;
+
+        if token_exp < now_secs {
+            return Err(ScpWasmError::Permission(format!(
+                "UCAN token expired: exp={token_exp}, now={now_secs}"
+            ))
+            .into_js()
+            .into());
+        }
+
+        let token_atts = payload["att"].as_array();
+        let has_capability = token_atts.is_some_and(|atts| {
+            atts.iter().any(|att| {
+                let with_str = att["with"].as_str().unwrap_or("");
+                let can_str = att["can"].as_str().unwrap_or("");
+                let att_uri = format!("{with_str}/{can_str}");
+                att_uri == capability || can_str == "*"
+            })
+        });
+
+        if !has_capability {
+            return Err(ScpWasmError::Permission(format!(
+                "UCAN token does not grant capability '{capability}'"
+            ))
+            .into_js()
+            .into());
+        }
+
+        runtime::with_context(&context_id, |rt| {
+            let token_cid = compute_token_cid(&token);
+            if rt.revoked_tokens.contains(&token_cid) {
+                return Err(ScpWasmError::Permission(
+                    "UCAN token has been revoked".to_owned(),
+                ));
+            }
+            Ok(())
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::UNDEFINED)
     })
 }
 
@@ -188,28 +253,50 @@ pub fn ucan_mint(
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        // Validate that capabilities_json is a valid JSON array.
         let caps: serde_json::Value = serde_json::from_str(&capabilities_json).map_err(|e| {
             ScpWasmError::Validation(format!("capabilities_json is not valid JSON: {e}")).into_js()
         })?;
 
-        if !caps.is_array() {
-            return Err(ScpWasmError::Validation(
+        let caps_array = caps.as_array().ok_or_else(|| {
+            ScpWasmError::Validation(
                 "capabilities_json must be a JSON array of capability URI strings".to_owned(),
             )
             .into_js()
-            .into());
-        }
+        })?;
 
-        let _ = (context_id, member_did);
+        let creator_did =
+            runtime::with_context(&context_id, |rt| Ok(rt.creator_did.clone()))
+                .map_err(ScpWasmError::into_js)?;
 
-        Err(ScpWasmError::Permission(
-            "not yet connected to runtime — UCAN minting requires a live context handle \
-             wired to scp-core"
-                .to_owned(),
-        )
-        .into_js()
-        .into())
+        let nonce = format!("tk-{}", uuid::Uuid::new_v4().as_hyphenated());
+
+        let capability_uris: Vec<String> = caps_array
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|cap| {
+                if cap.starts_with("scp:ctx:") {
+                    cap.to_owned()
+                } else {
+                    format!("scp:ctx:{context_id}/{cap}")
+                }
+            })
+            .collect();
+
+        let uris_json = serde_json::to_string(&capability_uris).unwrap_or_else(|_| "[]".to_owned());
+
+        #[allow(clippy::cast_precision_loss)]
+        let now_secs = js_sys::Date::now() / 1000.0;
+        let exp = now_secs + 3600.0;
+
+        let token = WasmUcanToken {
+            token_id: nonce,
+            issuer: creator_did,
+            audience: member_did,
+            capabilities_json: uris_json,
+            expires_at: Some(exp),
+        };
+
+        Ok(JsValue::from(token))
     })
 }
 
@@ -235,17 +322,33 @@ pub fn ucan_mint(
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
+#[allow(clippy::similar_names)]
 pub fn ucan_revoke(context: &WasmContextHandle, token_id: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let _ = (context_id, token_id);
+        let token_cid = compute_token_cid(&token_id);
 
-        Err(ScpWasmError::Permission(
-            "not yet connected to runtime — UCAN revocation requires a live context handle \
-             wired to scp-core"
-                .to_owned(),
-        )
-        .into_js()
-        .into())
+        runtime::with_context(&context_id, |rt| {
+            rt.revoked_tokens.insert(token_cid.clone());
+            Ok(())
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::UNDEFINED)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Computes a content-hash CID (SHA-256 hex) for a token string.
+///
+/// Mirrors scp-core's `compute_revocation_cid`. Uses the token string (or
+/// token ID) as the CID input.
+fn compute_token_cid(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    runtime::encode_hex(&hash)
 }

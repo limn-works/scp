@@ -30,7 +30,7 @@ percent-encoding = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true }
 uuid = { workspace = true }
-jsonschema = { workspace = true }
+jsonschema = { workspace = true, features = ["resolve-http", "resolve-file"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]
