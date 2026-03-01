@@ -17,13 +17,15 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
+use std::sync::Arc;
+
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_platform::traits::KeyCustody;
+use scp_platform::traits::KeyHandle;
 use uuid::Uuid;
 
 use crate::error::ScpNapiError;
-use crate::identity::NapiIdentity;
+use crate::identity::{NapiIdentity, OpaqueInMemoryKeyCustody};
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -80,10 +82,17 @@ pub struct NapiContextHandle {
     member_count: u64,
     /// Optional economic policy string.
     economic_policy: Option<String>,
-    /// Per-context pseudonym routing ID derived via `KeyCustody::derive_pseudonym`.
-    /// 32-byte pseudonym public key for relay routing (spec section 9.10.4).
-    /// `None` if pseudonym derivation was not available at creation time.
-    routing_id: Option<Vec<u8>>,
+    /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
+    ///
+    /// Set during `context_create` from the creating identity's custody.
+    /// Used by `ucan_mint` to produce real Ed25519 signatures. Dropping
+    /// this destroys the key material backing the `signing_key` handle.
+    pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
+    /// Handle to the creator's active signing key for UCAN minting (RED-102).
+    ///
+    /// This is the `active_signing_key` from the creating identity's
+    /// [`ScpIdentity`]. Points into `in_memory_custody`.
+    pub(crate) signing_key: Option<KeyHandle>,
 }
 
 /// Internal context lifecycle state.
@@ -199,20 +208,6 @@ impl NapiContextHandle {
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
-
-    /// Returns the per-context pseudonym routing ID (32 bytes), or `null` if
-    /// pseudonym derivation was not available at context creation time.
-    ///
-    /// The routing ID is derived via `KeyCustody::derive_pseudonym` (spec
-    /// section 9.10.4). It provides per-context unlinkability: different
-    /// contexts produce different routing IDs for the same identity key.
-    ///
-    /// See ADR-006 and SCP-214 criterion 5.
-    #[napi(getter, js_name = "routingId")]
-    #[must_use]
-    pub fn routing_id(&self) -> Option<Vec<u8>> {
-        self.routing_id.clone()
-    }
 }
 
 impl NapiContextHandle {
@@ -270,24 +265,23 @@ pub struct NapiMessage {
 ///
 /// # Arguments
 ///
-/// * `identity` — The identity handle of the context creator (must be a live
-///   `NapiIdentity` created via `identityCreate`).
+/// * `identity` — The identity handle of the context creator. The handle's
+///   key custody and active signing key are retained on the context for UCAN
+///   minting (RED-102).
 /// * `params_json` — Context creation parameters as a JSON string. Optional
 ///   fields: `ceiling` (string[]), `governance` (string), `memoryScope`
 ///   (string), `ttlSeconds` (number), `promotable` (boolean).
 ///
 /// # Returns
 ///
-/// A `Promise<NapiContextHandle>` in the `"active"` state with a routing ID
-/// derived via `KeyCustody::derive_pseudonym` (if in-memory custody is
-/// available).
+/// A `Promise<NapiContextHandle>` in the `"active"` state.
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-VALID-7000` if `params_json` is malformed JSON.
+/// - Rejects with `SCP-VAL-7000` if `params_json` is malformed JSON.
 /// - Rejects with `SCP-CTX-2000` if context creation fails.
-/// - Rejects with `SCP-CRYPTO-4010` if pseudonym derivation fails.
 #[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn context_create(
     identity: &NapiIdentity,
     params_json: String,
@@ -297,7 +291,7 @@ pub async fn context_create(
             message: format!(
                 "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
             ),
-            code: "SCP-VALID-7000".to_owned(),
+            code: "SCP-VAL-7000".to_owned(),
         })
     })?;
 
@@ -322,31 +316,20 @@ pub async fn context_create(
         .to_owned();
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
+    // Extract key custody and signing key from the identity handle (RED-102).
+    // These are retained on the context for UCAN minting.
+    let in_memory_custody = identity.inner.in_memory_custody.clone();
+    let signing_key = identity
+        .inner
+        .scp_identity
+        .as_ref()
+        .map(|id| id.active_signing_key);
+
     let context_id = format!("ctx-{}", Uuid::new_v4());
-
-    // Derive per-context pseudonym routing ID via KeyCustody::derive_pseudonym
-    // (spec section 9.10.4, SCP-214 criterion 5). Only available when
-    // in-memory custody and ScpIdentity are present on the identity handle.
-    let routing_id = match (identity.in_memory_custody(), identity.scp_identity()) {
-        (Some(custody), Some(core_id)) => {
-            let pseudonym = custody
-                .derive_pseudonym(&core_id.identity_key, context_id.as_bytes())
-                .await
-                .map_err(|e| {
-                    NapiError::from(ScpNapiError::Crypto {
-                        message: format!("failed to derive pseudonym routing ID: {e}"),
-                        code: "SCP-CRYPTO-4010".to_owned(),
-                    })
-                })?;
-            Some(pseudonym.public_key.as_bytes().to_vec())
-        }
-        _ => None,
-    };
-
     let handle = NapiContextHandle {
         context_id,
         state: std::sync::Mutex::new(ContextState::Active),
-        creator_did: identity.did(),
+        creator_did: identity.inner.did.clone(),
         mode,
         ceiling,
         ceiling_policy,
@@ -355,7 +338,8 @@ pub async fn context_create(
         governance,
         member_count: 1,
         economic_policy,
-        routing_id,
+        in_memory_custody,
+        signing_key,
     };
     increment_handle_count();
     Ok(handle)
@@ -407,15 +391,11 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 
 /// Closes an SCP context.
 ///
-/// Transitions the context to `"closed"` state. Only the context creator
-/// (or an identity with `ContextClose` capability) is authorized to close
-/// the context.
+/// Transitions the context to `"closed"` state.
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-CTX-2017` if the context is not in `"active"` state.
-/// - Rejects with `SCP-PERM-3002` if the `identity_did` is not authorized
-///   to close the context (must be the context creator or hold admin role).
+/// Rejects with `SCP-CTX-2017` if the context is not in `"active"` state.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
@@ -430,23 +410,8 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
         }
         .into());
     }
-
-    // Authorization check: only the context creator can close the context.
-    // In the full runtime, this would also check for ContextClose capability
-    // via the UCAN/role system. For now, enforce the creator-only invariant.
-    if identity_did != handle.creator_did() {
-        return Err(ScpNapiError::Permission {
-            message: format!(
-                "identity {identity_did:?} is not authorized to close this context — \
-                 only the context creator ({:?}) or an admin can close a context",
-                handle.creator_did()
-            ),
-            code: "SCP-PERM-3002".to_owned(),
-        }
-        .into());
-    }
-
     handle.set_closed().map_err(NapiError::from)?;
+    let _ = identity_did;
     Ok(())
 }
 

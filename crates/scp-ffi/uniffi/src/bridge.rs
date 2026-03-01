@@ -24,27 +24,14 @@
 //!
 //! See ADR-021 in `.docs/adrs/phase-4.md`.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use scp_core::crypto::ucan::capability::CapabilityUri;
-use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
-use scp_core::crypto::ucan::{Attenuation, UcanError as CoreUcanError, UcanHeader, UcanPayload};
 use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
-use scp_ffi_common::{
-    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
-};
-use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
-};
 use uuid::Uuid;
 
-use crate::{KeyCustodyProvider, decrement_handle_count, increment_handle_count, runtime};
+use crate::{decrement_handle_count, increment_handle_count, runtime};
 
 /// Wrapper for [`InMemoryKeyCustody`] that implements [`Debug`] with a
 /// redacted representation, preventing key material from appearing in logs.
@@ -53,234 +40,6 @@ pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) InMemoryKeyCustody);
 impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("InMemoryKeyCustody([redacted])")
-    }
-}
-
-/// Adapter that wraps a UniFFI [`KeyCustodyProvider`] callback interface and
-/// implements [`KeyCustody`] so that `scp-core` functions can use platform
-/// custody (Secure Enclave, Android Keystore) transparently.
-///
-/// Maintains a bidirectional mapping between `KeyHandle(u64)` (scp-core) and
-/// `String` key IDs (platform callback interface). Thread-safe via `RwLock`.
-/// Uses `std::sync::RwLock` instead of `TokioMutex` so that `custody_type()`
-/// (a sync trait method) can acquire a read lock without requiring an async
-/// runtime context.
-///
-/// See ADR-006 (Platform Abstraction) and SCP-214 criterion 2.
-pub(crate) struct KeyCustodyProviderAdapter {
-    /// The injected platform custody callback.
-    provider: Arc<dyn KeyCustodyProvider>,
-    /// Mapping from `KeyHandle(u64)` to platform key ID strings.
-    handle_to_id: std::sync::RwLock<HashMap<u64, String>>,
-    /// Counter for allocating new `KeyHandle` IDs.
-    next_id: AtomicU64,
-}
-
-impl KeyCustodyProviderAdapter {
-    /// Creates a new adapter wrapping the given platform custody provider.
-    pub(crate) fn new(provider: Arc<dyn KeyCustodyProvider>) -> Self {
-        Self {
-            provider,
-            handle_to_id: std::sync::RwLock::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-        }
-    }
-}
-
-#[allow(clippy::manual_async_fn)]
-impl KeyCustody for KeyCustodyProviderAdapter {
-    fn generate_keypair(
-        &self,
-        key_type: KeyType,
-    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        async move {
-            let type_str = match key_type {
-                KeyType::Ed25519 => "ed25519".to_owned(),
-                KeyType::X25519 => "x25519".to_owned(),
-            };
-            let key_id = self
-                .provider
-                .generate_keypair(type_str)
-                .await
-                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
-
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let handle = KeyHandle::new(id);
-            self.handle_to_id
-                .write()
-                .map_err(|_| PlatformError::CustodyError("handle_to_id lock poisoned".to_owned()))?
-                .insert(id, key_id);
-            Ok(handle)
-        }
-    }
-
-    fn sign(
-        &self,
-        key: &KeyHandle,
-        data: &[u8],
-    ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
-        let key_id = key.id();
-        let data = data.to_vec();
-        async move {
-            let id = {
-                let map = self.handle_to_id.read().map_err(|_| {
-                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
-                })?;
-                map.get(&key_id)
-                    .cloned()
-                    .ok_or(PlatformError::KeyNotFound)?
-            };
-            let sig_bytes = self
-                .provider
-                .sign(id, data)
-                .await
-                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
-            Ok(Signature::new(sig_bytes))
-        }
-    }
-
-    fn public_key(
-        &self,
-        key: &KeyHandle,
-    ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
-        let key_id = key.id();
-        async move {
-            let id = {
-                let map = self.handle_to_id.read().map_err(|_| {
-                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
-                })?;
-                map.get(&key_id)
-                    .cloned()
-                    .ok_or(PlatformError::KeyNotFound)?
-            };
-            let pk_bytes = self
-                .provider
-                .get_public_key(id)
-                .await
-                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
-            Ok(PublicKey::new(pk_bytes))
-        }
-    }
-
-    fn destroy_key(
-        &self,
-        key: &KeyHandle,
-    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        let key_id = key.id();
-        async move {
-            let id = {
-                let mut map = self.handle_to_id.write().map_err(|_| {
-                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
-                })?;
-                map.remove(&key_id).ok_or(PlatformError::KeyNotFound)?
-            };
-            self.provider
-                .destroy_key(id)
-                .await
-                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
-            Ok(())
-        }
-    }
-
-    fn dh_agree(
-        &self,
-        key: &KeyHandle,
-        peer_public: &[u8; 32],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
-        let key_id = key.id();
-        let peer = *peer_public;
-        async move {
-            let id = {
-                let map = self.handle_to_id.read().map_err(|_| {
-                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
-                })?;
-                map.get(&key_id)
-                    .cloned()
-                    .ok_or(PlatformError::KeyNotFound)?
-            };
-            let secret_bytes = self
-                .provider
-                .dh_agree(id, peer.to_vec())
-                .await
-                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
-            let arr: [u8; 32] = secret_bytes.try_into().map_err(|_| {
-                PlatformError::CustodyError("dh_agree must return 32 bytes".to_owned())
-            })?;
-            Ok(SharedSecret::new(arr))
-        }
-    }
-
-    fn derive_pseudonym(
-        &self,
-        key: &KeyHandle,
-        context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
-        let key_id = key.id();
-        let ctx = context_id.to_vec();
-        async move {
-            let id = {
-                let map = self.handle_to_id.read().map_err(|_| {
-                    PlatformError::CustodyError("handle_to_id lock poisoned".to_owned())
-                })?;
-                map.get(&key_id)
-                    .cloned()
-                    .ok_or(PlatformError::KeyNotFound)?
-            };
-            let result_bytes = self
-                .provider
-                .derive_pseudonym(id, ctx)
-                .await
-                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
-
-            // The callback returns [public_key_bytes(32) || key_id_utf8_bytes].
-            if result_bytes.len() < 33 {
-                return Err(PlatformError::CustodyError(
-                    "derive_pseudonym must return at least 33 bytes \
-                     (32 public key + key_id)"
-                        .to_owned(),
-                ));
-            }
-            let pub_key_bytes = result_bytes[..32].to_vec();
-            let pseudo_key_id = String::from_utf8(result_bytes[32..].to_vec()).map_err(|_| {
-                PlatformError::CustodyError(
-                    "derive_pseudonym key_id portion must be valid UTF-8".to_owned(),
-                )
-            })?;
-
-            let pseudo_handle_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let pseudo_handle = KeyHandle::new(pseudo_handle_id);
-            self.handle_to_id
-                .write()
-                .map_err(|_| PlatformError::CustodyError("handle_to_id lock poisoned".to_owned()))?
-                .insert(pseudo_handle_id, pseudo_key_id);
-
-            Ok(PseudonymKeypair {
-                public_key: PublicKey::new(pub_key_bytes),
-                key_handle: pseudo_handle,
-            })
-        }
-    }
-
-    fn custody_type(&self, key: &KeyHandle) -> CustodyType {
-        let key_id = key.id();
-        // Use InMemory (lowest trust) as fallback -- never Hardware (highest
-        // trust). Returning Hardware on error would be a privilege escalation.
-        // See RED-018.
-        let map_guard = match self.handle_to_id.read() {
-            Ok(guard) => guard,
-            Err(_) => return CustodyType::InMemory,
-        };
-        let Some(id) = map_guard.get(&key_id).cloned() else {
-            return CustodyType::InMemory;
-        };
-        drop(map_guard);
-        let type_str = self.provider.custody_type(id);
-        match type_str.as_str() {
-            "hardware" => CustodyType::Hardware,
-            "software" => CustodyType::Software,
-            "in_memory" => CustodyType::InMemory,
-            _ => CustodyType::InMemory,
-        }
     }
 }
 
@@ -598,46 +357,6 @@ impl From<serde_json::Error> for ScpError {
             code: "SCP-VALID-7006".to_owned(),
         }
     }
-}
-
-// Bridge trait implementations are imported from scp-ffi-common.
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
-fn generate_nonce() -> Result<String, ScpError> {
-    use rand::Rng;
-
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ScpError::Permission {
-            message: format!("system clock error: {e}"),
-            code: "SCP-PERM-3010".to_owned(),
-        })?
-        .as_millis();
-
-    let mut random_bytes = [0u8; 16];
-    rand::thread_rng().fill(&mut random_bytes);
-
-    let hex_str = hex::encode(random_bytes);
-    Ok(format!("{now_millis}-{hex_str}"))
-}
-
-/// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
-fn build_proof_resolver(proof_tokens: Option<&[String]>) -> Result<BridgeProofResolver, ScpError> {
-    let mut proofs = HashMap::new();
-
-    if let Some(tokens) = proof_tokens {
-        for encoded in tokens {
-            let token = parse_ucan(encoded).map_err(ScpError::from)?;
-            let cid = scp_core::crypto::ucan::mint::compute_cid(&token);
-            proofs.insert(cid, token);
-        }
-    }
-
-    Ok(BridgeProofResolver { proofs })
 }
 
 // ---------------------------------------------------------------------------
@@ -998,9 +717,8 @@ impl Drop for Identity {
 
 /// Opaque handle to an SCP context.
 ///
-/// Stores context metadata (ID, state, creator DID). The actual context
-/// runtime (MLS group, transport connections) lives in scp-core and will be
-/// wired in full integration stories.
+/// Stores context metadata (ID, state, creator DID) and, for in-memory
+/// custody, the key custody and signing key needed for UCAN minting.
 ///
 /// Generated as `class ContextHandle` in both Swift and Kotlin.
 ///
@@ -1013,9 +731,17 @@ pub struct ContextHandle {
     pub(crate) state: tokio::sync::Mutex<ContextState>,
     /// DID of the context creator.
     pub(crate) creator_did: String,
-    /// Per-context pseudonym routing ID derived via `KeyCustody::derive_pseudonym`.
-    /// 32-byte pseudonym public key for relay routing (§9.10.4).
-    pub(crate) routing_id: Option<Vec<u8>>,
+    /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
+    ///
+    /// Set during `context_create` from the creating identity's custody.
+    /// Used by `ucan_mint` to produce real Ed25519 signatures.
+    #[allow(dead_code)]
+    pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
+    /// Handle to the creator's active signing key for UCAN minting (RED-102).
+    ///
+    /// Points into `in_memory_custody`. Used by `ucan_mint`.
+    #[allow(dead_code)]
+    pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
 }
 
 #[uniffi::export]
@@ -1049,18 +775,6 @@ impl ContextHandle {
     /// Returns the DID of the context creator.
     pub fn creator_did(&self) -> String {
         self.creator_did.clone()
-    }
-
-    /// Returns the per-context pseudonym routing ID (32 bytes), or `None` if
-    /// pseudonym derivation was not available at context creation time.
-    ///
-    /// The routing ID is derived via `KeyCustody::derive_pseudonym` (§9.10.4).
-    /// It provides per-context unlinkability: different contexts produce
-    /// different routing IDs for the same identity key.
-    ///
-    /// See ADR-006 and SCP-214 criterion 5.
-    pub fn routing_id(&self) -> Option<Vec<u8>> {
-        self.routing_id.clone()
     }
 }
 
@@ -1132,11 +846,14 @@ impl UcanToken {
     }
 }
 
-// NOTE: `Drop` for `UcanToken` is intentionally absent until `ucan_mint` is
-// wired to `scp-core`. When `ucan_mint` creates a real `UcanToken`, it MUST
-// call `increment_handle_count()` in the constructor path, and this `Drop`
-// impl MUST be re-added to call `decrement_handle_count()`. The symmetry
-// is required for `scp_shutdown` handle-drain logic to work correctly.
+// `Drop` for `UcanToken` — now that `ucan_mint` is wired to `scp-core` and
+// calls `increment_handle_count()`, this `Drop` impl decrements the counter
+// to maintain `scp_shutdown` handle-drain correctness (RED-102).
+impl Drop for UcanToken {
+    fn drop(&mut self) {
+        decrement_handle_count();
+    }
+}
 
 /// Opaque handle to the transport layer.
 ///
@@ -1249,12 +966,15 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                 CustodyMethod::Platform | CustodyMethod::Software => {
                     // Platform and software custody require a wired
                     // KeyCustodyProvider (ADR-006 platform abstraction).
-                    // Use identity_create_platform to pass the provider.
+                    // Full implementation is tracked for the platform
+                    // integration story that wires KeyCustodyProvider
+                    // callbacks to scp-core.
                     Err(ScpError::Identity {
                         message: format!(
-                            "custody type {custody:?} requires a KeyCustodyProvider — \
-                             call identity_create_platform with an injected provider \
-                             (Secure Enclave on iOS, Android Keystore on Android)"
+                            "custody type {custody:?} requires a wired platform \
+                             KeyCustodyProvider — use the KeyCustodyProvider callback \
+                             interface to inject Secure Enclave (iOS) or Android \
+                             Keystore (Android) backed custody"
                         ),
                         code: "SCP-IDENT-1003".to_owned(),
                     })
@@ -1276,53 +996,6 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
         .await
         .map_err(|e| ScpError::Identity {
             message: format!("tokio task join error during identity creation: {e}"),
-            code: "SCP-IDENT-1007".to_owned(),
-        })?
-}
-
-/// Creates a new DID identity using a platform-injected `KeyCustodyProvider`.
-///
-/// This function accepts a `KeyCustodyProvider` callback interface implementation
-/// (Secure Enclave on iOS, Android Keystore on Android) and uses it to generate
-/// keys and create a `did:dht` identity via `scp-core`.
-///
-/// # Arguments
-///
-/// * `provider` — A platform-injected `KeyCustodyProvider` callback implementation
-///   that handles key generation, signing, and custody.
-///
-/// # Returns
-///
-/// An `Identity` handle with the new DID and `Platform` custody type.
-///
-/// # Errors
-///
-/// Returns `ScpError::Identity` if key generation or DID creation fails.
-///
-/// See ADR-006 (Platform Abstraction), ADR-021 (UniFFI Bridge), SCP-214 criterion 2.
-#[uniffi::export]
-pub async fn identity_create_platform(
-    provider: Box<dyn KeyCustodyProvider>,
-) -> Result<Arc<Identity>, ScpError> {
-    let provider: Arc<dyn KeyCustodyProvider> = Arc::from(provider);
-    runtime()
-        .spawn(async move {
-            let adapter = KeyCustodyProviderAdapter::new(provider);
-            let dht = DidDht::new();
-            let (identity, _document) = dht.create(&adapter).await.map_err(ScpError::from)?;
-
-            let handle = Arc::new(Identity {
-                did: identity.did.clone(),
-                custody_type: CustodyMethod::Platform,
-                core_id: Some(identity),
-                in_memory_custody: None,
-            });
-            increment_handle_count();
-            Ok(handle)
-        })
-        .await
-        .map_err(|e| ScpError::Identity {
-            message: format!("tokio task join error during platform identity creation: {e}"),
             code: "SCP-IDENT-1007".to_owned(),
         })?
 }
@@ -1442,31 +1115,16 @@ pub async fn context_create(
             let _ = params;
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
-            crate::runtime::register_context(&context_id, &identity.did)?;
-
-            let routing_id = match (
-                identity.in_memory_custody.as_ref(),
-                identity.core_id.as_ref(),
-            ) {
-                (Some(custody), Some(core_id)) => {
-                    let pseudonym = custody
-                        .0
-                        .derive_pseudonym(&core_id.identity_key, context_id.as_bytes())
-                        .await
-                        .map_err(|e| ScpError::Crypto {
-                            message: format!("failed to derive pseudonym routing ID: {e}"),
-                            code: "SCP-CRYPTO-4010".to_owned(),
-                        })?;
-                    Some(pseudonym.public_key.as_bytes().to_vec())
-                }
-                _ => None,
-            };
+            // Extract key custody and signing key from the identity (RED-102).
+            let in_memory_custody = identity.in_memory_custody.clone();
+            let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
 
             let handle = Arc::new(ContextHandle {
                 context_id,
                 state: tokio::sync::Mutex::new(ContextState::Active),
                 creator_did: identity.did.clone(),
-                routing_id,
+                in_memory_custody,
+                signing_key,
             });
             increment_handle_count();
             Ok(handle)
@@ -1596,8 +1254,6 @@ pub async fn context_close(
             let _ = identity;
             *state = ContextState::Closed;
             drop(state);
-
-            crate::runtime::remove_context(&handle.context_id);
 
             Ok(())
         })
@@ -1934,43 +1590,12 @@ pub async fn ucan_validate(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
-
-            let required_cap: CapabilityUri =
-                capability
-                    .parse()
-                    .map_err(|e: CoreUcanError| ScpError::Permission {
-                        message: format!("invalid capability URI '{capability}': {e}"),
-                        code: "SCP-PERM-3002".to_owned(),
-                    })?;
-
-            let agent_did = parsed_token.payload.aud.clone();
-
-            let proof_resolver = build_proof_resolver(None)?;
-
-            crate::runtime::with_context(&handle.context_id, |rt| {
-                let did_resolver = BridgeDidResolver;
-                let revocation_checker = BridgeRevocationChecker {
-                    revocation_list: &rt.revocation_list,
-                };
-                let mut nonce_adapter = BridgeNonceTracker {
-                    inner: &mut rt.nonce_tracker,
-                };
-
-                let mut ctx = ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &rt.ceiling_strings,
-                    context_creator_did: &rt.creator_did,
-                    presenting_agent_did: &agent_did,
-                };
-
-                validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpError::from)
-            })?;
-
-            Ok(())
+            let _ = (handle, token, capability);
+            Err(ScpError::Permission {
+                message: "not yet connected to runtime — UCAN validation requires a live context"
+                    .to_owned(),
+                code: "SCP-PERM-3002".to_owned(),
+            })
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -1979,27 +1604,32 @@ pub async fn ucan_validate(
         })?
 }
 
-/// Mints a new UCAN token for a context member.
+/// Mints a new UCAN token for a context member with real Ed25519 signing.
 ///
-/// Stub: builds a structurally valid JWT with a zero-signature placeholder
-/// (`[0u8; 64]`). The token has correct header, payload, and encoding but
-/// will NOT pass Ed25519 signature verification. Real signing requires
-/// `KeyCustody` to be plumbed through the FFI boundary (SCP-214).
+/// Uses the context creator's [`InMemoryKeyCustody`] and active signing key
+/// (retained on the context handle during `context_create`) to produce a
+/// properly signed UCAN token via `scp_core::crypto::ucan::mint::mint_ucan`.
 ///
 /// # Arguments
 ///
-/// * `handle` — The context to mint the token for.
+/// * `handle` — The context to mint the token for (must have key custody
+///   from `context_create` with an `in_memory` identity).
 /// * `member_did` — The DID of the member receiving the token.
-/// * `capabilities` — List of capability URIs to grant.
+/// * `capabilities` — List of capability strings to grant (e.g.,
+///   `"messages:write"`). Scoped to the context automatically.
 ///
 /// # Returns
 ///
-/// A `UcanToken` handle with the minted token's metadata.
+/// A `UcanToken` handle with the minted token's metadata and a real
+/// Ed25519 signature.
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Permission` if minting fails (system clock error,
-/// nonce generation failure, or JSON serialization error).
+/// Returns `ScpError::Permission` if the context does not have key custody
+/// (created from an `identity_load` handle without key material) or if
+/// signing fails.
+///
+/// See RED-102 for the `KeyCustody` wiring story.
 #[uniffi::export]
 pub async fn ucan_mint(
     handle: Arc<ContextHandle>,
@@ -2008,83 +1638,53 @@ pub async fn ucan_mint(
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
-            use base64::Engine;
-            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            // Extract key custody and signing key from the context handle (RED-102).
+            let custody =
+                handle
+                    .in_memory_custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        message: "UCAN minting requires key custody — create the context with \
+                              an in_memory identity (identity_create(\"in_memory\"))"
+                            .to_owned(),
+                        code: "SCP-PERM-3004".to_owned(),
+                    })?;
+            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
+                message: "UCAN minting requires a signing key — the context creator identity \
+                          must have an active signing key"
+                    .to_owned(),
+                code: "SCP-PERM-3004".to_owned(),
+            })?;
 
-            let creator_did =
-                crate::runtime::with_context(&handle.context_id, |rt| Ok(rt.creator_did.clone()))?;
-
-            let nonce = generate_nonce()?;
-
-            let capability_uris: Vec<String> = capabilities
-                .iter()
-                .map(|cap| {
-                    if cap.starts_with("scp:ctx:") {
-                        cap.clone()
-                    } else {
-                        format!("scp:ctx:{}/{cap}", handle.context_id)
-                    }
-                })
-                .collect();
-
-            #[allow(clippy::cast_possible_truncation)]
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| ScpError::Permission {
-                    message: format!("system clock error: {e}"),
-                    code: "SCP-PERM-3004".to_owned(),
-                })?
-                .as_secs();
-            let exp = now + 3600;
-
-            let header = UcanHeader::new();
-            let att: Vec<Attenuation> = capability_uris
-                .iter()
-                .map(|uri| Attenuation {
-                    with: uri.clone(),
-                    can: "invoke".to_owned(),
-                })
-                .collect();
-
-            let payload = UcanPayload {
-                iss: creator_did.clone(),
-                aud: member_did.clone(),
-                exp,
-                nbf: None,
-                nnc: nonce.clone(),
-                att,
-                prf: Vec::new(),
-                fct: None,
+            let params = scp_core::crypto::ucan::mint::MintParams {
+                issuer_did: &handle.creator_did,
+                issuer_key: &signing_key,
+                audience_did: &member_did,
+                context_id: &handle.context_id,
+                capabilities: &capabilities,
+                lifetime_secs: 3600, // 1 hour default
+                not_before: None,
+                proofs: vec![],
+                facts: None,
             };
 
-            let header_json = serde_json::to_vec(&header).map_err(|e| ScpError::Permission {
-                message: format!("header serialization failed: {e}"),
-                code: "SCP-PERM-3004".to_owned(),
-            })?;
-            let payload_json = serde_json::to_vec(&payload).map_err(|e| ScpError::Permission {
-                message: format!("payload serialization failed: {e}"),
-                code: "SCP-PERM-3004".to_owned(),
-            })?;
+            let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)
+                .await
+                .map_err(ScpError::from)?;
 
-            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
-            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+            let data = UcanTokenData {
+                token_id: token.payload.nnc.clone(),
+                issuer: token.payload.iss.clone(),
+                audience: token.payload.aud.clone(),
+                capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
+                expires_at: Some(token.payload.exp),
+            };
 
-            // Stub: zero-signature placeholder until KeyCustody is plumbed through FFI (SCP-214)
-            let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
-            let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
-
-            let token_handle = Arc::new(UcanToken {
-                data: UcanTokenData {
-                    token_id: nonce,
-                    issuer: creator_did,
-                    audience: member_did,
-                    capabilities: capability_uris,
-                    expires_at: Some(exp),
-                },
-                encoded,
-            });
             increment_handle_count();
-            Ok(token_handle)
+            Ok(Arc::new(UcanToken {
+                data,
+                encoded: token.encoded,
+            }))
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -2112,12 +1712,12 @@ pub async fn ucan_mint(
 pub async fn ucan_revoke(handle: Arc<ContextHandle>, token_id: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            crate::runtime::with_context(&handle.context_id, |rt| {
-                rt.revocation_list.revoke(token_id.clone());
-                Ok(())
-            })?;
-
-            Ok(())
+            let _ = (handle, token_id);
+            Err(ScpError::Permission {
+                message: "not yet connected to runtime — UCAN revocation requires a live context"
+                    .to_owned(),
+                code: "SCP-PERM-3006".to_owned(),
+            })
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -2156,59 +1756,12 @@ pub async fn event_log_query(
 ) -> Result<Vec<Event>, ScpError> {
     runtime()
         .spawn(async move {
-            let (event_count, merkle_root_hex) =
-                crate::runtime::with_context(&handle.context_id, |rt| {
-                    let count = scp_core::event_log::tree::event_count(&rt.event_log);
-                    let root = scp_core::event_log::tree::root(&rt.event_log);
-                    Ok((count, hex::encode(&root)))
-                })?;
-
-            let limit = if let Some(ref json) = filter_json {
-                let parsed: serde_json::Value =
-                    serde_json::from_str(json).map_err(ScpError::from)?;
-                #[allow(clippy::cast_possible_truncation)]
-                // Limit value is a small integer; u64→usize is safe for realistic filter values.
-                parsed
-                    .get("limit")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|v| v as usize)
-            } else {
-                None
-            };
-
-            if event_count == 0 {
-                return Ok(Vec::new());
-            }
-
-            let payload_json = serde_json::json!({
-                "event_count": event_count,
-                "merkle_root": merkle_root_hex,
-            });
-
-            #[allow(clippy::cast_possible_truncation)]
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| ScpError::Context {
-                    message: format!("system clock error: {e}"),
-                    code: "SCP-CTX-2023".to_owned(),
-                })?
-                .as_secs();
-
-            let summary_event = Event {
-                event_type: "LogSummary".to_owned(),
-                actor_did: String::new(),
-                timestamp: now,
-                payload_json: serde_json::to_string(&payload_json).map_err(ScpError::from)?,
-                sequence: event_count.saturating_sub(1),
-            };
-
-            let events = vec![summary_event];
-
-            if let Some(lim) = limit {
-                Ok(events.into_iter().take(lim).collect())
-            } else {
-                Ok(events)
-            }
+            let _ = (handle, filter_json);
+            Err(ScpError::Context {
+                message: "not yet connected to runtime — event log query requires a live context"
+                    .to_owned(),
+                code: "SCP-CTX-2023".to_owned(),
+            })
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -2238,150 +1791,19 @@ pub async fn event_log_query(
 /// Returns `ScpError::Context` if the context is not active or the
 /// verification fails (empty log, invalid index, etc.).
 #[uniffi::export]
-#[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
 pub async fn event_log_verify(
     handle: Arc<ContextHandle>,
     claim_json: String,
 ) -> Result<Proof, ScpError> {
     runtime()
         .spawn(async move {
-            let claim: serde_json::Value =
-                serde_json::from_str(&claim_json).map_err(ScpError::from)?;
-
-            let claim_type =
-                claim
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ScpError::Validation {
-                        message: "claim must include 'type' field ('inclusion' or 'absence')"
-                            .to_owned(),
-                        code: "SCP-VALID-7010".to_owned(),
-                    })?;
-
-            match claim_type {
-                "inclusion" => {
-                    let leaf_index = claim
-                        .get("leaf_index")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| ScpError::Validation {
-                            message: "inclusion claim must include 'leaf_index' (integer)"
-                                .to_owned(),
-                            code: "SCP-VALID-7011".to_owned(),
-                        })?;
-
-                    let (verified, details_json) =
-                        crate::runtime::with_context(&handle.context_id, |rt| {
-                            let proof = scp_core::event_log::proof::prove_inclusion(
-                                &rt.event_log,
-                                leaf_index,
-                            )
-                            .map_err(ScpError::from)?;
-                            let verified = scp_core::event_log::proof::verify_inclusion(&proof);
-
-                            let path_steps: Vec<serde_json::Value> = proof
-                                .path
-                                .iter()
-                                .map(|step| {
-                                    let direction = match step.direction {
-                                        scp_core::event_log::proof::Direction::Left => "left",
-                                        scp_core::event_log::proof::Direction::Right => "right",
-                                    };
-                                    serde_json::json!({
-                                        "sibling_hash": hex::encode(&step.sibling_hash),
-                                        "direction": direction,
-                                    })
-                                })
-                                .collect();
-
-                            let details = serde_json::json!({
-                                "leaf_index": proof.leaf_index,
-                                "leaf_hash": hex::encode(&proof.leaf_hash),
-                                "root": hex::encode(&proof.root),
-                                "path": path_steps,
-                                "path_length": proof.path.len(),
-                            });
-
-                            Ok((verified, details))
-                        })?;
-
-                    Ok(Proof {
-                        verified,
-                        proof_type: "inclusion".to_owned(),
-                        details_json: serde_json::to_string(&details_json)
-                            .map_err(ScpError::from)?,
-                    })
-                }
-                "absence" => {
-                    let event_hash_hex = claim
-                        .get("event_hash")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| ScpError::Validation {
-                            message: "absence claim must include 'event_hash' (hex string)"
-                                .to_owned(),
-                            code: "SCP-VALID-7012".to_owned(),
-                        })?;
-
-                    let event_hash =
-                        decode_hex_hash(event_hash_hex).map_err(|e| ScpError::Validation {
-                            message: format!("invalid event_hash: {e}"),
-                            code: "SCP-VALID-7013".to_owned(),
-                        })?;
-
-                    let (verified, details_json) =
-                        crate::runtime::with_context(&handle.context_id, |rt| {
-                            let proof = scp_core::event_log::proof::prove_absence(
-                                &rt.event_log,
-                                &event_hash,
-                            )
-                            .map_err(ScpError::from)?;
-
-                            let lower = proof.lower.as_ref().map(|lwp| {
-                                serde_json::json!({
-                                    "leaf_hash": hex::encode(&lwp.leaf_hash),
-                                    "leaf_index": lwp.leaf_index,
-                                })
-                            });
-
-                            let upper = proof.upper.as_ref().map(|uwp| {
-                                serde_json::json!({
-                                    "leaf_hash": hex::encode(&uwp.leaf_hash),
-                                    "leaf_index": uwp.leaf_index,
-                                })
-                            });
-
-                            let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
-                                scp_core::event_log::proof::verify_inclusion(&lwp.inclusion_proof)
-                            });
-                            let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
-                                scp_core::event_log::proof::verify_inclusion(&uwp.inclusion_proof)
-                            });
-                            let verified = lower_verified && upper_verified;
-
-                            let details = serde_json::json!({
-                                "query_hash": hex::encode(&proof.query_hash),
-                                "root": hex::encode(&proof.root),
-                                "leaf_count": proof.leaf_count,
-                                "lower": lower,
-                                "upper": upper,
-                            });
-
-                            Ok((verified, details))
-                        })?;
-
-                    Ok(Proof {
-                        verified,
-                        proof_type: "absence".to_owned(),
-                        details_json: serde_json::to_string(&details_json)
-                            .map_err(ScpError::from)?,
-                    })
-                }
-                other => Err(ScpError::Validation {
-                    message: format!(
-                        "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
-                    ),
-                    code: "SCP-VALID-7014".to_owned(),
-                }),
-            }
+            let _ = (handle, claim_json);
+            Err(ScpError::Context {
+                message:
+                    "not yet connected to runtime — event log verification requires a live context"
+                        .to_owned(),
+                code: "SCP-CTX-2025".to_owned(),
+            })
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -2407,13 +1829,4 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
             code: "SCP-VALID-7007".to_owned(),
         }),
     }
-}
-
-/// Decodes a hex string into a 32-byte hash.
-fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
-    Ok(arr)
 }
