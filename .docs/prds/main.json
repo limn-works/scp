@@ -60,7 +60,7 @@
       "id": "gate-3",
       "name": "Phase 3: Python SDK + MCP",
       "priority": "P0",
-      "status": "in-progress",
+      "status": "done",
       "stories": [
         "SCP-036",
         "SCP-037",
@@ -191,7 +191,7 @@
       "id": "gate-6",
       "name": "Phase 6: Scale + Harden",
       "priority": "P2",
-      "status": "in-progress",
+      "status": "done",
       "stories": [
         "SCP-110",
         "SCP-111",
@@ -278,7 +278,9 @@
         "SCP-224",
         "SCP-225",
         "SCP-226",
-        "SCP-227"
+        "SCP-227",
+        "SCP-230",
+        "SCP-231"
       ]
     }
   ],
@@ -10088,7 +10090,7 @@
       ],
       "description": "Spec §17.4 defines a ProtocolStore that provides typed domain methods (60+) wrapping the raw Storage trait (SCP-001). This is the persistence layer that all higher-level code uses. Currently not implemented — higher-level code works with in-memory state only. Note: SCP-135 (auto-accept policy persistence) is a consumer of Storage, not a prerequisite.",
       "acceptanceCriteria": [
-        "ProtocolStore struct wraps a Box<dyn Storage> with typed accessor methods",
+        "ProtocolStore<S: Storage> struct wraps a generic Storage implementation with typed accessor methods",
         "Identity state CRUD: store/load/delete identity, key handles, DID documents",
         "Context state CRUD: store/load/delete context params, membership, roles, event log",
         "UCAN state: store/load/delete tokens, revocation lists, nonce tracker",
@@ -10294,6 +10296,72 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.14.8 Blocking"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
+    },
+    {
+      "id": "SCP-230",
+      "title": "Implement event_log store module for ProtocolStore",
+      "gate": "gate-audit",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "blockedBy": [
+        "SCP-222"
+      ],
+      "files": [
+        "crates/scp-core/src/store/event_log.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Spec §17.4 defines an event_log.rs submodule of ProtocolStore with 8 methods for event log persistence, Merkle tree nodes, and roots. SCP-222 establishes the ProtocolStore struct and key conventions; this story implements the event log domain methods as an impl block on ProtocolStore<S>. Each method translates to one or two Storage trait calls using the key convention from §17.3 (context/{context_id}/event/{seq:020d}, context/{context_id}/event_meta/count, context/{context_id}/event_meta/root, context/{context_id}/event_tree/{level}/{index}).",
+      "acceptanceCriteria": [
+        "append_event(context_id, seq, event_hash) stores event data at context/{context_id}/event/{seq:020d}",
+        "load_event(context_id, seq) retrieves event data by sequence number or returns None",
+        "load_event_range(context_id, start, end) returns events in [start, end) in sequence order",
+        "event_count(context_id) returns the stored event count from context/{context_id}/event_meta/count",
+        "store_event_root(context_id, root) persists the Merkle root hash at context/{context_id}/event_meta/root",
+        "load_event_root(context_id) retrieves the Merkle root or returns None",
+        "store_event_tree_node(context_id, level, index, hash) persists a Merkle tree node at context/{context_id}/event_tree/{level}/{index}",
+        "load_event_tree_node(context_id, level, index) retrieves a Merkle tree node or returns None"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
+    },
+    {
+      "id": "SCP-231",
+      "title": "Implement transport store module for ProtocolStore",
+      "gate": "gate-audit",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "blockedBy": [
+        "SCP-222"
+      ],
+      "files": [
+        "crates/scp-core/src/store/transport.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Spec §17.4 defines a transport.rs submodule of ProtocolStore with 6 methods for relay scores and key package persistence. SCP-222 establishes the ProtocolStore struct and key conventions; this story implements the transport domain methods as an impl block on ProtocolStore<S>. Each method translates to one or two Storage trait calls using the key convention from §17.3 (relay_score/{relay_url}, key_package/{relay_url}/{index}).",
+      "acceptanceCriteria": [
+        "store_relay_score(relay_url, score) persists relay score data at relay_score/{relay_url}",
+        "load_relay_score(relay_url) retrieves relay score data or returns None",
+        "list_relay_scores() returns all stored relay scores as (url, data) pairs",
+        "store_key_package(relay_url, index, kp) persists a key package at key_package/{relay_url}/{index}",
+        "load_key_packages(relay_url) returns all key packages for the given relay",
+        "delete_key_package(relay_url, index) removes a specific key package"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
         }
       ],
       "actionItems": [],

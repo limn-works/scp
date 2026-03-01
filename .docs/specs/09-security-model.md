@@ -541,7 +541,7 @@ context_pseudonym = context_keypair.public_key
 
 Cover traffic is **enabled by default and configurable per-client.** The SDK ships with cover traffic on. Clients or operators may disable it via SDK configuration. Disabling degrades traffic analysis resistance but has no functional impact on message delivery or protocol correctness.
 
-1. **Persistent connections: constant-rate, default on.** One padded message per relay connection per 30 seconds. Real messages replace dummy messages. ~15MB/day for 5 relay connections at 1KB padding.
+1. **Persistent connections: constant-rate, default on.** One padded dummy message per relay connection per 30 seconds. Dummy messages are always sent at each interval. Real messages are sent as additional traffic. This prevents timing oracles where observers infer real traffic from missing dummies. ~15MB/day for 5 relay connections at 1KB padding.
 2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
 3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.

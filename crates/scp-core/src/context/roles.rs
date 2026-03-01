@@ -12,7 +12,7 @@
 //! - [`CapabilityCeiling`] -- Immutable set of capabilities declared at context
 //!   creation.
 //! - [`RoleDefinition`] -- Named role mapping to a capability subset.
-//! - [`UcanToken`] -- Stub UCAN token for Phase 2 (full crypto in SCP-024).
+//! - [`UcanToken`] -- Lightweight UCAN token representation for role-based access control in broadcast contexts.
 //! - [`RoleError`] -- Error type for role and capability operations.
 //!
 //! # Built-in Roles
@@ -435,14 +435,16 @@ pub fn builtin_broadcast_roles(ceiling: &CapabilityCeiling) -> Vec<RoleDefinitio
 }
 
 // ---------------------------------------------------------------------------
-// UcanToken (stub for Phase 2)
+// UcanToken
 // ---------------------------------------------------------------------------
 
-/// Stub UCAN token for Phase 2.
+/// Lightweight UCAN token representation for role-based access control
+/// in broadcast contexts.
 ///
-/// Contains the fields specified by ADR-009 but without cryptographic signing.
-/// Full UCAN implementation with Ed25519 signatures, delegation chains, and
-/// nonce tracking will be introduced in SCP-024.
+/// Contains the core UCAN fields specified by ADR-009: issuer DID,
+/// audience DID, capability attestations, and a unique nonce. Full
+/// cryptographic UCAN validation (Ed25519 signatures, delegation chains,
+/// nonce tracking) is implemented in `scp-core/ucan/` (see ADR-016).
 ///
 /// Each token: `iss` = context creator DID, `aud` = member DID,
 /// `att` = capability attestations, `nnc` = unique nonce.

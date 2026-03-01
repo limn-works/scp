@@ -74,6 +74,10 @@ Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. Th
    - All async bridge functions declared with `async fn` use PyO3's native async support, which automatically bridges between the tokio runtime and Python's asyncio event loop.
    - **Runtime isolation:** The tokio runtime is NEVER accessed via `block_on` from within an async context. All sync->async bridging happens in the Python layer (via `run_coroutine_threadsafe` to a dedicated asyncio loop), which then calls the async bridge functions normally. The Rust side only ever sees async function calls driven by PyO3's native async machinery.
    - Runtime shutdown is handled on module finalization (Python interpreter exit). The `Runtime` is dropped, which waits for in-flight tasks to complete (with a 5-second timeout).
+   - **Thread pool sizing guidance:** The `py.allow_threads(|| rt.block_on(...))` pattern (used in sync wrappers and internally by PyO3's async machinery) blocks one tokio worker thread per concurrent Python call. With the default tokio thread count (number of CPU cores), a Python application making N concurrent SCP calls can exhaust the tokio thread pool if N >= core count. Deployers should:
+     - **Size the tokio runtime** based on expected concurrent Python operations. If the application makes many concurrent SCP calls (e.g., a web server handling parallel requests), configure the runtime with more threads than the default: `Runtime::new_multi_thread().worker_threads(N)` where N accounts for peak concurrency.
+     - **Monitor thread pool exhaustion.** When all tokio worker threads are blocked in `block_on`, new async operations stall. Symptoms include increasing latency and eventual timeouts. Expose the tokio runtime's metrics (active tasks, blocking threads) via the Python SDK's status API.
+     - **Prefer async over sync.** The `py.allow_threads(|| rt.block_on(...))` pattern is inherently thread-consuming. Python callers should prefer `await`-based async calls whenever possible, as PyO3's native async support cooperatively schedules on the tokio runtime without blocking threads.
 
 2. **Identity bridge functions:**
 
