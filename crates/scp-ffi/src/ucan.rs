@@ -292,8 +292,9 @@ pub fn py_ucan_validate(
 /// Mints a new UCAN token for a context member.
 ///
 /// Creates a new UCAN token granting the specified capabilities to the
-/// given member DID. The token is signed with a real Ed25519 signature
-/// using the context creator's retained [`KeyCustody`] provider.
+/// given member DID. The token is structured with proper SCP capability
+/// URIs scoped to the context. Real Ed25519 signing requires `KeyCustody`
+/// integration (SCP-214).
 ///
 /// # Arguments
 ///

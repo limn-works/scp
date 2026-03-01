@@ -2414,7 +2414,7 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-ffi/pyo3/identity.rs"
+        "crates/scp-ffi/src/identity.rs"
       ],
       "description": "Implement PyO3 bridge functions for identity operations. The bridge exposes `PyIdentity` and `PyDIDDocument` as opaque Python objects with attribute access — no raw structs, no Rust generics, no lifetime markers visible to Python. All async functions use PyO3's native async support (`#[pyfunction] async fn`).",
       "acceptanceCriteria": [
@@ -3106,7 +3106,7 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/crypto/ucan/validate.rs"
+        "crates/scp-core/src/crypto/ucan/validate.rs"
       ],
       "description": "Implement `validate_ucan(context, token, required_capability) -> Result<(), UcanError>` with the full 11-step validation pipeline: parse, signature verification, chain verification, root issuer check, audience check, capability match, attenuation verification, ceiling check, nonce validation, revocation check, and expiry verification. Returns `Ok(())` if all 11 checks pass. Returns a specific `UcanError` variant indicating which check failed.",
       "acceptanceCriteria": [
@@ -3256,7 +3256,7 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/crypto/ucan/mint.rs"
+        "crates/scp-core/src/crypto/ucan/mint.rs"
       ],
       "description": "Implement `mint_ucan()` for creating new UCAN tokens and `delegate_ucan()` for creating delegated tokens with attenuation. Token creation generates unique nonces, constructs capability attenuations scoped to context, and signs with Ed25519. Delegation verifies delegator identity, enforces attenuation (never widening), and constructs proof chain.",
       "acceptanceCriteria": [
@@ -6527,7 +6527,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/src/main/kotlin/com/limn/scp/stream/Streams.kt"
+        "bindings/kotlin/scp-sdk-kotlin/src/main/kotlin/com/limn/scp/stream/Streams.kt"
       ],
       "description": "Implement streaming API for the Kotlin SDK using Flow and Channel. Flow preferred for cold streams (lazy, on-demand data), Channel for hot streams (real-time events). Must decide Flow vs Channel assignment per stream type.",
       "acceptanceCriteria": [
@@ -6576,7 +6576,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/src/main/kotlin/com/limn/scp/lifecycle/LifecycleManager.kt"
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/lifecycle/ContextLifecycle.kt"
       ],
       "description": "Implement LifecycleOwner-aware cleanup of SCP resources for the Kotlin SDK. SCP connections, MLS state, and streaming subscriptions must be tied to Android lifecycle events to prevent resource leaks when activities/fragments are destroyed.",
       "acceptanceCriteria": [
@@ -6626,7 +6626,7 @@
       "severity": "minor",
       "status": "done",
       "files": [
-        "bindings/kotlin/src/main/kotlin/com/limn/scp/compose/StateHolders.kt"
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/compose/StateHolders.kt"
       ],
       "description": "Implement Jetpack Compose integration for the Kotlin SDK. State holders and remember patterns that expose SCP state as Compose-observable state. Mirrors SwiftUI integration patterns from ADR-026.",
       "acceptanceCriteria": [
@@ -6727,7 +6727,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/src/test/kotlin/com/limn/scp/conformance/ConformanceTests.kt"
+        "bindings/kotlin/scp-sdk-kotlin/src/test/kotlin/com/limn/scp/conformance/ConformanceRunnerTest.kt"
       ],
       "description": "Implement the cross-platform conformance test suite for the Kotlin SDK. Tests must verify that Kotlin SDK behavior matches Swift SDK and Python SDK for all protocol operations. Cross-platform conformance test suite from scaffold/shared.md is the reference.",
       "acceptanceCriteria": [
@@ -10108,8 +10108,7 @@
         "SCP-001"
       ],
       "files": [
-        "crates/scp-core/src/store/mod.rs",
-        "crates/scp-core/src/store/protocol_store.rs"
+        "crates/scp-core/src/store/mod.rs"
       ],
       "description": "Spec §17.4 defines a ProtocolStore that provides typed domain methods (60+) wrapping the raw Storage trait (SCP-001). This is the persistence layer that all higher-level code uses. Currently not implemented — higher-level code works with in-memory state only. Note: SCP-135 (auto-accept policy persistence) is a consumer of Storage, not a prerequisite.",
       "acceptanceCriteria": [
