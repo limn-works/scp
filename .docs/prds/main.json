@@ -2443,7 +2443,7 @@
       "details": {
         "function_signatures": "py_identity_create(custody: &str) -> PyResult<PyIdentity>\npy_identity_load(did: &str) -> PyResult<PyIdentity>\npy_identity_resolve(py: Python<'py>, did: &str) -> PyResult<Bound<'py, PyAny>>\npy_identity_rotate_key(identity: &PyIdentity) -> PyResult<PyIdentity>"
       },
-      "result": "PyIdentity, PyDIDDocument opaque types + 4 bridge functions (create, load, resolve, rotate_key) + module registration in identity.rs"
+      "result": "PyIdentity with Arc<InMemoryKeyCustody> retention implemented via SCP-214 identity registry. py_identity_create, py_identity_load, py_identity_resolve, py_identity_rotate_key, py_identity_migrate all wired. Remaining: verify all 5 acceptance criteria explicitly pass."
     },
     {
       "id": "SCP-039",
@@ -9769,7 +9769,7 @@
         "sealEnvelopeNote": "seal_envelope (outer.rs:169) takes routing_id: &[u8] and InnerEnvelope as pre-computed inputs. It does not take KeyCustody directly, but both inputs require KeyCustody upstream: routing_id comes from derive_pseudonym, and InnerEnvelope comes from create_inner_envelope which signs with KeyCustody. The entire message send path is blocked without this wiring.",
         "inMemoryCodeBug": "InMemoryKeyCustody::derive_pseudonym at key_custody.rs:333 uses signing_key.to_bytes() (Ed25519 private/secret key bytes, 32 bytes) as the HMAC key. ADR-027 mandates verifying_key.to_bytes() (Ed25519 public key bytes, 32 bytes) for cross-platform determinism — hardware TEE keys (Android Keystore, Secure Enclave) cannot export private bytes. AndroidKeyCustody.kt correctly uses publicKey(keyHandle) at line 178. AppleKeyCustody.swift correctly uses publicKey(). InMemoryKeyCustody is the outlier. The golden vector test at key_custody.rs:626 will need updated expected values after the fix."
       },
-      "result": "PARTIAL: InMemoryKeyCustody derive_pseudonym fixed to use public key bytes (criteria 12-13). Golden vector test updated. Remaining: FFI bridge wiring for PyO3/UniFFI/NAPI/WASM (criteria 1-11, 14-17)."
+      "result": "PARTIAL: Iteration 4 added PyO3 identity registry (Arc<InMemoryKeyCustody> retained), KeyCustody::derive_pseudonym wiring in context.rs, py_ucan_mint/delegate real wiring, py_identity_rotate_key/migrate bridge functions, routing secret stubs removed. Remaining: UniFFI callback interface (criterion 1-2), NAPI/WASM context routing (criterion 5), cross-platform pseudonym test (criterion 16)."
     },
     {
       "id": "SCP-215",
@@ -9942,7 +9942,7 @@
       "id": "SCP-218",
       "title": "Wire WASM bridge to scp-core for tools, UCAN, and event log",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-079"
       ],
@@ -9973,13 +9973,14 @@
         }
       ],
       "actionItems": [],
-      "details": {}
+      "details": {},
+      "result": "All stubs in tools.rs, ucan.rs, event_log.rs replaced with WASM-local implementations. runtime.rs added with WasmContextRuntime, ToolRegistry, WasmEventLog (RFC 6962 Merkle). wasm-pack build clean. 3088 workspace tests pass."
     },
     {
       "id": "SCP-219",
       "title": "Wire NAPI bridge to scp-core for UCAN and event log",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-080"
       ],
@@ -10006,7 +10007,8 @@
         }
       ],
       "actionItems": [],
-      "details": {}
+      "details": {},
+      "result": "UCAN validate/mint/revoke and event_log query/verify wired to scp-core via bridge trait adapters (BridgeDidResolver, BridgeRevocationChecker, BridgeProofResolver, BridgeNonceTracker). Runtime registry with lazy registration. 12 tests. CLAUDE.md added."
     },
     {
       "id": "SCP-220",
@@ -10123,7 +10125,7 @@
       "id": "SCP-223",
       "title": "Implement human-readable addressing types and discovery handle tools",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-074",
         "SCP-075"
@@ -10157,7 +10159,8 @@
         }
       ],
       "actionItems": [],
-      "details": {}
+      "details": {},
+      "result": "Full addressing layer: ParsedAddress types (DiscoveryHandle, DomainHandle, AttestationHandle, Unscoped), TrustLevel enum with ranking, HandleRegistry (register/lookup/deregister), AddressResolver with multi-path resolution, PetnameMap with bidirectional mappings, ResolutionCache with per-layer TTLs. 70 unit tests."
     },
     {
       "id": "SCP-224",
