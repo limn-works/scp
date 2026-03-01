@@ -53,7 +53,9 @@ A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live ru
 - `BridgeProofResolver` — in-memory `HashMap<String, UcanToken>` for delegation chains
 - `BridgeNonceTracker` — adapts `nonce::NonceTracker` struct to `validate::NonceTracker` trait
 
-`ucan_mint` creates token metadata with placeholder signature (real signing deferred to SCP-214 KeyCustody wiring).
+`ucan_mint` **does not call `scp_core::crypto::ucan::mint::mint_ucan`** — it manually constructs `NapiUcanToken` with `encoded: String::new()`. This is a known gap (gate-audit): the token has no JWT structure and cannot be passed to `ucan_revoke` or `ucan_validate`. Fix: call `mint_ucan` with `InMemoryKeyCustody` as a placeholder (as the UniFFI bridge does) until SCP-214 wires real `KeyCustody`. See ACTION items in SCP-219 audit.
+
+`ucan_validate` does not accept a `proof_tokens` parameter — delegated UCAN tokens (non-empty `prf` arrays) will always fail at delegation chain traversal (step 3) with "proof CID not found". The PyO3 bridge accepts `Option<Vec<String>>` proof tokens and populates `BridgeProofResolver` from them. This gap must be fixed before delegated UCANs can be validated through the NAPI bridge.
 
 `ucan_revoke` parses the full JWT, computes CID via `compute_revocation_cid`, adds to `RevocationList`.
 
@@ -71,3 +73,5 @@ A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live ru
 - `napi-rs` requires owned `String`/`Vec` parameters — annotate with `#[allow(clippy::needless_pass_by_value)]`.
 - Handle count: opaque types (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`, `NapiTransportManager`) must increment `HANDLE_COUNT` on construction and decrement in `Drop`.
 - Runtime registry uses lazy init pattern — `ensure_registered()` must be called before `with_context()` in every bridge function that needs runtime state.
+- `event_log.rs` has no test module — `decode_hex_hash` and the inclusion/absence proof paths are untested at the unit level. Add `#[cfg(test)]` block matching the PyO3 bridge coverage before marking related stories done.
+- `ensure_registered` has a TOCTOU pattern: `contains_key` check + `or_insert` are not atomic across the two calls. The current behavior is safe (DashMap `or_insert` is atomic; duplicate construction is benign), but prefer `entry().or_insert_with(|| ContextRuntime { ... })` to avoid constructing unused runtime objects on races.
