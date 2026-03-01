@@ -483,6 +483,7 @@ fn invariant_1_relay_economic_config_visible_in_wellknown() {
                 payee: "did:dht:z6MkRelayOperator".to_owned(),
             }),
         }),
+        handles: None,
     };
 
     // Client inspects relay economics BEFORE connecting.
@@ -1212,6 +1213,7 @@ fn invariant_8_bootstrap_list_has_free_relay() {
             rate_limit_subscribe: None,
             economic: None, // Free relay -- no economic config.
         }),
+        handles: None,
     };
 
     let paid_relay = WellKnownScp {
@@ -1232,6 +1234,7 @@ fn invariant_8_bootstrap_list_has_free_relay() {
                 payee: "did:dht:z6MkPaidRelay".to_owned(),
             }),
         }),
+        handles: None,
     };
 
     // Validate: list with free relay passes.
@@ -1270,6 +1273,7 @@ fn invariant_8_no_relay_config_is_free() {
         relay: "wss://minimal.example.com/scp/v1".to_owned(),
         contexts: None,
         relay_config: None, // No config at all -- treated as free.
+        handles: None,
     };
 
     let is_free = minimal_relay
