@@ -60,7 +60,7 @@
       "id": "gate-3",
       "name": "Phase 3: Python SDK + MCP",
       "priority": "P0",
-      "status": "in-progress",
+      "status": "done",
       "stories": [
         "SCP-036",
         "SCP-037",
@@ -191,7 +191,7 @@
       "id": "gate-6",
       "name": "Phase 6: Scale + Harden",
       "priority": "P2",
-      "status": "in-progress",
+      "status": "done",
       "stories": [
         "SCP-110",
         "SCP-111",
@@ -279,8 +279,8 @@
         "SCP-225",
         "SCP-226",
         "SCP-227",
-        "SCP-228",
-        "SCP-229"
+        "SCP-230",
+        "SCP-231"
       ]
     }
   ],
@@ -2305,29 +2305,29 @@
       "files": [
         "crates/scp-ffi/pyo3/lib.rs"
       ],
-      "description": "Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. The bridge exposes a flat set of `#[pyfunction]` and `#[pyclass]` definitions that map directly to scp-core's public API. A single tokio `Runtime` is created at module import time and shared across all async calls. Bridge functions use synchronous `#[pyfunction]` with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the Python GIL. Build output: Python extension module `_scp_core` (imported by the `scp_sdk` Python package).",
+      "description": "Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. The bridge exposes a flat set of `#[pyfunction]` and `#[pyclass]` definitions that map directly to scp-core's public API. A single tokio `Runtime` is created at module import time and shared across all async calls. The runtime runs in a background thread pool managed by PyO3's native async machinery. Build output: Python extension module `_scp_core` (imported by the `scp_sdk` Python package).",
       "acceptanceCriteria": [
         "A tokio `Runtime` is created once at Python module import (`_scp_core.__init__`).",
         "The runtime is multi-threaded (default thread count) and stored in a `OnceCell<Runtime>`.",
-        "All async bridge functions use synchronous `#[pyfunction]` with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the Python GIL. This pattern is preferred over PyO3's experimental native async (`#[pyfunction] async fn`) because native async holds the GIL during `Future::poll` and does not integrate with the tokio runtime. The `allow_threads` + `block_on` pattern provides full GIL release during I/O and runs on the shared tokio thread pool.",
-        "Runtime isolation: Bridge functions access the tokio runtime exclusively through `crate::runtime()?.block_on()` wrapped in `py.allow_threads()`. The GIL is released for the entire duration of the async operation. No bridge function calls `block_on` from within a tokio async context (which would panic). Sync-to-async bridging in the Python SDK wrapper layer uses `run_coroutine_threadsafe` to a dedicated asyncio loop.",
-        "Runtime shutdown uses a two-phase design: (1) An `atexit` handler calls `shutdown_runtime()`, which blocks for 100ms to let cooperative tasks observe shutdown — kept short to avoid holding the Python GIL during interpreter exit. (2) On process exit, the static `OnceLock` is reclaimed and the tokio runtime is dropped, which waits for remaining tasks to complete. This ordering ensures Python cleanup (GC, `__del__`, atexit) completes before the Rust runtime is dropped.",
+        "All async bridge functions declared with `async fn` use PyO3's native async support, which automatically bridges between the tokio runtime and Python's asyncio event loop.",
+        "Runtime isolation: The tokio runtime is NEVER accessed via `block_on` from within an async context. All sync->async bridging happens in the Python layer (via `run_coroutine_threadsafe` to a dedicated asyncio loop), which then calls the async bridge functions normally. The Rust side only ever sees async function calls driven by PyO3's native async machinery.",
+        "Runtime shutdown is handled on module finalization (Python interpreter exit). The `Runtime` is dropped, which waits for in-flight tasks to complete (with a 5-second timeout).",
         "`maturin develop` builds the extension in-place for development.",
         "`maturin build --release` produces optimized wheels.",
         "CI builds wheels for Linux (manylinux2014 x86_64 + aarch64), macOS (universal2), Windows (x86_64).",
         "`maturin publish` uploads built wheels to PyPI for `pip install scp-sdk` distribution.",
-        "FFI safety: The tokio runtime MUST NEVER block on Python GIL acquisition. All bridge functions release the GIL via `py.allow_threads()` before calling `rt.block_on()`, ensuring Python threads can run concurrently during Rust async operations. `Python::with_gil()` is only used from non-async contexts where the GIL is not already held by the calling thread.",
+        "FFI safety: The tokio runtime MUST NEVER block on Python GIL acquisition. All GIL-requiring operations are dispatched via `Python::with_gil()` from non-async contexts or use PyO3's native async machinery which handles GIL release automatically.",
         "Shutdown ordering: Python cleanup (GC, __del__, atexit handlers) completes BEFORE the Rust tokio runtime is dropped. Module finalization respects this ordering to prevent use-after-free of Rust objects from Python destructor callbacks."
       ],
       "actionItems": [
         "Create `scp-ffi/pyo3/lib.rs` with `#[pymodule]` entry point for `_scp_core`.",
         "Initialize tokio `Runtime` in `OnceCell<Runtime>` at module init time, multi-threaded with default thread count.",
         "Register all bridge submodule functions and classes in the module init.",
-        "Implement two-phase module finalization: (1) atexit handler with 100ms drain window for cooperative task shutdown, (2) process-exit OnceLock reclamation drops the tokio Runtime.",
+        "Implement module finalization that drops the `Runtime` with a 5-second timeout for in-flight tasks.",
         "Configure `Cargo.toml` for the `scp-ffi` crate with PyO3 0.22+ and maturin build tool dependencies.",
         "Add `pyproject.toml` with maturin build backend configuration.",
         "Verify `maturin develop` produces a working `_scp_core` extension module importable from Python.",
-        "Verify GIL safety: audit all bridge functions to ensure `py.allow_threads()` wraps every `rt.block_on()` call — no GIL held during tokio execution",
+        "Verify GIL safety: audit all async bridge functions to ensure no `block_on` calls that could deadlock with GIL acquisition",
         "Implement shutdown ordering: module finalization drops Python references before dropping the tokio Runtime"
       ],
       "blockedBy": [
@@ -2355,13 +2355,13 @@
         "crate": "scp-ffi",
         "module": "scp-ffi/pyo3/",
         "build_output": "Python extension module `_scp_core`",
-        "async_runtime": "A single tokio `Runtime` is created at module import time and shared across all async calls. Bridge functions use `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the GIL. PyO3's experimental native async was evaluated but rejected: it holds the GIL during Future::poll and does not integrate with the tokio runtime.",
+        "async_runtime": "A single tokio `Runtime` is created at module import time and shared across all async calls. The runtime runs in a background thread pool managed by PyO3's native async machinery.",
         "platform_wheels": "maturin builds wheels for manylinux (x86_64, aarch64), macOS (x86_64, arm64 universal2), and Windows (x86_64). CI/CD via GitHub Actions with maturin's `maturin-action`.",
         "libraries": [
           "pyo3 (0.22+)",
           "maturin (build tool)"
         ],
-        "FFI async risks (PyO3)": "Risk 1: tokio runtime must never block on Python GIL acquisition. Bridge functions release the GIL via py.allow_threads() before calling rt.block_on(), preventing deadlock. Risk 2: Shutdown ordering — Python cleanup (GC, __del__, atexit) must complete before Rust runtime drop. Two-phase shutdown: (1) atexit handler with 100ms drain window, (2) process-exit OnceLock reclamation drops the runtime."
+        "FFI async risks (PyO3)": "Risk 1: tokio runtime must never block on Python GIL acquisition. If a tokio task calls Python::with_gil() while another task holds the GIL and is awaiting a tokio future, deadlock occurs. Rule: Use PyO3 native async which releases the GIL during await. Risk 4: Shutdown ordering — Python cleanup (GC, __del__, atexit) must complete before Rust runtime drop. Module finalization sequence: (1) cancel pending Rust tasks, (2) allow Python GC to run, (3) drop the Runtime."
       }
     },
     {
@@ -2412,9 +2412,9 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
-        "crates/scp-ffi/src/identity.rs"
+        "crates/scp-ffi/pyo3/identity.rs"
       ],
       "description": "Implement PyO3 bridge functions for identity operations. The bridge exposes `PyIdentity` and `PyDIDDocument` as opaque Python objects with attribute access — no raw structs, no Rust generics, no lifetime markers visible to Python. All async functions use PyO3's native async support (`#[pyfunction] async fn`).",
       "acceptanceCriteria": [
@@ -2445,7 +2445,7 @@
       "details": {
         "function_signatures": "py_identity_create(custody: &str) -> PyResult<PyIdentity>\npy_identity_load(did: &str) -> PyResult<PyIdentity>\npy_identity_resolve(py: Python<'py>, did: &str) -> PyResult<Bound<'py, PyAny>>\npy_identity_rotate_key(identity: &PyIdentity) -> PyResult<PyIdentity>"
       },
-      "result": "All 5 acceptance criteria verified: py_identity_create, py_identity_load, py_identity_resolve, py_identity_rotate_key exist with correct signatures. PyIdentity and PyDIDDocument are opaque with getter methods. All functions registered in module."
+      "result": "PyIdentity, PyDIDDocument opaque types + 4 bridge functions (create, load, resolve, rotate_key) + module registration in identity.rs"
     },
     {
       "id": "SCP-039",
@@ -3106,7 +3106,7 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/src/crypto/ucan/validate.rs"
+        "crates/scp-core/crypto/ucan/validate.rs"
       ],
       "description": "Implement `validate_ucan(context, token, required_capability) -> Result<(), UcanError>` with the full 11-step validation pipeline: parse, signature verification, chain verification, root issuer check, audience check, capability match, attenuation verification, ceiling check, nonce validation, revocation check, and expiry verification. Returns `Ok(())` if all 11 checks pass. Returns a specific `UcanError` variant indicating which check failed.",
       "acceptanceCriteria": [
@@ -3206,28 +3206,23 @@
       "files": [
         "crates/scp-core/crypto/ucan/revoke.rs"
       ],
-      "description": "Implement per-context RevocationList and `revoke_ucan()` function. Revocations are distributed as MLS application messages so all members maintain consistent revocation lists. Uses `HashMap<String, RevocationState>` instead of a plain HashSet to support a three-state revocation model: Active -> RevocationPending -> Revoked. The pending state is fail-closed (denies capability exercise) to prevent token use during the MLS propagation window. If MLS distribution fails, the revocation is rolled back to prevent split-brain between the revoker and other context members. `merge()` is monotonic and union-only (revocations only advance state, never regress — a token cannot be un-revoked). Revocation verification: revoker must be the token's issuer or the context creator. Appends `TokenRevoked` event to context's event log.",
+      "description": "Implement per-context RevocationList and `revoke_ucan()` function. Revocations are distributed as MLS application messages so all members maintain consistent revocation lists. `merge()` is union-only (revocations are append-only — a token cannot be un-revoked). Revocation verification: revoker must be the token's issuer or the context creator. Appends `TokenRevoked` event to context's event log.",
       "acceptanceCriteria": [
-        "RevocationList struct with `revoked: HashMap<String, RevocationState>` (map of token CIDs to revocation state) and `context_id: ContextId`. RevocationState is a three-state enum: Active (implicit, not stored), RevocationPending (revocation initiated locally, MLS distribution not yet confirmed), and Revoked (fully committed). Both RevocationPending and Revoked are treated as revoked for capability validation (fail-closed).",
-        "`is_revoked(token_cid) -> bool` returns true if the token CID is in RevocationPending or Revoked state (fail-closed: pending revocations deny capability exercise).",
+        "RevocationList struct with `revoked: HashSet<String>` (set of revoked token CIDs) and `context_id: ContextId`.",
+        "`is_revoked(token_cid) -> bool` checks if a token CID is in the revocation list.",
         "`revoke(token_cid)` adds a token CID to the revocation list.",
-        "`merge(remote)` merges remote revocation list with monotonic state advancement (union-only, append-only — a token cannot be un-revoked, and state only advances: Active -> RevocationPending -> Revoked). Rejects cross-context merges.",
+        "`merge(remote)` merges remote revocation list (union-only, append-only — a token cannot be un-revoked).",
         "`revoke_ucan(context, token_cid, revoker) -> Result<(), UcanError>` verifies the revoker is the token's issuer or the context creator.",
         "`revoke_ucan` adds the token CID to the context's revocation list.",
         "`revoke_ucan` distributes the revocation as an MLS application message to all context members.",
-        "`revoke_ucan` appends `TokenRevoked` event to the context's event log.",
-        "`mark_pending(token_cid)` transitions a token to RevocationPending state (no-op if already Revoked).",
-        "`confirm_revocation(token_cid)` transitions a pending token to Revoked state.",
-        "`rollback_revocation(token_cid)` removes a pending entry (rollback to Active); no-op if already Revoked.",
-        "`revoke_ucan` is transactional: marks token as RevocationPending before MLS distribution, confirms to Revoked on success, rolls back to Active on distribution failure (no split-brain)."
+        "`revoke_ucan` appends `TokenRevoked` event to the context's event log."
       ],
       "actionItems": [
-        "Create `crates/scp-core/crypto/ucan/revoke.rs` with `RevocationState` enum (Active, RevocationPending, Revoked) and `RevocationList` struct.",
-        "Implement `is_revoked(&self, token_cid: &str) -> bool` with fail-closed semantics (true for both Pending and Revoked).",
-        "Implement `revoke(&mut self, token_cid: String)` to add a token as fully Revoked.",
-        "Implement `mark_pending`, `confirm_revocation`, `rollback_revocation` state machine transitions.",
-        "Implement `merge(&mut self, remote: &RevocationList)` as monotonic state union with cross-context rejection.",
-        "Implement `revoke_ucan(revocation_list, payload, revoker_did, authorizer, distributor, event_logger)` with transactional pending/confirm/rollback flow.",
+        "Create `crates/scp-core/crypto/ucan/revoke.rs` with `RevocationList` struct.",
+        "Implement `is_revoked(&self, token_cid: &str) -> bool`.",
+        "Implement `revoke(&mut self, token_cid: String)`.",
+        "Implement `merge(&mut self, remote: &RevocationList)` as set union.",
+        "Implement `revoke_ucan(context, token_cid, revoker) -> Result<(), UcanError>` that verifies revoker authority (issuer or context creator), adds CID to list, distributes via MLS application message, and appends TokenRevoked event to event log.",
         "Implement persistence: serialize/deserialize revocation state to Storage."
       ],
       "blockedBy": [
@@ -3242,11 +3237,9 @@
         }
       ],
       "details": {
-        "revocation_state": "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]\npub enum RevocationState {\n    Active,             // Implicit -- absence from map\n    RevocationPending,  // Local revocation, MLS not yet confirmed (fail-closed)\n    Revoked,            // Fully committed\n}",
-        "revocation_list": "pub struct RevocationList {\n    revoked: HashMap<String, RevocationState>,  // Token CID -> state\n    context_id: ContextId,\n}\n\nimpl RevocationList {\n    pub fn is_revoked(&self, token_cid: &str) -> bool { ... }     // fail-closed\n    pub fn state(&self, token_cid: &str) -> RevocationState { ... }\n    pub fn revoke(&mut self, token_cid: String) { ... }\n    pub fn mark_pending(&mut self, token_cid: String) { ... }\n    pub fn confirm_revocation(&mut self, token_cid: &str) { ... }\n    pub fn rollback_revocation(&mut self, token_cid: &str) { ... }\n    pub fn merge(&mut self, remote: &Self) { ... }                // Monotonic state union\n}",
-        "design_rationale": "HashMap<String, RevocationState> is used instead of HashSet<String> to support a transactional revocation flow: mark_pending -> distribute via MLS -> confirm_revocation (or rollback on failure). The pending state is fail-closed, denying capability exercise during the MLS propagation window. This prevents a race condition where a revoked token could be exercised between the local revocation decision and MLS distribution completing. A plain HashSet cannot distinguish these states and would force a choice between fail-open (security gap) or no rollback on distribution failure (split-brain risk)."
+        "revocation_list": "pub struct RevocationList {\n    revoked: HashSet<String>,       // Set of revoked token CIDs\n    context_id: ContextId,\n}\n\nimpl RevocationList {\n    pub fn is_revoked(&self, token_cid: &str) -> bool { ... }\n    pub fn revoke(&mut self, token_cid: String) { ... }\n    pub fn merge(&mut self, remote: &RevocationList) { ... }  // Merge from MLS message\n}"
       },
-      "result": "RevocationList with HashMap<String, RevocationState>, three-state model (Active/RevocationPending/Revoked), transactional revoke_ucan with rollback, monotonic merge, trait-based dependencies, 27 tests"
+      "result": "RevocationList with union-only merge, trait-based revoke_ucan, 27 tests"
     },
     {
       "id": "SCP-056",
@@ -3256,7 +3249,7 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/src/crypto/ucan/mint.rs"
+        "crates/scp-core/crypto/ucan/mint.rs"
       ],
       "description": "Implement `mint_ucan()` for creating new UCAN tokens and `delegate_ucan()` for creating delegated tokens with attenuation. Token creation generates unique nonces, constructs capability attenuations scoped to context, and signs with Ed25519. Delegation verifies delegator identity, enforces attenuation (never widening), and constructs proof chain.",
       "acceptanceCriteria": [
@@ -5205,7 +5198,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-media/src/signaling.rs"
       ],
@@ -5248,8 +5241,7 @@
           "ADR-002": "Signaling messages use envelope format with MessageType::Signaling variant.",
           "ADR-005": "Signaling routed through SCP transport."
         }
-      },
-      "result": "Signaling message construction implemented: SessionDescription, Candidate, SignalingMessage types with create_offer/create_answer/create_ice_candidate constructors, MessageType::Signaling variant, send_signaling routing. Full test suite passes."
+      }
     },
     {
       "id": "SCP-093",
@@ -6426,7 +6418,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/PlatformAdapter.kt"
       ],
@@ -6434,9 +6426,9 @@
       "acceptanceCriteria": [
         "mod.rs declares pub mod for key_custody, device_attestation, push_provider, storage",
         "All Android adapter types re-exported from mod.rs",
-        "Module is Android-only via `com.android.library` Gradle plugin in build.gradle.kts",
-        "build.gradle.kts declares android block with compileSdk, minSdk, and dependencies on all four provider modules",
-        "`./gradlew :scp-sdk-kotlin-android:build` succeeds",
+        "Module conditionally compiled for Android targets (#[cfg(target_os = \"android\")])",
+        "scp-platform/src/lib.rs includes conditional pub mod android",
+        "`cargo build -p scp-platform --target aarch64-linux-android` succeeds",
         "All public items have /// doc comments"
       ],
       "actionItems": [
@@ -6463,8 +6455,7 @@
       "details": {
         "stubADR": true,
         "note": "Mirrors SCP-097 (Apple platform module root). Creates conditional compilation module root for Android platform adapters."
-      },
-      "result": "Android platform module root with conditional compilation, re-exports, Kotlin PlatformAdapter factory. Commit 35991ea."
+      }
     },
     {
       "id": "SCP-115",
@@ -6525,9 +6516,9 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin/src/main/kotlin/com/limn/scp/stream/Streams.kt"
+        "bindings/kotlin/src/main/kotlin/com/limn/scp/stream/Streams.kt"
       ],
       "description": "Implement streaming API for the Kotlin SDK using Flow and Channel. Flow preferred for cold streams (lazy, on-demand data), Channel for hot streams (real-time events). Must decide Flow vs Channel assignment per stream type.",
       "acceptanceCriteria": [
@@ -6565,8 +6556,7 @@
           "scaffold/kotlin.md",
           "standards/kotlin.md — kotlinx.coroutines"
         ]
-      },
-      "result": "Two-tier streaming: ColdStreamFactory, HotStreamFactory, ColdMessageFlow. 22 tests. Commit e220e49."
+      }
     },
     {
       "id": "SCP-117",
@@ -6574,9 +6564,9 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/lifecycle/ContextLifecycle.kt"
+        "bindings/kotlin/src/main/kotlin/com/limn/scp/lifecycle/LifecycleManager.kt"
       ],
       "description": "Implement LifecycleOwner-aware cleanup of SCP resources for the Kotlin SDK. SCP connections, MLS state, and streaming subscriptions must be tied to Android lifecycle events to prevent resource leaks when activities/fragments are destroyed.",
       "acceptanceCriteria": [
@@ -6615,8 +6605,7 @@
           "scaffold/kotlin.md",
           "ADR-026 (Swift SDK) as parallel reference"
         ]
-      },
-      "result": "ContextLifecycle extension + ScpViewModel base class. 11 tests. Commit 2548f6c."
+      }
     },
     {
       "id": "SCP-118",
@@ -6624,9 +6613,9 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "minor",
-      "status": "done",
+      "status": "pending",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/compose/StateHolders.kt"
+        "bindings/kotlin/src/main/kotlin/com/limn/scp/compose/StateHolders.kt"
       ],
       "description": "Implement Jetpack Compose integration for the Kotlin SDK. State holders and remember patterns that expose SCP state as Compose-observable state. Mirrors SwiftUI integration patterns from ADR-026.",
       "acceptanceCriteria": [
@@ -6665,8 +6654,7 @@
           "scaffold/kotlin.md",
           "ADR-026 (Swift SDK) as parallel reference"
         ]
-      },
-      "result": "Jetpack Compose state holders implemented: rememberContextState, rememberMessages, rememberMembers composable functions with DisposableEffect cleanup. StateHolders.kt in scp-sdk-kotlin-android module. Unit tests with Compose test utilities."
+      }
     },
     {
       "id": "SCP-119",
@@ -6674,7 +6662,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "minor",
-      "status": "done",
+      "status": "pending",
       "files": [
         "bindings/kotlin/build.gradle.kts"
       ],
@@ -6716,8 +6704,7 @@
           "scaffold/kotlin.md — Gradle/KTS build",
           "standards/kotlin.md — ktlint + detekt, JVM 11+"
         ]
-      },
-      "result": "Maven Central publishing config for both modules. Sonatype OSSRH, GPG signing, detekt update. Commit 45e97a9."
+      }
     },
     {
       "id": "SCP-120",
@@ -6725,9 +6712,9 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin/src/test/kotlin/com/limn/scp/conformance/ConformanceRunnerTest.kt"
+        "bindings/kotlin/src/test/kotlin/com/limn/scp/conformance/ConformanceTests.kt"
       ],
       "description": "Implement the cross-platform conformance test suite for the Kotlin SDK. Tests must verify that Kotlin SDK behavior matches Swift SDK and Python SDK for all protocol operations. Cross-platform conformance test suite from scaffold/shared.md is the reference.",
       "acceptanceCriteria": [
@@ -6764,8 +6751,7 @@
           "ADR-026 (Swift SDK) as parallel reference",
           "ADR-014 (Python SDK) as pattern"
         ]
-      },
-      "result": "Cross-platform conformance test suite implemented in Kotlin JUnit 5 with coroutine test support. Covers identity, context lifecycle, messaging, encryption, governance operations. ConformanceTests.kt in scp-sdk-kotlin module."
+      }
     },
     {
       "id": "SCP-121",
@@ -9666,7 +9652,7 @@
       "gate": "gate-6",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-ffi/src/identity.rs",
         "crates/scp-ffi/src/context.rs",
@@ -9783,8 +9769,7 @@
         "notYetExposedViaFFI": "Two scp-core functions take KeyCustody but have no corresponding FFI bridge function: (1) delegate_ucan (mint.rs:292) — SCP-056 implemented the scp-core function and SCP-057 defined a Python wrapper, but no py_ucan_delegate bridge function exists in crates/scp-ffi/src/ucan.rs. (2) DidDht::migrate_identity (dht.rs:531) — SCP-008 implemented scp-core but no py_identity_migrate bridge function exists. This story should add bridge functions for both, since they require KeyCustody and are part of the complete FFI surface.",
         "sealEnvelopeNote": "seal_envelope (outer.rs:169) takes routing_id: &[u8] and InnerEnvelope as pre-computed inputs. It does not take KeyCustody directly, but both inputs require KeyCustody upstream: routing_id comes from derive_pseudonym, and InnerEnvelope comes from create_inner_envelope which signs with KeyCustody. The entire message send path is blocked without this wiring.",
         "inMemoryCodeBug": "InMemoryKeyCustody::derive_pseudonym at key_custody.rs:333 uses signing_key.to_bytes() (Ed25519 private/secret key bytes, 32 bytes) as the HMAC key. ADR-027 mandates verifying_key.to_bytes() (Ed25519 public key bytes, 32 bytes) for cross-platform determinism — hardware TEE keys (Android Keystore, Secure Enclave) cannot export private bytes. AndroidKeyCustody.kt correctly uses publicKey(keyHandle) at line 178. AppleKeyCustody.swift correctly uses publicKey(). InMemoryKeyCustody is the outlier. The golden vector test at key_custody.rs:626 will need updated expected values after the fix."
-      },
-      "result": "All 17 acceptance criteria complete. PyO3 identity registry with Arc<InMemoryKeyCustody>, real derive_pseudonym/create_inner_envelope/mint_ucan/delegate_ucan/rotate_key/migrate wiring, UniFFI callback interface with all 7 KeyCustody methods, NAPI/WASM routing ID derivation, InMemoryKeyCustody HMAC fixed to public key bytes, golden vector test updated, cross-platform pseudonym test added."
+      }
     },
     {
       "id": "SCP-215",
@@ -9792,7 +9777,7 @@
       "gate": "gate-6",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         ".docs/standards/sdk-common.md",
         "crates/scp-ffi/src/mcp.rs",
@@ -9842,8 +9827,7 @@
       "details": {
         "currentChaos": "18+ distinct prefixes found: SCP-IDENT, SCP-DID, SCP-CTX, SCP-CRYPTO, SCP-TRANS, SCP-TOOL, SCP-VALID, SCP-STORAGE, SCP-ATTEST, SCP-MCP, SCP-PRM, SCP-PERM, SCP-VAL, SCP-TRANSPORT, SCP-TXP, SCP-KEY, SCP-PUSH, SCP-IDENTITY. Three numbering conventions: bare 3-digit (001, 002), correct 4-digit (1001, 2001), wrong-range 4-digit (6001 in STORAGE). NAPI has TOOL codes SCP-TOOL-5001..5004 in TRANS range and TRANS codes SCP-TRANS-6001 in TOOL range.",
         "rangeCollision": "SCP-MCP- codes 8001-8008 (Python mcp.py) now land in SCP-STORAGE- range 8000-8999 (allocated during PR #118 fix). Need separate range allocation."
-      },
-      "result": "Error codes normalized across 33 files. SCP-MCP- allocated range 10000-10999. NAPI TOOL/TRANS swap fixed. All prefixes unified. CI script scripts/check-error-codes.sh created. 493 error codes verified conformant."
+      }
     },
     {
       "id": "SCP-216",
@@ -9851,7 +9835,7 @@
       "gate": "gate-3",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-ffi/src/context.rs",
         ".docs/adrs/phase-3.md",
@@ -9903,8 +9887,7 @@
       "details": {
         "currentBehavior": "PyMessageReceiver.__anext__ at context.rs:388-408 uses sync try_recv(). TryRecvError::Empty and TryRecvError::Disconnected both map to StopAsyncIteration. py_context_receive at lines 719-727 creates an mpsc::channel(32) but immediately drops the sender _tx, so the channel is always in Disconnected state. Three inline comments document this as placeholder behavior.",
         "intendedBehavior": "Per sketch.md: receive() returns AsyncStream<ContextEvent>. Stream stays open as long as membership is active. Buffer holds 1000 events. On overflow, oldest event is dropped and BufferOverflow warning is injected. Stream ends on leave/eviction/context-close."
-      },
-      "result": "Python receive() iterator lifecycle implemented: async bounded channel (1000 events), oldest-drop overflow with BufferOverflow warning, deterministic shutdown on leave/evict/close, ADR-014 amended with lifecycle spec. Tokio mutex blocking_lock lesson documented."
+      }
     },
     {
       "id": "SCP-217",
@@ -9912,7 +9895,7 @@
       "gate": "gate-3",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-ffi/src/identity.rs",
         "crates/scp-ffi/src/runtime.rs",
@@ -9950,33 +9933,31 @@
       "details": {
         "currentStub": "py_identity_load at identity.rs:278-299 validates DID format (did:dht: prefix) then returns PyIdentity { did, custody: \"in_memory\" } without any storage interaction. The inline comment says \"See ADR-013 acceptance criterion 2\" — the criterion exists but was never wired.",
         "relationship": "This is the Storage analog of SCP-214 (KeyCustody wiring). SCP-214 wires KeyCustodyProvider for crypto operations; SCP-217 wires StorageProvider for identity persistence. Both are required for a production-ready Python FFI bridge."
-      },
-      "result": "StorageProvider wired into Python FFI bridge: py_init_storage injection, py_identity_create persists via ProtocolStore-style keys, py_identity_load retrieves from storage with error on not-found. In-memory storage for testing. CLAUDE.md updated."
+      }
     },
     {
       "id": "SCP-218",
-      "title": "Wire WASM bridge tools, UCAN, and event log via local runtime",
+      "title": "Wire WASM bridge to scp-core for tools, UCAN, and event log",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-079"
       ],
       "files": [
-        "crates/scp-ffi/wasm/src/runtime.rs",
         "crates/scp-ffi/wasm/src/tools.rs",
         "crates/scp-ffi/wasm/src/ucan.rs",
         "crates/scp-ffi/wasm/src/event_log.rs"
       ],
-      "description": "The WASM bridge (SCP-079) provides typed function signatures and error types but tool, UCAN, and event log functions return 'not yet connected to runtime' errors. Wire these to WASM-local re-implementations of scp-core algorithms in runtime.rs. The WASM crate cannot depend on scp-core because wasm32-unknown-unknown is incompatible with tokio's multi-thread runtime. Instead, runtime.rs re-implements the relevant scp-core logic (ToolRegistry, WasmEventLog with RFC 6962 Merkle tree, UCAN revocation, JSON Schema validation) in pure Rust that compiles to wasm32. The algorithms are identical to scp-core's implementations. Scope: tool_register/invoke/verify, ucan_validate/mint/revoke, event_log_query/verify. Identity and KeyCustody wiring is covered separately by SCP-214.",
+      "description": "The WASM bridge (SCP-079) provides typed function signatures and error types but tool, UCAN, and event log functions return 'not yet connected to runtime' errors. Wire these to scp-core implementations using the same patterns as the PyO3 bridge (SCP-163). Scope: tool_register/invoke/verify, ucan_validate/mint/revoke, event_log_query/verify. Identity and KeyCustody wiring is covered separately by SCP-214.",
       "acceptanceCriteria": [
-        "tool_register validates input/output JSON Schemas via runtime::validate_schema and inserts into runtime::ToolRegistry",
-        "tool_invoke looks up the tool in runtime::ToolRegistry, validates input against the tool's input schema, and checks identity_did has tool_invoke capability on the context",
-        "tool_verify retrieves the tool from runtime::ToolRegistry and runs test vectors against the input schema, returning pass/fail with per-vector failure messages",
-        "ucan_validate parses JWT segments, checks expiry against js_sys::Date::now(), verifies att[] capability URIs, and checks the context revocation set",
-        "ucan_mint creates a WasmUcanToken with issuer (context creator DID), audience (member DID), capability URIs, nonce, and 1-hour expiry (signing deferred to SCP-214)",
-        "ucan_revoke computes SHA-256 CID of the token and inserts it into the context's revoked_tokens set",
-        "event_log_query returns event count and Merkle root from runtime::WasmEventLog for the context",
-        "event_log_verify generates and verifies RFC 6962 Merkle inclusion/absence proofs via runtime::prove_inclusion, runtime::prove_absence, and runtime::verify_inclusion",
+        "tool_register calls scp-core ToolRegistry::register with schema validation",
+        "tool_invoke calls scp-core tool invocation pipeline and returns structured result",
+        "tool_verify calls scp-core schema verification and returns pass/fail with diagnostics",
+        "ucan_validate calls scp-core 11-step UCAN validation pipeline (verify_ucan_chain)",
+        "ucan_mint calls scp-core mint_ucan (signing deferred to KeyCustody wiring in SCP-214)",
+        "ucan_revoke calls scp-core UCAN revocation",
+        "event_log_query calls scp-core EventLog query with filter parameters",
+        "event_log_verify calls scp-core Merkle verification",
         "wasm-pack build compiles without errors",
         "No 'not yet connected to runtime' errors remain in tools.rs, ucan.rs, event_log.rs"
       ],
@@ -9989,14 +9970,13 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "All stubs in tools.rs, ucan.rs, event_log.rs replaced with WASM-local runtime implementations (no scp-core dependency — wasm32 incompatible with tokio multi-thread runtime). runtime.rs added with WasmContextRuntime, ToolRegistry, WasmEventLog (RFC 6962 Merkle), schema validation, and UCAN revocation tracking. tool_invoke checks identity_did capability. wasm-pack build clean."
+      "details": {}
     },
     {
       "id": "SCP-219",
       "title": "Wire NAPI bridge to scp-core for UCAN and event log",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-080"
       ],
@@ -10023,14 +10003,13 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "UCAN validate/mint/revoke and event_log query/verify wired to scp-core via bridge trait adapters (BridgeDidResolver, BridgeRevocationChecker, BridgeProofResolver, BridgeNonceTracker). Runtime registry with lazy registration. 12 tests. CLAUDE.md added."
+      "details": {}
     },
     {
       "id": "SCP-220",
       "title": "Wire UniFFI bridge to scp-core for UCAN and event log",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-078"
       ],
@@ -10056,14 +10035,13 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "UniFFI bridge wired to scp-core: ucan_validate (11-step pipeline), ucan_mint, ucan_revoke, event_log_query, event_log_verify. Runtime registry added (DashMap pattern). 4 bridge trait adapters. No stub errors remain. cargo check clean."
+      "details": {}
     },
     {
       "id": "SCP-221",
       "title": "Wire Swift SDK wrapper functions to UniFFI bridge",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-220",
         "SCP-103"
@@ -10076,15 +10054,15 @@
         "bindings/swift/Sources/SCP/EventLog.swift",
         "bindings/swift/Sources/SCP/Trust.swift"
       ],
-      "description": "The Swift SDK wrappers (SCP-103) contain placeholder functions that return 'not yet available' errors across Mcp.swift, Tools.swift, Ucan.swift, Transport.swift, EventLog.swift, and Trust.swift. Wire these to the UniFFI bridge layer where exports exist (Tools, Ucan, Transport, EventLog). For modules without Rust UniFFI exports (MCP, Trust), implement the injectable bridge pattern with typed closures and descriptive defaults. Follow-on stories SCP-228 and SCP-229 add the missing Rust exports.",
+      "description": "The Swift SDK wrappers (SCP-103) contain placeholder functions that return 'not yet available' errors across Mcp.swift, Tools.swift, Ucan.swift, Transport.swift, EventLog.swift, and Trust.swift. Wire these to the UniFFI bridge layer.",
       "acceptanceCriteria": [
-        "Mcp.swift uses injectable bridge pattern (McpBridge closures) with descriptive error defaults pending UniFFI MCP exports (SCP-228)",
+        "Mcp.swift functions delegate to ScpBindings (UniFFI bridge) for MCP tool operations",
         "Tools.swift functions delegate to ScpBindings for tool registration, invocation, and verification",
         "Ucan.swift functions delegate to ScpBindings for UCAN validation, minting, and revocation",
         "Transport.swift functions delegate to ScpBindings for transport send/receive",
         "EventLog.swift functions delegate to ScpBindings for event log query and verification",
-        "Trust.swift uses injectable bridge pattern (TrustBridge closure) with TrustInput-based default pending UniFFI trust evaluation export (SCP-229)",
-        "No callback-continuation placeholder pattern remains — all modules use direct async/await bridge delegation or injectable bridge stubs",
+        "Trust.swift functions delegate to ScpBindings for attestation verification and trust evaluation",
+        "No 'not yet available' placeholder errors remain in any Swift wrapper file",
         "At least one async roundtrip test per module (Tools, Ucan, EventLog, Transport, Trust) verifies async/await bridging compiles and executes"
       ],
       "priority": "P1",
@@ -10096,23 +10074,23 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "4 of 6 Swift wrapper modules wired directly to UniFFI bridge. MCP and Trust use injectable bridge pattern with typed closure defaults (not placeholder errors). 18 async tests. Commit 622e26a. Follow-on: SCP-228 (MCP UniFFI exports), SCP-229 (trust evaluation UniFFI export)."
+      "details": {}
     },
     {
       "id": "SCP-222",
       "title": "Implement ProtocolStore typed domain layer over Storage trait",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-001"
       ],
       "files": [
-        "crates/scp-core/src/store/mod.rs"
+        "crates/scp-core/src/store/mod.rs",
+        "crates/scp-core/src/store/protocol_store.rs"
       ],
       "description": "Spec §17.4 defines a ProtocolStore that provides typed domain methods (60+) wrapping the raw Storage trait (SCP-001). This is the persistence layer that all higher-level code uses. Currently not implemented — higher-level code works with in-memory state only. Note: SCP-135 (auto-accept policy persistence) is a consumer of Storage, not a prerequisite.",
       "acceptanceCriteria": [
-        "ProtocolStore<S: Storage> struct wraps a generic Storage implementation with typed accessor methods (Storage trait uses RPITIT, not dyn-compatible)",
+        "ProtocolStore<S: Storage> struct wraps a generic Storage implementation with typed accessor methods",
         "Identity state CRUD: store/load/delete identity, key handles, DID documents",
         "Context state CRUD: store/load/delete context params, membership, roles, event log",
         "UCAN state: store/load/delete tokens, revocation lists, nonce tracker",
@@ -10134,14 +10112,13 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "ProtocolStore<S: Storage> implemented with typed domain modules: identity (6 methods), context (10 methods), ucan (11 methods), tools (6 methods). StoredValue<T> version envelope with MessagePack serialization. Key convention: domain/{id}/field. Generic parameter required because Storage trait uses RPITIT (impl Future in trait methods) and is not dyn-compatible. All tests pass."
+      "details": {}
     },
     {
       "id": "SCP-223",
       "title": "Implement human-readable addressing types and discovery handle tools",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-074",
         "SCP-075"
@@ -10175,14 +10152,13 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "Full addressing layer: ParsedAddress types (DiscoveryHandle, DomainHandle, AttestationHandle, Unscoped), TrustLevel enum with ranking, HandleRegistry (register/lookup/deregister), AddressResolver with multi-path resolution, PetnameMap with bidirectional mappings, ResolutionCache with per-layer TTLs. 70 unit tests."
+      "details": {}
     },
     {
       "id": "SCP-224",
       "title": "Implement broadcast key lifecycle and BroadcastEnvelope seal/open",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-018",
         "SCP-012",
@@ -10215,14 +10191,13 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "Broadcast key lifecycle implemented: generate_broadcast_key, rotate_broadcast_key, BroadcastEnvelope seal/open with AES-256-GCM, BroadcastKeyEpochAdvance event. 23 tests including property-based testing. validate_memory_scope_for_broadcast already existed and verified correct."
+      "details": {}
     },
     {
       "id": "SCP-225",
       "title": "Implement cover traffic generation and heartbeat messages",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-016"
       ],
@@ -10254,14 +10229,13 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "Cover traffic and heartbeat implemented: CoverTrafficGenerator with configurable interval (30s default), real-replaces-dummy behavior. HeartbeatMonitor with suppression detection (2x threshold). Both independently configurable. 900 lines, comprehensive tests."
+      "details": {}
     },
     {
       "id": "SCP-226",
       "title": "Implement attestation renewal orchestration",
       "gate": "gate-audit",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [],
       "files": [
         "crates/scp-core/src/trust/renewal.rs"
@@ -10288,8 +10262,7 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "Implemented renew_attestation, RenewalError, RenewalChecker trait, DefaultRenewalChecker in crates/scp-core/src/trust/renewal.rs. 11 tests pass. Commit 6ed73c7."
+      "details": {}
     },
     {
       "id": "SCP-227",
@@ -10297,7 +10270,7 @@
       "gate": "gate-audit",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "blockedBy": [
         "SCP-224"
       ],
@@ -10326,114 +10299,73 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "result": "Broadcast subscriber registration and blocking implemented: subscribe_broadcast with open/gated modes, UCAN capability checks, block_broadcast_author via sender key revocation, capability enforcement. Integration tests for 3-subscriber decryption and blocked author undecryptability."
+      "details": {}
     },
     {
-      "id": "SCP-228",
-      "title": "Add MCP server and client UniFFI bridge exports",
+      "id": "SCP-230",
+      "title": "Implement event_log store module for ProtocolStore",
       "gate": "gate-audit",
-      "status": "pending",
-      "blockedBy": [
-        "SCP-221"
-      ],
-      "files": [
-        "crates/scp-ffi/uniffi/src/bridge.rs",
-        "crates/scp-ffi/uniffi/src/lib.rs",
-        "bindings/swift/Sources/SCP/Mcp.swift"
-      ],
-      "description": "The UniFFI bridge (crates/scp-ffi/uniffi/) has no MCP exports. The scp-mcp crate provides full McpServer and McpClient implementations, and the PyO3 bridge (crates/scp-ffi/src/mcp.rs) has 9+ wired functions. Add UniFFI-exported functions: mcp_serve, mcp_server_stop, mcp_client_connect_stdio, mcp_client_connect_sse, mcp_client_disconnect, mcp_client_list_tools, mcp_client_invoke. Then update Mcp.swift McpBridge defaults to delegate to the generated ScpBindings functions instead of throwing errors. Model after the PyO3 MCP bridge (SCP-165) which has proven patterns for handle management, transport selection, and provenance wrapping.",
-      "acceptanceCriteria": [
-        "UniFFI bridge exports mcp_serve function that starts an MCP server via scp-mcp McpServer",
-        "UniFFI bridge exports mcp_client_connect_stdio and mcp_client_connect_sse functions",
-        "UniFFI bridge exports mcp_client_list_tools and mcp_client_invoke functions",
-        "McpBridge.defaultServe delegates to ScpBindings.mcpServe instead of throwing",
-        "McpBridge.defaultClientCreate delegates to ScpBindings instead of throwing",
-        "McpBridge.defaultClientListTools delegates to ScpBindings instead of throwing",
-        "McpBridge.defaultClientInvoke delegates to ScpBindings instead of throwing",
-        "No SCP-MCP-1000x error codes remain in Mcp.swift bridge defaults",
-        "At least one async roundtrip test for MCP server and client bridge functions"
-      ],
-      "actionItems": [
-        "Add MCP opaque handle types (McpServerHandle, McpClientHandle) to bridge.rs with handle counting",
-        "Implement mcp_serve, mcp_server_stop as #[uniffi::export] async functions delegating to scp-mcp McpServer",
-        "Implement mcp_client_connect_stdio, mcp_client_connect_sse as #[uniffi::export] async functions",
-        "Implement mcp_client_list_tools, mcp_client_invoke as #[uniffi::export] async functions",
-        "Re-export all MCP functions from lib.rs",
-        "Update Mcp.swift McpBridge defaults to call generated ScpBindings functions",
-        "Replace McpClientHandle placeholder class with UniFFI-generated type",
-        "Add roundtrip tests to Swift test suite"
-      ],
       "priority": "P1",
       "severity": "major",
+      "status": "pending",
+      "blockedBy": [
+        "SCP-222"
+      ],
+      "files": [
+        "crates/scp-core/src/store/event_log.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Spec §17.4 defines an event_log.rs submodule of ProtocolStore with 8 methods for event log persistence, Merkle tree nodes, and roots. SCP-222 establishes the ProtocolStore struct and key conventions; this story implements the event log domain methods as an impl block on ProtocolStore<S>. Each method translates to one or two Storage trait calls using the key convention from §17.3 (context/{context_id}/event/{seq:020d}, context/{context_id}/event_meta/count, context/{context_id}/event_meta/root, context/{context_id}/event_tree/{level}/{index}).",
+      "acceptanceCriteria": [
+        "append_event(context_id, seq, event_hash) stores event data at context/{context_id}/event/{seq:020d}",
+        "load_event(context_id, seq) retrieves event data by sequence number or returns None",
+        "load_event_range(context_id, start, end) returns events in [start, end) in sequence order",
+        "event_count(context_id) returns the stored event count from context/{context_id}/event_meta/count",
+        "store_event_root(context_id, root) persists the Merkle root hash at context/{context_id}/event_meta/root",
+        "load_event_root(context_id) retrieves the Merkle root or returns None",
+        "store_event_tree_node(context_id, level, index, hash) persists a Merkle tree node at context/{context_id}/event_tree/{level}/{index}",
+        "load_event_tree_node(context_id, level, index) retrieves a Merkle tree node or returns None"
+      ],
       "sources": [
         {
-          "file": ".docs/adrs/phase-3.md",
-          "section": "## ADR-015: MCP Adapter"
-        },
-        {
-          "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-021: UniFFI Bridge Definitions"
-        },
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-026: Swift SDK"
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
         }
       ],
-      "details": {
-        "referenceImplementation": "crates/scp-ffi/src/mcp.rs (PyO3 bridge has proven MCP wiring patterns)",
-        "transportDependency": "MCP server/client transport (stdio/SSE) must work across UniFFI async boundary"
-      }
+      "actionItems": [],
+      "details": {}
     },
     {
-      "id": "SCP-229",
-      "title": "Add trust evaluation UniFFI bridge export",
+      "id": "SCP-231",
+      "title": "Implement transport store module for ProtocolStore",
       "gate": "gate-audit",
-      "status": "pending",
-      "blockedBy": [
-        "SCP-221"
-      ],
-      "files": [
-        "crates/scp-ffi/uniffi/src/bridge.rs",
-        "crates/scp-ffi/uniffi/src/lib.rs",
-        "bindings/swift/Sources/SCP/Trust.swift"
-      ],
-      "description": "The UniFFI bridge defines TrustInput as a record but exports no trust evaluation function. The scp-core trust module provides aggregate_trust_input() which collects all four trust layers into a TrustInput. Add a UniFFI-exported trust_evaluate function that delegates to scp-core's aggregate_trust_input, maps the result to the FFI TrustInput record, and returns it. Then update Trust.swift TrustBridge.defaultEvaluate to call the generated ScpBindings function instead of constructing a zeroed TrustInput locally.",
-      "acceptanceCriteria": [
-        "UniFFI bridge exports trust_evaluate async function accepting subject_did and context_id",
-        "trust_evaluate delegates to scp-core aggregate_trust_input and maps result to FFI TrustInput record",
-        "TrustBridge.defaultEvaluate in Trust.swift delegates to ScpBindings.trustEvaluate",
-        "TrustBridge.defaultEvaluate no longer constructs TrustInput with hardcoded zero values",
-        "At least one async roundtrip test for trust evaluation bridge function"
-      ],
-      "actionItems": [
-        "Implement trust_evaluate as #[uniffi::export] async function in bridge.rs",
-        "Wire trust_evaluate to scp-core::trust::aggregate::aggregate_trust_input",
-        "Map scp-core TrustInput fields to FFI TrustInput record fields",
-        "Re-export trust_evaluate from lib.rs",
-        "Update Trust.swift TrustBridge.defaultEvaluate to call ScpBindings.trustEvaluate",
-        "Add roundtrip test to Swift test suite"
-      ],
       "priority": "P1",
       "severity": "major",
+      "status": "pending",
+      "blockedBy": [
+        "SCP-222"
+      ],
+      "files": [
+        "crates/scp-core/src/store/transport.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Spec §17.4 defines a transport.rs submodule of ProtocolStore with 6 methods for relay scores and key package persistence. SCP-222 establishes the ProtocolStore struct and key conventions; this story implements the transport domain methods as an impl block on ProtocolStore<S>. Each method translates to one or two Storage trait calls using the key convention from §17.3 (relay_score/{relay_url}, key_package/{relay_url}/{index}).",
+      "acceptanceCriteria": [
+        "store_relay_score(relay_url, score) persists relay score data at relay_score/{relay_url}",
+        "load_relay_score(relay_url) retrieves relay score data or returns None",
+        "list_relay_scores() returns all stored relay scores as (url, data) pairs",
+        "store_key_package(relay_url, index, kp) persists a key package at key_package/{relay_url}/{index}",
+        "load_key_packages(relay_url) returns all key packages for the given relay",
+        "delete_key_package(relay_url, index) removes a specific key package"
+      ],
       "sources": [
         {
-          "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-017: Trust Engine (Four-Layer Evaluation)"
-        },
-        {
-          "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-021: UniFFI Bridge Definitions"
-        },
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-026: Swift SDK"
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
         }
       ],
-      "details": {
-        "coreFunction": "scp-core::trust::aggregate::aggregate_trust_input",
-        "ffiRecord": "TrustInput record already defined in bridge.rs — field mapping needed between core and FFI"
-      }
+      "actionItems": [],
+      "details": {}
     }
   ]
 }

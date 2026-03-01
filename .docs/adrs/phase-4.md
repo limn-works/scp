@@ -1395,3 +1395,58 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 | `bindings/typescript/tests/conformance/conformance.test.ts` | Cross-language conformance runner |
 
 **Estimated functions:** ~25-30 bridge functions per crate (mirroring ADR-013), ~15 type definitions, ~10 TypeScript wrapper classes/interfaces.
+
+---
+
+## ADR-034: WASM Bridge Re-Implementation Strategy
+
+**Status:** Decided
+
+### Context
+
+ADR-022 specifies a wasm-bindgen bridge crate (`scp-ffi/wasm/`) that compiles scp-core to WebAssembly for browser environments. In practice, scp-core cannot be compiled to `wasm32-unknown-unknown` due to two hard dependencies:
+
+1. **tokio multi-thread runtime.** scp-core uses `tokio::runtime::Runtime` with the multi-thread scheduler (required by PyO3 native async, MLS group operations, and transport concurrency). The `wasm32-unknown-unknown` target does not support `std::thread`, so `tokio::runtime::Builder::new_multi_thread()` fails to compile. While tokio offers a `current_thread` runtime that compiles to WASM, switching would require pervasive changes throughout scp-core and all FFI bridges, breaking the single-implementation invariant.
+
+2. **OpenMLS dependencies.** OpenMLS pulls in platform-specific crypto backends (RustCrypto or ring) that include assembly routines and C code incompatible with `wasm32-unknown-unknown`. The OpenMLS `wasm` feature flag exists but changes the API surface and introduces a different set of trait requirements that would require a parallel integration path.
+
+These are not feature-flag-able constraints — they are structural incompatibilities between scp-core's architecture and the WASM compilation target.
+
+### Decision
+
+The WASM bridge (`scp-ffi/wasm/`) uses **verbatim re-implementation** of scp-core's public API surface in WASM-compatible Rust. The re-implementation:
+
+- Implements the same public API types and function signatures as the napi-rs bridge.
+- Uses `wasm-bindgen-futures` for async bridging (single-threaded, cooperative scheduling on the browser event loop).
+- Uses WebCrypto API (via `web-sys`) for cryptographic operations instead of ring/RustCrypto.
+- Uses a WASM-compatible MLS implementation or a pure-Rust MLS subset that compiles to WASM.
+- Passes the same cross-language conformance test suite as all other bridges (JSON fixtures from `tests/conformance/`).
+
+The re-implementation is NOT a fork — it is a second implementation of the same specification, verified against the same acceptance criteria.
+
+### Alternatives Considered
+
+1. **Feature-gating tokio to `current_thread`.** Would require pervasive `#[cfg(target_arch = "wasm32")]` annotations throughout scp-core, dual-testing every async code path, and breaking the "one implementation" invariant for the protocol engine. Rejected because the maintenance burden exceeds that of a separate WASM bridge.
+
+2. **Extracting `scp-core-portable`.** A hypothetical refactoring that strips scp-core into a platform-agnostic core with no tokio or OpenMLS dependency. The remaining functionality would be too thin to be useful — most protocol logic requires crypto and async I/O. Rejected because the extraction boundary does not exist at a useful abstraction layer.
+
+3. **Emscripten compilation.** Emscripten can compile C/C++ dependencies (ring, OpenMLS's C backend) to WASM, but produces significantly larger binaries, requires manual JavaScript glue, and does not integrate with wasm-bindgen's type system. Rejected because it trades one set of problems for a worse set.
+
+### Risk Profile
+
+**Primary risk: implementation drift.** The WASM bridge may diverge from scp-core's behavior over time as new features are added to scp-core but not mirrored in the WASM re-implementation. This is the same category of risk that any multi-implementation protocol faces.
+
+### Mitigation
+
+1. **`wasm_conformance.rs` test suite.** A dedicated conformance test module that exercises every public API function of the WASM bridge against the same JSON test fixtures used by the native bridge. Both bridges must produce identical outputs for identical inputs.
+
+2. **Cross-language conformance in CI.** The `tests/conformance/conformance.test.ts` runner (ADR-022 acceptance criterion 14) executes the full conformance suite in both Bun (napi-rs bridge) and a browser environment (wasm-bindgen bridge). CI fails if either bridge produces different results.
+
+3. **Shared type definitions.** The `@scp/sdk` TypeScript types are defined once in `bindings/typescript/src/types/` and used by both bridges. Type-level drift is caught by the TypeScript compiler.
+
+4. **New feature checklist.** Every PR that adds a new scp-core public API function must include a corresponding WASM bridge implementation or a tracking issue. CI can enforce this via a bridge surface parity check script.
+
+### Dependencies
+
+- **ADR-022 (TypeScript SDK):** Defines the TypeScript wrapper layer that consumes both bridges.
+- **ADR-006 (Platform Adapter):** The WASM bridge implements the `Storage` and `KeyCustody` traits using browser-native APIs (wa-sqlite, WebCrypto).

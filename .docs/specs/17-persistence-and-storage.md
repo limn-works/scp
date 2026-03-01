@@ -116,17 +116,17 @@ mls/{context_id}/...
 
 ## 17.4 ProtocolStore
 
-`ProtocolStore` is a concrete struct in `scp-core/store/` that wraps `Arc<dyn Storage>` and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolStore` is the single interface between protocol logic and persistent storage.
+`ProtocolStore` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolStore` is the single interface between protocol logic and persistent storage. The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolStore` is generic rather than using `Arc<dyn Storage>`.
 
 ```rust
 /// scp-core/src/store/mod.rs
 
-pub struct ProtocolStore {
-    storage: Arc<dyn Storage>,
+pub struct ProtocolStore<S: Storage> {
+    storage: S,
 }
 
-impl ProtocolStore {
-    pub fn new(storage: Arc<dyn Storage>) -> Self;
+impl<S: Storage> ProtocolStore<S> {
+    pub fn new(storage: S) -> Self;
 
     // --- Context state ---
     pub async fn store_context_state(&self, context_id: &ContextId, state: &ContextState) -> Result<(), StoreError>;
@@ -403,16 +403,16 @@ OpenMLS requires a `StorageProvider` trait implementation for persisting MLS gro
 ```rust
 /// scp-core/src/crypto/mls/storage.rs
 
-pub struct MlsStorageBridge {
-    store: Arc<ProtocolStore>,
+pub struct MlsStorageBridge<S: Storage> {
+    store: Arc<ProtocolStore<S>>,
     context_id: ContextId,
 }
 
-impl MlsStorageBridge {
-    pub fn new(store: Arc<ProtocolStore>, context_id: ContextId) -> Self;
+impl<S: Storage> MlsStorageBridge<S> {
+    pub fn new(store: Arc<ProtocolStore<S>>, context_id: ContextId) -> Self;
 }
 
-impl openmls_traits::storage::StorageProvider for MlsStorageBridge {
+impl<S: Storage> openmls_traits::storage::StorageProvider for MlsStorageBridge<S> {
     // All methods delegate to self.store.storage with key prefix "mls/{context_id}/..."
     // OpenMLS key types are serialized via MessagePack before storage.
     // This is a mechanical mapping — no protocol logic.
