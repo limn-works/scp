@@ -229,7 +229,17 @@ pub fn tool_invoke(
             runtime::validate_value_against_schema(&input, &registration.input_schema)
                 .map_err(|e| ScpWasmError::Validation(format!("input validation failed: {e}")))?;
 
-            let _ = &identity_did;
+            if identity_did.is_empty() {
+                return Err(ScpWasmError::Permission(
+                    "identity_did is required for tool invocation".to_owned(),
+                ));
+            }
+
+            if !rt.ceiling_strings.contains("tool_invoke:*") {
+                return Err(ScpWasmError::Permission(format!(
+                    "context '{context_id}' does not permit tool_invoke capability"
+                )));
+            }
 
             Ok(input.clone())
         })
