@@ -46,7 +46,7 @@ use crate::identity::DID;
 // KeyPackage (stub)
 // ---------------------------------------------------------------------------
 
-/// Stub key package for membership operations.
+/// Stub key package for membership operations — see SCP-003 for MLS wiring.
 ///
 /// Phase 2 placeholder: in production, this wraps the MLS `KeyPackage` type
 /// from ADR-001. The stub carries only the member's DID for testing.

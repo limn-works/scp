@@ -358,6 +358,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unimplemented)]
     impl DidMethod for MockDidMethod {
         fn create(
             &self,
@@ -793,7 +794,9 @@ mod tests {
             WellKnownHandle::Identity { did } => {
                 assert_eq!(did, "did:dht:z6MkAlice...");
             }
-            other => panic!("expected Identity, got: {other:?}"),
+            other @ WellKnownHandle::Context { .. } => {
+                panic!("expected Identity, got: {other:?}")
+            }
         }
 
         match &handles["recipes"] {
@@ -806,7 +809,9 @@ mod tests {
                     Some("wss://relay.example.com/scp/v1")
                 );
             }
-            other => panic!("expected Context, got: {other:?}"),
+            other @ WellKnownHandle::Identity { .. } => {
+                panic!("expected Context, got: {other:?}")
+            }
         }
     }
 

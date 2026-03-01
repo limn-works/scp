@@ -32,20 +32,34 @@ class Context:
 
 ### Sync wrapper pattern
 
+Uses a dedicated background event loop running in a daemon thread. This is safe to call from any context — plain scripts, Jupyter notebooks, inside async functions, and inside other frameworks' event loops. See ADR-014 acceptance criterion 6.
+
 ```python
 # scp_sdk/sync.py
 import asyncio
+import threading
+from typing import TypeVar
 
-def run_sync[T](coro: Coroutine[Any, Any, T]) -> T:
-    """Run an async coroutine synchronously. Raises RuntimeError if called from within an event loop."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        # No running loop — safe to use asyncio.run()
-        return asyncio.run(coro)
-    raise RuntimeError(
-        "Cannot use sync API inside an async context. Use the async API instead."
-    )
+_T = TypeVar("_T")
+
+_sync_loop: asyncio.AbstractEventLoop | None = None
+_sync_loop_lock = threading.Lock()
+
+def _get_sync_loop() -> asyncio.AbstractEventLoop:
+    global _sync_loop
+    if _sync_loop is None or _sync_loop.is_closed():
+        with _sync_loop_lock:
+            if _sync_loop is None or _sync_loop.is_closed():
+                _sync_loop = asyncio.new_event_loop()
+                t = threading.Thread(target=_sync_loop.run_forever, daemon=True)
+                t.start()
+    return _sync_loop
+
+def run_sync(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Run an async coroutine synchronously from any context."""
+    loop = _get_sync_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result()
 ```
 
 ### Type hints

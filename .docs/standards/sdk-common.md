@@ -69,7 +69,7 @@ All SCP SDK operations involving I/O (network, storage, crypto operations) are a
 | Language | Async mechanism | Runtime | Sync wrapper pattern |
 |----------|-----------------|---------|----------------------|
 | Rust | `async fn` → `Future` | tokio | `tokio::runtime::Runtime::block_on()` |
-| Python | `async def` → coroutine | asyncio | `asyncio.run()` via `*_sync()` methods |
+| Python | `async def` → coroutine | asyncio | Background thread via `run_coroutine_threadsafe()` (see `python.md`) |
 | TypeScript | `async function` → `Promise` | Event loop (browser/Bun/Node) | N/A (always async) |
 | Swift | `async` → structured concurrency | Swift concurrency | `Task { await ... }.value` (rare) |
 | Kotlin | `suspend fun` → coroutine | kotlinx.coroutines | `runBlocking { }` |

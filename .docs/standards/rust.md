@@ -66,9 +66,11 @@ max_width = 100
 tab_spaces = 4
 use_field_init_shorthand = true
 use_try_shorthand = true
-imports_granularity = "Crate"
-group_imports = "StdExternalCrate"
+# imports_granularity = "Crate"      # Requires nightly rustfmt
+# group_imports = "StdExternalCrate" # Requires nightly rustfmt
 ```
+
+`imports_granularity` and `group_imports` are the desired import style but require nightly rustfmt. They are commented out in `rustfmt.toml` and enforced by convention and code review until stabilized. Follow the grouping order from `conventions.md` manually: std, external, local.
 
 ## Testing
 
