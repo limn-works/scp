@@ -65,17 +65,18 @@ const DEFAULT_MAX_CAPACITY: usize = 100_000;
 /// Uses `OsRng` for cryptographic randomness.
 ///
 /// See ADR-009 acceptance criterion 7 and ADR-016 acceptance criterion 6.
-pub fn generate_nonce() -> String {
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+///
+/// # Errors
+///
+/// Returns [`crate::time::ClockError`] if the system clock is unavailable.
+pub fn generate_nonce() -> Result<String, crate::time::ClockError> {
+    let now_millis = crate::time::now_millis()?;
 
     let mut random_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random_bytes);
 
     let hex_suffix = hex::encode(random_bytes);
-    format!("{now_millis}-{hex_suffix}")
+    Ok(format!("{now_millis}-{hex_suffix}"))
 }
 
 // ---------------------------------------------------------------------------

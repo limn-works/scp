@@ -22,6 +22,7 @@
 
 use std::time::Duration;
 
+use rand::RngCore;
 use tokio::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,42 @@ pub const DUMMY_FLAG: u8 = 0x00;
 /// The single-byte flag that marks a real message payload. Used to
 /// distinguish real content from cover traffic after decryption.
 pub const REAL_FLAG: u8 = 0x01;
+
+/// Power-of-2 size buckets for payload padding. All payloads (real and dummy)
+/// are padded to the nearest bucket boundary so that message sizes do not
+/// distinguish real traffic from cover traffic.
+const BUCKET_SIZES: [usize; 5] = [256, 512, 1024, 2048, 4096];
+
+/// Pads a payload to the nearest power-of-2 size bucket (256, 512, 1024,
+/// 2048, or 4096 bytes). Payloads larger than 4096 bytes are padded to the
+/// next power of 2.
+///
+/// Padding bytes are filled with random data to prevent distinguishing
+/// padded regions from content via entropy analysis.
+#[must_use]
+pub fn pad_to_bucket(payload: &[u8]) -> Vec<u8> {
+    let target = bucket_size_for(payload.len());
+    let mut padded = Vec::with_capacity(target);
+    padded.extend_from_slice(payload);
+    if padded.len() < target {
+        let start = padded.len();
+        padded.resize(target, 0);
+        rand::thread_rng().fill_bytes(&mut padded[start..]);
+    }
+    padded
+}
+
+/// Returns the bucket size for a given payload length.
+#[must_use]
+fn bucket_size_for(len: usize) -> usize {
+    for &bucket in &BUCKET_SIZES {
+        if len <= bucket {
+            return bucket;
+        }
+    }
+    // For payloads larger than the largest bucket, round up to next power of 2
+    len.next_power_of_two()
+}
 
 // ---------------------------------------------------------------------------
 // CoverTrafficConfig
@@ -191,13 +228,19 @@ impl CoverTrafficGenerator {
         CoverAction::SendDummy(Self::build_dummy_payload(self.config.message_size))
     }
 
-    /// Builds a dummy payload: a single `DUMMY_FLAG` byte followed by
-    /// zero-padding to the target size.
+    /// Builds a dummy payload: a single `DUMMY_FLAG` byte padded to the
+    /// nearest power-of-2 bucket size with random bytes. The `size` hint
+    /// determines the minimum payload size before bucket padding.
     #[must_use]
     fn build_dummy_payload(size: usize) -> Vec<u8> {
-        let mut payload = vec![0u8; size.max(1)];
-        payload[0] = DUMMY_FLAG;
-        payload
+        let mut base = vec![DUMMY_FLAG];
+        // Extend with random bytes to the requested size
+        if size > 1 {
+            let start = base.len();
+            base.resize(size, 0);
+            rand::thread_rng().fill_bytes(&mut base[start..]);
+        }
+        pad_to_bucket(&base)
     }
 }
 
@@ -222,22 +265,23 @@ mod tests {
     fn dummy_payload_starts_with_dummy_flag() {
         let payload = CoverTrafficGenerator::build_dummy_payload(1024);
         assert_eq!(payload[0], DUMMY_FLAG);
+        // 1024 is already a bucket size, so padded to 1024
         assert_eq!(payload.len(), 1024);
     }
 
     #[test]
-    fn dummy_payload_is_zero_padded_after_flag() {
+    fn dummy_payload_is_bucket_padded() {
+        // 256 bytes -> bucket 256, so length should be 256
         let payload = CoverTrafficGenerator::build_dummy_payload(256);
         assert_eq!(payload[0], DUMMY_FLAG);
-        for &byte in &payload[1..] {
-            assert_eq!(byte, 0x00);
-        }
+        assert_eq!(payload.len(), 256);
     }
 
     #[test]
-    fn dummy_payload_minimum_size_is_one() {
+    fn dummy_payload_minimum_size_is_bucket() {
+        // size=0 produces a 1-byte base (DUMMY_FLAG), padded to bucket 256
         let payload = CoverTrafficGenerator::build_dummy_payload(0);
-        assert_eq!(payload.len(), 1);
+        assert_eq!(payload.len(), 256);
         assert_eq!(payload[0], DUMMY_FLAG);
     }
 
@@ -263,6 +307,7 @@ mod tests {
         let now = Instant::now();
         match ctg.next_action(now) {
             CoverAction::SendDummy(payload) => {
+                // Default message_size=1024, which is a bucket boundary
                 assert_eq!(payload.len(), 1024);
                 assert_eq!(payload[0], DUMMY_FLAG);
             }
@@ -353,6 +398,7 @@ mod tests {
         let mut ctg = CoverTrafficGenerator::new(config);
         let now = Instant::now();
         match ctg.next_action(now) {
+            // 256 is a bucket boundary so padded size stays 256
             CoverAction::SendDummy(payload) => assert_eq!(payload.len(), 256),
             CoverAction::Skip => panic!("expected SendDummy"),
         }
@@ -428,5 +474,71 @@ mod tests {
             ctg.next_action(now + Duration::from_secs(62)),
             CoverAction::SendDummy(_),
         ));
+    }
+
+    // -- Bucket padding tests -------------------------------------------------
+
+    #[test]
+    fn pad_to_bucket_pads_small_payload_to_256() {
+        let payload = vec![REAL_FLAG, 0x01, 0x02];
+        let padded = pad_to_bucket(&payload);
+        assert_eq!(padded.len(), 256);
+        assert_eq!(&padded[..3], &[REAL_FLAG, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn pad_to_bucket_exact_boundary_no_growth() {
+        let payload = vec![0u8; 256];
+        let padded = pad_to_bucket(&payload);
+        assert_eq!(padded.len(), 256);
+    }
+
+    #[test]
+    fn pad_to_bucket_just_over_256_goes_to_512() {
+        let payload = vec![0u8; 257];
+        let padded = pad_to_bucket(&payload);
+        assert_eq!(padded.len(), 512);
+    }
+
+    #[test]
+    fn pad_to_bucket_1024_stays_1024() {
+        let payload = vec![0u8; 1024];
+        let padded = pad_to_bucket(&payload);
+        assert_eq!(padded.len(), 1024);
+    }
+
+    #[test]
+    fn pad_to_bucket_over_4096_rounds_to_power_of_2() {
+        let payload = vec![0u8; 5000];
+        let padded = pad_to_bucket(&payload);
+        assert_eq!(padded.len(), 8192); // next power of 2 above 5000
+    }
+
+    #[test]
+    fn pad_to_bucket_preserves_original_content() {
+        let payload = vec![REAL_FLAG, 0xAA, 0xBB, 0xCC];
+        let padded = pad_to_bucket(&payload);
+        assert_eq!(&padded[..4], &[REAL_FLAG, 0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn pad_to_bucket_empty_payload_pads_to_256() {
+        let padded = pad_to_bucket(&[]);
+        assert_eq!(padded.len(), 256);
+    }
+
+    #[test]
+    fn bucket_size_for_returns_correct_buckets() {
+        assert_eq!(bucket_size_for(1), 256);
+        assert_eq!(bucket_size_for(256), 256);
+        assert_eq!(bucket_size_for(257), 512);
+        assert_eq!(bucket_size_for(512), 512);
+        assert_eq!(bucket_size_for(513), 1024);
+        assert_eq!(bucket_size_for(1024), 1024);
+        assert_eq!(bucket_size_for(1025), 2048);
+        assert_eq!(bucket_size_for(2048), 2048);
+        assert_eq!(bucket_size_for(2049), 4096);
+        assert_eq!(bucket_size_for(4096), 4096);
+        assert_eq!(bucket_size_for(4097), 8192);
     }
 }

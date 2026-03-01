@@ -239,7 +239,12 @@ fun <T> rememberScpHotStream(
             flowState.value = start()
         }
         onDispose {
-            scope.launch { onStop() }
+            // Run onStop before cancelling the scope. Using runBlocking here
+            // is safe because onDispose runs on the composition thread (Main),
+            // and the scope uses Dispatchers.IO, so there is no deadlock risk.
+            // We must NOT launch { onStop() } then cancel — that races the
+            // coroutine against scope cancellation and onStop may never execute.
+            kotlinx.coroutines.runBlocking { onStop() }
             scope.cancel()
         }
     }

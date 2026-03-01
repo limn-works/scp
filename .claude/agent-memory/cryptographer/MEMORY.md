@@ -109,6 +109,22 @@
 - Swift/CryptoKit: HMAC key = private key bytes (correct), keygen = PrivateKey(rawRepresentation:) -- INCOMPATIBLE (scalar vs seed)
 - All three produce DIFFERENT pseudonyms for same identity+context. Must be unified per SCP-214.
 
+### PR #127 Crypto Audit (2026-03-01)
+- CRITICAL: UniFFI ucan_revoke (bridge.rs:2220) revokes by token_id, NOT content-hash CID
+  Validation pipeline (validate.rs:467) checks compute_revocation_cid(&payload) = SHA-256(JSON)
+  UniFFI inserts raw token_id string -- revocations are no-ops for mobile/desktop
+  PyO3, WASM, NAPI bridges all correctly compute CID before revoking
+- HIGH: WASM WasmUcanPayload (wasm/ucan.rs:139-151) duplicates UcanPayload (mod.rs:289)
+  Field order must match for CID consistency; no compile-time or test enforcement
+- Inner envelope: domain separator SCP-INNER-ENVELOPE-V1, length-prefixed var fields, SOUND
+- AES-256-GCM: OsRng nonces throughout, Zeroize+ZeroizeOnDrop on all key types, SOUND
+- Broadcast key rotation: fresh random keys (not HKDF), epoch overflow checked, SOUND
+- Outer envelope pipeline: MLS->SenderKey->deserialize->verify sender->content integrity->sig, SOUND
+- UCAN mint: 24h max expiry, clock error propagation, Ed25519 signing via KeyCustody, SOUND
+- Nonce tracker: format validation, freshness +/-5min, capacity 100K, pruning, serialization, SOUND
+- Attestation renewal: mandatory re-verification before renewed_at update, SOUND
+- MessageType::as_discriminator_byte() exists but NOT used in compute_canonical_hash -- docstring misleading
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs
@@ -116,7 +132,18 @@
 - `crates/scp-core/src/bridge/claiming.rs` -- shadow claiming, dual sig verification
 - `crates/scp-core/src/context/nesting.rs` -- governance config hashing, BTreeSet
 - `crates/scp-core/src/crypto/sender_keys/` -- sender key protocol, HKDF, X25519
+- `crates/scp-core/src/envelope/inner.rs` -- inner envelope, canonical hash, domain separator
+- `crates/scp-core/src/envelope/outer.rs` -- seal/open pipeline, SCP-177 sender key resolution
+- `crates/scp-core/src/crypto/ucan/mint.rs` -- UCAN minting, CID computation
+- `crates/scp-core/src/crypto/ucan/nonce.rs` -- nonce generation and NonceTracker
+- `crates/scp-core/src/crypto/ucan/revoke.rs` -- revocation CID, RevocationList
+- `crates/scp-core/src/crypto/ucan/validate.rs` -- 11-step validation pipeline
+- `crates/scp-core/src/trust/renewal.rs` -- attestation renewal with re-verification
 - `bindings/swift/Sources/SCP/Platform/` -- Apple platform adapters
+- `crates/scp-ffi/wasm/src/ucan.rs` -- WASM UCAN bridge (partial validation)
+- `crates/scp-ffi/uniffi/src/bridge.rs` -- UniFFI bridge (CID mismatch bug)
+- `crates/scp-ffi/napi/src/ucan.rs` -- NAPI UCAN bridge (correct CID handling)
+- `crates/scp-ffi/src/ucan.rs` -- PyO3 UCAN bridge (correct CID handling)
 - `crates/scp-ffi/wasm/src/custody.rs` -- WASM key custody FFI boundary
 - `crates/scp-ffi/napi/src/identity.rs` -- Node/Bun identity bridge
 - `crates/scp-core/src/economy/credentials.rs` -- adapter credential management

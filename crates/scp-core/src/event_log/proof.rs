@@ -264,7 +264,7 @@ pub fn prove_absence(log: &EventLog, event_hash: &[u8; 32]) -> Result<AbsencePro
 
     // Generate inclusion proofs for the neighbors.
     let lower_proof = lower
-        .map(|(hash, index)| {
+        .map(|(hash, index)| -> Result<LeafWithProof, EventLogError> {
             let inclusion_proof = prove_inclusion(log, index)?;
             Ok(LeafWithProof {
                 leaf_hash: hash,
@@ -275,7 +275,7 @@ pub fn prove_absence(log: &EventLog, event_hash: &[u8; 32]) -> Result<AbsencePro
         .transpose()?;
 
     let upper_proof = upper
-        .map(|(hash, index)| {
+        .map(|(hash, index)| -> Result<LeafWithProof, EventLogError> {
             let inclusion_proof = prove_inclusion(log, index)?;
             Ok(LeafWithProof {
                 leaf_hash: hash,

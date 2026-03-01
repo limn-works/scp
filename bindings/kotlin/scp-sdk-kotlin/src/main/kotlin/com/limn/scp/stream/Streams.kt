@@ -18,6 +18,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -205,6 +207,8 @@ class HotStreamFactory(
 ) {
     private val activeEventSubscriptions = ConcurrentHashMap<Long, HotStreamState>()
     private val activeMessageSubscriptions = ConcurrentHashMap<Long, HotStreamState>()
+    private val eventMutex = Mutex()
+    private val messageMutex = Mutex()
 
     /**
      * Start a hot [SharedFlow] of real-time context events.
@@ -213,6 +217,9 @@ class HotStreamFactory(
      * can subscribe to the returned [SharedFlow]; each receives all events
      * from their subscription point forward (plus [replay] historical events).
      *
+     * Thread-safe: uses a [Mutex] to prevent duplicate subscriptions from
+     * concurrent calls with the same [contextHandle] (TOCTOU fix).
+     *
      * @param contextHandle Opaque context handle from create/join.
      * @param replay Number of past events to replay to new subscribers.
      * @return Hot [SharedFlow] of JSON-encoded context events.
@@ -220,9 +227,9 @@ class HotStreamFactory(
     suspend fun contextEvents(
         contextHandle: Long,
         replay: Int = 0,
-    ): SharedFlow<String> {
+    ): SharedFlow<String> = eventMutex.withLock {
         val existing = activeEventSubscriptions[contextHandle]
-        if (existing != null) return existing.readOnly
+        if (existing != null) return@withLock existing.readOnly
 
         val sharedFlow = MutableSharedFlow<String>(
             replay = replay,
@@ -250,7 +257,7 @@ class HotStreamFactory(
         }
 
         activeEventSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
-        return readOnly
+        readOnly
     }
 
     /**
@@ -260,6 +267,9 @@ class HotStreamFactory(
      * cold [Flow] (one collector, subscription starts on collect), this
      * returns a hot [SharedFlow] suitable for multiple concurrent collectors.
      *
+     * Thread-safe: uses a [Mutex] to prevent duplicate subscriptions from
+     * concurrent calls with the same [contextHandle] (TOCTOU fix).
+     *
      * @param contextHandle Opaque context handle from create/join.
      * @param replay Number of past messages to replay to new subscribers.
      * @return Hot [SharedFlow] of JSON-encoded messages.
@@ -267,9 +277,9 @@ class HotStreamFactory(
     suspend fun incomingMessages(
         contextHandle: Long,
         replay: Int = 0,
-    ): SharedFlow<String> {
+    ): SharedFlow<String> = messageMutex.withLock {
         val existing = activeMessageSubscriptions[contextHandle]
-        if (existing != null) return existing.readOnly
+        if (existing != null) return@withLock existing.readOnly
 
         val sharedFlow = MutableSharedFlow<String>(
             replay = replay,
@@ -297,7 +307,7 @@ class HotStreamFactory(
         }
 
         activeMessageSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
-        return readOnly
+        readOnly
     }
 
     /**

@@ -20,6 +20,7 @@ rmp-serde = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true }
 lru = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

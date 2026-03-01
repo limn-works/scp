@@ -222,6 +222,10 @@ pub enum DiscoveryError {
     /// A cache operation failed.
     #[error("cache error: {0}")]
     CacheError(String),
+
+    /// The system clock is unavailable or before the Unix epoch.
+    #[error("clock error: {0}")]
+    ClockError(#[from] crate::time::ClockError),
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
-use scp_core::context::roles::{Capability, CapabilityCeiling};
+use scp_core::context::roles::default_ceiling;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::event_log::EventLog;
@@ -43,21 +43,7 @@ pub struct ContextRuntime {
     pub creator_did: String,
 }
 
-/// Default capability ceiling for new contexts (matches `PyO3` bridge).
-fn default_ceiling() -> CapabilityCeiling {
-    CapabilityCeiling::new([
-        Capability::MessagesRead,
-        Capability::MessagesWrite,
-        Capability::ToolRegister,
-        Capability::ToolInvokeAll,
-        Capability::RoleAssign,
-        Capability::MemberInvite,
-        Capability::MemberRemove,
-        Capability::GovernancePropose,
-        Capability::GovernanceVote,
-        Capability::ContextClose,
-    ])
-}
+// default_ceiling() imported from scp_core::context::roles.
 
 /// Registers a new context in the global runtime registry.
 ///

@@ -8,13 +8,18 @@
 //! response to future key requests.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use serde::{Deserialize, Serialize};
 
 use crate::context::ContextError;
 use crate::context::params::ContextMode;
-use crate::context::roles::UcanToken;
 use crate::crypto::sender_keys::{SenderKey, generate_sender_key};
+use crate::crypto::ucan::UcanToken;
+use crate::crypto::ucan::capability::CapabilityUri;
+use crate::crypto::ucan::validate::{
+    DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, validate_ucan,
+};
 
 // ---------------------------------------------------------------------------
 // BroadcastAdmission
@@ -144,7 +149,8 @@ pub struct BroadcastContext {
     context_id: String,
     /// Admission policy: open or gated.
     admission: BroadcastAdmission,
-    /// Registered subscribers, keyed by DID.
+    /// Local view of known subscribers. Not a distributed index — bounded by
+    /// context policy, not `HashMap` capacity.
     subscribers: HashMap<String, SubscriberRecord>,
     /// Per-author broadcast key state, keyed by author DID.
     authors: HashMap<String, AuthorState>,
@@ -227,12 +233,6 @@ impl BroadcastContext {
         self.authors.get(author_did)
     }
 
-    /// Returns a mutable reference to the author state for a given DID.
-    #[must_use]
-    pub fn get_author_mut(&mut self, author_did: &str) -> Option<&mut AuthorState> {
-        self.authors.get_mut(author_did)
-    }
-
     // -----------------------------------------------------------------------
     // Subscriber registration (spec section 5.14.3)
     // -----------------------------------------------------------------------
@@ -242,7 +242,9 @@ impl BroadcastContext {
     /// For open broadcast contexts (`BroadcastAdmission::Open`), any DID can
     /// subscribe with `ucan = None`. For gated contexts
     /// (`BroadcastAdmission::Gated`), a valid `messagesRead` UCAN must be
-    /// provided.
+    /// provided and is validated through the full 11-step UCAN validation
+    /// pipeline (signature, delegation chain, expiry, revocation, nonce —
+    /// see ADR-016).
     ///
     /// Returns the current epoch for each author so the subscriber knows which
     /// key epochs to request.
@@ -250,15 +252,24 @@ impl BroadcastContext {
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the context is gated and no
-    ///   UCAN is provided, or the UCAN does not contain `messagesRead`.
+    ///   UCAN is provided, or the UCAN fails full validation (signature,
+    ///   expiry, revocation, capability match, etc.).
     /// - [`ContextError::MembershipFailed`] if the subscriber is already
     ///   registered.
-    pub fn subscribe(
+    pub fn subscribe<D, N, R, P, S>(
         &mut self,
         subscriber_did: &str,
         ucan: Option<&UcanToken>,
         timestamp: u64,
-    ) -> Result<SubscriptionResult, ContextError> {
+        validation_ctx: Option<&mut ValidationContext<'_, D, N, R, P, S>>,
+    ) -> Result<SubscriptionResult, ContextError>
+    where
+        D: DidResolver,
+        N: NonceTracker,
+        R: RevocationChecker,
+        P: ProofResolver,
+        S: BuildHasher,
+    {
         if self.subscribers.contains_key(subscriber_did) {
             return Err(ContextError::MembershipFailed(format!(
                 "subscriber already registered: {subscriber_did}"
@@ -273,7 +284,13 @@ impl BroadcastContext {
                         "gated broadcast requires messagesRead UCAN".to_owned(),
                     )
                 })?;
-                validate_messages_read_ucan(token, &self.context_id, subscriber_did)?;
+                let ctx = validation_ctx.ok_or_else(|| {
+                    ContextError::PermissionDenied(
+                        "gated broadcast requires validation context for UCAN verification"
+                            .to_owned(),
+                    )
+                })?;
+                validate_messages_read_ucan(token, &self.context_id, ctx)?;
                 true
             }
         };
@@ -325,6 +342,11 @@ impl BroadcastContext {
         })?;
 
         author.block_list.insert(blocked_did.to_owned());
+
+        // Remove the blocked subscriber from the local subscriber roster so
+        // `can_read()` immediately reflects the block. Without this, the
+        // subscriber retains read permission until the next roster sync.
+        self.subscribers.remove(blocked_did);
 
         let new_epoch = author
             .epoch
@@ -404,41 +426,32 @@ impl BroadcastContext {
 // ---------------------------------------------------------------------------
 
 /// Validates that a UCAN token grants `messagesRead` for the given context
-/// and is audience-bound to the presenting subscriber.
+/// using the full 11-step UCAN validation pipeline from ADR-016.
 ///
-/// Checks: (1) `token.aud == subscriber_did` — prevents presenting a UCAN
-/// issued to someone else. (2) An attestation matching exactly
-/// `scp:ctx:{context_id}/messages:read` for this specific context.
+/// Delegates to [`validate_ucan`] which performs: (1) JWT parse + header
+/// validation, (2) Ed25519 signature verification, (3) delegation chain
+/// integrity, (4) root issuer = context creator, (5) audience = presenting
+/// subscriber, (6) capability match for `messages:read`, (7) attenuation
+/// narrowing, (8) ceiling compliance, (9) nonce freshness + uniqueness,
+/// (10) revocation check, (11) expiry + not-before bounds.
 ///
-/// Wildcard URIs (`scp:ctx:*/messages:read`) are explicitly rejected at this
-/// layer. Accepting wildcards without the full 11-step UCAN validation
-/// pipeline (signature chains, expiry, revocation — ADR-016) would allow a
-/// token issued for any context to grant access to all gated broadcast
-/// contexts. The full UCAN module (SCP-024) may support scoped wildcards
-/// after full validation is in place; until then, only context-specific
-/// capability URIs are accepted. See RED-012.
-///
-/// Full cryptographic UCAN validation (signature chains, expiry, revocation)
-/// is deferred to the UCAN module (SCP-024).
-fn validate_messages_read_ucan(
+/// This replaces the previous stub that only checked `aud` and `att` strings
+/// without cryptographic verification (RED-103).
+fn validate_messages_read_ucan<D, N, R, P, S>(
     token: &UcanToken,
     context_id: &str,
-    subscriber_did: &str,
-) -> Result<(), ContextError> {
-    if token.aud != subscriber_did {
-        return Err(ContextError::PermissionDenied(format!(
-            "UCAN audience '{}' does not match subscriber '{}'",
-            token.aud, subscriber_did,
-        )));
-    }
-    let specific = format!("scp:ctx:{context_id}/messages:read");
-    let has_messages_read = token.att.iter().any(|att| att.with == specific);
-    if !has_messages_read {
-        return Err(ContextError::PermissionDenied(
-            "UCAN does not grant messagesRead for this context".to_owned(),
-        ));
-    }
-    Ok(())
+    ctx: &mut ValidationContext<'_, D, N, R, P, S>,
+) -> Result<(), ContextError>
+where
+    D: DidResolver,
+    N: NonceTracker,
+    R: RevocationChecker,
+    P: ProofResolver,
+    S: BuildHasher,
+{
+    let required_capability = CapabilityUri::new(context_id, "messages", "read");
+    validate_ucan(token, &required_capability, ctx)
+        .map_err(|e| ContextError::PermissionDenied(format!("UCAN validation failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -449,8 +462,138 @@ fn validate_messages_read_ucan(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::context::roles::UcanAttestation;
     use crate::crypto::sender_keys::{decrypt_sender_layer, encrypt_sender_layer};
+    use crate::crypto::ucan::validate::{
+        InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver, InMemoryRevocationChecker,
+    };
+    use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+    use std::collections::HashMap as StdHashMap;
+    use std::hash::RandomState;
+
+    /// Helper to call subscribe on open contexts without a validation context.
+    /// Specifies the generic types so the compiler can infer them.
+    fn subscribe_open(
+        ctx: &mut BroadcastContext,
+        subscriber_did: &str,
+        ucan: Option<&UcanToken>,
+        timestamp: u64,
+    ) -> Result<SubscriptionResult, ContextError> {
+        ctx.subscribe::<
+            InMemoryDidResolver,
+            InMemoryNonceTracker,
+            InMemoryRevocationChecker,
+            InMemoryProofResolver,
+            RandomState,
+        >(subscriber_did, ucan, timestamp, None)
+    }
+
+    /// Ed25519 keypair for test UCAN signing.
+    fn test_keypair() -> ed25519_dalek::SigningKey {
+        // Deterministic key for reproducible tests.
+        let seed = [42u8; 32];
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    }
+
+    /// Creates a properly signed UCAN token for testing gated subscription.
+    fn make_signed_ucan(
+        context_id: &str,
+        issuer_did: &str,
+        subscriber_did: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> UcanToken {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::Signer;
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let header = UcanHeader::new();
+        let payload = UcanPayload {
+            iss: issuer_did.to_owned(),
+            aud: subscriber_did.to_owned(),
+            exp: now_secs + 3600,     // 1 hour from now
+            nbf: Some(now_secs - 60), // valid from 1 minute ago
+            nnc: format!("{now_millis}-aabbccdd11223344aabbccdd11223344"),
+            att: vec![Attenuation {
+                with: format!("scp:ctx:{context_id}/messages:read"),
+                can: "read".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature = signing_key.sign(signing_input.as_bytes());
+        let sig_bytes = signature.to_bytes().to_vec();
+        let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+
+        let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+        UcanToken {
+            header,
+            payload,
+            signature: sig_bytes,
+            encoded,
+        }
+    }
+
+    /// Setup all the validation dependencies for a gated subscription test.
+    struct GatedTestSetup {
+        signing_key: ed25519_dalek::SigningKey,
+        issuer_did: String,
+        did_resolver: InMemoryDidResolver,
+        nonce_tracker: InMemoryNonceTracker,
+        revocation_checker: InMemoryRevocationChecker,
+        proof_resolver: InMemoryProofResolver,
+        ceiling: HashSet<String>,
+    }
+
+    impl GatedTestSetup {
+        fn new() -> Self {
+            let signing_key = test_keypair();
+            let verifying_key = signing_key.verifying_key();
+            let issuer_did = "did:example:admin".to_owned();
+
+            let mut keys = StdHashMap::new();
+            keys.insert(issuer_did.clone(), verifying_key.to_bytes());
+
+            let mut ceiling = HashSet::new();
+            ceiling.insert("messages:read".to_owned());
+            ceiling.insert("messages:write".to_owned());
+
+            Self {
+                signing_key,
+                issuer_did,
+                did_resolver: InMemoryDidResolver { keys },
+                nonce_tracker: InMemoryNonceTracker::new(),
+                revocation_checker: InMemoryRevocationChecker::new(),
+                proof_resolver: InMemoryProofResolver::new(),
+                ceiling,
+            }
+        }
+
+        fn make_ucan(&self, context_id: &str, subscriber_did: &str) -> UcanToken {
+            make_signed_ucan(
+                context_id,
+                &self.issuer_did,
+                subscriber_did,
+                &self.signing_key,
+            )
+        }
+    }
 
     fn make_open_ctx() -> BroadcastContext {
         BroadcastContext::new(
@@ -468,18 +611,6 @@ mod tests {
             BroadcastAdmission::Gated,
         )
         .unwrap()
-    }
-
-    fn make_messages_read_ucan(context_id: &str, subscriber_did: &str) -> UcanToken {
-        UcanToken {
-            iss: "did:example:admin".to_owned(),
-            aud: subscriber_did.to_owned(),
-            att: vec![UcanAttestation {
-                with: format!("scp:ctx:{context_id}/messages:read"),
-                can: "invoke".to_owned(),
-            }],
-            nnc: "nonce-1".to_owned(),
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -534,7 +665,7 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        let result = ctx.subscribe("did:example:bob", None, 1000).unwrap();
+        let result = subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
         assert_eq!(result.author_epochs.len(), 1);
         assert_eq!(result.author_epochs["did:example:alice"], 0);
@@ -546,9 +677,11 @@ mod tests {
     fn subscribe_open_with_ucan_also_succeeds() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        let ucan = make_messages_read_ucan("ctx-broadcast-1", "did:example:bob");
+        let setup = GatedTestSetup::new();
+        let ucan = setup.make_ucan("ctx-broadcast-1", "did:example:bob");
 
-        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000).unwrap();
+        // Open context accepts UCAN but doesn't validate it.
+        let result = subscribe_open(&mut ctx, "did:example:bob", Some(&ucan), 1000).unwrap();
 
         assert_eq!(result.author_epochs.len(), 1);
         assert!(ctx.is_subscriber("did:example:bob"));
@@ -560,7 +693,7 @@ mod tests {
         ctx.add_author("did:example:alice").unwrap();
         ctx.add_author("did:example:carol").unwrap();
 
-        let result = ctx.subscribe("did:example:bob", None, 1000).unwrap();
+        let result = subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
         assert_eq!(result.author_epochs.len(), 2);
         assert_eq!(result.author_epochs["did:example:alice"], 0);
@@ -570,9 +703,9 @@ mod tests {
     #[test]
     fn subscribe_rejects_duplicate() {
         let mut ctx = make_open_ctx();
-        ctx.subscribe("did:example:bob", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        let result = ctx.subscribe("did:example:bob", None, 2000);
+        let result = subscribe_open(&mut ctx, "did:example:bob", None, 2000);
         assert!(result.is_err());
     }
 
@@ -585,7 +718,8 @@ mod tests {
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        let result = ctx.subscribe("did:example:bob", None, 1000);
+        // Gated subscription with no UCAN and no validation context.
+        let result = subscribe_open(&mut ctx, "did:example:bob", None, 1000);
         assert!(result.is_err());
         assert!(!ctx.is_subscriber("did:example:bob"));
     }
@@ -594,9 +728,22 @@ mod tests {
     fn subscribe_gated_with_valid_ucan_succeeds() {
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        let ucan = make_messages_read_ucan("ctx-gated-1", "did:example:bob");
+        let mut setup = GatedTestSetup::new();
+        let ucan = setup.make_ucan("ctx-gated-1", "did:example:bob");
 
-        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000).unwrap();
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+        };
+
+        let result = ctx
+            .subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
+            .unwrap();
 
         assert_eq!(result.author_epochs.len(), 1);
         assert!(ctx.is_subscriber("did:example:bob"));
@@ -606,9 +753,21 @@ mod tests {
     fn subscribe_gated_rejects_wrong_context_ucan() {
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        let ucan = make_messages_read_ucan("wrong-context", "did:example:bob");
+        let mut setup = GatedTestSetup::new();
+        // Token for wrong context — capability URI won't match.
+        let ucan = setup.make_ucan("wrong-context", "did:example:bob");
 
-        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+        };
+
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
         assert!(result.is_err());
         assert!(!ctx.is_subscriber("did:example:bob"));
     }
@@ -617,17 +776,67 @@ mod tests {
     fn subscribe_gated_rejects_wrong_capability() {
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        let ucan = UcanToken {
-            iss: "did:example:admin".to_owned(),
-            aud: "did:example:bob".to_owned(),
-            att: vec![UcanAttestation {
-                with: "scp:ctx:ctx-gated-1/messages:write".to_owned(),
-                can: "invoke".to_owned(),
-            }],
-            nnc: "nonce-1".to_owned(),
+        let mut setup = GatedTestSetup::new();
+
+        // Manually construct a token with messages:write instead of messages:read.
+        let ucan = {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use ed25519_dalek::Signer;
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let now_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+
+            let header = UcanHeader::new();
+            let payload = UcanPayload {
+                iss: setup.issuer_did.clone(),
+                aud: "did:example:bob".to_owned(),
+                exp: now_secs + 3600,
+                nbf: Some(now_secs - 60),
+                nnc: format!("{now_millis}-bbccddee11223344bbccddee11223344"),
+                att: vec![Attenuation {
+                    with: "scp:ctx:ctx-gated-1/messages:write".to_owned(),
+                    can: "write".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            };
+
+            let header_json = serde_json::to_vec(&header).unwrap();
+            let payload_json = serde_json::to_vec(&payload).unwrap();
+            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+            let signing_input = format!("{header_b64}.{payload_b64}");
+            let signature = setup.signing_key.sign(signing_input.as_bytes());
+            let sig_bytes = signature.to_bytes().to_vec();
+            let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+            let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+            UcanToken {
+                header,
+                payload,
+                signature: sig_bytes,
+                encoded,
+            }
         };
 
-        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+        };
+
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
         assert!(result.is_err());
     }
 
@@ -635,9 +844,21 @@ mod tests {
     fn subscribe_gated_rejects_aud_mismatch() {
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        let ucan = make_messages_read_ucan("ctx-gated-1", "did:example:carol");
+        let mut setup = GatedTestSetup::new();
+        // Token audience is "did:example:carol" but subscriber is "did:example:bob".
+        let ucan = setup.make_ucan("ctx-gated-1", "did:example:carol");
 
-        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+        };
+
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
         assert!(result.is_err());
         assert!(!ctx.is_subscriber("did:example:bob"));
     }
@@ -650,7 +871,7 @@ mod tests {
     fn block_subscriber_rotates_key_and_increments_epoch() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        ctx.subscribe("did:example:dave", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
 
         let old_epoch = ctx.get_author("did:example:alice").unwrap().epoch;
         let old_key = ctx
@@ -674,7 +895,7 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         ctx.add_author("did:example:carol").unwrap();
-        ctx.subscribe("did:example:dave", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
 
         ctx.block_subscriber("did:example:alice", "did:example:dave")
             .unwrap();
@@ -698,7 +919,7 @@ mod tests {
     fn can_write_only_for_authors() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        ctx.subscribe("did:example:bob", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
         assert!(ctx.can_write("did:example:alice"));
         assert!(!ctx.can_write("did:example:bob"));
@@ -709,7 +930,7 @@ mod tests {
     fn can_read_for_subscribers_and_authors() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        ctx.subscribe("did:example:bob", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
         assert!(ctx.can_read("did:example:alice"));
         assert!(ctx.can_read("did:example:bob"));
@@ -725,9 +946,9 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        ctx.subscribe("did:example:sub1", None, 1000).unwrap();
-        ctx.subscribe("did:example:sub2", None, 1001).unwrap();
-        ctx.subscribe("did:example:sub3", None, 1002).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub2", None, 1001).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub3", None, 1002).unwrap();
 
         let author = ctx.get_author("did:example:alice").unwrap();
         let plaintext = b"Hello from Alice's broadcast!";
@@ -750,8 +971,8 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        ctx.subscribe("did:example:sub1", None, 1000).unwrap();
-        ctx.subscribe("did:example:sub2", None, 1001).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub2", None, 1001).unwrap();
 
         let old_key = ctx
             .get_author("did:example:alice")
@@ -795,7 +1016,7 @@ mod tests {
         ctx.add_author("did:example:alice").unwrap();
         ctx.add_author("did:example:carol").unwrap();
 
-        ctx.subscribe("did:example:sub1", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
 
         ctx.block_subscriber("did:example:alice", "did:example:sub1")
             .unwrap();
@@ -817,8 +1038,19 @@ mod tests {
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        let ucan = make_messages_read_ucan("ctx-gated-1", "did:example:sub1");
-        ctx.subscribe("did:example:sub1", Some(&ucan), 1000)
+        let mut setup = GatedTestSetup::new();
+        let ucan = setup.make_ucan("ctx-gated-1", "did:example:sub1");
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:sub1",
+        };
+        ctx.subscribe("did:example:sub1", Some(&ucan), 1000, Some(&mut val_ctx))
             .unwrap();
 
         let author = ctx.get_author("did:example:alice").unwrap();
@@ -851,49 +1083,151 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn subscribe_gated_rejects_wildcard_ucan() {
+    fn subscribe_gated_accepts_wildcard_ucan_with_full_validation() {
+        // With full UCAN validation (signature, chain, expiry, revocation),
+        // wildcard capabilities from legitimate issuers are safe to accept.
+        // The original stub rejected wildcards because it lacked cryptographic
+        // verification — without that, any wildcard token would grant access
+        // to all contexts. Now that full validation is in place (RED-103),
+        // wildcard grants from the context creator are legitimate.
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        let ucan = UcanToken {
-            iss: "did:example:admin".to_owned(),
-            aud: "did:example:bob".to_owned(),
-            att: vec![UcanAttestation {
-                with: "scp:ctx:*/messages:read".to_owned(),
-                can: "invoke".to_owned(),
-            }],
-            nnc: "nonce-wildcard".to_owned(),
+        let mut setup = GatedTestSetup::new();
+
+        let ucan = {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use ed25519_dalek::Signer;
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let now_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+
+            let header = UcanHeader::new();
+            let payload = UcanPayload {
+                iss: setup.issuer_did.clone(),
+                aud: "did:example:bob".to_owned(),
+                exp: now_secs + 3600,
+                nbf: Some(now_secs - 60),
+                nnc: format!("{now_millis}-ccddee1122334455ccddee1122334455"),
+                att: vec![Attenuation {
+                    with: "scp:ctx:*/messages:read".to_owned(),
+                    can: "read".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            };
+
+            let header_json = serde_json::to_vec(&header).unwrap();
+            let payload_json = serde_json::to_vec(&payload).unwrap();
+            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+            let signing_input = format!("{header_b64}.{payload_b64}");
+            let signature = setup.signing_key.sign(signing_input.as_bytes());
+            let sig_bytes = signature.to_bytes().to_vec();
+            let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+            let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+            UcanToken {
+                header,
+                payload,
+                signature: sig_bytes,
+                encoded,
+            }
         };
 
-        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
-        assert!(result.is_err(), "wildcard UCAN must be rejected");
-        assert!(!ctx.is_subscriber("did:example:bob"));
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+        };
+
+        // With full validation, a properly signed wildcard UCAN from the
+        // context creator is accepted.
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
+        assert!(
+            result.is_ok(),
+            "fully validated wildcard UCAN should be accepted"
+        );
+        assert!(ctx.is_subscriber("did:example:bob"));
     }
 
     #[test]
-    fn subscribe_gated_rejects_wildcard_alongside_wrong_context() {
+    fn subscribe_gated_rejects_unsigned_wildcard_ucan() {
+        // Verify that a wildcard UCAN with an invalid signature is rejected.
+        // This is the actual security property: the old stub could not verify
+        // signatures, so it rejected wildcards entirely. Now we verify
+        // signatures, and an invalid signature correctly fails.
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        let ucan = UcanToken {
-            iss: "did:example:admin".to_owned(),
-            aud: "did:example:bob".to_owned(),
-            att: vec![
-                UcanAttestation {
+        let mut setup = GatedTestSetup::new();
+
+        let ucan = {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let now_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+
+            let header = UcanHeader::new();
+            let payload = UcanPayload {
+                iss: setup.issuer_did.clone(),
+                aud: "did:example:bob".to_owned(),
+                exp: now_secs + 3600,
+                nbf: Some(now_secs - 60),
+                nnc: format!("{now_millis}-ddee112233445566ddee112233445566"),
+                att: vec![Attenuation {
                     with: "scp:ctx:*/messages:read".to_owned(),
-                    can: "invoke".to_owned(),
-                },
-                UcanAttestation {
-                    with: "scp:ctx:other-context/messages:read".to_owned(),
-                    can: "invoke".to_owned(),
-                },
-            ],
-            nnc: "nonce-multi".to_owned(),
+                    can: "read".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            };
+
+            let header_json = serde_json::to_vec(&header).unwrap();
+            let payload_json = serde_json::to_vec(&payload).unwrap();
+            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+            // Invalid signature (all zeros)
+            let sig_bytes = vec![0u8; 64];
+            let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+            let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+            UcanToken {
+                header,
+                payload,
+                signature: sig_bytes,
+                encoded,
+            }
         };
 
-        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
-        assert!(
-            result.is_err(),
-            "wildcard + wrong-context attestations must not grant access"
-        );
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+        };
+
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
+        assert!(result.is_err(), "unsigned wildcard UCAN must be rejected");
         assert!(!ctx.is_subscriber("did:example:bob"));
     }
 
@@ -905,7 +1239,7 @@ mod tests {
     fn restore_block_list_rehydrates_author_state() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        ctx.subscribe("did:example:dave", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
 
         let mut stored_block_list = HashSet::new();
         stored_block_list.insert("did:example:dave".to_owned());
@@ -930,7 +1264,7 @@ mod tests {
     fn block_result_includes_author_did_and_block_list() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
-        ctx.subscribe("did:example:dave", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
 
         let result = ctx
             .block_subscriber("did:example:alice", "did:example:dave")
@@ -939,5 +1273,30 @@ mod tests {
         assert_eq!(result.author_did, "did:example:alice");
         assert!(result.block_list.contains("did:example:dave"));
         assert_eq!(result.block_list.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Block removes subscriber from roster (RED-108)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_subscriber_removes_from_subscribers() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+
+        assert!(ctx.is_subscriber("did:example:dave"));
+        assert!(ctx.can_read("did:example:dave"));
+
+        ctx.block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+
+        // After blocking, subscriber should be removed from the roster and
+        // can_read should return false (unless they are also an author).
+        assert!(!ctx.is_subscriber("did:example:dave"));
+        assert!(
+            !ctx.can_read("did:example:dave"),
+            "blocked subscriber must lose read access (RED-108)"
+        );
     }
 }

@@ -247,7 +247,7 @@ fn identity_state_key(did: &str) -> String {
 ///
 /// Uses a simple `did\ncustody` text format. When `ProtocolStore`'s identity
 /// module lands (spec 17.4), this will migrate to `StoredValue<T>` with
-/// MessagePack serialization.
+/// `MessagePack` serialization.
 fn serialize_identity_state(did: &str, custody: &str) -> Vec<u8> {
     format!("{did}\n{custody}").into_bytes()
 }

@@ -20,6 +20,8 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
+scp-ffi-common = { path = "../common" }
+hex = { workspace = true }
 # The `testing` feature enables InMemoryKeyCustody, used by the `"in_memory"`
 # custody path in `identity_create`. This is an intentional bridge-layer
 # dependency: the in-memory custody path is needed for testing, CLI use, and

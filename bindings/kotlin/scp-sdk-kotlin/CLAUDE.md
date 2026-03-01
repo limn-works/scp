@@ -4,6 +4,27 @@
 
 Pure Kotlin ergonomics layer over UniFFI-generated Rust bindings. Provides idiomatic Kotlin API: `suspend` functions, `Flow<T>` streaming, `AutoCloseable` lifecycle. Zero protocol logic — every SDK method delegates through the coroutine bridge to exactly one UniFFI function (ADR-028 flat delegation pattern).
 
+## Breaking Changes
+
+### `HotStreamFactory` methods changed from synchronous to `suspend`
+
+`HotStreamFactory.contextEvents()`, `incomingMessages()`, `stopContextEvents()`, `stopMessageStream()`, and `stopAll()` are now `suspend` functions. Previously they were synchronous and used `runBlocking(Dispatchers.IO)` internally to call FFI.
+
+**Rationale:** Coroutine safety and proper structured concurrency. `runBlocking` inside a synchronous function blocks the calling thread and risks deadlock when called from a single-threaded dispatcher (e.g., `Dispatchers.Main`). Making them `suspend` lets the caller control the dispatcher and avoids thread starvation.
+
+**Migration:** Callers must now invoke these methods from a coroutine scope:
+```kotlin
+// Before (synchronous):
+val events = factory.contextEvents(handle)
+
+// After (suspend):
+lifecycleScope.launch {
+    val events = factory.contextEvents(handle)
+}
+```
+
+Additionally, `contextEvents()` and `incomingMessages()` now use a `Mutex` internally to prevent duplicate subscriptions from concurrent calls (TOCTOU fix). This is transparent to callers.
+
 ## Architecture
 
 ### Coroutine Bridge (`bridge/CoroutineBridge.kt`)
@@ -78,9 +99,9 @@ Rust callbacks (`onMessage`, `onEvent`) run on non-coroutine threads. You cannot
 
 `ColdStreamFactory.messageHistoryPages()` and `eventLogPages()` both call `infraBindings.eventLogQuery()` — they are currently identical at the FFI level. The distinction is semantic and documentary only. When a separate `messageHistoryQuery` FFI binding is added, `messageHistoryPages()` must be updated to call it, or it will silently continue routing message history queries to the event log endpoint.
 
-### Streaming: HotStreamFactory factory methods use runBlocking — do not call from constrained dispatchers
+### Streaming: HotStreamFactory methods are suspend — call from a coroutine scope
 
-`HotStreamFactory.contextEvents()` and `incomingMessages()` are synchronous (non-`suspend`) and use `runBlocking(Dispatchers.IO)` internally to call the subscribe FFI. This is correct when called from a non-coroutine context (e.g., ViewModel init). If called from a coroutine running on a single-threaded dispatcher (e.g., `Dispatchers.Main`), `runBlocking` will block that thread for the duration of the FFI call. Always call these from a non-constrained context or from within a `withContext(Dispatchers.IO)` block.
+`HotStreamFactory.contextEvents()` and `incomingMessages()` are `suspend` functions that use `withContext(ioDispatcher)` for FFI calls and a `Mutex` to prevent duplicate subscriptions. They must be called from a coroutine scope (e.g., `lifecycleScope.launch { }`, `viewModelScope.launch { }`). See the Breaking Changes section above for migration details.
 
 ### UniFFI NativeLib.kt generation configured but requires compiled Rust binary
 

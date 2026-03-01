@@ -3520,6 +3520,7 @@ dependencies = [
  "pyo3",
  "rand 0.8.5",
  "scp-core",
+ "scp-ffi-common",
  "scp-mcp",
  "scp-platform",
  "scp-transport",
@@ -3528,6 +3529,15 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "z-base-32",
+]
+
+[[package]]
+name = "scp-ffi-common"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "scp-core",
  "z-base-32",
 ]
 
@@ -3543,6 +3553,7 @@ dependencies = [
  "napi-derive",
  "rand 0.8.5",
  "scp-core",
+ "scp-ffi-common",
  "scp-platform",
  "serde_json",
  "thiserror 2.0.18",
@@ -3559,8 +3570,10 @@ dependencies = [
  "async-trait",
  "base64",
  "dashmap",
+ "hex",
  "rand 0.8.5",
  "scp-core",
+ "scp-ffi-common",
  "scp-platform",
  "scp-transport",
  "serde_json",
@@ -3685,6 +3698,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "lru",
+ "rand 0.8.5",
  "rmp-serde",
  "rmpv",
  "scp-core",

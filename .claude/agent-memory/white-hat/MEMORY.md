@@ -1,32 +1,37 @@
 # White Hat Agent Memory
 
-## PR #127 Security Review (2026-03-01)
+## PR #127 Defense-in-Depth Review (2026-03-01)
 
-### P0 Findings
-- WASM ucan_validate (wasm/src/ucan.rs L147-220) skips Ed25519 signature verification entirely
-- WASM compute_token_cid hashes raw string, scp-core compute_revocation_cid hashes JSON payload -- revocation CID mismatch
-- WASM ucan_revoke hashes token_id not full JWT payload -- third CID variant
-- No zeroization on SenderKey, BroadcastKey, SenderKeyStore (Clone derived, no Drop+Zeroize)
-- check_and_record_nonce (store/ucan.rs L128-145) has TOCTOU race
+### Fixed Since Prior Review
+- WASM Ed25519 verification now implemented (wasm/src/ucan.rs L402-452 verify_token_signature)
+- SenderKey and BroadcastKey now derive Zeroize+ZeroizeOnDrop
+- WASM revocation CID now uses compute_revocation_cid(WasmUcanPayload) matching scp-core
 
-### P1 Findings
-- NAPI ucan_mint uses [0u8; 64] placeholder signature (napi/src/ucan.rs L423) -- stub for SCP-214
-- HeartbeatConfig.suppression_threshold_multiplier is f64, no NaN/Infinity validation
-- WASM ucan_mint silently drops non-string capabilities via filter_map
-- Storage keys use unsanitized DID/context_id strings (potential traversal)
-- WASM runtime re-implements scp-core logic (divergence risk caused revocation CID mismatch)
+### P0 Current Findings
+- UniFFI ucan_revoke stores raw token_id string, NOT content-hash CID (bridge.rs L2220-2226) -- revocations invisible to validate step 10
+
+### P1 Current Findings
+- NAPI proof resolver uses compute_revocation_cid instead of compute_cid for proof chain (napi/src/ucan.rs L308) -- CID mismatch with PyO3
+- Broadcast validate_messages_read_ucan skips signature/expiry/revocation checks (broadcast.rs L423-442)
+- WASM ucan_mint silently drops non-string capabilities via filter_map (wasm/src/ucan.rs L317-327)
+- spending.rs uses unwrap_or_default for system clock (L676, L709, L785) -- should return Err like mint.rs
+- HeartbeatConfig.suppression_threshold_multiplier f64 no NaN/Infinity validation (heartbeat.rs L54)
+- Storage keys use unsanitized context_id/token_id strings (store/ucan.rs L49-74)
+- NAPI/UniFFI ucan_mint use [0u8; 64] placeholder signature (SCP-214 scope)
+- WASM missing 5 of 11 validation steps (SCP-218 scope)
 
 ### Well-Defended
-- RevocationPending treated as revoked (fail-closed revocation state machine)
-- Inner envelope MessageType discriminator prevents type-flipping
-- Broadcast key independence (fresh random per epoch, not HKDF)
+- scp-core 11-step validate_ucan pipeline with verify_strict Ed25519
+- RevocationPending treated as revoked (fail-closed state machine)
+- Broadcast key independence (fresh OsRng per epoch, not HKDF)
 - Debug redaction on SenderKey and BroadcastKey
-- NAPI full 11-step validate_ucan pipeline with real Ed25519
-- PyO3 real Ed25519 signing via KeyCustody
-- Epoch overflow checked with checked_add
+- NAPI/PyO3/UniFFI all delegate validate to scp-core pipeline
+- PyO3 real Ed25519 signing via retained KeyCustody
+- Epoch overflow checked_add on all paths
 - AES-256-GCM nonces from OsRng
-- ProtocolStore version envelope rejects future versions
-- Signaling sender attribution verification
+- Cover traffic constant-rate invariant (dummies never suppressed)
+- Delegation chain cycle detection with depth limit (32)
+- Nonce defense-in-depth (in-memory primary + ProtocolStore persistence)
 
 ## PR #76 Security Review (2026-02-26)
 

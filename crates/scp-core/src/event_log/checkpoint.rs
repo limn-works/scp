@@ -801,7 +801,7 @@ pub async fn generate_checkpoint(
     let context_id = log.context_id().to_owned();
     let event_count = tree::event_count(log);
     let merkle_root = tree::root(log);
-    let timestamp = current_timestamp();
+    let timestamp = current_timestamp()?;
 
     // Compute the canonical hash for signing.
     let canonical_hash = compute_checkpoint_canonical_hash(
@@ -1084,14 +1084,12 @@ fn compute_checkpoint_canonical_hash(
 
 /// Returns the current Unix timestamp in seconds.
 ///
-/// Uses `std::time::SystemTime` for the timestamp. In production, this would
-/// be injected via a clock trait for testability. For Phase 2, direct system
-/// time is acceptable.
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// # Errors
+///
+/// Returns [`EventLogError::ClockError`] (via [`crate::time::ClockError`])
+/// if the system clock is before the Unix epoch.
+fn current_timestamp() -> Result<u64, crate::time::ClockError> {
+    crate::time::now_secs()
 }
 
 // ---------------------------------------------------------------------------

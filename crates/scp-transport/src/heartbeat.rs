@@ -64,7 +64,40 @@ impl Default for HeartbeatConfig {
     }
 }
 
+/// Error returned when a [`HeartbeatConfig`] is constructed with invalid
+/// parameters.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum HeartbeatConfigError {
+    /// The suppression threshold multiplier was NaN, infinite, or non-positive.
+    #[error("suppression_threshold_multiplier must be finite and positive, got {0}")]
+    InvalidMultiplier(f64),
+}
+
 impl HeartbeatConfig {
+    /// Creates a new `HeartbeatConfig` with validated parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeartbeatConfigError::InvalidMultiplier`] if
+    /// `suppression_threshold_multiplier` is NaN, infinite, or non-positive.
+    pub fn new(
+        interval: Duration,
+        enabled: bool,
+        suppression_threshold_multiplier: f64,
+    ) -> Result<Self, HeartbeatConfigError> {
+        if !suppression_threshold_multiplier.is_finite() || suppression_threshold_multiplier <= 0.0
+        {
+            return Err(HeartbeatConfigError::InvalidMultiplier(
+                suppression_threshold_multiplier,
+            ));
+        }
+        Ok(Self {
+            interval,
+            enabled,
+            suppression_threshold_multiplier,
+        })
+    }
+
     /// Returns the suppression threshold duration: `interval * multiplier`.
     #[must_use]
     pub fn suppression_threshold(&self) -> Duration {
@@ -452,5 +485,57 @@ mod tests {
                 .check_suppression(now + Duration::from_secs(181))
                 .is_some()
         );
+    }
+
+    // -- HeartbeatConfig::new validation --------------------------------------
+
+    #[test]
+    fn new_accepts_valid_multiplier() {
+        let config = HeartbeatConfig::new(Duration::from_secs(60), true, 2.0);
+        assert!(config.is_ok());
+        let config = config.unwrap();
+        assert_eq!(config.interval, Duration::from_secs(60));
+        assert!(config.enabled);
+        assert!((config.suppression_threshold_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn new_rejects_nan_multiplier() {
+        let result = HeartbeatConfig::new(Duration::from_secs(60), true, f64::NAN);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HeartbeatConfigError::InvalidMultiplier(_)
+        ));
+    }
+
+    #[test]
+    fn new_rejects_infinity_multiplier() {
+        let result = HeartbeatConfig::new(Duration::from_secs(60), true, f64::INFINITY);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_negative_infinity_multiplier() {
+        let result = HeartbeatConfig::new(Duration::from_secs(60), true, f64::NEG_INFINITY);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_zero_multiplier() {
+        let result = HeartbeatConfig::new(Duration::from_secs(60), true, 0.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_negative_multiplier() {
+        let result = HeartbeatConfig::new(Duration::from_secs(60), true, -1.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_accepts_small_positive_multiplier() {
+        let result = HeartbeatConfig::new(Duration::from_secs(60), true, 0.1);
+        assert!(result.is_ok());
     }
 }

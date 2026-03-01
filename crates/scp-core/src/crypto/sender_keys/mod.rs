@@ -176,6 +176,10 @@ pub enum SenderKeyError {
         /// The epoch specified in the envelope.
         actual: u64,
     },
+
+    /// The system clock is unavailable or before the Unix epoch.
+    #[error("clock error: {0}")]
+    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------

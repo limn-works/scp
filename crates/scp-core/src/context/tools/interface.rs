@@ -59,14 +59,17 @@ impl RateLimit {
     /// Creates a new rate limit with the given maximum calls and window duration.
     ///
     /// Initializes `current_count` to 0 and `window_start` to the current time.
-    #[must_use]
-    pub fn new(max_calls: u64, window: Duration) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
+    pub fn new(max_calls: u64, window: Duration) -> Result<Self, crate::time::ClockError> {
+        Ok(Self {
             max_calls,
             window,
             current_count: 0,
-            window_start: current_timestamp_ms(),
-        }
+            window_start: crate::time::now_millis()?,
+        })
     }
 
     /// Checks whether a call is permitted under the current rate limit.
@@ -74,9 +77,13 @@ impl RateLimit {
     /// If the current window has expired, resets the counter and starts a new
     /// window. Returns `true` if the call is permitted (count < max), `false`
     /// otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
-    fn check_and_increment(&mut self) -> bool {
-        let now = current_timestamp_ms();
+    fn check_and_increment(&mut self) -> Result<bool, crate::time::ClockError> {
+        let now = crate::time::now_millis()?;
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;
 
@@ -88,9 +95,9 @@ impl RateLimit {
 
         if self.current_count < self.max_calls {
             self.current_count += 1;
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 }
@@ -344,7 +351,7 @@ where
     // 2. Check rate limit.
     #[allow(clippy::cast_possible_truncation)]
     if let Some(ref mut rate_limit) = interface.rate_limit
-        && !rate_limit.check_and_increment()
+        && !rate_limit.check_and_increment()?
     {
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = rate_limit.window.as_millis() as u64;
@@ -408,25 +415,6 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Returns the current Unix timestamp in milliseconds.
-#[allow(clippy::cast_possible_truncation)]
-fn current_timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| {
-            let millis = d.as_millis();
-            if millis > u128::from(u64::MAX) {
-                u64::MAX
-            } else {
-                millis as u64
-            }
-        })
-        .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -639,7 +627,7 @@ mod tests {
         let source_context = test_context("ctx-source");
         let registry = setup_registry_with_tool(&source_role_state, admin_did);
 
-        let rate_limit = RateLimit::new(10, Duration::from_secs(60));
+        let rate_limit = RateLimit::new(10, Duration::from_secs(60)).unwrap();
         let interface = expose_tool(
             &source_context,
             &"calculator".to_owned(),
@@ -950,7 +938,7 @@ mod tests {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
             tool_id: "calculator".to_owned(),
-            rate_limit: Some(RateLimit::new(2, Duration::from_secs(3600))),
+            rate_limit: Some(RateLimit::new(2, Duration::from_secs(3600)).unwrap()),
             approved_by_source: true,
             approved_by_target: true,
         };
@@ -1156,7 +1144,7 @@ mod tests {
         };
 
         // Window should have expired, so this should succeed and reset.
-        assert!(rl.check_and_increment());
+        assert!(rl.check_and_increment().unwrap());
         assert_eq!(rl.current_count, 1);
     }
 
@@ -1187,7 +1175,7 @@ mod tests {
             source_context: "ctx-a".to_owned(),
             target_context: "ctx-b".to_owned(),
             tool_id: "tool-1".to_owned(),
-            rate_limit: Some(RateLimit::new(50, Duration::from_secs(120))),
+            rate_limit: Some(RateLimit::new(50, Duration::from_secs(120)).unwrap()),
             approved_by_source: true,
             approved_by_target: false,
         };

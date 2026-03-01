@@ -75,10 +75,7 @@ pub struct MintParams<'a> {
 /// Returns [`UcanError::ClockError`] if the system clock is before the Unix
 /// epoch. Defaulting to zero would silently produce expired tokens.
 fn now_secs() -> Result<u64, UcanError> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))
+    crate::time::now_secs().map_err(UcanError::from)
 }
 
 /// Mints a new UCAN token with Ed25519 signature.
@@ -141,7 +138,7 @@ pub async fn mint_ucan(
         aud: params.audience_did.to_owned(),
         exp,
         nbf: params.not_before,
-        nnc: generate_nonce(),
+        nnc: generate_nonce()?,
         att,
         prf: params.proofs.clone(),
         fct: params.facts.clone(),
@@ -339,7 +336,7 @@ pub async fn delegate_ucan(
         aud: params.delegatee_did.to_owned(),
         exp,
         nbf: None,
-        nnc: generate_nonce(),
+        nnc: generate_nonce()?,
         att: params.attenuated_capabilities.to_vec(),
         prf: proofs,
         fct: params.facts.clone(),

@@ -31,15 +31,13 @@ use std::collections::HashMap;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use napi_derive::napi;
-use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+use scp_core::crypto::ucan::{Attenuation, UcanError as CoreUcanError, UcanHeader, UcanPayload};
 
-use scp_core::crypto::ucan::UcanError as CoreUcanError;
-use scp_core::crypto::ucan::UcanToken;
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::revoke::compute_revocation_cid;
-use scp_core::crypto::ucan::validate::{
-    DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
-    ValidationContext, parse_ucan, validate_ucan,
+use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
+use scp_ffi_common::{
+    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
 };
 
 use crate::context::NapiContextHandle;
@@ -153,101 +151,7 @@ impl Drop for NapiUcanToken {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bridge trait implementations for scp-core validation pipeline
-// ---------------------------------------------------------------------------
-
-/// Bridge [`DidResolver`] that extracts Ed25519 public keys from DID strings.
-///
-/// Supports:
-/// - `did:dht:z{z-base-32-encoded-pubkey}` — production format.
-/// - `did:key:{hex-encoded-pubkey}` — testing format.
-///
-/// This resolver operates in-memory with no network calls. `did:dht:` DIDs
-/// encode the public key directly in the DID string using z-base-32, so
-/// resolution is a simple decode operation.
-struct BridgeDidResolver;
-
-impl DidResolver for BridgeDidResolver {
-    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
-        if let Some(suffix) = did.strip_prefix("did:dht:z") {
-            let decoded = zbase32::decode(suffix).map_err(|_| {
-                CoreUcanError::MalformedToken(format!("z-base-32 decode failed for DID: {did}"))
-            })?;
-            let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(bytes);
-        }
-
-        if let Some(hex_str) = did.strip_prefix("did:key:") {
-            let bytes = decode_hex(hex_str).map_err(|e| {
-                CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
-            })?;
-            let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(pk);
-        }
-
-        Err(CoreUcanError::MalformedToken(format!(
-            "unsupported DID method: {did} (expected did:dht: or did:key:)"
-        )))
-    }
-}
-
-/// Bridge [`RevocationChecker`] that wraps the context's [`RevocationList`].
-///
-/// Holds a reference to the revocation list from the [`ContextRuntime`] and
-/// delegates the `is_revoked` check. Uses the content-hash CID format from
-/// `scp_core::crypto::ucan::revoke::compute_revocation_cid`.
-struct BridgeRevocationChecker<'a> {
-    revocation_list: &'a scp_core::crypto::ucan::revoke::RevocationList,
-}
-
-impl RevocationChecker for BridgeRevocationChecker<'_> {
-    fn is_revoked(&self, token_cid: &str) -> bool {
-        self.revocation_list.is_revoked(token_cid)
-    }
-}
-
-/// Bridge [`ProofResolver`] backed by an in-memory `HashMap`.
-///
-/// Stores parent UCAN tokens by their CID for delegation chain traversal.
-/// The caller can supply proof tokens alongside the token being validated.
-struct BridgeProofResolver {
-    proofs: HashMap<String, UcanToken>,
-}
-
-impl ProofResolver for BridgeProofResolver {
-    fn resolve_proof(&self, cid: &str) -> Result<UcanToken, CoreUcanError> {
-        self.proofs.get(cid).cloned().ok_or_else(|| {
-            CoreUcanError::DelegationChainBroken(format!("proof CID not found: {cid}"))
-        })
-    }
-}
-
-/// Adapter that implements the `validate::NonceTracker` trait for
-/// `nonce::NonceTracker<C>`.
-///
-/// The `nonce::NonceTracker` struct and `validate::NonceTracker` trait have
-/// the same `check_and_record` method signature but are separate types. This
-/// adapter bridges the two by wrapping a mutable reference to the struct.
-struct BridgeNonceTracker<'a, C: scp_core::identity::cache::Clock> {
-    inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
-}
-
-impl<C: scp_core::identity::cache::Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
-    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
-        self.inner.check_and_record(nonce, token_expiry)
-    }
-}
+// Bridge trait implementations are imported from scp-ffi-common.
 
 // ---------------------------------------------------------------------------
 // Bridge functions
@@ -373,7 +277,7 @@ pub async fn ucan_mint(
     let context_id = handle.context_id();
     let issuer_did = handle.creator_did();
 
-    let nonce = generate_nonce();
+    let nonce = generate_nonce().map_err(napi::Error::from)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -490,14 +394,12 @@ pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Res
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Encodes a byte slice as a lowercase hex string.
-fn encode_hex(bytes: &[u8]) -> String {
-    hex::encode(bytes)
-}
-
-/// Decodes a hex string to bytes.
-fn decode_hex(hex_str: &str) -> Result<Vec<u8>, String> {
-    hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))
+/// Generates a nonce. Delegates to `scp_core::crypto::ucan::nonce::generate_nonce`.
+fn generate_nonce() -> Result<String, ScpNapiError> {
+    scp_core::crypto::ucan::nonce::generate_nonce().map_err(|e| ScpNapiError::Permission {
+        message: format!("system clock error: {e}"),
+        code: "SCP-PERM-3004".to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +416,12 @@ fn decode_hex(hex_str: &str) -> Result<Vec<u8>, String> {
 )]
 mod tests {
     use super::*;
+
+    use scp_core::crypto::ucan::UcanError as CoreUcanError;
+    use scp_core::crypto::ucan::UcanToken;
+    use scp_core::crypto::ucan::validate::{
+        DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
+    };
 
     #[test]
     fn bridge_did_resolver_resolves_did_dht() {
@@ -532,8 +440,8 @@ mod tests {
     #[test]
     fn bridge_did_resolver_resolves_did_key_hex() {
         let pk_bytes: [u8; 32] = [0xab; 32];
-        let hex = encode_hex(&pk_bytes);
-        let did = format!("did:key:{hex}");
+        let hex_str = hex::encode(pk_bytes);
+        let did = format!("did:key:{hex_str}");
 
         let resolver = BridgeDidResolver;
         let result = resolver.resolve_public_key(&did).unwrap();
@@ -629,7 +537,7 @@ mod tests {
 
     #[test]
     fn generate_nonce_produces_valid_format() {
-        let nonce = generate_nonce();
+        let nonce = generate_nonce().unwrap();
         let parts: Vec<&str> = nonce.splitn(2, '-').collect();
         assert_eq!(parts.len(), 2);
         assert!(parts[0].parse::<u128>().is_ok());
@@ -637,25 +545,16 @@ mod tests {
     }
 
     #[test]
-    fn encode_hex_roundtrip() {
+    fn hex_encode_decode_roundtrip() {
         let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let hex = encode_hex(&bytes);
-        let decoded = decode_hex(&hex).unwrap();
+        let encoded = hex::encode(bytes);
+        let decoded = hex::decode(&encoded).unwrap();
         assert_eq!(decoded, bytes);
     }
 
     #[test]
-    fn decode_hex_rejects_odd_length() {
-        let result = decode_hex("abc");
+    fn hex_decode_rejects_odd_length() {
+        let result = hex::decode("abc");
         assert!(result.is_err());
     }
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Generates a nonce. Delegates to `scp_core::crypto::ucan::nonce::generate_nonce`.
-fn generate_nonce() -> String {
-    scp_core::crypto::ucan::nonce::generate_nonce()
 }

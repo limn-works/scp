@@ -12,9 +12,9 @@
 //! share these registries. Context IDs and identity DIDs from one tenant are
 //! accessible to another. This is a known architectural limitation.
 //!
-//! The NAPI (Node.js), UniFFI (Swift/Kotlin), and WASM bridges avoid this
+//! The NAPI (`Node.js`), `UniFFI` (Swift/Kotlin), and WASM bridges avoid this
 //! issue by using per-instance handle objects instead of global registries.
-//! The PyO3 bridge must be refactored to match. See SCP-228.
+//! The `PyO3` bridge must be refactored to match. See SCP-228.
 //!
 //! # Pattern
 //!
@@ -55,7 +55,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
-use scp_core::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
@@ -309,24 +309,7 @@ pub struct ContextRuntime {
     pub message_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>>,
 }
 
-/// Default capability ceiling for new contexts.
-///
-/// Includes all standard SCP capabilities. This matches the ceiling used in
-/// scp-core test helpers.
-fn default_ceiling() -> CapabilityCeiling {
-    CapabilityCeiling::new([
-        Capability::MessagesRead,
-        Capability::MessagesWrite,
-        Capability::ToolRegister,
-        Capability::ToolInvokeAll,
-        Capability::RoleAssign,
-        Capability::MemberInvite,
-        Capability::MemberRemove,
-        Capability::GovernancePropose,
-        Capability::GovernanceVote,
-        Capability::ContextClose,
-    ])
-}
+// default_ceiling() imported from scp_core::context::roles.
 
 /// Registers a new context in the global runtime registry.
 ///
@@ -496,7 +479,7 @@ pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
 /// injected so consumers can track drop events.
 ///
 /// The function extracts channel references from the runtime registry (brief
-/// DashMap shard lock), then operates on the channel outside the lock to
+/// `DashMap` shard lock), then operates on the channel outside the lock to
 /// avoid holding the shard lock during overflow handling.
 ///
 /// # Errors
@@ -619,7 +602,7 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 /// Injected via [`init_storage`] at Python initialization time. Bridge
 /// functions use [`get_storage`] to access the provider for storing and
 /// loading identity state. The storage backend is `InMemoryStorage` for
-/// now — persistent backends (SQLite via `SqliteStorage`) will replace it
+/// now -- persistent backends (`SQLite` via [`SqliteStorage`]) will replace it
 /// when platform storage adapters land.
 ///
 /// Uses the same `OnceLock` pattern as `CONTEXT_REGISTRY` and

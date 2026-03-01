@@ -90,10 +90,18 @@ Notes:
 - **Empty awaitClose with captured handle:** subscriptionHandle captured but awaitClose body is empty. No unsubscribe call means Rust continues invoking callback after Flow cancellation. Pattern: placeholder cleanup that will leak when wired to real FFI.
 - **Double-buffering in callbackFlow + .buffer():** callbackFlow already has Channel.BUFFERED internal capacity; .buffer(Channel.BUFFERED) adds another 64-item layer. Total buffer is ~128, not the documented 64. Pattern: redundant buffer operator on callbackFlow.
 
-### Known Bug Patterns (Mar 2026 — PR #127, loom/main-0301-0312 review)
+### Known Bug Patterns (Mar 2026 — PR #127, loom/main-0301-0312 review, initial)
 - **UniFFI ucan_mint signs with ephemeral key:** Creates new InMemoryKeyCustody + DID per call, signs token with wrong key. Token claims issuer_did = creator but signature is from ephemeral key. Pattern: placeholder key generation that looks real but produces unverifiable signatures. Same pattern as prior "key material discarded on identity_create".
-- **Sentinel-value collision in TTL calculation:** shortest_ttl_for_results uses PETNAME_CACHE_TTL (365d) as both sentinel and real value. Petname-only results collide with "no results" case, get 15min TTL. Pattern: using domain value as sentinel.
-- **NAPI transport_disconnect TOCTOU:** Lock acquired for read, dropped, re-acquired for write. Same pattern as prior TOCTOU in standing_channel. Pattern: check-then-act with lock gap.
-- **HotStreamFactory thread-unsafe maps:** Plain mutableMapOf accessed from both caller thread and Rust callback thread (onComplete). Pattern: Kotlin mutableMapOf used across thread boundaries without synchronization.
-- **ScpViewModel.trackContext fire-and-forget:** viewModelScope.launch to add, but viewModelScope cancelled before onCleared. Pattern: async add to cleanup list where sync would be correct.
-- **WASM ucan_validate wildcard bypass:** can=="*" check doesn't verify resource is scoped to current context. Pattern: re-implemented validation logic that is weaker than scp-core's canonical implementation.
+- **FIXED: Sentinel-value collision in TTL calculation:** Now uses Option<Duration> sentinel, petname-only results get correct 365d TTL.
+- **FIXED: NAPI transport_disconnect TOCTOU:** Single lock acquisition for check-and-modify.
+- **FIXED: HotStreamFactory thread-unsafe maps:** Now uses ConcurrentHashMap.
+- **FIXED: ScpViewModel.trackContext:** Now uses dedicated cleanupScope instead of viewModelScope.
+- **FIXED: rememberScpEventList scope leak:** Now has DisposableEffect with scope.cancel().
+
+### Known Bug Patterns (Mar 2026 — PR #127, loom/main-0301-0312 review, second pass)
+- **MessageType discriminator not in canonical hash (HIGH):** inner.rs defines MessageType with as_discriminator_byte() doc'd as "for inclusion in canonical hashes to prevent type-flipping", but compute_canonical_hash never includes it. InnerEnvelopeParams lacks message_type field. Pattern: defense mechanism defined but never wired.
+- **WASM ucan_validate wildcard context prefix confusion (HIGH):** starts_with("scp:ctx:{id}") without trailing "/" allows cross-context escalation when IDs share prefix. CLAUDE.md documents correct fix but code not updated. Pattern: documented fix not applied.
+- **Python delegate() no proof chain (HIGH):** delegate() calls mint() without parent token proof. Delegated token appears as root token. No py_ucan_delegate FFI binding exists. Pattern: delegation that doesn't delegate.
+- **Compose rememberScpHotStream scope race (MEDIUM):** scope.launch{onStop()} then scope.cancel() — onStop never executes. Pattern: launching cleanup work then immediately cancelling the scope.
+- **HotStreamFactory.contextEvents TOCTOU (MEDIUM):** ConcurrentHashMap get-then-put with suspend point between. Duplicate subscriptions possible, first leaks. Pattern: check-then-act on ConcurrentHashMap across suspension points.
+- **CheckpointManager.is_checkpoint_due ignores min_events_since_last (LOW):** Doc says min_events prevents spam, but time_due returns true regardless. Field is dead.

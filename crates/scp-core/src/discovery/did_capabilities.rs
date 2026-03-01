@@ -110,10 +110,7 @@ fn extract_capabilities(
     let mut seen = std::collections::HashSet::new();
     capabilities.retain(|cap| seen.insert(cap.clone()));
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::time::now_secs()?;
 
     Ok(CapabilityEntry {
         did: did.into(),

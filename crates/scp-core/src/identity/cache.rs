@@ -92,10 +92,14 @@ pub trait Clock: Send + Sync {
 pub struct SystemClock;
 
 impl Clock for SystemClock {
+    #[allow(clippy::expect_used)]
     fn now(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
+        // The Clock trait returns u64 (not Result), so we cannot propagate the
+        // error. A system clock before the Unix epoch is an unrecoverable
+        // environment failure — panicking is the correct behaviour here, as
+        // silently returning 0 would bypass UCAN expiry and nonce freshness
+        // checks.
+        crate::time::now_secs().expect("system clock is unavailable or before Unix epoch")
     }
 }
 

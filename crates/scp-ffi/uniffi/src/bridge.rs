@@ -30,12 +30,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use scp_core::crypto::ucan::capability::CapabilityUri;
-use scp_core::crypto::ucan::validate::{
-    DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
-    ValidationContext, parse_ucan, validate_ucan,
-};
+use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
 use scp_core::crypto::ucan::{Attenuation, UcanError as CoreUcanError, UcanHeader, UcanPayload};
 use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
+use scp_ffi_common::{
+    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
+};
 use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
@@ -600,119 +600,11 @@ impl From<serde_json::Error> for ScpError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bridge trait implementations for scp-core UCAN validation pipeline
-//
-// These adapters bridge the UniFFI runtime state to scp-core's validation
-// traits. Follows the same pattern as the PyO3 bridge in
-// crates/scp-ffi/src/ucan.rs.
-// ---------------------------------------------------------------------------
-
-/// Bridge [`DidResolver`] that extracts Ed25519 public keys from DID strings.
-///
-/// Supports `did:dht:z{z-base-32-encoded-pubkey}` (production) and
-/// `did:key:{hex-encoded-pubkey}` (testing).
-struct BridgeDidResolver;
-
-impl DidResolver for BridgeDidResolver {
-    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
-        if let Some(suffix) = did.strip_prefix("did:dht:z") {
-            let decoded = zbase32::decode(suffix).map_err(|_| {
-                CoreUcanError::MalformedToken(format!("z-base-32 decode failed for DID: {did}"))
-            })?;
-            let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(bytes);
-        }
-
-        if let Some(hex_str) = did.strip_prefix("did:key:") {
-            let bytes = decode_hex(hex_str).map_err(|e| {
-                CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
-            })?;
-            let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(pk);
-        }
-
-        Err(CoreUcanError::MalformedToken(format!(
-            "unsupported DID method: {did} (expected did:dht: or did:key:)"
-        )))
-    }
-}
-
-/// Bridge [`RevocationChecker`] wrapping the context's [`RevocationList`].
-struct BridgeRevocationChecker<'a> {
-    revocation_list: &'a scp_core::crypto::ucan::revoke::RevocationList,
-}
-
-impl RevocationChecker for BridgeRevocationChecker<'_> {
-    fn is_revoked(&self, token_cid: &str) -> bool {
-        self.revocation_list.is_revoked(token_cid)
-    }
-}
-
-/// Bridge [`ProofResolver`] backed by an in-memory `HashMap`.
-struct BridgeProofResolver {
-    proofs: HashMap<String, scp_core::crypto::ucan::UcanToken>,
-}
-
-impl ProofResolver for BridgeProofResolver {
-    fn resolve_proof(&self, cid: &str) -> Result<scp_core::crypto::ucan::UcanToken, CoreUcanError> {
-        self.proofs.get(cid).cloned().ok_or_else(|| {
-            CoreUcanError::DelegationChainBroken(format!("proof CID not found: {cid}"))
-        })
-    }
-}
-
-/// Adapter bridging `nonce::NonceTracker<C>` struct to `validate::NonceTracker`
-/// trait.
-struct BridgeNonceTracker<'a, C: scp_core::identity::cache::Clock> {
-    inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
-}
-
-impl<C: scp_core::identity::cache::Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
-    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
-        self.inner.check_and_record(nonce, token_expiry)
-    }
-}
+// Bridge trait implementations are imported from scp-ffi-common.
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Decodes a hex string to bytes.
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length: {}", hex.len()));
-    }
-
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte_str = &hex[i..i + 2];
-        let byte =
-            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
-        bytes.push(byte);
-    }
-    Ok(bytes)
-}
-
-/// Encodes bytes as a lowercase hex string.
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{byte:02x}");
-    }
-    s
-}
 
 /// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
 fn generate_nonce() -> Result<String, ScpError> {
@@ -729,8 +621,8 @@ fn generate_nonce() -> Result<String, ScpError> {
     let mut random_bytes = [0u8; 16];
     rand::thread_rng().fill(&mut random_bytes);
 
-    let hex = encode_hex(&random_bytes);
-    Ok(format!("{now_millis}-{hex}"))
+    let hex_str = hex::encode(random_bytes);
+    Ok(format!("{now_millis}-{hex_str}"))
 }
 
 /// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
@@ -2268,7 +2160,7 @@ pub async fn event_log_query(
                 crate::runtime::with_context(&handle.context_id, |rt| {
                     let count = scp_core::event_log::tree::event_count(&rt.event_log);
                     let root = scp_core::event_log::tree::root(&rt.event_log);
-                    Ok((count, encode_hex(&root)))
+                    Ok((count, hex::encode(&root)))
                 })?;
 
             let limit = if let Some(ref json) = filter_json {
@@ -2395,7 +2287,7 @@ pub async fn event_log_verify(
                                         scp_core::event_log::proof::Direction::Right => "right",
                                     };
                                     serde_json::json!({
-                                        "sibling_hash": encode_hex(&step.sibling_hash),
+                                        "sibling_hash": hex::encode(&step.sibling_hash),
                                         "direction": direction,
                                     })
                                 })
@@ -2403,8 +2295,8 @@ pub async fn event_log_verify(
 
                             let details = serde_json::json!({
                                 "leaf_index": proof.leaf_index,
-                                "leaf_hash": encode_hex(&proof.leaf_hash),
-                                "root": encode_hex(&proof.root),
+                                "leaf_hash": hex::encode(&proof.leaf_hash),
+                                "root": hex::encode(&proof.root),
                                 "path": path_steps,
                                 "path_length": proof.path.len(),
                             });
@@ -2445,14 +2337,14 @@ pub async fn event_log_verify(
 
                             let lower = proof.lower.as_ref().map(|lwp| {
                                 serde_json::json!({
-                                    "leaf_hash": encode_hex(&lwp.leaf_hash),
+                                    "leaf_hash": hex::encode(&lwp.leaf_hash),
                                     "leaf_index": lwp.leaf_index,
                                 })
                             });
 
                             let upper = proof.upper.as_ref().map(|uwp| {
                                 serde_json::json!({
-                                    "leaf_hash": encode_hex(&uwp.leaf_hash),
+                                    "leaf_hash": hex::encode(&uwp.leaf_hash),
                                     "leaf_index": uwp.leaf_index,
                                 })
                             });
@@ -2466,8 +2358,8 @@ pub async fn event_log_verify(
                             let verified = lower_verified && upper_verified;
 
                             let details = serde_json::json!({
-                                "query_hash": encode_hex(&proof.query_hash),
-                                "root": encode_hex(&proof.root),
+                                "query_hash": hex::encode(&proof.query_hash),
+                                "root": hex::encode(&proof.root),
                                 "leaf_count": proof.leaf_count,
                                 "lower": lower,
                                 "upper": upper,
@@ -2518,19 +2410,10 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
 }
 
 /// Decodes a hex string into a 32-byte hash.
-fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!(
-            "expected 64 hex characters (32 bytes), got {}",
-            hex.len()
-        ));
-    }
-
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
-        bytes[i] =
-            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
-    }
-    Ok(bytes)
+fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
+    Ok(arr)
 }

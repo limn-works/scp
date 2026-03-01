@@ -281,6 +281,10 @@ pub enum ToolError {
         /// Minimum number of fields required.
         min_fields: usize,
     },
+
+    /// The system clock is unavailable or before the Unix epoch.
+    #[error("clock error: {0}")]
+    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------

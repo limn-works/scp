@@ -223,7 +223,7 @@ pub fn py_ucan_mint(
 
     let rt = crate::runtime()?;
     let context_id_owned = context_id.to_owned();
-    let nonce = scp_core::crypto::ucan::nonce::generate_nonce();
+    let _nonce = scp_core::crypto::ucan::nonce::generate_nonce();
 
     // Mint using real scp_core::mint_ucan with Ed25519 signing via
     // the retained KeyCustody. See SCP-214 criterion 7.
@@ -466,7 +466,6 @@ pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
 )]
 mod tests {
     use super::*;
-    use crate::types::encode_hex;
 
     use scp_core::crypto::ucan::UcanToken;
     use scp_core::crypto::ucan::validate::{

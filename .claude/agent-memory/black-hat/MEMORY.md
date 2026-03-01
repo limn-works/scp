@@ -43,75 +43,67 @@ Notes:
 
 ### CRITICAL: Discovery context governance capture = total namespace hijack
 - File: `.docs/specs/22-human-readable-addressing.md` Section 22.3.4
-- Default handle-registry template is single-admin governance
-- Writer verification is behavioral (SHOULD), not protocol-enforced
-- Compromised governance -> writers skip signature verification on deregister
 
 ### HIGH: Handle squatting -- zero economic cost for bulk registration
 - File: `.docs/specs/22-human-readable-addressing.md` Section 22.3.1
-- No rate limits per DID, no cost, no attestation linkage in default template
 
 ### HIGH: Petname auto-creation permanent after one successful deception
 - File: `.docs/specs/22-human-readable-addressing.md` Section 22.8.3, 22.8.4
-- Disambiguation selection auto-creates indefinite petname, overrides all layers
 
-### HIGH: Privacy -- all lookups DID-authenticated, discovery contexts see who queries whom
+### HIGH: Privacy -- all lookups DID-authenticated
 - File: `.docs/specs/22-human-readable-addressing.md` Section 22.10.4
-- Unscoped resolution broadcasts to ALL known discovery contexts
 
-### HIGH: Cache poisoning via stale-while-revalidate pattern
+### HIGH: Cache poisoning via stale-while-revalidate
 - File: `.docs/specs/22-human-readable-addressing.md` Section 22.8.4
-- Poisoned result returned immediately, background verification happens after user acts
 
-## Key Attack Surfaces Identified (PR #127 -- FFI/SDK/Broadcast)
+## Key Attack Surfaces -- PR #127 Second Pass (post-fix)
 
-### CRITICAL: WASM bridge UCAN validation has no signature verification
-- File: `crates/scp-ffi/wasm/src/ucan.rs` lines 147-220
-- Only checks JWT structure, expiry, capability matching, `can == "*"` wildcard
-- Zero Ed25519 verification -- any crafted JWT passes
+### CRITICAL: WASM bridge UCAN validation still missing 6/11 steps
+- File: `crates/scp-ffi/wasm/src/ucan.rs`
+- Ed25519 sig verification ADDED but steps 3-5, 7-9 still missing
+- Self-signed DIDs pass: attacker encodes own pubkey in DID, signs with own key
+- No root issuer check, no audience check, no delegation chain, no nonce tracking
 
-### CRITICAL: NAPI ucan_mint uses all-zero placeholder signatures
-- File: `crates/scp-ffi/napi/src/ucan.rs` line 423
-- `let placeholder_sig = [0u8; 64]` -- tokens parseable but unsigned
-- Cross-bridge token laundering: mint in NAPI, validate in WASM
+### HIGH: context_close auth bypass on NAPI/WASM/UniFFI (UNFIXED)
+- PyO3 fixed (checks ContextClose capability)
+- NAPI: `crates/scp-ffi/napi/src/context.rs` line 430 `let _ = identity_did`
+- WASM: `crates/scp-ffi/wasm/src/context.rs` line 579 `let _ = identity_did`
+- UniFFI: `crates/scp-ffi/uniffi/src/bridge.rs` line 1704 `let _ = identity`
 
-### CRITICAL: Cross-bridge security parity violation
-- PyO3 = full scp-core delegation; NAPI = full validation but broken minting; WASM = structural only
-- Heterogeneous deployments vulnerable to token laundering
+### HIGH: Broadcast UCAN validation still skips all crypto
+- File: `crates/scp-core/src/context/broadcast.rs` lines 423-442
+- Wildcard rejection added (RED-012) but no sig/expiry/issuer/chain checks
+- Forged UcanToken struct with correct `aud` + `att` string bypasses
 
-### HIGH: Broadcast UCAN validation skips all crypto
-- File: `crates/scp-core/src/context/broadcast.rs` lines 382-405
-- Accepts wildcard `scp:ctx:*/messages:read`
-- No signature, expiry, revocation, delegation chain checks
+### HIGH: NAPI/UniFFI mint zero-signature tokens with no unsigned indicator
+- NAPI: `crates/scp-ffi/napi/src/ucan.rs` line 432 `[0u8; 64]`
+- UniFFI: `crates/scp-ffi/uniffi/src/bridge.rs` line 2181 `[0u8; 64]`
+- No `is_signed` field, tokens appear production-ready
 
-### HIGH: context_close has no authorization in ANY bridge
-- PyO3/NAPI/WASM/UniFFI all skip admin/capability check
+### MEDIUM: Nonce replay TOCTOU -- substantially improved
+- File: `crates/scp-core/src/store/ucan.rs` lines 236-267
+- Post-write re-verification added, in-memory path serialized by DashMap
+- Residual risk only during crash recovery window
 
-### HIGH: Nonce replay TOCTOU in check_and_record_nonce
-- File: `crates/scp-core/src/store/ucan.rs` lines 128-145
-- exists() then store_value() is not atomic
-
-### HIGH: identity_load produces cryptographically dead handles
-- NAPI/PyO3: loaded identity has no KeyCustody, silent degradation
-
-### HIGH: Attestation renewal without re-verification
-- File: `crates/scp-core/src/trust/renewal.rs` lines 63-87
-
-### MEDIUM: Inner envelope canonical hash lacks length prefixes
-- File: `crates/scp-core/src/envelope/inner.rs` lines 373-386
-
-### MEDIUM: Cover traffic DUMMY_FLAG=0x00 + fixed 30s interval
+### MEDIUM: Cover traffic size/timing distinguishability
 - File: `crates/scp-transport/src/cover_traffic.rs`
+- Fixed 30s interval + fixed 1024-byte size = distinguishable pattern
+
+### MEDIUM: Attestation renewal re-verifies internal fields only
+- File: `crates/scp-core/src/trust/renewal.rs` lines 93-125
+- Fix added verify_attestation call (good), but external evidence not re-fetched
 
 ## Patterns Confirmed Working (PR #127)
-- Broadcast key isolation per author is sound (independent AES-256-GCM, random nonces, AAD)
+- Broadcast key isolation per author sound (AES-256-GCM, random nonces)
 - Epoch overflow protection at u64::MAX
 - Key material Debug redaction across all bridges
-- Inner envelope domain separation with message type discriminator
-- Signaling sender attribution verification
-- PyO3 UCAN validation delegates to scp-core 11-step pipeline
-- Transport TLS enforcement in NAPI (rejects ws://)
-- Storage key conventions with context scoping
+- scp-core 11-step UCAN pipeline thorough when invoked (NAPI/UniFFI/PyO3)
+- NAPI TLS enforcement (rejects ws://)
+- Nonce replay (in-memory path) serialized by DashMap entry locks
+- Heartbeat suppression detection sound
+- Broadcast wildcard rejection (RED-012)
+- PyO3 context_close authorization check
+- Merkle checkpoint equivocation detection
 
 ## Patterns Confirmed Working (prior PRs)
 - Ceiling inheritance in nesting is sound
@@ -120,7 +112,5 @@ Notes:
 - Auto-accept hard rules (tools, payment) non-bypassable
 - Budget tracker uses saturating arithmetic throughout
 - UCAN attenuation validation is thorough
-- ASCII-only local-part `[a-z0-9._-]` blocks Unicode homoglyph attacks
-- DID canonical identity + MLS binding means resolution hijack cannot forge messages
-- Scoped resolution (with @scope) is unambiguous within its namespace
-- Domain verification chain is sound for domain operator's own DID
+- ASCII-only local-part blocks Unicode homoglyph attacks
+- DID canonical identity + MLS binding = resolution hijack cannot forge messages

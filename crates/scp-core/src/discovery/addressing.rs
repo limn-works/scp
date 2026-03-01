@@ -318,6 +318,10 @@ pub enum AddressingError {
         /// Error description.
         message: String,
     },
+
+    /// The system clock is unavailable or before the Unix epoch.
+    #[error("clock error: {0}")]
+    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------
@@ -618,7 +622,7 @@ impl AddressResolver {
             }
             ParsedAddress::Unscoped { name } => {
                 // §22.8.2: Check petnames first (instant, no network).
-                let petname_results = petname_store.resolve_petname(&name);
+                let petname_results = petname_store.resolve_petname(&name)?;
                 if !petname_results.is_empty() {
                     results.extend(petname_results);
                     self.cache
@@ -660,7 +664,7 @@ impl AddressResolver {
 
         // Deduplicate by DID: if multiple paths found the same DID, promote to
         // MultiLayerCorroborated per §22.8.2 step 4c.
-        results = corroborate_results(results);
+        results = corroborate_results(results)?;
 
         // Cache the results with the shortest applicable TTL.
         let ttl = shortest_ttl_for_results(&results);
@@ -689,7 +693,14 @@ pub trait PetnameStore {
     ///
     /// Returns matching entries instantly (no network I/O). Returns an empty
     /// vec if no petname matches.
-    fn resolve_petname(&self, name: &str) -> Vec<AddressResolution>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
+    fn resolve_petname(
+        &self,
+        name: &str,
+    ) -> Result<Vec<AddressResolution>, crate::time::ClockError>;
 }
 
 /// Trait for querying remote handle resolution layers.
@@ -730,7 +741,9 @@ pub trait HandleQuerier {
 
 /// Detects when multiple resolution paths found the same DID and promotes
 /// those results to `MultiLayerCorroborated` per §22.8.2 step 4c.
-fn corroborate_results(results: Vec<AddressResolution>) -> Vec<AddressResolution> {
+fn corroborate_results(
+    results: Vec<AddressResolution>,
+) -> Result<Vec<AddressResolution>, crate::time::ClockError> {
     let mut by_did: HashMap<String, Vec<AddressResolution>> = HashMap::new();
     let mut non_identity: Vec<AddressResolution> = Vec::new();
 
@@ -755,10 +768,7 @@ fn corroborate_results(results: Vec<AddressResolution>) -> Vec<AddressResolution
                 .map(|e| e.resolution_path().clone())
                 .collect();
             if let Some(AddressResolution::Identity { did, .. }) = entries.into_iter().next() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let now = crate::time::now_secs()?;
                 output.push(AddressResolution::Identity {
                     did,
                     trust_level: TrustLevel::MultiLayerCorroborated {
@@ -786,7 +796,7 @@ fn corroborate_results(results: Vec<AddressResolution>) -> Vec<AddressResolution
             .cmp(&a.trust_level().default_rank())
     });
 
-    output
+    Ok(output)
 }
 
 /// Determines the shortest TTL to use for a set of resolution results.
@@ -1111,7 +1121,7 @@ mod tests {
             },
         ];
 
-        let corroborated = corroborate_results(results);
+        let corroborated = corroborate_results(results).unwrap();
         assert_eq!(corroborated.len(), 1);
         assert!(matches!(
             corroborated[0].trust_level(),
@@ -1136,7 +1146,7 @@ mod tests {
             },
         }];
 
-        let corroborated = corroborate_results(results);
+        let corroborated = corroborate_results(results).unwrap();
         assert_eq!(corroborated.len(), 1);
         assert_eq!(
             *corroborated[0].trust_level(),
@@ -1176,8 +1186,11 @@ mod tests {
     }
 
     impl PetnameStore for TestPetnameStore {
-        fn resolve_petname(&self, name: &str) -> Vec<AddressResolution> {
-            self.petnames.get(name).cloned().unwrap_or_default()
+        fn resolve_petname(
+            &self,
+            name: &str,
+        ) -> Result<Vec<AddressResolution>, crate::time::ClockError> {
+            Ok(self.petnames.get(name).cloned().unwrap_or_default())
         }
     }
 

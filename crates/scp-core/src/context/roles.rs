@@ -253,6 +253,27 @@ impl CapabilityCeiling {
     }
 }
 
+/// Returns the default capability ceiling for new contexts.
+///
+/// Includes all standard SCP capabilities: messaging, tool management, role
+/// assignment, membership control, governance, and context close. Used by
+/// all FFI bridges when no explicit ceiling is provided.
+#[must_use]
+pub fn default_ceiling() -> CapabilityCeiling {
+    CapabilityCeiling::new([
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::ToolRegister,
+        Capability::ToolInvokeAll,
+        Capability::RoleAssign,
+        Capability::MemberInvite,
+        Capability::MemberRemove,
+        Capability::GovernancePropose,
+        Capability::GovernanceVote,
+        Capability::ContextClose,
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // check_ceiling (free function)
 // ---------------------------------------------------------------------------
@@ -510,6 +531,10 @@ pub enum RoleError {
     /// A context lifecycle error occurred during role assignment.
     #[error("context error: {0}")]
     Context(#[from] ContextError),
+
+    /// The system clock is unavailable or before the Unix epoch.
+    #[error("clock error: {0}")]
+    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +635,7 @@ impl ContextRoleState {
             .cloned()
             .unwrap_or_else(|| builtin_admin(&ceiling));
 
-        let tokens = mint_role_tokens(&context_id, &creator_did, &creator_did, &admin_role);
+        let tokens = mint_role_tokens(&context_id, &creator_did, &creator_did, &admin_role)?;
 
         let mut assignments = HashMap::new();
         let assignment = RoleAssignment {
@@ -690,7 +715,7 @@ pub fn assign_role(
         .clone();
 
     // 4. Mint UCAN tokens for each capability in the role.
-    let tokens = mint_role_tokens(&state.context_id, &state.creator_did, member_did, &role_def);
+    let tokens = mint_role_tokens(&state.context_id, &state.creator_did, member_did, &role_def)?;
 
     // 5. Update state: replace any previous assignment.
     let assignment = RoleAssignment {
@@ -750,7 +775,7 @@ fn mint_role_tokens(
     creator_did: &str,
     member_did: &str,
     role: &RoleDefinition,
-) -> Vec<UcanToken> {
+) -> Result<Vec<UcanToken>, crate::time::ClockError> {
     role.capabilities
         .iter()
         .map(|cap| {
@@ -758,12 +783,12 @@ fn mint_role_tokens(
                 with: format!("scp:ctx:{context_id}/{cap}"),
                 can: "invoke".to_owned(),
             };
-            UcanToken {
+            Ok(UcanToken {
                 iss: creator_did.to_owned(),
                 aud: member_did.to_owned(),
                 att: vec![att],
-                nnc: generate_nonce(),
-            }
+                nnc: generate_nonce()?,
+            })
         })
         .collect()
 }
@@ -1459,7 +1484,7 @@ mod tests {
 
     #[test]
     fn generated_nonces_are_unique() {
-        let nonces: Vec<String> = (0..100).map(|_| generate_nonce()).collect();
+        let nonces: Vec<String> = (0..100).map(|_| generate_nonce().unwrap()).collect();
         let unique: HashSet<&String> = nonces.iter().collect();
         assert_eq!(
             nonces.len(),
@@ -1470,7 +1495,7 @@ mod tests {
 
     #[test]
     fn nonce_format_is_valid() {
-        let nonce = generate_nonce();
+        let nonce = generate_nonce().unwrap();
         let parts: Vec<&str> = nonce.splitn(2, '-').collect();
         assert_eq!(parts.len(), 2, "nonce should have timestamp-hex format");
         // Timestamp part should be a valid number.

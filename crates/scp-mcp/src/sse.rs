@@ -43,8 +43,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
@@ -86,6 +88,13 @@ pub struct SseConfig {
     /// Maximum number of events retained in the replay buffer for
     /// reconnecting clients. Defaults to 256.
     pub replay_capacity: usize,
+
+    /// Optional bearer token for authenticating SSE and message requests.
+    /// When `Some(token)`, all requests to `/sse` and `/message` must include
+    /// an `Authorization: Bearer <token>` header. Unauthenticated requests
+    /// receive HTTP 401 Unauthorized. When `None`, no authentication is
+    /// required (backwards compatible).
+    pub auth_token: Option<String>,
 }
 
 impl SseConfig {
@@ -97,6 +106,7 @@ impl SseConfig {
             channel_capacity: 256,
             retry_ms: DEFAULT_RETRY_MS,
             replay_capacity: DEFAULT_REPLAY_CAPACITY,
+            auth_token: None,
         }
     }
 }
@@ -250,10 +260,47 @@ pub fn sse_router<P: ContextProvider + 'static>(
         retry_ms: config.retry_ms,
     });
 
-    Router::new()
+    let router = Router::new()
         .route("/sse", get(sse_handler::<P>))
         .route("/message", post(message_handler::<P>))
-        .with_state(state)
+        .with_state(state);
+
+    if let Some(ref token) = config.auth_token {
+        let expected = token.clone();
+        router.layer(middleware::from_fn(move |req, next| {
+            bearer_auth_middleware(req, next, expected.clone())
+        }))
+    } else {
+        router
+    }
+}
+
+/// Middleware that validates bearer token authentication.
+///
+/// Checks the `Authorization: Bearer <token>` header on incoming requests.
+/// Returns HTTP 401 Unauthorized if the header is missing, malformed, or
+/// contains the wrong token.
+async fn bearer_auth_middleware(
+    req: Request<Body>,
+    next: Next,
+    expected_token: String,
+) -> impl IntoResponse {
+    let auth_header = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(value) if value.starts_with("Bearer ") => {
+            let provided = &value["Bearer ".len()..];
+            if provided == expected_token {
+                next.run(req).await.into_response()
+            } else {
+                StatusCode::UNAUTHORIZED.into_response()
+            }
+        }
+        _ => StatusCode::UNAUTHORIZED.into_response(),
+    }
 }
 
 /// Runs the MCP server as an SSE HTTP server.
@@ -379,11 +426,12 @@ async fn message_handler<P: ContextProvider + 'static>(
             server.handle_request(&req)
         }
         Ok(SseIncoming::Notification(notif)) => {
+            let synthetic_id = state.next_event_id.fetch_add(1, Ordering::SeqCst);
             let synthetic = JsonRpcRequest {
                 jsonrpc: notif.jsonrpc,
                 method: notif.method,
                 params: notif.params,
-                id: RequestId::Number(0),
+                id: RequestId::Number(synthetic_id.cast_signed()),
             };
             let mut server = state.server.lock().await;
             server.handle_request(&synthetic);
@@ -696,11 +744,12 @@ mod tests {
                 srv.handle_request(&req)
             }
             SseIncoming::Notification(notif) => {
+                let synthetic_id = state.next_event_id.fetch_add(1, Ordering::SeqCst);
                 let synthetic = JsonRpcRequest {
                     jsonrpc: notif.jsonrpc,
                     method: notif.method,
                     params: notif.params,
-                    id: RequestId::Number(0),
+                    id: RequestId::Number(synthetic_id.cast_signed()),
                 };
                 let mut srv = state.server.lock().await;
                 srv.handle_request(&synthetic);
@@ -719,6 +768,7 @@ mod tests {
         assert_eq!(config.channel_capacity, 256);
         assert_eq!(config.retry_ms, DEFAULT_RETRY_MS);
         assert_eq!(config.replay_capacity, DEFAULT_REPLAY_CAPACITY);
+        assert!(config.auth_token.is_none());
     }
 
     #[tokio::test]
@@ -884,5 +934,79 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), task).await;
         assert!(result.is_ok(), "server should shut down within timeout");
         assert!(result.unwrap().unwrap().is_ok());
+    }
+
+    // -- Auth middleware -------------------------------------------------------
+
+    #[tokio::test]
+    async fn sse_router_with_auth_builds_successfully() {
+        let server = McpServer::new(MockProvider::default());
+        let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+        config.auth_token = Some("secret-token".to_owned());
+        let _router = sse_router(server, &config);
+    }
+
+    #[tokio::test]
+    async fn sse_router_without_auth_builds_successfully() {
+        let server = McpServer::new(MockProvider::default());
+        let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+        assert!(config.auth_token.is_none());
+        let _router = sse_router(server, &config);
+    }
+
+    #[test]
+    fn sse_config_with_auth_token() {
+        let mut config = SseConfig::new("127.0.0.1:3000".parse().unwrap());
+        config.auth_token = Some("my-secret".to_owned());
+        assert_eq!(config.auth_token.as_deref(), Some("my-secret"));
+    }
+
+    // -- Synthetic request IDs ------------------------------------------------
+
+    #[tokio::test]
+    async fn synthetic_notification_ids_are_unique() {
+        let state = test_state();
+
+        // Send two notifications and verify the counter advances
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_INITIALIZE,
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test" }
+            },
+            "id": 0
+        })
+        .to_string();
+        if let SseIncoming::Request(req) = parse_sse_incoming(&init_body).unwrap() {
+            let mut srv = state.server.lock().await;
+            srv.handle_request(&req);
+        }
+
+        // First notification uses next_event_id (starts at 1)
+        let id1 = state.next_event_id.load(Ordering::SeqCst);
+        let notif_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_INITIALIZED
+        })
+        .to_string();
+        if let SseIncoming::Notification(notif) = parse_sse_incoming(&notif_body).unwrap() {
+            let synthetic_id = state.next_event_id.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(synthetic_id, id1);
+
+            // Verify the ID is correctly assigned
+            let request = JsonRpcRequest {
+                jsonrpc: notif.jsonrpc,
+                method: notif.method,
+                params: notif.params,
+                id: RequestId::Number(synthetic_id.cast_signed()),
+            };
+            assert_eq!(request.id, RequestId::Number(id1.cast_signed()));
+        }
+
+        // Second call produces a different ID
+        let id2 = state.next_event_id.fetch_add(1, Ordering::SeqCst);
+        assert_ne!(id1, id2);
     }
 }

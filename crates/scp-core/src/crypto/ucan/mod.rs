@@ -189,6 +189,12 @@ pub enum UcanError {
     ClockError(String),
 }
 
+impl From<crate::time::ClockError> for UcanError {
+    fn from(err: crate::time::ClockError) -> Self {
+        Self::ClockError(err.to_string())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UcanHeader
 // ---------------------------------------------------------------------------

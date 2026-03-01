@@ -41,10 +41,12 @@ pub mod traits;
 // Re-export primary types at the crate level for convenience.
 pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
 pub use cover_traffic::{
-    CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender,
+    CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender, pad_to_bucket,
 };
 pub use error::TransportError;
-pub use heartbeat::{HeartbeatConfig, HeartbeatMonitor, SuppressionSuspected};
+pub use heartbeat::{
+    HeartbeatConfig, HeartbeatConfigError, HeartbeatMonitor, SuppressionSuspected,
+};
 pub use manager::TransportManager;
 pub use scoring::SuppressionWarning;
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};

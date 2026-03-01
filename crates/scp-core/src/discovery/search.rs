@@ -108,10 +108,7 @@ pub async fn unified_search<C: ContactCache, Q: ContextQuerier>(
 
     for (context_id, result) in remote_results {
         queried_sources.push(context_id.clone());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = crate::time::now_secs()?;
 
         for agent_entry in result.entries {
             all_entries.push(DiscoveryResultEntry {

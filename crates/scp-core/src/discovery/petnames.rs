@@ -241,11 +241,11 @@ impl PetnameMap {
 }
 
 impl PetnameStore for PetnameMap {
-    fn resolve_petname(&self, name: &str) -> Vec<AddressResolution> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+    fn resolve_petname(
+        &self,
+        name: &str,
+    ) -> Result<Vec<AddressResolution>, crate::time::ClockError> {
+        let now = crate::time::now_secs()?;
 
         let mut results = Vec::new();
 
@@ -279,7 +279,7 @@ impl PetnameStore for PetnameMap {
             });
         }
 
-        results
+        Ok(results)
     }
 }
 
@@ -498,7 +498,7 @@ mod tests {
         let mut map = PetnameMap::new();
         map.set_petname(DID::from("did:dht:zAlice"), "alice".to_owned());
 
-        let results = map.resolve_petname("alice");
+        let results = map.resolve_petname("alice").unwrap();
         assert_eq!(results.len(), 1);
         assert!(matches!(
             &results[0],
@@ -515,7 +515,7 @@ mod tests {
         let mut map = PetnameMap::new();
         map.set_context_petname("ctx-recipes".to_owned(), "recipes".to_owned());
 
-        let results = map.resolve_petname("recipes");
+        let results = map.resolve_petname("recipes").unwrap();
         assert_eq!(results.len(), 1);
         assert!(matches!(
             &results[0],
@@ -533,14 +533,14 @@ mod tests {
         map.set_petname(DID::from("did:dht:zAlice"), "shared".to_owned());
         map.set_context_petname("ctx-shared".to_owned(), "shared".to_owned());
 
-        let results = map.resolve_petname("shared");
+        let results = map.resolve_petname("shared").unwrap();
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn petname_store_resolve_empty_returns_empty() {
         let map = PetnameMap::new();
-        let results = map.resolve_petname("nonexistent");
+        let results = map.resolve_petname("nonexistent").unwrap();
         assert!(results.is_empty());
     }
 }

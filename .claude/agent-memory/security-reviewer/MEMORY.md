@@ -66,11 +66,12 @@
 - MEDIUM: custody_type() returns Hardware as silent default on lock contention
 
 ### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 + PR#127
-- CRITICAL: ucan_validate skips Ed25519 signature verification entirely -- complete auth bypass
-- CRITICAL: ucan_mint returns unsigned tokens accepted by ucan_validate
+- FIXED (PR#127): ucan_validate now has Ed25519 signature verification via verify_strict
+- REMAINING (MEDIUM): ucan_mint returns unsigned tokens (metadata-only, no Ed25519 signing) -- SCP-218 scope
 - HIGH: runtime.rs reimplements scp-core logic (Merkle tree, schema, tool registry) -- divergence risk
 - MEDIUM: context_send base64 check is_empty() only; panic hook leaks file paths
 - MEDIUM: Context IDs use UUID format not crypto-random hex per spec 18.4.1
+- MEDIUM: compute_revocation_cid uses unwrap_or_default() on serde_json -- silent CID collision on serialize failure
 
 ### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86 + PR#127
 - CRITICAL: ucan_mint uses [0u8; 64] placeholder zero signature
@@ -132,10 +133,27 @@
 - GOOD: rust-deny job runs cargo-deny for supply chain security
 - GOOD: PyPI uses OIDC Trusted Publishers (no stored token)
 
+### Broadcast Context (`scp-core/src/context/broadcast.rs`) -- PR#127
+- MEDIUM: validate_messages_read_ucan checks aud + att only -- no expiry, signature, revocation, or chain verification
+- MEDIUM: subscribers/authors/block_list HashMaps unbounded -- Sybil risk on open broadcast contexts
+- GOOD: Wildcard UCAN rejection (RED-012); epoch overflow via checked_add; per-author key isolation
+
+### Event Log Checkpoint (`scp-core/src/event_log/checkpoint.rs`) -- PR#127
+- HIGH: compute_checkpoint_canonical_hash lacks length prefixes and domain separator
+- MEDIUM: current_timestamp() uses unwrap_or(0) on clock failure -- zero-timestamp checkpoints
+- MEDIUM: CheckpointManager::checkpoints Vec unbounded growth
+- GOOD: Cross-checkpoint verification; pruned inclusion proofs; RFC 6962 interior node hashing
+
+### PyO3 UCAN Bridge (PR#127)
+- GOOD: Full 11-step ADR-016 pipeline via scp-core delegation with real Ed25519 signing
+- GOOD: MintParams uses real KeyCustody; build_proof_resolver indexes by CID
+- GOOD: Tool handler cloned (Arc) before execution -- DashMap shard lock no longer held
+
 ### General Patterns
 - No `unwrap`/`expect` in lib code -- project standard via clippy deny
 - `thiserror` for error types; Rust edition 2024; `#![forbid(unsafe_code)]` on all crates except scp-ffi
 - `zeroize` crate not yet used anywhere; `unwrap_or_default()` on clock ops is a recurring systemic pattern
+- Inner envelope now uses domain-separated length-prefixed canonical hash -- gold standard pattern for other hash functions to follow
 - FfiBridgeProvider reimplementing scp-core logic instead of delegating silently drops spec obligations (event log, timeout, request_id) -- always prefer delegation
 - DashMap shard locks must not be held across Python GIL acquisition -- clone Arc before entering with_context
 - New PyO3 Rust functions must also be wrapped in the Python SDK layer or they are unreachable to SDK users

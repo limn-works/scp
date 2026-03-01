@@ -22,6 +22,7 @@ extension-module = ["pyo3/extension-module"]
 pyo3 = { version = "0.23", features = ["experimental-async"] }
 tokio = { workspace = true }
 scp-core = { path = "../scp-core" }
+scp-ffi-common = { path = "common" }
 scp-mcp = { path = "../scp-mcp" }
 scp-platform = { path = "../scp-platform", features = ["software_platform"] }
 scp-transport = { path = "../scp-transport" }
