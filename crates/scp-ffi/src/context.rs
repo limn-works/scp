@@ -460,13 +460,30 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
         .map_err(|e| PyRuntimeError::new_err(format!("failed to register context runtime: {e}")))?;
 
     // Register in the known-contexts registry for discovery via
-    // py_mcp_load_contexts. Derive a routing ID from the context ID
-    // (SHA-256 hash) and use the currently connected relay URL if available.
+    // py_mcp_load_contexts. Derive a per-identity routing ID using
+    // HMAC-SHA256(random_secret, context_id || "scp-pseudonym") to preserve
+    // participant unlinkability. The random secret is per-identity and
+    // in-memory only — see runtime::get_or_create_routing_secret.
     {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(context_id.as_bytes());
-        let hash: [u8; 32] = hasher.finalize().into();
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        type HmacSha256 = Hmac<Sha256>;
+
+        // Interim derivation: use a per-identity random secret as the HMAC key.
+        // This provides actual pseudonym unlinkability — unlike the DID (which is
+        // public), the secret never leaves the client. The secret is in-memory
+        // only and will not persist across process restarts.
+        //
+        // When `KeyCustody` is wired into the runtime, replace with
+        // `scp_core::envelope::pseudonym::derive_pseudonym` using real key material.
+        // See §9.10.4 and crates/scp-core/src/envelope/pseudonym.rs for the spec derivation.
+        let routing_secret = crate::runtime::get_or_create_routing_secret(identity_did);
+        let mut mac = HmacSha256::new_from_slice(&routing_secret)
+            .map_err(|e| PyRuntimeError::new_err(format!("HMAC initialization failed: {e}")))?;
+        mac.update(context_id.as_bytes());
+        mac.update(b"scp-pseudonym");
+        let routing_id: [u8; 32] = mac.finalize().into_bytes().into();
 
         // Get the relay URL from transport status if a relay is connected.
         let relay_url = crate::transport::py_transport_status()
@@ -475,7 +492,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
             .unwrap_or_default();
 
         let known = crate::runtime::KnownContext {
-            routing_id: hash,
+            routing_id,
             relay_url,
             member_did: identity_did.to_owned(),
             last_seen: std::time::SystemTime::now()

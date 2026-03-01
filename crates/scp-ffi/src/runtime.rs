@@ -341,6 +341,31 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 }
 
 // ---------------------------------------------------------------------------
+// Per-identity routing secrets (interim pseudonym derivation)
+// ---------------------------------------------------------------------------
+
+/// Returns a 32-byte random secret for the given identity DID, creating one
+/// if none exists.
+///
+/// This is an interim mechanism for pseudonym derivation until `KeyCustody`
+/// is wired into the FFI bridge. The secret provides actual unlinkability
+/// (unlike using the public DID as the HMAC key). The secret is in-memory
+/// only and will not match across process restarts.
+///
+/// When `KeyCustody` is wired in, replace callers with
+/// `scp_core::envelope::pseudonym::derive_pseudonym` using real key material.
+pub fn get_or_create_routing_secret(identity_did: &str) -> [u8; 32] {
+    static IDENTITY_ROUTING_SECRETS: OnceLock<DashMap<String, [u8; 32]>> = OnceLock::new();
+
+    let map = IDENTITY_ROUTING_SECRETS.get_or_init(DashMap::new);
+    *map.entry(identity_did.to_owned()).or_insert_with(|| {
+        let mut secret = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
+        secret
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Relay connection state (SCP-213: transport wiring)
 // ---------------------------------------------------------------------------
 

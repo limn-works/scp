@@ -3506,6 +3506,7 @@ dependencies = [
  "base64",
  "dashmap",
  "ed25519-dalek",
+ "hmac",
  "pyo3",
  "rand 0.8.5",
  "scp-core",
