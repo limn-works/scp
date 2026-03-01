@@ -275,7 +275,7 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 ///
 /// # Note
 ///
-/// Stub — see SCP-217 for StorageProvider wiring. Currently reconstructs a
+/// Stub — see SCP-217 for `StorageProvider` wiring. Currently reconstructs a
 /// `PyIdentity` from the DID string with `"in_memory"` custody instead of
 /// loading from persistent storage (ADR-013 acceptance criterion 2).
 #[pyfunction]
