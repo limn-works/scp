@@ -1,82 +1,84 @@
 # Loom Status
 
-## Iteration: 4 (2026-03-01)
+## Iteration: 5 (2026-03-01)
 
-### Result: PARTIAL
+### Result: SUCCESS
 
-4 of 5 dispatched stories completed. SCP-221 (Swift SDK) failed entirely — subagent couldn't execute bash. SCP-214 progressed (9/17 criteria). All tests pass. All code committed. Review fixes applied.
+All 5 dispatched stories completed successfully. Tests green. Review found and fixed 1 bug (ScpViewModel.onCleared scope). All code committed.
 
 ### Commits
 
 | Commit | Story | Description |
 |--------|-------|-------------|
-| `b46c324` | SCP-219 | feat(napi): wire UCAN and event log bridge to scp-core |
-| `af3d572` | SCP-219 | docs(napi): add CLAUDE.md |
-| `5fc5f96` | SCP-223 | feat(discovery): implement addressing types (SCP-223) |
-| `c5436f2` | SCP-218 | feat(wasm): wire WASM bridge to runtime |
-| `5c0e1d6` | SCP-214 | feat(ffi): wire KeyCustody into PyO3 bridge |
-| `8f01fe2` | SCP-214 | docs(ffi): update CLAUDE.md with identity registry pattern |
-| `ca15ebb` | — | merge: SCP-214 worktree |
-| `d3ffa85` | — | merge: SCP-218 worktree |
-| `b4058b9` | — | merge: SCP-219 worktree |
-| `55043f0` | — | merge: SCP-223 worktree |
-| `aafb9ff` | — | chore(prd): mark SCP-218, SCP-219, SCP-223 done; update SCP-214 |
-| `e50dee5` | SCP-223 | fix(discovery): address review findings for SCP-223 |
-| `57d8e79` | SCP-219 | fix(napi): produce properly encoded UCAN tokens in ucan_mint |
-| `d939b80` | SCP-219 | docs(napi): CLAUDE.md and lesson for NAPI bridge UCAN encoded field |
-| `5e9c4c7` | — | docs: add review lessons and CLAUDE.md for WASM/NAPI bridges |
-| `40f2835` | — | merge: SCP-219 fix worktree |
+| `668a5e6` | — | chore: update Cargo.lock for iteration 4 dependency additions |
+| `35991ea` | SCP-114 | feat(platform): create Android platform module root and re-exports |
+| `e220e49` | SCP-116 | feat(kotlin): implement Flow/Channel streaming layer |
+| `2548f6c` | SCP-117 | feat(kotlin): implement Android lifecycle-aware resource management |
+| `45e97a9` | SCP-119 | feat(kotlin): configure Maven Central publishing |
+| `622e26a` | SCP-221 | feat(swift): wire SDK wrapper functions to UniFFI bridge |
+| `a5830c7` | — | chore(prd): mark SCP-114, SCP-116, SCP-117, SCP-119, SCP-221 done |
+| `71f15e9` | SCP-117 | fix(kotlin): use dedicated cleanup scope in ScpViewModel.onCleared |
+| `2d58fa3` | — | docs: add review learnings for SCP-116, SCP-221 |
 
 ### Failing Tests
-None. Full workspace compiles and tests pass (`cargo test --workspace --exclude scp-ffi`). 2574 tests green.
+None. Full workspace compiles and tests pass (`cargo test --workspace --exclude scp-ffi`).
 
 ### Uncommitted Changes
 None.
 
 ### Fixed This Iteration
-- SCP-223: unscoped resolution missing domain handle lookup path; corroborate_results wrong ResolutionLayer — commit `e50dee5`
-- SCP-219: NAPI ucan_mint returning empty `encoded` field instead of proper JWT — commit `57d8e79`
+- SCP-117: ScpViewModel.onCleared() was launching cleanup on viewModelScope which is already cancelled — switched to dedicated CoroutineScope with runBlocking (commit `71f15e9`)
 
 ### Tests Added / Updated
-- `crates/scp-core/src/discovery/addressing.rs` — 35 tests: ParsedAddress parsing, AddressResolver multi-path resolution, corroboration, caching
-- `crates/scp-core/src/discovery/handles.rs` — 20 tests: HandleRegistry register/lookup/deregister/list
-- `crates/scp-core/src/discovery/petnames.rs` — 15 tests: PetnameMap bidirectional mappings, events
+- `bindings/kotlin/scp-sdk-kotlin/src/test/kotlin/com/limn/scp/stream/StreamsTest.kt` — 22 tests: cold streams, hot streams, ColdMessageFlow, pagination
+- `bindings/kotlin/scp-sdk-kotlin-android/src/test/kotlin/com/limn/scp/android/ContextLifecycleTest.kt` — 5 tests: lifecycle flow behavior
+- `bindings/kotlin/scp-sdk-kotlin-android/src/test/kotlin/com/limn/scp/android/ScpViewModelTest.kt` — 6 tests: ViewModel cleanup
+- `bindings/swift/Tests/SCPTests/ToolsTests.swift` — 3 async roundtrip tests
+- `bindings/swift/Tests/SCPTests/UcanTests.swift` — 6 async roundtrip tests
+- `bindings/swift/Tests/SCPTests/TransportTests.swift` — 2 async roundtrip tests
+- `bindings/swift/Tests/SCPTests/EventLogTests.swift` — 3 async roundtrip tests
+- `bindings/swift/Tests/SCPTests/McpTests.swift` — 4 async roundtrip tests
+- `bindings/swift/Tests/SCPTests/TrustTests.swift` — 2 async roundtrip tests
+
+### Tool-Gated Stories
+None.
 
 ### Subagent Outcomes
 
 | Story | Result | Summary |
 |-------|--------|---------|
-| SCP-214 (KeyCustody wiring) | PARTIAL | 9/17 criteria: identity registry, KeyCustody wiring, ucan_mint/delegate, rotate_key/migrate, routing secret removal. Remaining: UniFFI (1-2), NAPI/WASM routing (5), cross-platform test (16). |
-| SCP-218 (WASM bridge) | SUCCESS | Local WASM runtime (can't use scp-core due to tokio). tools/ucan/event_log wired. ~700 lines runtime.rs. |
-| SCP-219 (NAPI bridge) | SUCCESS | Bridge trait adapters (BridgeDidResolver, BridgeRevocationChecker, BridgeProofResolver, BridgeNonceTracker). JWT-encoded ucan_mint. event_log query/verify. |
-| SCP-221 (Swift SDK) | FAILED | Subagent couldn't run bash commands. Zero commits. Needs different approach. |
-| SCP-223 (Addressing types) | SUCCESS | ParsedAddress, TrustLevel, HandleRegistry, AddressResolver, PetnameMap, ResolutionCache. 70 tests, ~2700 lines. |
+| SCP-114 (Android platform module) | SUCCESS | Rust android/ module root with cfg gate, re-exports, doc modules. Kotlin PlatformAdapter factory. |
+| SCP-116 (Kotlin streaming) | SUCCESS | ColdStreamFactory, HotStreamFactory, ColdMessageFlow. Fixes SCP-115 trySend/awaitClose/double-buffer issues. 22 tests. |
+| SCP-117 (Android lifecycle) | SUCCESS | ContextLifecycle.kt (asLifecycleFlow extension), ScpViewModel.kt (auto-cleanup). 11 tests. |
+| SCP-119 (Maven Central) | SUCCESS | maven-publish + signing plugins for both modules. Sonatype OSSRH repos. detekt.yml updates. |
+| SCP-221 (Swift SDK wiring) | SUCCESS | All 6 Swift wrapper modules wired via injectable bridge closures. 18 async tests. Third attempt succeeded. |
 
 ### Review Outcomes
 
-**SCP-214 (KeyCustody wiring):**
-- Deferred: py_identity_load doesn't register loaded identity in identity registry; pre-rotation key not stored in custody
+**SCP-116 (Kotlin streaming):**
+- Learning: messageHistoryPages/eventLogPages share same FFI call (documented in CLAUDE.md)
+- Learning: runBlocking in HotStreamFactory factory methods (documented in CLAUDE.md)
+- Learning: Hot stream cleanup is explicit, not scope-linked (lesson file)
 
-**SCP-218 (WASM bridge):**
-- Deferred: partial UCAN validation (local-only, no scp-core); CID consistency (no multihash); wildcard matching bug in tool_invoke
+**SCP-117 (Android lifecycle):**
+- ACTION FIXED: ScpViewModel.onCleared() used viewModelScope (already cancelled). Fixed with dedicated cleanupScope + runBlocking (commit `71f15e9`)
+- Learning: viewModelScope cancelled before onCleared runs (lesson file)
 
-**SCP-219 (NAPI bridge):**
-- Fixed: ucan_mint empty encoded field → proper JWT (commit `57d8e79`)
-- Deferred: delegated UCAN validation gap (empty BridgeProofResolver); zero event_log tests
+**SCP-221 (Swift SDK wiring):**
+- Learning: ContextBridge type aliases must match ScpBindings signatures (lesson file updated)
+- Learning: noPointer constructors are test-only, never production (lesson file updated)
+- Learning: Legacy UCAN wrappers manufacture fake handles, always fail in production (lesson file updated)
 
-**SCP-223 (Addressing types):**
-- Fixed: unscoped resolution + corroborate_results bugs (commit `e50dee5`)
-- All other criteria pass
-
-### Cumulative Progress (Iterations 1-4)
-**Done:** SCP-092, SCP-164, SCP-210, SCP-211, SCP-212, SCP-213, SCP-216, SCP-217, SCP-218, SCP-219, SCP-223, SCP-227
+### Cumulative Progress (Iterations 1-5)
+**Done:** SCP-092, SCP-114, SCP-116, SCP-117, SCP-119, SCP-164, SCP-210, SCP-211, SCP-212, SCP-213, SCP-216, SCP-217, SCP-218, SCP-219, SCP-221, SCP-223, SCP-227
 **In-progress:** SCP-214 (9/17 criteria)
-**Failed:** SCP-221 (2 attempts)
 **Blocked:** SCP-038 (by SCP-214)
 
+### Remaining Stories
+- **SCP-118** (Jetpack Compose state holders) — now unblocked (SCP-116, SCP-117 done)
+- **SCP-120** (Kotlin SDK conformance tests) — now unblocked
+
 ### Next Iteration Recommendations
-1. **SCP-221** (Swift SDK) — retry with main agent or pre-validate Swift toolchain
-2. **SCP-214** remaining criteria — UniFFI callback interface, NAPI/WASM routing, cross-platform test
-3. **SCP-038** — unblocked once SCP-214 completes identity wiring
-4. Address deferred review findings (py_identity_load gap, NAPI proof resolver, WASM validation)
-5. Consider SCP-220 (Kotlin SDK), SCP-222 (MCP multi-transport), SCP-224 (context templates) if capacity allows
+1. **SCP-118** (Compose state holders) — unblocked, builds on SCP-116/117
+2. **SCP-120** (Conformance tests) — unblocked, exercises full Kotlin SDK
+3. **SCP-214** remaining criteria — UniFFI callback interface, NAPI/WASM routing
