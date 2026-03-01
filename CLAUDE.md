@@ -39,6 +39,16 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — the social layer 
 
 `session_context` at start → `search` before decisions → `smart_ingest` to save (auto-deduplicates) → `codebase` for project patterns/decisions → `intention` for reminders → `memory` for promote/demote. **Use every time you receive or recall information.**
 
+**Remember with connotation** — tag memories so future sessions know how to act:
+- `"always"` — do this every time, no exceptions.
+- `"prefer"` — good default, may have exceptions. Use unless context says otherwise.
+- `"avoid"` — bad default, may have exceptions. Don't use unless context demands it.
+- `"never"` — don't do this. Detect it in others' code.
+
+Architectural decisions: `codebase(action="remember_decision")` — mirrors ADRs for fast recall; includes rejected alternatives so sessions don't re-litigate.
+
+Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige is fluid cognitive recall. They complement each other: decisions belong in both.
+
 ### Loom Plugin — Autonomous dev loop ([instructions](./.claude/LOOM_PLUGIN.md))
 
 User provides a directive → dispatches parallel subagents → runs tests → commits green code → repeats. State and logs at `.loom/`. Use when given one of the / commands.

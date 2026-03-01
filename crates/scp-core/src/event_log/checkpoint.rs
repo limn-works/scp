@@ -122,6 +122,7 @@ pub enum CheckpointComparison {
 /// - 10 minutes have elapsed since the last checkpoint,
 ///
 /// whichever comes first. See ADR-011 acceptance criterion 8.
+#[deprecated(note = "Use CheckpointManager instead")]
 #[derive(Debug, Clone)]
 pub struct CheckpointScheduler {
     /// Number of events appended since the last checkpoint.
@@ -130,6 +131,7 @@ pub struct CheckpointScheduler {
     last_checkpoint_timestamp: u64,
 }
 
+#[allow(deprecated)]
 impl CheckpointScheduler {
     /// Creates a new scheduler with the given initial timestamp.
     ///
@@ -288,16 +290,18 @@ impl CheckpointManager {
         let elapsed = current_timestamp.saturating_sub(self.last_checkpoint_timestamp);
         let time_due = elapsed >= self.policy.time_interval_secs;
         let event_due = self.events_since_last >= self.policy.event_interval;
+        let min_events_met = self.events_since_last >= self.policy.min_events_since_last;
 
-        // Event threshold met: always create checkpoint.
-        if event_due {
+        // Event threshold met AND minimum events met: create checkpoint.
+        if event_due && min_events_met {
             return true;
         }
 
-        // Time threshold met: create checkpoint if minimum events met, or
-        // if the time interval has been reached (time is the upper bound on
-        // checkpoint staleness per ADR-030 §3).
-        if time_due {
+        // Time threshold met AND minimum events met: create checkpoint.
+        // The time interval is the upper bound on checkpoint staleness per
+        // ADR-030 §3, but we still require the minimum event threshold to
+        // prevent checkpoint spam in low-activity contexts.
+        if time_due && min_events_met {
             return true;
         }
 
@@ -329,19 +333,16 @@ impl CheckpointManager {
             return Ok(None);
         }
 
-        let checkpoint = generate_checkpoint_at(
-            log,
-            sender_did,
-            epoch,
-            current_timestamp,
-            key_custody,
-            signing_key,
-        )
-        .await?;
-
-        self.checkpoints.push(checkpoint.clone());
-        self.events_since_last = 0;
-        self.last_checkpoint_timestamp = current_timestamp;
+        let checkpoint = self
+            .create_and_store_checkpoint(
+                log,
+                sender_did,
+                epoch,
+                current_timestamp,
+                key_custody,
+                signing_key,
+            )
+            .await?;
 
         Ok(Some(checkpoint))
     }
@@ -356,6 +357,30 @@ impl CheckpointManager {
     ///
     /// Returns [`EventLogError::SigningFailed`] if signing fails.
     pub async fn force_create_checkpoint(
+        &mut self,
+        log: &EventLog,
+        sender_did: &DID,
+        epoch: u64,
+        current_timestamp: u64,
+        key_custody: &impl KeyCustody,
+        signing_key: &KeyHandle,
+    ) -> Result<ConsistencyCheckpoint, EventLogError> {
+        self.create_and_store_checkpoint(
+            log,
+            sender_did,
+            epoch,
+            current_timestamp,
+            key_custody,
+            signing_key,
+        )
+        .await
+    }
+
+    /// Creates a checkpoint, stores it, and resets the scheduler.
+    ///
+    /// Shared implementation for [`Self::maybe_create_checkpoint`] and
+    /// [`Self::force_create_checkpoint`].
+    async fn create_and_store_checkpoint(
         &mut self,
         log: &EventLog,
         sender_did: &DID,
@@ -798,36 +823,8 @@ pub async fn generate_checkpoint(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
 ) -> Result<ConsistencyCheckpoint, EventLogError> {
-    let context_id = log.context_id().to_owned();
-    let event_count = tree::event_count(log);
-    let merkle_root = tree::root(log);
     let timestamp = current_timestamp()?;
-
-    // Compute the canonical hash for signing.
-    let canonical_hash = compute_checkpoint_canonical_hash(
-        &context_id,
-        sender_did,
-        event_count,
-        &merkle_root,
-        Some(epoch),
-        timestamp,
-    );
-
-    // Sign the canonical hash.
-    let signature = key_custody
-        .sign(signing_key, &canonical_hash)
-        .await
-        .map_err(|e| EventLogError::SigningFailed(e.to_string()))?;
-
-    Ok(ConsistencyCheckpoint {
-        context_id,
-        sender_did: sender_did.clone(),
-        event_count,
-        merkle_root,
-        epoch: Some(epoch),
-        timestamp,
-        signature: signature.into_bytes(),
-    })
+    generate_checkpoint_at(log, sender_did, epoch, timestamp, key_custody, signing_key).await
 }
 
 /// Compares a received remote checkpoint against the local event log state.
@@ -1565,6 +1562,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[allow(deprecated)]
     fn scheduler_triggers_after_event_threshold() {
         let mut scheduler = CheckpointScheduler::new(1_000_000);
 
@@ -1585,6 +1583,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[allow(deprecated)]
     fn scheduler_triggers_after_time_threshold() {
         let scheduler = CheckpointScheduler::new(1_000_000);
 
@@ -1598,6 +1597,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[allow(deprecated)]
     fn scheduler_reset_clears_state() {
         let mut scheduler = CheckpointScheduler::new(1_000_000);
 
@@ -1856,9 +1856,17 @@ mod tests {
             time_interval_secs: 3600,
             min_events_since_last: 10,
         };
-        let mgr = CheckpointManager::new(policy, 1_000_000);
+        let mut mgr = CheckpointManager::new(policy, 1_000_000);
 
-        // Time threshold reached even with 0 events.
+        // Time threshold reached but min_events_since_last not met.
+        assert!(!mgr.is_checkpoint_due(1_003_600));
+
+        // Record enough events to meet min_events_since_last.
+        for _ in 0..10 {
+            mgr.record_event();
+        }
+
+        // Now both time threshold and min events are met.
         assert!(mgr.is_checkpoint_due(1_003_600));
     }
 
