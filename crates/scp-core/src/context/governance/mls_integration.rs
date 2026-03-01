@@ -430,13 +430,17 @@ pub const fn is_proposal_epoch_valid(
 mod tests {
     use super::*;
     use crate::context::governance::{
-        GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+        GovernanceAction, GovernanceProposal, ProposalStatus, VoteType, sign_vote,
     };
     use crate::context::params::{Capability, ContextParams, ToolRegistration};
     use crate::identity::DID;
 
     fn alice() -> DID {
         DID::from("did:dht:z6MkAlice")
+    }
+
+    fn sk_alice() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
     }
 
     fn bob() -> DID {
@@ -472,12 +476,15 @@ mod tests {
             status: ProposalStatus::Approved,
             created_at: 1_700_000_000,
             voting_deadline: 1_700_086_400,
-            approvals: vec![SignedVote {
-                voter_did: alice(),
-                vote: VoteType::Approve,
-                timestamp: 1_700_000_000,
-                signature: Vec::new(),
-            }],
+            approvals: vec![
+                sign_vote(
+                    &VoteType::Approve,
+                    alice().as_ref(),
+                    1_700_000_000,
+                    &sk_alice(),
+                )
+                .expect("sign_vote"),
+            ],
             rejections: Vec::new(),
             created_at_epoch: epoch,
         }

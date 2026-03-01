@@ -141,7 +141,7 @@ pub use standing::{StandingChannelError, StandingChannelManager};
 pub use governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
+    SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine, sign_vote, verify_vote,
 };
 
 // Re-export broadcast context types (SCP-227, spec section 5.14).

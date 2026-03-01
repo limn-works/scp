@@ -50,6 +50,7 @@ pub mod unanimity;
 
 use std::collections::HashMap;
 
+use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -100,6 +101,115 @@ pub(crate) fn compute_proposal_id(
     let mut id = [0u8; 32];
     id.copy_from_slice(&result);
     id
+}
+
+// ---------------------------------------------------------------------------
+// Vote signing
+// ---------------------------------------------------------------------------
+
+/// Domain separator prepended to the vote hash input to prevent
+/// cross-protocol signature confusion. Because the same Ed25519 key may be
+/// used for multiple signing purposes (envelope, UCAN, DID auth, votes),
+/// a unique prefix ensures that a signature produced for one purpose can
+/// never be replayed as valid in another.
+const VOTE_DOMAIN_SEPARATOR: &[u8] = b"SCP-VOTE-V1:";
+
+/// Computes the canonical hash over vote fields for signing.
+///
+/// Uses SHA-256 with a domain separator and length-prefixed fields:
+/// ```text
+/// SHA-256(VOTE_DOMAIN_SEPARATOR
+///         || len(voter_did) as u32 BE || voter_did
+///         || len(vote_json) as u32 BE || vote_json
+///         || timestamp BE)
+/// ```
+///
+/// Length prefixes prevent ambiguity when concatenating variable-length fields.
+#[allow(clippy::similar_names)] // voter_did_bytes vs vote_type_bytes are semantically distinct
+fn compute_vote_hash(
+    voter_did: &str,
+    vote: &VoteType,
+    timestamp: u64,
+) -> Result<Vec<u8>, GovernanceError> {
+    let vote_type_bytes = serde_json::to_vec(vote)
+        .map_err(|e| GovernanceError::SerializationFailed(e.to_string()))?;
+
+    let voter_did_bytes = voter_did.as_bytes();
+
+    let mut hasher = Sha256::new();
+    hasher.update(VOTE_DOMAIN_SEPARATOR);
+    // Length-prefixed voter DID.
+    #[allow(clippy::cast_possible_truncation)] // DID strings are always < 4 GiB
+    let voter_len = voter_did_bytes.len() as u32;
+    hasher.update(voter_len.to_be_bytes());
+    hasher.update(voter_did_bytes);
+    // Length-prefixed vote type.
+    #[allow(clippy::cast_possible_truncation)] // serialized VoteType is a few bytes
+    let vote_len = vote_type_bytes.len() as u32;
+    hasher.update(vote_len.to_be_bytes());
+    hasher.update(&vote_type_bytes);
+    // Timestamp.
+    hasher.update(timestamp.to_be_bytes());
+    Ok(hasher.finalize().to_vec())
+}
+
+/// Creates a signed vote with a real Ed25519 signature.
+///
+/// Computes a canonical hash over `(voter_did, vote, timestamp)` with a
+/// `SCP-VOTE-V1:` domain separator and length-prefixed fields, then signs
+/// it with the provided Ed25519 signing key.
+///
+/// # Errors
+///
+/// Returns [`GovernanceError::SerializationFailed`] if the vote type cannot
+/// be serialized.
+pub fn sign_vote(
+    vote: &VoteType,
+    voter_did: &str,
+    timestamp: u64,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<SignedVote, GovernanceError> {
+    let hash = compute_vote_hash(voter_did, vote, timestamp)?;
+    let signature = signing_key.sign(&hash);
+
+    Ok(SignedVote {
+        voter_did: DID::from(voter_did),
+        vote: vote.clone(),
+        timestamp,
+        signature: signature.to_bytes().to_vec(),
+    })
+}
+
+/// Verifies the Ed25519 signature on a signed vote.
+///
+/// Recomputes the canonical hash from the vote's fields using the same
+/// domain separator and layout as [`sign_vote`], then verifies the
+/// signature against the provided public key.
+///
+/// # Errors
+///
+/// Returns [`GovernanceError::VerificationFailed`] if:
+/// - The signature bytes are not exactly 64 bytes.
+/// - The signature does not match the recomputed hash.
+/// - The vote type cannot be serialized for hash recomputation.
+pub fn verify_vote(
+    vote: &SignedVote,
+    voter_public_key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), GovernanceError> {
+    let hash = compute_vote_hash(vote.voter_did.as_ref(), &vote.vote, vote.timestamp)?;
+
+    let sig_bytes: [u8; 64] = vote.signature.as_slice().try_into().map_err(|_| {
+        GovernanceError::VerificationFailed(format!(
+            "signature must be 64 bytes, got {}",
+            vote.signature.len()
+        ))
+    })?;
+
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+    voter_public_key
+        .verify_strict(&hash, &signature)
+        .map_err(|e| GovernanceError::VerificationFailed(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +495,14 @@ pub enum GovernanceError {
     /// The requested operation is not supported by this governance model.
     #[error("operation not supported: {0}")]
     OperationNotSupported(String),
+
+    /// Vote signing failed.
+    #[error("vote signing failed: {0}")]
+    SigningFailed(String),
+
+    /// Vote signature verification failed.
+    #[error("vote verification failed: {0}")]
+    VerificationFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +562,8 @@ pub trait GovernanceEngine: Send + Sync {
     ///
     /// The proposer must hold `GovernancePropose` capability (UCAN-validated).
     /// In single-admin mode, the proposal is auto-approved if the proposer is
-    /// the admin.
+    /// the admin. The signing key is used to produce an Ed25519 signature over
+    /// the proposer's implicit approval vote.
     ///
     /// # Errors
     ///
@@ -455,11 +574,13 @@ pub trait GovernanceEngine: Send + Sync {
         proposer: &DID,
         action: GovernanceAction,
         context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError>;
 
     /// Cast an approval vote on a pending proposal.
     ///
     /// The voter must hold `GovernanceVote` capability (UCAN-validated).
+    /// The signing key produces an Ed25519 signature over the vote content.
     /// Returns the updated proposal status and any events produced.
     ///
     /// # Errors
@@ -471,11 +592,13 @@ pub trait GovernanceEngine: Send + Sync {
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>;
 
     /// Cast a rejection vote on a pending proposal.
     ///
     /// The voter must hold `GovernanceVote` capability (UCAN-validated).
+    /// The signing key produces an Ed25519 signature over the vote content.
     /// Returns the updated proposal status and any events produced.
     ///
     /// # Errors
@@ -487,6 +610,7 @@ pub trait GovernanceEngine: Send + Sync {
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>;
 
     /// Withdraw a previously cast vote on a pending proposal.
@@ -606,6 +730,7 @@ impl GovernanceEngine for SingleAdminEngine {
         proposer: &DID,
         action: GovernanceAction,
         context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
         // Only the admin can propose in single-admin mode.
         if *proposer != self.admin_did {
@@ -624,6 +749,14 @@ impl GovernanceEngine for SingleAdminEngine {
             return Err(GovernanceError::DuplicateProposal(hex_encode(&proposal_id)));
         }
 
+        // Sign the proposer's implicit approval vote.
+        let admin_vote = sign_vote(
+            &VoteType::Approve,
+            proposer.as_ref(),
+            context.now,
+            signing_key,
+        )?;
+
         // In single-admin mode, the proposal is immediately approved.
         let proposal = GovernanceProposal {
             proposal_id,
@@ -633,12 +766,7 @@ impl GovernanceEngine for SingleAdminEngine {
             status: ProposalStatus::Approved,
             created_at: context.now,
             voting_deadline: context.now, // Immediate resolution.
-            approvals: vec![SignedVote {
-                voter_did: proposer.clone(),
-                vote: VoteType::Approve,
-                timestamp: context.now,
-                signature: Vec::new(), // Signature validation deferred to UCAN layer.
-            }],
+            approvals: vec![admin_vote],
             rejections: Vec::new(),
             created_at_epoch: context.current_epoch,
         };
@@ -671,6 +799,7 @@ impl GovernanceEngine for SingleAdminEngine {
         proposal_id: &ProposalId,
         voter: &DID,
         _context: &GovernanceContext,
+        _signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         let proposal =
             self.proposals
@@ -695,6 +824,7 @@ impl GovernanceEngine for SingleAdminEngine {
         proposal_id: &ProposalId,
         voter: &DID,
         _context: &GovernanceContext,
+        _signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         let proposal =
             self.proposals
@@ -763,6 +893,20 @@ mod tests {
 
     fn carol() -> DID {
         DID::from("did:dht:z6MkCarol")
+    }
+
+    /// Returns a deterministic signing key for use in governance tests.
+    ///
+    /// The seed is arbitrary -- tests only care that the key is valid,
+    /// not that it corresponds to a real DID.
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
+    }
+
+    /// Returns a second deterministic signing key (different from
+    /// [`test_signing_key`]) for multi-party test scenarios.
+    fn test_signing_key_2() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[2u8; 32])
     }
 
     fn test_context(admin: &DID) -> GovernanceContext {
@@ -984,7 +1128,9 @@ mod tests {
             role: "member".to_owned(),
         };
 
-        let (proposal, events) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, events) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
 
         // Proposal should be immediately approved.
         assert_eq!(proposal.status, ProposalStatus::Approved);
@@ -1027,7 +1173,7 @@ mod tests {
             role: "member".to_owned(),
         };
 
-        let result = engine.propose(&bob(), action, &ctx);
+        let result = engine.propose(&bob(), action, &ctx, &test_signing_key_2());
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GovernanceError::NotAdmin));
     }
@@ -1043,11 +1189,13 @@ mod tests {
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
-        let (proposal, _) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, _) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
 
         // Approve on an already-approved proposal returns the current status.
         let (status, events) = engine
-            .approve(&proposal.proposal_id, &admin, &ctx)
+            .approve(&proposal.proposal_id, &admin, &ctx, &test_signing_key())
             .expect("approve");
         assert_eq!(status, ProposalStatus::Approved);
         assert!(events.is_empty(), "no-op should produce no events");
@@ -1064,10 +1212,12 @@ mod tests {
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
-        let (proposal, _) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, _) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
 
         let (status, events) = engine
-            .reject(&proposal.proposal_id, &admin, &ctx)
+            .reject(&proposal.proposal_id, &admin, &ctx, &test_signing_key())
             .expect("reject");
         assert_eq!(status, ProposalStatus::Approved);
         assert!(events.is_empty());
@@ -1084,9 +1234,11 @@ mod tests {
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
-        let (proposal, _) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, _) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
 
-        let result = engine.approve(&proposal.proposal_id, &bob(), &ctx);
+        let result = engine.approve(&proposal.proposal_id, &bob(), &ctx, &test_signing_key_2());
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1105,9 +1257,11 @@ mod tests {
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
-        let (proposal, _) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, _) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
 
-        let result = engine.reject(&proposal.proposal_id, &bob(), &ctx);
+        let result = engine.reject(&proposal.proposal_id, &bob(), &ctx, &test_signing_key_2());
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1126,7 +1280,7 @@ mod tests {
         let ctx = test_context(&admin);
         let fake_id = [0u8; 32];
 
-        let result = engine.approve(&fake_id, &admin, &ctx);
+        let result = engine.approve(&fake_id, &admin, &ctx, &test_signing_key());
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1141,7 +1295,7 @@ mod tests {
         let ctx = test_context(&admin);
         let fake_id = [0u8; 32];
 
-        let result = engine.reject(&fake_id, &admin, &ctx);
+        let result = engine.reject(&fake_id, &admin, &ctx, &test_signing_key());
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1194,7 +1348,9 @@ mod tests {
             role: "member".to_owned(),
         };
 
-        let (proposal, _) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, _) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
         let stored = engine.get_proposal(&proposal.proposal_id);
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().proposal_id, proposal.proposal_id);
@@ -1220,7 +1376,9 @@ mod tests {
 
         // Propose transfer.
         let action = GovernanceAction::TransferAdmin { new_admin: bob() };
-        let (proposal, _) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, _) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
         assert_eq!(proposal.status, ProposalStatus::Approved);
 
         // Execute the transfer.
@@ -1235,12 +1393,12 @@ mod tests {
 
         // Alice can no longer propose.
         let action = GovernanceAction::CloseContext { reason: None };
-        let result = engine.propose(&admin, action, &ctx);
+        let result = engine.propose(&admin, action, &ctx, &test_signing_key());
         assert!(matches!(result.unwrap_err(), GovernanceError::NotAdmin));
 
         // Bob can propose.
         let action = GovernanceAction::CloseContext { reason: None };
-        let result = engine.propose(&bob(), action, &ctx);
+        let result = engine.propose(&bob(), action, &ctx, &test_signing_key_2());
         assert!(result.is_ok());
     }
 
@@ -1272,8 +1430,13 @@ mod tests {
         let action1 = GovernanceAction::CloseContext { reason: None };
         let action2 = GovernanceAction::CloseContext { reason: None };
 
-        let (p1, _) = engine.propose(&admin, action1, &ctx1).expect("propose 1");
-        let (p2, _) = engine.propose(&admin, action2, &ctx2).expect("propose 2");
+        let sk = test_signing_key();
+        let (p1, _) = engine
+            .propose(&admin, action1, &ctx1, &sk)
+            .expect("propose 1");
+        let (p2, _) = engine
+            .propose(&admin, action2, &ctx2, &sk)
+            .expect("propose 2");
 
         assert_ne!(p1.proposal_id, p2.proposal_id);
     }
@@ -1324,13 +1487,14 @@ mod tests {
             },
         ];
 
+        let sk = test_signing_key();
         for (i, action) in actions.into_iter().enumerate() {
             // Use different timestamps to get distinct proposal IDs.
             let mut ctx_i = ctx.clone();
             ctx_i.now = 1_700_000_000 + i as u64;
 
             let (proposal, events) = engine
-                .propose(&admin, action, &ctx_i)
+                .propose(&admin, action, &ctx_i, &sk)
                 .unwrap_or_else(|e| panic!("propose action {i} failed: {e}"));
 
             assert_eq!(proposal.status, ProposalStatus::Approved);
@@ -1375,7 +1539,9 @@ mod tests {
             did: DID::from("did:dht:z6MkDave"),
             role: "member".to_owned(),
         };
-        let (proposal, events) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, events) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
 
         // Verify the events trace the full lifecycle.
         assert!(matches!(
@@ -1393,13 +1559,13 @@ mod tests {
 
         // 2. Subsequent approve/reject on resolved proposal are no-ops.
         let (status, events) = engine
-            .approve(&proposal.proposal_id, &admin, &ctx)
+            .approve(&proposal.proposal_id, &admin, &ctx, &test_signing_key())
             .expect("approve");
         assert_eq!(status, ProposalStatus::Approved);
         assert!(events.is_empty());
 
         let (status, events) = engine
-            .reject(&proposal.proposal_id, &admin, &ctx)
+            .reject(&proposal.proposal_id, &admin, &ctx, &test_signing_key())
             .expect("reject");
         assert_eq!(status, ProposalStatus::Approved);
         assert!(events.is_empty());
@@ -1508,7 +1674,9 @@ mod tests {
             new_role: "observer".to_owned(),
         };
 
-        let (_, events) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (_, events) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
 
         // All events must serialize to bytes for Merkle tree hashing.
         for event in &events {
@@ -1536,7 +1704,9 @@ mod tests {
             role: "member".to_owned(),
         };
 
-        let (proposal, _) = engine.propose(&admin, action, &ctx).expect("propose");
+        let (proposal, _) = engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose");
 
         let json = serde_json::to_string(&proposal).expect("serialize proposal");
         let deserialized: GovernanceProposal =
@@ -1560,5 +1730,147 @@ mod tests {
         assert_eq!(hex_encode(&[0x00, 0xff, 0x0a]), "00ff0a");
         assert_eq!(hex_encode(&[]), "");
         assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    // -----------------------------------------------------------------------
+    // sign_vote / verify_vote
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sign_vote_produces_64_byte_signature() {
+        let sk = test_signing_key();
+        let sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+
+        assert_eq!(sv.signature.len(), 64);
+        assert_eq!(sv.voter_did, alice());
+        assert_eq!(sv.vote, VoteType::Approve);
+        assert_eq!(sv.timestamp, 1_700_000_000);
+    }
+
+    #[test]
+    fn verify_vote_accepts_valid_signature() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+
+        let sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        verify_vote(&sv, &vk).expect("verify_vote should succeed");
+    }
+
+    #[test]
+    fn verify_vote_rejects_wrong_key() {
+        let sk = test_signing_key();
+        let wrong_vk = test_signing_key_2().verifying_key();
+
+        let sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        let result = verify_vote(&sv, &wrong_vk);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VerificationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn verify_vote_rejects_tampered_voter_did() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+
+        let mut sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        sv.voter_did = bob();
+
+        let result = verify_vote(&sv, &vk);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_vote_rejects_tampered_vote_type() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+
+        let mut sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        sv.vote = VoteType::Reject;
+
+        let result = verify_vote(&sv, &vk);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_vote_rejects_tampered_timestamp() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+
+        let mut sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        sv.timestamp = 1_700_000_001;
+
+        let result = verify_vote(&sv, &vk);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_vote_rejects_empty_signature() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+
+        let mut sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        sv.signature = Vec::new();
+
+        let result = verify_vote(&sv, &vk);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VerificationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn sign_vote_is_deterministic() {
+        let sk = test_signing_key();
+        let sv1 = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        let sv2 = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        assert_eq!(sv1.signature, sv2.signature);
+    }
+
+    #[test]
+    fn sign_vote_different_inputs_produce_different_signatures() {
+        let sk = test_signing_key();
+        let sv1 = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        let sv2 = sign_vote(&VoteType::Reject, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        let sv3 = sign_vote(&VoteType::Approve, "did:dht:z6MkBob", 1_700_000_000, &sk)
+            .expect("sign_vote");
+        let sv4 = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_001, &sk)
+            .expect("sign_vote");
+
+        assert_ne!(sv1.signature, sv2.signature);
+        assert_ne!(sv1.signature, sv3.signature);
+        assert_ne!(sv1.signature, sv4.signature);
+    }
+
+    #[test]
+    fn propose_produces_verifiable_vote() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+
+        let action = GovernanceAction::CloseContext { reason: None };
+        let (proposal, _) = engine.propose(&admin, action, &ctx, &sk).expect("propose");
+
+        // The admin's implicit approval should have a verifiable signature.
+        assert_eq!(proposal.approvals.len(), 1);
+        let vote = &proposal.approvals[0];
+        assert_eq!(vote.signature.len(), 64);
+        verify_vote(vote, &vk).expect("vote produced by propose should be verifiable");
     }
 }
