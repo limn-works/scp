@@ -18,7 +18,13 @@
 //!
 //! See spec section 17.4 and ADR-006.
 
+pub mod context;
 pub mod economy;
+pub mod identity;
+pub mod tools;
+pub mod ucan;
+
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use scp_platform::traits::Storage;
 
@@ -43,7 +49,42 @@ pub enum StoreError {
     /// Deserialization of a stored value failed.
     #[error("deserialization failed: {0}")]
     DeserializationFailed(String),
+
+    /// The stored value was written by a newer SCP version and cannot be read.
+    #[error("incompatible version: stored={stored}, current={current}")]
+    IncompatibleVersion {
+        /// The version found in the stored data.
+        stored: u16,
+        /// The maximum version this build can read.
+        current: u16,
+    },
 }
+
+// ---------------------------------------------------------------------------
+// StoredValue
+// ---------------------------------------------------------------------------
+
+/// Version envelope for all values persisted by `ProtocolStore`.
+///
+/// Every value written by `ProtocolStore` is wrapped in `StoredValue`.
+/// On read, `version` is checked before deserializing `data`. This enables
+/// lazy on-read migration (spec section 17.10) without requiring
+/// schema-level versioning in the storage backend.
+///
+/// See spec section 17.5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredValue<T> {
+    /// Schema version for the contained data type.
+    pub version: u16,
+    /// The serialized domain value.
+    pub data: T,
+}
+
+/// Current schema version for all `StoredValue` envelopes.
+///
+/// Incremented when the serialized format of any domain type changes.
+/// Migration logic (spec section 17.10) uses this to detect stale data.
+pub const CURRENT_STORE_VERSION: u16 = 1;
 
 // ---------------------------------------------------------------------------
 // ProtocolStore
@@ -70,5 +111,119 @@ impl<S: Storage> ProtocolStore<S> {
     #[must_use]
     pub const fn new(storage: S) -> Self {
         Self { storage }
+    }
+
+    /// Serializes a value into a `StoredValue` envelope using `MessagePack`.
+    ///
+    /// Wraps the data in a version envelope (spec section 17.5) and
+    /// serializes the entire envelope with `rmp-serde`.
+    fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
+        let envelope = StoredValue {
+            version: CURRENT_STORE_VERSION,
+            data: value,
+        };
+        rmp_serde::to_vec(&envelope).map_err(|e| StoreError::SerializationFailed(e.to_string()))
+    }
+
+    /// Deserializes a `StoredValue` envelope from `MessagePack` bytes.
+    ///
+    /// Checks the version field: if the stored version exceeds the current
+    /// version, returns `StoreError::IncompatibleVersion`. Otherwise
+    /// deserializes and returns the inner data.
+    fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
+        let envelope: StoredValue<T> = rmp_serde::from_slice(bytes)
+            .map_err(|e| StoreError::DeserializationFailed(e.to_string()))?;
+        if envelope.version > CURRENT_STORE_VERSION {
+            return Err(StoreError::IncompatibleVersion {
+                stored: envelope.version,
+                current: CURRENT_STORE_VERSION,
+            });
+        }
+        Ok(envelope.data)
+    }
+
+    /// Stores a serialized value under the given key.
+    ///
+    /// Wraps the value in a `StoredValue` envelope and writes it to
+    /// the underlying storage backend.
+    async fn store_value<T: Serialize + Sync>(&self, key: &str, value: &T) -> Result<(), StoreError> {
+        let bytes = Self::serialize(value)?;
+        self.storage.store(key, &bytes).await?;
+        Ok(())
+    }
+
+    /// Loads and deserializes a value from the given key.
+    ///
+    /// Returns `None` if the key does not exist. Checks the version
+    /// envelope before deserializing the inner data.
+    async fn load_value<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, StoreError> {
+        match self.storage.retrieve(key).await? {
+            Some(bytes) => Ok(Some(Self::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_value_roundtrip_via_msgpack() {
+        let original = StoredValue {
+            version: 1,
+            data: "hello".to_owned(),
+        };
+        let bytes = rmp_serde::to_vec(&original).unwrap();
+        let decoded: StoredValue<String> = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn serialize_deserialize_roundtrip() {
+        let value = vec![1u32, 2, 3, 4, 5];
+        let bytes = ProtocolStore::<scp_platform::testing::InMemoryStorage>::serialize(&value)
+            .unwrap();
+        let decoded: Vec<u32> =
+            ProtocolStore::<scp_platform::testing::InMemoryStorage>::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn deserialize_rejects_future_version() {
+        let envelope = StoredValue {
+            version: CURRENT_STORE_VERSION + 1,
+            data: "future",
+        };
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let result =
+            ProtocolStore::<scp_platform::testing::InMemoryStorage>::deserialize::<String>(&bytes);
+        assert!(matches!(
+            result,
+            Err(StoreError::IncompatibleVersion { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn store_value_and_load_value_roundtrip() {
+        let store =
+            ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let value = vec![42u64, 100, 999];
+        store.store_value("test/key", &value).await.unwrap();
+        let loaded: Option<Vec<u64>> = store.load_value("test/key").await.unwrap();
+        assert_eq!(loaded, Some(value));
+    }
+
+    #[tokio::test]
+    async fn load_value_returns_none_for_missing_key() {
+        let store =
+            ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let loaded: Option<String> = store.load_value("nonexistent").await.unwrap();
+        assert!(loaded.is_none());
     }
 }
