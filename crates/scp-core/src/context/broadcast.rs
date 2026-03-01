@@ -110,13 +110,19 @@ pub struct SubscriptionResult {
 /// Result returned by [`BroadcastContext::block_subscriber`].
 ///
 /// Contains the new broadcast key and epoch after rotation, which the caller
-/// must distribute to non-blocked subscribers.
+/// must distribute to non-blocked subscribers. Also includes the author DID
+/// and the full block list so the caller can persist block state via
+/// `ProtocolStore::store_broadcast_block_list`. See RED-016.
 #[derive(Debug)]
 pub struct BlockResult {
     /// The new AES-256-GCM broadcast key after rotation.
     pub new_key: SenderKey,
     /// The new epoch number after rotation.
     pub new_epoch: u64,
+    /// The author DID whose block list was modified.
+    pub author_did: String,
+    /// The full block list after the block operation, for persistence.
+    pub block_list: HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,8 +336,15 @@ impl BroadcastContext {
         let new_key = generate_sender_key();
         author.epoch = new_epoch;
         author.broadcast_key = new_key.clone();
+        let result_author_did = author.author_did.clone();
+        let result_block_list = author.block_list.clone();
 
-        Ok(BlockResult { new_key, new_epoch })
+        Ok(BlockResult {
+            new_key,
+            new_epoch,
+            author_did: result_author_did,
+            block_list: result_block_list,
+        })
     }
 
     /// Returns `true` if the given subscriber DID is blocked by the given
@@ -341,6 +354,28 @@ impl BroadcastContext {
         self.authors
             .get(author_did)
             .is_some_and(|a| a.block_list.contains(subscriber_did))
+    }
+
+    /// Restores a previously persisted block list for an author.
+    ///
+    /// Called during initialization to rehydrate block state from
+    /// `ProtocolStore::load_broadcast_block_list`. If the author is not
+    /// registered, returns an error. See RED-016.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::MemberNotFound`] if the author DID is not
+    /// registered.
+    pub fn restore_block_list(
+        &mut self,
+        author_did: &str,
+        block_list: HashSet<String>,
+    ) -> Result<(), ContextError> {
+        let author = self.authors.get_mut(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+        author.block_list = block_list;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -374,8 +409,16 @@ impl BroadcastContext {
 /// and is audience-bound to the presenting subscriber.
 ///
 /// Checks: (1) `token.aud == subscriber_did` — prevents presenting a UCAN
-/// issued to someone else. (2) An attestation matching
-/// `scp:ctx:{context_id}/messages:read` or `scp:ctx:*/messages:read`.
+/// issued to someone else. (2) An attestation matching exactly
+/// `scp:ctx:{context_id}/messages:read` for this specific context.
+///
+/// Wildcard URIs (`scp:ctx:*/messages:read`) are explicitly rejected at this
+/// layer. Accepting wildcards without the full 11-step UCAN validation
+/// pipeline (signature chains, expiry, revocation — ADR-016) would allow a
+/// token issued for any context to grant access to all gated broadcast
+/// contexts. The full UCAN module (SCP-024) may support scoped wildcards
+/// after full validation is in place; until then, only context-specific
+/// capability URIs are accepted. See RED-012.
 ///
 /// Full cryptographic UCAN validation (signature chains, expiry, revocation)
 /// is deferred to the UCAN module (SCP-024).
@@ -391,11 +434,7 @@ fn validate_messages_read_ucan(
         )));
     }
     let specific = format!("scp:ctx:{context_id}/messages:read");
-    let wildcard = "scp:ctx:*/messages:read";
-    let has_messages_read = token
-        .att
-        .iter()
-        .any(|att| att.with == specific || att.with == wildcard);
+    let has_messages_read = token.att.iter().any(|att| att.with == specific);
     if !has_messages_read {
         return Err(ContextError::PermissionDenied(
             "UCAN does not grant messagesRead for this context".to_owned(),
@@ -807,5 +846,100 @@ mod tests {
             blocked_result.is_err(),
             "blocked subscriber cannot decrypt post-block gated messages"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wildcard UCAN rejection (RED-012)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscribe_gated_rejects_wildcard_ucan() {
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        let ucan = UcanToken {
+            iss: "did:example:admin".to_owned(),
+            aud: "did:example:bob".to_owned(),
+            att: vec![UcanAttestation {
+                with: "scp:ctx:*/messages:read".to_owned(),
+                can: "invoke".to_owned(),
+            }],
+            nnc: "nonce-wildcard".to_owned(),
+        };
+
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
+        assert!(result.is_err(), "wildcard UCAN must be rejected");
+        assert!(!ctx.is_subscriber("did:example:bob"));
+    }
+
+    #[test]
+    fn subscribe_gated_rejects_wildcard_alongside_wrong_context() {
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        let ucan = UcanToken {
+            iss: "did:example:admin".to_owned(),
+            aud: "did:example:bob".to_owned(),
+            att: vec![
+                UcanAttestation {
+                    with: "scp:ctx:*/messages:read".to_owned(),
+                    can: "invoke".to_owned(),
+                },
+                UcanAttestation {
+                    with: "scp:ctx:other-context/messages:read".to_owned(),
+                    can: "invoke".to_owned(),
+                },
+            ],
+            nnc: "nonce-multi".to_owned(),
+        };
+
+        let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000);
+        assert!(
+            result.is_err(),
+            "wildcard + wrong-context attestations must not grant access"
+        );
+        assert!(!ctx.is_subscriber("did:example:bob"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Block list restore (RED-016)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restore_block_list_rehydrates_author_state() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.subscribe("did:example:dave", None, 1000).unwrap();
+
+        let mut stored_block_list = HashSet::new();
+        stored_block_list.insert("did:example:dave".to_owned());
+        stored_block_list.insert("did:example:eve".to_owned());
+
+        ctx.restore_block_list("did:example:alice", stored_block_list)
+            .unwrap();
+
+        assert!(ctx.is_blocked("did:example:alice", "did:example:dave"));
+        assert!(ctx.is_blocked("did:example:alice", "did:example:eve"));
+        assert!(!ctx.is_blocked("did:example:alice", "did:example:bob"));
+    }
+
+    #[test]
+    fn restore_block_list_unknown_author_returns_error() {
+        let mut ctx = make_open_ctx();
+        let result = ctx.restore_block_list("did:example:unknown", HashSet::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn block_result_includes_author_did_and_block_list() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.subscribe("did:example:dave", None, 1000).unwrap();
+
+        let result = ctx
+            .block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+
+        assert_eq!(result.author_did, "did:example:alice");
+        assert!(result.block_list.contains("did:example:dave"));
+        assert_eq!(result.block_list.len(), 1);
     }
 }

@@ -12,6 +12,8 @@
 //!
 //! See spec sections 17.3 and 17.4.
 
+use std::collections::HashSet;
+
 use scp_platform::traits::Storage;
 
 use crate::identity::DID;
@@ -74,6 +76,14 @@ fn role_key(context_id: &str, role_name: &str) -> String {
 /// Format: `context/{context_id}/role/`
 fn roles_prefix(context_id: &str) -> String {
     format!("context/{context_id}/role/")
+}
+
+/// Builds the storage key for an author's broadcast block list.
+///
+/// Format: `context/{context_id}/broadcast_block/{author_did}`
+/// See spec section 5.14.8.
+fn broadcast_block_key(context_id: &str, author_did: &str) -> String {
+    format!("context/{context_id}/broadcast_block/{author_did}")
 }
 
 /// Builds the prefix for all keys belonging to a context.
@@ -323,6 +333,51 @@ impl<S: Storage> ProtocolStore<S> {
             .filter_map(|key| key.strip_prefix(&prefix).map(String::from))
             .collect();
         Ok(role_names)
+    }
+
+    /// Stores a broadcast block list for an author within a context.
+    ///
+    /// Persists the set of blocked subscriber DIDs under
+    /// `context/{context_id}/broadcast_block/{author_did}`. The caller
+    /// (typically the `ContextManager`) should invoke this after
+    /// `BroadcastContext::block_subscriber` returns, using the
+    /// `block_list` field from `BlockResult`.
+    ///
+    /// See spec section 5.14.8 for blocking semantics. See RED-016.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_broadcast_block_list(
+        &self,
+        context_id: &str,
+        author_did: &str,
+        block_list: &HashSet<String>,
+    ) -> Result<(), StoreError> {
+        let key = broadcast_block_key(context_id, author_did);
+        self.store_value(&key, block_list).await
+    }
+
+    /// Loads a broadcast block list for an author within a context.
+    ///
+    /// Returns `None` if no block list has been persisted for the given
+    /// author. The caller should pass the loaded set to
+    /// `BroadcastContext::restore_block_list` during initialization.
+    ///
+    /// See spec section 5.14.8 for blocking semantics. See RED-016.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_broadcast_block_list(
+        &self,
+        context_id: &str,
+        author_did: &str,
+    ) -> Result<Option<HashSet<String>>, StoreError> {
+        let key = broadcast_block_key(context_id, author_did);
+        self.load_value(&key).await
     }
 }
 
@@ -578,5 +633,94 @@ mod tests {
     #[test]
     fn role_key_follows_convention() {
         assert_eq!(role_key("ctx-123", "admin"), "context/ctx-123/role/admin");
+    }
+
+    #[test]
+    fn broadcast_block_key_follows_convention() {
+        assert_eq!(
+            broadcast_block_key("ctx-123", "did:dht:z6MkAuthor"),
+            "context/ctx-123/broadcast_block/did:dht:z6MkAuthor"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Broadcast block list persistence (RED-016)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_and_load_broadcast_block_list_roundtrip() {
+        let store = make_store();
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:z6MkBlocked1".to_owned());
+        block_list.insert("did:dht:z6MkBlocked2".to_owned());
+
+        store
+            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &block_list)
+            .await
+            .unwrap();
+        let loaded = store
+            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
+            .await
+            .unwrap();
+
+        assert_eq!(loaded, Some(block_list));
+    }
+
+    #[tokio::test]
+    async fn load_broadcast_block_list_returns_none_for_missing() {
+        let store = make_store();
+        let loaded = store
+            .load_broadcast_block_list("ctx-1", "did:dht:z6MkUnknown")
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_broadcast_block_list_overwrites_previous() {
+        let store = make_store();
+        let mut first = HashSet::new();
+        first.insert("did:dht:z6MkBlocked1".to_owned());
+
+        store
+            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &first)
+            .await
+            .unwrap();
+
+        let mut second = HashSet::new();
+        second.insert("did:dht:z6MkBlocked1".to_owned());
+        second.insert("did:dht:z6MkBlocked2".to_owned());
+        second.insert("did:dht:z6MkBlocked3".to_owned());
+
+        store
+            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &second)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(second));
+    }
+
+    #[tokio::test]
+    async fn delete_context_removes_broadcast_block_lists() {
+        let store = make_store();
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:z6MkBlocked".to_owned());
+
+        store
+            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &block_list)
+            .await
+            .unwrap();
+
+        store.delete_context("ctx-1").await.unwrap();
+
+        let loaded = store
+            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
     }
 }
