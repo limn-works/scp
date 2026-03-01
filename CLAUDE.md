@@ -31,6 +31,47 @@ SCP (Shareable Context Protocol) is an open, ecosystem-agnostic infrastructure p
 - **No shortcuts.** The best solution is the right one. No force unwraps, no placeholder implementations, no "good enough." Ship excellent, complete, production-ready code.
 - **Provenance is paramount.** Every line of code must trace back to a documented decision. Typically this will be: source(s) in ~/.docs/ > story in .docs/prds/. But it may be more complex, involving comments in GitHub or feature-local .docs/ artifacts. No matter how long the chain, provenance must be maintained so that full context is retraceable for every line of code, and fresh agents with no memory can obtain it quickly and easily.
 
+## Available Tools
+
+### Context+ MCP
+
+**What it is**
+Semantic codebase mapping for context-optimized information retrieval.
+
+**How it works**
+`get_context_tree` → `get_file_skeleton` → `semantic_code_search` / `semantic_identifier_search` → `get_blast_radius` before modifying symbols → `propose_commit` to write → `run_static_analysis` to validate.
+
+**When to use**
+Every time you search the codebase.
+
+[Instructions](./.claude/CONTEXT_MCP.md)
+
+### Vestige MCP
+
+**What it is**
+Long-term cognitive memory for agents.
+
+**How it works**
+`session_context` at start → `search` before decisions → `smart_ingest` to save (auto-deduplicates) → `codebase` for project patterns/decisions → `intention` for reminders → `memory` for promote/demote. Memories decay via spaced repetition; searching strengthens recall.
+
+**When to use**
+Every time you receive or recall information.
+
+Instructions are already available from the user-scope CLAUDE.md file.
+
+### Loom Plugin
+
+**What it is**
+Autonomous development loop with parallel execution.
+
+**How it works**
+User provides a source → command dispatches parallel subagents → runs tests → commits green code → repeats. State and logs persist in `.loom/`. Supports worktrees and auto-opening PRs.
+
+**When to use**
+When instructed to via one of the slash commands.
+
+[Instructions](./.claude/LOOM_PLUGIN.md)
+
 ## Rules
 
 **Operating model:**
@@ -119,34 +160,3 @@ These agents should generally be used:
 - @"simplifier (agent)"
 
 You should use discretion to add or remove agents from this roster based on the review contents.
-
-<!-- loom:begin -->
-## Loom — Autonomous Development Loop
-
-Loom is installed as a Claude Code plugin (`alecmarcus/loom`). It runs Claude Code in a continuous loop: read tasks from a PRD, dispatch parallel subagents, run tests, commit green code, repeat.
-
-```
-.loom/               # Per-project Loom state (plugin provides scripts, hooks, and skills)
-├── prd.json         # Structured stories with gates (P0/P1/P2), deps, acceptance criteria
-├── status.md        # Current iteration state (read at start, written at end of each cycle)
-└── logs/            # Per-iteration logs
-```
-
-**Skills:** `/loom:start`, `/loom:init`, `/loom:setup`, `/loom:prd`, `/loom:status`, `/loom:stop`, `/loom:kill`, `/loom:preview`
-
-### Rules for success
-
-**Stories must be atomic.** Each story is executed by a single subagent in one iteration (~15-30 min). If it can't be done in one shot, split it. Coupled work (model + migration + route) stays together; unrelated work does not.
-
-**Acceptance criteria must be machine-verifiable.** Not "it works" but "POST /api/x returns 200 with a JWT". If you can't write a test for it, Loom can't verify it.
-
-**Parallelism requires file isolation.** Stories that touch the same files cannot run in the same batch. Set `blockedBy` for true data dependencies; leave it empty otherwise to maximize parallelism.
-
-**Green tests are a hard gate.** Loom never commits failing code. Test failures are recorded in status.md and become top priority for the next iteration. After 3 failed fix attempts within one iteration, Loom stops and records the state.
-
-**Context is the scarcest resource.** Read prd.json in jq waves of 10. Never cat entire files. Use dedicated tools (Read, Grep, Glob) instead of shell commands. status.md is the only continuity across loop restarts — write it thoroughly.
-
-**Search before building.** Subagents must search the codebase before assuming something is missing. Reimplementing existing code is a common failure mode.
-
-**Scope is sacred.** Implement only the assigned story. Do not "fix" adjacent code, add unrequested features, or refactor code that seems inconsistent with other specs.
-<!-- loom:end -->
