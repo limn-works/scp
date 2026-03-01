@@ -16,6 +16,8 @@
 //! relay URLs, operator DID, protocol version, relay configuration,
 //! and broadcast context IDs. See §18.3 for the full privacy model.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::economy::types::{Amount, CurrencyCode, PaymentAdapterRef};
@@ -47,6 +49,12 @@ pub struct WellKnownScp {
     /// Relay operator configuration subset (§18.3.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_config: Option<RelayConfig>,
+
+    /// Human-readable handle mappings (§22.6.1). Keys are handle
+    /// local-parts; values are resolution records pointing to an
+    /// identity DID or a context ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handles: Option<HashMap<String, WellKnownHandle>>,
 }
 
 /// A publicly listed context entry in the `.well-known/scp` document.
@@ -72,6 +80,32 @@ pub struct WellKnownContext {
     /// Full `scp://` URI for the context (§18.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+}
+
+/// A handle resolution record in the `.well-known/scp` handles map.
+///
+/// Maps a human-readable local-part to either an identity DID or a
+/// context ID with optional relay override. See §22.6.1.
+///
+/// Handle keys must match the address format (§22.2):
+/// `[a-z0-9._-]`, max 64 characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum WellKnownHandle {
+    /// An identity handle that resolves to a DID.
+    Identity {
+        /// The identity's DID.
+        did: String,
+    },
+    /// A context handle that resolves to a context ID.
+    Context {
+        /// Hex-encoded context ID.
+        context_id: String,
+        /// Override relay URL for this context. Defaults to the
+        /// document-level `relay` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay: Option<String>,
+    },
 }
 
 /// Relay operator configuration subset exposed in `.well-known/scp`.
@@ -324,6 +358,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unimplemented)]
     impl DidMethod for MockDidMethod {
         fn create(
             &self,
@@ -412,6 +447,21 @@ mod tests {
 
     /// Helper: a full document with all fields populated.
     fn full_document() -> WellKnownScp {
+        let mut handles = HashMap::new();
+        handles.insert(
+            "alice".to_owned(),
+            WellKnownHandle::Identity {
+                did: "did:dht:z6MkAlice...".to_owned(),
+            },
+        );
+        handles.insert(
+            "recipes".to_owned(),
+            WellKnownHandle::Context {
+                context_id: "a1b2c3d4e5f6".to_owned(),
+                relay: Some("wss://relay.example.com/scp/v1".to_owned()),
+            },
+        );
+
         WellKnownScp {
             version: 1,
             did: "did:dht:z6Mk...".to_owned(),
@@ -433,6 +483,7 @@ mod tests {
                 rate_limit_subscribe: Some(50),
                 economic: None,
             }),
+            handles: Some(handles),
         }
     }
 
@@ -444,6 +495,7 @@ mod tests {
             relay: "wss://relay.example.com/scp/v1".to_owned(),
             contexts: None,
             relay_config: None,
+            handles: None,
         }
     }
 
@@ -561,6 +613,7 @@ mod tests {
                 uri: None,
             }]),
             relay_config: None,
+            handles: None,
         };
 
         let err = doc.validate().expect_err("should reject encrypted context");
@@ -586,6 +639,7 @@ mod tests {
                 uri: None,
             }]),
             relay_config: None,
+            handles: None,
         };
 
         let err = doc.validate().expect_err("should reject absent mode");
@@ -611,6 +665,7 @@ mod tests {
                 uri: None,
             }]),
             relay_config: None,
+            handles: None,
         };
 
         let err = doc.validate().expect_err("should reject unknown mode");
@@ -640,6 +695,123 @@ mod tests {
         assert!(json.get("rate_limit_subscribe").is_none());
     }
 
+    // -- handles tests (§22.6.1) -------------------------------------------
+
+    #[test]
+    fn handles_serialize_with_tagged_type() {
+        let mut handles = HashMap::new();
+        handles.insert(
+            "alice".to_owned(),
+            WellKnownHandle::Identity {
+                did: "did:dht:z6MkAlice".to_owned(),
+            },
+        );
+        handles.insert(
+            "recipes".to_owned(),
+            WellKnownHandle::Context {
+                context_id: "a1b2c3d4e5f6".to_owned(),
+                relay: None,
+            },
+        );
+
+        let doc = WellKnownScp {
+            version: 1,
+            did: "did:dht:z6Mk...".to_owned(),
+            relay: "wss://relay.example.com/scp/v1".to_owned(),
+            contexts: None,
+            relay_config: None,
+            handles: Some(handles),
+        };
+
+        let json = serde_json::to_value(&doc).expect("serialization failed");
+        let handles_json = &json["handles"];
+
+        let alice = &handles_json["alice"];
+        assert_eq!(alice["type"], "identity");
+        assert_eq!(alice["did"], "did:dht:z6MkAlice");
+
+        let recipes = &handles_json["recipes"];
+        assert_eq!(recipes["type"], "context");
+        assert_eq!(recipes["context_id"], "a1b2c3d4e5f6");
+        assert!(recipes.get("relay").is_none());
+    }
+
+    #[test]
+    fn handles_roundtrip_preserves_all_fields() {
+        let mut handles = HashMap::new();
+        handles.insert(
+            "bob".to_owned(),
+            WellKnownHandle::Context {
+                context_id: "deadbeef".to_owned(),
+                relay: Some("wss://alt.example.com/scp/v1".to_owned()),
+            },
+        );
+
+        let original = WellKnownScp {
+            version: 1,
+            did: "did:dht:z6Mk...".to_owned(),
+            relay: "wss://relay.example.com/scp/v1".to_owned(),
+            contexts: None,
+            relay_config: None,
+            handles: Some(handles),
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: WellKnownScp = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn handles_absent_when_none() {
+        let doc = minimal_document();
+        let json = serde_json::to_value(&doc).expect("serialization failed");
+        assert!(json.get("handles").is_none());
+    }
+
+    #[test]
+    fn handles_deserialize_from_json() {
+        let json = r#"{
+            "version": 1,
+            "did": "did:dht:z6Mk...",
+            "relay": "wss://relay.example.com/scp/v1",
+            "handles": {
+                "alice": {
+                    "type": "identity",
+                    "did": "did:dht:z6MkAlice..."
+                },
+                "recipes": {
+                    "type": "context",
+                    "context_id": "a1b2c3d4e5f6",
+                    "relay": "wss://relay.example.com/scp/v1"
+                }
+            }
+        }"#;
+        let doc: WellKnownScp = serde_json::from_str(json).expect("deserialization failed");
+        let handles = doc.handles.expect("handles present");
+        assert_eq!(handles.len(), 2);
+
+        match &handles["alice"] {
+            WellKnownHandle::Identity { did } => {
+                assert_eq!(did, "did:dht:z6MkAlice...");
+            }
+            other @ WellKnownHandle::Context { .. } => {
+                panic!("expected Identity, got: {other:?}")
+            }
+        }
+
+        match &handles["recipes"] {
+            WellKnownHandle::Context {
+                context_id, relay, ..
+            } => {
+                assert_eq!(context_id, "a1b2c3d4e5f6");
+                assert_eq!(relay.as_deref(), Some("wss://relay.example.com/scp/v1"));
+            }
+            other @ WellKnownHandle::Identity { .. } => {
+                panic!("expected Context, got: {other:?}")
+            }
+        }
+    }
+
     // -- verify_against_did tests (SCP-188) --------------------------------
 
     #[tokio::test]
@@ -656,6 +828,7 @@ mod tests {
             relay: relay_url.to_owned(),
             contexts: None,
             relay_config: None,
+            handles: None,
         };
 
         assert!(well_known.verify_against_did(&mock).await.is_ok());
@@ -682,6 +855,7 @@ mod tests {
             relay: relay_url.to_owned(),
             contexts: None,
             relay_config: None,
+            handles: None,
         };
 
         assert!(well_known.verify_against_did(&mock).await.is_ok());
@@ -702,6 +876,7 @@ mod tests {
             relay: claimed_relay.to_owned(),
             contexts: None,
             relay_config: None,
+            handles: None,
         };
 
         let err = well_known
@@ -733,6 +908,7 @@ mod tests {
             relay: "wss://relay.example.com/scp/v1".to_owned(),
             contexts: None,
             relay_config: None,
+            handles: None,
         };
 
         let err = well_known
@@ -768,6 +944,7 @@ mod tests {
             relay: relay_url.to_owned(),
             contexts: None,
             relay_config: None,
+            handles: None,
         };
 
         let err = well_known
@@ -799,6 +976,7 @@ mod tests {
             relay: relay_url.to_owned(),
             contexts: None,
             relay_config: None,
+            handles: None,
         };
 
         let err = well_known

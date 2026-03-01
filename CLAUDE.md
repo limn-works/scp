@@ -70,6 +70,13 @@ User provides a directive → dispatches parallel subagents → runs tests → c
 - Protocol-first design; inject through initializers; no singletons
 - APIs: self-evident, one happy path
 
+**PRD stories (MANDATORY):**
+- **Before creating, editing, or updating any story in `.docs/prds/`**, read `.docs/standards/prd.md` in full. No exceptions.
+- Every field in the standard is required. Every acceptance criterion must be machine-verifiable. Every source must trace to an actual heading in an actual file. Every dependency must be forward-only.
+- The artifact flow applies to stories: stories reference specs and ADRs, never the reverse. If a story can't cite a spec section or ADR, it needs one written first.
+- Run `python3 scripts/validate-prd.py` before committing PRD changes. CI enforces this.
+- Subagents creating stories must self-validate against the standard before returning. Two audits missed quality issues because no one checked their own output — that failure mode is why this standard exists.
+
 **Stubs:**
 - Every stub must reference a PRD story ID (`// Stub — see SCP-NNN`)
 - Stories marked "done" must have zero stubs against their acceptance criteria

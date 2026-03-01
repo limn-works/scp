@@ -647,6 +647,7 @@ mod tests {
             renewal_interval: None,
             revocation_status: RevocationStatus::Active,
             signature: vec![0u8; 64],
+            renewed_at: None,
         }
     }
 

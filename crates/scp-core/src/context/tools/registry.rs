@@ -241,6 +241,18 @@ pub fn register_tool(
     schema::validate_schema(&registration.schema.output_schema)
         .map_err(ToolError::InvalidOutputSchema)?;
 
+    // 2b. Enforce schema specificity floor (spec section 6.2, 9.2.1).
+    if let Err((side, field_count)) = schema::validate_specificity_floor(
+        &registration.schema.input_schema,
+        &registration.schema.output_schema,
+    ) {
+        return Err(ToolError::SchemaSpecificityFloor {
+            side: side.to_owned(),
+            field_count,
+            min_fields: schema::MIN_SCHEMA_FIELDS,
+        });
+    }
+
     // 3. Implementation hash is 32 bytes by type ([u8; 32]) -- enforced at compile time.
     //    No runtime check needed.
 
@@ -327,6 +339,18 @@ pub fn update_tool(
         .map_err(ToolError::InvalidInputSchema)?;
     schema::validate_schema(&new_registration.schema.output_schema)
         .map_err(ToolError::InvalidOutputSchema)?;
+
+    // 4b. Enforce schema specificity floor (spec section 6.2, 9.2.1).
+    if let Err((side, field_count)) = schema::validate_specificity_floor(
+        &new_registration.schema.input_schema,
+        &new_registration.schema.output_schema,
+    ) {
+        return Err(ToolError::SchemaSpecificityFloor {
+            side: side.to_owned(),
+            field_count,
+            min_fields: schema::MIN_SCHEMA_FIELDS,
+        });
+    }
 
     // 5. Validate operator DID.
     validate_did(&new_registration.operator_did)?;
@@ -609,6 +633,74 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), ToolError::InvalidOutputSchema(_)),
             "expected InvalidOutputSchema"
+        );
+    }
+
+    #[test]
+    fn register_tool_rejects_schema_below_specificity_floor() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = ToolRegistry::new();
+
+        // Both schemas have only 1 property -- below the MIN_SCHEMA_FIELDS (2) floor.
+        let mut registration = valid_registration("tool-1");
+        registration.schema = ToolSchema {
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "data": {"type": "string"}
+                }
+            }),
+            output_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "result": {"type": "string"}
+                }
+            }),
+        };
+
+        let result = register_tool(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::SchemaSpecificityFloor { min_fields: 2, .. }),
+            "expected SchemaSpecificityFloor, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn register_tool_accepts_schema_meeting_specificity_floor_on_input() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = ToolRegistry::new();
+
+        // Input has 2 properties, output has 0 -- should pass.
+        let mut registration = valid_registration("tool-1");
+        registration.schema = ToolSchema {
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"}
+                }
+            }),
+            output_schema: serde_json::json!({
+                "type": "object"
+            }),
+        };
+
+        let result = register_tool(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
+        );
+        assert!(
+            result.is_ok(),
+            "should accept when input meets floor: {result:?}"
         );
     }
 
@@ -1183,8 +1275,19 @@ mod tests {
         // Update with changed schema and test vectors but same name/description.
         let mut new_reg = valid_registration("tool-1");
         new_reg.schema = ToolSchema {
-            input_schema: serde_json::json!({"type": "string"}),
-            output_schema: serde_json::json!({"type": "string"}),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"}
+                }
+            }),
+            output_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "sum": {"type": "number"}
+                }
+            }),
         };
         new_reg.test_vectors = vec![];
 

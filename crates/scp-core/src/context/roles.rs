@@ -86,6 +86,16 @@ pub enum Capability {
     ContextClose,
     /// Create child contexts with this context as parent (spec section 5.13).
     ChildContextCreate,
+    /// Cross-context tool interface exposure (spec section 6.2).
+    ToolInterface,
+    /// Bridge connector participation (spec section 12).
+    Bridging,
+    /// Real-time voice communication via delegated media transport (spec section 10.9.1).
+    MediaVoice,
+    /// Real-time video communication via delegated media transport (spec section 10.9.1).
+    MediaVideo,
+    /// Screen sharing via delegated media transport (spec section 10.9.1).
+    MediaScreenShare,
     /// Context-specific custom capability.
     Custom(String),
 }
@@ -96,7 +106,9 @@ impl Capability {
     /// Recognized names: `"messages:read"`, `"messages:write"`,
     /// `"tool:invoke:*"`, `"tool:register"`, `"member:invite"`,
     /// `"member:remove"`, `"role:assign"`, `"governance:propose"`,
-    /// `"governance:vote"`, `"context:close"`, `"context:child:create"`.
+    /// `"governance:vote"`, `"context:close"`, `"context:child:create"`,
+    /// `"tool:interface"`, `"bridging"`, `"media:voice"`, `"media:video"`,
+    /// `"media:screen_share"`.
     /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
     /// Anything else maps to `Custom(name)`.
     #[must_use]
@@ -113,6 +125,11 @@ impl Capability {
             "governance:vote" => Self::GovernanceVote,
             "context:close" => Self::ContextClose,
             "context:child:create" => Self::ChildContextCreate,
+            "tool:interface" => Self::ToolInterface,
+            "bridging" => Self::Bridging,
+            "media:voice" => Self::MediaVoice,
+            "media:video" => Self::MediaVideo,
+            "media:screen_share" => Self::MediaScreenShare,
             other => other.strip_prefix("tool:invoke:").map_or_else(
                 || Self::Custom(other.to_owned()),
                 |tool_id| Self::ToolInvoke(tool_id.to_owned()),
@@ -136,6 +153,11 @@ impl Capability {
             Self::GovernanceVote => "governance:vote",
             Self::ContextClose => "context:close",
             Self::ChildContextCreate => "context:child:create",
+            Self::ToolInterface => "tool:interface",
+            Self::Bridging => "bridging",
+            Self::MediaVoice => "media:voice",
+            Self::MediaVideo => "media:video",
+            Self::MediaScreenShare => "media:screen_share",
             Self::Custom(name) => name,
         }
     }
@@ -156,6 +178,11 @@ impl std::fmt::Display for Capability {
             Self::GovernanceVote => write!(f, "governance:vote"),
             Self::ContextClose => write!(f, "context:close"),
             Self::ChildContextCreate => write!(f, "context:child:create"),
+            Self::ToolInterface => write!(f, "tool:interface"),
+            Self::Bridging => write!(f, "bridging"),
+            Self::MediaVoice => write!(f, "media:voice"),
+            Self::MediaVideo => write!(f, "media:video"),
+            Self::MediaScreenShare => write!(f, "media:screen_share"),
             Self::Custom(name) => write!(f, "custom:{name}"),
         }
     }

@@ -23,6 +23,7 @@ use super::registry::ToolRegistry;
 use super::{DID, ToolError, ToolId, has_admin_role};
 use crate::context::ContextHandle;
 use crate::context::roles::ContextRoleState;
+use crate::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH;
 
 // ---------------------------------------------------------------------------
 // ContextId
@@ -280,15 +281,19 @@ pub fn accept_tool_interface(
 /// * `invoker_did` - The DID of the participant invoking the tool.
 /// * `source_role_state` - Source context role state for governance checks.
 /// * `target_registry` - Target context tool registry.
+/// * `chain_depth` - Current cross-context chain depth (0 for first hop).
 /// * `executor` - Synchronous executor for the tool (returns Result).
 ///
 /// # Errors
 ///
+/// Returns [`ToolError::ChainDepthExceeded`] if `chain_depth` exceeds the
+/// protocol maximum ([`DEFAULT_MAX_CHAIN_DEPTH`], 3 hops).
 /// Returns [`ToolError::InterfaceNotApproved`] if either context has not
 /// approved the interface.
 /// Returns [`ToolError::InterfaceRateLimited`] if the rate limit is exceeded.
 /// Returns [`ToolError::InterfaceAdminRequired`] if the invoker lacks the
 /// required capability in the source context.
+#[allow(clippy::too_many_arguments)]
 pub fn invoke_cross_context<F>(
     source_context: &ContextHandle,
     interface: &mut ToolInterface,
@@ -296,6 +301,7 @@ pub fn invoke_cross_context<F>(
     invoker_did: &DID,
     source_role_state: &ContextRoleState,
     target_registry: &ToolRegistry,
+    chain_depth: u8,
     executor: F,
 ) -> Result<
     (
@@ -308,6 +314,17 @@ pub fn invoke_cross_context<F>(
 where
     F: FnOnce(&serde_json::Value) -> Result<serde_json::Value, String>,
 {
+    // 0. Enforce chain depth limit (spec section 6.2, default max 3).
+    // Depth is 0-indexed: 0 = first hop, 3 = third hop. Values 0..=3 are
+    // allowed; depth 4+ is rejected. This matches check_chain_depth() in
+    // provenance/attach.rs.
+    if chain_depth > DEFAULT_MAX_CHAIN_DEPTH {
+        return Err(ToolError::ChainDepthExceeded {
+            depth: chain_depth,
+            max_depth: DEFAULT_MAX_CHAIN_DEPTH,
+        });
+    }
+
     // 1. Both sides must have approved.
     if !interface.approved_by_source || !interface.approved_by_target {
         return Err(ToolError::InterfaceNotApproved {
@@ -769,6 +786,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         )
         .unwrap();
@@ -821,6 +839,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         );
 
@@ -862,6 +881,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         );
 
@@ -903,6 +923,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         );
 
@@ -944,6 +965,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         );
         assert!(result1.is_ok(), "first call should succeed");
@@ -956,6 +978,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         );
         assert!(result2.is_ok(), "second call should succeed");
@@ -968,6 +991,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         );
         assert!(result3.is_err());
@@ -1007,6 +1031,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         )
         .unwrap();
@@ -1067,6 +1092,7 @@ mod tests {
             &DID::from(member_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         );
 
@@ -1104,6 +1130,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             add_executor,
         );
 
@@ -1198,6 +1225,88 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // invoke_cross_context: chain depth exceeded
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invoke_cross_context_rejects_chain_depth_exceeding_max() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let source_role_state = test_role_state("ctx-source", admin_did);
+        let source_context = test_context("ctx-source");
+        let target_role_state = test_role_state("ctx-target", admin_did);
+        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+
+        let mut interface = ToolInterface {
+            source_context: "ctx-source".to_owned(),
+            target_context: "ctx-target".to_owned(),
+            tool_id: "calculator".to_owned(),
+            rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+        };
+
+        // Chain depth 4 exceeds DEFAULT_MAX_CHAIN_DEPTH (3).
+        let result = invoke_cross_context(
+            &source_context,
+            &mut interface,
+            &serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(admin_did),
+            &source_role_state,
+            &target_registry,
+            4,
+            add_executor,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ToolError::ChainDepthExceeded {
+                    depth: 4,
+                    max_depth: 3,
+                }
+            ),
+            "expected ChainDepthExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn invoke_cross_context_allows_chain_depth_at_max() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let source_role_state = test_role_state("ctx-source", admin_did);
+        let source_context = test_context("ctx-source");
+        let target_role_state = test_role_state("ctx-target", admin_did);
+        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+
+        let mut interface = ToolInterface {
+            source_context: "ctx-source".to_owned(),
+            target_context: "ctx-target".to_owned(),
+            tool_id: "calculator".to_owned(),
+            rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+        };
+
+        // Chain depth 3 == DEFAULT_MAX_CHAIN_DEPTH, should succeed.
+        let result = invoke_cross_context(
+            &source_context,
+            &mut interface,
+            &serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(admin_did),
+            &source_role_state,
+            &target_registry,
+            3,
+            add_executor,
+        );
+
+        assert!(
+            result.is_ok(),
+            "chain depth at max should succeed: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // invoke_cross_context: executor failure propagates
     // -----------------------------------------------------------------------
 
@@ -1229,6 +1338,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
+            0,
             failing_executor,
         );
 

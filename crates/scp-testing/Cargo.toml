@@ -8,7 +8,7 @@ license.workspace = true
 
 [features]
 ci-tier2 = []
-ci-tier3 = []
+ci-tier3 = ["ci-tier2"]
 
 [dependencies]
 scp-core = { path = "../scp-core" }

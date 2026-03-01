@@ -90,7 +90,9 @@
         "SCP-165",
         "SCP-210",
         "SCP-216",
-        "SCP-217"
+        "SCP-217",
+        "SCP-212",
+        "SCP-213"
       ]
     },
     {
@@ -218,7 +220,8 @@
         "SCP-136",
         "SCP-139",
         "SCP-214",
-        "SCP-215"
+        "SCP-215",
+        "SCP-211"
       ]
     },
     {
@@ -273,7 +276,9 @@
         "SCP-222",
         "SCP-223",
         "SCP-224",
-        "SCP-225"
+        "SCP-225",
+        "SCP-226",
+        "SCP-227"
       ]
     }
   ],
@@ -1509,7 +1514,7 @@
         },
         {
           "file": ".docs/sketch.md",
-          "section": "## Context > Buffer semantics"
+          "section": "### Receive (streaming)"
         }
       ],
       "details": {
@@ -2405,7 +2410,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "in_progress",
+      "status": "in-progress",
       "files": [
         "crates/scp-ffi/pyo3/identity.rs"
       ],
@@ -4838,7 +4843,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol > ### Acceptance Criteria > 2, 9, 10, 11"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -4892,7 +4897,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol > ### Acceptance Criteria > 3, 4"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -4941,7 +4946,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol > ### Acceptance Criteria > 5, 6"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -5003,7 +5008,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol > ### Acceptance Criteria > 7, 8"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -5110,7 +5115,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-024: Real-Time Media Transport > ### Acceptance Criteria > 2, 3"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -5168,7 +5173,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-024: Real-Time Media Transport > ### Acceptance Criteria > 4, 6, 7, 8"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -5191,7 +5196,7 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-media/src/signaling.rs"
       ],
@@ -5222,7 +5227,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-024: Real-Time Media Transport > ### Acceptance Criteria > 5"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -5331,7 +5336,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-025: Apple Platform Adapter > ### Expected Decisions"
+          "section": "### What This ADR Will Decide"
         }
       ],
       "details": {
@@ -5377,7 +5382,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-025: Apple Platform Adapter > ### Expected Decisions"
+          "section": "### What This ADR Will Decide"
         }
       ],
       "details": {
@@ -5426,7 +5431,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-025: Apple Platform Adapter > ### Expected Decisions"
+          "section": "### What This ADR Will Decide"
         }
       ],
       "details": {
@@ -5477,7 +5482,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-025: Apple Platform Adapter > ### Scope"
+          "section": "### Scope"
         }
       ],
       "details": {
@@ -5593,7 +5598,7 @@
         },
         {
           "file": ".docs/scaffold/swift.md",
-          "section": "## SDK Type Definitions > ### Identity"
+          "section": "### Identity"
         }
       ],
       "details": {
@@ -5650,7 +5655,7 @@
         },
         {
           "file": ".docs/scaffold/swift.md",
-          "section": "## UniFFI Bridge > ### Async bridging"
+          "section": "### Async bridging"
         }
       ],
       "details": {
@@ -5951,7 +5956,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "Phase 5 Architecture Decision Records"
+          "section": "# Phase 5 Architecture Decision Records — Bridges, Media, Apple Platform, Swift SDK"
         }
       ],
       "details": {
@@ -6238,10 +6243,6 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-027: Android Platform Adapter"
-        },
-        {
-          "file": "https://github.com/limn-works/scp/issues/88",
-          "section": "GitHub issue #88 — InMemoryKeyCustody ships unconditionally in production cdylib (P0 blocker: must be guarded before real KeyCustody can ship safely)"
         }
       ],
       "details": {
@@ -7556,7 +7557,7 @@
       "sources": [
         {
           "file": ".docs/standards/sdk-common.md",
-          "section": "## Auto-Accept Policies"
+          "section": "### Auto-accept policies"
         },
         {
           "file": ".docs/specs/19-economic-governance.md",
@@ -8348,7 +8349,7 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Implementation — Key types"
+          "section": "### Implementation"
         }
       ],
       "details": {
@@ -8389,7 +8390,7 @@
       "sources": [
         {
           "file": ".docs/specs/19-economic-governance.md",
-          "section": "Full section"
+          "section": "# 19. Economic Governance"
         }
       ],
       "details": {}
@@ -8472,11 +8473,11 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria #1-#4"
+          "section": "### Acceptance Criteria"
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Implementation — Key types"
+          "section": "### Implementation"
         }
       ],
       "details": {
@@ -8545,7 +8546,7 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria #4"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -8619,15 +8620,15 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria #5, #6"
+          "section": "### Acceptance Criteria"
         },
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
-          "section": "§7.2 UCAN attenuation"
+          "section": "## 7.2 Layer 1: Protocol Enforcement"
         },
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
-          "section": "§7.4.4 Revocation"
+          "section": "### 7.4.4 Revocation"
         }
       ],
       "details": {
@@ -8708,7 +8709,7 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria #7, #8, #9, #10"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -8791,11 +8792,11 @@
         },
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
-          "section": "§7.7.1 DataProvenance"
+          "section": "### 7.7.1 Provenance Format"
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria #11"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -8871,7 +8872,7 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Decision #5"
+          "section": "### Decision"
         }
       ],
       "details": {
@@ -8944,7 +8945,7 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria #8"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -9010,11 +9011,11 @@
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "§18.3.3"
+          "section": "### 18.3.3 Relay Operator Configuration Subset"
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria #12, #14"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -9077,7 +9078,7 @@
         },
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
-          "section": "§7.3.7 Consequence mechanisms"
+          "section": "### 7.3.7 Consequence Mechanisms"
         }
       ],
       "details": {
@@ -9156,7 +9157,7 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria (all)"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -9223,7 +9224,7 @@
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-033 — Acceptance Criteria #13"
+          "section": "### Acceptance Criteria"
         }
       ],
       "details": {
@@ -9344,11 +9345,11 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "## ADR-015: PyO3 Bridge"
+          "section": "## ADR-015: MCP Adapter"
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "## ADR-018: MCP Integration"
+          "section": "## ADR-016: UCAN Validation"
         }
       ],
       "details": {
@@ -9413,14 +9414,6 @@
         {
           "file": ".docs/adrs/phase-3.md",
           "section": "## ADR-016: UCAN Validation"
-        },
-        {
-          "file": "crates/scp-core/src/crypto/ucan.rs",
-          "section": "Full validation pipeline"
-        },
-        {
-          "file": "https://github.com/anthropics/scp/issues/105",
-          "section": "GitHub issue #105"
         }
       ],
       "details": {
@@ -9474,18 +9467,6 @@
         {
           "file": ".docs/adrs/phase-3.md",
           "section": "## ADR-015: MCP Adapter"
-        },
-        {
-          "file": "crates/scp-mcp/src/server.rs",
-          "section": "MCP server implementation"
-        },
-        {
-          "file": "crates/scp-mcp/src/client.rs",
-          "section": "MCP client implementation"
-        },
-        {
-          "file": "https://github.com/anthropics/scp/issues/106",
-          "section": "GitHub issue #106"
         }
       ],
       "details": {
@@ -9531,10 +9512,6 @@
         {
           "file": ".docs/adrs/phase-3.md",
           "section": "## ADR-015: MCP Adapter"
-        },
-        {
-          "file": "https://github.com/limn-works/scp/issues/106",
-          "section": "GitHub issue #106 — remaining acceptance criteria"
         }
       ],
       "details": {
@@ -9581,7 +9558,7 @@
         },
         {
           "file": ".docs/scaffold/kotlin.md",
-          "section": "Build infrastructure"
+          "section": "## build.gradle.kts"
         }
       ],
       "details": {
@@ -9624,17 +9601,10 @@
         {
           "file": ".docs/adrs/phase-2.md",
           "section": "## ADR-010: Tool Registration and Invocation"
-        },
-        {
-          "file": "https://github.com/limn-works/scp/issues/115",
-          "section": "GitHub issue #115"
-        },
-        {
-          "file": "https://github.com/limn-works/scp/issues/104",
-          "section": "GitHub issue #104 — input validation at bridge boundary"
         }
       ],
-      "result": "Tool handler registration and dispatch wired. Python callables stored as closures in runtime registry. FfiBridgeProvider dispatches to handlers. Commit 8d4c405."
+      "result": "Tool handler registration and dispatch wired. Python callables stored as closures in runtime registry. FfiBridgeProvider dispatches to handlers. Commit 8d4c405.",
+      "details": {}
     },
     {
       "id": "SCP-213",
@@ -9669,17 +9639,10 @@
         {
           "file": ".docs/adrs/phase-3.md",
           "section": "## ADR-015: MCP Adapter"
-        },
-        {
-          "file": "https://github.com/limn-works/scp/issues/116",
-          "section": "GitHub issue #116"
-        },
-        {
-          "file": "https://github.com/limn-works/scp/issues/109",
-          "section": "GitHub issue #109 — expose missing ContextParams fields in PyO3 bridge"
         }
       ],
-      "result": "Client-side context discovery via KnownContext registry + relay QUERY probing. Falls back to local registry when relay unavailable. Commit 3d8016f."
+      "result": "Client-side context discovery via KnownContext registry + relay QUERY probing. Falls back to local registry when relay unavailable. Commit 3d8016f.",
+      "details": {}
     },
     {
       "id": "SCP-214",
@@ -9752,75 +9715,23 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-1.md",
-          "section": "ADR-006: Platform Abstraction Traits — KeyCustody trait with 7 methods including derive_pseudonym"
+          "section": "## ADR-006: In-Memory Platform Adapter (Testing)"
         },
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "ADR-021: UniFFI Bridge — KeyCustodyProvider callback interface (currently incomplete: 5 of 7 methods)"
+          "section": "## ADR-021: UniFFI Bridge Definitions"
         },
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "ADR-025: Apple Platform Adapter — AppleKeyCustody as KeyCustodyProvider, Secure Enclave wiring (lines 334-578)"
+          "section": "## ADR-025: Apple Platform Adapter"
         },
         {
           "file": ".docs/adrs/phase-6.md",
-          "section": "ADR-027: Android Platform Adapter — key_material = public key bytes amendment for cross-platform determinism"
+          "section": "## ADR-027: Android Platform Adapter"
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "§9.10.4 — Per-context pseudonym derivation via HMAC-SHA256(identity_key_material, context_id || \"scp-pseudonym\"); line 530 stale text fixed to say public key bytes per ADR-027"
-        },
-        {
-          "file": "crates/scp-ffi/src/runtime.rs",
-          "section": "Lines 358-363 — get_or_create_routing_secret() generates random 32-byte per-identity secrets for interim routing ID derivation; IDENTITY_ROUTING_SECRETS static. Both will be removed when KeyCustody::derive_pseudonym is wired"
-        },
-        {
-          "file": "crates/scp-ffi/src/identity.rs",
-          "section": "Lines 198-219 — parse_custody stub always returns InMemoryKeyCustody; lines 16-21 — KeyHandles unsafe across GIL; lines 349-367 — rotate_key always errors"
-        },
-        {
-          "file": "crates/scp-ffi/uniffi/src/bridge.rs",
-          "section": "Lines 930-968 — InMemory path retains core_id+custody in handle; Platform/Software paths error"
-        },
-        {
-          "file": "crates/scp-ffi/uniffi/src/lib.rs",
-          "section": "Lines 295-317 — KeyCustodyProvider callback interface missing derive_pseudonym and dh_agree"
-        },
-        {
-          "file": "crates/scp-ffi/src/context.rs",
-          "section": "Lines 465-500 — HMAC-SHA256(random_secret, ...) stub routing ID derivation"
-        },
-        {
-          "file": "crates/scp-platform/src/traits.rs",
-          "section": "Lines 332-354 — KeyCustody::derive_pseudonym trait definition; line 340 doc fixed to say public key bytes per ADR-027"
-        },
-        {
-          "file": "crates/scp-platform/src/testing/key_custody.rs",
-          "section": "Line 333 — InMemoryKeyCustody::derive_pseudonym uses signing_key.to_bytes() (private key bytes) as HMAC key; must change to verifying_key.to_bytes() (public key bytes) per ADR-027. Golden vector test at line 626 will need new expected values"
-        },
-        {
-          "file": "crates/scp-core/src/envelope/inner.rs",
-          "section": "Line 122 — create_inner_envelope takes key_custody for message signing"
-        },
-        {
-          "file": "crates/scp-core/src/crypto/ucan/mint.rs",
-          "section": "Line 129 — mint_ucan takes key_custody for token signing; line 292 — delegate_ucan takes key_custody for delegation chain signing"
-        },
-        {
-          "file": "crates/scp-core/src/identity/dht.rs",
-          "section": "Line 155 — make_sign_fn captures Arc<K: KeyCustody>; line 459 — rotate_active_key takes key_custody; line 531 — migrate_identity takes key_custody"
-        },
-        {
-          "file": "crates/scp-core/src/event_log/checkpoint.rs",
-          "section": "Line 319 — CheckpointManager::maybe_create_checkpoint; line 358 — force_create_checkpoint; line 794 — generate_checkpoint (all take key_custody)"
-        },
-        {
-          "file": "crates/scp-core/src/crypto/sender_keys/key_protocol.rs",
-          "section": "Lines 205, 263, 429, 483, 579 — all sender key protocol functions take key_custody"
-        },
-        {
-          "file": "crates/scp-ffi/wasm/src/custody.rs",
-          "section": "Lines 1-32 — JsKeyCustody extern type with derive_pseudonym; line 97 doc fixed to say public_key_bytes per ADR-027"
+          "section": "### 9.10.4 Per-Context Pseudonyms"
         }
       ],
       "details": {
@@ -9908,15 +9819,7 @@
       "sources": [
         {
           "file": ".docs/standards/sdk-common.md",
-          "section": "Error code format table — 9 defined ranges (IDENT, DID, CTX, CRYPTO, TRANS, TOOL, VALID, STORAGE, ATTEST)"
-        },
-        {
-          "file": "PR #118",
-          "section": "7-agent review finding #3 — SCP-STORAGE-/SCP-ATTEST- collision with SCP-TOOL- 6000-6999 range"
-        },
-        {
-          "file": "PR #118",
-          "section": "Comprehensive error code audit — 18+ distinct prefixes, range swaps, spelling variants"
+          "section": "### Error code format"
         }
       ],
       "details": {
@@ -9960,31 +9863,23 @@
       "sources": [
         {
           "file": ".docs/sketch.md",
-          "section": "Lines 371-389 — receive() returns AsyncStream<ContextEvent>, buffer 1000 events, oldest-drop, BufferOverflow warning"
+          "section": "### Receive (streaming)"
         },
         {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-014 line 291-293 — receive() signature only, no lifecycle semantics"
-        },
-        {
-          "file": "crates/scp-ffi/src/context.rs",
-          "section": "Lines 388-408 — PyMessageReceiver.__anext__ uses sync try_recv(), conflates Empty/Disconnected"
-        },
-        {
-          "file": "crates/scp-ffi/src/context.rs",
-          "section": "Lines 719-727 — py_context_receive creates channel, immediately drops sender _tx"
+          "section": "## ADR-014: Python SDK Wrappers"
         },
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "ADR-019 — TypeScript receive pattern with onMessage/onError/onComplete callbacks (reference for detail level)"
+          "section": "## ADR-019: Data Provenance"
         },
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "ADR-023 — Swift AsyncStream<Message> with continuation.yield/finish (reference for detail level)"
+          "section": "## ADR-023: Bridge Connector Protocol"
         },
         {
           "file": ".docs/adrs/phase-6.md",
-          "section": "ADR-027 — Kotlin callbackFlow/awaitClose (reference for detail level)"
+          "section": "## ADR-027: Android Platform Adapter"
         }
       ],
       "details": {
@@ -10025,20 +9920,12 @@
       "tools": [],
       "sources": [
         {
-          "file": "crates/scp-ffi/src/identity.rs",
-          "section": "Lines 278-299 — py_identity_load stub with inline comment referencing ADR-013 criterion 2"
-        },
-        {
           "file": ".docs/adrs/phase-3.md",
-          "section": "ADR-013 — py_identity_load acceptance criterion"
+          "section": "## ADR-013: PyO3 Bridge Layer"
         },
         {
-          "file": "crates/scp-platform/src/traits.rs",
-          "section": "Storage trait definition (6 methods: set, get, delete, list_keys, delete_prefix, exists)"
-        },
-        {
-          "file": ".docs/specs/17-persistence.md",
-          "section": "Persistence architecture — ProtocolStore layer, Storage trait"
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
         }
       ],
       "details": {
@@ -10052,25 +9939,36 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-079",
-        "SCP-214"
+        "SCP-079"
       ],
       "files": [
         "crates/scp-ffi/wasm/src/tools.rs",
         "crates/scp-ffi/wasm/src/ucan.rs",
-        "crates/scp-ffi/wasm/src/event_log.rs",
-        "crates/scp-ffi/wasm/src/identity.rs"
+        "crates/scp-ffi/wasm/src/event_log.rs"
       ],
-      "description": "The WASM bridge (SCP-079) provides typed function signatures and error types but all functions return 'not yet connected to runtime' errors. Wire these to scp-core implementations using the same patterns as the PyO3 bridge (SCP-163).",
+      "description": "The WASM bridge (SCP-079) provides typed function signatures and error types but tool, UCAN, and event log functions return 'not yet connected to runtime' errors. Wire these to scp-core implementations using the same patterns as the PyO3 bridge (SCP-163). Scope: tool_register/invoke/verify, ucan_validate/mint/revoke, event_log_query/verify. Identity and KeyCustody wiring is covered separately by SCP-214.",
       "acceptanceCriteria": [
-        "tool_register, tool_invoke, tool_verify call scp-core tool registration/invocation pipeline",
-        "ucan_validate calls scp-core 11-step UCAN validation pipeline",
-        "ucan_mint and ucan_revoke call real scp-core operations",
-        "event_log_query and event_log_verify call scp-core EventLog operations",
-        "identity_create and identity_resolve wire to scp-core identity operations",
-        "All existing WASM compilation (wasm-pack build) continues to succeed",
-        "No 'not yet connected to runtime' errors remain in bridge functions"
-      ]
+        "tool_register calls scp-core ToolRegistry::register with schema validation",
+        "tool_invoke calls scp-core tool invocation pipeline and returns structured result",
+        "tool_verify calls scp-core schema verification and returns pass/fail with diagnostics",
+        "ucan_validate calls scp-core 11-step UCAN validation pipeline (verify_ucan_chain)",
+        "ucan_mint calls scp-core mint_ucan (signing deferred to KeyCustody wiring in SCP-214)",
+        "ucan_revoke calls scp-core UCAN revocation",
+        "event_log_query calls scp-core EventLog query with filter parameters",
+        "event_log_verify calls scp-core Merkle verification",
+        "wasm-pack build compiles without errors",
+        "No 'not yet connected to runtime' errors remain in tools.rs, ucan.rs, event_log.rs"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-022: TypeScript SDK (Dual-Target Architecture)"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
     },
     {
       "id": "SCP-219",
@@ -10078,23 +9976,32 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-080",
-        "SCP-214"
+        "SCP-080"
       ],
       "files": [
         "crates/scp-ffi/napi/src/ucan.rs",
-        "crates/scp-ffi/napi/src/event_log.rs",
-        "crates/scp-ffi/napi/src/transport.rs"
+        "crates/scp-ffi/napi/src/event_log.rs"
       ],
-      "description": "The NAPI bridge (SCP-080) has stub functions for UCAN validation/minting/revocation and event log query/verification that return 'not yet connected to runtime' errors. Wire these to scp-core implementations.",
+      "description": "The NAPI bridge (SCP-080) has stub functions for UCAN validation/minting/revocation and event log query/verification that return 'not yet connected to runtime' errors. Wire these to scp-core implementations. Scope: ucan_validate/mint/revoke, event_log_query/verify. NAPI tools.rs, identity.rs, and transport.rs have no 'not yet connected' stubs and are not in scope. Identity/KeyCustody wiring is SCP-214.",
       "acceptanceCriteria": [
-        "ucan_validate calls scp-core 11-step UCAN validation pipeline",
-        "ucan_mint and ucan_revoke call real scp-core operations",
-        "event_log_query and event_log_verify call scp-core EventLog operations",
-        "transport_send wires to real TransportManager",
-        "All existing NAPI compilation (napi build) continues to succeed",
-        "No 'not yet connected to runtime' errors remain in bridge functions"
-      ]
+        "ucan_validate calls scp-core 11-step UCAN validation pipeline (verify_ucan_chain)",
+        "ucan_mint calls scp-core mint_ucan (signing deferred to KeyCustody wiring in SCP-214)",
+        "ucan_revoke calls scp-core UCAN revocation",
+        "event_log_query calls scp-core EventLog query with filter parameters",
+        "event_log_verify calls scp-core Merkle verification",
+        "napi build compiles without errors",
+        "No 'not yet connected to runtime' errors remain in ucan.rs, event_log.rs"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-022: TypeScript SDK (Dual-Target Architecture)"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
     },
     {
       "id": "SCP-220",
@@ -10102,20 +10009,31 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-078",
-        "SCP-214"
+        "SCP-078"
       ],
       "files": [
         "crates/scp-ffi/uniffi/src/bridge.rs"
       ],
-      "description": "The UniFFI bridge (SCP-078) has stub functions for UCAN validation/minting/revocation and event log query/verification that return 'not yet connected to runtime' errors. Wire these to scp-core implementations.",
+      "description": "The UniFFI bridge (SCP-078) has stub functions for UCAN validation/minting/revocation and event log query/verification that return 'not yet connected to runtime' errors. Wire these to scp-core implementations. Scope: ucan_validate/mint/revoke, event_log_query/verify (5 stubs in bridge.rs). Identity/KeyCustody wiring is SCP-214.",
       "acceptanceCriteria": [
-        "ucan_validate calls scp-core 11-step UCAN validation pipeline",
-        "ucan_mint and ucan_revoke call real scp-core operations",
-        "event_log_query and event_log_verify call scp-core EventLog operations",
-        "All existing UniFFI compilation (cargo build -p scp-ffi-uniffi) continues to succeed",
-        "No 'not yet connected to runtime' errors remain in bridge functions"
-      ]
+        "ucan_validate calls scp-core 11-step UCAN validation pipeline (verify_ucan_chain)",
+        "ucan_mint calls scp-core mint_ucan (signing deferred to KeyCustody wiring in SCP-214)",
+        "ucan_revoke calls scp-core UCAN revocation",
+        "event_log_query calls scp-core EventLog query with filter parameters",
+        "event_log_verify calls scp-core Merkle verification",
+        "cargo build -p scp-ffi-uniffi compiles without errors",
+        "No 'not yet connected to runtime' errors remain in bridge.rs"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-021: UniFFI Bridge Definitions"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
     },
     {
       "id": "SCP-221",
@@ -10136,11 +10054,25 @@
       ],
       "description": "The Swift SDK wrappers (SCP-103) contain placeholder functions that return 'not yet available' errors across Mcp.swift, Tools.swift, Ucan.swift, Transport.swift, EventLog.swift, and Trust.swift. Wire these to the UniFFI bridge layer.",
       "acceptanceCriteria": [
-        "All Swift wrapper functions delegate to the UniFFI bridge (ScpBindings)",
-        "No 'not yet available' placeholder errors remain",
-        "Swift SDK conformance tests (SCP-102) pass with wired implementations",
-        "async/await bridging works correctly for all async operations"
-      ]
+        "Mcp.swift functions delegate to ScpBindings (UniFFI bridge) for MCP tool operations",
+        "Tools.swift functions delegate to ScpBindings for tool registration, invocation, and verification",
+        "Ucan.swift functions delegate to ScpBindings for UCAN validation, minting, and revocation",
+        "Transport.swift functions delegate to ScpBindings for transport send/receive",
+        "EventLog.swift functions delegate to ScpBindings for event log query and verification",
+        "Trust.swift functions delegate to ScpBindings for attestation verification and trust evaluation",
+        "No 'not yet available' placeholder errors remain in any Swift wrapper file",
+        "At least one async roundtrip test per module (Tools, Ucan, EventLog, Transport, Trust) verifies async/await bridging compiles and executes"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-026: Swift SDK"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
     },
     {
       "id": "SCP-222",
@@ -10148,14 +10080,13 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-001",
-        "SCP-135"
+        "SCP-001"
       ],
       "files": [
         "crates/scp-core/src/store/mod.rs",
         "crates/scp-core/src/store/protocol_store.rs"
       ],
-      "description": "Spec §17.4 defines a ProtocolStore that provides typed domain methods (60+) wrapping the raw Storage trait. This is the persistence layer that all higher-level code uses. Currently not implemented — higher-level code works with in-memory state only.",
+      "description": "Spec §17.4 defines a ProtocolStore that provides typed domain methods (60+) wrapping the raw Storage trait (SCP-001). This is the persistence layer that all higher-level code uses. Currently not implemented — higher-level code works with in-memory state only. Note: SCP-135 (auto-accept policy persistence) is a consumer of Storage, not a prerequisite.",
       "acceptanceCriteria": [
         "ProtocolStore struct wraps a Box<dyn Storage> with typed accessor methods",
         "Identity state CRUD: store/load/delete identity, key handles, DID documents",
@@ -10165,7 +10096,21 @@
         "Key convention follows §17.3 namespace pattern (e.g., identity/{did}/state)",
         "StoredValue<T> version envelope per §17.5 for forward compatibility",
         "All methods use MessagePack serialization via rmp-serde"
-      ]
+      ],
+      "priority": "P0",
+      "severity": "critical",
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.5 Serialization"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
     },
     {
       "id": "SCP-223",
@@ -10179,22 +10124,37 @@
       "files": [
         "crates/scp-core/src/discovery/addressing.rs",
         "crates/scp-core/src/discovery/handles.rs",
-        "crates/scp-core/src/discovery/petnames.rs"
+        "crates/scp-core/src/discovery/petnames.rs",
+        "crates/scp-core/src/discovery/mod.rs"
       ],
       "description": "Spec §22 defines a human-readable addressing layer with 5 mechanisms: petnames (local), discovery context handles, attestation-backed handles, domain handles, and unified resolution. Currently zero implementation exists.",
       "acceptanceCriteria": [
-        "Address format types: Petname, DiscoveryHandle, AttestationHandle, DomainHandle",
-        "TrustLevel enum: Self, Attestation, Context, Community per §22.2",
+        "Address format types: Petname, DiscoveryHandle, AttestationHandle, DomainHandle per §22.2",
+        "TrustLevel enum: Self, Attestation, Context, Community per §22.7",
         "handle_register, handle_lookup, handle_deregister discovery context tools per §22.5",
-        "AddressResolver with resolve() returning ranked results with trust levels",
+        "AddressResolver with resolve() returning results ranked by TrustLevel (Self > Attestation > Context > Community)",
         "Petname storage in identity private state per §22.3",
         "Resolution caching with TTL per §22.8",
-        "Unit tests covering all 5 addressing mechanisms"
-      ]
+        "Unit tests: at least one test per addressing mechanism (petname, discovery, attestation, domain, unified resolution)"
+      ],
+      "priority": "P2",
+      "severity": "moderate",
+      "sources": [
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "## 22.2 Address Format"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "## 22.8 Unified Resolution Protocol"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
     },
     {
       "id": "SCP-224",
-      "title": "Implement broadcast context runtime behavior",
+      "title": "Implement broadcast key lifecycle and BroadcastEnvelope seal/open",
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
@@ -10203,19 +10163,33 @@
         "SCP-013"
       ],
       "files": [
-        "crates/scp-core/src/context/broadcast.rs",
-        "crates/scp-core/src/crypto/sender_keys/broadcast.rs"
+        "crates/scp-core/src/crypto/sender_keys/broadcast.rs",
+        "crates/scp-core/src/crypto/sender_keys/mod.rs"
       ],
-      "description": "ContextMode::Broadcast is type-defined (SCP-018) but has no runtime behavior. Spec §5.14.2-12 defines subscriber registration, per-author broadcast keys, BroadcastEnvelope processing, and broadcast-specific blocking.",
+      "description": "ContextMode::Broadcast is type-defined (SCP-018) but has no runtime behavior. This story implements the core crypto layer: per-author AES-256 broadcast keys (§5.14.2), BroadcastEnvelope seal/open (§5.14.5), and KeyEpochAdvance event type. Subscriber registration, blocking, and integration testing are SCP-227.",
       "acceptanceCriteria": [
-        "Subscriber registration protocol for broadcast contexts",
-        "Per-author AES-256 broadcast key lifecycle (generation, rotation, distribution)",
-        "BroadcastEnvelope seal/open using author broadcast keys",
-        "Broadcast blocking using sender key revocation",
-        "KeyEpochAdvance event type for broadcast key rotation",
-        "validate_memory_scope_for_broadcast rejects Ephemeral/Summary",
-        "Integration test: author publishes, N subscribers receive"
-      ]
+        "generate_broadcast_key() creates per-author AES-256 key with epoch counter per §5.14.2",
+        "rotate_broadcast_key() increments epoch, generates new key, emits KeyEpochAdvance event",
+        "BroadcastEnvelope seal: encrypts payload with author's current broadcast key, includes epoch in header",
+        "BroadcastEnvelope open: decrypts payload using author's broadcast key at the specified epoch",
+        "KeyEpochAdvance event type defined and serializable",
+        "validate_memory_scope_for_broadcast rejects Ephemeral and Summary (only Full allowed per §5.14.10)",
+        "Unit tests: key generation, rotation, seal/open roundtrip, epoch mismatch rejected, memory scope validation"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.14 Broadcast Contexts"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-007: Sender-Side Key Layer"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
     },
     {
       "id": "SCP-225",
@@ -10231,12 +10205,99 @@
       ],
       "description": "Spec §9.10.6 mandates constant-rate cover traffic on persistent connections. §9.9.2 specifies periodic heartbeat messages for relay suppression detection. Neither is implemented.",
       "acceptanceCriteria": [
-        "CoverTrafficGenerator produces dummy messages at configurable interval (default 30s per §9.10.6)",
-        "Dummy messages are single-byte flag inside encrypted payload, indistinguishable from real messages",
-        "HeartbeatMonitor sends periodic heartbeats and detects suppression (missing heartbeat responses)",
-        "Cover traffic and heartbeats are configurable (enabled/disabled, interval)",
-        "Unit tests verify timing, format, and suppression detection"
-      ]
+        "CoverTrafficGenerator produces padded dummy messages at configurable interval (default 30s per §9.10.6)",
+        "Dummy messages are single-byte flag inside encrypted payload, indistinguishable from real messages after encryption",
+        "Real messages replace dummy messages in the schedule (no double-send within a window)",
+        "Cover traffic rate is per relay connection, not per context — a single timer per connection (§9.10.6 item 4)",
+        "HeartbeatMonitor sends heartbeats at configurable interval (default 60s per §9.9.2)",
+        "HeartbeatMonitor raises SuppressionSuspected event when expected heartbeats are missing for > 2x the heartbeat interval",
+        "Cover traffic and heartbeats are independently configurable (enabled/disabled, interval)",
+        "Unit tests verify: timing intervals, message format, real-replaces-dummy behavior, suppression detection threshold"
+      ],
+      "priority": "P1",
+      "severity": "major",
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.6 Cover Traffic"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.9.2 Suppression Detection"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
+    },
+    {
+      "id": "SCP-226",
+      "title": "Implement attestation renewal orchestration",
+      "gate": "gate-audit",
+      "status": "pending",
+      "blockedBy": [],
+      "files": [
+        "crates/scp-core/src/trust/renewal.rs"
+      ],
+      "description": "The Attestation struct has renewed_at and renewal_interval fields, and check_attestation_freshness correctly uses renewed_at as base time (SCP-062). But no orchestration exists to perform renewals — no function updates renewed_at, and no scheduling mechanism triggers re-verification. Spec §7.3.6 specifies type-specific automated renewal: identity links re-verified via OAuth on interval, tool integrity checks on schedule, endorsements refreshed periodically. This story adds the renewal API and a platform-injectable scheduling trait.",
+      "acceptanceCriteria": [
+        "renew_attestation(attestation, clock) -> Attestation returns a new Attestation with renewed_at set to current time, all other fields preserved",
+        "renew_attestation rejects attestations without renewal_interval (returns RenewalError::NotRenewable)",
+        "renew_attestation rejects expired attestations (returns RenewalError::Expired)",
+        "RenewalChecker trait with fn needs_renewal(&self, attestation: &Attestation) -> bool for platform-specific scheduling integration",
+        "Default RenewalChecker implementation checks renewal_interval against renewed_at (or issued_at if never renewed)",
+        "Unit tests: renewal updates renewed_at, non-renewable rejected, expired rejected, needs_renewal returns true when past interval, false when within interval"
+      ],
+      "priority": "P2",
+      "severity": "moderate",
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-017: Trust Engine (Four-Layer Evaluation)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.6 Time-Locked Attestation Renewal"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
+    },
+    {
+      "id": "SCP-227",
+      "title": "Implement broadcast subscriber registration, blocking, and integration",
+      "gate": "gate-audit",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "blockedBy": [
+        "SCP-224"
+      ],
+      "files": [
+        "crates/scp-core/src/context/broadcast.rs",
+        "crates/scp-core/src/context/mod.rs"
+      ],
+      "description": "With broadcast key lifecycle implemented (SCP-224), this story adds subscriber registration (§5.14.3), open vs. gated admission (§5.14.4), broadcast-specific blocking via sender key revocation (§5.14.8), broadcast capabilities and routing (§5.14.6, §5.14.9), and an integration test proving end-to-end: author publishes, N subscribers receive.",
+      "acceptanceCriteria": [
+        "subscribe_broadcast(context_id, subscriber_did) registers subscriber and returns current author key epoch",
+        "Open broadcast: any DID can subscribe without UCAN per §5.14.4",
+        "Gated broadcast: subscription requires valid UCAN with MessagesRead capability per §5.14.4",
+        "block_broadcast_author(author_did) revokes sender key, preventing decryption of future messages per §5.14.8",
+        "Broadcast capabilities enforce MessagesWrite restricted to authors, MessagesRead open to subscribers per §5.14.9",
+        "Integration test: author publishes message, 3 subscribers receive and decrypt successfully",
+        "Integration test: blocked author's subsequent messages are undecryptable by subscribers"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.3 Subscriber Registration"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.8 Blocking"
+        }
+      ],
+      "actionItems": [],
+      "details": {}
     }
   ]
 }

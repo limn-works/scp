@@ -113,6 +113,57 @@ pub fn validate_value_against_schema(value: &Value, schema: &Value) -> Result<()
         .map_err(|e| format!("schema validation failed: {e}"))
 }
 
+/// Minimum number of distinct property fields required by the schema
+/// specificity floor (spec section 6.2, 9.2.1).
+///
+/// Prevents degenerate broad-schema tools that function as arbitrary
+/// message channels. At least one of the input or output schemas must
+/// declare this many distinct property fields.
+pub const MIN_SCHEMA_FIELDS: usize = 2;
+
+/// Counts the number of distinct property fields declared in a JSON Schema.
+///
+/// Only counts top-level `properties` entries in an object-type schema.
+/// Returns 0 for non-object schemas or schemas without a `properties` key.
+#[must_use]
+pub fn count_schema_fields(schema: &Value) -> usize {
+    schema
+        .as_object()
+        .and_then(|obj| obj.get("properties"))
+        .and_then(Value::as_object)
+        .map_or(0, serde_json::Map::len)
+}
+
+/// Validates the schema specificity floor for a tool registration.
+///
+/// At least one of the input or output schemas must declare at least
+/// [`MIN_SCHEMA_FIELDS`] distinct property fields. This prevents
+/// degenerate single-field or empty-field schemas that function as
+/// arbitrary message channels (spec section 6.2, 9.2.1).
+///
+/// # Errors
+///
+/// Returns `("input"|"output", field_count)` if neither schema meets
+/// the minimum.
+pub fn validate_specificity_floor(
+    input_schema: &Value,
+    output_schema: &Value,
+) -> Result<(), (&'static str, usize)> {
+    let input_fields = count_schema_fields(input_schema);
+    let output_fields = count_schema_fields(output_schema);
+
+    if input_fields >= MIN_SCHEMA_FIELDS || output_fields >= MIN_SCHEMA_FIELDS {
+        return Ok(());
+    }
+
+    // Report whichever side has fewer fields (or input if tied).
+    if input_fields <= output_fields {
+        Err(("input", input_fields))
+    } else {
+        Err(("output", output_fields))
+    }
+}
+
 /// Returns a human-readable name for a JSON value's type.
 const fn json_type_name(value: &Value) -> &'static str {
     match value {
@@ -558,5 +609,92 @@ mod tests {
         // Invalid: zip does not match pattern.
         let bad_zip = serde_json::json!({"address": {"city": "Portland", "zip": "abcde"}});
         assert!(validate_value_against_schema(&bad_zip, &schema).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema specificity floor (spec section 6.2, 9.2.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn count_schema_fields_returns_property_count() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "number"},
+                "b": {"type": "number"},
+                "c": {"type": "string"}
+            }
+        });
+        assert_eq!(count_schema_fields(&schema), 3);
+    }
+
+    #[test]
+    fn count_schema_fields_returns_zero_for_no_properties() {
+        let schema = serde_json::json!({"type": "object"});
+        assert_eq!(count_schema_fields(&schema), 0);
+    }
+
+    #[test]
+    fn count_schema_fields_returns_zero_for_non_object_schema() {
+        let schema = serde_json::json!({"type": "string"});
+        assert_eq!(count_schema_fields(&schema), 0);
+    }
+
+    #[test]
+    fn specificity_floor_passes_when_input_has_enough_fields() {
+        let input = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "number"},
+                "b": {"type": "number"}
+            }
+        });
+        let output = serde_json::json!({"type": "object"});
+        assert!(validate_specificity_floor(&input, &output).is_ok());
+    }
+
+    #[test]
+    fn specificity_floor_passes_when_output_has_enough_fields() {
+        let input = serde_json::json!({"type": "object"});
+        let output = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "result": {"type": "number"},
+                "status": {"type": "string"}
+            }
+        });
+        assert!(validate_specificity_floor(&input, &output).is_ok());
+    }
+
+    #[test]
+    fn specificity_floor_fails_when_neither_has_enough_fields() {
+        let input = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "data": {"type": "string"}
+            }
+        });
+        let output = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "result": {"type": "string"}
+            }
+        });
+        let result = validate_specificity_floor(&input, &output);
+        assert!(result.is_err());
+        let (side, count) = result.unwrap_err();
+        assert_eq!(side, "input");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn specificity_floor_fails_when_both_have_zero_fields() {
+        let input = serde_json::json!({"type": "object"});
+        let output = serde_json::json!({"type": "string"});
+        let result = validate_specificity_floor(&input, &output);
+        assert!(result.is_err());
+        let (side, count) = result.unwrap_err();
+        assert_eq!(side, "input");
+        assert_eq!(count, 0);
     }
 }

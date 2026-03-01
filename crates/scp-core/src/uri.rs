@@ -123,6 +123,11 @@ pub enum ScpUri {
         /// Advisory human-readable context name. Not verified against actual
         /// context metadata.
         name: Option<String>,
+        /// Advisory human-readable handle (e.g.,
+        /// `recipes@cooking-community`). Provides a resolution starting
+        /// point for clients but the canonical reference remains the
+        /// `context_id`. See spec section 22.9.1.
+        handle: Option<String>,
     },
 }
 
@@ -153,6 +158,14 @@ impl ScpUri {
     pub fn name(&self) -> Option<&str> {
         let Self::Context { name, .. } = self;
         name.as_deref()
+    }
+
+    /// Returns the advisory handle, if present (e.g.,
+    /// `recipes@cooking-community`). See spec section 22.9.1.
+    #[must_use]
+    pub fn handle(&self) -> Option<&str> {
+        let Self::Context { handle, .. } = self;
+        handle.as_deref()
     }
 }
 
@@ -266,6 +279,7 @@ impl FromStr for ScpUri {
             None
         };
         let mut name: Option<String> = None;
+        let mut handle: Option<String> = None;
 
         for (key, value) in &params {
             match key.as_str() {
@@ -281,6 +295,9 @@ impl FromStr for ScpUri {
                 }
                 "name" => {
                     name = Some(value.clone());
+                }
+                "handle" => {
+                    handle = Some(value.clone());
                 }
                 _ => {
                     // Unknown query parameters are ignored (forward
@@ -298,6 +315,7 @@ impl FromStr for ScpUri {
             relays,
             mode,
             name,
+            handle,
         })
     }
 }
@@ -313,6 +331,7 @@ impl fmt::Display for ScpUri {
             relays,
             mode,
             name,
+            handle,
         } = self;
 
         // Always emit universal format.
@@ -351,10 +370,24 @@ impl fmt::Display for ScpUri {
         if let Some(n) = name {
             if first {
                 write!(f, "?")?;
+                first = false;
             } else {
                 write!(f, "&")?;
             }
             write!(f, "name={}", utf8_percent_encode(n, QUERY_VALUE_ENCODE_SET))?;
+        }
+
+        if let Some(h) = handle {
+            if first {
+                write!(f, "?")?;
+            } else {
+                write!(f, "&")?;
+            }
+            write!(
+                f,
+                "handle={}",
+                utf8_percent_encode(h, QUERY_VALUE_ENCODE_SET)
+            )?;
         }
 
         Ok(())
@@ -526,6 +559,7 @@ mod tests {
             relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
             mode: Some(ContextMode::Encrypted),
             name: None,
+            handle: None,
         };
         let serialized = original.to_string();
         let parsed: ScpUri = serialized.parse().unwrap();
@@ -542,6 +576,7 @@ mod tests {
             ],
             mode: Some(ContextMode::Broadcast),
             name: Some("Tech News".to_owned()),
+            handle: None,
         };
         let serialized = original.to_string();
         let parsed: ScpUri = serialized.parse().unwrap();
@@ -555,6 +590,7 @@ mod tests {
             relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
             mode: None,
             name: None,
+            handle: None,
         };
         let serialized = original.to_string();
         let parsed: ScpUri = serialized.parse().unwrap();
@@ -568,6 +604,7 @@ mod tests {
             relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
             mode: None,
             name: Some("Hello World & Friends!".to_owned()),
+            handle: None,
         };
         let serialized = original.to_string();
         let parsed: ScpUri = serialized.parse().unwrap();
@@ -583,6 +620,7 @@ mod tests {
             relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
             mode: Some(ContextMode::Broadcast),
             name: None,
+            handle: None,
         };
         let s = uri.to_string();
         assert!(s.starts_with("scp://context/"));
@@ -596,6 +634,7 @@ mod tests {
             relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
             mode: None,
             name: None,
+            handle: None,
         };
         let s = uri.to_string();
         // The relay URL should be percent-encoded (colons, slashes).
@@ -609,6 +648,7 @@ mod tests {
             relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
             mode: None,
             name: Some("Hello World".to_owned()),
+            handle: None,
         };
         let s = uri.to_string();
         assert!(s.contains("name=Hello%20World"));
@@ -685,5 +725,41 @@ mod tests {
             &mode=broadcast";
         let uri: ScpUri = input.parse().unwrap();
         assert_eq!(uri.mode(), Some(ContextMode::Broadcast));
+    }
+
+    // -- Handle query parameter (§22.9.1) ------------------------------------
+
+    #[test]
+    fn parse_handle_query_parameter() {
+        let input = "scp://context/a1b2c3d4e5f6\
+            ?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1\
+            &handle=recipes%40cooking-community";
+        let uri: ScpUri = input.parse().unwrap();
+        assert_eq!(uri.context_id(), "a1b2c3d4e5f6");
+        assert_eq!(uri.handle(), Some("recipes@cooking-community"));
+        assert_eq!(uri.name(), None);
+    }
+
+    #[test]
+    fn roundtrip_uri_with_handle() {
+        let original = ScpUri::Context {
+            context_id: "a1b2c3d4e5f6".to_owned(),
+            relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
+            mode: Some(ContextMode::Broadcast),
+            name: Some("Recipes".to_owned()),
+            handle: Some("recipes@cooking-community".to_owned()),
+        };
+        let serialized = original.to_string();
+        let parsed: ScpUri = serialized.parse().unwrap();
+        assert_eq!(original, parsed);
+        assert_eq!(parsed.handle(), Some("recipes@cooking-community"));
+    }
+
+    #[test]
+    fn uri_without_handle_has_none() {
+        let input = "scp://context/abcdef\
+            ?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1";
+        let uri: ScpUri = input.parse().unwrap();
+        assert_eq!(uri.handle(), None);
     }
 }

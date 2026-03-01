@@ -1,0 +1,230 @@
+name: PRD Validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    paths:
+      - '.docs/prds/**'
+      - '.docs/specs/**'
+      - '.docs/adrs/**'
+      - '.docs/standards/prd.md'
+      - '.loom/prd.json'
+
+concurrency:
+  group: prd-validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  prd-validate:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run structural validation
+        run: python3 scripts/validate-prd.py
+
+      - name: Compute review scope
+        id: diff
+        run: |
+          EVENT="${{ github.event.action }}"
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          PR_BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          if [[ "$EVENT" == "synchronize" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            MODE="incremental"
+            DIFF_BASE="$BEFORE"
+            DIFF_HEAD="$AFTER"
+          else
+            MODE="full"
+            DIFF_BASE="$PR_BASE"
+            DIFF_HEAD="$HEAD"
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+          # Write raw file list, then filter to PRD paths only
+          git diff --name-only "$DIFF_BASE".."$DIFF_HEAD" > /tmp/all-changed-files.txt || \
+            gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > /tmp/all-changed-files.txt
+
+          grep -E '^(\.docs/prds/|\.docs/specs/|\.docs/adrs/|\.docs/standards/prd\.md$|\.loom/prd\.json$)' /tmp/all-changed-files.txt > /tmp/changed-files.txt || true
+
+          FILE_COUNT=$(wc -l < /tmp/changed-files.txt | tr -d ' ')
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [[ "$FILE_COUNT" -eq 0 ]]; then
+            echo "No PRD files changed — skipping semantic check."
+            exit 0
+          fi
+
+          echo "## Review Scope" > /tmp/review-scope.md
+          echo "**Mode:** $MODE" >> /tmp/review-scope.md
+          echo "**Range:** \`${DIFF_BASE:0:8}..${DIFF_HEAD:0:8}\`" >> /tmp/review-scope.md
+          echo "**PRD files in scope:** $FILE_COUNT" >> /tmp/review-scope.md
+          echo "" >> /tmp/review-scope.md
+          echo "### Changed files" >> /tmp/review-scope.md
+          cat /tmp/changed-files.txt >> /tmp/review-scope.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch review history
+        if: steps.diff.outputs.file_count != '0'
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          REPO="${{ github.repository }}"
+
+          echo "## Previous PRD Validation Comments" > /tmp/review-history.md
+
+          gh api "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | select(.body | test("PRD Validation")) | "- \(.user.login) at \(.created_at): \(.body | .[0:500])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
+
+          echo "" >> /tmp/review-history.md
+          echo "## Previous Review Verdicts" >> /tmp/review-history.md
+          gh api "repos/$REPO/pulls/$PR/reviews" \
+            --jq '.[] | "- \(.state) by \(.user.login) at \(.submitted_at): \(.body | .[0:300])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Claude PRD semantic review
+        if: steps.diff.outputs.file_count != '0'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: '--model claude-opus-4-20250514 --max-turns 50 --allowedTools "Bash(gh *),Read,Glob,Grep"'
+          prompt: |
+            Validate PRD stories changed in PR #${{ github.event.pull_request.number }}
+            against the PRD standard and upstream artifacts.
+
+            IMPORTANT: Be turn-efficient. Use parallel tool calls aggressively. Read
+            multiple files in one turn.
+
+            ## Setup
+
+            Read pre-computed files:
+            1. `/tmp/review-scope.md` — PRD files in scope and review mode
+            2. `/tmp/review-history.md` — previous PRD validation comments
+            3. `/tmp/changed-files.txt` — changed PRD file list
+
+            Then read the PRD standard:
+            4. `.docs/standards/prd.md` — the authoritative quality standard
+
+            This check is in **${{ steps.diff.outputs.mode }}** mode.
+            - **full**: Validate all stories in changed PRD files.
+            - **incremental**: Validate ONLY stories added or modified in the latest push.
+
+            ## History Rules
+
+            Review previous PRD validation comments in /tmp/review-history.md.
+            - Do NOT repeat findings already flagged in previous comments.
+            - If a previous "Action Required" finding is on a story in scope, check if
+              fixed. Report as **Resolved** or re-flag.
+            - If a previous finding is on a story NOT in scope, ignore it entirely.
+
+            ## Step 1: Identify changed stories
+
+            For each changed PRD file, use `git diff` to identify which stories were
+            added or modified. In incremental mode, only validate those stories.
+            In full mode, validate all stories in the changed files.
+
+            ## Step 2: Validate each story against the standard
+
+            For each story in scope, check ALL of these (from `.docs/standards/prd.md`):
+
+            ### Structure
+            - All 14 required fields present (`id`, `title`, `gate`, `priority`,
+              `severity`, `status`, `files`, `description`, `acceptanceCriteria`,
+              `actionItems`, `blockedBy`, `tools`, `sources`, `details`)
+            - `priority` is P0/P1/P2; `severity` is critical/major/moderate/minor;
+              `status` is pending/in-progress/done
+            - `id` follows PREFIX-NNN format (zero-padded 3 digits)
+            - Story is listed in its gate's `stories` array
+
+            ### Provenance (sources)
+            - Every source `file` exists in the repository
+            - Every source `section` exists as a heading in that file
+            - Sources reference the **most specific** artifact in the unidirectional
+              chain: planning sessions → specs → ADRs → PRD stories
+            - If both a spec section and an ADR section apply, both are referenced
+            - Empty sources `[]` are only valid with an explanation in `description`
+
+            ### Acceptance criteria
+            - Every criterion is machine-verifiable (a test can be written for it)
+            - No vague language: "works correctly", "handles edge cases", "is wired"
+            - 1:1 mapping from source spec/ADR requirements — no merged criteria,
+              no dropped conditionals
+
+            ### Dependencies (blockedBy)
+            - Every ID references an existing story in the same PRD
+            - Dependencies are forward-only (story depends on work that must exist
+              before it can start)
+            - No backwards dependencies (A "depends on" B but B consumes A's output)
+            - No transitive over-specification (A→B→C: A lists only B, not B and C)
+            - No false dependencies from scope confusion
+
+            ### Semantic accuracy
+            - `description` gives enough context for autonomous implementation
+            - `files` list is accurate (files the story creates or modifies)
+            - `gate` assignment is correct (story belongs to the right phase)
+            - Scope is achievable by one agent in one iteration (~15-30 min)
+
+            ## Step 3: Cross-reference with upstream artifacts
+
+            For stories with sources, READ the actual source sections (specs, ADRs).
+            Verify:
+            - Story accurately represents what the source says
+            - No drift between source requirements and acceptance criteria
+            - Conditional language in sources ("unless", "except when", "only if")
+              is preserved as explicit test cases
+            - Source sections haven't been updated since the story was written
+              (check for content that the story doesn't reflect)
+
+            ## Step 4: Report
+
+            ### When to post
+
+            **In incremental mode**: Only post if you found new issues or resolved
+            previous ones. If no stories in scope have problems, exit silently.
+
+            **In full mode**: Always post.
+
+            ### How to post
+
+            Write the report to /tmp/prd-report.md, then post:
+            ```bash
+            gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/prd-report.md
+            ```
+
+            **Report format:**
+
+            Start with:
+            `## PRD Validation — [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+
+            Scope line:
+            `**Mode:** ${{ steps.diff.outputs.mode }} | **Stories checked:** <count>`
+
+            **If there are resolved findings from previous reviews:**
+            `### Resolved (from previous review)`
+            Brief summary of what was fixed.
+
+            **If there are Action Required findings:**
+            `### Action Required`
+            Format each as:
+            - **Story:** `SCP-NNN` — title
+            - **Issue:** structure | provenance | acceptance-criteria | dependency | semantic | drift
+            - **Description:** what's wrong and what the fix should be
+
+            **If no issues:**
+            `**PASSED** — All stories conform to PRD standard.`

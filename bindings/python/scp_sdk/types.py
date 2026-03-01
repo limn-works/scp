@@ -98,6 +98,11 @@ class Capability(enum.Enum):
     GOVERNANCE_VOTE = "GovernanceVote"
     CONTEXT_CLOSE = "ContextClose"
     CHILD_CONTEXT_CREATE = "ChildContextCreate"
+    TOOL_INTERFACE = "ToolInterface"
+    BRIDGING = "Bridging"
+    MEDIA_VOICE = "MediaVoice"
+    MEDIA_VIDEO = "MediaVideo"
+    MEDIA_SCREEN_SHARE = "MediaScreenShare"
 
     @staticmethod
     def tool_invoke(tool_id: str) -> str:

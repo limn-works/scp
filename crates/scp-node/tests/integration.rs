@@ -293,6 +293,7 @@ async fn scenario4_scp_uri_roundtrip() {
         relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
         mode: Some(ContextMode::Encrypted),
         name: None,
+        handle: None,
     };
 
     let serialized = uri.to_string();
@@ -310,6 +311,7 @@ async fn scenario4_scp_uri_roundtrip() {
         ],
         mode: Some(ContextMode::Broadcast),
         name: Some("Tech News".to_owned()),
+        handle: None,
     };
 
     let serialized = uri_broadcast.to_string();
@@ -326,6 +328,7 @@ async fn scenario4_scp_uri_roundtrip() {
         relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
         mode: None,
         name: None,
+        handle: None,
     };
 
     let serialized = uri_minimal.to_string();
@@ -358,6 +361,7 @@ async fn scenario4_scp_uri_roundtrip() {
         relays: vec!["wss://relay.example.com/scp/v1".to_owned()],
         mode: None,
         name: Some("Hello World & Friends!".to_owned()),
+        handle: None,
     };
     let serialized = uri_special.to_string();
     let parsed: ScpUri = serialized

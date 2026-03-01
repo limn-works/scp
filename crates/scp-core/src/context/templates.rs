@@ -118,8 +118,8 @@ fn messaging_tool_invoke_ceiling() -> Vec<Capability> {
 /// Returns the messaging + full tools ceiling: messaging + `tool:invoke_all` +
 /// `tool:register`.
 ///
-/// Used by broadcast templates (spec section 5.12.1) where authors can both
-/// invoke and register tools.
+/// Used by broadcast templates and the tool-interface template (spec section
+/// 5.12.1) where participants can both invoke and register tools.
 fn messaging_tools_ceiling() -> Vec<Capability> {
     vec![
         Capability::new(CAP_MESSAGES_READ),
@@ -241,6 +241,19 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             template_id: Some(TemplateId::GatedBroadcast),
             economic_policy: None,
         },
+        TemplateId::ToolInterfaceTemplate => ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: messaging_tools_ceiling(),
+            ceiling_policy: CeilingPolicy::Immutable,
+            promotion_policy: PromotionPolicy::NoPromotion,
+            roles: Vec::new(),
+            tools: Vec::new(),
+            ttl: None,
+            memory_scope: MemoryScope::Full,
+            governance: GovernanceModel::SingleAdmin,
+            template_id: Some(TemplateId::ToolInterfaceTemplate),
+            economic_policy: None,
+        },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
         TemplateId::PaidService => ContextParams {
@@ -314,6 +327,7 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
         TemplateId::GroupDiscussion
         | TemplateId::PublicBroadcast
         | TemplateId::GatedBroadcast
+        | TemplateId::ToolInterfaceTemplate
         | TemplateId::PaidService
         | TemplateId::PaidBroadcast => TtlPolicy::Optional,
     }
@@ -959,6 +973,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
+            TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
         ];
@@ -1090,6 +1105,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
+            TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
         ];
