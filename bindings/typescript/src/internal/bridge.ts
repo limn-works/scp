@@ -52,7 +52,10 @@ export interface Bridge {
   identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle>;
 
   // Context
-  contextCreate(identityDid: string, paramsJson: string): Promise<BridgeContextHandle>;
+  contextCreate(
+    identity: BridgeIdentityHandle,
+    paramsJson: string,
+  ): Promise<BridgeContextHandle>;
   contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void>;
   contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void>;
   contextClose(handle: BridgeContextHandle, identityDid: string): Promise<void>;

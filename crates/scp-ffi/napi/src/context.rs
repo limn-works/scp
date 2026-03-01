@@ -17,11 +17,15 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
+use std::sync::Arc;
+
 use napi::Error as NapiError;
 use napi_derive::napi;
+use scp_platform::traits::KeyHandle;
 use uuid::Uuid;
 
 use crate::error::ScpNapiError;
+use crate::identity::{NapiIdentity, OpaqueInMemoryKeyCustody};
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -78,6 +82,17 @@ pub struct NapiContextHandle {
     member_count: u64,
     /// Optional economic policy string.
     economic_policy: Option<String>,
+    /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
+    ///
+    /// Set during `context_create` from the creating identity's custody.
+    /// Used by `ucan_mint` to produce real Ed25519 signatures. Dropping
+    /// this destroys the key material backing the `signing_key` handle.
+    pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
+    /// Handle to the creator's active signing key for UCAN minting (RED-102).
+    ///
+    /// This is the `active_signing_key` from the creating identity's
+    /// [`ScpIdentity`]. Points into `in_memory_custody`.
+    pub(crate) signing_key: Option<KeyHandle>,
 }
 
 /// Internal context lifecycle state.
@@ -250,7 +265,9 @@ pub struct NapiMessage {
 ///
 /// # Arguments
 ///
-/// * `identity_did` — The DID string of the context creator.
+/// * `identity` — The identity handle of the context creator. The handle's
+///   key custody and active signing key are retained on the context for UCAN
+///   minting (RED-102).
 /// * `params_json` — Context creation parameters as a JSON string. Optional
 ///   fields: `ceiling` (string[]), `governance` (string), `memoryScope`
 ///   (string), `ttlSeconds` (number), `promotable` (boolean).
@@ -266,7 +283,7 @@ pub struct NapiMessage {
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn context_create(
-    identity_did: String,
+    identity: &NapiIdentity,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
     let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
@@ -299,11 +316,20 @@ pub async fn context_create(
         .to_owned();
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
+    // Extract key custody and signing key from the identity handle (RED-102).
+    // These are retained on the context for UCAN minting.
+    let in_memory_custody = identity.inner.in_memory_custody.clone();
+    let signing_key = identity
+        .inner
+        .scp_identity
+        .as_ref()
+        .map(|id| id.active_signing_key);
+
     let context_id = format!("ctx-{}", Uuid::new_v4());
     let handle = NapiContextHandle {
         context_id,
         state: std::sync::Mutex::new(ContextState::Active),
-        creator_did: identity_did,
+        creator_did: identity.inner.did.clone(),
         mode,
         ceiling,
         ceiling_policy,
@@ -312,6 +338,8 @@ pub async fn context_create(
         governance,
         member_count: 1,
         economic_policy,
+        in_memory_custody,
+        signing_key,
     };
     increment_handle_count();
     Ok(handle)

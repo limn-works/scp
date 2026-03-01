@@ -92,7 +92,7 @@ export class Context implements AsyncDisposable {
         economicPolicy: params.economicPolicy,
       });
 
-      const handle = await bridge.contextCreate(identity.did, paramsJson);
+      const handle = await bridge.contextCreate(identity._handle, paramsJson);
       return new Context(handle.contextId, handle, identity.did);
     } catch (error) {
       throw mapBridgeError(error);

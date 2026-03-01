@@ -210,9 +210,13 @@ export function createWasmBridge(): Bridge {
     },
 
     // Context
-    async contextCreate(identityDid: string, paramsJson: string): Promise<BridgeContextHandle> {
+    async contextCreate(
+      identity: BridgeIdentityHandle,
+      paramsJson: string,
+    ): Promise<BridgeContextHandle> {
       const wasm = getWasm();
-      const handle = await wasm.context_create(identityDid, paramsJson);
+      // WASM bridge uses identity.did since wasm_bindgen context_create takes a DID string.
+      const handle = await wasm.context_create(identity.did, paramsJson);
       return {
         contextId: handle.contextId,
         state: handle.state,
