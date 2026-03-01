@@ -468,11 +468,12 @@ const DEFAULT_CACHE_CAPACITY: usize = 10_000;
 impl ResolutionCache {
     /// Creates a new empty resolution cache with default capacity (10,000).
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn new() -> Self {
         Self {
             entries: lru::LruCache::new(
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY)
-                    .expect("DEFAULT_CACHE_CAPACITY is non-zero"),
+                    .expect("constant is non-zero"),
             ),
         }
     }
@@ -1044,7 +1045,7 @@ mod tests {
 
     #[test]
     fn cache_returns_none_for_missing_key() {
-        let cache = ResolutionCache::new();
+        let mut cache = ResolutionCache::new();
         assert!(cache.get("nonexistent").is_none());
     }
 
