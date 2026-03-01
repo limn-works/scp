@@ -294,9 +294,8 @@ pub fn py_ucan_validate(
 /// given member DID. The token is structured with proper SCP capability
 /// URIs scoped to the context.
 ///
-/// Stub — see SCP-214 for `KeyCustody` wiring. Currently creates a properly
-/// formatted token with a placeholder signature. Real Ed25519 signing
-/// requires `KeyCustody` integration.
+/// Creates a properly formatted token with context-scoped capability URIs.
+/// Real Ed25519 signing requires `KeyCustody` integration (SCP-214).
 ///
 /// # Arguments
 ///
