@@ -1,10 +1,12 @@
-# scp-sdk-kotlin-android — Android Platform Adapter
+# scp-sdk-kotlin-android — Android Platform Adapter & Lifecycle Integration
 
 ## Overview
 
-Android-specific platform trait implementations for SCP. Implements the four UniFFI callback interfaces (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`, `StorageProvider`) using Android's native platform security stack. See ADR-027 in `.docs/adrs/phase-6.md`.
+Android-specific platform trait implementations and lifecycle-aware resource management for SCP. Implements the four UniFFI callback interfaces (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`, `StorageProvider`) using Android's native platform security stack (ADR-027), and provides `LifecycleOwner`-aware cleanup of SCP resources (ADR-028).
 
 ## Architecture
+
+### Platform Adapters (`com.limn.scp.android.platform`)
 
 Each platform trait is a Kotlin class that implements a UniFFI-generated callback interface. The Rust engine calls these via UniFFI's callback mechanism. All classes accept an Android `Context` parameter for platform API access.
 
@@ -15,6 +17,15 @@ Each platform trait is a Kotlin class that implements a UniFFI-generated callbac
 | `AndroidPushProvider.kt` | `PushProvider` | Firebase Cloud Messaging | SCP-112 |
 | `AndroidStorage.kt` | `StorageProvider` | SQLCipher + TEE-derived AES-256 key | SCP-113 |
 | `PlatformAdapter.kt` | Factory | Constructs and injects all four providers | SCP-114 |
+
+### Lifecycle Integration (`com.limn.scp.android`)
+
+Lifecycle-aware SCP resource management for Activities and Fragments. Keeps the core SDK Android-free.
+
+| File | Purpose | Story |
+|------|---------|-------|
+| `ContextLifecycle.kt` | `Flow<T>.asLifecycleFlow(LifecycleOwner)` extension — scopes flow collection to lifecycle | SCP-117 |
+| `ScpViewModel.kt` | `ScpViewModel` base class — tracks contexts, auto-cleanup on `onCleared()` | SCP-117 |
 
 ## Gotchas
 
@@ -60,6 +71,18 @@ The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matchi
 
 `listKeys()` and `deletePrefix()` escape `%`, `_`, and `\` wildcards via `escapeLikePrefix()` and use `ESCAPE '\'` clauses in SQL LIKE patterns. The in-memory test double uses `startsWith` which does not need escaping but has equivalent prefix-match semantics.
 
+### TestLifecycleOwner needs UnconfinedTestDispatcher for synchronous emission
+
+`TestLifecycleOwner` from `lifecycle-runtime-testing` dispatches lifecycle events via a coroutine dispatcher. In tests, pass `UnconfinedTestDispatcher(testScheduler)` to `TestLifecycleOwner`'s constructor so lifecycle state changes take effect immediately. Using `StandardTestDispatcher` requires explicit `advanceUntilIdle()` calls between lifecycle transitions which can cause subtle ordering issues in flow collection tests.
+
+### ScpViewModel.onCleared() uses viewModelScope
+
+The `onCleared()` method dispatches cleanup via `viewModelScope.launch`. In tests, set `Dispatchers.setMain(testDispatcher)` before constructing the ViewModel and call `Dispatchers.resetMain()` in teardown. The `viewModelScope` is cancelled after `onCleared()` returns, so cleanup coroutines must be launched before the scope is cancelled.
+
+### Lifecycle extension is generic, not SCP-specific
+
+`asLifecycleFlow` is defined as `Flow<T>.asLifecycleFlow()` (generic), not `Flow<Message>.asLifecycleFlow()`. This works with any Flow type including the bridge's `Flow<String>` from `ContextBridge.subscribe()` and the future ergonomics layer's `Flow<Message>` from `Context.receiveFlow()`.
+
 ## Build
 
 ```bash
@@ -72,6 +95,8 @@ The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matchi
 
 ## Dependencies (from build.gradle.kts)
 
+- `androidx.lifecycle:lifecycle-runtime-ktx:2.8.7` — `flowWithLifecycle()` for lifecycle-scoped flows (SCP-117)
+- `androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7` — ViewModel + `viewModelScope` (SCP-117)
 - `com.google.android.play:integrity:1.4.0` — Play Integrity API
 - `org.bouncycastle:bcprov-jdk18on:1.80` — Software Ed25519 fallback
 - `com.google.firebase:firebase-messaging:24.1.0` — FCM push
@@ -80,6 +105,7 @@ The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matchi
 - `androidx.security:security-crypto:1.1.0-alpha06` — EncryptedSharedPreferences
 - `org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0` — Coroutines
 - `org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0` — Android dispatcher
+- `androidx.lifecycle:lifecycle-runtime-testing:2.8.7` — (test) `TestLifecycleOwner` for lifecycle tests
 
 ## Standards
 
