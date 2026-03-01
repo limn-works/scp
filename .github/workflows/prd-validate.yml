@@ -5,6 +5,9 @@ on:
     types: [opened, synchronize, ready_for_review]
     paths:
       - '.docs/prds/**'
+      - '.docs/specs/**'
+      - '.docs/adrs/**'
+      - '.docs/standards/prd.md'
       - '.loom/prd.json'
 
 concurrency:
@@ -63,7 +66,7 @@ jobs:
           git diff --name-only "$DIFF_BASE".."$DIFF_HEAD" > /tmp/all-changed-files.txt || \
             gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > /tmp/all-changed-files.txt
 
-          grep -E '^(\.docs/prds/|\.loom/prd\.json$)' /tmp/all-changed-files.txt > /tmp/changed-files.txt || true
+          grep -E '^(\.docs/prds/|\.docs/specs/|\.docs/adrs/|\.docs/standards/prd\.md$|\.loom/prd\.json$)' /tmp/all-changed-files.txt > /tmp/changed-files.txt || true
 
           FILE_COUNT=$(wc -l < /tmp/changed-files.txt | tr -d ' ')
           echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
