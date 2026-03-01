@@ -88,7 +88,9 @@
         "SCP-163",
         "SCP-164",
         "SCP-165",
-        "SCP-210"
+        "SCP-210",
+        "SCP-216",
+        "SCP-217"
       ]
     },
     {
@@ -215,7 +217,8 @@
         "SCP-133",
         "SCP-136",
         "SCP-139",
-        "SCP-214"
+        "SCP-214",
+        "SCP-215"
       ]
     },
     {
@@ -2386,7 +2389,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in_progress",
       "files": [
         "crates/scp-ffi/pyo3/identity.rs"
       ],
@@ -2408,8 +2411,7 @@
         "Register all functions and classes in the module."
       ],
       "blockedBy": [
-        "SCP-036",
-        "SCP-037"
+        "SCP-217"
       ],
       "sources": [
         {
@@ -9838,6 +9840,194 @@
         "notYetExposedViaFFI": "Two scp-core functions take KeyCustody but have no corresponding FFI bridge function: (1) delegate_ucan (mint.rs:292) — SCP-056 implemented the scp-core function and SCP-057 defined a Python wrapper, but no py_ucan_delegate bridge function exists in crates/scp-ffi/src/ucan.rs. (2) DidDht::migrate_identity (dht.rs:531) — SCP-008 implemented scp-core but no py_identity_migrate bridge function exists. This story should add bridge functions for both, since they require KeyCustody and are part of the complete FFI surface.",
         "sealEnvelopeNote": "seal_envelope (outer.rs:169) takes routing_id: &[u8] and InnerEnvelope as pre-computed inputs. It does not take KeyCustody directly, but both inputs require KeyCustody upstream: routing_id comes from derive_pseudonym, and InnerEnvelope comes from create_inner_envelope which signs with KeyCustody. The entire message send path is blocked without this wiring.",
         "inMemoryCodeBug": "InMemoryKeyCustody::derive_pseudonym at key_custody.rs:333 uses signing_key.to_bytes() (Ed25519 private/secret key bytes, 32 bytes) as the HMAC key. ADR-027 mandates verifying_key.to_bytes() (Ed25519 public key bytes, 32 bytes) for cross-platform determinism — hardware TEE keys (Android Keystore, Secure Enclave) cannot export private bytes. AndroidKeyCustody.kt correctly uses publicKey(keyHandle) at line 178. AppleKeyCustody.swift correctly uses publicKey(). InMemoryKeyCustody is the outlier. The golden vector test at key_custody.rs:626 will need updated expected values after the fix."
+      }
+    },
+    {
+      "id": "SCP-215",
+      "title": "Error code range audit and normalization across all SDKs",
+      "gate": "gate-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/standards/sdk-common.md",
+        "crates/scp-ffi/src/mcp.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/src/ucan.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/wasm/src/identity.rs",
+        "crates/scp-ffi/wasm/src/context.rs",
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/Types.kt",
+        ".docs/adrs/phase-5.md",
+        ".docs/adrs/phase-6.md"
+      ],
+      "description": "Audit and normalize every error code across all SDKs to conform to the SCP-{PREFIX}-{NUMBER} standard defined in .docs/standards/sdk-common.md.\n\nPR #118 agent review revealed systematic non-conformance: 18+ distinct prefixes in the codebase versus 9 defined ranges, three numbering conventions (bare 3-digit, correct 4-digit, wrong-range 4-digit), prefix spelling variants (PERM/PRM, VALID/VAL, TRANS/TRANSPORT/TXP), and an outright range swap in NAPI (TOOL codes in TRANS range and vice versa). Root cause: the standard existed (Feb 23) but implementing agents did not read it.\n\nAdditionally, SCP-MCP- codes (8001-8008 in Python mcp.py) now collide with the SCP-STORAGE- range (8000-8999) allocated during the PR #118 fix. SCP-MCP- needs its own range.",
+      "acceptanceCriteria": [
+        "Every SCP-{PREFIX}-{NUMBER} code in the codebase falls within its sdk-common.md allocated range",
+        "No two prefixes share a numeric range — each prefix has an exclusive range",
+        "SCP-MCP- has its own allocated range in sdk-common.md (not colliding with SCP-STORAGE- 8000-8999)",
+        "Python mcp.py codes (SCP-MCP-8001..8008) updated to the new SCP-MCP- range",
+        "NAPI TOOL/TRANS range swap corrected — SCP-TOOL- codes are in 6000-6999, SCP-TRANS- codes are in 5000-5999",
+        "All bare 3-digit codes normalized to 4-digit within their correct range",
+        "Prefix spellings unified: PERM not PRM, VALID not VAL, TRANS not TRANSPORT or TXP",
+        "ADR phase-5.md code examples use conformant codes (SCP-CTX-001 → SCP-CTX-3001)",
+        "ADR phase-6.md code examples use conformant codes (SCP-PUSH- → SCP-TRANS-, SCP-IDENTITY- → SCP-IDENT-, SCP-CTX-001 → SCP-CTX-3001)",
+        "CI conformance test (grep-based) prevents future drift from sdk-common.md ranges"
+      ],
+      "actionItems": [
+        "Allocate SCP-MCP- range in sdk-common.md (10000-10999)",
+        "Update Python mcp.py SCP-MCP-8001..8008 to new range (SCP-MCP-10001..10008)",
+        "Fix NAPI error codes: swap TOOL and TRANS codes back to correct ranges",
+        "Normalize bare 3-digit codes to 4-digit in all SDKs",
+        "Unify prefix spellings across all SDKs (PERM, VALID, TRANS)",
+        "Fix ADR phase-5.md examples: SCP-CTX-001 → SCP-CTX-3001 (2 occurrences)",
+        "Fix ADR phase-6.md examples: SCP-PUSH-5001/5002 → SCP-TRANS-5001/5002, SCP-IDENTITY-1001 → SCP-IDENT-1001, SCP-CTX-001 → SCP-CTX-3001",
+        "Add CI grep test that validates all SCP-{PREFIX}-{NUMBER} codes against sdk-common.md ranges"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "Error code format table — 9 defined ranges (IDENT, DID, CTX, CRYPTO, TRANS, TOOL, VALID, STORAGE, ATTEST)"
+        },
+        {
+          "file": "PR #118",
+          "section": "7-agent review finding #3 — SCP-STORAGE-/SCP-ATTEST- collision with SCP-TOOL- 6000-6999 range"
+        },
+        {
+          "file": "PR #118",
+          "section": "Comprehensive error code audit — 18+ distinct prefixes, range swaps, spelling variants"
+        }
+      ],
+      "details": {
+        "currentChaos": "18+ distinct prefixes found: SCP-IDENT, SCP-DID, SCP-CTX, SCP-CRYPTO, SCP-TRANS, SCP-TOOL, SCP-VALID, SCP-STORAGE, SCP-ATTEST, SCP-MCP, SCP-PRM, SCP-PERM, SCP-VAL, SCP-TRANSPORT, SCP-TXP, SCP-KEY, SCP-PUSH, SCP-IDENTITY. Three numbering conventions: bare 3-digit (001, 002), correct 4-digit (1001, 2001), wrong-range 4-digit (6001 in STORAGE). NAPI has TOOL codes SCP-TOOL-5001..5004 in TRANS range and TRANS codes SCP-TRANS-6001 in TOOL range.",
+        "rangeCollision": "SCP-MCP- codes 8001-8008 (Python mcp.py) now land in SCP-STORAGE- range 8000-8999 (allocated during PR #118 fix). Need separate range allocation."
+      }
+    },
+    {
+      "id": "SCP-216",
+      "title": "Specify and implement Python receive() iterator lifecycle semantics",
+      "gate": "gate-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/context.rs",
+        ".docs/adrs/phase-3.md",
+        ".docs/sketch.md"
+      ],
+      "description": "The Python receive() iterator (py_context_receive / PyMessageReceiver.__anext__) has placeholder semantics that conflate empty and closed channels. The __anext__ method uses sync try_recv() and maps both TryRecvError::Empty and TryRecvError::Disconnected to StopAsyncIteration. The sender _tx is dropped immediately after channel creation, meaning the channel is always disconnected.\n\nNo spec, ADR, or PRD story captures the intended lifecycle semantics. ADR-014 has only a function signature (line 291-293). By contrast, TypeScript (ADR-019 phase-4.md) specifies full onMessage/onError/onComplete callbacks, Swift (ADR-023 phase-5.md) specifies AsyncStream with continuation.yield/finish, and Kotlin (ADR-027 phase-6.md) specifies callbackFlow/awaitClose. sketch.md (lines 371-389) specifies AsyncStream<ContextEvent>, 1000-event buffer, oldest-drop overflow, and BufferOverflow warning event.\n\nThis story adds the missing lifecycle specification to ADR-014 and implements it.",
+      "acceptanceCriteria": [
+        "ADR-014 specifies receive() lifecycle: async channel receive (not sync try_recv), empty vs closed distinction, transport wiring, buffer overflow, shutdown triggers",
+        "__anext__ uses async recv() and distinguishes empty channel (await more) from closed channel (StopAsyncIteration)",
+        "Sender handle (_tx) wired to transport adapter message delivery pipeline — not immediately dropped",
+        "Buffer capacity is 1000 events with oldest-drop overflow behavior per sketch.md",
+        "BufferOverflow warning event emitted when buffer is full and oldest event is dropped",
+        "Channel closes deterministically on leave(), eviction, or context close",
+        "Tests cover: empty-then-message delivery, graceful close, buffer overflow with oldest-drop, concurrent receive"
+      ],
+      "actionItems": [
+        "Add receive lifecycle semantics section to ADR-014 in .docs/adrs/phase-3.md matching detail level of TypeScript/Swift/Kotlin ADRs",
+        "Replace try_recv() with async channel receive in PyMessageReceiver.__anext__ (context.rs)",
+        "Wire sender (_tx) to transport adapter message delivery instead of dropping immediately",
+        "Implement bounded buffer with 1000-event capacity and oldest-drop overflow policy",
+        "Add BufferOverflow warning event type",
+        "Add shutdown signal on membership loss (leave/evict/context-close)",
+        "Add unit tests for lifecycle transitions"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        {
+          "file": ".docs/sketch.md",
+          "section": "Lines 371-389 — receive() returns AsyncStream<ContextEvent>, buffer 1000 events, oldest-drop, BufferOverflow warning"
+        },
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "ADR-014 line 291-293 — receive() signature only, no lifecycle semantics"
+        },
+        {
+          "file": "crates/scp-ffi/src/context.rs",
+          "section": "Lines 388-408 — PyMessageReceiver.__anext__ uses sync try_recv(), conflates Empty/Disconnected"
+        },
+        {
+          "file": "crates/scp-ffi/src/context.rs",
+          "section": "Lines 719-727 — py_context_receive creates channel, immediately drops sender _tx"
+        },
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "ADR-019 — TypeScript receive pattern with onMessage/onError/onComplete callbacks (reference for detail level)"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "ADR-023 — Swift AsyncStream<Message> with continuation.yield/finish (reference for detail level)"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "ADR-027 — Kotlin callbackFlow/awaitClose (reference for detail level)"
+        }
+      ],
+      "details": {
+        "currentBehavior": "PyMessageReceiver.__anext__ at context.rs:388-408 uses sync try_recv(). TryRecvError::Empty and TryRecvError::Disconnected both map to StopAsyncIteration. py_context_receive at lines 719-727 creates an mpsc::channel(32) but immediately drops the sender _tx, so the channel is always in Disconnected state. Three inline comments document this as placeholder behavior.",
+        "intendedBehavior": "Per sketch.md: receive() returns AsyncStream<ContextEvent>. Stream stays open as long as membership is active. Buffer holds 1000 events. On overflow, oldest event is dropped and BufferOverflow warning is injected. Stream ends on leave/eviction/context-close."
+      }
+    },
+    {
+      "id": "SCP-217",
+      "title": "Wire StorageProvider into Python FFI bridge for identity persistence",
+      "gate": "gate-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        "crates/scp-ffi/src/lib.rs"
+      ],
+      "description": "py_identity_load (identity.rs:278) is a stub that reconstructs a PyIdentity from the DID string with in_memory custody instead of loading from persistent storage. The inline comment says \"full storage integration is a future story\" but no story was ever created.\n\nSCP-038 acceptance criterion 2 requires: \"py_identity_load(did) -> loads an existing identity from storage.\" This criterion is unmet. The Storage trait (scp-platform) and ProtocolStore (scp-core/store) exist, and platform implementations are done (SCP-113 Android, SCP-093 Apple). What is missing is:\n\n1. A StorageProvider injection point in the Python FFI bridge (analogous to SCP-214 for KeyCustody)\n2. py_identity_load calling ProtocolStore to retrieve persisted identity state\n3. py_identity_create persisting identity state after creation\n\nThis is the Storage counterpart to SCP-214 (KeyCustody wiring). Both are required for a functional production FFI bridge.",
+      "acceptanceCriteria": [
+        "Python FFI bridge accepts a StorageProvider at initialization (analogous to KeyCustody injection in SCP-214)",
+        "py_identity_create persists identity state (DID, custody type, key handles) via StorageProvider after successful creation",
+        "py_identity_load retrieves persisted identity state from StorageProvider and reconstructs a fully functional PyIdentity",
+        "py_identity_load returns an error if the DID is not found in storage (not a silent fallback to in_memory)",
+        "Identity state survives process restart when backed by persistent storage (SQLite, Keychain, etc.)",
+        "In-memory storage works for testing (InMemoryStorage from scp-platform/testing)",
+        "Storage key convention follows ProtocolStore patterns (e.g., identity/{did}/state)"
+      ],
+      "actionItems": [
+        "Add StorageProvider injection to Python FFI initialization (py_init or module-level registration)",
+        "Implement identity persistence in py_identity_create — store DID, custody type, key handle references",
+        "Implement real py_identity_load — retrieve from StorageProvider, reconstruct PyIdentity with correct custody",
+        "Add error path for missing identity in storage",
+        "Add integration test: create identity, restart (re-init bridge), load identity, verify DID matches"
+      ],
+      "blockedBy": [],
+      "tools": [],
+      "sources": [
+        {
+          "file": "crates/scp-ffi/src/identity.rs",
+          "section": "Lines 278-299 — py_identity_load stub with inline comment referencing ADR-013 criterion 2"
+        },
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "ADR-013 — py_identity_load acceptance criterion"
+        },
+        {
+          "file": "crates/scp-platform/src/traits.rs",
+          "section": "Storage trait definition (6 methods: set, get, delete, list_keys, delete_prefix, exists)"
+        },
+        {
+          "file": ".docs/specs/17-persistence.md",
+          "section": "Persistence architecture — ProtocolStore layer, Storage trait"
+        }
+      ],
+      "details": {
+        "currentStub": "py_identity_load at identity.rs:278-299 validates DID format (did:dht: prefix) then returns PyIdentity { did, custody: \"in_memory\" } without any storage interaction. The inline comment says \"See ADR-013 acceptance criterion 2\" — the criterion exists but was never wired.",
+        "relationship": "This is the Storage analog of SCP-214 (KeyCustody wiring). SCP-214 wires KeyCustodyProvider for crypto operations; SCP-217 wires StorageProvider for identity persistence. Both are required for a production-ready Python FFI bridge."
       }
     }
   ]
