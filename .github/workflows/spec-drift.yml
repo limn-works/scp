@@ -159,7 +159,18 @@ jobs:
             classify it as **Planned** (non-actionable). If no pending story covers it, classify
             it as **Action Required**.
 
-            ## Step 3: Report — YOU MUST ALWAYS COMMENT ON THE PR
+            ## Step 3: Report
+
+            ## When to post
+
+            **In incremental mode**: Only post if you found new drift (Action Required or Planned),
+            or if a previous Action Required finding was resolved by the new changes. If the
+            incremental diff has no spec-relevant files or no drift findings, exit silently —
+            do not post an empty "PASSED" comment.
+
+            **In full mode**: Always post (this is the first check).
+
+            ## How to post
 
             IMPORTANT: Always write the comment body to a file first, then post with --body-file.
             Do NOT pass the body inline with --body (it breaks permission matching on multi-line content).
