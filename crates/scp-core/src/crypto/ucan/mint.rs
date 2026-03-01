@@ -145,7 +145,7 @@ pub async fn mint_ucan(
         return Err(UcanError::ExpiryTooFar(params.lifetime_secs));
     }
 
-    let now = now_secs();
+    let now = now_secs()?;
     let exp = now + params.lifetime_secs;
 
     // Build attestations from capabilities, scoped to the context.
@@ -172,7 +172,7 @@ pub async fn mint_ucan(
         aud: params.audience_did.to_owned(),
         exp,
         nbf: params.not_before,
-        nnc: generate_nonce(),
+        nnc: generate_nonce()?,
         att,
         prf: params.proofs.clone(),
         fct: params.facts.clone(),
@@ -297,6 +297,7 @@ pub struct DelegateParams<'a> {
 /// `parent_token.payload.aud`.
 /// Returns [`UcanError::AttenuationViolation`] if any capability in
 /// `attenuated_capabilities` is not granted by the parent token.
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix epoch.
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
 /// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
 ///
@@ -353,7 +354,7 @@ pub async fn delegate_ucan(
         return Err(UcanError::ExpiryTooFar(params.lifetime_secs));
     }
 
-    let now = now_secs();
+    let now = now_secs()?;
     let exp = now + params.lifetime_secs;
 
     // Step 4: Compute the parent token's CID for the proof chain.
@@ -369,7 +370,7 @@ pub async fn delegate_ucan(
         aud: params.delegatee_did.to_owned(),
         exp,
         nbf: None,
-        nnc: generate_nonce(),
+        nnc: generate_nonce()?,
         att: params.attenuated_capabilities.to_vec(),
         prf: proofs,
         fct: params.facts.clone(),
