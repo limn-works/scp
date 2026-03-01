@@ -410,23 +410,30 @@ jobs:
             --language kotlin \
             --out-dir bindings/kotlin/src/main/kotlin
 
-      # NOTE: Gradle-based AAR packaging requires bindings/kotlin/build.gradle.kts
-      # which will be added when the Kotlin binding scaffold is created.
-      - name: Package AAR (placeholder)
+      - name: Stage native libraries for AAR
         run: |
-          echo "AAR packaging requires bindings/kotlin/build.gradle.kts scaffold"
-          echo "Uploading raw .so files and generated Kotlin sources instead"
+          JNILIBS=bindings/kotlin/scp-sdk-kotlin-android/src/main/jniLibs
+          mkdir -p "$JNILIBS/arm64-v8a" "$JNILIBS/armeabi-v7a" "$JNILIBS/x86_64" "$JNILIBS/x86"
+          cp target/aarch64-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/arm64-v8a/"
+          cp target/armv7-linux-androideabi/release/libscp_ffi_uniffi.so "$JNILIBS/armeabi-v7a/"
+          cp target/x86_64-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/x86_64/"
+          cp target/i686-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/x86/"
 
-      - name: Upload Kotlin artifacts
+      - name: Build Android AAR
+        working-directory: bindings/kotlin
+        run: ./gradlew :scp-sdk-kotlin-android:assembleRelease
+
+      - name: Build Kotlin JVM JAR
+        working-directory: bindings/kotlin
+        run: ./gradlew :scp-sdk-kotlin:jar
+
+      - name: Upload Kotlin AAR
         uses: actions/upload-artifact@v4
         with:
           name: kotlin-aar
           path: |
-            target/aarch64-linux-android/release/libscp_ffi_uniffi.so
-            target/armv7-linux-androideabi/release/libscp_ffi_uniffi.so
-            target/x86_64-linux-android/release/libscp_ffi_uniffi.so
-            target/i686-linux-android/release/libscp_ffi_uniffi.so
-            bindings/kotlin/
+            bindings/kotlin/scp-sdk-kotlin-android/build/outputs/aar/*-release.aar
+            bindings/kotlin/scp-sdk-kotlin/build/libs/*.jar
           retention-days: 7
 
   # ---------------------------------------------------------------------------
