@@ -10233,7 +10233,7 @@
       "id": "SCP-226",
       "title": "Implement attestation renewal orchestration",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [],
       "files": [
         "crates/scp-core/src/trust/renewal.rs"
@@ -10260,7 +10260,8 @@
         }
       ],
       "actionItems": [],
-      "details": {}
+      "details": {},
+      "result": "Implemented renew_attestation, RenewalError, RenewalChecker trait, DefaultRenewalChecker in crates/scp-core/src/trust/renewal.rs. 11 tests pass. Commit 6ed73c7."
     },
     {
       "id": "SCP-227",
