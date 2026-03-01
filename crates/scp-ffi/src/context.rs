@@ -470,14 +470,10 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
 
         type HmacSha256 = Hmac<Sha256>;
 
-        // Interim derivation: use a per-identity random secret as the HMAC key.
-        // This provides actual pseudonym unlinkability — unlike the DID (which is
-        // public), the secret never leaves the client. The secret is in-memory
-        // only and will not persist across process restarts.
-        //
-        // When `KeyCustody` is wired into the runtime, replace with
-        // `scp_core::envelope::pseudonym::derive_pseudonym` using real key material.
-        // See §9.10.4 and crates/scp-core/src/envelope/pseudonym.rs for the spec derivation.
+        // Stub — see SCP-214 for KeyCustody wiring. Uses a per-identity random
+        // secret as the HMAC key (provides unlinkability but doesn't persist across
+        // restarts). Replace with scp_core::envelope::pseudonym::derive_pseudonym
+        // using real key material (§9.10.4).
         let routing_secret = crate::runtime::get_or_create_routing_secret(identity_did);
         let mut mac = HmacSha256::new_from_slice(&routing_secret)
             .map_err(|e| PyRuntimeError::new_err(format!("HMAC initialization failed: {e}")))?;

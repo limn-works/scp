@@ -342,7 +342,7 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 }
 
 // ---------------------------------------------------------------------------
-// Per-identity routing secrets (interim pseudonym derivation)
+// Stub — see SCP-214 for KeyCustody wiring (interim pseudonym derivation)
 // ---------------------------------------------------------------------------
 
 /// Returns a 32-byte random secret for the given identity DID, creating one

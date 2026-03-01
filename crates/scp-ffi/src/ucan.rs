@@ -294,9 +294,9 @@ pub fn py_ucan_validate(
 /// given member DID. The token is structured with proper SCP capability
 /// URIs scoped to the context.
 ///
-/// Full Ed25519 signing requires key custody integration which is connected
-/// when the transport layer is wired. This function creates a properly
-/// formatted token with a placeholder signature.
+/// Stub — see SCP-214 for KeyCustody wiring. Currently creates a properly
+/// formatted token with a placeholder signature. Real Ed25519 signing
+/// requires KeyCustody integration.
 ///
 /// # Arguments
 ///

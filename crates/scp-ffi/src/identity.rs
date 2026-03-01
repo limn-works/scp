@@ -275,11 +275,9 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 ///
 /// # Note
 ///
-/// This is a placeholder implementation. The full storage integration is a
-/// future story. Currently reconstructs a `PyIdentity` from the DID string
-/// with `"in_memory"` custody.
-///
-/// See ADR-013 acceptance criterion 2.
+/// Stub — see SCP-217 for StorageProvider wiring. Currently reconstructs a
+/// `PyIdentity` from the DID string with `"in_memory"` custody instead of
+/// loading from persistent storage (ADR-013 acceptance criterion 2).
 #[pyfunction]
 fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
     let did_owned = did.to_owned();
