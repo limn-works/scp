@@ -26,6 +26,7 @@
 //! handles are serialized internally via `tokio::sync::RwLock`. See
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
+pub mod broadcast;
 pub mod builder;
 pub mod close;
 pub mod governance;
@@ -72,6 +73,9 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
     bytes.copy_from_slice(&result);
     bytes
 }
+
+// Re-export broadcast subscription validation (SCP-227).
+pub use broadcast::validate_messages_read_ucan;
 
 // Re-export all parameter types for convenience.
 pub use params::{
