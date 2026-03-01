@@ -24,14 +24,22 @@
 //!
 //! See ADR-021 in `.docs/adrs/phase-4.md`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
+use scp_platform::traits::{
+    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
+    Signature,
+};
+use scp_platform::PlatformError;
+use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
-use crate::{decrement_handle_count, increment_handle_count, runtime};
+use crate::{KeyCustodyProvider, decrement_handle_count, increment_handle_count, runtime};
 
 /// Wrapper for [`InMemoryKeyCustody`] that implements [`Debug`] with a
 /// redacted representation, preventing key material from appearing in logs.
@@ -40,6 +48,221 @@ pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) InMemoryKeyCustody);
 impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("InMemoryKeyCustody([redacted])")
+    }
+}
+
+/// Adapter that wraps a UniFFI [`KeyCustodyProvider`] callback interface and
+/// implements [`KeyCustody`] so that `scp-core` functions can use platform
+/// custody (Secure Enclave, Android Keystore) transparently.
+///
+/// Maintains a bidirectional mapping between `KeyHandle(u64)` (scp-core) and
+/// `String` key IDs (platform callback interface). Thread-safe via `TokioMutex`.
+///
+/// See ADR-006 (Platform Abstraction) and SCP-214 criterion 2.
+pub(crate) struct KeyCustodyProviderAdapter {
+    /// The injected platform custody callback.
+    provider: Arc<dyn KeyCustodyProvider>,
+    /// Mapping from `KeyHandle(u64)` to platform key ID strings.
+    handle_to_id: TokioMutex<HashMap<u64, String>>,
+    /// Counter for allocating new `KeyHandle` IDs.
+    next_id: AtomicU64,
+}
+
+impl KeyCustodyProviderAdapter {
+    /// Creates a new adapter wrapping the given platform custody provider.
+    pub(crate) fn new(provider: Arc<dyn KeyCustodyProvider>) -> Self {
+        Self {
+            provider,
+            handle_to_id: TokioMutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+}
+
+#[allow(clippy::manual_async_fn)]
+impl KeyCustody for KeyCustodyProviderAdapter {
+    fn generate_keypair(
+        &self,
+        key_type: KeyType,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        async move {
+            let type_str = match key_type {
+                KeyType::Ed25519 => "ed25519".to_owned(),
+                KeyType::X25519 => "x25519".to_owned(),
+            };
+            let key_id = self
+                .provider
+                .generate_keypair(type_str)
+                .await
+                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
+
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let handle = KeyHandle::new(id);
+            self.handle_to_id.lock().await.insert(id, key_id);
+            Ok(handle)
+        }
+    }
+
+    fn sign(
+        &self,
+        key: &KeyHandle,
+        data: &[u8],
+    ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
+        let key_id = key.id();
+        let data = data.to_vec();
+        async move {
+            let id = {
+                let map = self.handle_to_id.lock().await;
+                map.get(&key_id)
+                    .cloned()
+                    .ok_or(PlatformError::KeyNotFound)?
+            };
+            let sig_bytes = self
+                .provider
+                .sign(id, data)
+                .await
+                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
+            Ok(Signature::new(sig_bytes))
+        }
+    }
+
+    fn public_key(
+        &self,
+        key: &KeyHandle,
+    ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
+        let key_id = key.id();
+        async move {
+            let id = {
+                let map = self.handle_to_id.lock().await;
+                map.get(&key_id)
+                    .cloned()
+                    .ok_or(PlatformError::KeyNotFound)?
+            };
+            let pk_bytes = self
+                .provider
+                .get_public_key(id)
+                .await
+                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
+            Ok(PublicKey::new(pk_bytes))
+        }
+    }
+
+    fn destroy_key(
+        &self,
+        key: &KeyHandle,
+    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        let key_id = key.id();
+        async move {
+            let id = {
+                let mut map = self.handle_to_id.lock().await;
+                map.remove(&key_id)
+                    .ok_or(PlatformError::KeyNotFound)?
+            };
+            self.provider
+                .destroy_key(id)
+                .await
+                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
+            Ok(())
+        }
+    }
+
+    fn dh_agree(
+        &self,
+        key: &KeyHandle,
+        peer_public: &[u8; 32],
+    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+        let key_id = key.id();
+        let peer = *peer_public;
+        async move {
+            let id = {
+                let map = self.handle_to_id.lock().await;
+                map.get(&key_id)
+                    .cloned()
+                    .ok_or(PlatformError::KeyNotFound)?
+            };
+            let secret_bytes = self
+                .provider
+                .dh_agree(id, peer.to_vec())
+                .await
+                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
+            let arr: [u8; 32] = secret_bytes.try_into().map_err(|_| {
+                PlatformError::CustodyError("dh_agree must return 32 bytes".to_owned())
+            })?;
+            Ok(SharedSecret::new(arr))
+        }
+    }
+
+    fn derive_pseudonym(
+        &self,
+        key: &KeyHandle,
+        context_id: &[u8],
+    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+        let key_id = key.id();
+        let ctx = context_id.to_vec();
+        async move {
+            let id = {
+                let map = self.handle_to_id.lock().await;
+                map.get(&key_id)
+                    .cloned()
+                    .ok_or(PlatformError::KeyNotFound)?
+            };
+            let result_bytes = self
+                .provider
+                .derive_pseudonym(id, ctx)
+                .await
+                .map_err(|e| PlatformError::CustodyError(format!("{e}")))?;
+
+            // The callback returns [public_key_bytes(32) || key_id_utf8_bytes].
+            if result_bytes.len() < 33 {
+                return Err(PlatformError::CustodyError(
+                    "derive_pseudonym must return at least 33 bytes \
+                     (32 public key + key_id)"
+                        .to_owned(),
+                ));
+            }
+            let pub_key_bytes = result_bytes[..32].to_vec();
+            let pseudo_key_id = String::from_utf8(result_bytes[32..].to_vec()).map_err(|_| {
+                PlatformError::CustodyError(
+                    "derive_pseudonym key_id portion must be valid UTF-8".to_owned(),
+                )
+            })?;
+
+            let pseudo_handle_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let pseudo_handle = KeyHandle::new(pseudo_handle_id);
+            self.handle_to_id
+                .lock()
+                .await
+                .insert(pseudo_handle_id, pseudo_key_id);
+
+            Ok(PseudonymKeypair {
+                public_key: PublicKey::new(pub_key_bytes),
+                key_handle: pseudo_handle,
+            })
+        }
+    }
+
+    fn custody_type(&self, key: &KeyHandle) -> CustodyType {
+        let key_id = key.id();
+        // We need the key ID string to call provider.custody_type().
+        // Since custody_type is sync and handle_to_id requires async lock,
+        // we use try_lock. If it fails (contended), return Hardware as the
+        // safe default for platform custody.
+        let map_guard = match self.handle_to_id.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return CustodyType::Hardware,
+        };
+        let Some(id) = map_guard.get(&key_id).cloned() else {
+            return CustodyType::Hardware;
+        };
+        drop(map_guard);
+        let type_str = self.provider.custody_type(id);
+        match type_str.as_str() {
+            "hardware" => CustodyType::Hardware,
+            "software" => CustodyType::Software,
+            "in_memory" => CustodyType::InMemory,
+            _ => CustodyType::Hardware,
+        }
     }
 }
 
@@ -732,6 +955,9 @@ pub struct ContextHandle {
     pub(crate) state: tokio::sync::Mutex<ContextState>,
     /// DID of the context creator.
     pub(crate) creator_did: String,
+    /// Per-context pseudonym routing ID derived via `KeyCustody::derive_pseudonym`.
+    /// 32-byte pseudonym public key for relay routing (§9.10.4).
+    pub(crate) routing_id: Option<Vec<u8>>,
 }
 
 #[uniffi::export]
@@ -765,6 +991,18 @@ impl ContextHandle {
     /// Returns the DID of the context creator.
     pub fn creator_did(&self) -> String {
         self.creator_did.clone()
+    }
+
+    /// Returns the per-context pseudonym routing ID (32 bytes), or `None` if
+    /// pseudonym derivation was not available at context creation time.
+    ///
+    /// The routing ID is derived via `KeyCustody::derive_pseudonym` (§9.10.4).
+    /// It provides per-context unlinkability: different contexts produce
+    /// different routing IDs for the same identity key.
+    ///
+    /// See ADR-006 and SCP-214 criterion 5.
+    pub fn routing_id(&self) -> Option<Vec<u8>> {
+        self.routing_id.clone()
     }
 }
 
@@ -953,15 +1191,12 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                 CustodyMethod::Platform | CustodyMethod::Software => {
                     // Platform and software custody require a wired
                     // KeyCustodyProvider (ADR-006 platform abstraction).
-                    // Full implementation is tracked for the platform
-                    // integration story that wires KeyCustodyProvider
-                    // callbacks to scp-core.
+                    // Use identity_create_platform to pass the provider.
                     Err(ScpError::Identity {
                         message: format!(
-                            "custody type {custody:?} requires a wired platform \
-                             KeyCustodyProvider — use the KeyCustodyProvider callback \
-                             interface to inject Secure Enclave (iOS) or Android \
-                             Keystore (Android) backed custody"
+                            "custody type {custody:?} requires a KeyCustodyProvider — \
+                             call identity_create_platform with an injected provider \
+                             (Secure Enclave on iOS, Android Keystore on Android)"
                         ),
                         code: "SCP-IDENT-1003".to_owned(),
                     })
@@ -983,6 +1218,54 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
         .await
         .map_err(|e| ScpError::Identity {
             message: format!("tokio task join error during identity creation: {e}"),
+            code: "SCP-IDENT-1007".to_owned(),
+        })?
+}
+
+/// Creates a new DID identity using a platform-injected `KeyCustodyProvider`.
+///
+/// This function accepts a `KeyCustodyProvider` callback interface implementation
+/// (Secure Enclave on iOS, Android Keystore on Android) and uses it to generate
+/// keys and create a `did:dht` identity via `scp-core`.
+///
+/// # Arguments
+///
+/// * `provider` — A platform-injected `KeyCustodyProvider` callback implementation
+///   that handles key generation, signing, and custody.
+///
+/// # Returns
+///
+/// An `Identity` handle with the new DID and `Platform` custody type.
+///
+/// # Errors
+///
+/// Returns `ScpError::Identity` if key generation or DID creation fails.
+///
+/// See ADR-006 (Platform Abstraction), ADR-021 (UniFFI Bridge), SCP-214 criterion 2.
+#[uniffi::export]
+pub async fn identity_create_platform(
+    provider: Box<dyn KeyCustodyProvider>,
+) -> Result<Arc<Identity>, ScpError> {
+    let provider: Arc<dyn KeyCustodyProvider> = Arc::from(provider);
+    runtime()
+        .spawn(async move {
+            let adapter = KeyCustodyProviderAdapter::new(provider);
+            let dht = DidDht::new();
+            let (identity, _document) =
+                dht.create(&adapter).await.map_err(ScpError::from)?;
+
+            let handle = Arc::new(Identity {
+                did: identity.did.clone(),
+                custody_type: CustodyMethod::Platform,
+                core_id: Some(identity),
+                in_memory_custody: None,
+            });
+            increment_handle_count();
+            Ok(handle)
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            message: format!("tokio task join error during platform identity creation: {e}"),
             code: "SCP-IDENT-1007".to_owned(),
         })?
 }
@@ -1102,10 +1385,35 @@ pub async fn context_create(
             let _ = params;
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
+            // Derive per-context pseudonym routing ID via KeyCustody::derive_pseudonym
+            // (§9.10.4, SCP-214 criterion 5). The routing ID provides per-context
+            // unlinkability: same identity key + different context_id = different
+            // routing ID. Only available when in-memory custody is present.
+            let routing_id = match (
+                identity.in_memory_custody.as_ref(),
+                identity.core_id.as_ref(),
+            ) {
+                (Some(custody), Some(core_id)) => {
+                    let pseudonym = custody
+                        .0
+                        .derive_pseudonym(&core_id.identity_key, context_id.as_bytes())
+                        .await
+                        .map_err(|e| ScpError::Crypto {
+                            message: format!(
+                                "failed to derive pseudonym routing ID: {e}"
+                            ),
+                            code: "SCP-CRYPTO-3010".to_owned(),
+                        })?;
+                    Some(pseudonym.public_key.as_bytes().to_vec())
+                }
+                _ => None,
+            };
+
             let handle = Arc::new(ContextHandle {
                 context_id,
                 state: tokio::sync::Mutex::new(ContextState::Active),
                 creator_did: identity.did.clone(),
+                routing_id,
             });
             increment_handle_count();
             Ok(handle)

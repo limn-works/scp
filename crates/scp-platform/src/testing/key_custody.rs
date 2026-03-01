@@ -329,9 +329,14 @@ impl KeyCustody for InMemoryKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(ed25519_private_key_bytes, context_id || "scp-pseudonym")
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(signing_key.to_bytes().as_slice())
-                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            // HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")
+            // ADR-027 amendment: use public key bytes (verifying_key) as HMAC key,
+            // not private key bytes. This ensures cross-platform determinism with
+            // hardware TEE keys that cannot export private bytes.
+            let verifying_key = signing_key.verifying_key();
+            let mut mac =
+                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
+                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(b"scp-pseudonym");
             let hmac_output = mac.finalize().into_bytes();
@@ -619,9 +624,9 @@ mod tests {
     ///
     /// Verifies that `derive_pseudonym` is deterministic and that different
     /// context IDs produce different pseudonyms. The `expected_seed` value is
-    /// computed from the reference HMAC-SHA256 algorithm defined in ADR-006
-    /// and is kept for future cross-language (Swift, Kotlin, TypeScript)
-    /// verification once those test harnesses are wired.
+    /// computed from the reference HMAC-SHA256 algorithm using public key bytes
+    /// as the HMAC key (ADR-027 amendment). This golden vector is authoritative
+    /// for cross-language (Swift, Kotlin, TypeScript) verification.
     #[tokio::test]
     async fn derive_pseudonym_cross_platform_golden_vector() {
         // Known identity key seed: 0x00...01 (31 zeros, then 0x01).
@@ -634,8 +639,12 @@ mod tests {
         let context_id = b"test";
 
         // Compute expected pseudonym seed using the reference algorithm directly:
-        // seed = HMAC-SHA256(sk_bytes, context_id || "scp-pseudonym")
-        let mut mac = Hmac::<Sha256>::new_from_slice(&seed_bytes).unwrap();
+        // seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")
+        // ADR-027 amendment: use public key bytes for cross-platform determinism.
+        let identity_signing_key = SigningKey::from_bytes(&seed_bytes);
+        let identity_public_key = identity_signing_key.verifying_key();
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(identity_public_key.to_bytes().as_slice()).unwrap();
         mac.update(context_id);
         mac.update(b"scp-pseudonym");
         let expected_seed: [u8; 32] = mac.finalize().into_bytes().into();
