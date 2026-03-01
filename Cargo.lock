@@ -3534,6 +3534,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "z-base-32",
 ]
 
 [[package]]

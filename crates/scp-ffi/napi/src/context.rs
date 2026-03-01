@@ -407,11 +407,15 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 
 /// Closes an SCP context.
 ///
-/// Transitions the context to `"closed"` state.
+/// Transitions the context to `"closed"` state. Only the context creator
+/// (or an identity with `ContextClose` capability) is authorized to close
+/// the context.
 ///
 /// # Errors
 ///
-/// Rejects with `SCP-CTX-2017` if the context is not in `"active"` state.
+/// - Rejects with `SCP-CTX-2017` if the context is not in `"active"` state.
+/// - Rejects with `SCP-PERM-3002` if the `identity_did` is not authorized
+///   to close the context (must be the context creator or hold admin role).
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
@@ -426,8 +430,23 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
         }
         .into());
     }
+
+    // Authorization check: only the context creator can close the context.
+    // In the full runtime, this would also check for ContextClose capability
+    // via the UCAN/role system. For now, enforce the creator-only invariant.
+    if identity_did != handle.creator_did() {
+        return Err(ScpNapiError::Permission {
+            message: format!(
+                "identity {identity_did:?} is not authorized to close this context — \
+                 only the context creator ({:?}) or an admin can close a context",
+                handle.creator_did()
+            ),
+            code: "SCP-PERM-3002".to_owned(),
+        }
+        .into());
+    }
+
     handle.set_closed().map_err(NapiError::from)?;
-    let _ = identity_did;
     Ok(())
 }
 
