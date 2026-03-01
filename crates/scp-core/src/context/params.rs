@@ -192,7 +192,7 @@ pub enum TemplateId {
     /// Broadcast mode, UCAN-gated subscriber access (spec section 5.14).
     GatedBroadcast,
     /// Cross-context tool interface template (spec section 5.12.1, 6.2).
-    /// Messaging + tools + tool interface exposure, summary memory, TTL required.
+    /// Messaging + tools + tool interface exposure, full memory, TTL optional.
     #[serde(rename = "scp:template/tool-interface")]
     ToolInterfaceTemplate,
     /// Tool invocation context with per-invoke cost. Extends `tool-interface`.
