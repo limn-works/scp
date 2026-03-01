@@ -26,38 +26,6 @@ use super::padding::pad_to_bucket;
 // Types
 // ---------------------------------------------------------------------------
 
-/// Discriminator for the type of payload carried by an inner envelope.
-///
-/// Distinguishes regular content messages from protocol-level signaling
-/// messages (e.g., WebRTC SDP offers/answers and ICE candidates). The
-/// discriminator is included in the canonical hash to prevent type-flipping
-/// attacks where an attacker reinterprets a content message as signaling or
-/// vice versa.
-///
-/// See ADR-024 acceptance criteria 5 in `.docs/adrs/phase-5.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum MessageType {
-    /// Regular content message (chat, tool output, etc.).
-    #[default]
-    Content,
-
-    /// WebRTC signaling message (SDP offer/answer, ICE candidate).
-    Signaling,
-}
-
-impl MessageType {
-    /// Returns a single-byte discriminator for inclusion in canonical hashes.
-    ///
-    /// Using a fixed-width encoding prevents ambiguity in the hash input.
-    #[must_use]
-    pub fn as_discriminator_byte(&self) -> u8 {
-        match self {
-            Self::Content => 0,
-            Self::Signaling => 1,
-        }
-    }
-}
-
 /// Provenance metadata attached to an inner envelope.
 ///
 /// Provenance tracks the origin of message content — which tool generated it,
@@ -99,14 +67,6 @@ pub struct InnerEnvelope {
     /// Creation timestamp (Unix milliseconds).
     pub timestamp: u64,
 
-    /// Discriminator for the payload type.
-    ///
-    /// Defaults to [`MessageType::Content`] for backward compatibility with
-    /// envelopes created before this field was introduced. The discriminator
-    /// is included in the canonical hash to prevent type-flipping attacks.
-    #[serde(default)]
-    pub message_type: MessageType,
-
     /// SHA-256 hash of the original plaintext payload (before padding).
     #[serde(with = "serde_bytes")]
     pub payload_hash: Vec<u8>,
@@ -129,21 +89,46 @@ pub struct InnerEnvelope {
 }
 
 // ---------------------------------------------------------------------------
+// Params
+// ---------------------------------------------------------------------------
+
+/// Parameters for inner envelope creation.
+///
+/// Groups the data fields that describe the envelope content, separating them
+/// from the cryptographic primitives (`key_custody`, `signing_key`) passed
+/// alongside. This eliminates the four consecutive `u64` parameters that were
+/// easy to accidentally transpose.
+#[derive(Debug, Clone)]
+pub struct InnerEnvelopeParams<'a> {
+    /// The SCP context identifier.
+    pub context_id: &'a str,
+    /// The sender's full DID.
+    pub sender_did: &'a str,
+    /// MLS epoch number.
+    pub epoch: u64,
+    /// MLS generation number.
+    pub generation: u64,
+    /// SCP per-sender monotonic sequence number.
+    pub sequence: u64,
+    /// Creation timestamp (Unix milliseconds).
+    pub timestamp: u64,
+    /// The message payload (before padding).
+    pub payload: &'a [u8],
+    /// Optional provenance metadata.
+    pub provenance: Option<Provenance>,
+}
+
+// ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
 
 /// Creates an inner envelope with a signed, padded payload.
 ///
-/// The message type defaults to [`MessageType::Content`]. Use
-/// [`create_inner_envelope_typed`] to specify a different message type
-/// (e.g., [`MessageType::Signaling`] for WebRTC signaling messages).
-///
 /// **Processing order:**
 /// 1. Compute `payload_hash = SHA-256(payload)` (original plaintext).
 /// 2. Compute `provenance_hash = SHA-256(serialize(provenance))` if present,
 ///    or `SHA-256(0x00)` if absent.
-/// 3. Compute the canonical hash over all critical fields (including
-///    `message_type`).
+/// 3. Compute the canonical hash over all critical fields.
 /// 4. Sign the canonical hash with `key_custody.sign(signing_key, hash)`.
 /// 5. Pad the payload to the next bucket boundary.
 /// 6. Return the complete inner envelope.
@@ -154,81 +139,19 @@ pub struct InnerEnvelope {
 /// Returns [`EnvelopeError::SerializationFailed`] if provenance serialization fails.
 /// Returns [`EnvelopeError::PayloadTooLarge`] if the payload exceeds the
 /// maximum bucket size.
-#[allow(clippy::too_many_arguments)]
 pub async fn create_inner_envelope(
-    context_id: &str,
-    sender_did: &str,
-    epoch: u64,
-    generation: u64,
-    sequence: u64,
-    timestamp: u64,
-    payload: &[u8],
-    provenance: Option<Provenance>,
-    key_custody: &impl KeyCustody,
-    signing_key: &KeyHandle,
-) -> Result<InnerEnvelope, EnvelopeError> {
-    create_inner_envelope_typed(
-        context_id,
-        sender_did,
-        epoch,
-        generation,
-        sequence,
-        timestamp,
-        MessageType::Content,
-        payload,
-        provenance,
-        key_custody,
-        signing_key,
-    )
-    .await
-}
-
-/// Creates an inner envelope with an explicit [`MessageType`].
-///
-/// Identical to [`create_inner_envelope`] but accepts a `message_type`
-/// parameter. The message type is included in the canonical hash, so
-/// changing it after signing invalidates the signature. This prevents
-/// type-flipping attacks (e.g., reinterpreting a content message as
-/// signaling or vice versa).
-///
-/// # Errors
-///
-/// Returns [`EnvelopeError::SigningFailed`] if the signing operation fails.
-/// Returns [`EnvelopeError::SerializationFailed`] if provenance serialization fails.
-/// Returns [`EnvelopeError::PayloadTooLarge`] if the payload exceeds the
-/// maximum bucket size.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_inner_envelope_typed(
-    context_id: &str,
-    sender_did: &str,
-    epoch: u64,
-    generation: u64,
-    sequence: u64,
-    timestamp: u64,
-    message_type: MessageType,
-    payload: &[u8],
-    provenance: Option<Provenance>,
+    params: &InnerEnvelopeParams<'_>,
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
 ) -> Result<InnerEnvelope, EnvelopeError> {
     // 1. Hash original plaintext.
-    let payload_hash = Sha256::digest(payload).to_vec();
+    let payload_hash = Sha256::digest(params.payload).to_vec();
 
     // 2. Hash provenance.
-    let provenance_hash = compute_provenance_hash(provenance.as_ref())?;
+    let provenance_hash = compute_provenance_hash(params.provenance.as_ref())?;
 
     // 3. Compute canonical hash for signing.
-    let canonical_hash = compute_canonical_hash(
-        context_id,
-        sender_did,
-        epoch,
-        generation,
-        sequence,
-        timestamp,
-        message_type,
-        &payload_hash,
-        &provenance_hash,
-    );
+    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash);
 
     // 4. Sign the canonical hash.
     let signature = key_custody
@@ -237,20 +160,19 @@ pub async fn create_inner_envelope_typed(
         .map_err(|e| EnvelopeError::SigningFailed(e.to_string()))?;
 
     // 5. Pad payload to bucket boundary.
-    let padded_payload = pad_to_bucket(payload)?;
+    let padded_payload = pad_to_bucket(params.payload)?;
 
     // 6. Build and return the envelope.
     Ok(InnerEnvelope {
-        context_id: context_id.to_owned(),
-        sender_did: sender_did.to_owned(),
-        epoch,
-        generation,
-        sequence,
-        timestamp,
-        message_type,
+        context_id: params.context_id.to_owned(),
+        sender_did: params.sender_did.to_owned(),
+        epoch: params.epoch,
+        generation: params.generation,
+        sequence: params.sequence,
+        timestamp: params.timestamp,
         payload_hash,
         payload: padded_payload,
-        provenance,
+        provenance: params.provenance.clone(),
         provenance_hash,
         signature: signature.into_bytes(),
     })
@@ -300,18 +222,20 @@ pub fn verify_inner_signature(
     let provenance_hash = compute_provenance_hash(inner.provenance.as_ref())
         .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
 
+    // Reconstruct params for canonical hash computation.
+    let params = InnerEnvelopeParams {
+        context_id: &inner.context_id,
+        sender_did: &inner.sender_did,
+        epoch: inner.epoch,
+        generation: inner.generation,
+        sequence: inner.sequence,
+        timestamp: inner.timestamp,
+        payload: &[],
+        provenance: inner.provenance.clone(),
+    };
+
     // Recompute the canonical hash.
-    let canonical_hash = compute_canonical_hash(
-        &inner.context_id,
-        &inner.sender_did,
-        inner.epoch,
-        inner.generation,
-        inner.sequence,
-        inner.timestamp,
-        inner.message_type,
-        &inner.payload_hash,
-        &provenance_hash,
-    );
+    let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
 
     // Verify.
     match verifying_key.verify_strict(&canonical_hash, &signature) {
@@ -350,56 +274,25 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, E
 /// cross-protocol signature confusion when the same Ed25519 key is reused
 /// across different signing contexts.
 ///
-/// Variable-length fields (`context_id`, `sender_did`, `payload_hash`,
-/// `provenance_hash`) are length-prefixed with their byte length as a
-/// big-endian `u32`. This prevents ambiguous concatenation where different
-/// field boundary positions could produce identical hash inputs (e.g.,
-/// `context_id="ab" + sender_did="cd"` vs `context_id="abc" + sender_did="d"`).
-/// Fixed-size fields (`epoch`, `generation`, `sequence`, `timestamp`,
-/// `message_type`) do not need length prefixes.
-///
-/// The `message_type` discriminator byte is included after the timestamp to
-/// prevent type-flipping attacks. This ensures a signature over a content
-/// message cannot be replayed as a signaling message (or vice versa).
-///
 /// ```text
-/// SHA-256(DOMAIN_SEPARATOR
-///         || len(context_id) as u32 BE || context_id
-///         || len(sender_did) as u32 BE || sender_did
-///         || epoch_BE || generation_BE || sequence_BE || timestamp_BE
-///         || message_type_byte
-///         || len(payload_hash) as u32 BE || payload_hash
-///         || len(provenance_hash) as u32 BE || provenance_hash)
+/// SHA-256(DOMAIN_SEPARATOR || context_id || sender_did || epoch_BE
+///         || generation_BE || sequence_BE || timestamp_BE
+///         || payload_hash || provenance_hash)
 /// ```
-#[allow(clippy::too_many_arguments)]
 fn compute_canonical_hash(
-    context_id: &str,
-    sender_did: &str,
-    epoch: u64,
-    generation: u64,
-    sequence: u64,
-    timestamp: u64,
-    message_type: MessageType,
+    params: &InnerEnvelopeParams<'_>,
     payload_hash: &[u8],
     provenance_hash: &[u8],
 ) -> Vec<u8> {
-    #[allow(clippy::cast_possible_truncation)]
-    let len_prefix = |len: usize| -> [u8; 4] { (len as u32).to_be_bytes() };
-
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_SEPARATOR);
-    hasher.update(len_prefix(context_id.len()));
-    hasher.update(context_id.as_bytes());
-    hasher.update(len_prefix(sender_did.len()));
-    hasher.update(sender_did.as_bytes());
-    hasher.update(epoch.to_be_bytes());
-    hasher.update(generation.to_be_bytes());
-    hasher.update(sequence.to_be_bytes());
-    hasher.update(timestamp.to_be_bytes());
-    hasher.update([message_type.as_discriminator_byte()]);
-    hasher.update(len_prefix(payload_hash.len()));
+    hasher.update(params.context_id.as_bytes());
+    hasher.update(params.sender_did.as_bytes());
+    hasher.update(params.epoch.to_be_bytes());
+    hasher.update(params.generation.to_be_bytes());
+    hasher.update(params.sequence.to_be_bytes());
+    hasher.update(params.timestamp.to_be_bytes());
     hasher.update(payload_hash);
-    hasher.update(len_prefix(provenance_hash.len()));
     hasher.update(provenance_hash);
     hasher.finalize().to_vec()
 }
@@ -425,14 +318,16 @@ mod tests {
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
         let envelope = create_inner_envelope(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            b"hello world",
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"hello world",
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )
@@ -466,14 +361,16 @@ mod tests {
         };
 
         let envelope = create_inner_envelope(
-            "ctx-2",
-            "did:dht:bob",
-            5,
-            3,
-            10,
-            1_700_000_000,
-            b"payload with provenance",
-            Some(provenance.clone()),
+            &InnerEnvelopeParams {
+                context_id: "ctx-2",
+                sender_did: "did:dht:bob",
+                epoch: 5,
+                generation: 3,
+                sequence: 10,
+                timestamp: 1_700_000_000,
+                payload: b"payload with provenance",
+                provenance: Some(provenance.clone()),
+            },
             &custody,
             &signing_key,
         )
@@ -494,14 +391,16 @@ mod tests {
         let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
 
         let envelope = create_inner_envelope(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            b"hello",
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"hello",
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )
@@ -518,14 +417,16 @@ mod tests {
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
         let mut envelope = create_inner_envelope(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            b"original",
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"original",
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )
@@ -550,14 +451,16 @@ mod tests {
         };
 
         let mut envelope = create_inner_envelope(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            b"data",
-            Some(provenance),
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"data",
+                provenance: Some(provenance),
+            },
             &custody,
             &signing_key,
         )
@@ -577,14 +480,16 @@ mod tests {
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
         let envelope = create_inner_envelope(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            b"data",
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"data",
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )
@@ -615,14 +520,16 @@ mod tests {
         let (custody, signing_key) = setup().await;
 
         let envelope = create_inner_envelope(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            b"msgpack test",
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"msgpack test",
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )
@@ -644,14 +551,16 @@ mod tests {
         let (custody, signing_key) = setup().await;
 
         let envelope = create_inner_envelope(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            b"test",
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"test",
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )
@@ -668,17 +577,17 @@ mod tests {
         let provenance_hash = Sha256::digest([0x00]).to_vec();
 
         // Hash with the real domain separator (via the production function).
-        let hash_with_domain = compute_canonical_hash(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            MessageType::Content,
-            &payload_hash,
-            &provenance_hash,
-        );
+        let params = InnerEnvelopeParams {
+            context_id: "ctx-1",
+            sender_did: "did:dht:alice",
+            epoch: 1,
+            generation: 0,
+            sequence: 1,
+            timestamp: 1_700_000_000,
+            payload: b"test",
+            provenance: None,
+        };
+        let hash_with_domain = compute_canonical_hash(&params, &payload_hash, &provenance_hash);
 
         // Hash WITHOUT any domain separator (manual construction).
         let hash_without_domain = {
@@ -689,7 +598,6 @@ mod tests {
             h.update(0u64.to_be_bytes());
             h.update(1u64.to_be_bytes());
             h.update(1_700_000_000u64.to_be_bytes());
-            h.update([0u8]);
             h.update(&payload_hash);
             h.update(&provenance_hash);
             h.finalize().to_vec()
@@ -705,7 +613,6 @@ mod tests {
             h.update(0u64.to_be_bytes());
             h.update(1u64.to_be_bytes());
             h.update(1_700_000_000u64.to_be_bytes());
-            h.update([0u8]);
             h.update(&payload_hash);
             h.update(&provenance_hash);
             h.finalize().to_vec()
@@ -718,152 +625,6 @@ mod tests {
         assert_ne!(
             hash_with_domain, hash_alt_domain,
             "different domain separator must produce different hash"
-        );
-    }
-
-    #[test]
-    fn message_type_changes_canonical_hash() {
-        let payload_hash = Sha256::digest(b"test").to_vec();
-        let provenance_hash = Sha256::digest([0x00]).to_vec();
-
-        let hash_content = compute_canonical_hash(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            MessageType::Content,
-            &payload_hash,
-            &provenance_hash,
-        );
-
-        let hash_signaling = compute_canonical_hash(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            MessageType::Signaling,
-            &payload_hash,
-            &provenance_hash,
-        );
-
-        assert_ne!(
-            hash_content, hash_signaling,
-            "different message types must produce different canonical hashes"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_typed_envelope_with_signaling() {
-        let (custody, signing_key) = setup().await;
-        let pubkey = custody.public_key(&signing_key).await.unwrap();
-
-        let envelope = create_inner_envelope_typed(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            MessageType::Signaling,
-            b"signaling payload",
-            None,
-            &custody,
-            &signing_key,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(envelope.message_type, MessageType::Signaling);
-
-        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
-        assert!(valid, "signaling envelope signature should verify");
-    }
-
-    #[tokio::test]
-    async fn signaling_signature_rejects_type_flip_to_content() {
-        let (custody, signing_key) = setup().await;
-        let pubkey = custody.public_key(&signing_key).await.unwrap();
-
-        let mut envelope = create_inner_envelope_typed(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            MessageType::Signaling,
-            b"payload",
-            None,
-            &custody,
-            &signing_key,
-        )
-        .await
-        .unwrap();
-
-        envelope.message_type = MessageType::Content;
-
-        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
-        assert!(!valid, "type-flipped envelope must fail verification");
-    }
-
-    #[tokio::test]
-    async fn default_create_uses_content_type() {
-        let (custody, signing_key) = setup().await;
-
-        let envelope = create_inner_envelope(
-            "ctx-1",
-            "did:dht:alice",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            b"hello",
-            None,
-            &custody,
-            &signing_key,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(envelope.message_type, MessageType::Content);
-    }
-
-    #[test]
-    fn length_prefixes_prevent_field_boundary_collision() {
-        let payload_hash = Sha256::digest(b"test").to_vec();
-        let provenance_hash = Sha256::digest([0x00]).to_vec();
-
-        let hash_a = compute_canonical_hash(
-            "ab",
-            "cd",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            MessageType::Content,
-            &payload_hash,
-            &provenance_hash,
-        );
-
-        let hash_b = compute_canonical_hash(
-            "abc",
-            "d",
-            1,
-            0,
-            1,
-            1_700_000_000,
-            MessageType::Content,
-            &payload_hash,
-            &provenance_hash,
-        );
-
-        assert_ne!(
-            hash_a, hash_b,
-            "different field boundaries must produce different canonical hashes"
         );
     }
 
@@ -881,14 +642,16 @@ mod tests {
                     let pubkey = custody.public_key(&signing_key).await.unwrap();
 
                     let envelope = create_inner_envelope(
-                        "ctx-prop",
-                        "did:dht:proptest",
-                        1,
-                        0,
-                        1,
-                        1_700_000_000,
-                        &payload,
-                        None,
+                        &InnerEnvelopeParams {
+                            context_id: "ctx-prop",
+                            sender_did: "did:dht:proptest",
+                            epoch: 1,
+                            generation: 0,
+                            sequence: 1,
+                            timestamp: 1_700_000_000,
+                            payload: &payload,
+                            provenance: None,
+                        },
                         &custody,
                         &signing_key,
                     )
