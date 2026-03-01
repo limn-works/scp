@@ -2,76 +2,112 @@
 
 ## Overview
 
-This crate is the native addon (`.node` file) for Node.js/Bun. It exposes scp-core Rust APIs to JavaScript via `#[napi]` functions and classes. The TypeScript SDK (`@scp/sdk`) consumes this addon.
+This crate is the `@scp/sdk-napi` native addon (`.node` file). It exposes scp-core APIs to
+Node.js/Bun via napi-rs `#[napi]` types and functions. Unlike the PyO3 bridge (`crates/scp-ffi`),
+this bridge has no global runtime registry — all context state lives in the `NapiContextHandle`
+struct itself.
 
 ## Architecture
 
-### Async Model
+### No Runtime Registry
 
-Uses a single tokio `Runtime` in a `OnceLock<Runtime>` (multi-thread). napi-rs `tokio_rt` feature handles the JS Promise ↔ Rust Future bridging. All async bridge functions are declared `async fn` with `#[napi]`.
+The PyO3 bridge uses a global `DashMap<String, ContextRuntime>` keyed by context ID. The NAPI
+bridge does NOT have an equivalent. All state needed by bridge functions is stored directly on
+the opaque handle structs:
 
-### Runtime Registry (`runtime.rs`)
+- `NapiContextHandle` — carries `context_id`, `creator_did`, `mode`, `ceiling`, etc.
+- `NapiUcanToken` — carries `data: NapiUcanTokenData` and `encoded: String`
+- `NapiIdentity` — carries `did`, `custody_type`
+- `NapiTransportManager` — carries transport state
 
-A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live runtime state:
-- `EventLog` — event recording, Merkle proofs
-- `RevocationList` — UCAN token revocation tracking
-- `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9)
-- `ceiling_strings: HashSet<String>` — capability ceiling as strings (ADR-016 step 8)
-- `creator_did` — the DID of the context creator
-
-**Lazy registration:** Unlike the PyO3 bridge (where `py_context_create` eagerly registers), the NAPI bridge uses `ensure_registered(&NapiContextHandle)` — the first UCAN or event_log call on a context triggers registration from the handle's metadata. This avoids coupling to `context.rs`.
+Functions that need context data receive the handle as `&NapiContextHandle` and read from it
+directly. There is no `with_context` lookup by ID.
 
 ### Module Structure
 
-| Module | Delegates to | Functions |
-|--------|-------------|-----------|
-| `identity.rs` | scp-core identity | `identity_create`, `identity_load`, `identity_resolve` |
-| `context.rs` | NapiContextHandle | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe` |
-| `tools.rs` | scp-core tools | `tool_register`, `tool_invoke`, `tool_verify` |
-| `ucan.rs` | scp-core UCAN | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
-| `event_log.rs` | scp-core event_log | `event_log_query`, `event_log_verify` |
-| `transport.rs` | scp-transport | `transport_connect`, `transport_disconnect`, `transport_status` |
-| `runtime.rs` | DashMap registry | `ensure_registered`, `with_context`, `remove_context` |
+| Module | Functions |
+|--------|-----------|
+| `identity.rs` | `identity_create`, `identity_load`, `identity_resolve` |
+| `context.rs` | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe` |
+| `tools.rs` | `tool_register`, `tool_invoke`, `tool_verify` |
+| `ucan.rs` | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
+| `event_log.rs` | `event_log_query`, `event_log_verify` |
+| `transport.rs` | `transport_connect`, `transport_disconnect`, `transport_status` |
 
 ### Build
 
-- `crate-type = ["cdylib"]` — native addon only (no rlib)
-- `#![allow(clippy::trailing_empty_array)]` required — napi-rs macros generate structs that trigger this lint
-- `#![forbid(unsafe_code)]` CANNOT be used — napi-rs macros generate unsafe code
-- `cargo check -p scp-ffi-napi` to verify compilation
-- `cargo test -p scp-ffi-napi` to run Rust-side unit tests
+- `crate-type = ["cdylib"]` only (unlike PyO3 which has rlib for test linkage)
+- Tests run via `cargo test -p scp-ffi-napi` (no Python linkage required, unlike scp-ffi)
+- `cargo check -p scp-ffi-napi` validates without building the full cdylib
 
-### Error Mapping
+## Key Differences From the PyO3 Bridge
 
-`error.rs` defines `ScpNapiError` enum (7 variants) with `From<scp-core error types>` and `From<ScpNapiError> for napi::Error` (using `napi::Status::GenericFailure + error.to_string()`).
+### NapiUcanToken Has `encoded` Field; PyUcanToken Does Not
 
-### UCAN Validation Pipeline (SCP-219)
+`NapiUcanToken` carries a `pub(crate) encoded: String` field for future revocation/validation
+wiring. `PyUcanToken` in the PyO3 bridge has no such field — it only exposes metadata.
 
-`ucan_validate` delegates to scp-core's full 11-step ADR-016 pipeline via bridge trait adapters:
-- `BridgeDidResolver` — extracts Ed25519 pubkeys from `did:dht:z{zbase32}` and `did:key:{hex}` DIDs
-- `BridgeRevocationChecker` — wraps `RevocationList` from runtime registry
-- `BridgeProofResolver` — in-memory `HashMap<String, UcanToken>` for delegation chains
-- `BridgeNonceTracker` — adapts `nonce::NonceTracker` struct to `validate::NonceTracker` trait
+When implementing `ucan_mint`, the `encoded` field MUST be set to a valid JWT-format string:
+`base64url(header_json).base64url(payload_json).base64url(sig_bytes)`. A placeholder 64-byte
+zero signature is acceptable until real Ed25519 signing is wired (SCP-214).
 
-`ucan_mint` **does not call `scp_core::crypto::ucan::mint::mint_ucan`** — it manually constructs `NapiUcanToken` with `encoded: String::new()`. This is a known gap (gate-audit): the token has no JWT structure and cannot be passed to `ucan_revoke` or `ucan_validate`. Fix: call `mint_ucan` with `InMemoryKeyCustody` as a placeholder (as the UniFFI bridge does) until SCP-214 wires real `KeyCustody`. See ACTION items in SCP-219 audit.
+An empty `encoded` field means:
+- `ucan_revoke` cannot compute the revocation CID (it needs to call `parse_ucan`)
+- `ucan_validate` cannot verify the token
+- The token is structurally non-round-trippable
 
-`ucan_validate` does not accept a `proof_tokens` parameter — delegated UCAN tokens (non-empty `prf` arrays) will always fail at delegation chain traversal (step 3) with "proof CID not found". The PyO3 bridge accepts `Option<Vec<String>>` proof tokens and populates `BridgeProofResolver` from them. This gap must be fixed before delegated UCANs can be validated through the NAPI bridge.
+### JWT Construction Pattern (NAPI)
 
-`ucan_revoke` parses the full JWT, computes CID via `compute_revocation_cid`, adds to `RevocationList`.
+```rust
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
 
-### Event Log (SCP-219)
+let header = UcanHeader::new();
+let payload = UcanPayload { iss, aud, exp, nbf: None, nnc, att, prf: vec![], fct: None };
 
-`event_log_query` returns Merkle tree metadata (event count + root hash). Full event replay requires transport-layer event storage.
+let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?);
+let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
+let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
 
-`event_log_verify` generates and verifies inclusion/absence Merkle proofs via `scp_core::event_log::proof`.
+let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+```
+
+This produces a string parseable by `scp_core::crypto::ucan::validate::parse_ucan`.
+
+### Capability URI Scoping
+
+Capabilities passed as `"messages:write"` are scoped to `"scp:ctx:{context_id}/messages:write"`.
+Capabilities already starting with `"scp:ctx:"` are passed through unchanged. The `can` field
+of each `Attenuation` is derived from `rsplit_once(':')` on the scoped URI.
+
+### Nonce Generation
+
+The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly (no wrapper). Format:
+`{unix_millis_timestamp}-{16_random_bytes_hex}` matching ADR-016 §7.2.
 
 ## Gotchas
 
-- The `z-base-32` workspace dependency has `lib.name = "zbase32"` — use `zbase32::encode/decode` in Rust code, NOT `z_base_32::`. Do NOT add the standalone `zbase32` crate (different API: takes `&[u8]` + `u64` bits).
-- `NapiContextHandle` fields are private but have `#[napi(getter)]` public methods (`context_id()`, `creator_did()`, `ceiling()`). Use these for Rust-side access.
-- `napi-rs` requires `async fn` for Promise returns even when the function is sync — annotate with `#[allow(clippy::unused_async)]`.
-- `napi-rs` requires owned `String`/`Vec` parameters — annotate with `#[allow(clippy::needless_pass_by_value)]`.
-- Handle count: opaque types (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`, `NapiTransportManager`) must increment `HANDLE_COUNT` on construction and decrement in `Drop`.
-- Runtime registry uses lazy init pattern — `ensure_registered()` must be called before `with_context()` in every bridge function that needs runtime state.
-- `event_log.rs` has no test module — `decode_hex_hash` and the inclusion/absence proof paths are untested at the unit level. Add `#[cfg(test)]` block matching the PyO3 bridge coverage before marking related stories done.
-- `ensure_registered` has a TOCTOU pattern: `contains_key` check + `or_insert` are not atomic across the two calls. The current behavior is safe (DashMap `or_insert` is atomic; duplicate construction is benign), but prefer `entry().or_insert_with(|| ContextRuntime { ... })` to avoid constructing unused runtime objects on races.
+- `NapiUcanToken.encoded` is `#[allow(dead_code)]` because `ucan_revoke` takes `token_id: String`
+  (not the full token). When revocation is wired to the runtime, the NAPI bridge will need a way
+  to look up the encoded token by ID (e.g., a handle registry or passing the full token to revoke).
+
+- Bridge functions returning `Err(...)` immediately without constructing the output type leave
+  `encoded` / other fields unset. Always construct the output struct before the feature is
+  "working" in any sense — stubs that silently produce empty fields are worse than stubs that
+  return errors, because they look like they work.
+
+- The `ucan_validate` and `ucan_revoke` functions still return errors — they require a live
+  runtime registry (not yet present in the NAPI bridge). These are SCP-219 scope work items.
+
+- Dependencies: add `base64 = { workspace = true }` and `rand = { workspace = true }` to
+  `Cargo.toml` when building JWT-format tokens. Both are workspace deps.
+
+## SCP-219 Status
+
+As of 2026-03-01:
+- `ucan_mint`: FIXED — constructs proper JWT-format `encoded` string with placeholder signature
+- `ucan_validate`: stub — returns `SCP-PRM-4002` error
+- `ucan_revoke`: stub — returns `SCP-PRM-4006` error
+
+Real signing and runtime wiring are SCP-214 scope.

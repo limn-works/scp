@@ -28,7 +28,10 @@
 
 use std::collections::HashMap;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use napi_derive::napi;
+use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
 
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 use scp_core::crypto::ucan::UcanToken;
@@ -87,9 +90,9 @@ pub struct NapiUcanTokenData {
 pub struct NapiUcanToken {
     /// Stable token metadata.
     pub(crate) data: NapiUcanTokenData,
-    /// Raw encoded JWT string — retained for validation operations.
+    /// Raw encoded JWT string — retained for revocation and validation wiring.
     #[allow(dead_code)]
-    encoded: String,
+    pub(crate) encoded: String,
 }
 
 #[napi]
@@ -322,13 +325,13 @@ pub async fn ucan_validate(
 
 /// Mints a new UCAN token for a context member.
 ///
-/// Creates a new UCAN token granting the specified capabilities to the
-/// given member DID. The token is structured with proper SCP capability
-/// URIs scoped to the context.
+/// Creates a UCAN token with a properly encoded JWT string
+/// (`base64url(header).base64url(payload).base64url(signature)`). The
+/// signature field is a 64-byte zero placeholder — real Ed25519 signing
+/// requires `KeyCustody` integration (SCP-214 scope).
 ///
-/// Signing is deferred to SCP-214 (`KeyCustody` wiring). Currently creates
-/// a properly formatted token with a placeholder signature. Real Ed25519
-/// signing requires `KeyCustody` integration.
+/// The encoded token is parseable by `scp_core::crypto::ucan::validate::parse_ucan`
+/// and round-trips through `ucan_revoke`.
 ///
 /// # Arguments
 ///
@@ -338,12 +341,14 @@ pub async fn ucan_validate(
 ///
 /// # Returns
 ///
-/// A `Promise<NapiUcanToken>` with the minted token's metadata.
+/// A `Promise<NapiUcanToken>` with the minted token's metadata and encoded JWT.
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-PERM-3001` if minting fails (capabilities outside
-///   the context ceiling, issuer not authorized, etc.).
+/// - Rejects with `SCP-PERM-4004` if JWT serialization fails (system clock
+///   error or JSON encoding failure).
+///
+/// Stub — real Ed25519 signing wired in SCP-214. See ADR-016 AC-3.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
@@ -352,51 +357,85 @@ pub async fn ucan_mint(
     member_did: String,
     capabilities: Vec<String>,
 ) -> napi::Result<NapiUcanToken> {
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
-
     let context_id = handle.context_id();
-    let creator_did =
-        crate::runtime::with_context(&context_id, |rt| Ok(rt.creator_did.clone()))
-            .map_err(napi::Error::from)?;
+    let issuer_did = handle.creator_did();
 
-    let nonce = generate_nonce().map_err(napi::Error::from)?;
+    let nonce = generate_nonce().map_err(|e| ScpNapiError::Permission {
+        message: format!("nonce generation failed: {e}"),
+        code: "SCP-PERM-4004".to_owned(),
+    })?;
 
-    let capability_uris: Vec<String> = capabilities
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ScpNapiError::Permission {
+            message: format!("system clock error: {e}"),
+            code: "SCP-PERM-4004".to_owned(),
+        })?
+        .as_secs();
+    let exp = now + 3600;
+
+    let att: Vec<Attenuation> = capabilities
         .iter()
         .map(|cap| {
-            if cap.starts_with("scp:ctx:") {
+            let scoped = if cap.starts_with("scp:ctx:") {
                 cap.clone()
             } else {
                 format!("scp:ctx:{context_id}/{cap}")
+            };
+            let action = scoped
+                .rsplit_once(':')
+                .map(|(_, a)| a.to_owned())
+                .unwrap_or_else(|| scoped.clone());
+            Attenuation {
+                with: scoped,
+                can: action,
             }
         })
         .collect();
 
-    #[allow(clippy::cast_precision_loss)]
-    let exp = {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| ScpNapiError::Permission {
-                message: format!("system clock error: {e}"),
-                code: "SCP-PERM-3001".to_owned(),
-            })
-            .map_err(napi::Error::from)?
-            .as_secs();
-        (now + 3600) as f64
+    let capability_uris: Vec<String> = att.iter().map(|a| a.with.clone()).collect();
+
+    let header = UcanHeader::new();
+    let payload = UcanPayload {
+        iss: issuer_did.clone(),
+        aud: member_did.clone(),
+        exp,
+        nbf: None,
+        nnc: nonce.clone(),
+        att,
+        prf: vec![],
+        fct: None,
     };
 
-    let token = NapiUcanToken {
+    let header_json = serde_json::to_vec(&header).map_err(|e| ScpNapiError::Permission {
+        message: format!("header serialization failed: {e}"),
+        code: "SCP-PERM-4004".to_owned(),
+    })?;
+    let payload_json = serde_json::to_vec(&payload).map_err(|e| ScpNapiError::Permission {
+        message: format!("payload serialization failed: {e}"),
+        code: "SCP-PERM-4004".to_owned(),
+    })?;
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+
+    let placeholder_sig = [0u8; 64];
+    let sig_b64 = URL_SAFE_NO_PAD.encode(placeholder_sig);
+
+    let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+    crate::increment_handle_count();
+    Ok(NapiUcanToken {
         data: NapiUcanTokenData {
             token_id: nonce,
-            issuer: creator_did,
+            issuer: issuer_did,
             audience: member_did,
             capabilities: capability_uris,
-            expires_at: Some(exp),
+            #[allow(clippy::cast_precision_loss)]
+            expires_at: Some(exp as f64),
         },
-        encoded: String::new(),
-    };
-    crate::increment_handle_count();
-    Ok(token)
+        encoded,
+    })
 }
 
 /// Revokes a UCAN token.
@@ -440,25 +479,6 @@ pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Res
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
-fn generate_nonce() -> Result<String, ScpNapiError> {
-    use rand::Rng;
-
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ScpNapiError::Permission {
-            message: format!("system clock error: {e}"),
-            code: "SCP-PERM-3001".to_owned(),
-        })?
-        .as_millis();
-
-    let mut random_bytes = [0u8; 16];
-    rand::thread_rng().fill(&mut random_bytes);
-
-    let hex = encode_hex(&random_bytes);
-    Ok(format!("{now_millis}-{hex}"))
-}
 
 /// Encodes a byte slice as a lowercase hex string.
 fn encode_hex(bytes: &[u8]) -> String {
@@ -637,4 +657,34 @@ mod tests {
         let result = decode_hex("abc");
         assert!(result.is_err());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
+///
+/// Uses cryptographic randomness via `rand::rngs::OsRng` (backed by the
+/// OS CSPRNG) to produce unpredictable nonces as required by ADR-016 §7.2.
+fn generate_nonce() -> Result<String, String> {
+    use rand::RngCore;
+
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system clock error: {e}"))?
+        .as_millis();
+
+    let mut random_bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut random_bytes);
+
+    let hex = random_bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+
+    Ok(format!("{now_millis}-{hex}"))
 }
