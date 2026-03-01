@@ -278,7 +278,8 @@
         "SCP-224",
         "SCP-225",
         "SCP-226",
-        "SCP-227"
+        "SCP-227",
+        "SCP-228"
       ]
     }
   ],
@@ -10298,6 +10299,60 @@
       ],
       "actionItems": [],
       "details": {}
+    },
+    {
+      "id": "SCP-228",
+      "title": "Replace global FFI registries with per-instance registries",
+      "gate": "gate-audit",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "blockedBy": [],
+      "files": [
+        "crates/scp-ffi/src/runtime.rs",
+        "crates/scp-ffi/src/lib.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/tools.rs",
+        "crates/scp-ffi/src/ucan.rs",
+        "crates/scp-ffi/src/event_log.rs",
+        "crates/scp-ffi/src/mcp.rs",
+        "crates/scp-ffi/src/transport.rs",
+        "bindings/python/scp_sdk/__init__.py"
+      ],
+      "description": "The PyO3 FFI bridge uses process-global OnceLock<DashMap<...>> statics for context state (CONTEXT_REGISTRY), discovery metadata (KNOWN_CONTEXTS), relay connections (RELAY_CONNECTION), and identity routing secrets (IDENTITY_ROUTING_SECRETS). In multi-tenant deployments (Django/FastAPI serving multiple SCP users), all tenants share these registries, enabling cross-tenant context and identity leakage. The NAPI, UniFFI, and WASM bridges already use per-instance handle objects and do not have this issue. This story refactors the PyO3 bridge to use a per-instance ScpRuntime object that owns all registries, matching the pattern established by the other three bridges. Identified as RED-017 in security review.",
+      "acceptanceCriteria": [
+        "No process-global OnceLock<DashMap<...>> statics remain in crates/scp-ffi/src/runtime.rs for context, identity, or relay state",
+        "A new ScpRuntime struct (or equivalent) owns context registry, known-context registry, relay connection state, and identity routing secrets as instance fields",
+        "Each ScpRuntime instance is fully isolated: contexts registered in one instance are not visible from another",
+        "All bridge functions (py_context_create, py_tool_register, py_ucan_validate, etc.) operate on a specific ScpRuntime instance, not global state",
+        "Two ScpRuntime instances in the same process can create contexts with the same context ID without collision",
+        "Test: create two ScpRuntime instances, register a context in instance A, verify instance B cannot access it via with_context",
+        "The Python SDK exposes ScpRuntime as the entry point for all operations, replacing module-level function calls",
+        "Existing single-tenant usage (creating one ScpRuntime at import time) works with no API change in the Python wrapper layer"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-3.md",
+          "section": "## ADR-013: PyO3 Bridge Layer"
+        }
+      ],
+      "actionItems": [
+        "Define ScpRuntime struct with DashMap fields for context, known-context, relay, and identity routing secret registries",
+        "Expose ScpRuntime as a #[pyclass] with constructor and Drop cleanup",
+        "Refactor register_context, with_context, remove_context to take &ScpRuntime instead of using global statics",
+        "Refactor known-context functions (register_known_context, all_known_contexts, known_contexts_for_member) to operate on ScpRuntime",
+        "Refactor relay connection functions (set_relay_connection, get_relay_connection, clear_relay_connection) to operate on ScpRuntime",
+        "Refactor get_or_create_routing_secret to operate on ScpRuntime",
+        "Update all py_* bridge functions to accept a runtime parameter or operate on self for a #[pymethods] approach",
+        "Add isolation test: two runtimes, same context ID, no cross-contamination",
+        "Update Python SDK wrapper to create a default ScpRuntime instance for backwards compatibility"
+      ],
+      "details": {
+        "securityReviewId": "RED-017",
+        "issueCategory": "cross-tenant-leakage",
+        "affectedBridges": "PyO3 only (NAPI, UniFFI, WASM already use per-instance handles)"
+      }
     }
   ]
 }

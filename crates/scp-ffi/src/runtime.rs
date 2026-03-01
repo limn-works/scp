@@ -5,6 +5,17 @@
 //! UCAN state). This module provides a global registry that maps context IDs
 //! to their associated runtime state.
 //!
+//! # Safety: Single-Tenant Only (RED-017)
+//!
+//! **All registries in this module are process-global.** In multi-tenant
+//! deployments (e.g., Django/FastAPI serving multiple SCP users), all tenants
+//! share these registries. Context IDs and identity DIDs from one tenant are
+//! accessible to another. This is a known architectural limitation.
+//!
+//! The NAPI (Node.js), UniFFI (Swift/Kotlin), and WASM bridges avoid this
+//! issue by using per-instance handle objects instead of global registries.
+//! The PyO3 bridge must be refactored to match. See SCP-228.
+//!
 //! # Pattern
 //!
 //! Uses [`DashMap`] for lock-free concurrent reads. Most bridge operations
@@ -65,6 +76,16 @@ pub type ToolHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 /// Global registry of per-context runtime state.
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. In multi-tenant deployments (e.g., a web
+/// server serving multiple SCP users), ALL tenants share this registry. Context
+/// IDs and identity DIDs from one tenant are accessible to another. This is a
+/// known architectural limitation tracked for resolution before production
+/// multi-tenant deployment.
+///
+/// See RED-017 in the security review. Follow-on story: SCP-228.
 static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::new();
 
 /// Global registry of known context-to-relay mappings for discovery (SCP-213).
@@ -73,6 +94,16 @@ static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::n
 /// routing IDs and relay URLs. This allows `py_mcp_load_contexts` to probe
 /// relays for context activity even across process restarts (when combined
 /// with persistence, a future story).
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. In multi-tenant deployments (e.g., a web
+/// server serving multiple SCP users), ALL tenants share this registry. Context
+/// IDs and identity DIDs from one tenant are accessible to another. This is a
+/// known architectural limitation tracked for resolution before production
+/// multi-tenant deployment.
+///
+/// See RED-017 in the security review. Follow-on story: SCP-228.
 static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new();
 
 /// Global relay connection for context discovery probing.
@@ -80,6 +111,16 @@ static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new()
 /// Set by [`set_relay_connection`] when `py_transport_connect` succeeds.
 /// Read by `py_mcp_load_contexts` to probe routing IDs on the relay.
 /// Uses `RwLock` for infrequent writes (connect) and concurrent reads (probe).
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. In multi-tenant deployments (e.g., a web
+/// server serving multiple SCP users), ALL tenants share this registry. Context
+/// IDs and identity DIDs from one tenant are accessible to another. This is a
+/// known architectural limitation tracked for resolution before production
+/// multi-tenant deployment.
+///
+/// See RED-017 in the security review. Follow-on story: SCP-228.
 static RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>> = OnceLock::new();
 
 /// Returns a reference to the global context registry.
@@ -360,6 +401,10 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 /// When `KeyCustody` is wired in, replace callers with
 /// `scp_core::envelope::pseudonym::derive_pseudonym` using real key material.
 pub fn get_or_create_routing_secret(identity_did: &str) -> [u8; 32] {
+    /// # Safety: Single-Tenant Only
+    ///
+    /// This registry is process-global. In multi-tenant deployments,
+    /// ALL tenants share routing secrets. See RED-017 / SCP-228.
     static IDENTITY_ROUTING_SECRETS: OnceLock<DashMap<String, [u8; 32]>> = OnceLock::new();
 
     let map = IDENTITY_ROUTING_SECRETS.get_or_init(DashMap::new);
