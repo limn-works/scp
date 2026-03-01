@@ -84,6 +84,58 @@ def _bridge() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers for bridge payload extraction
+# ---------------------------------------------------------------------------
+
+_EMPTY_ROOT_HASH = "0" * 64
+
+
+def _extract_root_hash(events: list[Any]) -> str:
+    """Extract the Merkle root hash from bridge query results.
+
+    The bridge ``event_log_query`` returns a single ``LogSummary`` event
+    whose ``payload`` dict contains a ``merkle_root`` key with the
+    hex-encoded Merkle root of the event log (RFC 6962 structure).
+
+    Returns the hex-encoded root hash, or the empty-tree sentinel
+    (64 zero characters) if the root cannot be extracted.
+    """
+    for event in events:
+        payload = getattr(event, "payload", None)
+        if payload is None:
+            continue
+
+        if isinstance(payload, dict):
+            root = payload.get("merkle_root")
+            if isinstance(root, str) and len(root) == 64:
+                return root
+
+    return _EMPTY_ROOT_HASH
+
+
+def _extract_event_count(events: list[Any]) -> int:
+    """Extract the total event count from bridge query results.
+
+    The bridge ``event_log_query`` returns a ``LogSummary`` event whose
+    ``payload`` dict contains an ``event_count`` key with the total
+    number of events in the log.
+
+    Returns the event count, or ``len(events)`` as a fallback.
+    """
+    for event in events:
+        payload = getattr(event, "payload", None)
+        if payload is None:
+            continue
+
+        if isinstance(payload, dict):
+            count = payload.get("event_count")
+            if isinstance(count, int):
+                return count
+
+    return len(events)
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -282,6 +334,12 @@ class EventLog:
         hash, sequence number, and event count.  Useful for incremental
         synchronization and consistency verification.
 
+        The root hash is extracted from the bridge's ``LogSummary``
+        event payload, which contains the Merkle root computed by the
+        Rust ``scp-core`` event log (RFC 6962 structure).  If no
+        events exist, the root hash is 64 zero hex characters (the
+        empty-tree sentinel).
+
         Returns:
             A :class:`Checkpoint` snapshot.
 
@@ -293,19 +351,28 @@ class EventLog:
             self._context_id,
         )
 
-        # Query all events to derive the checkpoint from current state.
-        # A dedicated bridge function may be added in the future; for now
-        # we derive from the query results.
         bridge = _bridge()
         events = bridge.event_log_query(self._context_id, None)
 
-        last_seq = events[-1].sequence if events else 0
+        if not events:
+            return Checkpoint(
+                context_id=self._context_id,
+                sequence=0,
+                timestamp=time.time(),
+                root_hash=_EMPTY_ROOT_HASH,
+                event_count=0,
+            )
+
+        root_hash = _extract_root_hash(events)
+        event_count = _extract_event_count(events)
+        last_seq = events[-1].sequence
+
         return Checkpoint(
             context_id=self._context_id,
             sequence=last_seq,
             timestamp=time.time(),
-            root_hash="",  # Populated by runtime when bridge supports it
-            event_count=len(events),
+            root_hash=root_hash,
+            event_count=event_count,
         )
 
 
