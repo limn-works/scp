@@ -84,6 +84,8 @@ pub enum HandleRegisterStatus {
     Registered,
     /// Another DID already holds this handle.
     Conflict,
+    /// The registrant DID does not match the target identity DID.
+    OwnershipMismatch,
 }
 
 // ---------------------------------------------------------------------------
@@ -206,13 +208,28 @@ impl HandleRegistry {
 
     /// Registers a handle.
     ///
-    /// Returns `Registered` on success or `Conflict` if another DID already
-    /// holds this handle. Handle uniqueness is enforced per local-part.
+    /// The `registrant_did` is the DID of the authenticated caller (verified
+    /// via DID-signed request at the transport layer). For identity targets,
+    /// `registrant_did` must match the target DID to prevent handle squatting.
+    /// Context targets may be registered by any authenticated DID.
+    ///
+    /// Returns `Registered` on success, `Conflict` if another DID already
+    /// holds this handle, or `OwnershipMismatch` if the registrant does not
+    /// own the target identity DID.
     pub fn register(
         &mut self,
         params: &HandleRegisterParams,
-        owner_did: &DID,
+        registrant_did: &DID,
     ) -> HandleRegisterResult {
+        if let HandleTarget::Identity { ref did } = params.target {
+            if did != registrant_did {
+                return HandleRegisterResult {
+                    status: HandleRegisterStatus::OwnershipMismatch,
+                    entry_id: None,
+                };
+            }
+        }
+
         let normalized = params.handle.to_lowercase();
 
         if self.entries.contains_key(&normalized) {
@@ -233,7 +250,7 @@ impl HandleRegistry {
         let entry = HandleEntry {
             handle: normalized.clone(),
             target: params.target.clone(),
-            owner_did: owner_did.clone(),
+            owner_did: registrant_did.clone(),
             registered_at: now,
             metadata: params.metadata.clone().unwrap_or_default(),
             entry_id: entry_id.clone(),
@@ -405,6 +422,21 @@ mod tests {
         registry.register(&params1, &alice_did);
         let result = registry.register(&params2, &bob_did);
         assert_eq!(result.status, HandleRegisterStatus::Conflict);
+    }
+
+    #[test]
+    fn register_identity_handle_rejects_ownership_mismatch() {
+        let mut registry = HandleRegistry::new("ctx-cooking".to_owned());
+        let params = HandleRegisterParams {
+            handle: "alice".to_owned(),
+            target: make_identity_target("did:dht:zAlice"),
+            metadata: None,
+        };
+
+        let result = registry.register(&params, &DID::from("did:dht:zEve"));
+        assert_eq!(result.status, HandleRegisterStatus::OwnershipMismatch);
+        assert!(result.entry_id.is_none());
+        assert!(registry.is_empty());
     }
 
     #[test]
@@ -591,7 +623,6 @@ mod tests {
     #[test]
     fn register_generates_unique_entry_ids() {
         let mut registry = HandleRegistry::new("ctx-cooking".to_owned());
-        let did = DID::from("did:dht:zAdmin");
 
         let r1 = registry.register(
             &HandleRegisterParams {
@@ -599,7 +630,7 @@ mod tests {
                 target: make_identity_target("did:dht:zAlice"),
                 metadata: None,
             },
-            &did,
+            &DID::from("did:dht:zAlice"),
         );
 
         let r2 = registry.register(
@@ -608,7 +639,7 @@ mod tests {
                 target: make_identity_target("did:dht:zBob"),
                 metadata: None,
             },
-            &did,
+            &DID::from("did:dht:zBob"),
         );
 
         assert_ne!(r1.entry_id, r2.entry_id);

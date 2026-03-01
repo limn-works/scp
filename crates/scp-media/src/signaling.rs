@@ -43,7 +43,14 @@ pub enum SignalingMessage {
     IceCandidate(Candidate),
 
     /// Graceful session teardown request.
-    SessionEnd,
+    ///
+    /// Carries the sender's DID so that `verify_sender_attribution` can
+    /// confirm the envelope sender matches. Without this, any context member
+    /// could forge a `SessionEnd` to tear down another participant's session.
+    SessionEnd {
+        /// DID of the participant requesting session teardown.
+        sender_did: DID,
+    },
 }
 
 /// An SDP session description with sender attribution.
@@ -128,6 +135,18 @@ pub fn create_ice_candidate(
     )
 }
 
+/// Creates a session-end signaling message.
+#[must_use]
+pub fn create_session_end(
+    session_id: &str,
+    sender_did: DID,
+) -> (SessionId, SignalingMessage) {
+    (
+        session_id.to_owned(),
+        SignalingMessage::SessionEnd { sender_did },
+    )
+}
+
 /// Serializes a signaling message to JSON bytes for transport.
 ///
 /// # Errors
@@ -182,7 +201,9 @@ pub fn send_signaling(msg: &SignalingMessage) -> Result<(Vec<u8>, MessageType), 
 /// group membership). Any mismatch indicates either a bug or a spoofing
 /// attempt and must be rejected.
 ///
-/// `SessionEnd` messages carry no sender DID and always pass verification.
+/// All variants -- including `SessionEnd` -- carry a `sender_did` and are
+/// verified. This prevents a malicious member from forging a `SessionEnd`
+/// to tear down another participant's WebRTC session.
 ///
 /// # Arguments
 ///
@@ -200,8 +221,7 @@ pub fn verify_sender_attribution(
     let claimed = match msg {
         SignalingMessage::Offer(desc) | SignalingMessage::Answer(desc) => &desc.sender_did,
         SignalingMessage::IceCandidate(c) => &c.sender_did,
-        // SessionEnd carries no sender DID -- nothing to verify.
-        SignalingMessage::SessionEnd => return Ok(()),
+        SignalingMessage::SessionEnd { sender_did } => sender_did,
     };
 
     if claimed != envelope_sender_did {
@@ -285,6 +305,18 @@ mod tests {
     }
 
     #[test]
+    fn create_session_end_returns_session_id_and_message() {
+        let (sid, msg) = create_session_end("sess-5", "did:dht:zAlice".into());
+        assert_eq!(sid, "sess-5");
+        match msg {
+            SignalingMessage::SessionEnd { sender_did } => {
+                assert_eq!(sender_did, "did:dht:zAlice");
+            }
+            _ => panic!("expected SessionEnd"),
+        }
+    }
+
+    #[test]
     fn serialize_deserialize_offer_roundtrip() {
         let (_, msg) = create_offer(
             "s1",
@@ -323,10 +355,15 @@ mod tests {
 
     #[test]
     fn serialize_session_end() {
-        let msg = SignalingMessage::SessionEnd;
+        let msg = SignalingMessage::SessionEnd {
+            sender_did: "did:dht:zAlice".into(),
+        };
         let bytes = serialize_signaling(&msg).unwrap();
         let restored = deserialize_signaling(&bytes).unwrap();
-        assert!(matches!(restored, SignalingMessage::SessionEnd));
+        assert!(matches!(
+            restored,
+            SignalingMessage::SessionEnd { sender_did } if sender_did == "did:dht:zAlice"
+        ));
     }
 
     #[test]
@@ -365,11 +402,21 @@ mod tests {
     }
 
     #[test]
-    fn verify_sender_attribution_passes_for_session_end() {
-        let msg = SignalingMessage::SessionEnd;
-        // SessionEnd has no sender_did -- should always pass.
-        let result = verify_sender_attribution(&msg, "did:dht:zAnyone");
+    fn verify_sender_attribution_passes_for_matching_session_end() {
+        let (_, msg) = create_session_end("s1", "did:dht:zAlice".into());
+        let result = verify_sender_attribution(&msg, "did:dht:zAlice");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_sender_attribution_fails_for_mismatched_session_end() {
+        let (_, msg) = create_session_end("s1", "did:dht:zAlice".into());
+        let result = verify_sender_attribution(&msg, "did:dht:zEve");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SignalingError::SenderMismatch { .. }
+        ));
     }
 
     #[test]
@@ -483,12 +530,15 @@ mod tests {
 
     #[test]
     fn send_signaling_session_end_roundtrip() {
-        let msg = SignalingMessage::SessionEnd;
+        let (_, msg) = create_session_end("s1", "did:dht:zAlice".into());
         let (payload, mt) = send_signaling(&msg).unwrap();
 
         assert_eq!(mt, scp_core::envelope::MessageType::Signaling);
 
         let restored = deserialize_signaling(&payload).unwrap();
-        assert!(matches!(restored, SignalingMessage::SessionEnd));
+        assert!(matches!(
+            restored,
+            SignalingMessage::SessionEnd { sender_did } if sender_did == "did:dht:zAlice"
+        ));
     }
 }

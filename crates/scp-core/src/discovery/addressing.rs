@@ -790,8 +790,14 @@ fn corroborate_results(results: Vec<AddressResolution>) -> Vec<AddressResolution
 }
 
 /// Determines the shortest TTL to use for a set of resolution results.
+///
+/// Uses `Option<Duration>` to distinguish "no results seen" from "all results
+/// are petname-only." The previous implementation initialized `min_ttl` to
+/// `PETNAME_CACHE_TTL` then treated an unchanged value as "no real results,"
+/// which incorrectly downgraded petname-only results from 365-day to 15-minute
+/// cache TTL.
 fn shortest_ttl_for_results(results: &[AddressResolution]) -> Duration {
-    let mut min_ttl = PETNAME_CACHE_TTL;
+    let mut min_ttl: Option<Duration> = None;
 
     for result in results {
         let ttl = match result.resolution_path().layer {
@@ -801,16 +807,10 @@ fn shortest_ttl_for_results(results: &[AddressResolution]) -> Duration {
             ResolutionLayer::Attestation => ATTESTATION_HANDLE_CACHE_TTL,
             ResolutionLayer::MultiLayerCorroborated => DISCOVERY_HANDLE_CACHE_TTL,
         };
-        if ttl < min_ttl {
-            min_ttl = ttl;
-        }
+        min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
     }
 
-    if min_ttl == PETNAME_CACHE_TTL {
-        DISCOVERY_HANDLE_CACHE_TTL
-    } else {
-        min_ttl
-    }
+    min_ttl.unwrap_or(DISCOVERY_HANDLE_CACHE_TTL)
 }
 
 // ---------------------------------------------------------------------------
