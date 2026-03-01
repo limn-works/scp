@@ -129,6 +129,20 @@ fn messaging_tools_ceiling() -> Vec<Capability> {
     ]
 }
 
+/// Returns the tool-interface template ceiling (spec section 5.12.1).
+///
+/// The spec defines this as: `[messagesRead, messagesWrite, toolRegister,
+/// toolInvokeAll]`. Agents can invoke tools and register new ones within
+/// the context.
+fn messaging_tool_registration_ceiling() -> Vec<Capability> {
+    vec![
+        Capability::new(CAP_MESSAGES_READ),
+        Capability::new(CAP_MESSAGES_WRITE),
+        Capability::new(CAP_TOOL_INVOKE_ALL),
+        Capability::new(CAP_TOOL_REGISTER),
+    ]
+}
+
 /// Returns the messaging + invite ceiling: messaging + `member:invite`.
 fn messaging_invite_ceiling() -> Vec<Capability> {
     vec![
@@ -241,6 +255,19 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             template_id: Some(TemplateId::GatedBroadcast),
             economic_policy: None,
         },
+        TemplateId::ToolInterfaceTemplate => ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: messaging_tool_registration_ceiling(),
+            ceiling_policy: CeilingPolicy::Immutable,
+            promotion_policy: PromotionPolicy::NoPromotion,
+            roles: Vec::new(),
+            tools: Vec::new(),
+            ttl: None,
+            memory_scope: MemoryScope::Full,
+            governance: GovernanceModel::SingleAdmin,
+            template_id: Some(TemplateId::ToolInterfaceTemplate),
+            economic_policy: None,
+        },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
         TemplateId::PaidService => ContextParams {
@@ -309,11 +336,13 @@ enum TtlPolicy {
 /// Returns the TTL policy for a given template.
 const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
     match template_id {
-        TemplateId::BilateralEphemeral | TemplateId::Coordination => TtlPolicy::Required,
+        TemplateId::BilateralEphemeral
+        | TemplateId::Coordination => TtlPolicy::Required,
         TemplateId::BilateralPersistent => TtlPolicy::Forbidden,
         TemplateId::GroupDiscussion
         | TemplateId::PublicBroadcast
         | TemplateId::GatedBroadcast
+        | TemplateId::ToolInterfaceTemplate
         | TemplateId::PaidService
         | TemplateId::PaidBroadcast => TtlPolicy::Optional,
     }
@@ -959,6 +988,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
+            TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
         ];
@@ -1090,6 +1120,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
+            TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
         ];

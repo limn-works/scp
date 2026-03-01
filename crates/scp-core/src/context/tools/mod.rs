@@ -246,6 +246,39 @@ pub enum ToolError {
         /// Human-readable description of the failure.
         message: String,
     },
+
+    /// The cross-context tool call chain depth exceeded the maximum.
+    #[error("chain depth {depth} exceeds maximum {max_depth}")]
+    ChainDepthExceeded {
+        /// The current chain depth.
+        depth: u8,
+        /// The maximum allowed chain depth.
+        max_depth: u8,
+    },
+
+    /// The per-caller session cap has been reached (spec section 6.2.1, 9.2.1).
+    #[error(
+        "session cap exceeded: calling context \"{source_context}\" has {current} active sessions (max {max})"
+    )]
+    SessionCapExceeded {
+        /// The calling context that hit the cap.
+        source_context: String,
+        /// Current number of active sessions from this caller.
+        current: usize,
+        /// Maximum allowed concurrent sessions per caller.
+        max: usize,
+    },
+
+    /// The tool schema does not meet the specificity floor (spec section 6.2, 9.2.1).
+    #[error("schema specificity floor not met: {side} schema has {field_count} distinct fields, minimum {min_fields} required")]
+    SchemaSpecificityFloor {
+        /// Which schema failed: "input" or "output".
+        side: String,
+        /// Number of distinct fields found.
+        field_count: usize,
+        /// Minimum number of fields required.
+        min_fields: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------

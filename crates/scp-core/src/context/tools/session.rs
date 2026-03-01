@@ -30,6 +30,12 @@ use super::registry::ToolRegistry;
 use super::schema::validate_value_against_schema;
 use super::{DID, ToolError, ToolId};
 
+/// Default maximum concurrent sessions per calling context (spec section 6.2.1).
+///
+/// Prevents session exhaustion attacks by bounding the number of active
+/// sessions any single calling context can hold simultaneously.
+pub const DEFAULT_SESSION_CAP_PER_CALLER: usize = 5;
+
 /// Context identifier type alias.
 pub type ContextId = String;
 use crate::context::roles::ContextRoleState;
@@ -127,6 +133,15 @@ impl SessionStore {
         self.sessions.is_empty()
     }
 
+    /// Returns the number of active sessions from a given source context.
+    #[must_use]
+    pub fn count_by_source(&self, source_context: &str) -> usize {
+        self.sessions
+            .values()
+            .filter(|s| s.source_context == source_context)
+            .count()
+    }
+
     /// Inserts a session into the store.
     fn insert(&mut self, session: ToolSession) {
         self.sessions.insert(session.session_id.clone(), session);
@@ -191,6 +206,16 @@ pub async fn create_session(
     if !registry.contains(tool_id) {
         return Err(ToolError::ToolNotFound {
             tool_id: tool_id.clone(),
+        });
+    }
+
+    // Enforce per-caller session cap (spec section 6.2.1, 9.2.1).
+    let current = store.count_by_source(source_context);
+    if current >= DEFAULT_SESSION_CAP_PER_CALLER {
+        return Err(ToolError::SessionCapExceeded {
+            source_context: source_context.clone(),
+            current,
+            max: DEFAULT_SESSION_CAP_PER_CALLER,
         });
     }
 
@@ -666,6 +691,103 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), ToolError::ToolNotFound { .. }),
             "expected ToolNotFound"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // create_session: per-caller session cap (spec section 6.2.1)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_session_rejects_when_caller_cap_exceeded() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let mut store = SessionStore::new();
+        let source_ctx = "ctx-source".to_owned();
+
+        // Fill up to the cap (DEFAULT_SESSION_CAP_PER_CALLER = 5).
+        for _ in 0..DEFAULT_SESSION_CAP_PER_CALLER {
+            let result = create_session(
+                &mut store,
+                &registry,
+                &context,
+                &"calculator".to_owned(),
+                &source_ctx,
+                Duration::from_secs(300),
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "sessions under cap should succeed: {result:?}"
+            );
+        }
+
+        assert_eq!(store.count_by_source(&source_ctx), 5);
+
+        // The next session from the same caller should fail.
+        let result = create_session(
+            &mut store,
+            &registry,
+            &context,
+            &"calculator".to_owned(),
+            &source_ctx,
+            Duration::from_secs(300),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ToolError::SessionCapExceeded {
+                    current: 5,
+                    max: 5,
+                    ..
+                }
+            ),
+            "expected SessionCapExceeded, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_allows_different_callers_independently() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let mut store = SessionStore::new();
+
+        // Fill caller A to the cap.
+        for _ in 0..DEFAULT_SESSION_CAP_PER_CALLER {
+            create_session(
+                &mut store,
+                &registry,
+                &context,
+                &"calculator".to_owned(),
+                &"ctx-caller-a".to_owned(),
+                Duration::from_secs(300),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Caller B should still be able to create sessions.
+        let result = create_session(
+            &mut store,
+            &registry,
+            &context,
+            &"calculator".to_owned(),
+            &"ctx-caller-b".to_owned(),
+            Duration::from_secs(300),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "different caller should not be affected by another caller's cap: {result:?}"
         );
     }
 
