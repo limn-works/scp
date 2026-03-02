@@ -47,6 +47,7 @@ use crate::bridge_adapters::{
     BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
 };
 use crate::error::ScpPyError;
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // PyUcanToken
@@ -153,6 +154,17 @@ pub fn py_ucan_validate(
     presenting_agent_did: Option<&str>,
     proof_tokens: Option<Vec<String>>,
 ) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_ucan_token(token)?;
+    validate::validate_capability_uri(capability)?;
+    if let Some(did) = presenting_agent_did {
+        validate::validate_did(did)?;
+    }
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
     // Step 1: Parse the UCAN token using scp-core's parser.
     let parsed_token = parse_ucan(token).map_err(ScpPyError::from)?;
 
@@ -226,6 +238,11 @@ pub fn py_ucan_mint(
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> PyResult<PyUcanToken> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(member_did)?;
+    for cap in &capabilities {
+        validate::validate_capability_uri(cap)?;
+    }
     // Look up the context to get the creator DID (issuer).
     let creator_did = crate::runtime::with_context(context_id, |rt| Ok(rt.creator_did.clone()))?;
 
@@ -303,6 +320,13 @@ pub fn py_ucan_delegate(
     parent_token: &str,
     capabilities: Vec<String>,
 ) -> PyResult<PyUcanToken> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(delegator_did)?;
+    validate::validate_did(delegatee_did)?;
+    validate::validate_ucan_token(parent_token)?;
+    for cap in &capabilities {
+        validate::validate_capability_uri(cap)?;
+    }
     // Parse the parent token.
     let parsed_parent = parse_ucan(parent_token).map_err(ScpPyError::from)?;
 
@@ -384,6 +408,8 @@ pub fn py_ucan_delegate(
 #[pyfunction]
 #[pyo3(name = "ucan_revoke")]
 pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_ucan_token(token)?;
     // Parse the token to extract its payload for CID computation.
     let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
 

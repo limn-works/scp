@@ -20,6 +20,7 @@ use pyo3::types::PyDict;
 
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // PyToolRegistration
@@ -151,6 +152,8 @@ impl PyToolVerificationResult {
 #[pyfunction]
 #[pyo3(name = "tool_register")]
 pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> PyResult<String> {
+    validate::validate_context_id(context_id)?;
+
     // Extract registration fields from the Python dict.
     let name: String = registration
         .get_item("name")?
@@ -164,6 +167,10 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         .get_item("operator_did")?
         .ok_or_else(|| ScpPyError::ValidationError("missing 'operator_did' field".to_owned()))?
         .extract()?;
+
+    // Validate extracted string fields at the bridge boundary.
+    validate::validate_tool_name(&name)?;
+    validate::validate_did(&operator_did)?;
 
     // Extract schema as JSON. The schema dict should have `input_schema` and
     // `output_schema` keys, each being a JSON Schema object.
@@ -270,6 +277,9 @@ pub fn py_tool_invoke(
     input: &Bound<'_, PyDict>,
     identity_did: &str,
 ) -> PyResult<PyObject> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_tool_id(tool_id)?;
+    validate::validate_did(identity_did)?;
     let input_json = py_dict_to_json(input)?;
     let start = std::time::Instant::now();
 
@@ -380,6 +390,8 @@ pub fn py_tool_invoke(
 #[pyfunction]
 #[pyo3(name = "tool_verify")]
 pub fn py_tool_verify(context_id: &str, tool_id: &str) -> PyResult<PyToolVerificationResult> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_tool_id(tool_id)?;
     // Look up the context and verify the tool against its test vectors.
     // The executor returns the expected output (identity function) since the
     // bridge layer has no external tool executor. This verifies the test

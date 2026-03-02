@@ -47,6 +47,25 @@ Additional global registries in `runtime.rs`:
 | `event_log.rs` | scp-core event_log | `py_event_log_query`, `py_event_log_verify` |
 | `mcp.rs` | scp-mcp | `py_mcp_serve`, `py_mcp_client_connect_stdio/sse`, `py_mcp_client_disconnect`, `py_mcp_client_list_tools`, `py_mcp_client_invoke`, `py_mcp_server_stop/wait`, `py_mcp_server_register/deregister_tool`, `py_mcp_server_list_contexts`, `py_register_tool_handler` |
 | `transport.rs` | scp-transport | `py_transport_connect`, `py_transport_disconnect`, `py_transport_status` |
+| `validate.rs` | (internal) | Input validation for all bridge functions |
+
+### Input Validation (`validate.rs`)
+
+All public `#[pyfunction]` bridge functions validate string inputs at the FFI boundary before passing them to scp-core. Validation is defense-in-depth: it catches malformed input early with clear `ValidationError` messages. All validators are O(n) string scans with no allocations on the happy path.
+
+| Input type | Validator | Checks | Max length |
+|-----------|-----------|--------|------------|
+| Context ID | `validate_context_id` | Non-empty, alphanumeric/hyphens/underscores, no control chars | 256 |
+| DID string | `validate_did` | Non-empty, `did:{method}:{id}` format, lowercase method, no control chars | 512 |
+| Tool name | `validate_tool_name` | Non-empty, no `{`/`}` (format string safety), no control chars | 256 |
+| Tool ID | `validate_tool_id` | Non-empty, no control chars | 512 |
+| Capability URI | `validate_capability_uri` | Non-empty, no control chars | 1024 |
+| UCAN token | `validate_ucan_token` | Non-empty, no control chars | 65536 |
+| MCP handle | `validate_mcp_handle` | Non-empty, no control chars | 256 |
+| Relay URL | `validate_relay_url` | Non-empty, valid scheme (ws/wss/http/https), no control chars (CRLF defense) | 2048 |
+| Transport mode | `validate_transport_mode` | Must be "stdio" or "sse" | 64 |
+
+Invalid inputs raise `ValidationError` (subclass of `ScpError`) with descriptive messages including the invalid value and what was expected. See GitHub issue #104.
 
 ### Build
 

@@ -36,6 +36,7 @@ use scp_platform::traits::{KeyCustody, Storage};
 
 use crate::error::ScpPyError;
 use crate::runtime::IdentityEntry;
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // PyIdentity — opaque Python object for SCP identity
@@ -410,6 +411,7 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 /// See SCP-217, spec section 17.3, and RED-013.
 #[pyfunction]
 fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
+    validate::validate_did(did)?;
     let did_owned = did.to_owned();
     let rt = crate::runtime()?;
 
@@ -489,6 +491,7 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
 /// See ADR-013 acceptance criterion 2.
 #[pyfunction]
 fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
+    validate::validate_did(did)?;
     let did_owned = did.to_owned();
     let rt = crate::runtime()?;
 

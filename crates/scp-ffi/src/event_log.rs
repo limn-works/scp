@@ -26,6 +26,7 @@ use pyo3::types::PyDict;
 
 use crate::error::ScpPyError;
 use crate::types::{encode_hex, json_to_py_dict};
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // PyEvent
@@ -211,6 +212,7 @@ pub fn py_event_log_query(
     context_id: &str,
     filter: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<PyEvent>> {
+    validate::validate_context_id(context_id)?;
     // Look up the context's event log from the runtime registry.
     let (event_count, merkle_root_hex) = crate::runtime::with_context(context_id, |rt| {
         let count = scp_core::event_log::tree::event_count(&rt.event_log);
@@ -298,6 +300,7 @@ pub fn py_event_log_verify(
     claim: &Bound<'_, PyDict>,
 ) -> PyResult<PyProof> {
     use crate::types::py_dict_to_json;
+    validate::validate_context_id(context_id)?;
 
     // Parse the claim dict.
     let claim_json = py_dict_to_json(claim)?;
@@ -468,6 +471,8 @@ pub fn py_event_log_checkpoint(
     identity_did: &str,
     epoch: u64,
 ) -> PyResult<PyCheckpoint> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(identity_did)?;
     let rt = crate::runtime()?;
 
     let context_id_owned = context_id.to_owned();
