@@ -57,6 +57,21 @@ pub struct BroadcastKey {
 }
 
 impl BroadcastKey {
+    /// Constructs a `BroadcastKey` from its component parts.
+    ///
+    /// Used by [`crate::context::broadcast::BroadcastContext::publish`] to
+    /// bridge from the context-layer `AuthorState` (which stores a `SenderKey`
+    /// and epoch) to the crypto-layer `BroadcastKey` required by
+    /// [`seal_broadcast`].
+    #[must_use]
+    pub const fn from_parts(key: SenderKey, epoch: u64, author_did: String) -> Self {
+        Self {
+            key,
+            epoch,
+            author_did,
+        }
+    }
+
     /// Returns a reference to the underlying AES-256 key material.
     #[must_use]
     pub const fn key(&self) -> &SenderKey {

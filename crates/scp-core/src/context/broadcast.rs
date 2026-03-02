@@ -16,7 +16,9 @@ use zeroize::Zeroizing;
 use crate::context::ContextError;
 use crate::context::membership::ContextEvent;
 use crate::context::params::ContextMode;
-use crate::crypto::sender_keys::{SenderKey, generate_sender_key};
+use crate::crypto::sender_keys::{
+    BroadcastEnvelope, BroadcastKey, SenderKey, generate_sender_key, seal_broadcast,
+};
 use crate::crypto::ucan::UcanToken;
 use crate::crypto::ucan::capability::CapabilityUri;
 use crate::crypto::ucan::validate::{
@@ -558,6 +560,55 @@ impl BroadcastContext {
     }
 
     // -----------------------------------------------------------------------
+    // Publish (capability-enforced seal)
+    // -----------------------------------------------------------------------
+
+    /// Encrypts a payload as a broadcast message after verifying that the
+    /// caller holds `messagesWrite` (is a registered author).
+    ///
+    /// This is the capability-enforced publish path: it combines the
+    /// `can_write` check with [`seal_broadcast`] in a single operation so
+    /// callers cannot accidentally bypass the authorization check.
+    ///
+    /// # Arguments
+    ///
+    /// * `author_did` -- The DID of the author publishing the message.
+    /// * `payload` -- The plaintext content to encrypt.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if `author_did` is not a
+    ///   registered author (does not hold `messagesWrite`).
+    /// - [`ContextError::CryptoFailed`] if the AES-256-GCM seal operation
+    ///   fails.
+    ///
+    /// [`seal_broadcast`]: crate::crypto::sender_keys::seal_broadcast
+    pub fn publish(
+        &self,
+        author_did: &str,
+        payload: &[u8],
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messagesWrite required)"
+            )));
+        }
+
+        let author = self.authors.get(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        let broadcast_key = BroadcastKey::from_parts(
+            author.broadcast_key.clone(),
+            author.epoch,
+            author.author_did.clone(),
+        );
+
+        seal_broadcast(&broadcast_key, payload)
+            .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
     // Unsubscribe (spec section 5.14.7)
     // -----------------------------------------------------------------------
 
@@ -740,7 +791,9 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::crypto::sender_keys::{SenderKey, decrypt_sender_layer, encrypt_sender_layer};
+    use crate::crypto::sender_keys::{
+        SenderKey, decrypt_sender_layer, encrypt_sender_layer, open_broadcast,
+    };
     use crate::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
         InMemoryProofResolver, InMemoryRevocationChecker,
@@ -2160,5 +2213,136 @@ mod tests {
             "Grant debug must not contain raw key byte values"
         );
         assert!(debug.contains('5'), "Grant debug must contain epoch");
+    }
+
+    // =======================================================================
+    // SCP-227: Capability-enforced publish + BroadcastEnvelope integration
+    // =======================================================================
+
+    #[test]
+    fn publish_rejects_non_author() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        // Subscriber tries to publish -- must be rejected.
+        let result = ctx.publish("did:example:bob", b"unauthorized message");
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(_))),
+            "non-author must be rejected by publish: {result:?}"
+        );
+
+        // Completely unknown DID also rejected.
+        let result = ctx.publish("did:example:unknown", b"ghost message");
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(_))),
+            "unknown DID must be rejected by publish: {result:?}"
+        );
+    }
+
+    /// SCP-227 integration test: author publishes via capability-enforced
+    /// `publish()`, producing a `BroadcastEnvelope` that all 3 subscribers
+    /// can decrypt with `open_broadcast` using the author's `BroadcastKey`.
+    #[test]
+    fn integration_publish_author_3_subscribers_decrypt_via_broadcast_envelope() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub2", None, 1001).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub3", None, 1002).unwrap();
+
+        let plaintext = b"Hello from Alice via publish()!";
+
+        // Author publishes through the capability-enforced path.
+        let envelope = ctx.publish("did:example:alice", plaintext).unwrap();
+
+        // Verify envelope metadata.
+        assert_eq!(envelope.author_did, "did:example:alice");
+        assert_eq!(envelope.key_epoch, 0);
+
+        // Each subscriber decrypts using the author's BroadcastKey.
+        // In practice, subscribers obtain key material via the pull-based
+        // key protocol (handle_key_request). Here we simulate that by
+        // constructing a BroadcastKey from the granted key material.
+        let author = ctx.get_author("did:example:alice").unwrap();
+        let subscriber_key = BroadcastKey::from_parts(
+            author.broadcast_key.clone(),
+            author.epoch,
+            author.author_did.clone(),
+        );
+
+        for sub_did in &["did:example:sub1", "did:example:sub2", "did:example:sub3"] {
+            assert!(ctx.can_read(sub_did), "{sub_did} must have read access");
+            let decrypted = open_broadcast(&subscriber_key, &envelope).unwrap();
+            assert_eq!(
+                decrypted, plaintext,
+                "{sub_did} must decrypt the correct plaintext"
+            );
+        }
+    }
+
+    /// SCP-227 integration test: blocked author's post-block messages are
+    /// undecryptable by subscribers who only hold the pre-block key, while
+    /// pre-block messages remain decryptable with the old key.
+    #[test]
+    fn integration_publish_blocked_author_messages_undecryptable_via_broadcast_envelope() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub2", None, 1001).unwrap();
+
+        // Capture the pre-block BroadcastKey for later decryption attempts.
+        let pre_block_author = ctx.get_author("did:example:alice").unwrap();
+        let pre_block_key = BroadcastKey::from_parts(
+            pre_block_author.broadcast_key.clone(),
+            pre_block_author.epoch,
+            pre_block_author.author_did.clone(),
+        );
+
+        // Author publishes a message before the block.
+        let pre_block_msg = b"message visible to everyone";
+        let pre_block_envelope = ctx.publish("did:example:alice", pre_block_msg).unwrap();
+
+        // Both subscribers can decrypt the pre-block message.
+        assert_eq!(
+            open_broadcast(&pre_block_key, &pre_block_envelope).unwrap(),
+            pre_block_msg,
+        );
+
+        // Block sub2: key rotates, sub2 loses access to future keys.
+        let block_result = ctx
+            .block_subscriber("did:example:alice", "did:example:sub2")
+            .unwrap();
+        assert_eq!(block_result.new_epoch, 1);
+
+        // Author publishes a post-block message (with the new key).
+        let post_block_msg = b"message only for sub1";
+        let post_block_envelope = ctx.publish("did:example:alice", post_block_msg).unwrap();
+        assert_eq!(post_block_envelope.key_epoch, 1);
+
+        // sub1 (non-blocked) obtains the new key and can decrypt.
+        let post_block_author = ctx.get_author("did:example:alice").unwrap();
+        let post_block_key = BroadcastKey::from_parts(
+            post_block_author.broadcast_key.clone(),
+            post_block_author.epoch,
+            post_block_author.author_did.clone(),
+        );
+        let sub1_decrypted = open_broadcast(&post_block_key, &post_block_envelope).unwrap();
+        assert_eq!(sub1_decrypted, post_block_msg);
+
+        // sub2 (blocked) only has the old key -- epoch mismatch means they
+        // cannot even attempt decryption of the new envelope.
+        let sub2_result = open_broadcast(&pre_block_key, &post_block_envelope);
+        assert!(
+            sub2_result.is_err(),
+            "blocked subscriber must not decrypt post-block messages"
+        );
+
+        // Verify pre-block messages remain decryptable with the old key
+        // (backwards compatibility: old content is not lost).
+        let pre_block_still_ok = open_broadcast(&pre_block_key, &pre_block_envelope).unwrap();
+        assert_eq!(pre_block_still_ok, pre_block_msg);
     }
 }
