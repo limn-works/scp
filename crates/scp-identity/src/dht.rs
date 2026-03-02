@@ -1035,8 +1035,8 @@ mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
 
     use super::*;
-    use crate::identity::cache::TestClock;
-    use crate::identity::dht_client::InMemoryDhtClient;
+    use crate::cache::TestClock;
+    use crate::dht_client::InMemoryDhtClient;
 
     /// Helper to create a fully-configured `DidDht` for testing.
     fn make_dht_with_custody(
@@ -1419,12 +1419,8 @@ mod tests {
     fn base58btc_decode_roundtrip() {
         let original = [42u8; 32];
         // Use the document module's encode (via the multibase_encode path)
-        let encoded = crate::identity::document::DidDocument::new(
-            "did:dht:zTest",
-            &original,
-            &[0u8; 32],
-            &[0u8; 32],
-        );
+        let encoded =
+            crate::document::DidDocument::new("did:dht:zTest", &original, &[0u8; 32], &[0u8; 32]);
         let vm = encoded.verification_method_by_fragment("0").unwrap();
         let decoded = decode_multibase_key(&vm.public_key_multibase).unwrap();
         assert_eq!(decoded, original);

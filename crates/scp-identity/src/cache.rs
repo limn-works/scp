@@ -99,7 +99,10 @@ impl Clock for SystemClock {
         // environment failure — panicking is the correct behaviour here, as
         // silently returning 0 would bypass UCAN expiry and nonce freshness
         // checks.
-        crate::time::now_secs().expect("system clock is unavailable or before Unix epoch")
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is unavailable or before Unix epoch")
+            .as_secs()
     }
 }
 

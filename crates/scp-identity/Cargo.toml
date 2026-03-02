@@ -1,0 +1,27 @@
+[package]
+name = "scp-identity"
+version = "0.1.0"
+description = "Decentralized identity (DID) management for SCP (Shareable Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+scp-platform = { path = "../scp-platform" }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+z-base-32 = { workspace = true }
+serde_json = { workspace = true }
+serde_bytes = { workspace = true }
+bs58 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+scp-platform = { path = "../scp-platform", features = ["testing"] }
+
+[lints]
+workspace = true

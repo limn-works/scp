@@ -3504,6 +3504,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-identity",
  "scp-media",
  "scp-platform",
  "serde",
@@ -3615,6 +3616,23 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+]
+
+[[package]]
+name = "scp-identity"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "ed25519-dalek",
+ "hex",
+ "scp-platform",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "z-base-32",
 ]
 
 [[package]]

@@ -337,7 +337,7 @@ async fn migration_republish_loop<D: DhtClient>(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::identity::dht_client::InMemoryDhtClient;
+    use crate::dht_client::InMemoryDhtClient;
 
     fn make_entry(did: &str) -> RepublishEntry {
         RepublishEntry {

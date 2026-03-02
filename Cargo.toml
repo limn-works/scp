@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/scp-platform",
+    "crates/scp-identity",
     "crates/scp-core",
     "crates/scp-transport",
     "crates/scp-testing",
