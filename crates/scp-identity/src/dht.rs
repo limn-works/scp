@@ -131,6 +131,56 @@ impl<D: DhtClient> DidDht<D, SystemClock> {
     }
 }
 
+/// Extracts the 32-byte public key from a `did:dht:z...` string.
+///
+/// Free function equivalent of [`DidDht::extract_public_key`] for use by
+/// modules that don't have a concrete `DidDht` instance.
+pub(crate) fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
+    let encoded = did_string
+        .strip_prefix(DID_DHT_PREFIX)
+        .and_then(|s| s.strip_prefix('z'))
+        .ok_or_else(|| {
+            IdentityError::InvalidDidFormat(format!(
+                "expected 'did:dht:z...' prefix, got: {did_string}"
+            ))
+        })?;
+
+    let decoded = zbase32::decode(encoded).map_err(|e| {
+        IdentityError::ZBase32DecodeError(format!("z-base-32 decode failed: {e}"))
+    })?;
+
+    let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+        IdentityError::InvalidDidFormat(format!(
+            "expected 32-byte public key, got {} bytes",
+            v.len()
+        ))
+    })?;
+
+    Ok(key_bytes)
+}
+
+/// Verifies a BEP44 Ed25519 signature over the given value and sequence.
+///
+/// Free function equivalent of [`DidDht::verify_bep44_signature`] for use by
+/// modules that don't have a concrete `DidDht` instance.
+pub(crate) fn verify_bep44_signature(
+    public_key: &[u8; 32],
+    signature: &[u8; 64],
+    value: &[u8],
+    seq: u64,
+) -> Result<(), IdentityError> {
+    let verifying_key = VerifyingKey::from_bytes(public_key).map_err(|e| {
+        IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}"))
+    })?;
+
+    let sig = ed25519_dalek::Signature::from_bytes(signature);
+    let payload = DidDht::<InMemoryDhtClient, SystemClock>::bep44_signable(value, seq);
+
+    verifying_key.verify_strict(&payload, &sig).map_err(|e| {
+        IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
+    })
+}
+
 impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// Creates a new `DidDht` instance with a specific DHT client, cache, and
     /// signing function.
@@ -219,7 +269,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// Returns [`IdentityError::Bep44SignatureInvalid`] if the signature does
     /// not verify.
-    fn verify_bep44_signature(
+    pub(crate) fn verify_bep44_signature(
         public_key: &[u8; 32],
         signature: &[u8; 64],
         value: &[u8],
@@ -243,7 +293,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// Returns [`IdentityError::InvalidDidFormat`] if the DID format is wrong
     /// or z-base-32 decoding fails.
-    fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
+    pub(crate) fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
         let encoded = did_string
             .strip_prefix(DID_DHT_PREFIX)
             .and_then(|s| s.strip_prefix('z'))
