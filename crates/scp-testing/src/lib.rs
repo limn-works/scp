@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod blob_store_tests;
 pub mod conformance;
 pub mod test_adapter;
 

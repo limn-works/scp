@@ -20,6 +20,31 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+/// A clock function that returns the current Unix timestamp in seconds.
+///
+/// Used by blob storage implementations for TTL enforcement. Production
+/// code uses [`system_clock`]. Conformance tests supply a controllable
+/// clock (e.g., backed by `AtomicU64`) for deterministic TTL testing.
+pub type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Returns a [`ClockFn`] backed by the real system clock.
+///
+/// # Panics
+///
+/// Panics if the system clock is before the Unix epoch (unrecoverable
+/// environment failure — see `scp_core::time` for rationale).
+#[must_use]
+pub fn system_clock() -> ClockFn {
+    Arc::new(|| {
+        scp_core::time::now_secs().unwrap_or_else(|e| {
+            // A system clock before the Unix epoch is an unrecoverable
+            // environment failure. Silently returning 0 would bypass TTL
+            // checks, allowing expired blobs to persist indefinitely.
+            unreachable!("system clock is unavailable: {e}")
+        })
+    })
+}
+
 /// A stored blob with its metadata.
 #[derive(Debug, Clone)]
 pub struct StoredBlob {
@@ -132,7 +157,7 @@ const DEFAULT_MAX_BLOBS: usize = 100_000;
 /// when the process exits.
 ///
 /// Thread-safe via `Arc<RwLock<...>>`. Clone is cheap (shared inner state).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InMemoryBlobStorage {
     /// Map from `blob_id` to blob entry.
     blobs: Arc<RwLock<HashMap<[u8; 32], BlobEntry>>>,
@@ -140,6 +165,19 @@ pub struct InMemoryBlobStorage {
     routing_index: RoutingIndex,
     /// Maximum number of blobs this storage will accept.
     max_blobs: usize,
+    /// Clock function for timestamps. Defaults to [`system_clock`].
+    clock: ClockFn,
+}
+
+impl std::fmt::Debug for InMemoryBlobStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryBlobStorage")
+            .field("blobs", &self.blobs)
+            .field("routing_index", &self.routing_index)
+            .field("max_blobs", &self.max_blobs)
+            .field("clock", &"<fn>")
+            .finish()
+    }
 }
 
 impl InMemoryBlobStorage {
@@ -156,6 +194,21 @@ impl InMemoryBlobStorage {
             blobs: Arc::new(RwLock::new(HashMap::new())),
             routing_index: Arc::new(RwLock::new(HashMap::new())),
             max_blobs,
+            clock: system_clock(),
+        }
+    }
+
+    /// Creates a new, empty in-memory blob storage with a controllable clock.
+    ///
+    /// Used by conformance tests to deterministically control TTL expiry
+    /// without relying on real time.
+    #[must_use]
+    pub fn with_clock(clock: ClockFn) -> Self {
+        Self {
+            blobs: Arc::new(RwLock::new(HashMap::new())),
+            routing_index: Arc::new(RwLock::new(HashMap::new())),
+            max_blobs: DEFAULT_MAX_BLOBS,
+            clock,
         }
     }
 }
@@ -186,7 +239,7 @@ impl BlobStorage for InMemoryBlobStorage {
         blob_ttl: u32,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
-        let stored_at = now_secs()?;
+        let stored_at = (self.clock)();
         let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
 
         let stored_blob = StoredBlob {
@@ -222,7 +275,7 @@ impl BlobStorage for InMemoryBlobStorage {
 
     async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError> {
         let blobs = self.blobs.read().await;
-        let now = now_secs()?;
+        let now = (self.clock)();
 
         Ok(blobs.get(blob_id).and_then(|entry| {
             if entry.expires_at > now {
@@ -241,7 +294,7 @@ impl BlobStorage for InMemoryBlobStorage {
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let blobs = self.blobs.read().await;
         let index = self.routing_index.read().await;
-        let now = now_secs()?;
+        let now = (self.clock)();
 
         let Some(blob_ids) = index.get(routing_id) else {
             return Ok(Vec::new());
@@ -295,7 +348,7 @@ impl BlobStorage for InMemoryBlobStorage {
     }
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
-        let now = now_secs()?;
+        let now = (self.clock)();
 
         // Phase 1: identify expired blob IDs under a read lock.
         let expired_ids: Vec<([u8; 32], [u8; 32])> = {
@@ -593,25 +646,24 @@ mod tests {
 
     #[tokio::test]
     async fn purge_expired_removes_old_blobs() {
-        let storage = InMemoryBlobStorage::new();
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock_value = Arc::new(AtomicU64::new(1_000_000));
+        let cv = clock_value.clone();
+        let clock: ClockFn = Arc::new(move || cv.load(Ordering::Relaxed));
+        let storage = InMemoryBlobStorage::with_clock(clock);
         let routing_id = [0xAA; 32];
         let data = vec![1, 2, 3];
         let blob_id = make_blob_id(&data);
 
-        // Store with TTL of 0 seconds so it expires immediately.
-        // We manually manipulate the entry after storage to ensure expiry.
+        // Store with TTL of 10 seconds.
         storage
-            .store(routing_id, blob_id, None, 1, data)
+            .store(routing_id, blob_id, None, 10, data)
             .await
             .unwrap();
 
-        // Manually set expires_at to the past.
-        {
-            let mut blobs = storage.blobs.write().await;
-            if let Some(entry) = blobs.get_mut(&blob_id) {
-                entry.expires_at = 1; // Far in the past.
-            }
-        }
+        // Advance clock past expiry.
+        clock_value.store(1_000_011, Ordering::Relaxed);
 
         let purged = storage.purge_expired().await.unwrap();
         assert_eq!(purged, 1);

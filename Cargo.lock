@@ -3791,6 +3791,7 @@ dependencies = [
  "scp-platform",
  "scp-transport",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
