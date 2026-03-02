@@ -618,15 +618,24 @@ fn verify_delegation_chain(
         proof_map.insert(cid, parsed);
     }
 
+    // Initialize seen_issuers with the current token's issuer to detect cycles.
+    let mut seen_issuers = HashSet::new();
+    seen_issuers.insert(token.payload.iss.clone());
+
     // Walk the chain from current token upward.
-    verify_chain_recursive(token, &proof_map, 0)
+    verify_chain_recursive(token, &proof_map, 0, &mut seen_issuers)
 }
 
 /// Recursively verifies the delegation chain.
+///
+/// `seen_issuers` tracks all issuer DIDs encountered during the chain walk
+/// to detect circular delegations (e.g., A->B->A). This mirrors scp-core's
+/// `verify_chain_recursive` in `validate.rs:636-668`.
 fn verify_chain_recursive(
     token: &ParsedUcanToken,
     proof_map: &HashMap<String, ParsedUcanToken>,
     depth: usize,
+    seen_issuers: &mut HashSet<String>,
 ) -> Result<String, String> {
     if depth > MAX_CHAIN_DEPTH {
         return Err("delegation chain too deep".to_owned());
@@ -645,6 +654,15 @@ fn verify_chain_recursive(
             .get(proof_cid)
             .ok_or_else(|| format!("delegation chain broken: proof CID not found: {proof_cid}"))?;
 
+        // Circular delegation detection: if the parent's issuer has already
+        // been seen in the chain, we have a cycle.
+        if !seen_issuers.insert(parent.payload.iss.clone()) {
+            return Err(format!(
+                "circular delegation detected: issuer '{}' appears multiple times in the delegation chain",
+                parent.payload.iss
+            ));
+        }
+
         // Verify parent signature.
         verify_signature(parent)?;
 
@@ -657,7 +675,7 @@ fn verify_chain_recursive(
         }
 
         // Recurse up the chain.
-        let issuer = verify_chain_recursive(parent, proof_map, depth + 1)?;
+        let issuer = verify_chain_recursive(parent, proof_map, depth + 1, seen_issuers)?;
         root_issuer = Some(issuer);
     }
 
