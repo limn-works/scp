@@ -4,8 +4,12 @@
 // is not available in JVM unit tests. The Keystore path (API 33+, CustodyType.HARDWARE)
 // requires an Android device or emulator and is tested via instrumented tests.
 //
+// Persistence tests verify that software Ed25519 keys are persisted to and restored from
+// the SoftwareKeyStore (InMemoryKeyStore in tests, EncryptedSharedPreferences in production).
+// See GitHub issue #119 and ADR-027.
+//
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
-// SCP-110 (Implement Android Keystore KeyCustody trait).
+// SCP-110 (Implement Android Keystore KeyCustody trait), GitHub issue #119.
 
 package com.limn.scp.android.platform
 
@@ -30,17 +34,21 @@ import org.junit.jupiter.api.assertThrows
  * - Pseudonym derivation determinism
  * - Key destruction
  * - Error handling (key not found, wrong key type)
+ * - Ed25519 key persistence to SoftwareKeyStore (issue #119)
+ * - Key restoration from SoftwareKeyStore on initialization
  *
  * The Build.VERSION.SDK_INT in JVM tests defaults to 0, which is below
  * API 33 (TIRAMISU), so all Ed25519 keys will use the software path.
  */
 class AndroidKeyCustodyTest {
 
+    private lateinit var keyStore: InMemoryKeyStore
     private lateinit var custody: AndroidKeyCustody
 
     @BeforeEach
     fun setUp() {
-        custody = AndroidKeyCustody()
+        keyStore = InMemoryKeyStore()
+        custody = AndroidKeyCustody(keyStore)
     }
 
     // -------------------------------------------------------------------
@@ -569,6 +577,133 @@ class AndroidKeyCustodyTest {
             assertThrows<ScpException> {
                 custody.sign(handle1, data)
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Ed25519 key persistence (GitHub issue #119, ADR-027)
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class Ed25519Persistence {
+
+        @Test
+        fun `generateKeypair ED25519 persists key to SoftwareKeyStore`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val persisted = keyStore.restoreAll()
+            assertTrue(persisted.containsKey(handle.id))
+            val (privBytes, pubBytes) = persisted[handle.id]!!
+            assertEquals(32, privBytes.size)
+            assertEquals(32, pubBytes.size)
+        }
+
+        @Test
+        fun `generateKeypair X25519 does NOT persist to SoftwareKeyStore`() {
+            val handle = custody.generateKeypair(KeyType.X25519)
+            val persisted = keyStore.restoreAll()
+            assertTrue(!persisted.containsKey(handle.id))
+        }
+
+        @Test
+        fun `persisted public key matches in-memory public key`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val inMemoryPubKey = custody.publicKey(handle)
+            val persisted = keyStore.restoreAll()
+            val (_, pubBytes) = persisted[handle.id]!!
+            assertArrayEquals(inMemoryPubKey, pubBytes)
+        }
+
+        @Test
+        fun `destroyKey removes from SoftwareKeyStore`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            assertTrue(keyStore.restoreAll().containsKey(handle.id))
+
+            custody.destroyKey(handle)
+            assertTrue(!keyStore.restoreAll().containsKey(handle.id))
+        }
+
+        @Test
+        fun `new instance restores Ed25519 keys from SoftwareKeyStore`() {
+            // Generate a key with the first custody instance
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val originalPubKey = custody.publicKey(handle)
+            val data = "persistence test".toByteArray(Charsets.UTF_8)
+
+            // Create a new custody instance with the SAME key store (simulates process restart)
+            val restoredCustody = AndroidKeyCustody(keyStore)
+
+            // The restored instance should have the key available
+            assertTrue(restoredCustody.softwareKeys.containsKey(handle.id))
+
+            // Public key should be identical
+            val restoredPubKey = restoredCustody.publicKey(handle)
+            assertArrayEquals(originalPubKey, restoredPubKey)
+
+            // Signing should produce verifiable signatures
+            val restoredSig = restoredCustody.sign(handle, data)
+            assertEquals(64, restoredSig.size)
+
+            // Verify the restored key's signature
+            val pubKeyParams = Ed25519PublicKeyParameters(restoredPubKey, 0)
+            val verifier = Ed25519Signer()
+            verifier.init(false, pubKeyParams)
+            verifier.update(data, 0, data.size)
+            assertTrue(verifier.verifySignature(restoredSig))
+        }
+
+        @Test
+        fun `restored key produces same signatures as original (Ed25519 determinism)`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val data = "deterministic signing".toByteArray(Charsets.UTF_8)
+            val originalSig = custody.sign(handle, data)
+
+            // Simulate process restart
+            val restoredCustody = AndroidKeyCustody(keyStore)
+            val restoredSig = restoredCustody.sign(handle, data)
+
+            // Ed25519 is deterministic — same key + same data = same signature
+            assertArrayEquals(originalSig, restoredSig)
+        }
+
+        @Test
+        fun `multiple Ed25519 keys all persist and restore`() {
+            val handles = (1..5).map { custody.generateKeypair(KeyType.ED25519) }
+            val pubKeys = handles.map { custody.publicKey(it) }
+
+            // Verify all persisted
+            val persisted = keyStore.restoreAll()
+            assertEquals(5, persisted.size)
+            handles.forEach { assertTrue(persisted.containsKey(it.id)) }
+
+            // Simulate process restart
+            val restoredCustody = AndroidKeyCustody(keyStore)
+            assertEquals(5, restoredCustody.softwareKeys.size)
+
+            // Verify all public keys match
+            handles.forEachIndexed { i, handle ->
+                assertArrayEquals(pubKeys[i], restoredCustody.publicKey(handle))
+            }
+        }
+
+        @Test
+        fun `destroying key before restart prevents restoration`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            custody.destroyKey(handle)
+
+            // Simulate process restart — key should NOT be restored
+            val restoredCustody = AndroidKeyCustody(keyStore)
+            assertTrue(!restoredCustody.softwareKeys.containsKey(handle.id))
+        }
+
+        @Test
+        fun `pseudonym keys are NOT persisted`() {
+            val identity = custody.generateKeypair(KeyType.ED25519)
+            val pseudonym = custody.derivePseudonym(identity, "ctx".toByteArray())
+            val persisted = keyStore.restoreAll()
+
+            // Only the identity key should be persisted, not the pseudonym
+            assertTrue(persisted.containsKey(identity.id))
+            assertTrue(!persisted.containsKey(pseudonym.id))
         }
     }
 }
