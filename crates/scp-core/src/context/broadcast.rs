@@ -804,6 +804,116 @@ impl BroadcastContext {
     pub fn author_dids(&self) -> impl Iterator<Item = &String> {
         self.authors.keys()
     }
+
+    /// Creates a serializable snapshot of the broadcast context state.
+    ///
+    /// Captures authors (with key material and epochs), subscribers, and
+    /// admission policy. Used by `ProtocolStore::store_broadcast_state` to
+    /// persist broadcast context state across process restarts.
+    ///
+    /// See spec section 5.14 and RED-016.
+    #[must_use]
+    pub fn to_snapshot(&self) -> BroadcastContextSnapshot {
+        let authors = self
+            .authors
+            .iter()
+            .map(|(did, state)| {
+                (
+                    did.clone(),
+                    AuthorStateSnapshot {
+                        author_did: state.author_did.clone(),
+                        broadcast_key: state.broadcast_key.clone(),
+                        epoch: state.epoch,
+                        block_list: state.block_list.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        BroadcastContextSnapshot {
+            context_id: self.context_id.clone(),
+            admission: self.admission,
+            subscribers: self.subscribers.clone(),
+            authors,
+        }
+    }
+
+    /// Reconstructs a `BroadcastContext` from a persisted snapshot.
+    ///
+    /// Restores authors (with key material, epochs, and block lists),
+    /// subscribers, and admission policy. Called during context restoration
+    /// after a process restart.
+    #[must_use]
+    pub fn from_snapshot(snapshot: BroadcastContextSnapshot) -> Self {
+        let authors = snapshot
+            .authors
+            .into_iter()
+            .map(|(did, snap)| {
+                (
+                    did,
+                    AuthorState {
+                        author_did: snap.author_did,
+                        broadcast_key: snap.broadcast_key,
+                        epoch: snap.epoch,
+                        block_list: snap.block_list,
+                    },
+                )
+            })
+            .collect();
+
+        Self {
+            context_id: snapshot.context_id,
+            admission: snapshot.admission,
+            subscribers: snapshot.subscribers,
+            authors,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BroadcastContextSnapshot -- serializable persistence format
+// ---------------------------------------------------------------------------
+
+/// Serializable snapshot of a [`BroadcastContext`] for persistence.
+///
+/// Captures the full broadcast context state: admission policy, subscriber
+/// roster, and per-author key state (including key material, epochs, and
+/// block lists). Stored via `ProtocolStore::store_broadcast_state` under the
+/// key `context/{context_id}/broadcast_state`.
+///
+/// This is separate from `BroadcastContext` because `AuthorState` contains
+/// `SenderKey` which has `Zeroize`/`ZeroizeOnDrop` derives that make adding
+/// `Serialize`/`Deserialize` directly to the live struct complex. The
+/// snapshot acts as a clean serialization boundary.
+///
+/// See spec section 5.14 and §17.3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastContextSnapshot {
+    /// The context's unique identifier.
+    pub context_id: String,
+    /// Admission policy: open or gated.
+    pub admission: BroadcastAdmission,
+    /// Subscriber roster, keyed by subscriber DID.
+    pub subscribers: HashMap<String, SubscriberRecord>,
+    /// Per-author broadcast key state, keyed by author DID.
+    pub authors: HashMap<String, AuthorStateSnapshot>,
+}
+
+/// Serializable snapshot of per-author broadcast key state.
+///
+/// Mirrors [`AuthorState`] but with `Serialize`/`Deserialize` derives for
+/// persistence. Includes the raw key material, which is encrypted at rest
+/// by the storage backend (`SQLCipher`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorStateSnapshot {
+    /// The author's DID.
+    pub author_did: String,
+    /// The current AES-256-GCM broadcast key.
+    pub broadcast_key: SenderKey,
+    /// The current key epoch (monotonically increasing).
+    pub epoch: u64,
+    /// DIDs blocked by this author.
+    pub block_list: HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2643,5 +2753,142 @@ mod tests {
             merkle_root, [0u8; 32],
             "Merkle root must be non-zero after appending an event"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Snapshot persistence roundtrip tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_roundtrip_preserves_empty_context() {
+        let bc = BroadcastContext::new(
+            "ctx-snap-1".to_owned(),
+            &ContextMode::Broadcast,
+            BroadcastAdmission::Open,
+        )
+        .unwrap();
+
+        let snapshot = bc.to_snapshot();
+        let restored = BroadcastContext::from_snapshot(snapshot);
+
+        assert_eq!(restored.context_id(), "ctx-snap-1");
+        assert_eq!(restored.admission(), BroadcastAdmission::Open);
+        assert_eq!(restored.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_subscribers_and_authors() {
+        let mut bc = BroadcastContext::new(
+            "ctx-snap-2".to_owned(),
+            &ContextMode::Broadcast,
+            BroadcastAdmission::Open,
+        )
+        .unwrap();
+
+        // Add an author.
+        bc.add_author("did:dht:z6MkAuthor1").unwrap();
+
+        // Subscribe two subscribers.
+        subscribe_open(&mut bc, "did:dht:z6MkSub1", None, 1_700_000_000).unwrap();
+        subscribe_open(&mut bc, "did:dht:z6MkSub2", None, 1_700_000_100).unwrap();
+
+        let snapshot = bc.to_snapshot();
+        let restored = BroadcastContext::from_snapshot(snapshot);
+
+        // Verify subscribers.
+        assert_eq!(restored.subscriber_count(), 2);
+        assert!(restored.is_subscriber("did:dht:z6MkSub1"));
+        assert!(restored.is_subscriber("did:dht:z6MkSub2"));
+
+        // Verify author.
+        assert!(restored.can_write("did:dht:z6MkAuthor1"));
+        let author = restored.get_author("did:dht:z6MkAuthor1").unwrap();
+        assert_eq!(author.epoch, 0);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_block_lists_and_epochs() {
+        let mut bc = BroadcastContext::new(
+            "ctx-snap-3".to_owned(),
+            &ContextMode::Broadcast,
+            BroadcastAdmission::Open,
+        )
+        .unwrap();
+
+        bc.add_author("did:dht:z6MkAuthor1").unwrap();
+        subscribe_open(&mut bc, "did:dht:z6MkSub1", None, 1_700_000_000).unwrap();
+        subscribe_open(&mut bc, "did:dht:z6MkSub2", None, 1_700_000_100).unwrap();
+
+        // Block a subscriber (rotates key, increments epoch).
+        bc.block_subscriber("did:dht:z6MkAuthor1", "did:dht:z6MkSub1")
+            .unwrap();
+
+        // Get the key bytes before snapshot for comparison.
+        let original_author = bc.get_author("did:dht:z6MkAuthor1").unwrap();
+        let original_key_bytes = *original_author.broadcast_key.as_bytes();
+        let original_epoch = original_author.epoch;
+
+        let snapshot = bc.to_snapshot();
+        let restored = BroadcastContext::from_snapshot(snapshot);
+
+        // Verify block list.
+        assert!(restored.is_blocked("did:dht:z6MkAuthor1", "did:dht:z6MkSub1"));
+        assert!(!restored.is_blocked("did:dht:z6MkAuthor1", "did:dht:z6MkSub2"));
+
+        // Verify epoch was preserved.
+        let restored_author = restored.get_author("did:dht:z6MkAuthor1").unwrap();
+        assert_eq!(restored_author.epoch, original_epoch);
+        assert_eq!(restored_author.epoch, 1);
+
+        // Verify key material was preserved.
+        assert_eq!(
+            *restored_author.broadcast_key.as_bytes(),
+            original_key_bytes
+        );
+
+        // Blocked subscriber should not be in subscriber list.
+        assert!(!restored.is_subscriber("did:dht:z6MkSub1"));
+        // Unblocked subscriber should still be there.
+        assert!(restored.is_subscriber("did:dht:z6MkSub2"));
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_gated_admission() {
+        let bc = BroadcastContext::new(
+            "ctx-snap-gated".to_owned(),
+            &ContextMode::Broadcast,
+            BroadcastAdmission::Gated,
+        )
+        .unwrap();
+
+        let snapshot = bc.to_snapshot();
+        let restored = BroadcastContext::from_snapshot(snapshot);
+
+        assert_eq!(restored.admission(), BroadcastAdmission::Gated);
+    }
+
+    #[test]
+    fn snapshot_serialization_roundtrip_via_msgpack() {
+        let mut bc = BroadcastContext::new(
+            "ctx-snap-msgpack".to_owned(),
+            &ContextMode::Broadcast,
+            BroadcastAdmission::Open,
+        )
+        .unwrap();
+
+        bc.add_author("did:dht:z6MkAuthor1").unwrap();
+        subscribe_open(&mut bc, "did:dht:z6MkSub1", None, 1_700_000_000).unwrap();
+
+        let snapshot = bc.to_snapshot();
+
+        // Serialize to MessagePack.
+        let bytes = rmp_serde::to_vec(&snapshot).unwrap();
+        assert!(!bytes.is_empty());
+
+        // Deserialize from MessagePack.
+        let decoded: BroadcastContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.context_id, "ctx-snap-msgpack");
+        assert_eq!(decoded.subscribers.len(), 1);
+        assert_eq!(decoded.authors.len(), 1);
     }
 }

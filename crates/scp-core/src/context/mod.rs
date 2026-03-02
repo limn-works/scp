@@ -99,7 +99,7 @@ pub use builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle, create_context,
 };
-pub use manager::{ContextManager, GovernanceActionResult};
+pub use manager::{BroadcastPersistence, ContextManager, GovernanceActionResult};
 
 // Re-export membership types.
 pub use membership::{
@@ -146,8 +146,9 @@ pub use governance::{
 
 // Re-export broadcast context types (SCP-227, spec section 5.14, #101).
 pub use broadcast::{
-    AuthorBlockResult, AuthorState, BlockResult, BroadcastAdmission, BroadcastContext,
-    KeyRequestDecision, SubscriberRecord, SubscriptionResult, UnsubscribeResult,
+    AuthorBlockResult, AuthorState, AuthorStateSnapshot, BlockResult, BroadcastAdmission,
+    BroadcastContext, BroadcastContextSnapshot, KeyRequestDecision, SubscriberRecord,
+    SubscriptionResult, UnsubscribeResult,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).
@@ -297,6 +298,13 @@ pub enum ContextError {
     /// See spec section 19.2.2.
     #[error("payment integration failed: {0}")]
     IntegrationFailed(#[from] crate::economy::IntegrationError),
+
+    /// A broadcast persistence operation failed (store or load).
+    ///
+    /// Returned when the `BroadcastPersistence` provider reports an error
+    /// during broadcast context state persistence or restoration.
+    #[error("broadcast persistence failed: {0}")]
+    PersistenceFailed(String),
 }
 
 // ---------------------------------------------------------------------------

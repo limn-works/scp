@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use broadcast::{
@@ -54,7 +55,7 @@ pub use key_protocol::{
 /// Key material is zeroized on drop to prevent sensitive bytes from
 /// persisting in freed memory. Clone is retained for API compatibility
 /// (e.g. `SenderKeyStore::get_all`).
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SenderKey([u8; 32]);
 
 impl SenderKey {
