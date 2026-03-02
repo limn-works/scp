@@ -120,7 +120,7 @@ In tests, set `Dispatchers.setMain(testDispatcher)` before constructing the View
 
 ### Compose tests require Robolectric + JUnit 4
 
-Compose UI tests (`createComposeRule()`) require `@RunWith(RobolectricTestRunner::class)` and JUnit 4's `@Rule` annotation for the Compose test rule. They cannot use JUnit 5's `@ExtendWith`. Use `@Config(manifest = Config.NONE, sdk = [33])` for headless execution. The `compose-ui-test-junit4` dependency is `testImplementation`, and `compose-ui-test-manifest` is `debugImplementation`.
+Compose UI tests (`createComposeRule()`) require `@RunWith(RobolectricTestRunner::class)` and JUnit 4's `@Rule` annotation for the Compose test rule. They cannot use JUnit 5's `@ExtendWith`. Use `@Config(manifest = Config.NONE, sdk = [33])` for headless execution. The `compose-ui-test-junit4` dependency is `testImplementation`, and `compose-ui-test-manifest` is `testImplementation` (not `debugImplementation` which excludes it from release unit tests — see #144).
 
 ### Compose plugin is kotlin("plugin.compose"), not a separate artifact
 
