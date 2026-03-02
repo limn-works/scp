@@ -9,7 +9,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dev_api;
 pub mod http;
+pub mod projection;
 pub mod tls;
 mod well_known;
 
@@ -26,6 +28,7 @@ use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, Shutdo
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 
 pub use http::BroadcastContext;
+pub use projection::ProjectedContext;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -153,7 +156,7 @@ impl IdentityHandle {
 /// `InMemoryStorage` for testing, `SqliteStorage` for production).
 ///
 /// See spec section 18.6 for the full design.
-pub struct ApplicationNode<S: Storage> {
+pub struct ApplicationNode<S: Storage, B: BlobStorage = InMemoryBlobStorage> {
     /// The domain this node serves. `None` for zero-config no-domain mode (§10.12.8).
     domain: Option<String>,
     /// Handle to the running relay server.
@@ -163,10 +166,10 @@ pub struct ApplicationNode<S: Storage> {
     /// The storage backend.
     storage: Arc<S>,
     /// Shared state for HTTP handlers (`.well-known/scp`, relay bridge).
-    state: Arc<http::NodeState>,
+    state: Arc<http::NodeState<B>>,
 }
 
-impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
+impl<S: Storage + std::fmt::Debug, B: BlobStorage> std::fmt::Debug for ApplicationNode<S, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApplicationNode")
             .field("domain", &self.domain)
@@ -177,7 +180,7 @@ impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
     }
 }
 
-impl<S: Storage> ApplicationNode<S> {
+impl<S: Storage, B: BlobStorage> ApplicationNode<S, B> {
     /// Returns the domain this node serves.
     ///
     /// Returns `None` in zero-config no-domain mode (§10.12.8).
@@ -235,11 +238,63 @@ impl<S: Storage> ApplicationNode<S> {
         scp_transport::native::server::hex_encode_32(&self.state.bridge_secret)
     }
 
+    /// Returns the dev API bearer token if the dev API is enabled.
+    ///
+    /// Returns `Some` when [`ApplicationNodeBuilder::local_api`] was called,
+    /// `None` otherwise. The token format is `scp_local_token_<32 hex chars>`.
+    ///
+    /// See spec section 18.10.2.
+    #[must_use]
+    pub fn dev_token(&self) -> Option<&str> {
+        self.state.dev_token.as_deref()
+    }
+
     /// Gracefully shuts down the relay server.
     ///
     /// In-flight connection handlers drain naturally — they are not cancelled.
     pub fn shutdown(&self) {
         self.relay.shutdown_handle.shutdown();
+    }
+
+    /// Activates HTTP broadcast projection for the given context.
+    ///
+    /// Computes `routing_id = SHA-256(context_id)` per spec section 5.14.6,
+    /// then creates or updates a [`ProjectedContext`] in the node's projected
+    /// contexts registry. If the context is already projected, the broadcast
+    /// key is inserted at its epoch (previous epochs are retained for the
+    /// blob TTL window).
+    ///
+    /// Once enabled, the node's HTTP endpoints serve decrypted broadcast
+    /// content at `/scp/broadcast/<routing_id_hex>/feed` and
+    /// `/scp/broadcast/<routing_id_hex>/messages/<blob_id_hex>`.
+    ///
+    /// See spec sections 18.11.2 and 18.11.8.
+    pub async fn enable_broadcast_projection(
+        &self,
+        context_id: &str,
+        broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
+    ) {
+        let routing_id = projection::compute_routing_id(context_id);
+        let mut registry = self.state.projected_contexts.write().await;
+        if let Some(existing) = registry.get_mut(&routing_id) {
+            existing.insert_key(broadcast_key);
+        } else {
+            let projected = ProjectedContext::new(context_id, broadcast_key);
+            registry.insert(routing_id, projected);
+        }
+    }
+
+    /// Deactivates HTTP broadcast projection for the given context.
+    ///
+    /// Computes `routing_id = SHA-256(context_id)` per spec section 5.14.6,
+    /// then removes the corresponding [`ProjectedContext`] from the registry.
+    /// All retained epoch keys are dropped.
+    ///
+    /// See spec sections 18.11.2 and 18.11.8.
+    pub async fn disable_broadcast_projection(&self, context_id: &str) {
+        let routing_id = projection::compute_routing_id(context_id);
+        let mut registry = self.state.projected_contexts.write().await;
+        registry.remove(&routing_id);
     }
 }
 
@@ -542,6 +597,8 @@ pub struct ApplicationNodeBuilder<
     nat_strategy: Option<Arc<dyn NatStrategy>>,
     /// Pluggable TLS provider for testability (domain mode only).
     tls_provider: Option<Arc<dyn TlsProvider>>,
+    /// Bind address for the local dev API server. `None` = dev API disabled.
+    local_api_addr: Option<SocketAddr>,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -564,6 +621,7 @@ impl ApplicationNodeBuilder {
             bridge_relay: None,
             nat_strategy: None,
             tls_provider: None,
+            local_api_addr: None,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -611,6 +669,7 @@ impl<
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
+            local_api_addr: self.local_api_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -638,6 +697,7 @@ impl<
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
+            local_api_addr: self.local_api_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -713,6 +773,29 @@ impl<
         self.tls_provider = Some(provider);
         self
     }
+
+    /// Enables the local dev API on the specified address.
+    ///
+    /// When set, a bearer token is generated at build time and logged at
+    /// `INFO` level. The dev API listens on a separate port from the public
+    /// HTTPS listener, typically bound to `127.0.0.1:<port>`.
+    ///
+    /// If not called, the dev API is disabled (production default).
+    ///
+    /// See spec section 18.10.2 and 18.10.5.
+    /// # Panics
+    ///
+    /// Panics if `addr` is not a loopback address (`127.0.0.1` or `::1`).
+    /// The dev API must never be exposed on a non-loopback interface.
+    #[must_use]
+    pub fn local_api(mut self, addr: SocketAddr) -> Self {
+        assert!(
+            addr.ip().is_loopback(),
+            "dev API bind address must be loopback (127.0.0.1 or ::1), got {addr}"
+        );
+        self.local_api_addr = Some(addr);
+        self
+    }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, Dom, Id>
@@ -736,6 +819,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, 
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
+            local_api_addr: self.local_api_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -764,6 +848,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
+            local_api_addr: self.local_api_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -798,6 +883,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
+            local_api_addr: self.local_api_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -825,6 +911,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
+            local_api_addr: self.local_api_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -861,7 +948,7 @@ impl<
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
-    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
+    pub async fn build(self) -> Result<ApplicationNode<S, B>, NodeError> {
         // Type-state guarantees domain and identity_source are set.
         // The runtime check is a defensive fallback — the type system
         // prevents reaching this code without both fields configured.
@@ -908,10 +995,32 @@ impl<
         let blob_storage = self
             .blob_storage
             .ok_or(NodeError::MissingField("blob_storage"))?;
-        let relay_server = RelayServer::new(relay_config, blob_storage);
+        let blob_storage = Arc::new(blob_storage);
+        let relay_server = RelayServer::new(relay_config, Arc::clone(&blob_storage));
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
-        // 7. Attempt TLS provisioning (§10.12.8 step 4).
+        // 7. Generate dev API token if local_api was configured.
+        //    16 random bytes → 32 hex chars (spec §18.10.2).
+        //    OsRng for cryptographic quality (not thread_rng).
+        let dev_token = self.local_api_addr.map(|_| {
+            use rand::RngCore;
+            let mut bytes = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            let hex = hex::encode(bytes);
+            format!("scp_local_token_{hex}")
+        });
+
+        if let Some(ref token) = dev_token {
+            // Log only the prefix — never expose the full token in logs.
+            let masked = &token[..("scp_local_token_".len() + 8)];
+            tracing::info!(
+                token_prefix = %masked,
+                dev_bind_addr = ?self.local_api_addr,
+                "dev API token generated (use node.dev_token() for full value)"
+            );
+        }
+
+        // 8. Attempt TLS provisioning (§10.12.8 step 4).
         //
         //    If TLS provisioning succeeds, proceed with domain-based deployment
         //    (wss://, .well-known/scp). If it fails (DNS misconfigured, ACME
@@ -949,6 +1058,11 @@ impl<
                     broadcast_contexts: RwLock::new(Vec::new()),
                     relay_addr: bound_addr,
                     bridge_secret,
+                    dev_token,
+                    dev_bind_addr: self.local_api_addr,
+                    projected_contexts: RwLock::new(std::collections::HashMap::new()),
+                    blob_storage,
+                    start_time: std::time::Instant::now(),
                 });
 
                 Ok(ApplicationNode {
@@ -985,6 +1099,9 @@ impl<
                     bound_addr,
                     strategy,
                     bridge_secret,
+                    dev_token,
+                    self.local_api_addr,
+                    blob_storage,
                 )
                 .await
             }
@@ -997,7 +1114,11 @@ impl<
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
+async fn build_no_domain_inner<
+    D: DidMethod + 'static,
+    S: Storage + 'static,
+    B: BlobStorage + 'static,
+>(
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
@@ -1006,7 +1127,10 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     bound_addr: SocketAddr,
     nat_strategy: Arc<dyn NatStrategy>,
     bridge_secret: [u8; 32],
-) -> Result<ApplicationNode<S>, NodeError> {
+    dev_token: Option<String>,
+    dev_bind_addr: Option<SocketAddr>,
+    blob_storage: Arc<B>,
+) -> Result<ApplicationNode<S, B>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
     let relay_url = match &tier {
@@ -1045,6 +1169,11 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         broadcast_contexts: RwLock::new(Vec::new()),
         relay_addr: bound_addr,
         bridge_secret,
+        dev_token,
+        dev_bind_addr,
+        projected_contexts: RwLock::new(std::collections::HashMap::new()),
+        blob_storage,
+        start_time: std::time::Instant::now(),
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
@@ -1093,7 +1222,7 @@ impl<
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
-    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
+    pub async fn build(self) -> Result<ApplicationNode<S, B>, NodeError> {
         let identity_source = self.identity_source.ok_or(NodeError::MissingField(
             "identity (call generate_identity_with() or identity())",
         ))?;
@@ -1130,10 +1259,29 @@ impl<
         let blob_storage = self
             .blob_storage
             .ok_or(NodeError::MissingField("blob_storage"))?;
-        let relay_server = RelayServer::new(relay_config, blob_storage);
+        let blob_storage = Arc::new(blob_storage);
+        let relay_server = RelayServer::new(relay_config, Arc::clone(&blob_storage));
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
-        // 4-8. Delegate to shared no-domain logic.
+        // 4. Generate dev API token if local_api was configured.
+        let dev_token = self.local_api_addr.map(|_| {
+            use rand::RngCore;
+            let mut bytes = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            let hex = hex::encode(bytes);
+            format!("scp_local_token_{hex}")
+        });
+
+        if let Some(ref token) = dev_token {
+            let masked = &token[..("scp_local_token_".len() + 8)];
+            tracing::info!(
+                token_prefix = %masked,
+                dev_bind_addr = ?self.local_api_addr,
+                "dev API token generated (use node.dev_token() for full value)"
+            );
+        }
+
+        // 5-8. Delegate to shared no-domain logic.
         let strategy: Arc<dyn NatStrategy> = self.nat_strategy.unwrap_or_else(|| {
             Arc::new(DefaultNatStrategy::new(
                 self.stun_server.clone(),
@@ -1150,6 +1298,9 @@ impl<
             bound_addr,
             strategy,
             bridge_secret,
+            dev_token,
+            self.local_api_addr,
+            blob_storage,
         )
         .await
     }

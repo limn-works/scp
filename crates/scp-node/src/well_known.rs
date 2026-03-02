@@ -14,6 +14,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
 use scp_core::well_known::{WellKnownContext, WellKnownScp};
+use scp_transport::native::storage::BlobStorage;
+
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::http::NodeState;
 
@@ -25,7 +28,9 @@ use crate::http::NodeState;
 /// 18.6.4: "dynamically generated from node state").
 ///
 /// Returns `application/json` with the `WellKnownScp` payload.
-pub async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
+pub async fn well_known_handler<B: BlobStorage>(
+    State(state): State<Arc<NodeState<B>>>,
+) -> impl IntoResponse {
     let contexts = {
         let guard = state.broadcast_contexts.read().await;
         if guard.is_empty() {
@@ -35,14 +40,18 @@ pub async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl Int
                 guard
                     .iter()
                     .map(|ctx| {
+                        let encoded_relay = utf8_percent_encode(&state.relay_url, NON_ALPHANUMERIC);
+                        let name_param = ctx
+                            .name
+                            .as_ref()
+                            .map(|n| {
+                                let encoded = utf8_percent_encode(n, NON_ALPHANUMERIC);
+                                format!("&name={encoded}")
+                            })
+                            .unwrap_or_default();
                         let uri = format!(
-                            "scp://context/{}?relay={}&mode=broadcast{}",
+                            "scp://context/{}?relay={encoded_relay}&mode=broadcast{name_param}",
                             ctx.id,
-                            state.relay_url,
-                            ctx.name
-                                .as_ref()
-                                .map(|n| format!("&name={n}"))
-                                .unwrap_or_default(),
                         );
                         WellKnownContext {
                             id: ctx.id.clone(),
