@@ -18,7 +18,7 @@
 use sha2::{Digest, Sha256};
 
 use super::{Event, EventLog, EventLogError, EventType};
-use crate::crypto::ed25519::verify_ed25519_signature;
+use crate::crypto::verify_ed25519_signature;
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
 ///
@@ -463,10 +463,8 @@ pub(crate) fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::event_log::EventPayload;
-    use crate::event_log::test_helpers::{
-        did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair,
-    };
+    use crate::EventPayload;
+    use crate::test_helpers::{did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair};
 
     // -----------------------------------------------------------------------
     // append updates tree and root correctly

@@ -24,6 +24,8 @@ thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 scp-platform = { path = "../scp-platform" }
 scp-identity = { path = "../scp-identity" }
+scp-event-log = { path = "../scp-event-log" }
+async-trait = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
@@ -40,11 +42,13 @@ bs58 = { workspace = true }
 uuid = { workspace = true }
 jsonschema = { workspace = true, features = ["resolve-http", "resolve-file"] }
 lru = { workspace = true }
+tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 scp-media = { path = "../scp-media" }

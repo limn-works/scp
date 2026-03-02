@@ -481,12 +481,15 @@ pub fn py_event_log_checkpoint(
     let checkpoint = crate::runtime::with_identity(&identity_did_owned, |entry| {
         crate::runtime::with_context(&context_id_owned, |ctx_rt| {
             let result = rt.block_on(async {
+                let signer = scp_core::event_log::KeyCustodySigner {
+                    custody: entry.custody.as_ref(),
+                    key: &entry.identity.active_signing_key,
+                };
                 scp_core::event_log::checkpoint::generate_checkpoint(
                     &ctx_rt.event_log,
                     &sender_did,
                     epoch,
-                    entry.custody.as_ref(),
-                    &entry.identity.active_signing_key,
+                    &signer,
                 )
                 .await
             });

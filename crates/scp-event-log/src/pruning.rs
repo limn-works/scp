@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use super::checkpoint::{ConsistencyCheckpoint, TruncatedEventLog};
 use super::proof::{Direction, ProofStep};
 use super::{Event, EventLog, EventLogError, EventType};
-use crate::event_log::tree;
+use crate::tree;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -467,10 +467,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::event_log::checkpoint::ConsistencyCheckpoint;
-    use crate::event_log::tree::{self, GENESIS_PREV_HASH};
-    use crate::event_log::{Event, EventLog, EventPayload, EventType};
-    use crate::trust::behavioral::compute_behavioral_record;
+    use crate::checkpoint::ConsistencyCheckpoint;
+    use crate::tree::{self, GENESIS_PREV_HASH};
+    use crate::{Event, EventLog, EventPayload, EventType};
 
     // -------------------------------------------------------------------
     // Test helpers
@@ -1172,119 +1171,11 @@ mod tests {
         // up to it is pruned.
         assert_eq!(boundary, 2);
     }
+    // NOTE: Test moved to scp-core integration tests
+    // (depends on trust::behavioral::compute_behavioral_record).
 
-    // ===================================================================
-    // Behavioral validation after pruning
-    // ===================================================================
-
-    #[test]
-    fn behavioral_validation_works_after_pruning() {
-        // Build a log with events from two participants.
-        let (verifying_key, signing_key) = test_keypair();
-        let did = did_from_pubkey(&verifying_key);
-        let (verifying_key2, signing_key2) = test_keypair();
-        let did2 = did_from_pubkey(&verifying_key2);
-
-        let mut log = EventLog::new("ctx-behavior-test".to_owned());
-        let mut prev_hash = GENESIS_PREV_HASH;
-        let mut all_events = Vec::new();
-
-        // Pre-checkpoint events (will be pruned).
-        for i in 0..10u64 {
-            let (actor_did, skey) = if i % 2 == 0 {
-                (did.as_str(), &signing_key)
-            } else {
-                (did2.as_str(), &signing_key2)
-            };
-
-            let event = sign_event(
-                EventType::MessageSent,
-                actor_did,
-                1_000_000 + i * 100,
-                i,
-                format!("pre-checkpoint-{i}").into_bytes(),
-                prev_hash,
-                skey,
-            );
-            tree::append(&mut log, &event).unwrap();
-            let serialized = rmp_serde::to_vec(&event).unwrap();
-            let mut h = Sha256::new();
-            h.update([0x00]);
-            h.update(&serialized);
-            prev_hash = h.finalize().into();
-            all_events.push(event);
-        }
-
-        // Post-checkpoint events (retained).
-        for i in 10..20u64 {
-            let (actor_did, skey) = if i % 2 == 0 {
-                (did.as_str(), &signing_key)
-            } else {
-                (did2.as_str(), &signing_key2)
-            };
-
-            let event = sign_event(
-                EventType::MessageSent,
-                actor_did,
-                1_000_000 + i * 100,
-                i,
-                format!("post-checkpoint-{i}").into_bytes(),
-                prev_hash,
-                skey,
-            );
-            tree::append(&mut log, &event).unwrap();
-            let serialized = rmp_serde::to_vec(&event).unwrap();
-            let mut h = Sha256::new();
-            h.update([0x00]);
-            h.update(&serialized);
-            prev_hash = h.finalize().into();
-            all_events.push(event);
-        }
-
-        // Create checkpoint and prune.
-        let checkpoint = make_checkpoint(&log, 10, 1_001_000);
-        let config = PruningConfig {
-            retain_last_n_checkpoints: None,
-            retention_secs: None,
-            structural_retention_multiplier: 1.0,
-        };
-
-        let (truncated, result) =
-            prune_before_checkpoint(&log, &checkpoint, &all_events, &config, 2_000_000).unwrap();
-
-        assert_eq!(result.events_pruned, 10);
-
-        // Behavioral validation should work with just the post-checkpoint events.
-        let post_checkpoint_events = &all_events[10..];
-        let tail_root = tree::root(truncated.tail_log());
-
-        let record = compute_behavioral_record(
-            post_checkpoint_events,
-            &did,
-            "ctx-behavior-test",
-            tail_root,
-            2_000_000,
-        )
-        .unwrap();
-
-        // Subject participated in events 10, 12, 14, 16, 18 (even indices).
-        assert_eq!(record.participation_count, 5);
-        assert!(record.participation_duration_seconds > 0);
-    }
-
-    #[test]
-    fn behavioral_validation_with_full_event_set() {
-        // Behavioral validation also works with the full event set (no pruning).
-        let (log, events, _) = build_log_with_events(10, 1_000_000);
-        let merkle_root = tree::root(&log);
-
-        let actor_did = &events[0].actor_did;
-        let record =
-            compute_behavioral_record(&events, actor_did, "ctx-prune-test", merkle_root, 2_000_000)
-                .unwrap();
-
-        assert_eq!(record.participation_count, 10);
-    }
+    // NOTE: Test moved to scp-core integration tests
+    // (depends on trust::behavioral::compute_behavioral_record).
 
     // ===================================================================
     // Configurable retention: last N checkpoints

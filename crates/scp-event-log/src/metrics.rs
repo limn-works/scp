@@ -526,11 +526,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::event_log::test_helpers::{
-        did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair,
-    };
-    use crate::event_log::tree::{self, GENESIS_PREV_HASH};
-    use crate::event_log::{EventLog, EventType};
+    use crate::test_helpers::{did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair};
+    use crate::tree::{self, GENESIS_PREV_HASH};
+    use crate::{EventLog, EventType};
 
     // -------------------------------------------------------------------
     // Test helpers (metrics-specific)

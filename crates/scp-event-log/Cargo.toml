@@ -1,0 +1,36 @@
+[package]
+name = "scp-event-log"
+version = "0.1.0"
+description = "Verifiable Merkle event log for SCP (Shareable Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+# Enables non-standard did:key:{hex} DID format acceptance and exports
+# test_helpers module. Only for integration tests that run outside
+# `#[cfg(test)]`. Production builds must never enable this feature.
+# See issue #128.
+testing = ["dep:rand"]
+
+[dependencies]
+scp-identity = { path = "../scp-identity" }
+sha2 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ed25519-dalek = { workspace = true }
+rmp-serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+z-base-32 = { workspace = true }
+hex = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+rand = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

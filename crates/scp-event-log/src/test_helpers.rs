@@ -8,10 +8,11 @@ use sha2::{Digest, Sha256};
 
 use super::tree::{GENESIS_PREV_HASH, compute_event_canonical_hash};
 use super::{Event, EventLog, EventPayload, EventType};
-use crate::event_log::tree;
-use crate::identity::DID;
+use crate::DID;
+use crate::tree;
 
 /// Creates an Ed25519 signing keypair and returns (`verifying_key`, `signing_key`).
+#[must_use]
 pub fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
     let mut rng = rand::thread_rng();
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
@@ -22,6 +23,7 @@ pub fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey
 /// Encodes a public key as a test DID (`did:key:<hex>`).
 ///
 /// Returns `DID` (the newtype wrapper) for consistency across all callers.
+#[must_use]
 pub fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
     let hex: String = verifying_key
         .as_bytes()
@@ -37,6 +39,7 @@ pub fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
 /// Signs an event and returns it with the signature populated.
 ///
 /// Accepts `&str` for `actor_did` since `DID` derefs to `str`.
+#[must_use]
 pub fn sign_event(
     event_type: EventType,
     actor_did: &str,
@@ -64,6 +67,11 @@ pub fn sign_event(
 }
 
 /// Computes a leaf hash with the 0x00 domain separation prefix (RFC 6962).
+///
+/// # Panics
+///
+/// Panics if event serialization fails.
+#[must_use]
 pub fn leaf_hash_from_event(event: &Event) -> [u8; 32] {
     let serialized = rmp_serde::to_vec(event).expect("event serialization should succeed");
     let mut hasher = Sha256::new();
@@ -72,7 +80,50 @@ pub fn leaf_hash_from_event(event: &Event) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// A test-only [`EventLogSigner`] that wraps an Ed25519 signing key directly.
+///
+/// Replaces `InMemoryKeyCustody` for tests within scp-event-log, which cannot
+/// depend on scp-platform.
+pub struct TestSigner {
+    signing_key: ed25519_dalek::SigningKey,
+}
+
+impl Default for TestSigner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TestSigner {
+    /// Creates a new `TestSigner` with a freshly generated Ed25519 keypair.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+        Self { signing_key }
+    }
+
+    /// Returns the verifying (public) key for manual signature verification.
+    #[must_use]
+    pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.signing_key.verifying_key()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::EventLogSigner for TestSigner {
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        let sig = self.signing_key.sign(message);
+        Ok(sig.to_bytes().to_vec())
+    }
+}
+
 /// Builds an event log with `n` events and returns the log and leaf hashes.
+///
+/// # Panics
+///
+/// Panics if event append fails.
+#[must_use]
 pub fn build_test_log(n: u64) -> (EventLog, Vec<[u8; 32]>) {
     let (verifying_key, signing_key) = test_keypair();
     let did = did_from_pubkey(&verifying_key);

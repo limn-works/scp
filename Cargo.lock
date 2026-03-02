@@ -3488,6 +3488,7 @@ name = "scp-core"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "base64",
  "bs58",
  "ed25519-dalek",
@@ -3504,6 +3505,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-event-log",
  "scp-identity",
  "scp-media",
  "scp-platform",
@@ -3513,10 +3515,30 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
  "x25519-dalek 2.0.1",
  "z-base-32",
  "zeroize",
+]
+
+[[package]]
+name = "scp-event-log"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "rmp-serde",
+ "scp-identity",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "z-base-32",
 ]
 
 [[package]]
