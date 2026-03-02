@@ -250,4 +250,144 @@ mod tests {
         let loaded: Option<String> = store.load_value("nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }
+
+    // -------------------------------------------------------------------
+    // sanitize_key_component unit tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_rejects_forward_slash() {
+        let result = sanitize_key_component("../identity/victim");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_backslash() {
+        let result = sanitize_key_component("evil\\path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_dot_dot() {
+        let result = sanitize_key_component("foo..bar");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_null_byte() {
+        let result = sanitize_key_component("evil\0id");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sanitize_accepts_well_formed_identifiers() {
+        assert!(sanitize_key_component("ctx-123").is_ok());
+        assert!(sanitize_key_component("did:dht:z6MkTest").is_ok());
+        assert!(sanitize_key_component("tok-abc-def").is_ok());
+        assert!(sanitize_key_component("x402").is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // Cross-domain key traversal rejection tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn context_store_rejects_traversal_context_id() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let result = store
+            .store_context_state("../identity/victim", b"bad")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn context_store_rejects_null_byte_context_id() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let result = store.store_context_state("evil\0ctx", b"bad").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn identity_store_rejects_traversal_did() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let malicious_did = crate::identity::DID::from("../context/victim");
+        let result = store.store_identity_document(&malicious_did, b"bad").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn identity_store_rejects_backslash_did() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let malicious_did = crate::identity::DID::from("evil\\did");
+        let result = store.store_identity_document(&malicious_did, b"bad").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_store_rejects_traversal_tool_id() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let result = store
+            .store_tool("ctx-1", "../ucan_token/steal", b"bad")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_store_rejects_null_byte_session_id() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let result = store.store_tool_session("ctx-1", "sess\0ion", b"bad").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn economy_store_rejects_traversal_adapter_id() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let did = crate::identity::DID::from("did:dht:z6MkTest");
+        let result = store
+            .store_adapter_credentials(&did, "../document", b"bad")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ucan_store_rejects_traversal_context_id() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let result = store
+            .store_ucan_token("../identity/victim", "tok-1", b"bad")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn well_formed_identifiers_succeed_across_all_domains() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let did = crate::identity::DID::from("did:dht:z6MkTest");
+
+        // Context domain
+        store
+            .store_context_state("ctx-valid", b"state")
+            .await
+            .unwrap();
+
+        // Identity domain
+        store.store_identity_document(&did, b"doc").await.unwrap();
+
+        // Tools domain
+        store
+            .store_tool("ctx-valid", "tool-ok", b"reg")
+            .await
+            .unwrap();
+
+        // Economy domain
+        store
+            .store_adapter_credentials(&did, "x402", b"cred")
+            .await
+            .unwrap();
+
+        // UCAN domain
+        store
+            .store_ucan_token("ctx-valid", "tok-ok", b"token")
+            .await
+            .unwrap();
+    }
 }

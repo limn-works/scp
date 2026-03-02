@@ -25,16 +25,18 @@ use super::{ProtocolStore, StoreError};
 ///
 /// Format: `identity/{did}/document`
 /// See spec section 17.3.
-fn identity_document_key(did: &DID) -> String {
-    format!("identity/{did}/document")
+fn identity_document_key(did: &DID) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("identity/{did_str}/document"))
 }
 
 /// Builds the storage key for the active signing key handle.
 ///
 /// Format: `identity/{did}/active_signing_key`
 /// See spec section 17.3.
-fn active_signing_key_key(did: &DID) -> String {
-    format!("identity/{did}/active_signing_key")
+fn active_signing_key_key(did: &DID) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("identity/{did_str}/active_signing_key"))
 }
 
 /// Builds the storage key for identity private state at a sequence number.
@@ -42,15 +44,17 @@ fn active_signing_key_key(did: &DID) -> String {
 /// Format: `identity/{did}/private_state/{seq:020d}`
 /// Uses 20-digit zero-padding for lexicographic ordering.
 /// See spec section 17.3.
-fn identity_private_state_key(did: &DID, seq: u64) -> String {
-    format!("identity/{did}/private_state/{seq:020}")
+fn identity_private_state_key(did: &DID, seq: u64) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("identity/{did_str}/private_state/{seq:020}"))
 }
 
 /// Builds the prefix for listing all identity keys.
 ///
 /// Format: `identity/{did}/`
-fn identity_prefix(did: &DID) -> String {
-    format!("identity/{did}/")
+fn identity_prefix(did: &DID) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("identity/{did_str}/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -68,7 +72,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::SerializationFailed`] if serialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage write fails.
     pub async fn store_identity_document(&self, did: &DID, doc: &[u8]) -> Result<(), StoreError> {
-        let key = identity_document_key(did);
+        let key = identity_document_key(did)?;
         self.store_value(&key, &doc.to_vec()).await
     }
 
@@ -81,7 +85,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage read fails.
     pub async fn load_identity_document(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = identity_document_key(did);
+        let key = identity_document_key(did)?;
         self.load_value(&key).await
     }
 
@@ -99,7 +103,7 @@ impl<S: Storage> ProtocolStore<S> {
         did: &DID,
         key_data: &[u8],
     ) -> Result<(), StoreError> {
-        let key = active_signing_key_key(did);
+        let key = active_signing_key_key(did)?;
         self.store_value(&key, &key_data.to_vec()).await
     }
 
@@ -112,7 +116,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage read fails.
     pub async fn load_active_signing_key(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = active_signing_key_key(did);
+        let key = active_signing_key_key(did)?;
         self.load_value(&key).await
     }
 
@@ -130,7 +134,7 @@ impl<S: Storage> ProtocolStore<S> {
         seq: u64,
         state: &[u8],
     ) -> Result<(), StoreError> {
-        let key = identity_private_state_key(did, seq);
+        let key = identity_private_state_key(did, seq)?;
         self.store_value(&key, &state.to_vec()).await
     }
 
@@ -147,7 +151,7 @@ impl<S: Storage> ProtocolStore<S> {
         did: &DID,
         seq: u64,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = identity_private_state_key(did, seq);
+        let key = identity_private_state_key(did, seq)?;
         self.load_value(&key).await
     }
 
@@ -161,7 +165,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn delete_identity(&self, did: &DID) -> Result<u64, StoreError> {
-        let prefix = identity_prefix(did);
+        let prefix = identity_prefix(did)?;
         Ok(self.storage.delete_prefix(&prefix).await?)
     }
 }
@@ -276,7 +280,7 @@ mod tests {
     fn identity_document_key_follows_convention() {
         let did = DID::from("did:dht:z6MkTest");
         assert_eq!(
-            identity_document_key(&did),
+            identity_document_key(&did).unwrap(),
             "identity/did:dht:z6MkTest/document"
         );
     }
@@ -285,7 +289,7 @@ mod tests {
     fn active_signing_key_key_follows_convention() {
         let did = DID::from("did:dht:z6MkTest");
         assert_eq!(
-            active_signing_key_key(&did),
+            active_signing_key_key(&did).unwrap(),
             "identity/did:dht:z6MkTest/active_signing_key"
         );
     }
@@ -294,7 +298,7 @@ mod tests {
     fn identity_private_state_key_uses_zero_padding() {
         let did = DID::from("did:dht:z6MkTest");
         assert_eq!(
-            identity_private_state_key(&did, 42),
+            identity_private_state_key(&did, 42).unwrap(),
             "identity/did:dht:z6MkTest/private_state/00000000000000000042"
         );
     }

@@ -28,15 +28,18 @@ use super::{ProtocolStore, StoreError};
 ///
 /// Format: `identity/{did}/adapter_credentials/{adapter_id}`
 /// See spec section 17.3.
-fn adapter_credential_key(did: &DID, adapter_id: &str) -> String {
-    format!("identity/{did}/adapter_credentials/{adapter_id}")
+fn adapter_credential_key(did: &DID, adapter_id: &str) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    let adapter = super::sanitize_key_component(adapter_id)?;
+    Ok(format!("identity/{did_str}/adapter_credentials/{adapter}"))
 }
 
 /// Builds the prefix for listing all adapter credentials for an identity.
 ///
 /// Format: `identity/{did}/adapter_credentials/`
-fn adapter_credentials_prefix(did: &DID) -> String {
-    format!("identity/{did}/adapter_credentials/")
+fn adapter_credentials_prefix(did: &DID) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("identity/{did_str}/adapter_credentials/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +63,7 @@ impl<S: Storage> ProtocolStore<S> {
         adapter_id: &str,
         credentials: &[u8],
     ) -> Result<(), StoreError> {
-        let key = adapter_credential_key(did, adapter_id);
+        let key = adapter_credential_key(did, adapter_id)?;
         self.store_value(&key, &credentials).await
     }
 
@@ -76,7 +79,7 @@ impl<S: Storage> ProtocolStore<S> {
         did: &DID,
         adapter_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = adapter_credential_key(did, adapter_id);
+        let key = adapter_credential_key(did, adapter_id)?;
         self.load_value(&key).await
     }
 
@@ -88,7 +91,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage list fails.
     pub async fn list_adapter_credentials(&self, did: &DID) -> Result<Vec<String>, StoreError> {
-        let prefix = adapter_credentials_prefix(did);
+        let prefix = adapter_credentials_prefix(did)?;
         let keys = self.storage.list_keys(&prefix).await?;
         let adapter_ids: Vec<String> = keys
             .into_iter()
@@ -109,7 +112,7 @@ impl<S: Storage> ProtocolStore<S> {
         did: &DID,
         adapter_id: &str,
     ) -> Result<(), StoreError> {
-        let key = adapter_credential_key(did, adapter_id);
+        let key = adapter_credential_key(did, adapter_id)?;
         self.storage.delete(&key).await?;
         Ok(())
     }
@@ -404,14 +407,14 @@ mod tests {
     #[test]
     fn adapter_credential_key_follows_convention() {
         let did = DID::from("did:dht:z6MkTest");
-        let key = adapter_credential_key(&did, "x402");
+        let key = adapter_credential_key(&did, "x402").unwrap();
         assert_eq!(key, "identity/did:dht:z6MkTest/adapter_credentials/x402");
     }
 
     #[test]
     fn adapter_credentials_prefix_follows_convention() {
         let did = DID::from("did:dht:z6MkTest");
-        let prefix = adapter_credentials_prefix(&did);
+        let prefix = adapter_credentials_prefix(&did).unwrap();
         assert_eq!(prefix, "identity/did:dht:z6MkTest/adapter_credentials/");
     }
 }

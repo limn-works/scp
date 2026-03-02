@@ -36,61 +36,72 @@ type ContextId = String;
 ///
 /// Format: `context/{context_id}/state`
 /// See spec section 17.3.
-fn context_state_key(context_id: &str) -> String {
-    format!("context/{context_id}/state")
+fn context_state_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/state"))
 }
 
 /// Builds the storage key for context params.
 ///
 /// Format: `context/{context_id}/params`
 /// See spec section 17.3.
-fn context_params_key(context_id: &str) -> String {
-    format!("context/{context_id}/params")
+fn context_params_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/params"))
 }
 
 /// Builds the storage key for a member's membership record.
 ///
 /// Format: `context/{context_id}/membership/{did}`
 /// See spec section 17.3.
-fn membership_key(context_id: &str, did: &DID) -> String {
-    format!("context/{context_id}/membership/{did}")
+fn membership_key(context_id: &str, did: &DID) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("context/{ctx}/membership/{did_str}"))
 }
 
 /// Builds the prefix for listing all memberships in a context.
 ///
 /// Format: `context/{context_id}/membership/`
-fn membership_prefix(context_id: &str) -> String {
-    format!("context/{context_id}/membership/")
+fn membership_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/membership/"))
 }
 
 /// Builds the storage key for a role definition within a context.
 ///
 /// Format: `context/{context_id}/role/{role_name}`
 /// See spec section 17.3.
-fn role_key(context_id: &str, role_name: &str) -> String {
-    format!("context/{context_id}/role/{role_name}")
+fn role_key(context_id: &str, role_name: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let role = super::sanitize_key_component(role_name)?;
+    Ok(format!("context/{ctx}/role/{role}"))
 }
 
 /// Builds the prefix for listing all roles in a context.
 ///
 /// Format: `context/{context_id}/role/`
-fn roles_prefix(context_id: &str) -> String {
-    format!("context/{context_id}/role/")
+fn roles_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/role/"))
 }
 
 /// Builds the storage key for an author's broadcast block list.
 ///
 /// Format: `context/{context_id}/broadcast_block/{author_did}`
 /// See spec section 5.14.8.
-fn broadcast_block_key(context_id: &str, author_did: &str) -> String {
-    format!("context/{context_id}/broadcast_block/{author_did}")
+fn broadcast_block_key(context_id: &str, author_did: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let author = super::sanitize_key_component(author_did)?;
+    Ok(format!("context/{ctx}/broadcast_block/{author}"))
 }
 
 /// Builds the prefix for all keys belonging to a context.
 ///
 /// Format: `context/{context_id}/`
-fn context_prefix(context_id: &str) -> String {
-    format!("context/{context_id}/")
+fn context_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +123,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         state: &[u8],
     ) -> Result<(), StoreError> {
-        let key = context_state_key(context_id);
+        let key = context_state_key(context_id)?;
         self.store_value(&key, &state.to_vec()).await
     }
 
@@ -128,7 +139,7 @@ impl<S: Storage> ProtocolStore<S> {
         &self,
         context_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = context_state_key(context_id);
+        let key = context_state_key(context_id)?;
         self.load_value(&key).await
     }
 
@@ -146,7 +157,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         params: &[u8],
     ) -> Result<(), StoreError> {
-        let key = context_params_key(context_id);
+        let key = context_params_key(context_id)?;
         self.store_value(&key, &params.to_vec()).await
     }
 
@@ -162,7 +173,7 @@ impl<S: Storage> ProtocolStore<S> {
         &self,
         context_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = context_params_key(context_id);
+        let key = context_params_key(context_id)?;
         self.load_value(&key).await
     }
 
@@ -178,7 +189,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn delete_context(&self, context_id: &str) -> Result<u64, StoreError> {
-        let prefix = context_prefix(context_id);
+        let prefix = context_prefix(context_id)?;
         Ok(self.storage.delete_prefix(&prefix).await?)
     }
 
@@ -224,7 +235,7 @@ impl<S: Storage> ProtocolStore<S> {
         did: &DID,
         role: &str,
     ) -> Result<(), StoreError> {
-        let key = membership_key(context_id, did);
+        let key = membership_key(context_id, did)?;
         self.store_value(&key, &role.to_owned()).await
     }
 
@@ -241,7 +252,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         did: &DID,
     ) -> Result<Option<String>, StoreError> {
-        let key = membership_key(context_id, did);
+        let key = membership_key(context_id, did)?;
         self.load_value(&key).await
     }
 
@@ -255,7 +266,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::DeserializationFailed`] if any member record fails
     /// to deserialize.
     pub async fn list_members(&self, context_id: &str) -> Result<Vec<(DID, String)>, StoreError> {
-        let prefix = membership_prefix(context_id);
+        let prefix = membership_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
         let mut members = Vec::with_capacity(keys.len());
         for key in keys {
@@ -277,7 +288,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
     pub async fn remove_membership(&self, context_id: &str, did: &DID) -> Result<(), StoreError> {
-        let key = membership_key(context_id, did);
+        let key = membership_key(context_id, did)?;
         self.storage.delete(&key).await?;
         Ok(())
     }
@@ -297,7 +308,7 @@ impl<S: Storage> ProtocolStore<S> {
         role_name: &str,
         role_data: &[u8],
     ) -> Result<(), StoreError> {
-        let key = role_key(context_id, role_name);
+        let key = role_key(context_id, role_name)?;
         self.store_value(&key, &role_data.to_vec()).await
     }
 
@@ -314,7 +325,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         role_name: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = role_key(context_id, role_name);
+        let key = role_key(context_id, role_name)?;
         self.load_value(&key).await
     }
 
@@ -326,7 +337,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn list_roles(&self, context_id: &str) -> Result<Vec<String>, StoreError> {
-        let prefix = roles_prefix(context_id);
+        let prefix = roles_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
         let role_names: Vec<String> = keys
             .into_iter()
@@ -355,7 +366,7 @@ impl<S: Storage> ProtocolStore<S> {
         author_did: &str,
         block_list: &HashSet<String>,
     ) -> Result<(), StoreError> {
-        let key = broadcast_block_key(context_id, author_did);
+        let key = broadcast_block_key(context_id, author_did)?;
         self.store_value(&key, block_list).await
     }
 
@@ -376,7 +387,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         author_did: &str,
     ) -> Result<Option<HashSet<String>>, StoreError> {
-        let key = broadcast_block_key(context_id, author_did);
+        let key = broadcast_block_key(context_id, author_did)?;
         self.load_value(&key).await
     }
 }
@@ -613,32 +624,41 @@ mod tests {
 
     #[test]
     fn context_state_key_follows_convention() {
-        assert_eq!(context_state_key("ctx-123"), "context/ctx-123/state");
+        assert_eq!(
+            context_state_key("ctx-123").unwrap(),
+            "context/ctx-123/state"
+        );
     }
 
     #[test]
     fn context_params_key_follows_convention() {
-        assert_eq!(context_params_key("ctx-123"), "context/ctx-123/params");
+        assert_eq!(
+            context_params_key("ctx-123").unwrap(),
+            "context/ctx-123/params"
+        );
     }
 
     #[test]
     fn membership_key_follows_convention() {
         let did = DID::from("did:dht:z6MkTest");
         assert_eq!(
-            membership_key("ctx-123", &did),
+            membership_key("ctx-123", &did).unwrap(),
             "context/ctx-123/membership/did:dht:z6MkTest"
         );
     }
 
     #[test]
     fn role_key_follows_convention() {
-        assert_eq!(role_key("ctx-123", "admin"), "context/ctx-123/role/admin");
+        assert_eq!(
+            role_key("ctx-123", "admin").unwrap(),
+            "context/ctx-123/role/admin"
+        );
     }
 
     #[test]
     fn broadcast_block_key_follows_convention() {
         assert_eq!(
-            broadcast_block_key("ctx-123", "did:dht:z6MkAuthor"),
+            broadcast_block_key("ctx-123", "did:dht:z6MkAuthor").unwrap(),
             "context/ctx-123/broadcast_block/did:dht:z6MkAuthor"
         );
     }
