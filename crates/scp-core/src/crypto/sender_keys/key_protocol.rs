@@ -30,6 +30,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
+use zeroize::Zeroizing;
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
@@ -444,7 +445,7 @@ pub async fn open_sender_key_response(
         .await
         .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
 
-    // Derive AES-128-GCM key from shared secret.
+    // Derive AES-128-GCM key from shared secret (zeroized on drop).
     let aes_key = hkdf_derive_key(shared_secret.as_bytes())?;
 
     // Decrypt the sealed sender key.
@@ -677,7 +678,7 @@ fn hpke_seal(
     let recipient_key = X25519Pub::from(*recipient_pub);
     let shared_secret = ephemeral_secret.diffie_hellman(&recipient_key);
 
-    // 3. HKDF to derive 16-byte AES-128-GCM key.
+    // 3. HKDF to derive 16-byte AES-128-GCM key (zeroized on drop).
     let aes_key = hkdf_derive_key(shared_secret.as_bytes())?;
 
     // 4. AES-128-GCM encrypt.
@@ -688,10 +689,13 @@ fn hpke_seal(
 
 /// Derives a 16-byte AES-128-GCM key from a 32-byte shared secret using
 /// HKDF-SHA256.
-fn hkdf_derive_key(shared_secret: &[u8]) -> Result<[u8; 16], SenderKeyError> {
+///
+/// The returned key is wrapped in [`Zeroizing`] so the derived key material
+/// is zeroed on drop (defense-in-depth, see issue #82).
+fn hkdf_derive_key(shared_secret: &[u8]) -> Result<Zeroizing<[u8; 16]>, SenderKeyError> {
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
-    let mut okm = [0u8; 16];
-    hk.expand(HPKE_INFO, &mut okm)
+    let mut okm = Zeroizing::new([0u8; 16]);
+    hk.expand(HPKE_INFO, okm.as_mut())
         .map_err(|e| SenderKeyError::HpkeEncryptionFailed(e.to_string()))?;
     Ok(okm)
 }
