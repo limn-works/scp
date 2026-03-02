@@ -22,6 +22,7 @@ tracing = { workspace = true }
 tokio-util = { workspace = true }
 lru = { workspace = true }
 rand = { workspace = true }
+subtle = "2"
 
 [dev-dependencies]
 scp-core = { path = "../scp-core" }

@@ -29,9 +29,13 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Callback, ErrorResponse, Request, Response,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::error::code;
@@ -73,6 +77,15 @@ pub struct RelayConfig {
     /// and subscriber delivery, mitigating relay-side traffic analysis
     /// (BLACK-001). Set to 0 to disable jitter (useful for tests).
     pub delivery_jitter_ms: u64,
+    /// Optional shared secret for authenticating internal bridge connections.
+    ///
+    /// When set, the relay rejects any WebSocket upgrade whose URI does not
+    /// include a `token` query parameter matching this value (hex-encoded,
+    /// constant-time comparison). Used by [`ApplicationNode`] to prevent
+    /// unauthorized connections to the internal relay port.
+    ///
+    /// See GitHub issue #85 for the threat model.
+    pub bridge_secret: Option<[u8; 32]>,
 }
 
 impl Default for RelayConfig {
@@ -88,6 +101,7 @@ impl Default for RelayConfig {
             max_total_connections: 1000,
             rate_limit_publishes_per_second: 100,
             delivery_jitter_ms: 50,
+            bridge_secret: None,
         }
     }
 }
@@ -463,7 +477,104 @@ async fn check_publish_rate_limit(
     allowed
 }
 
+/// Callback for `accept_hdr_async` that validates the bridge secret.
+///
+/// Extracts the `token` query parameter from the WebSocket upgrade URI,
+/// hex-decodes it, and performs a constant-time comparison against the
+/// expected secret. Returns HTTP 403 on mismatch or missing token.
+///
+/// The token is never included in error messages or logs to prevent leakage.
+struct BridgeSecretCallback {
+    expected: [u8; 32],
+}
+
+impl Callback for BridgeSecretCallback {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        use tokio_tungstenite::tungstenite::http::StatusCode;
+
+        let uri = request.uri();
+        let query = uri.query().unwrap_or("");
+
+        // Parse the `token` parameter from the query string.
+        let provided_token = query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            if key == "token" { Some(value) } else { None }
+        });
+
+        let Some(hex_token) = provided_token else {
+            tracing::warn!("bridge connection rejected: missing token");
+            let mut err = ErrorResponse::new(None);
+            *err.status_mut() = StatusCode::FORBIDDEN;
+            return Err(err);
+        };
+
+        // Hex-decode the provided token.
+        let decoded = hex_decode_32(hex_token);
+        let Some(decoded) = decoded else {
+            tracing::warn!("bridge connection rejected: invalid token format");
+            let mut err = ErrorResponse::new(None);
+            *err.status_mut() = StatusCode::FORBIDDEN;
+            return Err(err);
+        };
+
+        // Constant-time comparison to prevent timing side-channels.
+        if decoded.ct_eq(&self.expected).into() {
+            Ok(response)
+        } else {
+            tracing::warn!("bridge connection rejected: invalid token");
+            let mut err = ErrorResponse::new(None);
+            *err.status_mut() = StatusCode::FORBIDDEN;
+            Err(err)
+        }
+    }
+}
+
+/// Decodes a 64-character hex string into a `[u8; 32]`.
+///
+/// Returns `None` on invalid length or non-hex characters.
+fn hex_decode_32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = hex.as_bytes().get(i * 2)?;
+        let lo = hex.as_bytes().get(i * 2 + 1)?;
+        *byte = (hex_nibble(*hi)? << 4) | hex_nibble(*lo)?;
+    }
+    Some(out)
+}
+
+/// Converts an ASCII hex character to its 4-bit value.
+const fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Encodes a `[u8; 32]` as a 64-character lowercase hex string.
+///
+/// Used by [`ApplicationNode`] to format the bridge token for the
+/// WebSocket connection URL.
+#[must_use]
+pub fn hex_encode_32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Handles a single WebSocket connection.
+///
+/// When `config.bridge_secret` is set, the WebSocket upgrade request must
+/// include a `token` query parameter whose hex-decoded value matches the
+/// secret (constant-time comparison). Connections without a valid token are
+/// rejected during the handshake — no protocol messages are exchanged.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection<S: BlobStorage + 'static>(
     stream: TcpStream,
@@ -474,9 +585,21 @@ async fn handle_connection<S: BlobStorage + 'static>(
     config: RelayConfig,
     rate_limiter: PublishRateLimiter,
 ) -> Result<(), ConnectionError> {
-    let ws_stream = tokio_tungstenite::accept_async(stream)
+    let ws_stream = if let Some(expected_secret) = config.bridge_secret {
+        // Validate the bridge token during the WebSocket handshake.
+        tokio_tungstenite::accept_hdr_async(
+            stream,
+            BridgeSecretCallback {
+                expected: expected_secret,
+            },
+        )
         .await
-        .map_err(|e| ConnectionError::WebSocket(e.to_string()))?;
+        .map_err(|e| ConnectionError::WebSocket(e.to_string()))?
+    } else {
+        tokio_tungstenite::accept_async(stream)
+            .await
+            .map_err(|e| ConnectionError::WebSocket(e.to_string()))?
+    };
 
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
