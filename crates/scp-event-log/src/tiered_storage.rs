@@ -32,7 +32,7 @@
 
 use super::proof::{self, InclusionProof};
 use super::{EventLog, EventLogError};
-use crate::event_log::tree;
+use crate::tree;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -620,9 +620,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::event_log::proof::{Direction, InclusionProof, ProofStep};
-    use crate::event_log::tree::{self, GENESIS_PREV_HASH};
-    use crate::event_log::{Event, EventPayload, EventType};
+    use crate::proof::{Direction, InclusionProof, ProofStep};
+    use crate::tree::{self, GENESIS_PREV_HASH};
+    use crate::{Event, EventPayload, EventType};
 
     // -------------------------------------------------------------------
     // Test helpers

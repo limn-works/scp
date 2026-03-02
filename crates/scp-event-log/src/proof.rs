@@ -14,7 +14,7 @@
 //! See ADR-011 in `.docs/adrs/phase-2.md` for the full design.
 
 use super::{EventLog, EventLogError};
-use crate::event_log::tree;
+use crate::tree;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -332,9 +332,9 @@ use super::tree::hash_pair;
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::event_log::test_helpers::build_test_log;
-    use crate::event_log::tree;
-    use crate::event_log::{EventLog, EventLogError};
+    use crate::test_helpers::build_test_log;
+    use crate::tree;
+    use crate::{EventLog, EventLogError};
 
     /// Helper: build a log with `n` events and return the log and leaf hashes.
     fn build_log(n: u64) -> (EventLog, Vec<[u8; 32]>) {

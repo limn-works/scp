@@ -2360,7 +2360,7 @@ mod tests {
     #[test]
     fn broadcast_subscribe_member_joined_persists_to_event_log() {
         use crate::context::membership::ContextEvent;
-        use crate::event_log::tree::{append_unsigned_event, event_count, root, GENESIS_PREV_HASH};
+        use crate::event_log::tree::{GENESIS_PREV_HASH, append_unsigned_event, event_count, root};
         use crate::event_log::{Event, EventLog, EventPayload, EventType};
 
         // 1. Create an open broadcast context and subscribe a DID.
@@ -2406,8 +2406,7 @@ mod tests {
         // 6. Verify the Merkle root is non-zero (a real commitment exists).
         let merkle_root = root(&log);
         assert_ne!(
-            merkle_root,
-            [0u8; 32],
+            merkle_root, [0u8; 32],
             "Merkle root must be non-zero after appending an event"
         );
     }

@@ -34,11 +34,9 @@
 
 use sha2::{Digest, Sha256};
 
-use scp_platform::traits::{KeyCustody, KeyHandle};
-
-use super::{ContextId, DID, Ed25519Signature, EventLog, EventLogError};
-use crate::event_log::proof::{self, Direction, InclusionProof, ProofStep};
-use crate::event_log::tree;
+use super::{ContextId, DID, Ed25519Signature, EventLog, EventLogError, EventLogSigner};
+use crate::proof::{self, Direction, InclusionProof, ProofStep};
+use crate::tree;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -370,22 +368,14 @@ impl CheckpointManager {
         sender_did: &DID,
         epoch: u64,
         current_timestamp: u64,
-        key_custody: &impl KeyCustody,
-        signing_key: &KeyHandle,
+        signer: &(impl EventLogSigner + ?Sized),
     ) -> Result<Option<ConsistencyCheckpoint>, EventLogError> {
         if !self.is_checkpoint_due(current_timestamp) {
             return Ok(None);
         }
 
         let checkpoint = self
-            .create_and_store_checkpoint(
-                log,
-                sender_did,
-                epoch,
-                current_timestamp,
-                key_custody,
-                signing_key,
-            )
+            .create_and_store_checkpoint(log, sender_did, epoch, current_timestamp, signer)
             .await?;
 
         Ok(Some(checkpoint))
@@ -412,18 +402,10 @@ impl CheckpointManager {
         sender_did: &DID,
         epoch: u64,
         current_timestamp: u64,
-        key_custody: &impl KeyCustody,
-        signing_key: &KeyHandle,
+        signer: &(impl EventLogSigner + ?Sized),
     ) -> Result<ConsistencyCheckpoint, EventLogError> {
-        self.create_and_store_checkpoint(
-            log,
-            sender_did,
-            epoch,
-            current_timestamp,
-            key_custody,
-            signing_key,
-        )
-        .await
+        self.create_and_store_checkpoint(log, sender_did, epoch, current_timestamp, signer)
+            .await
     }
 
     /// Creates a checkpoint, stores it, and resets the scheduler.
@@ -436,18 +418,10 @@ impl CheckpointManager {
         sender_did: &DID,
         epoch: u64,
         current_timestamp: u64,
-        key_custody: &impl KeyCustody,
-        signing_key: &KeyHandle,
+        signer: &(impl EventLogSigner + ?Sized),
     ) -> Result<ConsistencyCheckpoint, EventLogError> {
-        let checkpoint = generate_checkpoint_at(
-            log,
-            sender_did,
-            epoch,
-            current_timestamp,
-            key_custody,
-            signing_key,
-        )
-        .await?;
+        let checkpoint =
+            generate_checkpoint_at(log, sender_did, epoch, current_timestamp, signer).await?;
 
         self.checkpoints.push(checkpoint.clone());
         self.events_since_last = 0;
@@ -870,11 +844,10 @@ pub async fn generate_checkpoint(
     log: &EventLog,
     sender_did: &DID,
     epoch: u64,
-    key_custody: &impl KeyCustody,
-    signing_key: &KeyHandle,
+    signer: &(impl EventLogSigner + ?Sized),
 ) -> Result<ConsistencyCheckpoint, EventLogError> {
     let timestamp = current_timestamp()?;
-    generate_checkpoint_at(log, sender_did, epoch, timestamp, key_custody, signing_key).await
+    generate_checkpoint_at(log, sender_did, epoch, timestamp, signer).await
 }
 
 /// Compares a received remote checkpoint against the local event log state.
@@ -931,8 +904,7 @@ async fn generate_checkpoint_at(
     sender_did: &DID,
     epoch: u64,
     timestamp: u64,
-    key_custody: &impl KeyCustody,
-    signing_key: &KeyHandle,
+    signer: &(impl EventLogSigner + ?Sized),
 ) -> Result<ConsistencyCheckpoint, EventLogError> {
     let context_id = log.context_id().to_owned();
     let event_count = tree::event_count(log);
@@ -947,10 +919,10 @@ async fn generate_checkpoint_at(
         timestamp,
     );
 
-    let signature = key_custody
-        .sign(signing_key, &canonical_hash)
+    let signature = signer
+        .sign(&canonical_hash)
         .await
-        .map_err(|e| EventLogError::SigningFailed(e.to_string()))?;
+        .map_err(EventLogError::SigningFailed)?;
 
     Ok(ConsistencyCheckpoint {
         context_id,
@@ -959,7 +931,7 @@ async fn generate_checkpoint_at(
         merkle_root,
         epoch: Some(epoch),
         timestamp,
-        signature: signature.into_bytes(),
+        signature,
     })
 }
 
@@ -1165,18 +1137,15 @@ fn current_timestamp() -> Result<u64, crate::time::ClockError> {
 )]
 mod tests {
     use ed25519_dalek::Verifier;
-
-    use scp_platform::testing::InMemoryKeyCustody;
-    use scp_platform::traits::KeyType;
+    use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::event_log::test_helpers::{
-        did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair,
+    use crate::DID;
+    use crate::test_helpers::{
+        TestSigner, did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair,
     };
-    use crate::event_log::tree::{self, GENESIS_PREV_HASH};
-    use crate::event_log::{Event, EventLog, EventType};
-    use crate::identity::DID;
-    use crate::trust::compute_behavioral_record;
+    use crate::tree::{self, GENESIS_PREV_HASH};
+    use crate::{EventLog, EventType};
 
     // -------------------------------------------------------------------
     // Test helpers (checkpoint-specific)
@@ -1248,12 +1217,9 @@ mod tests {
     #[tokio::test]
     async fn generate_creates_valid_signed_checkpoint() {
         let (log, _, did) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log, &did, 5, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 5, &signer).await.unwrap();
 
         assert_eq!(checkpoint.context_id, "ctx-checkpoint-test");
         assert_eq!(checkpoint.sender_did, did);
@@ -1264,9 +1230,7 @@ mod tests {
         assert_eq!(checkpoint.signature.len(), 64);
 
         // Verify the signature manually.
-        let pubkey = custody.public_key(&key).await.unwrap();
-        let pubkey_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
-        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
+        let verifying_key = signer.verifying_key();
 
         let canonical_hash = compute_checkpoint_canonical_hash(
             &checkpoint.context_id,
@@ -1290,13 +1254,10 @@ mod tests {
     #[tokio::test]
     async fn generate_checkpoint_on_empty_log() {
         let log = EventLog::new("ctx-empty".to_owned());
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
         let did: DID = "did:key:test".into();
 
-        let checkpoint = generate_checkpoint(&log, &did, 0, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 0, &signer).await.unwrap();
 
         assert_eq!(checkpoint.event_count, 0);
         assert_eq!(checkpoint.merkle_root, [0u8; 32]);
@@ -1309,12 +1270,9 @@ mod tests {
     #[tokio::test]
     async fn compare_returns_consistent_for_matching_roots() {
         let (log_a, log_b, did) = build_matching_logs(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log_a, &did, 5, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log_a, &did, 5, &signer).await.unwrap();
 
         let result = compare_checkpoint(&log_b, &checkpoint);
         assert_eq!(result, CheckpointComparison::Consistent);
@@ -1379,9 +1337,8 @@ mod tests {
         assert_eq!(tree::event_count(&log_a), tree::event_count(&log_b));
         assert_ne!(tree::root(&log_a), tree::root(&log_b));
 
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let checkpoint = generate_checkpoint(&log_a, &did_a, 1, &custody, &key)
+        let signer = TestSigner::new();
+        let checkpoint = generate_checkpoint(&log_a, &did_a, 1, &signer)
             .await
             .unwrap();
 
@@ -1430,10 +1387,9 @@ mod tests {
             prev_hash = leaf_hash;
         }
 
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log_full, &did, 1, &custody, &key)
+        let checkpoint = generate_checkpoint(&log_full, &did, 1, &signer)
             .await
             .unwrap();
 
@@ -1477,10 +1433,9 @@ mod tests {
             prev_hash = leaf_hash;
         }
 
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log_partial, &did, 1, &custody, &key)
+        let checkpoint = generate_checkpoint(&log_partial, &did, 1, &signer)
             .await
             .unwrap();
 
@@ -1496,13 +1451,10 @@ mod tests {
     async fn compare_returns_consistent_for_empty_logs() {
         let log_a = EventLog::new("ctx-empty".to_owned());
         let log_b = EventLog::new("ctx-empty".to_owned());
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
         let did: DID = "did:key:test".into();
 
-        let checkpoint = generate_checkpoint(&log_a, &did, 0, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log_a, &did, 0, &signer).await.unwrap();
 
         let result = compare_checkpoint(&log_b, &checkpoint);
         assert_eq!(result, CheckpointComparison::Consistent);
@@ -1720,10 +1672,9 @@ mod tests {
         assert_eq!(tree::event_count(&log_a), tree::event_count(&log_b));
         assert_ne!(tree::root(&log_a), tree::root(&log_b));
 
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint_a = generate_checkpoint(&log_a, &did_a, 1, &custody, &key)
+        let checkpoint_a = generate_checkpoint(&log_a, &did_a, 1, &signer)
             .await
             .unwrap();
 
@@ -1834,15 +1785,14 @@ mod tests {
         };
         let mut mgr = CheckpointManager::new(policy, 1_000_000);
         let (log, _, did) = build_log(5);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         for _ in 0..5 {
             mgr.record_event();
         }
 
         let result = mgr
-            .maybe_create_checkpoint(&log, &did, 1, 1_000_100, &custody, &key)
+            .maybe_create_checkpoint(&log, &did, 1, 1_000_100, &signer)
             .await
             .unwrap();
 
@@ -1863,15 +1813,14 @@ mod tests {
         };
         let mut mgr = CheckpointManager::new(policy, 1_000_000);
         let (log, _, did) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         for _ in 0..5 {
             mgr.record_event();
         }
 
         let result = mgr
-            .maybe_create_checkpoint(&log, &did, 1, 1_000_100, &custody, &key)
+            .maybe_create_checkpoint(&log, &did, 1, 1_000_100, &signer)
             .await
             .unwrap();
 
@@ -1898,12 +1847,11 @@ mod tests {
         };
         let mut mgr = CheckpointManager::new(policy, 1_000_000);
         let (log, _, did) = build_log(3);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         // Not due by any metric, but force_create overrides.
         let cp = mgr
-            .force_create_checkpoint(&log, &did, 1, 1_000_001, &custody, &key)
+            .force_create_checkpoint(&log, &did, 1, 1_000_001, &signer)
             .await
             .unwrap();
 
@@ -1924,15 +1872,14 @@ mod tests {
         };
         let mut mgr = CheckpointManager::new(policy, 1_000_000);
         let (log, _, did) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         for _ in 0..5 {
             mgr.record_event();
         }
         assert!(mgr.is_checkpoint_due(1_000_100));
 
-        mgr.maybe_create_checkpoint(&log, &did, 1, 1_000_100, &custody, &key)
+        mgr.maybe_create_checkpoint(&log, &did, 1, 1_000_100, &signer)
             .await
             .unwrap();
 
@@ -1954,14 +1901,13 @@ mod tests {
         };
         let mut mgr = CheckpointManager::new(policy, 1_000_000);
         let (log, _, did) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         // First checkpoint.
         for _ in 0..3 {
             mgr.record_event();
         }
-        mgr.maybe_create_checkpoint(&log, &did, 1, 1_000_100, &custody, &key)
+        mgr.maybe_create_checkpoint(&log, &did, 1, 1_000_100, &signer)
             .await
             .unwrap();
 
@@ -1969,7 +1915,7 @@ mod tests {
         for _ in 0..3 {
             mgr.record_event();
         }
-        mgr.maybe_create_checkpoint(&log, &did, 2, 1_000_200, &custody, &key)
+        mgr.maybe_create_checkpoint(&log, &did, 2, 1_000_200, &signer)
             .await
             .unwrap();
 
@@ -1999,12 +1945,9 @@ mod tests {
     #[tokio::test]
     async fn pruned_proof_verifies_against_checkpoint_root() {
         let (log, _, did) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log, &did, 1, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 1, &signer).await.unwrap();
 
         let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
@@ -2025,12 +1968,9 @@ mod tests {
     #[tokio::test]
     async fn pruned_proof_fails_with_tampered_leaf_hash() {
         let (log, _, did) = build_log(8);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log, &did, 1, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 1, &signer).await.unwrap();
 
         let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
@@ -2046,12 +1986,9 @@ mod tests {
     #[tokio::test]
     async fn pruned_proof_rejects_out_of_bounds() {
         let (log, _, did) = build_log(5);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log, &did, 1, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 1, &signer).await.unwrap();
 
         let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
@@ -2070,12 +2007,9 @@ mod tests {
     #[tokio::test]
     async fn checkpointed_proof_verifies_correctly() {
         let (log, _, did) = build_log(8);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log, &did, 1, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 1, &signer).await.unwrap();
 
         let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
@@ -2090,12 +2024,9 @@ mod tests {
     #[tokio::test]
     async fn checkpointed_proof_fails_with_mismatched_root() {
         let (log, _, did) = build_log(8);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log, &did, 1, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 1, &signer).await.unwrap();
 
         let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
@@ -2116,8 +2047,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_log_counts_are_correct() {
         let (log, _, did) = build_log(20);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         // Create checkpoint at event 10 by making a checkpoint from a
         // partial log with 10 events.
@@ -2127,7 +2057,7 @@ mod tests {
             partial_log.push_leaf_raw(leaves[i]);
         }
 
-        let checkpoint = generate_checkpoint_at(&partial_log, &did, 1, 1_000_010, &custody, &key)
+        let checkpoint = generate_checkpoint_at(&partial_log, &did, 1, 1_000_010, &signer)
             .await
             .unwrap();
 
@@ -2145,8 +2075,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_log_tail_proofs_work() {
         let (log, _, did) = build_log(15);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         // Checkpoint at 8 events.
         let mut partial_log = EventLog::new("ctx-checkpoint-test".to_owned());
@@ -2155,7 +2084,7 @@ mod tests {
             partial_log.push_leaf_raw(leaves[i]);
         }
 
-        let checkpoint = generate_checkpoint_at(&partial_log, &did, 1, 1_000_008, &custody, &key)
+        let checkpoint = generate_checkpoint_at(&partial_log, &did, 1, 1_000_008, &signer)
             .await
             .unwrap();
 
@@ -2178,12 +2107,9 @@ mod tests {
     #[tokio::test]
     async fn truncated_log_preserves_pruned_leaf_hashes() {
         let (log, leaf_hashes, did) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log, &did, 1, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 1, &signer).await.unwrap();
 
         let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
@@ -2202,12 +2128,9 @@ mod tests {
     #[tokio::test]
     async fn truncated_log_all_pruned() {
         let (log, _, did) = build_log(5);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let checkpoint = generate_checkpoint(&log, &did, 1, &custody, &key)
-            .await
-            .unwrap();
+        let checkpoint = generate_checkpoint(&log, &did, 1, &signer).await.unwrap();
 
         let truncated = TruncatedEventLog::from_log_and_checkpoint(&log, checkpoint).unwrap();
 
@@ -2227,8 +2150,7 @@ mod tests {
     #[tokio::test]
     async fn cross_checkpoint_consistent() {
         let (log, _, did) = build_log(20);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         // Checkpoint at 10 events.
         let mut log_10 = EventLog::new("ctx-checkpoint-test".to_owned());
@@ -2236,12 +2158,12 @@ mod tests {
         for i in 0..10 {
             log_10.push_leaf_raw(leaves[i]);
         }
-        let cp_10 = generate_checkpoint_at(&log_10, &did, 1, 1_000_010, &custody, &key)
+        let cp_10 = generate_checkpoint_at(&log_10, &did, 1, 1_000_010, &signer)
             .await
             .unwrap();
 
         // Checkpoint at 20 events.
-        let cp_20 = generate_checkpoint_at(&log, &did, 2, 1_000_020, &custody, &key)
+        let cp_20 = generate_checkpoint_at(&log, &did, 2, 1_000_020, &signer)
             .await
             .unwrap();
 
@@ -2266,14 +2188,13 @@ mod tests {
     async fn cross_checkpoint_divergent() {
         let (log_a, _, did_a) = build_log(10);
         let (log_b, _, _) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let cp_a = generate_checkpoint_at(&log_a, &did_a, 1, 1_000_010, &custody, &key)
+        let cp_a = generate_checkpoint_at(&log_a, &did_a, 1, 1_000_010, &signer)
             .await
             .unwrap();
 
-        let cp_b = generate_checkpoint_at(&log_b, &did_a, 1, 1_000_010, &custody, &key)
+        let cp_b = generate_checkpoint_at(&log_b, &did_a, 1, 1_000_010, &signer)
             .await
             .unwrap();
 
@@ -2288,18 +2209,17 @@ mod tests {
 
     #[tokio::test]
     async fn cross_checkpoint_context_mismatch() {
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
         let did: DID = "did:key:test".into();
 
         let log_a = EventLog::new("ctx-a".to_owned());
         let log_b = EventLog::new("ctx-b".to_owned());
 
-        let cp_a = generate_checkpoint_at(&log_a, &did, 0, 1_000_000, &custody, &key)
+        let cp_a = generate_checkpoint_at(&log_a, &did, 0, 1_000_000, &signer)
             .await
             .unwrap();
 
-        let cp_b = generate_checkpoint_at(&log_b, &did, 0, 1_000_000, &custody, &key)
+        let cp_b = generate_checkpoint_at(&log_b, &did, 0, 1_000_000, &signer)
             .await
             .unwrap();
 
@@ -2314,8 +2234,7 @@ mod tests {
     #[tokio::test]
     async fn cross_checkpoint_order_violation() {
         let (log, _, did) = build_log(20);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         let mut log_10 = EventLog::new("ctx-checkpoint-test".to_owned());
         let leaves = log.leaves();
@@ -2323,11 +2242,11 @@ mod tests {
             log_10.push_leaf_raw(leaves[i]);
         }
 
-        let cp_10 = generate_checkpoint_at(&log_10, &did, 1, 1_000_010, &custody, &key)
+        let cp_10 = generate_checkpoint_at(&log_10, &did, 1, 1_000_010, &signer)
             .await
             .unwrap();
 
-        let cp_20 = generate_checkpoint_at(&log, &did, 2, 1_000_020, &custody, &key)
+        let cp_20 = generate_checkpoint_at(&log, &did, 2, 1_000_020, &signer)
             .await
             .unwrap();
 
@@ -2344,16 +2263,15 @@ mod tests {
     async fn cross_checkpoint_with_leaves_detects_divergent() {
         let (log_a, _, did) = build_log(10);
         let (log_b, _, _) = build_log(20);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         // Checkpoint from log_a at 10.
-        let cp_a = generate_checkpoint_at(&log_a, &did, 1, 1_000_010, &custody, &key)
+        let cp_a = generate_checkpoint_at(&log_a, &did, 1, 1_000_010, &signer)
             .await
             .unwrap();
 
         // Checkpoint from log_b at 20 (different history).
-        let cp_b = generate_checkpoint_at(&log_b, &did, 2, 1_000_020, &custody, &key)
+        let cp_b = generate_checkpoint_at(&log_b, &did, 2, 1_000_020, &signer)
             .await
             .unwrap();
 
@@ -2370,10 +2288,9 @@ mod tests {
     #[tokio::test]
     async fn cross_checkpoint_same_is_consistent() {
         let (log, _, did) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
-        let cp = generate_checkpoint_at(&log, &did, 1, 1_000_010, &custody, &key)
+        let cp = generate_checkpoint_at(&log, &did, 1, 1_000_010, &signer)
             .await
             .unwrap();
 
@@ -2381,297 +2298,19 @@ mod tests {
         assert_eq!(result, CrossCheckpointResult::Consistent);
     }
 
-    // ===================================================================
-    // Phase 6 tests — Behavioral validation compatibility
-    // ===================================================================
-
-    // -------------------------------------------------------------------
-    // 26. Behavioral validation works with checkpointed logs (SCP-125 AC6)
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn behavioral_validation_works_with_checkpointed_log() {
-        // Build a non-trivial event log with multiple event types and two
-        // participants. This exercises behavioral record computation against
-        // a checkpoint Merkle root -- the core of SCP-125 AC6.
-        let (vk_alice, sk_alice) = test_keypair();
-        let did_alice = did_from_pubkey(&vk_alice);
-        let (vk_bob, sk_bob) = test_keypair();
-        let did_bob = did_from_pubkey(&vk_bob);
-
-        let mut log = EventLog::new("ctx-behavioral-checkpoint".to_owned());
-        let mut prev_hash = GENESIS_PREV_HASH;
-        let mut all_events = Vec::new();
-
-        // Helper closure: append an event and track it.
-        let append = |log: &mut EventLog,
-                      events: &mut Vec<Event>,
-                      event_type: EventType,
-                      actor_did: &str,
-                      timestamp: u64,
-                      seq: u64,
-                      payload: Vec<u8>,
-                      signing_key: &ed25519_dalek::SigningKey,
-                      prev: [u8; 32]|
-         -> [u8; 32] {
-            let event = sign_event(
-                event_type,
-                actor_did,
-                timestamp,
-                seq,
-                payload,
-                prev,
-                signing_key,
-            );
-            tree::append(log, &event).unwrap();
-            let leaf_hash: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event).unwrap());
-                h.finalize().into()
-            };
-            events.push(event);
-            leaf_hash
-        };
-
-        // Event 0: Alice creates context.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::ContextCreated,
-            &did_alice,
-            1_000_000,
-            0,
-            vec![],
-            &sk_alice,
-            prev_hash,
-        );
-
-        // Event 1: Alice joins.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::MemberJoined,
-            &did_alice,
-            1_000_001,
-            1,
-            vec![],
-            &sk_alice,
-            prev_hash,
-        );
-
-        // Event 2: Bob joins.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::MemberJoined,
-            &did_bob,
-            1_000_002,
-            2,
-            vec![],
-            &sk_bob,
-            prev_hash,
-        );
-
-        // Event 3: Alice assigns role to Bob.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::RoleAssigned,
-            &did_alice,
-            1_000_003,
-            3,
-            did_bob.as_bytes().to_vec(),
-            &sk_alice,
-            prev_hash,
-        );
-
-        // Event 4: Alice sends a message.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::MessageSent,
-            &did_alice,
-            1_000_004,
-            4,
-            b"hello from alice".to_vec(),
-            &sk_alice,
-            prev_hash,
-        );
-
-        // Event 5: Bob sends a message.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::MessageSent,
-            &did_bob,
-            1_000_005,
-            5,
-            b"hello from bob".to_vec(),
-            &sk_bob,
-            prev_hash,
-        );
-
-        // Event 6: Alice invokes a tool.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::ToolInvoked,
-            &did_alice,
-            1_000_006,
-            6,
-            b"search-tool".to_vec(),
-            &sk_alice,
-            prev_hash,
-        );
-
-        // Event 7: Alice invokes the same tool again.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::ToolInvoked,
-            &did_alice,
-            1_000_007,
-            7,
-            b"search-tool".to_vec(),
-            &sk_alice,
-            prev_hash,
-        );
-
-        // Event 8: Bob invokes a different tool.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::ToolInvoked,
-            &did_bob,
-            1_000_008,
-            8,
-            b"execute-tool".to_vec(),
-            &sk_bob,
-            prev_hash,
-        );
-
-        // Event 9: Alice performs a governance action targeting Bob.
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::GovernanceAction,
-            &did_alice,
-            1_000_009,
-            9,
-            did_bob.as_bytes().to_vec(),
-            &sk_alice,
-            prev_hash,
-        );
-
-        // Event 10: Alice verifies a tool (attestation-adjacent).
-        prev_hash = append(
-            &mut log,
-            &mut all_events,
-            EventType::ToolVerified,
-            &did_alice,
-            1_000_010,
-            10,
-            vec![],
-            &sk_alice,
-            prev_hash,
-        );
-
-        // Event 11: Bob sends another message.
-        let _ = append(
-            &mut log,
-            &mut all_events,
-            EventType::MessageSent,
-            &did_bob,
-            1_000_011,
-            11,
-            b"final message".to_vec(),
-            &sk_bob,
-            prev_hash,
-        );
-
-        assert_eq!(tree::event_count(&log), 12);
-
-        // Create a checkpoint capturing the current Merkle root.
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-
-        let checkpoint = generate_checkpoint(&log, &did_alice, 1, &custody, &key)
-            .await
-            .unwrap();
-
-        assert_eq!(checkpoint.event_count, 12);
-        assert_eq!(checkpoint.merkle_root, tree::root(&log));
-
-        // Compute behavioral record for Alice using the checkpoint's Merkle root.
-        // This is the core assertion of SCP-125 AC6: behavioral validation
-        // continues to work with checkpointed logs.
-        let record = compute_behavioral_record(
-            &all_events,
-            &did_alice,
-            "ctx-behavioral-checkpoint",
-            checkpoint.merkle_root,
-            2_000_000,
-        )
-        .unwrap();
-
-        // Alice participated in events 0,1,3,4,6,7,9,10 = 8 events.
-        assert_eq!(record.participation_count, 8);
-        // Duration: 1_000_010 - 1_000_000 = 10 seconds.
-        assert_eq!(record.participation_duration_seconds, 10);
-        // Tool invocations: search-tool x2.
-        assert_eq!(record.tool_invocations.len(), 1);
-        assert_eq!(record.tool_invocations.get("search-tool"), Some(&2));
-        // Governance actions by Alice: 1 (targeting Bob).
-        assert_eq!(record.governance_actions_by.len(), 1);
-        // Governance actions against Alice: 0.
-        assert_eq!(record.governance_actions_against.len(), 0);
-        // Role history for Alice: 0 (Alice assigned Bob, not herself).
-        assert_eq!(record.role_history.len(), 0);
-        // Attestation history: 1 (ToolVerified event).
-        assert_eq!(record.attestation_history.len(), 1);
-        // Context creation: 1.
-        assert_eq!(record.context_creation_count, 1);
-        // Merkle root matches checkpoint.
-        assert_eq!(record.event_log_root, checkpoint.merkle_root);
-
-        // Also verify Bob's behavioral record against the same checkpoint.
-        let bob_record = compute_behavioral_record(
-            &all_events,
-            &did_bob,
-            "ctx-behavioral-checkpoint",
-            checkpoint.merkle_root,
-            2_000_000,
-        )
-        .unwrap();
-
-        // Bob participated in events 2,5,8,11 = 4 events.
-        assert_eq!(bob_record.participation_count, 4);
-        // Duration: 1_000_011 - 1_000_002 = 9 seconds.
-        assert_eq!(bob_record.participation_duration_seconds, 9);
-        // Bob's tool invocations: execute-tool x1.
-        assert_eq!(bob_record.tool_invocations.len(), 1);
-        assert_eq!(bob_record.tool_invocations.get("execute-tool"), Some(&1));
-        // Bob is the target of Alice's governance action.
-        assert_eq!(bob_record.governance_actions_against.len(), 1);
-        // Bob was assigned a role.
-        assert_eq!(bob_record.role_history.len(), 1);
-        assert_eq!(bob_record.event_log_root, checkpoint.merkle_root);
-    }
-
-    // -------------------------------------------------------------------
+    // NOTE: Test "26. Behavioral validation works with checkpointed logs (SCP-125 AC6)"
+    // has been moved to scp-core integration tests because it depends on
+    // crate::trust::compute_behavioral_record which crosses crate boundaries.
     // 27. Pruned proofs work for all leaf positions in various tree sizes
     // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn pruned_proofs_all_positions_various_sizes() {
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         for size in [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17] {
             let (log, _, did) = build_log(size);
-            let checkpoint = generate_checkpoint_at(&log, &did, 1, 1_000_000, &custody, &key)
+            let checkpoint = generate_checkpoint_at(&log, &did, 1, 1_000_000, &signer)
                 .await
                 .unwrap();
 
@@ -2694,15 +2333,12 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_does_not_mutate_log() {
         let (log, _, did) = build_log(10);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         let root_before = tree::root(&log);
         let count_before = tree::event_count(&log);
 
-        let _cp = generate_checkpoint(&log, &did, 1, &custody, &key)
-            .await
-            .unwrap();
+        let _cp = generate_checkpoint(&log, &did, 1, &signer).await.unwrap();
 
         assert_eq!(tree::root(&log), root_before);
         assert_eq!(tree::event_count(&log), count_before);
@@ -2721,13 +2357,12 @@ mod tests {
         };
         let mut mgr = CheckpointManager::new(policy, 1_000_000);
         let (log, _, did) = build_log(5);
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         mgr.record_event();
 
         let result = mgr
-            .maybe_create_checkpoint(&log, &did, 1, 2_000_000, &custody, &key)
+            .maybe_create_checkpoint(&log, &did, 1, 2_000_000, &signer)
             .await
             .unwrap();
 
@@ -2741,11 +2376,10 @@ mod tests {
 
     #[tokio::test]
     async fn pruned_proof_path_length_is_logarithmic() {
-        let custody = InMemoryKeyCustody::new();
-        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signer = TestSigner::new();
 
         let (log_16, _, did) = build_log(16);
-        let cp_16 = generate_checkpoint_at(&log_16, &did, 1, 1_000_000, &custody, &key)
+        let cp_16 = generate_checkpoint_at(&log_16, &did, 1, 1_000_000, &signer)
             .await
             .unwrap();
         let truncated_16 = TruncatedEventLog::from_log_and_checkpoint(&log_16, cp_16).unwrap();
@@ -2754,7 +2388,7 @@ mod tests {
         assert_eq!(proof_16.path.len(), 4);
 
         let (log_8, _, did2) = build_log(8);
-        let cp_8 = generate_checkpoint_at(&log_8, &did2, 1, 1_000_000, &custody, &key)
+        let cp_8 = generate_checkpoint_at(&log_8, &did2, 1, 1_000_000, &signer)
             .await
             .unwrap();
         let truncated_8 = TruncatedEventLog::from_log_and_checkpoint(&log_8, cp_8).unwrap();
