@@ -131,56 +131,6 @@ impl<D: DhtClient> DidDht<D, SystemClock> {
     }
 }
 
-/// Extracts the 32-byte public key from a `did:dht:z...` string.
-///
-/// Free function equivalent of [`DidDht::extract_public_key`] for use by
-/// modules that don't have a concrete `DidDht` instance.
-pub(crate) fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
-    let encoded = did_string
-        .strip_prefix(DID_DHT_PREFIX)
-        .and_then(|s| s.strip_prefix('z'))
-        .ok_or_else(|| {
-            IdentityError::InvalidDidFormat(format!(
-                "expected 'did:dht:z...' prefix, got: {did_string}"
-            ))
-        })?;
-
-    let decoded = zbase32::decode(encoded).map_err(|e| {
-        IdentityError::ZBase32DecodeError(format!("z-base-32 decode failed: {e}"))
-    })?;
-
-    let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-        IdentityError::InvalidDidFormat(format!(
-            "expected 32-byte public key, got {} bytes",
-            v.len()
-        ))
-    })?;
-
-    Ok(key_bytes)
-}
-
-/// Verifies a BEP44 Ed25519 signature over the given value and sequence.
-///
-/// Free function equivalent of [`DidDht::verify_bep44_signature`] for use by
-/// modules that don't have a concrete `DidDht` instance.
-pub(crate) fn verify_bep44_signature(
-    public_key: &[u8; 32],
-    signature: &[u8; 64],
-    value: &[u8],
-    seq: u64,
-) -> Result<(), IdentityError> {
-    let verifying_key = VerifyingKey::from_bytes(public_key).map_err(|e| {
-        IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}"))
-    })?;
-
-    let sig = ed25519_dalek::Signature::from_bytes(signature);
-    let payload = DidDht::<InMemoryDhtClient, SystemClock>::bep44_signable(value, seq);
-
-    verifying_key.verify_strict(&payload, &sig).map_err(|e| {
-        IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
-    })
-}
-
 impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// Creates a new `DidDht` instance with a specific DHT client, cache, and
     /// signing function.
@@ -245,76 +195,29 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 
     /// Constructs the BEP44 signable payload for a value and sequence number.
     ///
-    /// BEP44 signing payload format:
-    /// `"4:salt" + salt_len + ":" + salt + "3:seqi" + seq + "e1:v" + val_len + ":" + val`
-    ///
-    /// For did:dht, salt is not used, so the payload is:
-    /// `"3:seqi" + seq + "e1:v" + val_len + ":" + val`
+    /// Delegates to the standalone [`bep44_signable`] function.
     #[must_use]
     pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-        // BEP44 mutable item signable: "3:seqi<seq>e1:v<len>:<val>"
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"3:seqi");
-        payload.extend_from_slice(seq.to_string().as_bytes());
-        payload.extend_from_slice(b"e1:v");
-        payload.extend_from_slice(value.len().to_string().as_bytes());
-        payload.extend_from_slice(b":");
-        payload.extend_from_slice(value);
-        payload
+        bep44_signable(value, seq)
     }
 
     /// Verifies a BEP44 Ed25519 signature over the given value and sequence.
     ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Bep44SignatureInvalid`] if the signature does
-    /// not verify.
-    pub(crate) fn verify_bep44_signature(
+    /// Delegates to the standalone [`verify_bep44_signature`] function.
+    fn verify_bep44_signature(
         public_key: &[u8; 32],
         signature: &[u8; 64],
         value: &[u8],
         seq: u64,
     ) -> Result<(), IdentityError> {
-        let verifying_key = VerifyingKey::from_bytes(public_key).map_err(|e| {
-            IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}"))
-        })?;
-
-        let sig = ed25519_dalek::Signature::from_bytes(signature);
-        let payload = Self::bep44_signable(value, seq);
-
-        verifying_key.verify_strict(&payload, &sig).map_err(|e| {
-            IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
-        })
+        verify_bep44_signature(public_key, signature, value, seq)
     }
 
     /// Extracts the 32-byte public key from a `did:dht:z...` string.
     ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::InvalidDidFormat`] if the DID format is wrong
-    /// or z-base-32 decoding fails.
-    pub(crate) fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
-        let encoded = did_string
-            .strip_prefix(DID_DHT_PREFIX)
-            .and_then(|s| s.strip_prefix('z'))
-            .ok_or_else(|| {
-                IdentityError::InvalidDidFormat(format!(
-                    "expected 'did:dht:z...' prefix, got: {did_string}"
-                ))
-            })?;
-
-        let decoded = zbase32::decode(encoded).map_err(|e| {
-            IdentityError::ZBase32DecodeError(format!("z-base-32 decode failed: {e}"))
-        })?;
-
-        let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-            IdentityError::InvalidDidFormat(format!(
-                "expected 32-byte public key, got {} bytes",
-                v.len()
-            ))
-        })?;
-
-        Ok(key_bytes)
+    /// Delegates to the standalone [`extract_public_key`] function.
+    fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
+        extract_public_key(did_string)
     }
 
     /// Publishes a DID document to the DHT with the given signing function.
@@ -1075,6 +978,120 @@ pub fn verify_migration(
     }
 
     Ok(true)
+}
+
+/// Decodes a lowercase hexadecimal string to bytes.
+///
+/// # Errors
+///
+/// Returns an error if the string length is odd or contains non-hex characters.
+fn hex_decode(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", hex.len()));
+    }
+
+    let mut result = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])
+            .ok_or_else(|| format!("invalid hex character: {}", chunk[0] as char))?;
+        let lo = hex_nibble(chunk[1])
+            .ok_or_else(|| format!("invalid hex character: {}", chunk[1] as char))?;
+        result[i] = (hi << 4) | lo;
+    }
+    Ok(result)
+}
+
+/// Converts a single hex ASCII byte to its numeric value (0-15).
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BEP44 utility functions — public for use by relay-based resolution (§3.10.2)
+// ---------------------------------------------------------------------------
+
+/// Constructs the BEP44 signable payload for a value and sequence number.
+///
+/// BEP44 signing payload format (without salt):
+/// `"3:seqi" + seq + "e1:v" + val_len + ":" + val`
+///
+/// This is a standalone function usable from both [`DidDht`] and relay-based
+/// resolution (§3.10.2).
+#[must_use]
+pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"3:seqi");
+    payload.extend_from_slice(seq.to_string().as_bytes());
+    payload.extend_from_slice(b"e1:v");
+    payload.extend_from_slice(value.len().to_string().as_bytes());
+    payload.extend_from_slice(b":");
+    payload.extend_from_slice(value);
+    payload
+}
+
+/// Verifies a BEP44 Ed25519 signature over the given value and sequence.
+///
+/// Constructs the BEP44 signable payload, then verifies the Ed25519 signature
+/// against `public_key`. Used by both DHT resolution and relay-based resolution
+/// (§3.10.2).
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Bep44SignatureInvalid`] if the signature does
+/// not verify or the public key is invalid.
+pub fn verify_bep44_signature(
+    public_key: &[u8; 32],
+    signature: &[u8; 64],
+    value: &[u8],
+    seq: u64,
+) -> Result<(), IdentityError> {
+    let verifying_key = VerifyingKey::from_bytes(public_key)
+        .map_err(|e| IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}")))?;
+
+    let sig = ed25519_dalek::Signature::from_bytes(signature);
+    let payload = bep44_signable(value, seq);
+
+    verifying_key.verify_strict(&payload, &sig).map_err(|e| {
+        IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
+    })
+}
+
+/// Extracts the 32-byte Ed25519 public key from a `did:dht:z...` string.
+///
+/// Strips the `did:dht:z` prefix and z-base-32 decodes the remainder to recover
+/// the 32-byte Identity Key public key. Used by both DHT resolution and
+/// relay-based resolution (§3.10.2).
+///
+/// # Errors
+///
+/// Returns [`IdentityError::InvalidDidFormat`] if the DID format is wrong
+/// or z-base-32 decoding fails, or if the decoded bytes are not 32 bytes.
+pub fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
+    let encoded = did_string
+        .strip_prefix(DID_DHT_PREFIX)
+        .and_then(|s| s.strip_prefix('z'))
+        .ok_or_else(|| {
+            IdentityError::InvalidDidFormat(format!(
+                "expected 'did:dht:z...' prefix, got: {did_string}"
+            ))
+        })?;
+
+    let decoded = zbase32::decode(encoded)
+        .map_err(|e| IdentityError::ZBase32DecodeError(format!("z-base-32 decode failed: {e}")))?;
+
+    let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+        IdentityError::InvalidDidFormat(format!(
+            "expected 32-byte public key, got {} bytes",
+            v.len()
+        ))
+    })?;
+
+    Ok(key_bytes)
 }
 
 #[cfg(test)]

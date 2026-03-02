@@ -1,8 +1,12 @@
 //! Automatic DID document republishing for active identities.
 //!
-//! Mainline DHT records expire if not refreshed. The [`RepublishManager`]
-//! manages background tokio tasks that periodically republish DID documents
-//! to keep them resolvable.
+//! DID documents are published to both SCP relays and Mainline DHT to ensure
+//! maximum reachability (anti-segmentation invariant, §3.10.6). The
+//! [`RepublishManager`] manages background tokio tasks for both layers:
+//!
+//! - **DHT layer**: 2-hour republish cycle (Mainline DHT records expire).
+//! - **Relay layer**: 6-day republish cycle (relay blob TTL is 7 days,
+//!   1-day safety margin per §3.10.2).
 //!
 //! # Lifecycle
 //!
@@ -16,6 +20,12 @@
 //! at 30 minutes. After 6 consecutive failures, a [`DhtPublishDegraded`]
 //! warning is emitted via the warning callback.
 //!
+//! # Anti-Segmentation Invariant (§3.10.6)
+//!
+//! Publishing to both layers is a MUST. Disabling either requires explicit
+//! opt-out via [`RepublishConfig`] and logs a warning:
+//! "DID resolution layer disabled. This identity may not be resolvable by all peers."
+//!
 //! See ADR-003 in `.docs/adrs/phase-1.md` for the full design.
 
 use std::collections::HashMap;
@@ -23,10 +33,21 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use super::IdentityError;
 use super::dht_client::DhtClient;
+use super::resolution::did_routing_id;
 
-/// Republish interval: every 2 hours (in seconds).
+/// Republish interval for DHT: every 2 hours (in seconds).
 pub const REPUBLISH_INTERVAL_SECS: u64 = 2 * 60 * 60;
+
+/// Republish interval for SCP relays: every 6 days (in seconds).
+///
+/// Relay blob TTL is 604800 seconds (7 days). Republishing every 6 days
+/// provides a 1-day safety margin before TTL expiry (§3.10.2).
+pub const RELAY_REPUBLISH_INTERVAL_SECS: u64 = 6 * 24 * 60 * 60;
+
+/// Relay blob TTL: 7 days (in seconds), per §3.10.2.
+pub const RELAY_BLOB_TTL_SECS: u64 = 604_800;
 
 /// Initial backoff on failure: 30 seconds.
 const INITIAL_BACKOFF_SECS: u64 = 30;
@@ -36,6 +57,226 @@ const MAX_BACKOFF_SECS: u64 = 30 * 60;
 
 /// Number of consecutive failures before emitting a degraded warning.
 const DEGRADED_THRESHOLD: u32 = 6;
+
+/// Anti-segmentation warning logged when a publishing layer is disabled.
+const LAYER_DISABLED_WARNING: &str =
+    "DID resolution layer disabled. This identity may not be resolvable by all peers.";
+
+// ---------------------------------------------------------------------------
+// RelayPublisher trait
+// ---------------------------------------------------------------------------
+
+/// Abstraction over SCP relay PUBLISH operations for DID documents (§3.10.2).
+///
+/// Production implementations wrap the relay client from `scp-transport`.
+/// The [`InMemoryRelayPublisher`] provides a test implementation that records
+/// all PUBLISH operations for assertion.
+///
+/// `scp-core` defines the trait; `scp-transport` implements it. This avoids
+/// a direct dependency from `scp-core` to `scp-transport`.
+pub trait RelayPublisher: Send + Sync {
+    /// Publishes a blob to SCP relays with the given routing ID and TTL.
+    ///
+    /// Corresponds to the PUBLISH operation defined in ADR-004:
+    /// ```text
+    /// PUBLISH {
+    ///     routing_id: <32-byte hash>,
+    ///     blob_ttl: <seconds>,
+    ///     blob: <BEP44-signed DID document bytes>,
+    /// }
+    /// ```
+    ///
+    /// Implementations SHOULD publish to the identity's own relays plus
+    /// bootstrap relays from the fallback relay list (§18.5.1).
+    ///
+    /// # Arguments
+    ///
+    /// * `routing_id` — The 32-byte routing ID derived via [`did_routing_id`].
+    /// * `blob_ttl` — TTL in seconds (604800 for DID documents).
+    /// * `blob` — The BEP44-signed DID document bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::RelayPublishFailed`] if the publish fails.
+    fn publish(
+        &self,
+        routing_id: &[u8; 32],
+        blob_ttl: u64,
+        blob: &[u8],
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryRelayPublisher (test double)
+// ---------------------------------------------------------------------------
+
+/// A recorded PUBLISH operation for test assertions.
+#[derive(Debug, Clone)]
+pub struct RecordedRelayPublish {
+    /// The routing ID used in the PUBLISH operation.
+    pub routing_id: [u8; 32],
+    /// The blob TTL used in the PUBLISH operation.
+    pub blob_ttl: u64,
+    /// The blob bytes sent in the PUBLISH operation.
+    pub blob: Vec<u8>,
+}
+
+/// In-memory relay publisher for testing.
+///
+/// Records all PUBLISH operations so tests can inspect routing IDs, TTLs,
+/// and blob contents without network access.
+#[derive(Debug, Default)]
+pub struct InMemoryRelayPublisher {
+    /// All recorded PUBLISH operations, in order.
+    publishes: Mutex<Vec<RecordedRelayPublish>>,
+}
+
+impl InMemoryRelayPublisher {
+    /// Creates a new empty in-memory relay publisher.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            publishes: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Returns a snapshot of all recorded PUBLISH operations.
+    pub async fn recorded_publishes(&self) -> Vec<RecordedRelayPublish> {
+        let publishes = self.publishes.lock().await;
+        publishes.clone()
+    }
+
+    /// Clears all recorded PUBLISH operations.
+    pub async fn clear(&self) {
+        let mut publishes = self.publishes.lock().await;
+        publishes.clear();
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl RelayPublisher for InMemoryRelayPublisher {
+    fn publish(
+        &self,
+        routing_id: &[u8; 32],
+        blob_ttl: u64,
+        blob: &[u8],
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        async move {
+            let mut publishes = self.publishes.lock().await;
+            publishes.push(RecordedRelayPublish {
+                routing_id: *routing_id,
+                blob_ttl,
+                blob: blob.to_vec(),
+            });
+            drop(publishes);
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RepublishConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for which publishing layers are enabled.
+///
+/// By default, both DHT and relay layers are enabled per the anti-segmentation
+/// invariant (§3.10.6). Disabling either layer requires explicit opt-out and
+/// the SDK logs a warning.
+#[derive(Clone)]
+pub struct RepublishConfig {
+    /// Whether DHT publishing is enabled.
+    dht_enabled: bool,
+    /// Whether relay publishing is enabled.
+    relay_enabled: bool,
+    /// Warning callback invoked when a layer is disabled.
+    #[allow(clippy::type_complexity)]
+    layer_disabled_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for RepublishConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepublishConfig")
+            .field("dht_enabled", &self.dht_enabled)
+            .field("relay_enabled", &self.relay_enabled)
+            .field(
+                "layer_disabled_callback",
+                &self.layer_disabled_callback.as_ref().map(|_| "..."),
+            )
+            .finish()
+    }
+}
+
+impl Default for RepublishConfig {
+    fn default() -> Self {
+        Self {
+            dht_enabled: true,
+            relay_enabled: true,
+            layer_disabled_callback: None,
+        }
+    }
+}
+
+impl RepublishConfig {
+    /// Creates a default config with both layers enabled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the callback invoked when a layer is disabled.
+    ///
+    /// The callback receives the warning message string. In production,
+    /// this would typically log via `tracing::warn!` or equivalent.
+    #[must_use]
+    pub fn with_layer_disabled_callback(
+        mut self,
+        callback: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        self.layer_disabled_callback = Some(callback);
+        self
+    }
+
+    /// Disables DHT publishing.
+    ///
+    /// **WARNING:** This violates the anti-segmentation invariant (§3.10.6).
+    /// The identity may not be resolvable by peers that only check the DHT.
+    /// A warning is logged via the configured callback.
+    pub fn disable_dht(&mut self) {
+        self.dht_enabled = false;
+        if let Some(ref cb) = self.layer_disabled_callback {
+            cb(LAYER_DISABLED_WARNING);
+        }
+    }
+
+    /// Disables relay publishing.
+    ///
+    /// **WARNING:** This violates the anti-segmentation invariant (§3.10.6).
+    /// The identity may not be resolvable by peers that only check SCP relays.
+    /// A warning is logged via the configured callback.
+    pub fn disable_relay(&mut self) {
+        self.relay_enabled = false;
+        if let Some(ref cb) = self.layer_disabled_callback {
+            cb(LAYER_DISABLED_WARNING);
+        }
+    }
+
+    /// Returns whether DHT publishing is enabled.
+    #[must_use]
+    pub const fn is_dht_enabled(&self) -> bool {
+        self.dht_enabled
+    }
+
+    /// Returns whether relay publishing is enabled.
+    #[must_use]
+    pub const fn is_relay_enabled(&self) -> bool {
+        self.relay_enabled
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Warning types
+// ---------------------------------------------------------------------------
 
 /// Information needed to republish a DID document.
 #[derive(Debug, Clone)]
@@ -64,27 +305,42 @@ pub struct DhtPublishDegraded {
 /// Callback type for degraded warnings.
 pub type WarningCallback = Arc<dyn Fn(DhtPublishDegraded) + Send + Sync>;
 
-/// Manages background republishing of DID documents on the DHT.
+// ---------------------------------------------------------------------------
+// RepublishManager
+// ---------------------------------------------------------------------------
+
+/// Manages background republishing of DID documents on both DHT and SCP relays.
 ///
-/// Each registered identity gets a background tokio task that republishes
-/// its DID document every 2 hours. The manager tracks all active tasks
-/// and provides methods to start, stop, and shut down republishing.
+/// Each registered identity gets background tokio tasks that republish its DID
+/// document on the configured layers:
+/// - **DHT**: every 2 hours (existing cycle, unchanged).
+/// - **Relay**: every 6 days (blob TTL is 7 days, 1-day margin per §3.10.2).
+///
+/// Both layers are enabled by default per the anti-segmentation invariant
+/// (§3.10.6). Use [`RepublishConfig`] to disable either layer (with warnings).
 ///
 /// # Type Parameters
 ///
 /// * `D` — The DHT client implementation. Use [`InMemoryDhtClient`] for
 ///   testing, or a production pkarr-based client for real DHT access.
-pub struct RepublishManager<D: DhtClient> {
+/// * `R` — The relay publisher implementation. Use [`InMemoryRelayPublisher`]
+///   for testing, or a production relay client for real relay access.
+pub struct RepublishManager<D: DhtClient, R: RelayPublisher = InMemoryRelayPublisher> {
     dht_client: Arc<D>,
-    /// Active republish tasks, keyed by DID string.
-    tasks: Mutex<HashMap<String, TaskHandle>>,
+    relay_publisher: Option<Arc<R>>,
+    config: RepublishConfig,
+    /// Active DHT republish tasks, keyed by DID string.
+    dht_tasks: Mutex<HashMap<String, TaskHandle>>,
+    /// Active relay republish tasks, keyed by DID string.
+    relay_tasks: Mutex<HashMap<String, TaskHandle>>,
     /// Optional callback for degraded warnings.
     warning_callback: Option<WarningCallback>,
 }
 
-impl<D: DhtClient> std::fmt::Debug for RepublishManager<D> {
+impl<D: DhtClient, R: RelayPublisher> std::fmt::Debug for RepublishManager<D, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RepublishManager")
+            .field("config", &self.config)
             .field(
                 "warning_callback",
                 &self.warning_callback.as_ref().map(|_| "..."),
@@ -100,79 +356,173 @@ struct TaskHandle {
 }
 
 impl<D: DhtClient + 'static> RepublishManager<D> {
-    /// Creates a new republish manager with the given DHT client.
+    /// Creates a new republish manager with DHT-only publishing.
+    ///
+    /// Relay publishing is not available until a [`RelayPublisher`] is provided
+    /// via [`with_relay_publisher`](RepublishManager::with_relay_publisher).
     #[must_use]
     pub fn new(dht_client: Arc<D>) -> Self {
         Self {
             dht_client,
-            tasks: Mutex::new(HashMap::new()),
+            relay_publisher: None,
+            config: RepublishConfig::default(),
+            dht_tasks: Mutex::new(HashMap::new()),
+            relay_tasks: Mutex::new(HashMap::new()),
             warning_callback: None,
         }
     }
 
-    /// Creates a new republish manager with a warning callback.
+    /// Creates a new republish manager with a warning callback (DHT-only).
     #[must_use]
     pub fn with_warning_callback(dht_client: Arc<D>, callback: WarningCallback) -> Self {
         Self {
             dht_client,
-            tasks: Mutex::new(HashMap::new()),
+            relay_publisher: None,
+            config: RepublishConfig::default(),
+            dht_tasks: Mutex::new(HashMap::new()),
+            relay_tasks: Mutex::new(HashMap::new()),
+            warning_callback: Some(callback),
+        }
+    }
+}
+
+impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R> {
+    /// Creates a new republish manager with both DHT and relay publishing.
+    #[must_use]
+    pub fn with_relay_publisher(
+        dht_client: Arc<D>,
+        relay_publisher: Arc<R>,
+        config: RepublishConfig,
+    ) -> Self {
+        Self {
+            dht_client,
+            relay_publisher: Some(relay_publisher),
+            config,
+            dht_tasks: Mutex::new(HashMap::new()),
+            relay_tasks: Mutex::new(HashMap::new()),
+            warning_callback: None,
+        }
+    }
+
+    /// Creates a new republish manager with both DHT and relay publishing,
+    /// plus a warning callback for degraded DHT publish events.
+    #[must_use]
+    pub fn with_relay_publisher_and_warning(
+        dht_client: Arc<D>,
+        relay_publisher: Arc<R>,
+        config: RepublishConfig,
+        callback: WarningCallback,
+    ) -> Self {
+        Self {
+            dht_client,
+            relay_publisher: Some(relay_publisher),
+            config,
+            dht_tasks: Mutex::new(HashMap::new()),
+            relay_tasks: Mutex::new(HashMap::new()),
             warning_callback: Some(callback),
         }
     }
 
-    /// Starts republishing a DID document.
+    /// Starts republishing a DID document on all enabled layers.
     ///
-    /// Performs an immediate publish, then schedules periodic republishing
-    /// every 2 hours. If the DID is already being republished, the existing
-    /// task is replaced.
+    /// - **DHT** (if enabled): immediate publish, then every 2 hours.
+    /// - **Relay** (if enabled and publisher configured): immediate publish,
+    ///   then every 6 days.
+    ///
+    /// If the DID is already being republished, existing tasks are replaced.
     pub async fn start_republishing(&self, entry: RepublishEntry) {
-        let mut tasks = self.tasks.lock().await;
+        // Start DHT republish task if enabled.
+        if self.config.dht_enabled {
+            let mut dht_tasks = self.dht_tasks.lock().await;
 
-        // Stop existing task if any.
-        if let Some(handle) = tasks.remove(&entry.did) {
-            handle.abort_handle.abort();
+            if let Some(handle) = dht_tasks.remove(&entry.did) {
+                handle.abort_handle.abort();
+            }
+
+            let dht_client = Arc::clone(&self.dht_client);
+            let warning_cb = self.warning_callback.clone();
+            let did = entry.did.clone();
+            let entry_clone = entry.clone();
+
+            let join_handle = tokio::spawn(dht_republish_loop(dht_client, entry_clone, warning_cb));
+
+            dht_tasks.insert(
+                did,
+                TaskHandle {
+                    abort_handle: join_handle.abort_handle(),
+                },
+            );
         }
 
-        let dht_client = Arc::clone(&self.dht_client);
-        let warning_cb = self.warning_callback.clone();
-        let did = entry.did.clone();
+        // Start relay republish task if enabled and publisher is configured.
+        if self.config.relay_enabled
+            && let Some(ref relay_publisher) = self.relay_publisher
+        {
+            let mut relay_tasks = self.relay_tasks.lock().await;
 
-        let join_handle = tokio::spawn(republish_loop(dht_client, entry, warning_cb));
+            if let Some(handle) = relay_tasks.remove(&entry.did) {
+                handle.abort_handle.abort();
+            }
 
-        tasks.insert(
-            did,
-            TaskHandle {
-                abort_handle: join_handle.abort_handle(),
-            },
-        );
+            let relay_pub = Arc::clone(relay_publisher);
+            let did = entry.did.clone();
+
+            let join_handle = tokio::spawn(relay_republish_loop(relay_pub, entry));
+
+            relay_tasks.insert(
+                did,
+                TaskHandle {
+                    abort_handle: join_handle.abort_handle(),
+                },
+            );
+        }
     }
 
-    /// Stops republishing a specific DID.
+    /// Stops republishing a specific DID on all layers.
     pub async fn stop_republishing(&self, did: &str) {
-        let mut tasks = self.tasks.lock().await;
-        if let Some(handle) = tasks.remove(did) {
+        let mut dht_tasks = self.dht_tasks.lock().await;
+        if let Some(handle) = dht_tasks.remove(did) {
+            handle.abort_handle.abort();
+        }
+        drop(dht_tasks);
+
+        let mut relay_tasks = self.relay_tasks.lock().await;
+        if let Some(handle) = relay_tasks.remove(did) {
             handle.abort_handle.abort();
         }
     }
 
-    /// Stops all republishing tasks (shutdown).
+    /// Stops all republishing tasks on all layers (shutdown).
     pub async fn stop_all(&self) {
-        let mut tasks = self.tasks.lock().await;
-        for (_, handle) in tasks.drain() {
+        let mut dht_tasks = self.dht_tasks.lock().await;
+        for (_, handle) in dht_tasks.drain() {
+            handle.abort_handle.abort();
+        }
+        drop(dht_tasks);
+
+        let mut relay_tasks = self.relay_tasks.lock().await;
+        for (_, handle) in relay_tasks.drain() {
             handle.abort_handle.abort();
         }
     }
 
-    /// Returns the number of active republish tasks.
+    /// Returns the number of active DHT republish tasks.
     pub async fn active_count(&self) -> usize {
-        let tasks = self.tasks.lock().await;
-        tasks.len()
+        let dht_tasks = self.dht_tasks.lock().await;
+        dht_tasks.len()
     }
 
-    /// Returns whether a specific DID is being republished.
+    /// Returns the number of active relay republish tasks.
+    pub async fn active_relay_count(&self) -> usize {
+        let relay_tasks = self.relay_tasks.lock().await;
+        relay_tasks.len()
+    }
+
+    /// Returns whether a specific DID is being republished (on any layer).
     pub async fn is_republishing(&self, did: &str) -> bool {
-        let tasks = self.tasks.lock().await;
-        tasks.contains_key(did)
+        let dht_tasks = self.dht_tasks.lock().await;
+        let relay_tasks = self.relay_tasks.lock().await;
+        dht_tasks.contains_key(did) || relay_tasks.contains_key(did)
     }
 }
 
@@ -184,11 +534,11 @@ fn backoff_secs(attempt: u32) -> u64 {
     backoff.min(MAX_BACKOFF_SECS)
 }
 
-/// The main republish loop for a single identity.
+/// The DHT republish loop for a single identity.
 ///
-/// Publishes immediately, then waits for the republish interval before
-/// the next publish. On failure, retries with exponential backoff.
-async fn republish_loop<D: DhtClient>(
+/// Publishes immediately, then waits for the DHT republish interval (2 hours)
+/// before the next publish. On failure, retries with exponential backoff.
+async fn dht_republish_loop<D: DhtClient>(
     dht_client: Arc<D>,
     entry: RepublishEntry,
     warning_cb: Option<WarningCallback>,
@@ -224,6 +574,38 @@ async fn republish_loop<D: DhtClient>(
             }
 
             // Backoff before retry.
+            let backoff = backoff_secs(consecutive_failures.saturating_sub(1));
+            tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+        }
+    }
+}
+
+/// The relay republish loop for a single identity.
+///
+/// Publishes immediately using the PUBLISH operation with:
+/// - `routing_id` = `did_routing_id(did_string)` (§3.10.2)
+/// - `blob_ttl` = 604800 (7 days, §3.10.2)
+/// - `blob` = BEP44-signed DID document bytes
+///
+/// Then waits for the relay republish interval (6 days) before the next
+/// publish. On failure, retries with exponential backoff.
+async fn relay_republish_loop<R: RelayPublisher>(relay_publisher: Arc<R>, entry: RepublishEntry) {
+    let routing_id = did_routing_id(&entry.did);
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        let result = relay_publisher
+            .publish(&routing_id, RELAY_BLOB_TTL_SECS, &entry.document_bytes)
+            .await;
+
+        if result.is_ok() {
+            consecutive_failures = 0;
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                RELAY_REPUBLISH_INTERVAL_SECS,
+            ))
+            .await;
+        } else {
+            consecutive_failures = consecutive_failures.saturating_add(1);
             let backoff = backoff_secs(consecutive_failures.saturating_sub(1));
             tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
         }
@@ -338,6 +720,7 @@ async fn migration_republish_loop<D: DhtClient>(
 mod tests {
     use super::*;
     use crate::dht_client::InMemoryDhtClient;
+    use crate::resolution::did_routing_id;
 
     fn make_entry(did: &str) -> RepublishEntry {
         RepublishEntry {
@@ -364,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn start_and_stop_republishing() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
         let entry = make_entry("did:dht:zTest1");
 
         manager.start_republishing(entry).await;
@@ -385,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn stop_all_clears_all_tasks() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
 
         manager
             .start_republishing(make_entry("did:dht:zTest1"))
@@ -402,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn replacing_existing_task_aborts_old_one() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
 
         manager
             .start_republishing(make_entry("did:dht:zTest1"))
@@ -418,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn immediate_publish_on_start() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
         let entry = make_entry("did:dht:zTest1");
 
         manager.start_republishing(entry).await;
@@ -431,6 +814,192 @@ mod tests {
         assert_eq!(record.unwrap().seq, 1);
 
         manager.stop_all().await;
+    }
+
+    // --- Relay publish tests (SCP-239) ---
+
+    #[tokio::test]
+    async fn relay_publish_uses_correct_routing_id_and_ttl() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(InMemoryRelayPublisher::new());
+        let config = RepublishConfig::new();
+
+        let manager =
+            RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
+
+        let did_str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let entry = RepublishEntry {
+            did: did_str.to_owned(),
+            public_key: [1u8; 32],
+            document_bytes: b"BEP44-signed DID document".to_vec(),
+            signature: [2u8; 64],
+            sequence: 1,
+        };
+
+        manager.start_republishing(entry).await;
+
+        // Give both tasks time to do their first publish.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Verify relay PUBLISH was sent with correct routing_id and blob_ttl.
+        let publishes = relay.recorded_publishes().await;
+        assert_eq!(publishes.len(), 1, "exactly one relay PUBLISH expected");
+
+        let publish = &publishes[0];
+        let expected_routing_id = did_routing_id(did_str);
+        assert_eq!(
+            publish.routing_id, expected_routing_id,
+            "routing_id must be SHA-256('scp:did:' || did_string)"
+        );
+        assert_eq!(
+            publish.blob_ttl, RELAY_BLOB_TTL_SECS,
+            "blob_ttl must be 604800 (7 days)"
+        );
+        assert_eq!(
+            publish.blob, b"BEP44-signed DID document",
+            "blob must be the BEP44-signed DID document bytes"
+        );
+
+        // Verify DHT publish also happened.
+        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap();
+        assert!(
+            dht_record.is_some(),
+            "DHT publish should also have occurred"
+        );
+
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn relay_publish_blob_ttl_is_seven_days() {
+        // Acceptance criterion: blob_ttl = 604800 (7 days).
+        assert_eq!(RELAY_BLOB_TTL_SECS, 604_800);
+    }
+
+    #[tokio::test]
+    async fn relay_republish_interval_is_six_days() {
+        // Acceptance criterion: republish timer fires at 6-day interval.
+        assert_eq!(RELAY_REPUBLISH_INTERVAL_SECS, 6 * 24 * 60 * 60);
+        assert_eq!(RELAY_REPUBLISH_INTERVAL_SECS, 518_400);
+    }
+
+    #[tokio::test]
+    async fn relay_and_dht_tasks_managed_independently() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(InMemoryRelayPublisher::new());
+        let config = RepublishConfig::new();
+
+        let manager =
+            RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
+
+        let entry = make_entry("did:dht:zTest1");
+        manager.start_republishing(entry).await;
+
+        assert_eq!(manager.active_count().await, 1, "one DHT task");
+        assert_eq!(manager.active_relay_count().await, 1, "one relay task");
+
+        manager.stop_all().await;
+
+        assert_eq!(manager.active_count().await, 0, "DHT tasks cleared");
+        assert_eq!(manager.active_relay_count().await, 0, "relay tasks cleared");
+    }
+
+    #[tokio::test]
+    async fn disable_dht_skips_dht_publishing() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(InMemoryRelayPublisher::new());
+
+        let warnings: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warnings_clone = Arc::clone(&warnings);
+
+        let mut config =
+            RepublishConfig::new().with_layer_disabled_callback(Arc::new(move |msg: &str| {
+                let mut w = warnings_clone.lock().unwrap();
+                w.push(msg.to_owned());
+            }));
+        config.disable_dht();
+
+        let manager =
+            RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
+
+        let entry = make_entry("did:dht:zTest1");
+        manager.start_republishing(entry).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // DHT should NOT have been published to.
+        assert_eq!(manager.active_count().await, 0, "no DHT tasks");
+        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap();
+        assert!(dht_record.is_none(), "DHT should have no records");
+
+        // Relay SHOULD have been published to.
+        assert_eq!(manager.active_relay_count().await, 1, "one relay task");
+        let publishes = relay.recorded_publishes().await;
+        assert_eq!(publishes.len(), 1, "relay publish should have occurred");
+
+        // Warning should have been logged.
+        let logged_warnings = warnings.lock().unwrap();
+        assert_eq!(logged_warnings.len(), 1);
+        assert_eq!(logged_warnings[0], LAYER_DISABLED_WARNING);
+        drop(logged_warnings);
+
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn disable_relay_skips_relay_publishing() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(InMemoryRelayPublisher::new());
+
+        let mut config = RepublishConfig::new();
+        config.disable_relay();
+
+        let manager =
+            RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
+
+        let entry = make_entry("did:dht:zTest1");
+        manager.start_republishing(entry).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // DHT SHOULD have been published to.
+        assert_eq!(manager.active_count().await, 1, "one DHT task");
+        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap();
+        assert!(dht_record.is_some(), "DHT should have a record");
+
+        // Relay should NOT have been published to.
+        assert_eq!(manager.active_relay_count().await, 0, "no relay tasks");
+        let publishes = relay.recorded_publishes().await;
+        assert!(
+            publishes.is_empty(),
+            "no relay publishes should have occurred"
+        );
+
+        manager.stop_all().await;
+    }
+
+    #[test]
+    fn config_defaults_to_both_layers_enabled() {
+        let config = RepublishConfig::new();
+        assert!(config.is_dht_enabled());
+        assert!(config.is_relay_enabled());
+    }
+
+    #[test]
+    fn config_disable_dht_sets_flag() {
+        let mut config = RepublishConfig::new();
+        config.disable_dht();
+        assert!(!config.is_dht_enabled());
+        assert!(config.is_relay_enabled());
+    }
+
+    #[test]
+    fn config_disable_relay_sets_flag() {
+        let mut config = RepublishConfig::new();
+        config.disable_relay();
+        assert!(config.is_dht_enabled());
+        assert!(!config.is_relay_enabled());
     }
 
     // --- Migration republisher tests ---
