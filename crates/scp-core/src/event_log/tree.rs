@@ -240,10 +240,6 @@ fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
     )
 }
 
-/// Domain separator for event canonical hashes, preventing cross-protocol
-/// signature confusion. See issue #78.
-const DOMAIN_EVENT_V1: &[u8] = b"SCP-EVENT-V1:";
-
 /// Computes the canonical hash of an event for signature purposes.
 ///
 /// This is the content that must be signed by the actor's Ed25519 key.

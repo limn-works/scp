@@ -989,9 +989,9 @@ pub fn verify_migration(
     rotated_at: u64,
 ) -> Result<bool, IdentityError> {
     // Step 1: Verify the migration proof signature.
-    // Reconstruct the signed digest: SHA-256("SCP-MIGRATION-V1:" || old_did || new_did || rotated_at).
+    // Reconstruct the signed digest: SHA-256(DOMAIN_MIGRATION_V1 || old_did || new_did || rotated_at).
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-MIGRATION-V1:");
+    hasher.update(DOMAIN_MIGRATION_V1);
     hasher.update(old_did.as_bytes());
     hasher.update(new_did.as_bytes());
     hasher.update(rotated_at.to_be_bytes());

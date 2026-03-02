@@ -834,19 +834,6 @@ fn aes128gcm_decrypt(key: &[u8; 16], sealed: &[u8]) -> Result<Vec<u8>, SenderKey
 }
 
 // ---------------------------------------------------------------------------
-// Domain separators (issue #78)
-// ---------------------------------------------------------------------------
-
-/// Domain separator for epoch advance hashes.
-const DOMAIN_EPOCH_ADVANCE_V1: &[u8] = b"SCP-EPOCH-ADVANCE-V1:";
-
-/// Domain separator for key request hashes.
-const DOMAIN_KEY_REQUEST_V1: &[u8] = b"SCP-KEY-REQUEST-V1:";
-
-/// Domain separator for block notification hashes.
-const DOMAIN_BLOCK_NOTIFY_V1: &[u8] = b"SCP-BLOCK-NOTIFY-V1:";
-
-// ---------------------------------------------------------------------------
 // Hash helpers
 // ---------------------------------------------------------------------------
 
