@@ -1305,3 +1305,200 @@ fn inclusion_proof_interoperable_verification() {
         );
     }
 }
+
+// ===========================================================================
+// WASM context registry mirror (verbatim from scp-ffi-wasm/src/runtime.rs)
+//
+// Mirrors the registry functions to validate registration, lookup, and
+// removal semantics. See issue #137.
+// ===========================================================================
+
+mod wasm_registry_mirror {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+
+    /// Minimal mirror of `WasmContextRuntime` — only the fields needed to
+    /// validate registry semantics.
+    pub struct WasmContextRuntime {
+        pub creator_did: String,
+        pub ceiling_strings: HashSet<String>,
+    }
+
+    thread_local! {
+        static CONTEXT_REGISTRY: RefCell<HashMap<String, WasmContextRuntime>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// Mirrors `runtime::register_context` from `scp-ffi-wasm/src/runtime.rs`.
+    pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), String> {
+        CONTEXT_REGISTRY.with(|reg| {
+            let mut map = reg.borrow_mut();
+            if map.contains_key(context_id) {
+                return Err(format!("context '{context_id}' is already registered"));
+            }
+
+            let ceiling_strings: HashSet<String> = [
+                "messages:read",
+                "messages:write",
+                "tool_register:*",
+                "tool_invoke:*",
+                "role_assign:*",
+                "member_invite:*",
+                "member_remove:*",
+                "governance_propose:*",
+                "governance_vote:*",
+                "context_close:*",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+
+            let runtime = WasmContextRuntime {
+                creator_did: creator_did.to_owned(),
+                ceiling_strings,
+            };
+
+            map.insert(context_id.to_owned(), runtime);
+            Ok(())
+        })
+    }
+
+    /// Mirrors `runtime::remove_context` from `scp-ffi-wasm/src/runtime.rs`.
+    pub fn remove_context(context_id: &str) {
+        CONTEXT_REGISTRY.with(|reg| {
+            reg.borrow_mut().remove(context_id);
+        });
+    }
+
+    /// Mirrors `runtime::with_context` from `scp-ffi-wasm/src/runtime.rs`.
+    pub fn with_context<T, F>(context_id: &str, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&mut WasmContextRuntime) -> Result<T, String>,
+    {
+        CONTEXT_REGISTRY.with(|reg| {
+            let mut map = reg.borrow_mut();
+            let rt = map.get_mut(context_id).ok_or_else(|| {
+                format!(
+                    "context '{context_id}' not found in runtime registry \
+                     — was it created with context_create?"
+                )
+            })?;
+            f(rt)
+        })
+    }
+}
+
+// ===========================================================================
+// Test 15: context_create registers context in runtime registry
+// ===========================================================================
+
+#[test]
+fn context_registry_register_then_lookup_succeeds() {
+    let context_id = "ctx-test-register-001";
+    let creator_did = "did:key:test-creator-001";
+
+    // Register the context (mirrors what context_create now does).
+    wasm_registry_mirror::register_context(context_id, creator_did).unwrap();
+
+    // with_context should succeed and return the creator DID.
+    let result = wasm_registry_mirror::with_context(context_id, |rt| Ok(rt.creator_did.clone()));
+    assert_eq!(result.unwrap(), creator_did);
+}
+
+// ===========================================================================
+// Test 16: context_close removes context from runtime registry
+// ===========================================================================
+
+#[test]
+fn context_registry_remove_then_lookup_fails() {
+    let context_id = "ctx-test-remove-001";
+    let creator_did = "did:key:test-creator-002";
+
+    // Register.
+    wasm_registry_mirror::register_context(context_id, creator_did).unwrap();
+
+    // Verify it exists.
+    let result = wasm_registry_mirror::with_context(context_id, |rt| Ok(rt.creator_did.clone()));
+    assert!(result.is_ok());
+
+    // Remove (mirrors what context_close now does).
+    wasm_registry_mirror::remove_context(context_id);
+
+    // with_context should now fail.
+    let result = wasm_registry_mirror::with_context(context_id, |rt| Ok(rt.creator_did.clone()));
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .contains("not found in runtime registry"),
+        "error message should indicate context not found"
+    );
+}
+
+// ===========================================================================
+// Test 17: with_context on nonexistent context fails with appropriate error
+// ===========================================================================
+
+#[test]
+fn context_registry_nonexistent_lookup_fails() {
+    let context_id = "ctx-nonexistent-999";
+
+    let result = wasm_registry_mirror::with_context(context_id, |rt| Ok(rt.creator_did.clone()));
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .contains("not found in runtime registry"),
+        "error message should indicate context not found"
+    );
+}
+
+// ===========================================================================
+// Test 18: duplicate registration is rejected
+// ===========================================================================
+
+#[test]
+fn context_registry_duplicate_registration_rejected() {
+    let context_id = "ctx-test-dup-001";
+    let creator_did = "did:key:test-creator-003";
+
+    // First registration succeeds.
+    wasm_registry_mirror::register_context(context_id, creator_did).unwrap();
+
+    // Second registration with same ID fails.
+    let result = wasm_registry_mirror::register_context(context_id, creator_did);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().contains("already registered"),
+        "error message should indicate duplicate"
+    );
+}
+
+// ===========================================================================
+// Test 19: register populates default capability ceiling
+// ===========================================================================
+
+#[test]
+fn context_registry_default_ceiling_populated() {
+    let context_id = "ctx-test-ceiling-001";
+    let creator_did = "did:key:test-creator-004";
+
+    wasm_registry_mirror::register_context(context_id, creator_did).unwrap();
+
+    let ceiling =
+        wasm_registry_mirror::with_context(context_id, |rt| Ok(rt.ceiling_strings.clone()))
+            .unwrap();
+
+    // Verify the 10 default capabilities.
+    assert!(ceiling.contains("messages:read"));
+    assert!(ceiling.contains("messages:write"));
+    assert!(ceiling.contains("tool_register:*"));
+    assert!(ceiling.contains("tool_invoke:*"));
+    assert!(ceiling.contains("role_assign:*"));
+    assert!(ceiling.contains("member_invite:*"));
+    assert!(ceiling.contains("member_remove:*"));
+    assert!(ceiling.contains("governance_propose:*"));
+    assert!(ceiling.contains("governance_vote:*"));
+    assert!(ceiling.contains("context_close:*"));
+    assert_eq!(ceiling.len(), 10);
+}
