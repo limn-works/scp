@@ -133,30 +133,6 @@ pub struct ClaimRequest {
 }
 
 // ---------------------------------------------------------------------------
-// ClaimResult
-// ---------------------------------------------------------------------------
-
-/// Result of a shadow claiming operation.
-///
-/// See ADR-023 acceptance criteria 7-8.
-#[derive(Debug)]
-pub enum ClaimResult {
-    /// The shadow was successfully claimed and bound to the claimant DID.
-    Success {
-        /// The shadow identity that was claimed.
-        shadow_id: String,
-        /// The DID the shadow is now bound to.
-        claimant_did: DID,
-    },
-
-    /// The claiming operation failed.
-    Failed {
-        /// The reason for failure.
-        reason: ClaimError,
-    },
-}
-
-// ---------------------------------------------------------------------------
 // ShadowClaimEvent
 // ---------------------------------------------------------------------------
 
@@ -465,57 +441,37 @@ fn validate_claim_request(
 pub fn claim_shadow(
     registry: &mut ShadowRegistry,
     request: &ClaimRequest,
-) -> (ClaimResult, Option<ShadowClaimEvent>) {
+) -> Result<ShadowClaimEvent, ClaimError> {
     // 1. Verify the shadow exists.
     let Ok(shadow) = registry.find_shadow_mut(&request.shadow_id) else {
-        return (
-            ClaimResult::Failed {
-                reason: ClaimError::ShadowNotFound {
-                    shadow_id: request.shadow_id.clone(),
-                },
-            },
-            None,
-        );
+        return Err(ClaimError::ShadowNotFound {
+            shadow_id: request.shadow_id.clone(),
+        });
     };
 
     // 2. Verify the shadow is unclaimed (one-way: cannot re-claim).
     if shadow.provenance_status == ShadowProvenanceStatus::Claimed {
-        return (
-            ClaimResult::Failed {
-                reason: ClaimError::AlreadyClaimed {
-                    shadow_id: request.shadow_id.clone(),
-                },
-            },
-            None,
-        );
+        return Err(ClaimError::AlreadyClaimed {
+            shadow_id: request.shadow_id.clone(),
+        });
     }
 
     // 3-8. Validate attestation, handle match, and signatures.
-    if let Err(reason) = validate_claim_request(request, &shadow.platform_handle) {
-        return (ClaimResult::Failed { reason }, None);
-    }
+    validate_claim_request(request, &shadow.platform_handle)?;
 
     // 9. All verifications passed. Retire the shadow by transitioning its
     //    provenance status to Claimed. This is irreversible.
     shadow.provenance_status = ShadowProvenanceStatus::Claimed;
 
     // 10. Produce a ShadowClaimEvent for the Merkle log.
-    let event = ShadowClaimEvent {
+    Ok(ShadowClaimEvent {
         shadow_id: request.shadow_id.clone(),
         claimant_did: request.claimant_did.clone(),
         platform_handle: request.platform_handle.clone(),
         attestation_id: request.identity_attestation.id.clone(),
         context_id: registry.context_id().to_owned(),
         timestamp: request.timestamp,
-    };
-
-    (
-        ClaimResult::Success {
-            shadow_id: request.shadow_id.clone(),
-            claimant_did: request.claimant_did.clone(),
-        },
-        Some(event),
-    )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -672,10 +628,9 @@ mod tests {
         create_test_shadow(&mut registry);
 
         let request = make_default_claim_request();
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let result = claim_shadow(&mut registry, &request);
 
-        assert!(matches!(result, ClaimResult::Success { .. }));
-        assert!(event.is_some());
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -687,18 +642,10 @@ mod tests {
         let did = did_from_pubkey(&verifying_key);
         let attestation = make_identity_attestation(&did, HANDLE, &signing_key);
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
-        let (result, _event) = claim_shadow(&mut registry, &request);
+        let event = claim_shadow(&mut registry, &request).unwrap();
 
-        match result {
-            ClaimResult::Success {
-                shadow_id,
-                claimant_did,
-            } => {
-                assert_eq!(shadow_id, SHADOW_ID);
-                assert_eq!(claimant_did, did.as_str());
-            }
-            ClaimResult::Failed { reason } => panic!("expected success, got: {reason}"),
-        }
+        assert_eq!(event.shadow_id, SHADOW_ID);
+        assert_eq!(event.claimant_did, did.as_str());
     }
 
     #[test]
@@ -713,8 +660,8 @@ mod tests {
         );
 
         let request = make_default_claim_request();
-        let (result, _) = claim_shadow(&mut registry, &request);
-        assert!(matches!(result, ClaimResult::Success { .. }));
+        let result = claim_shadow(&mut registry, &request);
+        assert!(result.is_ok());
 
         // After claiming: status is Claimed.
         assert_eq!(
@@ -732,9 +679,7 @@ mod tests {
         let did = did_from_pubkey(&verifying_key);
         let attestation = make_identity_attestation(&did, HANDLE, &signing_key);
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
-        let (_result, event) = claim_shadow(&mut registry, &request);
-
-        let event = event.expect("expected ShadowClaimEvent");
+        let event = claim_shadow(&mut registry, &request).unwrap();
         assert_eq!(event.shadow_id, SHADOW_ID);
         assert_eq!(event.claimant_did, did.as_str());
         assert_eq!(event.platform_handle, HANDLE);
@@ -753,15 +698,9 @@ mod tests {
         // No shadows created.
 
         let request = make_default_claim_request();
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        match result {
-            ClaimResult::Failed { reason } => {
-                assert!(matches!(reason, ClaimError::ShadowNotFound { .. }));
-            }
-            ClaimResult::Success { .. } => panic!("expected failure"),
-        }
+        assert!(matches!(err, ClaimError::ShadowNotFound { .. }));
     }
 
     #[test]
@@ -779,15 +718,9 @@ mod tests {
             attestation,
             &signing_key,
         );
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        assert!(matches!(
-            result,
-            ClaimResult::Failed {
-                reason: ClaimError::ShadowNotFound { .. }
-            }
-        ));
+        assert!(matches!(err, ClaimError::ShadowNotFound { .. }));
     }
 
     // -------------------------------------------------------------------
@@ -804,20 +737,13 @@ mod tests {
         let did = did_from_pubkey(&verifying_key);
         let attestation = make_identity_attestation(&did, HANDLE, &signing_key);
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
-        let (result, _) = claim_shadow(&mut registry, &request);
-        assert!(matches!(result, ClaimResult::Success { .. }));
+        assert!(claim_shadow(&mut registry, &request).is_ok());
 
         // Second claim fails with AlreadyClaimed.
         let attestation2 = make_identity_attestation(&did, HANDLE, &signing_key);
         let request2 = make_claim_request(SHADOW_ID, &did, HANDLE, attestation2, &signing_key);
-        let (result2, event2) = claim_shadow(&mut registry, &request2);
-        assert!(event2.is_none());
-        match result2 {
-            ClaimResult::Failed { reason } => {
-                assert!(matches!(reason, ClaimError::AlreadyClaimed { .. }));
-            }
-            ClaimResult::Success { .. } => panic!("expected AlreadyClaimed"),
-        }
+        let err = claim_shadow(&mut registry, &request2).unwrap_err();
+        assert!(matches!(err, ClaimError::AlreadyClaimed { .. }));
     }
 
     #[test]
@@ -830,22 +756,15 @@ mod tests {
         let alice_did = did_from_pubkey(&alice_vk);
         let attestation = make_identity_attestation(&alice_did, HANDLE, &alice_sk);
         let request = make_claim_request(SHADOW_ID, &alice_did, HANDLE, attestation, &alice_sk);
-        let (result, _) = claim_shadow(&mut registry, &request);
-        assert!(matches!(result, ClaimResult::Success { .. }));
+        assert!(claim_shadow(&mut registry, &request).is_ok());
 
         // Attempt to re-claim by Bob.
         let (bob_vk, bob_sk) = test_keypair();
         let bob_did = did_from_pubkey(&bob_vk);
         let attestation = make_identity_attestation(&bob_did, HANDLE, &bob_sk);
         let bob_request = make_claim_request(SHADOW_ID, &bob_did, HANDLE, attestation, &bob_sk);
-        let (result2, event2) = claim_shadow(&mut registry, &bob_request);
-        assert!(event2.is_none());
-        assert!(matches!(
-            result2,
-            ClaimResult::Failed {
-                reason: ClaimError::AlreadyClaimed { .. }
-            }
-        ));
+        let err = claim_shadow(&mut registry, &bob_request).unwrap_err();
+        assert!(matches!(err, ClaimError::AlreadyClaimed { .. }));
     }
 
     // -------------------------------------------------------------------
@@ -863,15 +782,9 @@ mod tests {
         let attestation = make_identity_attestation(&did, "@wrong_handle", &signing_key);
         let request =
             make_claim_request(SHADOW_ID, &did, "@wrong_handle", attestation, &signing_key);
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        assert!(matches!(
-            result,
-            ClaimResult::Failed {
-                reason: ClaimError::HandleMismatch
-            }
-        ));
+        assert!(matches!(err, ClaimError::HandleMismatch));
     }
 
     // -------------------------------------------------------------------
@@ -889,15 +802,9 @@ mod tests {
         attestation.attestation_type = AttestationType::Endorsement;
 
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        match result {
-            ClaimResult::Failed { reason } => {
-                assert!(matches!(reason, ClaimError::AttestationInvalid { .. }));
-            }
-            ClaimResult::Success { .. } => panic!("expected AttestationInvalid"),
-        }
+        assert!(matches!(err, ClaimError::AttestationInvalid { .. }));
     }
 
     #[test]
@@ -911,15 +818,9 @@ mod tests {
         attestation.attestation_type = AttestationType::CapabilityDelegation;
 
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        assert!(matches!(
-            result,
-            ClaimResult::Failed {
-                reason: ClaimError::AttestationInvalid { .. }
-            }
-        ));
+        assert!(matches!(err, ClaimError::AttestationInvalid { .. }));
     }
 
     // -------------------------------------------------------------------
@@ -940,15 +841,9 @@ mod tests {
         let attestation = make_identity_attestation(&other_did, HANDLE, &other_sk);
         let request =
             make_claim_request(SHADOW_ID, &claimant_did, HANDLE, attestation, &claimant_sk);
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        match result {
-            ClaimResult::Failed { reason } => {
-                assert!(matches!(reason, ClaimError::AttestationInvalid { .. }));
-            }
-            ClaimResult::Success { .. } => panic!("expected AttestationInvalid"),
-        }
+        assert!(matches!(err, ClaimError::AttestationInvalid { .. }));
     }
 
     // -------------------------------------------------------------------
@@ -969,15 +864,9 @@ mod tests {
         };
 
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        match result {
-            ClaimResult::Failed { reason } => {
-                assert!(matches!(reason, ClaimError::AttestationInvalid { .. }));
-            }
-            ClaimResult::Success { .. } => panic!("expected AttestationInvalid for revoked"),
-        }
+        assert!(matches!(err, ClaimError::AttestationInvalid { .. }));
     }
 
     // -------------------------------------------------------------------
@@ -995,17 +884,9 @@ mod tests {
         attestation.claim = serde_json::json!({"platform": "discord"});
 
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        match result {
-            ClaimResult::Failed { reason } => {
-                assert!(matches!(reason, ClaimError::AttestationInvalid { .. }));
-            }
-            ClaimResult::Success { .. } => {
-                panic!("expected AttestationInvalid for missing handle")
-            }
-        }
+        assert!(matches!(err, ClaimError::AttestationInvalid { .. }));
     }
 
     // -------------------------------------------------------------------
@@ -1025,20 +906,12 @@ mod tests {
         // Corrupt the claim request signature.
         request.signature = vec![0u8; 64];
 
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        match result {
-            ClaimResult::Failed { reason } => {
-                assert!(
-                    matches!(reason, ClaimError::InvalidClaimSignature { .. }),
-                    "expected InvalidClaimSignature, got: {reason}"
-                );
-            }
-            ClaimResult::Success { .. } => {
-                panic!("expected InvalidClaimSignature for corrupted signature")
-            }
-        }
+        assert!(
+            matches!(err, ClaimError::InvalidClaimSignature { .. }),
+            "expected InvalidClaimSignature, got: {err}"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1060,20 +933,12 @@ mod tests {
         // Re-sign the claim request (so only the attestation sig is bad).
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
 
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
-        match result {
-            ClaimResult::Failed { reason } => {
-                assert!(
-                    matches!(reason, ClaimError::InvalidAttestationSignature { .. }),
-                    "expected InvalidAttestationSignature, got: {reason}"
-                );
-            }
-            ClaimResult::Success { .. } => {
-                panic!("expected InvalidAttestationSignature for corrupted signature")
-            }
-        }
+        assert!(
+            matches!(err, ClaimError::InvalidAttestationSignature { .. }),
+            "expected InvalidAttestationSignature, got: {err}"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1098,16 +963,10 @@ mod tests {
         let wrong_sig = wrong_sk.sign(&canonical_hash);
         request.signature = wrong_sig.to_bytes().to_vec();
 
-        let (result, event) = claim_shadow(&mut registry, &request);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
 
-        assert!(event.is_none());
         assert!(
-            matches!(
-                result,
-                ClaimResult::Failed {
-                    reason: ClaimError::InvalidClaimSignature { .. }
-                }
-            ),
+            matches!(err, ClaimError::InvalidClaimSignature { .. }),
             "expected InvalidClaimSignature for wrong-key signature"
         );
     }
@@ -1201,8 +1060,7 @@ mod tests {
         let did = did_from_pubkey(&verifying_key);
         let attestation = make_identity_attestation(&did, "@alice", &signing_key);
         let request = make_claim_request("shadow-a", &did, "@alice", attestation, &signing_key);
-        let (result, _) = claim_shadow(&mut registry, &request);
-        assert!(matches!(result, ClaimResult::Success { .. }));
+        assert!(claim_shadow(&mut registry, &request).is_ok());
 
         // shadow-a is Claimed.
         assert_eq!(
@@ -1237,9 +1095,8 @@ mod tests {
         .unwrap();
 
         let request = make_default_claim_request();
-        let (_result, event) = claim_shadow(&mut registry, &request);
+        let event = claim_shadow(&mut registry, &request).unwrap();
 
-        let event = event.expect("expected event");
         assert_eq!(event.context_id, custom_ctx);
     }
 
@@ -1300,28 +1157,5 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("attestation signature verification failed"));
         assert!(msg.contains("bad attest sig"));
-    }
-
-    // -------------------------------------------------------------------
-    // ClaimResult variants
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn claim_result_success_variant_debug() {
-        let result = ClaimResult::Success {
-            shadow_id: "s-001".to_owned(),
-            claimant_did: "did:test".into(),
-        };
-        let debug = format!("{result:?}");
-        assert!(debug.contains("Success"));
-    }
-
-    #[test]
-    fn claim_result_failed_variant_debug() {
-        let result = ClaimResult::Failed {
-            reason: ClaimError::HandleMismatch,
-        };
-        let debug = format!("{result:?}");
-        assert!(debug.contains("Failed"));
     }
 }

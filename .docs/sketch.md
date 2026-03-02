@@ -799,10 +799,9 @@ SCP.Bridge.claimShadow(
   shadowID: shadowID,
   claimant: DID,
   attestation: Attestation        // identity_link matching the shadow's platform handle
-) → ClaimResult {
-  merged: Bool,                    // shadow retired, history attributed to claimant DID
-  historicalActions: Int           // retroactively attributed
-}
+) → Result<ShadowClaimEvent, ClaimError>
+// On success: shadow retired, history attributed to claimant DID
+// On error: ClaimError (HandleMismatch, AttestationInvalid, AlreadyClaimed, ShadowNotFound)
 ```
 
 ### Bridge Content Provenance

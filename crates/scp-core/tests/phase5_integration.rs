@@ -27,7 +27,7 @@ use std::time::Duration;
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
-use scp_core::bridge::claiming::{ClaimRequest, ClaimResult, ShadowClaimEvent, claim_shadow};
+use scp_core::bridge::claiming::{ClaimRequest, claim_shadow};
 use scp_core::bridge::provenance::{
     BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
 };
@@ -377,22 +377,10 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
         &claimant_sk,
     );
 
-    let (result, claim_event) = claim_shadow(&mut shadow_registry, &claim_request);
+    let claim_event =
+        claim_shadow(&mut shadow_registry, &claim_request).expect("claim should succeed");
 
-    // Verify claiming succeeded.
-    match &result {
-        ClaimResult::Success {
-            shadow_id: sid,
-            claimant_did: cdid,
-        } => {
-            assert_eq!(sid, shadow_id);
-            assert_eq!(*cdid, claimant_did);
-        }
-        ClaimResult::Failed { reason } => panic!("claim should succeed, got: {reason}"),
-    }
-
-    // Verify claim event was produced (retroattribution event).
-    let claim_event: ShadowClaimEvent = claim_event.expect("claim event must be produced");
+    // Verify claim event fields.
     assert_eq!(claim_event.shadow_id, shadow_id);
     assert_eq!(claim_event.claimant_did, claimant_did);
     assert_eq!(claim_event.platform_handle, platform_handle);
