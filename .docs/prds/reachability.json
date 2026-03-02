@@ -188,8 +188,7 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-node/src/builder.rs",
-        "crates/scp-node/src/node.rs"
+        "crates/scp-node/src/lib.rs"
       ],
       "description": "Add .no_domain() to ApplicationNodeBuilder (§10.12.8). When set: skip ACME TLS provisioning, probe NAT type via STUN, attempt UPnP (Tier 1), fallback to STUN address (Tier 2), register with bridge (Tier 3), publish DID document with ws:// relay URL, do NOT serve .well-known/scp. Also adds .stun_server() and .bridge_relay() builder methods for override configuration. This is the zero-config deployment path for self-hosted relays behind residential NAT.",
       "acceptanceCriteria": [
@@ -325,8 +324,7 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/src/identity/resolution.rs",
-        "crates/scp-core/src/identity/mod.rs"
+        "crates/scp-identity/src/resolution.rs"
       ],
       "description": "Implement the did_routing_id derivation (§3.10.2): SHA-256(\"scp:did:\" || did_string). The \"scp:did:\" domain separator prevents collision with context routing IDs (HMAC-SHA256(identity_key, context_id) per §5.7.1) and broadcast routing IDs (SHA-256(context_id) per §5.14). This is a pure function with no dependencies — the building block for relay-based DID resolution.",
       "acceptanceCriteria": [
@@ -364,8 +362,8 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/src/identity/resolution.rs",
-        "crates/scp-core/src/identity/republish.rs"
+        "crates/scp-identity/src/resolution.rs",
+        "crates/scp-identity/src/republish.rs"
       ],
       "description": "Extend RepublishManager to publish DID documents to SCP relays using existing PUBLISH operation (§3.10.5). DID documents are published as standard blobs with routing_id = did_routing_id(did_string) and blob_ttl = 604800 (7 days). Identity owners SHOULD publish to their own relays plus bootstrap relays. RepublishManager schedules relay republishing on a 6-day cycle (1-day margin before TTL expiry). Publishing to both SCP relays and Mainline DHT is a MUST per the anti-segmentation invariant (§3.10.6).",
       "acceptanceCriteria": [
@@ -413,7 +411,7 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/src/identity/resolution.rs"
+        "crates/scp-identity/src/resolution.rs"
       ],
       "description": "Implement relay-based DID document resolution using existing QUERY operation (§3.10.4). Resolver computes did_routing_id, queries known SCP relays (identity's relays if known, else bootstrap relays), verifies BEP44 signature against the public key encoded in the DID string, and checks seq >= last_known_seq. This is the relay layer of the dual-layer resolution protocol. Cache results per §9.10.7 (24h active, 7d inactive).",
       "acceptanceCriteria": [
@@ -462,30 +460,29 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/src/identity/resolver.rs",
-        "crates/scp-core/src/identity/mod.rs"
+        "crates/scp-identity/src/resolver.rs"
       ],
-      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel; first valid response wins. Valid means BEP44 signature verifies AND sequence number >= last known. When both return valid documents, highest sequence number wins. Slower query is cancelled once first valid response arrives. ResolutionSource enum tracks whether the result came from an SCP relay, Mainline DHT, or cache.",
+      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel via tokio::join! with per-layer 10-second timeouts. Valid means BEP44 signature verifies AND sequence number >= last known cached sequence. When both return valid documents, highest sequence number wins. On a tie, relay is preferred (lower latency). ResolutionSource enum tracks whether the result came from an SCP relay, Mainline DHT, or cache.",
       "acceptanceCriteria": [
         "DidResolver trait defined with resolve(&self, did: &str) -> Result<Option<ResolvedDidDocument>>",
         "ResolvedDidDocument contains document, seq, and source fields",
         "ResolutionSource enum has ScpRelay { relay_url: String }, MainlineDht, and Cache variants",
-        "Parallel query: both SCP relay and DHT resolution initiated concurrently",
-        "First valid response accepted (latency = min(relay, dht))",
-        "When both return valid documents, highest sequence number wins",
-        "Slower query cancelled after first valid response arrives",
+        "Parallel query: both SCP relay and DHT resolution initiated concurrently via tokio::join!",
+        "Both layers are awaited; highest sequence number wins (§3.10.7)",
+        "When both return valid documents, highest sequence number wins; on tie, relay preferred",
+        "Results with seq < cached_sequence are rejected (rollback protection)",
         "DidMethod::resolve() continues to work for single-layer DHT resolution (no regression)",
-        "Unit test: relay responds first with valid doc, DHT query cancelled",
-        "Unit test: DHT responds first with valid doc, relay query cancelled",
+        "Unit test: relay responds with valid doc, DHT returns nothing — relay result used",
+        "Unit test: DHT responds with valid doc, relay returns nothing — DHT result used",
         "Unit test: both respond, higher seq wins regardless of arrival order",
         "Unit test: one layer fails, other layer's result is accepted"
       ],
       "actionItems": [
         "Define DidResolver trait, ResolvedDidDocument struct, and ResolutionSource enum",
-        "Implement DualLayerResolver composing relay resolution (SCP-236) and DhtClient::resolve()",
-        "Implement parallel query with tokio::select! or similar",
-        "Implement cancellation of slower query on first valid response",
+        "Implement DualLayerResolver composing relay resolution (SCP-240) and DhtClient::resolve()",
+        "Implement parallel query with tokio::join! and per-layer timeouts",
         "Implement highest-seq-wins logic when both layers return valid documents",
+        "Implement rollback protection: reject results with seq < cached_sequence",
         "Preserve DidMethod::resolve() for backward compatibility",
         "Add tests for all resolution scenarios"
       ],
@@ -648,8 +645,8 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "crates/scp-core/src/identity/resolver.rs",
-        "crates/scp-core/src/identity/republish.rs"
+        "crates/scp-identity/src/resolver.rs",
+        "crates/scp-identity/src/republish.rs"
       ],
       "description": "Per §3.10.7, when both resolution layers return valid documents with different sequence numbers, the resolver SHOULD re-publish the fresher document to the layer that returned the stale one (protocol-level healing). Currently DualLayerResolver picks the highest seq but does not trigger a republish to the stale layer. This story implements the healing mechanism: when the relay returns seq=1 and DHT returns seq=5, the resolver queues a republish of the seq=5 document to the relay layer.",
       "acceptanceCriteria": [
@@ -689,9 +686,9 @@
       "status": "pending",
       "files": [
         "crates/scp-node/src/lib.rs",
-        "crates/scp-transport/src/tls.rs"
+        "crates/scp-node/src/tls.rs"
       ],
-      "description": "The AcmeProvider module exists in scp-transport/src/tls.rs but is never called from the domain build path in ApplicationNodeBuilder.build(). When .domain() is set, the builder should invoke AcmeProvider to provision a TLS certificate via Let's Encrypt before starting the relay listener. Currently the code has a comment noting ACME is not yet integrated (§10.12.8 ADR-032 AC 7). This story wires the existing module into the build path.",
+      "description": "The AcmeProvider module exists in scp-node/src/tls.rs but is never called from the domain build path in ApplicationNodeBuilder.build(). When .domain() is set, the builder should invoke AcmeProvider to provision a TLS certificate via Let's Encrypt before starting the relay listener. Currently the code has a comment noting ACME is not yet integrated (§10.12.8 ADR-032 AC 7). This story wires the existing module into the build path.",
       "acceptanceCriteria": [
         "When .domain() is set, AcmeProvider is invoked during build() to provision TLS",
         "ACME challenge success results in wss:// relay URL in DID document",

@@ -254,11 +254,18 @@ impl<C: Clock> DidCache<C> {
         let mut entries = self.entries.lock().await;
         let now = self.clock.now();
 
-        // If entry exists, only update if new sequence is strictly greater.
-        if let Some(existing) = entries.get(did)
-            && sequence <= existing.sequence
-        {
-            return;
+        // If entry exists with a higher sequence, reject the update. If the
+        // sequence matches, refresh `last_verified` (the document was just
+        // re-verified) but keep the existing document to avoid a permanent
+        // re-resolution loop for stable identities.
+        if let Some(existing) = entries.get_mut(did) {
+            if sequence < existing.sequence {
+                return;
+            }
+            if sequence == existing.sequence {
+                existing.last_verified = now;
+                return;
+            }
         }
 
         let active = entries.get(did).is_some_and(|e| e.active);
@@ -455,19 +462,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_with_same_sequence_is_rejected() {
+    async fn insert_with_same_sequence_keeps_document_refreshes_timestamp() {
         let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
+        let cache = DidCache::with_clock(Arc::clone(&clock));
         let did = "did:dht:zTest123";
         let doc1 = make_document(did);
         let doc2 = DidDocument::new(did, &[10u8; 32], &[20u8; 32], &[30u8; 32]);
 
         cache.insert(did, doc1.clone(), 5).await;
+
+        // Advance time so we can verify last_verified is refreshed.
+        clock.advance(STALENESS_THRESHOLD_SECS + 1);
+
+        // Before re-insert, entry should be stale.
+        let result_before = cache.get(did).await.unwrap();
+        assert!(matches!(result_before.staleness, Staleness::Stale { .. }));
+
+        // Re-insert with same seq refreshes last_verified.
         cache.insert(did, doc2, 5).await;
 
-        let result = cache.get(did).await.unwrap();
-        assert_eq!(result.document, doc1);
-        assert_eq!(result.sequence, 5);
+        // After re-insert, entry should be fresh again (last_verified updated).
+        let result_after = cache.get(did).await.unwrap();
+        assert_eq!(result_after.document, doc1); // Original document preserved
+        assert_eq!(result_after.sequence, 5);
+        assert_eq!(result_after.staleness, Staleness::Fresh); // Timestamp refreshed
     }
 
     #[tokio::test]

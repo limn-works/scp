@@ -284,7 +284,41 @@ impl<R: MultiRelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static>
             let relay_doc = validate_relay_result(relay_result, &did, &public_key);
             let dht_doc = validate_dht_result(dht_result, &did, &public_key);
 
-            // Step 5: Pick the result with the highest sequence number.
+            // Step 5: Reject results with sequence numbers lower than the
+            // last known cached sequence. Prevents rollback attacks where an
+            // attacker serves a validly-signed but outdated document after
+            // cache TTL expiry.
+            let cached_seq = cache.cached_sequence(&did).await;
+            let relay_doc = relay_doc.and_then(|doc| {
+                if let Some(min_seq) = cached_seq
+                    && doc.seq < min_seq
+                {
+                    warn!(
+                        did = %did,
+                        received_seq = doc.seq,
+                        cached_seq = min_seq,
+                        "relay returned stale seq, rejecting"
+                    );
+                    return None;
+                }
+                Some(doc)
+            });
+            let dht_doc = dht_doc.and_then(|doc| {
+                if let Some(min_seq) = cached_seq
+                    && doc.seq < min_seq
+                {
+                    warn!(
+                        did = %did,
+                        received_seq = doc.seq,
+                        cached_seq = min_seq,
+                        "DHT returned stale seq, rejecting"
+                    );
+                    return None;
+                }
+                Some(doc)
+            });
+
+            // Step 6: Pick the result with the highest sequence number.
             // On a tie, prefer relay (lower latency for subsequent operations).
             let result = match (relay_doc, dht_doc) {
                 (Some(relay), Some(dht)) => {
@@ -1031,5 +1065,93 @@ mod tests {
         assert_eq!(resolved.seq, 1);
         assert_eq!(resolved.source, ResolutionSource::MainlineDht);
         assert_eq!(resolved.document, doc);
+    }
+
+    #[tokio::test]
+    async fn stale_seq_rejected_after_cache_expiry() {
+        // Pre-populate cache with seq=5, then let it expire. Both layers
+        // return seq=1 (validly signed but stale). Resolver must reject
+        // both because seq=1 < cached seq=5.
+        let (signing_key, did, doc) = make_test_identity();
+        let (value, signature) = sign_document(&signing_key, &doc, 1);
+        let public_key = signing_key.verifying_key();
+
+        // Pre-populate cache with seq=5 to establish the high-water mark.
+        let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        cache.insert(&did, doc_v5, 5).await;
+
+        // Expire the cache entry so the resolver queries both layers.
+        clock.advance(8 * 24 * 60 * 60); // 8 days > 7-day inactive TTL
+
+        // Both layers return seq=1 (stale).
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value: value.clone(),
+                    signature,
+                    seq: 1,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &signature, &value, 1)
+            .await
+            .unwrap();
+
+        let resolver = make_resolver(relay, dht, cache);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        // Both seq=1 results must be rejected (< cached seq=5).
+        assert!(
+            result.is_none(),
+            "stale seq=1 should be rejected when cached seq=5 exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_seq_accepted_after_cache_expiry() {
+        // Pre-populate cache with seq=5, expire it. DHT returns seq=7
+        // (fresh). Should be accepted.
+        let (signing_key, did, _) = make_test_identity();
+        let public_key = signing_key.verifying_key();
+
+        let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        cache.insert(&did, doc_v5, 5).await;
+
+        // Expire the cache.
+        clock.advance(8 * 24 * 60 * 60);
+
+        let doc_v7 = DidDocument::new(&did, public_key.as_bytes(), &[70u8; 32], &[71u8; 32]);
+        let (value_v7, sig_v7) = sign_document(&signing_key, &doc_v7, 7);
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &sig_v7, &value_v7, 7)
+            .await
+            .unwrap();
+
+        let resolver = make_resolver(relay, dht, cache);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        let resolved = result.expect("seq=7 > cached seq=5, should be accepted");
+        assert_eq!(resolved.seq, 7);
     }
 }

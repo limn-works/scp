@@ -111,7 +111,7 @@ pub fn py_transport_connect(relay_url: &str) -> PyResult<()> {
     let rt = crate::runtime()?;
     let url = relay_url.to_owned();
 
-    #[allow(deprecated)] // TODO: migrate to connect_sourced() with provenance tracking
+    #[allow(deprecated)] // Stub — see #220: migrate to connect_sourced() with provenance tracking
     let adapter = rt.block_on(async { NativeRelayAdapter::connect(&url).await });
 
     match adapter {

@@ -984,6 +984,7 @@ impl<
                     shutdown_handle,
                     bound_addr,
                     strategy,
+                    bridge_secret,
                 )
                 .await
             }
@@ -995,6 +996,7 @@ impl<
 // Shared no-domain build logic (used by HasNoDomain::build and domain fallthrough)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
@@ -1003,6 +1005,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
     nat_strategy: Arc<dyn NatStrategy>,
+    bridge_secret: [u8; 32],
 ) -> Result<ApplicationNode<S>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
@@ -1038,7 +1041,6 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    let bridge_secret: [u8; 32] = rand::random();
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         relay_url,
@@ -1120,8 +1122,10 @@ impl<
             .bind_addr
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
 
+        let bridge_secret: [u8; 32] = rand::random();
         let relay_config = RelayConfig {
             bind_addr,
+            bridge_secret: Some(bridge_secret),
             ..RelayConfig::default()
         };
 
@@ -1147,6 +1151,7 @@ impl<
             shutdown_handle,
             bound_addr,
             strategy,
+            bridge_secret,
         )
         .await
     }

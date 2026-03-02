@@ -259,21 +259,20 @@ impl BridgeRegistry {
 
     /// Removes all registrations for a given connection (on disconnect).
     pub async fn deregister_connection(&self, connection_id: u64) {
-        let routing_ids: Vec<[u8; 32]> = {
-            let entries = self.entries.read().await;
-            entries
-                .iter()
-                .filter(|(_, e)| e.connection_id == connection_id)
-                .map(|(id, _)| *id)
-                .collect()
-        };
+        // Hold a single write lock throughout to prevent TOCTOU races:
+        // a concurrent register() between a read-check and write-remove
+        // could be wrongly removed.
+        let mut entries = self.entries.write().await;
+        let routing_ids: Vec<[u8; 32]> = entries
+            .iter()
+            .filter(|(_, e)| e.connection_id == connection_id)
+            .map(|(id, _)| *id)
+            .collect();
 
-        if !routing_ids.is_empty() {
-            let mut entries = self.entries.write().await;
-            for id in &routing_ids {
-                entries.remove(id);
-            }
+        for id in &routing_ids {
+            entries.remove(id);
         }
+        drop(entries);
 
         self.connection_counts.write().await.remove(&connection_id);
 

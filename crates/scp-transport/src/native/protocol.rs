@@ -342,7 +342,8 @@ impl ClientMessage {
             }
             Self::Subscribe { ref_id, .. }
             | Self::Unsubscribe { ref_id, .. }
-            | Self::Delete { ref_id, .. } => {
+            | Self::Delete { ref_id, .. }
+            | Self::BridgeRegister { ref_id, .. } => {
                 validate_ref_id(ref_id)?;
             }
             Self::Query { ref_id, limit, .. } => {
@@ -356,9 +357,6 @@ impl ClientMessage {
                 }
             }
             Self::Ack { .. } | Self::Ping { .. } => {}
-            Self::BridgeRegister { ref_id, .. } => {
-                validate_ref_id(ref_id)?;
-            }
             Self::BridgeData {
                 ref_id, payload, ..
             } => {
