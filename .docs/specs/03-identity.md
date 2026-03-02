@@ -135,3 +135,206 @@ DID resolution is the trust root for the entire protocol. If resolution can be M
 ## 3.9 Key Lifecycle
 
 Identity keys follow a defined lifecycle: generation (in hardware security modules where available), distribution (via DID document publication), rotation (DID document update with authorization chain from old key), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4 and §9.12.
+
+## 3.10 DID Resolution Layers
+
+DID resolution is the trust root for identity verification (§3.8). The current architecture resolves identities exclusively via Mainline DHT — BEP44 signed mutable items stored on BitTorrent's distributed hash table, a network of millions of nodes with over 20 years of operational history. This works, and it works well. But it routes all identity resolution through infrastructure SCP does not control, cannot improve, and cannot guarantee will continue to operate on terms compatible with the protocol's needs.
+
+SCP introduces a dual-layer resolution architecture:
+
+- **Primary: SCP relay-based resolution.** DID documents stored on SCP relays as standard blobs, resolved via existing relay operations. Grows with the SCP network. Requires no protocol changes — DID documents are just another blob type routed by a deterministic `routing_id`.
+- **Fallback: Mainline DHT.** Existing did:dht resolution via BEP44. Works from day one. Transitions from "only path" to "fallback path" as the relay network matures.
+
+Both layers are self-certifying: the BEP44 signature on a DID document is verified against the public key encoded in the DID string itself (§9.6.1). The storage backend — whether an SCP relay or a DHT node — is untrusted. Trust derives from the cryptographic binding between the DID and its document, not from the infrastructure serving it.
+
+### 3.10.1 Resolution Priority
+
+| Layer | Backend | Day-one availability | Latency | SCP dependency |
+|-------|---------|---------------------|---------|----------------|
+| 1 | SCP relays | Low (few relays exist) | Low (relay QUERY, single hop) | Yes |
+| 2 | Mainline DHT | High (millions of nodes) | Higher (DHT traversal, 1-3s typical) | No |
+
+Resolution strategy: query both layers in parallel. The first valid response wins. "Valid" means the BEP44 signature verifies against the public key encoded in the target DID AND the sequence number is greater than or equal to the last known sequence number for that DID. When both layers return valid documents, the document with the highest sequence number is accepted.
+
+Parallel query means resolution latency is `min(relay_latency, dht_latency)`. The slower query is cancelled once the first valid response arrives.
+
+### 3.10.2 Layer 1: SCP Relay-Based Resolution
+
+DID documents are published to SCP relays using the existing relay operations defined in ADR-004. No new wire types, no special relay behavior — a DID document is a blob addressed by a deterministic `routing_id`.
+
+**Routing ID derivation:**
+
+```
+did_routing_id = SHA-256("scp:did:" || did_string)
+```
+
+The `"scp:did:"` domain separator prevents collision with other routing ID derivation schemes in the protocol: encrypted context routing IDs use HKDF from identity key material (§9.10.4), broadcast context routing IDs use `SHA-256(context_id)` (§5.14), and context metadata routing IDs use `SHA-256(context_id || "scp-metadata")` (§5.7). The domain separator ensures that a DID string can never produce a routing ID that collides with a context ID or metadata address.
+
+**Publication** uses the existing PUBLISH operation (ADR-004):
+
+```
+PUBLISH {
+    routing_id: did_routing_id,
+    blob_ttl: 604800,
+    blob: <BEP44-signed DID document>
+}
+```
+
+**Resolution** uses the existing QUERY operation:
+
+```
+QUERY {
+    routing_id: did_routing_id,
+    since: null,
+    limit: 1
+}
+```
+
+**Properties:**
+
+- **No protocol changes.** PUBLISH and QUERY are existing relay operations. DID documents are stored and retrieved like any other blob. Relays require no awareness that a blob contains a DID document.
+- **Relay-agnostic.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for suppression resistance.
+- **Size budget.** DID documents range from 2-30KB depending on attestation count and service endpoint list. The relay blob size limit is 256KB (ADR-004). Well within bounds.
+- **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager already handles periodic DHT republishing on a 2-hour cycle; relay republishing adds a separate 6-day cycle for relay-stored DID documents.
+
+### 3.10.3 Layer 2: Mainline DHT (Fallback)
+
+Existing did:dht resolution via BEP44 signed mutable items on Mainline DHT. The mechanism is unchanged from §3.8 and §9.6.1. What changes is its role: from "only resolution path" to "fallback resolution path."
+
+The DHT layer remains essential for:
+
+- **Day-one operation.** The SCP relay network starts small. Most DID documents will not be available on relays until the network grows. DHT availability is immediate.
+- **Resolution of identities not yet publishing to SCP relays.** Older identities or identities using minimal SDK configurations may only publish to DHT. The protocol MUST resolve them.
+- **Resilience when all of an identity's relays are down.** DHT provides a resolution path independent of any specific relay's availability.
+- **Cross-network interoperability.** Any BEP44-capable client can resolve SCP identities without running SCP software. The DHT layer preserves this property.
+
+### 3.10.4 Resolution Protocol
+
+The full resolution sequence:
+
+```
+1. Compute did_routing_id = SHA-256("scp:did:" || did_string)
+2. Extract public_key from DID string (z-base-32 decode per did:dht spec)
+3. In parallel:
+   a. QUERY did_routing_id on known SCP relays
+      (identity's published relays if known, else bootstrap relays from §18.5.1)
+   b. DhtClient.resolve(public_key) on Mainline DHT
+4. For each response:
+   a. Verify BEP44 signature against public_key
+   b. Verify seq >= last_known_seq for this DID
+5. Accept the valid response with highest sequence number
+6. Cache result per §9.10.7 caching policy
+   (24h refresh for active contacts, 7d for inactive)
+```
+
+The relay query in step 3a targets relays in priority order: the identity's own relays (from a previously cached DID document), then bootstrap relays. If the resolver has no prior knowledge of the identity's relays, only bootstrap relays are queried for the relay layer — the DHT layer provides the backup.
+
+### 3.10.5 Publishing Protocol
+
+Identity owners publish to both layers on every DID document create or update:
+
+```
+On DID document create or update:
+1. Serialize DID document
+2. Sign via BEP44 (Ed25519 signature over bencoded value concatenated with
+   sequence number, per BEP44 spec)
+3. In parallel:
+   a. PUBLISH to SCP relays (own relays + bootstrap relays), blob_ttl: 604800
+   b. DhtClient.publish(public_key, signature, doc_bytes, seq) to Mainline DHT
+4. RepublishManager schedules:
+   - Relay republishing: every 6 days (blob_ttl is 7 days, 1-day margin)
+   - DHT republishing: every 2 hours (existing cycle, unchanged)
+```
+
+Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically.
+
+### 3.10.6 Anti-Segmentation Invariant
+
+**Publishing to both layers is a MUST, not a SHOULD.** Resolution from both layers is a SHOULD (performance optimization — parallel query is faster but not required for correctness).
+
+The risk: if the DHT layer works well enough and relay-based resolution is "just faster," developers may skip DHT publishing as unnecessary overhead. If this becomes widespread, identity resolution fragments — some DIDs resolvable only on relays, others only on DHT. A resolver that checks only one layer misses identities published only on the other. The network splits into two resolution namespaces without anyone intending it.
+
+The SDK prevents this by default. RepublishManager publishes to both layers on every cycle. Disabling either layer requires explicit opt-out (`RepublishConfig::disable_dht()` or `RepublishConfig::disable_relay()`) and the SDK MUST log a warning when either is disabled. The warning states: "DID resolution layer disabled. This identity may not be resolvable by all peers."
+
+### 3.10.7 Version Resolution
+
+The BEP44 sequence number is the sole authority for document freshness. The highest valid sequence number wins, regardless of which layer served it. Split-brain is impossible: the sequence number is monotonically increasing, and only the identity owner (holder of the Ed25519 private key) can increment it.
+
+Stale documents are detected by comparing the received sequence number against the last known sequence number for that DID. A relay or DHT node serving a stale document is not malicious — it simply has not received the latest publish. The stale document is overwritten on the next republish cycle.
+
+When both layers return valid documents with different sequence numbers, the higher sequence number is authoritative. The resolver SHOULD update its cache and MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing).
+
+### 3.10.8 Security Analysis
+
+The dual-layer architecture preserves all security properties of §9.6.1 (self-certification) while adding relay-layer resilience:
+
+- **Self-certification preserved.** The BEP44 signature is verified against the public key encoded in the DID string. The storage backend (relay or DHT) is untrusted. §9.6.1 properties are unchanged.
+- **Relay serves stale document.** Detected by sequence number comparison. The resolver falls through to other relays or DHT. Stale documents do not compromise security — they delay propagation of key rotations, which is bounded by the republish cycle (6 days for relays, 2 hours for DHT).
+- **Relay suppresses document.** Parallel query across multiple relays plus DHT. Suppression by one source does not prevent resolution. Multi-relay publishing (§9.9.2) applies to DID documents as it does to context blobs.
+- **Relay serves wrong DID's document.** The BEP44 signature does not verify against the target DID's public key. Rejected immediately. The routing ID is derived from the DID string, but verification is against the DID's key — substitution is cryptographically impossible.
+- **Dual-layer resilience.** An attacker must suppress a DID document on ALL of an identity's relays AND ALL reachable DHT nodes to prevent resolution. This is a strictly harder attack than suppressing on either layer alone.
+
+### 3.10.9 Privacy Properties
+
+| Layer | What the backend learns |
+|-------|------------------------|
+| SCP relay | Resolver's IP address queried a specific `routing_id`. The relay can infer which DID is being resolved if the relay knows the DID (it can compute the same `SHA-256("scp:did:" \|\| did_string)` for known DIDs). |
+| Mainline DHT | Resolver's IP address queried a public key. DHT routing traffic makes isolation harder (§9.10.7). |
+
+Adding relay-based resolution does not degrade privacy relative to DHT-only resolution. It adds one additional observer (the relay operator) who, for identities hosted on that relay, already sees message traffic for that identity. The DID resolution query does not reveal information the relay operator did not already have.
+
+Caching policy from §9.10.7 applies to both layers: 24-hour refresh for active contacts, 7-day for inactive. The local Mainline DHT node on desktop (§9.10.7) continues to provide resolution privacy for DHT queries.
+
+### 3.10.10 DidResolver Trait
+
+The SDK exposes a unified resolution interface that composes both layers:
+
+```rust
+/// Unified DID resolution across SCP relays and Mainline DHT.
+/// Implements the parallel dual-layer resolution protocol (§3.10.4).
+pub trait DidResolver: Send + Sync {
+    fn resolve(&self, did: &str)
+        -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send;
+}
+
+/// A resolved DID document with provenance metadata.
+pub struct ResolvedDidDocument {
+    /// The verified DID document.
+    pub document: DidDocument,
+    /// BEP44 sequence number. Monotonically increasing.
+    pub seq: u64,
+    /// Which resolution layer served this document.
+    pub source: ResolutionSource,
+}
+
+/// Provenance of a resolved DID document.
+pub enum ResolutionSource {
+    /// Resolved via QUERY to an SCP relay.
+    ScpRelay { relay_url: String },
+    /// Resolved via Mainline DHT BEP44 lookup.
+    MainlineDht,
+    /// Served from local cache (original source recorded at cache time).
+    Cache,
+}
+```
+
+`DidResolver` composes the relay QUERY path with `DhtClient::resolve()` internally. The existing `DidMethod::resolve()` interface continues to work for single-layer DHT resolution — `DidResolver` is an additive layer, not a replacement. Code that only needs DHT resolution (e.g., interoperability tools) can use `DidMethod` directly.
+
+### 3.10.11 Bootstrap and Network Growth
+
+The dual-layer architecture is designed to be self-reinforcing as the SCP network grows:
+
+- **Day one.** DHT dominates. Relay-layer queries mostly fail because few relays exist and few identities have published DID documents to relays. Resolution latency is DHT latency. The protocol works identically to the pre-§3.10 architecture.
+- **Growth.** More relays come online. More identities publish to relays. Relay-layer resolution begins succeeding more often, and faster than DHT traversal. DHT queries still run in parallel as backup.
+- **Maturity.** Relay-layer resolution is primary for most identities. DHT latency becomes irrelevant because relay responses arrive first. DHT serves as an availability backstop and interoperability bridge for non-SCP clients.
+- **DHT is never removed.** The cost of maintaining DHT publishing is one BEP44 put every 2 hours — negligible. The benefit is permanent: a resolution path that works even if every SCP relay is unreachable. Removing it would violate the anti-segmentation invariant (§3.10.6).
+
+### 3.10.12 Phase Integration
+
+| Component | Phase | Crate | Notes |
+|-----------|-------|-------|-------|
+| `did_routing_id` derivation | Phase 1 patch | `scp-core` | Pure function, no dependencies. SHA-256 of domain-separated DID string. |
+| DID document PUBLISH to relays | Phase 2 | `scp-core` | RepublishManager gains relay publishing cycle alongside existing DHT cycle. |
+| DID document QUERY from relays | Phase 2 | `scp-core` | Extends existing DID resolution path with relay QUERY before/parallel to DHT. |
+| `DidResolver` trait | Phase 2 | `scp-core` | Unified interface composing relay + DHT resolution. |
+| Parallel dual-layer resolution | Phase 2 | `scp-core` | Orchestration of parallel queries with first-valid-wins semantics. |

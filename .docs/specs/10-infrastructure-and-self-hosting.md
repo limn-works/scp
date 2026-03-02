@@ -222,3 +222,257 @@ The transport, data sovereignty, and self-hosting layers are the least novel par
 **libp2p** provides peer-to-peer transport primitives (pubsub, DHT, NAT traversal) that could underpin direct device-to-device communication without relays for devices that are simultaneously online.
 
 The protocol should define its transport requirements abstractly and provide reference bindings for at least one existing transport. The choice of primary transport binding is a design decision with ecosystem implications — it determines which existing community SCP builds alongside.
+
+## 10.12 Relay Reachability
+
+The deployment spectrum (§10.2) places "laptop running SCP daemon" and "agent workstation" as core self-hosting tiers. §10.4 describes relays as needing "stable address, TLS, and uptime commitment." This section specifies how a self-hosted relay behind residential NAT becomes reachable from the internet with zero manual configuration — no domain, no static IP, no router access. Domain-based deployment (§18.6) provides the broadest reach when available; this section adds a zero-config floor beneath it and specifies graceful fallback when domain-based deployment is configured but fails.
+
+The "run it on your MacBook" thesis is the keystone of "protocol requires no operator." If a developer's laptop or an agent workstation behind residential NAT cannot serve as an SCP relay without infrastructure provisioning, self-hosting collapses to "rent a VPS" — which is just managed infrastructure with extra steps. This section closes the gap between the deployment spectrum's promise and the networking reality of consumer internet connections.
+
+**Design principle: layered reachability.** Four tiers, tried in order. The first that produces a reachable address wins. If a domain is configured, domain-based deployment (Tier 4) is attempted first — if it works, it becomes the active tier; if it fails, fall through to Tiers 1-3. If no domain is configured, start at Tier 1. Selection is automatic — infrastructure plumbing, not a user decision.
+
+### 10.12.1 Reachability Tiers
+
+| Tier | Mechanism | NAT coverage | External infrastructure | Latency | Protocol changes |
+|------|-----------|-------------|------------------------|---------|-----------------|
+| 1 | UPnP/NAT-PMP port mapping | ~40% home routers | None | Direct | None |
+| 2 | STUN hole punching | ~85% cumulative (cone NATs) | Any SCP relay as STUN server | Direct after punch | None (STUN is pre-connection) |
+| 3 | Relay bridging (TURN-like) | ~100% (symmetric NAT fallback) | A willing SCP relay as bridge | +1 hop | BRIDGE operation |
+| 4 | Domain-based (existing §18.6) | 100% | DNS + ACME CA | Direct | None |
+
+**Tier selection algorithm:**
+
+1. If a domain is configured (`.domain()`), attempt domain-based deployment first. Verify: DNS resolves to a reachable address, ACME challenge succeeds, `wss://` WebSocket upgrade completes. If all checks pass, Tier 4 is the active tier. If any check fails, log the failure reason and fall through to step 2.
+2. If no domain is configured (`.no_domain()`), or if domain-based deployment failed, probe NAT type via STUN binding request to a known relay (§10.12.3).
+3. Attempt Tier 1 (UPnP/NAT-PMP). If a port mapping is obtained and external reachability is verified, Tier 1 is the active tier.
+4. If Tier 1 fails and NAT type is non-symmetric (full-cone, address-restricted, or port-restricted), attempt Tier 2 (STUN hole punching). If the external address is reachable, Tier 2 is the active tier.
+5. If Tier 2 fails or NAT type is symmetric, register with a bridge relay (Tier 3). Tier 3 always succeeds if a bridge relay is available.
+6. If no bridge relay is available, the self-hosted relay is unreachable from the internet. Log an error. The operator can still participate as an SCP identity using external relays — they just cannot serve as a relay for others.
+
+Selection is logged at INFO level but not exposed to the user as a choice. The SDK re-evaluates periodically (recommended: every 30 minutes) and on network change events (IP change, interface up/down). Tier changes are transparent — the DID document is updated with the new relay address, and peers re-resolve on connection failure.
+
+### 10.12.2 Tier 1: UPnP/NAT-PMP Port Mapping
+
+On relay startup, the SDK attempts to open a port mapping on the local gateway using UPnP-IGD (Universal Plug and Play Internet Gateway Device) or NAT-PMP/PCP (Port Control Protocol). Both are standard protocols for requesting port forwarding from consumer routers.
+
+**Procedure:**
+
+1. Discover local gateway via UPnP SSDP multicast or NAT-PMP default gateway.
+2. Request a port mapping: external port (any available) mapped to internal relay listen port.
+3. On success, the gateway's external IP and assigned port become the relay's reachable address.
+4. Verify reachability: the SDK performs a self-test by connecting to its own external address from the public internet side (via a STUN-like probe or a test connection through a known relay). If the self-test fails, the mapping is considered unreliable — fall through to Tier 2.
+
+**Lease management:**
+
+- UPnP mappings have a TTL (typically 10-60 minutes, router-dependent). The SDK renews at 50% TTL.
+- NAT-PMP/PCP mappings have explicit lifetimes. The SDK renews at 50% lifetime.
+- If renewal fails (router rebooted, UPnP disabled mid-session), the SDK detects the loss on the next renewal attempt, re-probes, and falls through to Tier 2 if re-mapping fails.
+- Mapping loss triggers immediate DID document update if the tier changes.
+
+**External address publication:** The external `ip:port` from the UPnP/NAT-PMP response is published in the DID document as an `SCPRelay` service endpoint (§18.2.1) with a `ws://` URL (§10.12.6). The `RepublishManager` handles address updates when the external IP or port changes.
+
+**Security considerations:** Opening a port via UPnP is intentional — the relay is designed to accept connections from the internet. The relay authenticates nothing at the transport level (§10.4); MLS handles all confidentiality and integrity. A UPnP-opened port exposes the relay's WebSocket endpoint, which accepts only SCP protocol operations (PUBLISH, SUBSCRIBE, QUERY, DELETE per ADR-004). The attack surface is the relay implementation itself, not the port mapping mechanism.
+
+**Coverage:** Approximately 40% of consumer routers support UPnP-IGD or NAT-PMP. The percentage varies by region, ISP, and router model. Many ISP-provided routers disable UPnP by default. This tier is opportunistic — when it works, it provides zero-config direct reachability with no external dependencies.
+
+**Fallthrough:** If UPnP/NAT-PMP is unavailable, disabled, or the self-test fails, proceed to Tier 2.
+
+### 10.12.3 Tier 2: STUN Hole Punching
+
+For routers that do not support UPnP, STUN (Session Traversal Utilities for NAT, RFC 8489) can discover the relay's external address and establish a reachable UDP socket through NAT hole punching.
+
+**NAT type classification:** The SDK performs a STUN binding request to classify the NAT type:
+
+| NAT type | Prevalence | Hole punchable | Behavior |
+|----------|-----------|----------------|----------|
+| Full-cone | ~20% | Yes | Any external host can send to the mapped address |
+| Address-restricted cone | ~30% | Yes | Only hosts the internal endpoint has contacted |
+| Port-restricted cone | ~35% | Yes | Only the specific host:port the internal endpoint has contacted |
+| Symmetric | ~15% | No | Different mapping per destination — external address unpredictable |
+
+**Procedure for non-symmetric NATs:**
+
+1. The SDK opens a UDP socket and performs a STUN Binding Request (RFC 8489) to a STUN server (see below). The response contains the external `ip:port` as seen by the STUN server.
+2. For full-cone NATs, this external address is immediately reachable by any host.
+3. For address-restricted and port-restricted NATs, the SDK must send an initial packet to a peer before the peer can send back. Connection coordination (step 5 below) handles this.
+4. The external address is published in the DID document as the relay's reachable address.
+5. **Connection coordination:** A peer resolving the self-hosted relay's DID document obtains the external address. For restricted NATs, the self-hosted relay must initiate a packet exchange with each connecting peer. The relay periodically sends keepalive packets to peers that have announced their intent to connect (via a coordination message through an intermediary relay). This creates the NAT pinhole that allows the peer to connect back.
+
+**Keepalive:** NAT mappings expire if unused (typical timeout: 30-120 seconds). The SDK sends a 25-second UDP keepalive to maintain the mapping. The keepalive is a minimal STUN Binding Indication (no response expected) or a zero-length UDP packet, depending on the STUN server's capabilities.
+
+**STUN service on SCP relays:** Any SCP relay MAY serve as a STUN endpoint. STUN is lightweight (stateless, single UDP socket, minimal CPU) and can coexist with the relay's WebSocket endpoint. The relay advertises STUN support in its `.well-known/scp` `relay_config` or relay metadata.
+
+- Bootstrap relays (§18.5.1, fallback relay list) MUST include at least one STUN-capable relay. This ensures that new identities can probe their NAT type without prior infrastructure.
+- Self-hosted relays that have achieved public reachability (Tiers 1, 2, or 4) MAY also offer STUN service — a self-reinforcing network where every new reachable relay makes the next NAT traversal easier.
+
+**Symmetric NAT:** If the STUN probe determines the NAT is symmetric (~15% of deployments), hole punching is not viable — the NAT assigns a different external mapping per destination, making the external address unpredictable. The SDK falls through to Tier 3.
+
+**Fallthrough:** If NAT is symmetric, or if the STUN-discovered address fails the reachability self-test, proceed to Tier 3.
+
+### 10.12.4 Tier 3: Relay Bridging
+
+For deployments behind symmetric NAT (~15% of consumer internet connections), where neither UPnP nor STUN hole punching can establish direct reachability, traffic is proxied through an intermediary SCP relay acting as a transparent bridge. This is architecturally analogous to TURN (Traversal Using Relays around NAT) but uses SCP's own relay infrastructure rather than dedicated TURN servers.
+
+**New relay operation:**
+
+```
+BRIDGE {
+    target_routing_id: [u8; 32],     // Routing ID of the bridged relay
+    target_relay_hint: String,        // URL hint for reaching the target
+}
+```
+
+The bridge relay establishes a connection to the target self-hosted relay (which maintains an outbound connection to the bridge) and proxies blobs bidirectionally. The bridge does NOT inspect, modify, decrypt, or cache proxied blobs — it is a transparent pipe.
+
+**Bridge establishment:**
+
+1. The self-hosted relay behind symmetric NAT connects outbound to a bridge relay (outbound connections are not blocked by NAT).
+2. The self-hosted relay registers its routing ID with the bridge via the BRIDGE operation.
+3. The bridge relay accepts incoming connections from peers and forwards traffic to the registered self-hosted relay over the existing outbound connection.
+4. The self-hosted relay publishes the bridge relay's address in its DID document, annotated as a bridge: `wss://bridge-relay.example.com/scp/v1?bridge_target=<hex-routing-hint>`.
+
+**Bridge properties:**
+
+- **Transparent.** The bridge relay sees the same metadata as any relay (§9.9.1): routing IDs, blob sizes, timing. MLS prevents content access. The bridge CANNOT read, modify, or inject messages.
+- **Substitutable.** If a bridge relay goes down, the self-hosted relay discovers another bridge relay and re-registers. Peers re-resolve the DID document and connect to the new bridge. No session state is lost — MLS sessions survive relay changes.
+- **Multiple bridges.** A self-hosted relay MAY register with multiple bridge relays simultaneously for availability. Each bridge is published as a separate `SCPRelay` entry in the DID document.
+- **Bridge relay MAY offer this service selectively.** Configuration flag: `supports_bridge: bool`. Bridge relays MAY charge for bridge service via the relay economic configuration (§19.8).
+
+**Honest constraint:** Tier 3 requires someone to operate a bridge relay that is itself publicly reachable. This is not Limn-specific — any SCP relay with a public address can serve as a bridge. But someone must operate one. This is the same pattern as bootstrap relays: the protocol requires no specific operator, but it requires that operators exist. The fallback relay list (§18.5.1) SHOULD include at least one relay that supports bridging.
+
+**Performance:** Bridge proxying adds one network hop compared to direct connections. For typical relay traffic (small encrypted blobs, store-and-forward), the latency impact is negligible. For high-throughput use cases (media hosting, large file transfer), bridge deployment is suboptimal — operators in that situation should obtain a domain (Tier 4) or a VPS with a public IP.
+
+### 10.12.5 Tier 4: Domain-Based Deployment
+
+When an operator has a domain name, domain-based deployment provides the broadest reach: `wss://` with ACME-provisioned TLS, full web compatibility, `.well-known/scp` for HTTP discovery, and no NAT traversal required (the domain resolves to a publicly routable address or the operator has configured port forwarding).
+
+This tier is specified in §18.6 (`ApplicationNode`), §18.6.3 (TLS Provisioning), and §18.3 (`.well-known/scp`). The protocol changes for this tier are zero — it is the existing deployment model.
+
+**Relationship to Tiers 1-3:** When configured via `.domain()`, Tier 4 is attempted first. If it succeeds (DNS resolves, ACME provisions a certificate, the WebSocket endpoint is reachable), it becomes the active tier. If it fails — DNS is misconfigured, ACME challenge cannot complete, the port is unreachable — the SDK falls through to Tiers 1-3 automatically. This makes `.domain()` a best-effort optimization rather than a hard requirement: set it, and it works when conditions allow; when conditions change (laptop moves to a different network, home IP rotates), the zero-config tiers catch you.
+
+Domain-based deployment is not a paid tier or a higher service level. Operators provision their own domain and DNS however they choose. A free domain from a dynamic DNS provider works the same as a custom domain on Cloudflare. The domain is a simple configuration attribute — easy to set, easy to change, easy to remove.
+
+### 10.12.6 Transport Security for Self-Hosted Relays
+
+TLS is required for all domain-based relay connections (§9.13). Self-hosted relays without a domain present a challenge: a laptop behind NAT with no domain cannot obtain a CA-signed TLS certificate, and self-signed certificates provide no trust benefit over plaintext (no trust anchor for the connecting peer to verify against).
+
+**Key decision: `ws://` (plaintext WebSocket) is permitted for self-hosted relays discovered via DHT.**
+
+| Relay type | Discovery path | Transport | TLS required |
+|-----------|---------------|-----------|-------------|
+| Domain-based | `.well-known/scp` or explicit URL | `wss://` | Yes (§9.13) |
+| Self-hosted, no domain | DHT-resolved DID document | `ws://` permitted | No |
+| Self-hosted, with domain | Either | `wss://` | Yes |
+
+**Rationale.** TLS serves two purposes: confidentiality and server authentication.
+
+1. **Confidentiality** is already provided by MLS. Every blob delivered through a relay is MLS-encrypted before it reaches the transport layer (§10.5). TLS on the relay connection protects already-encrypted traffic — defense in depth, not the confidentiality boundary. Removing TLS from a self-hosted relay connection does not expose message content. The confidentiality guarantee is MLS, not TLS.
+
+2. **Server authentication** via TLS requires a domain name and a CA-signed certificate. A relay identified only by IP address behind NAT has no domain and cannot complete ACME challenges. Self-signed certificates provide no authentication benefit — any attacker can generate one. The DID document itself is the authentication mechanism: it is BEP44-signed (§9.6.1), self-certifying against the DID's public key, and published to the DHT with a monotonic sequence number. The relay URL in the DID document IS the authenticated relay address — the trust anchor is the DID document signature, not a TLS certificate.
+
+**Enforcement constraint:** The SDK MUST reject `ws://` relay URLs obtained from `.well-known/scp` or any non-DHT discovery source. Only relay URLs resolved from a BEP44-signed DID document (self-certifying path) may use `ws://`. This prevents downgrade attacks where an attacker substitutes `ws://` URLs in HTTP-based discovery (which lacks the self-certifying property of BEP44).
+
+**Metadata tradeoff.** Without TLS, network intermediaries (ISPs, network operators) can observe the same metadata that any relay operator already sees (§9.9.1): connection timing, blob sizes, routing IDs. They cannot read MLS-encrypted content. This is an accepted tradeoff for the zero-config floor. The metadata exposure is not new — it is the same exposure the relay operator has. TLS merely prevents intermediaries other than the relay from seeing it.
+
+Operators concerned about metadata exposure to network intermediaries can:
+
+- Add a domain and use `wss://` (Tier 4).
+- Route relay traffic through a VPN or Tor.
+- Use a bridge relay with `wss://` (Tier 3 always uses `wss://` because the bridge relay has a domain).
+
+### 10.12.7 DID Document Relay URL Encoding
+
+Each reachability tier produces a different relay URL format for the DID document's `SCPRelay` service endpoints (§18.2.1):
+
+| Tier | URL format | Example |
+|------|-----------|---------|
+| 1 (UPnP) | `ws://` with IP literal | `ws://203.0.113.42:8443/scp/v1` |
+| 2 (STUN) | `ws://` with IP literal | `ws://198.51.100.7:32891/scp/v1` |
+| 3 (Bridge) | `wss://` with bridge domain | `wss://bridge.example.com/scp/v1?bridge_target=<hex-routing-hint>` |
+| 4 (Domain) | `wss://` with operator domain | `wss://relay.example.com/scp/v1` |
+
+Tiers 1 and 2 use `ws://` with raw IP addresses — these are the zero-config, no-domain tiers where TLS is not available (§10.12.6). Tier 3 uses `wss://` because the bridge relay itself has a domain and TLS. Tier 4 uses `wss://` with the operator's domain.
+
+**Address change handling.** Residential IP addresses change (ISP DHCP lease renewal, router reboot). UPnP port mappings may be reassigned. STUN-discovered addresses shift when NAT mappings expire and reform. The `RepublishManager` handles address changes by:
+
+1. Detecting the change (periodic STUN re-probe, UPnP lease renewal response, network interface change event).
+2. Incrementing the DID document sequence number.
+3. Republishing the DID document with the new relay URL to both the DHT and SCP relays (§3.10.5 when specified, otherwise DHT-only).
+
+Peers that fail to connect to a stale relay address re-resolve the DID document immediately. Multi-relay publishing (§18.7) provides availability during address transitions — if the self-hosted relay publishes to external relays in addition to advertising its own address, messages accumulate on external relays while the self-hosted relay's address updates propagate.
+
+### 10.12.8 ApplicationNode Integration
+
+`ApplicationNodeBuilder` (§18.6.2) gains additional methods for zero-config deployment:
+
+```rust
+impl ApplicationNodeBuilder {
+    /// Zero-config NAT-traversed mode. No domain, no TLS, no .well-known/scp.
+    /// Probes NAT, attempts Tiers 1-3, publishes ws:// relay URL in DID document.
+    pub fn no_domain(mut self) -> Self;
+
+    /// Override the STUN endpoint used for NAT type probing.
+    /// Default: bootstrap relay with STUN support.
+    pub fn stun_server(mut self, url: &str) -> Self;
+
+    /// Override the bridge relay used for Tier 3 fallback.
+    /// Default: first bridge-capable relay in the fallback relay list.
+    pub fn bridge_relay(mut self, url: &str) -> Self;
+}
+```
+
+**Behavior when `.no_domain()` is set:**
+
+1. Skip ACME TLS provisioning entirely.
+2. Probe NAT type via STUN binding request.
+3. Attempt Tier 1 (UPnP/NAT-PMP port mapping).
+4. If Tier 1 fails and NAT is non-symmetric, attempt Tier 2 (STUN hole punching).
+5. If Tier 2 fails or NAT is symmetric, register with a bridge relay (Tier 3).
+6. Publish DID document with `ws://` relay URL (Tiers 1-2) or `wss://` bridge URL (Tier 3).
+7. Do NOT serve `.well-known/scp` — there is no domain to serve it from. Discovery is DHT-only.
+
+**Behavior when `.domain()` is set:**
+
+1. Attempt domain-based deployment first: ACME TLS provisioning, `wss://` WebSocket endpoint, `.well-known/scp` generation.
+2. Verify DNS resolves correctly and the ACME challenge completes.
+3. If domain-based deployment succeeds, use Tier 4. Serve `.well-known/scp`. Publish `wss://` relay URL in DID document.
+4. If domain-based deployment fails (DNS misconfigured, ACME challenge fails, port 80/443 unreachable), log the failure and fall through to `.no_domain()` behavior (steps 1-7 above).
+5. The SDK re-attempts domain-based deployment periodically (recommended: every 30 minutes) in case conditions change (DNS propagation completes, port becomes reachable).
+
+**Behavior when neither `.domain()` nor `.no_domain()` is set:**
+
+The builder requires one of the two. Calling `.build()` without either returns an error. This forces the operator to make an explicit choice about their deployment model, even though the choice between them is simple: "Do you have a domain? `.domain()`. No? `.no_domain()`."
+
+### 10.12.9 Threat Model
+
+The reachability tiers introduce attack surfaces beyond the standard relay threat model (§9.9). This section catalogs them.
+
+**UPnP mapping hijack.** A malicious device on the local network deletes or modifies the relay's UPnP port mapping. Impact: availability only — the relay becomes unreachable. MLS prevents any confidentiality or integrity impact. Mitigation: the SDK verifies the mapping periodically (at 50% TTL) and detects loss. On loss, the SDK re-attempts the mapping and, if that fails, falls through to Tier 2. A persistent attacker on the LAN can deny Tier 1 indefinitely, but cannot prevent fallthrough to other tiers.
+
+**STUN server manipulation.** A malicious or compromised STUN server reports an incorrect external address to the self-hosted relay. Impact: availability — peers attempt to connect to the wrong address. Cannot affect confidentiality (MLS) or integrity (DID document is self-certifying). Mitigation: the SDK validates the STUN-reported address by performing a reachability self-test (connecting to its own reported address via an intermediary). If the self-test fails, the STUN result is discarded. Additionally, the SDK SHOULD probe multiple STUN servers and compare results — divergence indicates manipulation.
+
+**Bridge relay as man-in-the-middle.** A bridge relay has the same position as any SCP relay — it sees routing IDs, blob sizes, and timing (§9.9.1). It CANNOT read MLS-encrypted content, forge messages, modify blobs, or inject members into contexts. It CAN perform suppression, delay, and replay — the same attacks any relay can mount. The same mitigations apply: multi-relay cross-check (§9.9.2), sequence gap detection, equivocation detection (§9.9.3), and Commit suppression detection (§9.9.4). Bridge relays are substitutable — switching bridges requires only a DID document update, not a session renegotiation.
+
+**Network metadata exposure without TLS.** For Tiers 1 and 2, relay traffic uses `ws://` (plaintext WebSocket). Network intermediaries (ISPs, network operators on the path) can observe the same metadata that the relay operator sees (§9.9.1): connection timing, blob sizes, routing IDs. They cannot read MLS-encrypted blob content. This is the same metadata exposure as the relay operator has — TLS merely prevents intermediaries other than the relay from seeing it. Accepted tradeoff for zero-config deployment (§10.12.6).
+
+**Residential IP exposure in DID document.** Tiers 1 and 2 publish the operator's residential IP address in the DHT-stored DID document. Anyone who resolves the DID learns the operator's IP. This is inherent to self-hosting without a domain — the relay must be reachable, and reachability requires a public address. Tier 3 (bridge) exposes only the bridge relay's address, not the operator's. Privacy-conscious operators who do not want to expose their residential IP have three options:
+
+- Use a bridge relay (Tier 3) even when not required by NAT type — the SDK could support a `force_bridge()` builder method for this.
+- Route traffic through a VPN, exposing the VPN's address instead.
+- Obtain a domain and use Tier 4.
+
+**NAT type probing as fingerprint.** The initial STUN probe reveals to the STUN server that an SCP node is starting up at a given IP address and time. This is a minor information leak. Mitigation: STUN probes are indistinguishable from WebRTC STUN probes (same protocol, RFC 8489). The SCP-specific semantics are not visible on the wire.
+
+### 10.12.10 Phase Integration
+
+| Component | Phase | Crate | Notes |
+|-----------|-------|-------|-------|
+| NAT type detection (STUN probing) | Phase 2 | `scp-transport` | RFC 8489 binding requests |
+| UPnP/NAT-PMP port mapping | Phase 2 | `scp-transport` | `igd-next` crate for UPnP, `natpmp` crate for NAT-PMP/PCP |
+| STUN hole punching + keepalive | Phase 2 | `scp-transport` | `stun-rs` or `webrtc-rs/stun` |
+| `.no_domain()` builder mode | Phase 2 | `scp-node` | `ApplicationNodeBuilder` extension |
+| `ws://` transport for DHT-discovered relays | Phase 2 | `scp-transport` | Enforcement: reject `ws://` from non-DHT sources |
+| Relay bridging (BRIDGE operation) | Phase 3 | `scp-transport` | New wire operation, bridge registration protocol |
+| STUN service on SCP relays | Phase 3 | `scp-transport` | Coexists with WebSocket endpoint |
+
+Phase 2 delivers the zero-config floor: a self-hosted relay behind most consumer NATs becomes reachable without any manual configuration. Phase 3 closes the remaining ~15% (symmetric NAT) with bridge relaying and adds STUN service to the relay fleet, making the network self-reinforcing. Domain-based deployment (Tier 4) is already specified in Phase 2 via §18.6.
