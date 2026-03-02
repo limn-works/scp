@@ -220,6 +220,43 @@ impl Default for CheckpointPolicy {
 /// manager takes an immutable reference to the log and produces a
 /// [`ConsistencyCheckpoint`] without mutating the log.
 ///
+/// # Concurrency
+///
+/// `CheckpointManager` is intended as a **single-owner-per-context** type:
+/// each context task owns exactly one manager instance. The `&mut self`
+/// requirement on mutating methods ([`record_event`](Self::record_event),
+/// [`maybe_create_checkpoint`](Self::maybe_create_checkpoint),
+/// [`force_create_checkpoint`](Self::force_create_checkpoint)) enforces
+/// exclusive access through the borrow checker, making accidental data
+/// races a compile-time error.
+///
+/// ## `&mut self` / `&EventLog` asymmetry
+///
+/// Checkpoint-creating methods take `&mut self` (exclusive access to the
+/// manager's internal state: counters, stored checkpoints) but only
+/// `&EventLog` (shared access to the log). This asymmetry is intentional:
+///
+/// - **`&mut self`** -- The manager must update its `events_since_last`
+///   counter, `last_checkpoint_timestamp`, and stored checkpoint list.
+///   These are manager-private bookkeeping; exclusive access prevents
+///   inconsistent counter resets.
+/// - **`&EventLog`** -- Checkpoint creation only *reads* the log's Merkle
+///   root and event count. Taking `&EventLog` (not `&mut EventLog`)
+///   ensures that ongoing appends to the log are not blocked while a
+///   checkpoint is being generated.
+///
+/// ## Sharing across threads
+///
+/// Although `CheckpointManager` is `Send + Sync` (all fields are plain
+/// data), the single-owner-per-context model means sharing is unnecessary
+/// in normal operation. If a use case does require sharing (e.g., a
+/// monitoring task that reads checkpoint state), wrap the manager in an
+/// `Arc<Mutex<CheckpointManager>>` and the log in a separate
+/// `Arc<RwLock<EventLog>>`. The two locks remain independent -- holding
+/// the manager mutex during checkpoint creation does not contend with log
+/// appends, because checkpoint creation requires only `&EventLog` (a read
+/// lock on the log).
+///
 /// See ADR-030 §3 in `.docs/adrs/phase-6.md`.
 #[derive(Debug, Clone)]
 pub struct CheckpointManager {
@@ -314,8 +351,15 @@ impl CheckpointManager {
     /// yet due. The checkpoint is stored internally and the scheduler is
     /// reset.
     ///
-    /// This method takes an immutable reference to the log, ensuring that
-    /// checkpoint creation does not block concurrent appends.
+    /// # Borrow semantics
+    ///
+    /// This method takes `&mut self` (exclusive manager access) but only
+    /// `&EventLog` (shared log access). The `&mut self` is needed to reset
+    /// the internal event counter and store the new checkpoint. The `&EventLog`
+    /// is intentionally immutable -- checkpoint creation reads the current
+    /// Merkle root and event count without blocking concurrent appends to the
+    /// log. See the [type-level concurrency docs](Self#concurrency) for the
+    /// full rationale.
     ///
     /// # Errors
     ///
@@ -352,6 +396,12 @@ impl CheckpointManager {
     /// Unlike [`Self::maybe_create_checkpoint`], this always creates a
     /// checkpoint regardless of whether one is due. Useful for forced
     /// checkpoints (e.g., before context closure).
+    ///
+    /// # Borrow semantics
+    ///
+    /// Same as [`Self::maybe_create_checkpoint`]: `&mut self` for exclusive
+    /// manager access, `&EventLog` for non-blocking log reads. See the
+    /// [type-level concurrency docs](Self#concurrency) for details.
     ///
     /// # Errors
     ///
