@@ -32,7 +32,7 @@ use napi_derive::napi;
 use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
-use scp_core::crypto::ucan::UcanToken;
+
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
 
@@ -430,6 +430,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 )]
 mod tests {
     use super::*;
+    use scp_core::crypto::ucan::UcanToken;
     use scp_core::crypto::ucan::validate::{
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };

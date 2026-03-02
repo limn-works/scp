@@ -2439,6 +2439,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn behavioral_validation_works_with_checkpointed_log() {
         // Build a non-trivial event log with multiple event types and two
         // participants. This exercises behavioral record computation against

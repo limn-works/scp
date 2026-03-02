@@ -101,7 +101,7 @@ pub async fn event_log_query(
     let (event_count, merkle_root_hex) = crate::runtime::with_context(&context_id, |rt| {
         let count = scp_core::event_log::tree::event_count(&rt.event_log);
         let root = scp_core::event_log::tree::root(&rt.event_log);
-        Ok((count, hex::encode(&root)))
+        Ok((count, hex::encode(root)))
     })
     .map_err(napi::Error::from)?;
 
@@ -227,7 +227,7 @@ pub async fn event_log_verify(
                             scp_core::event_log::proof::Direction::Right => "right",
                         };
                         serde_json::json!({
-                            "sibling_hash": hex::encode(&step.sibling_hash),
+                            "sibling_hash": hex::encode(step.sibling_hash),
                             "direction": direction,
                         })
                     })
@@ -235,8 +235,8 @@ pub async fn event_log_verify(
 
                 let details = serde_json::json!({
                     "leaf_index": proof.leaf_index,
-                    "leaf_hash": hex::encode(&proof.leaf_hash),
-                    "root": hex::encode(&proof.root),
+                    "leaf_hash": hex::encode(proof.leaf_hash),
+                    "root": hex::encode(proof.root),
                     "path": path_steps,
                     "path_length": proof.path.len(),
                 });
@@ -277,14 +277,14 @@ pub async fn event_log_verify(
 
                 let lower = proof.lower.as_ref().map(|lwp| {
                     serde_json::json!({
-                        "leaf_hash": hex::encode(&lwp.leaf_hash),
+                        "leaf_hash": hex::encode(lwp.leaf_hash),
                         "leaf_index": lwp.leaf_index,
                     })
                 });
 
                 let upper = proof.upper.as_ref().map(|uwp| {
                     serde_json::json!({
-                        "leaf_hash": hex::encode(&uwp.leaf_hash),
+                        "leaf_hash": hex::encode(uwp.leaf_hash),
                         "leaf_index": uwp.leaf_index,
                     })
                 });
@@ -298,8 +298,8 @@ pub async fn event_log_verify(
                 let verified = lower_verified && upper_verified;
 
                 let details = serde_json::json!({
-                    "query_hash": hex::encode(&proof.query_hash),
-                    "root": hex::encode(&proof.root),
+                    "query_hash": hex::encode(proof.query_hash),
+                    "root": hex::encode(proof.root),
                     "leaf_count": proof.leaf_count,
                     "lower": lower,
                     "upper": upper,

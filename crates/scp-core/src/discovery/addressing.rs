@@ -1038,7 +1038,7 @@ mod tests {
 
         cache.insert(
             "alice".to_owned(),
-            results.clone(),
+            results,
             Duration::from_secs(3600),
         );
 
@@ -1212,6 +1212,7 @@ mod tests {
     }
 
     /// Test double: in-memory handle querier.
+    #[allow(clippy::struct_field_names)]
     struct TestHandleQuerier {
         discovery_handles: HashMap<(String, String), Vec<AddressResolution>>,
         domain_handles: HashMap<(String, String), Vec<AddressResolution>>,

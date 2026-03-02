@@ -136,12 +136,14 @@ impl NapiIdentity {
 impl NapiIdentity {
     /// Returns the retained `InMemoryKeyCustody` if this identity uses in-memory
     /// custody. Used by context creation for routing ID derivation (SCP-214).
+    #[allow(dead_code)]
     pub(crate) fn in_memory_custody(&self) -> Option<&InMemoryKeyCustody> {
         self.inner.in_memory_custody.as_ref().map(|c| &c.0)
     }
 
     /// Returns the retained `ScpIdentity` if available. Used by context creation
     /// for routing ID derivation (SCP-214).
+    #[allow(dead_code)]
     pub(crate) fn scp_identity(&self) -> Option<&ScpIdentity> {
         self.inner.scp_identity.as_ref()
     }

@@ -482,7 +482,7 @@ mod tests {
         let forged_envelope = BroadcastEnvelope {
             author_did: envelope.author_did.clone(),
             key_epoch: 0,
-            encrypted_content: envelope.encrypted_content.clone(),
+            encrypted_content: envelope.encrypted_content,
         };
 
         let wrong_key = BroadcastKey {

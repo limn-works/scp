@@ -1,3 +1,7 @@
+// Runtime registry infrastructure — built in this PR, wired in follow-up.
+// context_create/context_close in bridge.rs will call register/remove_context.
+#![allow(dead_code)]
+
 //! Global runtime registry mapping context IDs to live `scp-core` objects.
 //!
 //! Mirrors the `PyO3` bridge's `runtime.rs` pattern: a `DashMap` maps context IDs

@@ -48,7 +48,7 @@ mod wasm_mirror {
     }
 
     impl WasmEventLog {
-        pub fn new() -> Self {
+        pub const fn new() -> Self {
             Self {
                 leaves: Vec::new(),
                 tree: Vec::new(),
@@ -74,7 +74,7 @@ mod wasm_mirror {
             top_layer[0]
         }
 
-        pub fn event_count(&self) -> u64 {
+        pub const fn event_count(&self) -> u64 {
             self.leaves.len() as u64
         }
 
@@ -474,7 +474,7 @@ fn leaf_hash_from_event(event: &Event) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Builds both an scp-core EventLog and a WASM mirror log with `n` events,
+/// Builds both an scp-core `EventLog` and a WASM mirror log with `n` events,
 /// returning both logs and the leaf hashes.
 fn build_dual_logs(n: u64) -> (EventLog, wasm_mirror::WasmEventLog, Vec<[u8; 32]>) {
     let (verifying_key, signing_key) = test_keypair();
@@ -788,8 +788,7 @@ fn absence_proofs_identical() {
 
         for query_hash in &test_hashes {
             // Skip if the hash happens to be present (unlikely but possible).
-            let sorted: Vec<[u8; 32]> = core_log.sorted_leaves().iter().map(|(h, _)| *h).collect();
-            if sorted.contains(query_hash) {
+            if core_log.sorted_leaves().iter().map(|(h, _)| *h).any(|x| x == *query_hash) {
                 continue;
             }
 
@@ -976,7 +975,7 @@ fn value_against_schema_validation_identical() {
             true,
         ),
         (
-            serde_json::json!(3.14),
+            serde_json::json!(2.72),
             serde_json::json!({"type": "number"}),
             true,
         ),
@@ -1007,7 +1006,7 @@ fn value_against_schema_validation_identical() {
             false,
         ),
         (
-            serde_json::json!(3.14),
+            serde_json::json!(2.72),
             serde_json::json!({"type": "integer"}),
             false,
         ),

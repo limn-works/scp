@@ -872,8 +872,7 @@ mod tests {
         state.broadcast("second".to_owned()).await;
         state.broadcast("third".to_owned()).await;
 
-        let buf = state.replay_buffer.read().await;
-        let missed = buf.events_after(1);
+        let missed = state.replay_buffer.read().await.events_after(1);
         assert_eq!(missed.len(), 2);
         assert_eq!(missed[0].data, "second");
         assert_eq!(missed[1].data, "third");

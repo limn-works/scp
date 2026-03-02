@@ -202,6 +202,7 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
     s.connected = false;
     s.relay_url = None;
     s.latency_ms = None;
+    drop(s);
 
     Ok(())
 }
