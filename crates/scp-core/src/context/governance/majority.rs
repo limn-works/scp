@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    VoteType, compute_proposal_id, sign_vote,
+    VoteType, compute_proposal_id, sign_vote, verify_vote,
 };
 use crate::identity::DID;
 
@@ -413,6 +413,9 @@ impl GovernanceEngine for MajorityVoteEngine {
             signing_key,
         )?;
 
+        // Defense-in-depth: verify the vote signature before accepting it.
+        verify_vote(proposal_id, &signed_vote, &signing_key.verifying_key())?;
+
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
                 id: hex::encode(proposal_id),
@@ -492,6 +495,9 @@ impl GovernanceEngine for MajorityVoteEngine {
             context.now,
             signing_key,
         )?;
+
+        // Defense-in-depth: verify the vote signature before accepting it.
+        verify_vote(proposal_id, &signed_vote, &signing_key.verifying_key())?;
 
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
@@ -1848,5 +1854,91 @@ mod tests {
             .approve(&proposal.proposal_id, &bob(), &ctx, &sk_bob())
             .unwrap();
         assert_eq!(status, ProposalStatus::Approved);
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_vote integration (defense-in-depth)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn approve_produces_verifiable_votes() {
+        use crate::context::governance::verify_vote;
+
+        let voters = three_voters();
+        let mut engine = default_engine(voters.clone());
+        let ctx = test_context(&voters, T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
+            .unwrap();
+
+        let p = engine.get_proposal(&proposal.proposal_id).unwrap();
+        assert_eq!(p.approvals.len(), 1);
+        verify_vote(
+            &proposal.proposal_id,
+            &p.approvals[0],
+            &sk_alice().verifying_key(),
+        )
+        .expect("vote recorded by approve() should be verifiable");
+    }
+
+    #[test]
+    fn reject_produces_verifiable_votes() {
+        use crate::context::governance::verify_vote;
+
+        let voters = three_voters();
+        let mut engine = default_engine(voters.clone());
+        let ctx = test_context(&voters, T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+
+        engine
+            .reject(&proposal.proposal_id, &bob(), &ctx, &sk_bob())
+            .unwrap();
+
+        let p = engine.get_proposal(&proposal.proposal_id).unwrap();
+        assert_eq!(p.rejections.len(), 1);
+        verify_vote(
+            &proposal.proposal_id,
+            &p.rejections[0],
+            &sk_bob().verifying_key(),
+        )
+        .expect("vote recorded by reject() should be verifiable");
+    }
+
+    #[test]
+    fn tampered_vote_signature_rejected_by_verify_proposal_votes() {
+        use crate::context::governance::verify_proposal_votes;
+
+        let voters = three_voters();
+        let mut engine = default_engine(voters.clone());
+        let ctx = test_context(&voters, T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
+            .unwrap();
+
+        // Serialize and deserialize to simulate persistence/sync boundary.
+        let p = engine.get_proposal(&proposal.proposal_id).unwrap();
+        let json = serde_json::to_string(p).unwrap();
+        let mut deserialized: GovernanceProposal = serde_json::from_str(&json).unwrap();
+
+        // Tamper with the vote signature.
+        deserialized.approvals[0].signature[0] ^= 0xff;
+
+        let result = verify_proposal_votes(&deserialized, |did| {
+            if *did == alice() {
+                Some(sk_alice().verifying_key())
+            } else {
+                None
+            }
+        });
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VerificationFailed(_)
+        ));
     }
 }

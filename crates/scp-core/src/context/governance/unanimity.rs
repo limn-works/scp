@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    VoteType, compute_proposal_id, sign_vote,
+    VoteType, compute_proposal_id, sign_vote, verify_vote,
 };
 use crate::identity::DID;
 
@@ -223,6 +223,9 @@ impl GovernanceEngine for UnanimityEngine {
             signing_key,
         )?;
 
+        // Defense-in-depth: verify the proposer's vote signature before accepting it.
+        verify_vote(&proposal_id, &proposer_vote, &signing_key.verifying_key())?;
+
         let proposal = GovernanceProposal {
             proposal_id,
             context_id: context.context_id.clone(),
@@ -321,6 +324,9 @@ impl GovernanceEngine for UnanimityEngine {
             signing_key,
         )?;
 
+        // Defense-in-depth: verify the vote signature before accepting it.
+        verify_vote(proposal_id, &vote, &signing_key.verifying_key())?;
+
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
             proposal_mut.approvals.push(vote);
@@ -387,6 +393,9 @@ impl GovernanceEngine for UnanimityEngine {
             context.now,
             signing_key,
         )?;
+
+        // Defense-in-depth: verify the vote signature before accepting it.
+        verify_vote(proposal_id, &vote, &signing_key.verifying_key())?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -1524,5 +1533,98 @@ mod tests {
         // Bob approves -> 2 of 2 -> unanimity.
         let (status, _) = engine.approve(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
         assert_eq!(status, ProposalStatus::Approved);
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_vote integration (defense-in-depth)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn propose_produces_verifiable_proposer_vote() {
+        use crate::context::governance::verify_vote;
+
+        let voters = vec![alice(), bob(), carol()];
+        let mut engine = UnanimityEngine::new(voters, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("ok");
+
+        // Proposer's implicit approval should be verifiable.
+        assert_eq!(proposal.approvals.len(), 1);
+        verify_vote(
+            &proposal.proposal_id,
+            &proposal.approvals[0],
+            &sk_alice().verifying_key(),
+        )
+        .expect("proposer's vote should be verifiable");
+    }
+
+    #[test]
+    fn approve_produces_verifiable_votes() {
+        use crate::context::governance::verify_vote;
+
+        let voters = vec![alice(), bob(), carol()];
+        let mut engine = UnanimityEngine::new(voters, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("ok");
+
+        engine
+            .approve(&proposal.proposal_id, &bob(), &ctx, &sk_bob())
+            .expect("ok");
+
+        let p = engine.get_proposal(&proposal.proposal_id).unwrap();
+        assert_eq!(p.approvals.len(), 2);
+        verify_vote(
+            &proposal.proposal_id,
+            &p.approvals[1],
+            &sk_bob().verifying_key(),
+        )
+        .expect("vote recorded by approve() should be verifiable");
+    }
+
+    #[test]
+    fn tampered_vote_signature_rejected_by_verify_proposal_votes() {
+        use crate::context::governance::verify_proposal_votes;
+
+        let voters = vec![alice(), bob(), carol()];
+        let mut engine = UnanimityEngine::new(voters, 86_400).expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("ok");
+
+        engine
+            .approve(&proposal.proposal_id, &bob(), &ctx, &sk_bob())
+            .expect("ok");
+
+        // Serialize and deserialize to simulate persistence/sync boundary.
+        let p = engine.get_proposal(&proposal.proposal_id).unwrap();
+        let json = serde_json::to_string(p).unwrap();
+        let mut deserialized: GovernanceProposal = serde_json::from_str(&json).unwrap();
+
+        // Tamper with bob's vote signature.
+        deserialized.approvals[1].signature[0] ^= 0xff;
+
+        let result = verify_proposal_votes(&deserialized, |did| {
+            if *did == alice() {
+                Some(sk_alice().verifying_key())
+            } else if *did == bob() {
+                Some(sk_bob().verifying_key())
+            } else {
+                None
+            }
+        });
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VerificationFailed(_)
+        ));
     }
 }
