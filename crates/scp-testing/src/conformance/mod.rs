@@ -7,3 +7,4 @@
 
 pub mod blob_store;
 pub mod payment;
+pub mod storage;
