@@ -342,6 +342,7 @@ impl ContextManager {
             ttl_timer: TtlTimer::new(),
             ttl_extension: None,
             broadcast_context: Some(broadcast_context),
+            executed_proposals: HashSet::new(),
         };
 
         let mut contexts = self.contexts.lock().await;
