@@ -78,7 +78,7 @@ fn validate_non_empty(value: &str, field_name: &str, max_len: usize) -> Result<(
 fn reject_control_chars(value: &str, field_name: &str) -> Result<(), ScpPyError> {
     if let Some(pos) = value.chars().position(char::is_control) {
         return Err(ScpPyError::ValidationError(format!(
-            "{field_name} contains control character at byte position {pos}"
+            "{field_name} contains control character at position {pos}"
         )));
     }
     Ok(())
