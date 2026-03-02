@@ -582,12 +582,33 @@ where `epoch_BE` is a 64-bit big-endian pseudonym rotation epoch (distinct from 
 
 ### 9.10.6 Cover Traffic
 
-Cover traffic is **enabled by default and configurable per-client.** The SDK ships with cover traffic on. Clients or operators may disable it via SDK configuration. Disabling degrades traffic analysis resistance but has no functional impact on message delivery or protocol correctness.
+Cover traffic uses **tiered configuration driven by transport profiles** (§10.13). The SDK selects a cover traffic tier based on the active transport profile. Disabling cover traffic (tier `off`) degrades traffic analysis resistance but has no functional impact on message delivery or protocol correctness.
 
-1. **Persistent connections: constant-rate, default on.** One padded dummy message per relay connection per 30 seconds. Dummy messages are always sent at each interval. Real messages are sent as additional traffic. This prevents timing oracles where observers infer real traffic from missing dummies. Dummy traffic baseline: ~15MB/day for 5 relay connections at 1KB padding. Real messages add variable bandwidth on top — typically <5% increase at moderate usage, making total bandwidth slightly above the baseline under normal conditions.
-2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
-3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
+**Cover traffic tiers:**
+
+| Tier | Interval | Padding size | Use case |
+|------|----------|-------------|----------|
+| `full` | 30s | 1024 bytes | Desktop/server profiles — maximum metadata privacy |
+| `reduced` | 120s | 256 bytes | Mobile profile — battery-conscious |
+| `off` | — | — | Constrained profile (§10.16), push-wake connections |
+| `custom` | User-specified | User-specified | Advanced configuration via `CoverTrafficTier::Custom { interval, message_size }` |
+
+**Configuration.** `CoverTrafficConfig` uses `tier: CoverTrafficTier` to select the active tier. The tier determines the interval and padding size. `CoverTrafficTier::from_profile(profile)` maps each `TransportProfile` to its default tier: `Server` and `Desktop` → `full`, `Mobile` → `reduced`, `Constrained` → `off`.
+
+**Invariants (apply to all tiers except `off`):**
+
+1. **Constant-rate.** Dummy messages are always sent at each interval tick. Real messages are sent as additional traffic — they never suppress a dummy. This prevents timing oracles where observers infer real traffic from missing dummies.
+2. **Push-wake connections: no cover traffic.** Push-wake connections are transient and brief; cover traffic is meaningless over them.
+3. **Dummy message format.** Single-byte flag inside encrypted payload distinguishes real from dummy. `REAL_FLAG = 0x01`, `DUMMY_FLAG = 0x00`. Recipients decrypt, check the flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
+5. **Bucket padding.** All payloads (real and dummy) are padded to the nearest power-of-2 bucket: 256, 512, 1024, 2048, 4096 bytes. This normalizes message sizes regardless of content length.
+
+**Bandwidth baseline by tier:**
+- `full`: ~15MB/day for 5 relay connections at 1024-byte padding. Real messages add <5% above baseline at moderate usage.
+- `reduced`: ~1.8MB/day for 5 relay connections at 256-byte padding. Suitable for metered mobile connections.
+- `off`: Zero cover traffic overhead. Constrained devices (§10.16) typically operate behind a gateway agent that provides cover traffic on their behalf.
+
+**Bandwidth budget.** An optional bytes-per-minute cap across all connections limits total cover traffic bandwidth. When the budget is reached, the tier degrades gracefully: `full` → `reduced` → `off`. The budget is a soft limit for resource-constrained environments, not a security feature.
 
 ### 9.10.7 DID Resolution Privacy
 

@@ -1187,3 +1187,200 @@ Implement two `ApplicationNode` features in the `scp-node` crate:
 | `crates/scp-transport/src/native/server.rs` | `RelayServer::new` accepts `Arc<B>` instead of owned `B` |
 
 **Estimated functions:** ~15-20 public functions, ~10-15 internal helpers across new and modified files.
+
+---
+
+## ADR-036: Transport Profiles and Adaptive Resource Management
+
+**Status:** Decided
+
+### Context
+
+SCP's native relay transport (ADR-004) uses persistent WebSocket connections with 30-second PING keepalive and 30-second cover traffic intervals per connection. Each context is assigned a minimum of 3 relays for suppression resistance (§9.10.1), meaning a single participant maintains at minimum 3 persistent TCP connections per context. This model works well for desktop and server deployments but creates real resource problems for:
+
+1. **Mobile devices:** Each persistent WebSocket holds an open TCP connection, preventing the radio from entering low-power idle. The 30-second cover traffic and 30-second PING intervals wake the radio 4 times per minute per connection. With 3 relays per context and multiple active contexts, battery drain is significant.
+2. **IoT and embedded devices:** Many constrained devices cannot sustain TCP connections at all — they use UDP-based protocols (CoAP, DTLS datagrams), have kilobytes of RAM, and operate on low-power duty cycles. WebSocket is architecturally incompatible.
+3. **High-connection-count relays:** Each WebSocket connection consumes server memory for TCP state, TLS session, and subscription registry entries. A relay serving thousands of participants must manage thousands of persistent connections with their associated cover traffic overhead.
+
+The existing cover traffic configuration (§9.10.6) was binary: enabled or disabled. This is too coarse — mobile devices need cover traffic but at reduced frequency, while constrained devices genuinely cannot afford any.
+
+### Decision
+
+Introduce named transport profiles and tiered cover traffic configuration to adapt SCP's transport behavior to device capabilities.
+
+**Transport profiles** (§10.13): Four named profiles — `server`, `desktop`, `mobile`, `constrained` — each bundling connection strategy, cover traffic tier, minimum relay count, reconnect behavior, and maximum connection budget. The SDK infers a profile from the platform at initialization, overridable by the application.
+
+**Cover traffic tiers** (§9.10.6 amended): Replace `CoverTrafficConfig { enabled: bool }` with `CoverTrafficConfig { tier: CoverTrafficTier }`. Four tiers: `full` (30s/1024B — maximum metadata privacy), `reduced` (120s/256B — battery-conscious), `off` (constrained devices, push-wake connections), `custom` (user-specified interval and padding). `CoverTrafficTier::from_profile()` maps profiles to their default tier. No backward compatibility shim — SCP has not shipped.
+
+**Connection pooling** (§10.13.2): Explicitly specify that a single adapter connection to a relay is shared by all contexts assigned to that relay. `TransportManager` maintains at most one connection per relay URL. Cross-`TransportManager` sharing via `Arc<ConnectionPool>` keyed by `(relay_url, transport_type)`.
+
+**Connection budget** (§10.13.3): Maximum total connections across all adapters, derived from profile. When budget is reached, least-recently-used connections are closed and subscriptions migrated. Mobile profile sheds connections for inactive contexts, relying on push notification bridge (§10.7) to wake on new messages.
+
+**Suppression resistance trade-offs:** `mobile` accepts 2-relay minimum (reduced suppression detection). `constrained` accepts 1-relay minimum (no suppression detection). Both are explicit, documented trade-offs — acceptable because mobile devices are typically behind gateways with full-profile connectivity, and constrained devices are behind gateway agents that participate in full-profile contexts.
+
+### Rationale
+
+- **Profiles over per-setting configuration:** Bundling related transport parameters into named profiles prevents misconfigurations (e.g., setting cover traffic to "full" with a connection budget of 2). A profile guarantees internally consistent transport behavior.
+- **Four profiles, not three or five:** `server` and `desktop` differ only in connection budget and are both persistent-connection models. `mobile` is the inflection point — it introduces push-wake semantics and reduced cover traffic. `constrained` is fundamentally different — connectionless, poll-based, no cover traffic. These four cover the real device-class spectrum without artificial granularity.
+- **No backward compat for CoverTrafficConfig:** SCP has not shipped. The `enabled: bool` field was a placeholder. Refactoring to `tier: CoverTrafficTier` is strictly better — no migration, no shim, no technical debt.
+- **Explicit suppression trade-offs:** Hiding the security implications of reduced relay counts would violate the legibility tenet. Documenting them in the spec makes them informed decisions, not silent degradation.
+
+### Rejected Alternatives
+
+1. **Automatic profile switching based on battery level.** Over-engineered — the application knows its device class at initialization. Dynamic switching mid-session would require re-negotiating relay assignments and cover traffic parameters, adding protocol complexity for a marginal benefit.
+2. **Per-context profiles.** Would allow a single device to run some contexts at "server" and others at "constrained." This complicates connection budgeting and creates confusing UX. The profile applies to the device, not the context. If a specific context needs different transport behavior, override individual settings rather than mixing profiles.
+3. **Six-tier cover traffic.** Early design had `full`, `high`, `medium`, `low`, `minimal`, `off`. Four tiers (plus `custom`) are sufficient — `full` and `reduced` cover the real-world cases, `off` covers constrained, and `custom` covers everything else.
+
+### Dependencies
+
+- **ADR-004 (Native Relay):** Cover traffic implementation, subscription registry, PING/PONG keepalive.
+- **§9.10.6 (Cover Traffic):** Amended specification that this ADR implements.
+- **§10.13 (Transport Profiles):** Specification that this ADR implements.
+- **§10.7 (Push Notification Bridge):** Mobile profile relies on push-wake for inactive context delivery.
+
+### Acceptance Criteria
+
+1. **`TransportProfile` enum** with `Server`, `Desktop`, `Mobile`, `Constrained` variants. Each variant carries default values for `min_relays`, `max_connections`, `reconnect_backoff_range`, and `cover_traffic_tier`. Platform inference via `#[cfg(target_os)]`.
+2. **`CoverTrafficTier` enum** with `Full`, `Reduced`, `Off`, `Custom { interval: Duration, padding_bytes: usize }` variants. `CoverTrafficConfig` uses `tier: CoverTrafficTier` instead of `enabled: bool`. `from_profile()` method maps profile to tier. All existing callers updated.
+3. **`ConnectionPool`** keyed by `(relay_url, transport_type)`. `TransportManager` uses the pool for adapter lookup and reuse. Single connection per relay per transport type. `Arc<ConnectionPool>` for cross-manager sharing.
+4. **Connection budget enforcement.** `TransportManager` tracks total active connections. When `max_connections` exceeded, LRU connection is closed. Subscriptions on evicted connections are migrated to surviving connections to the same relay, or trigger relay reassignment.
+5. **`TransportConfig` gains `profile: TransportProfile` field.** Existing `TransportConfig` construction sites updated. Profile defaults apply unless overridden.
+
+### Scope
+
+**New files:**
+
+| File | Purpose |
+|------|---------|
+| `crates/scp-transport/src/pool.rs` | `ConnectionPool` keyed by `(relay_url, transport_type)`, LRU eviction |
+| `crates/scp-transport/src/profile.rs` | `TransportProfile` enum, platform inference, default mappings |
+
+**Modified files:**
+
+| File | Change |
+|------|--------|
+| `crates/scp-transport/src/config.rs` | Add `profile: TransportProfile` to `TransportConfig`. Add `CoverTrafficTier` enum, refactor `CoverTrafficConfig`. |
+| `crates/scp-transport/src/cover_traffic.rs` | Use `CoverTrafficTier` for interval/padding selection. Remove boolean `enabled` paths. |
+| `crates/scp-transport/src/manager.rs` | Use `ConnectionPool` for adapter lookup. Enforce connection budget. Profile-aware defaults. |
+| `crates/scp-transport/src/lib.rs` | Re-export new types. |
+
+**Estimated functions:** ~15-20 public functions, ~10-12 internal helpers.
+
+---
+
+## ADR-037: Alternative Transport Bindings (QUIC, WebTransport, UDP/DTLS)
+
+**Status:** Decided
+
+### Context
+
+SCP's transport layer is designed around the `TransportAdapter` trait (ADR-005), which abstracts the wire protocol behind five methods (`send`, `subscribe`, `unsubscribe`, `query`, `delete`). The only fully implemented adapter is the native relay using MessagePack-over-WebSocket (ADR-004). While functional, WebSocket has limitations that matter at scale:
+
+1. **Head-of-line blocking.** WebSocket is a single ordered stream over TCP. A slow or lost packet blocks all subsequent frames — including frames for unrelated contexts multiplexed on the same connection. This is a fundamental TCP limitation.
+2. **No connection migration.** When a mobile device switches from Wi-Fi to cellular, the TCP connection breaks. The client must fully reconnect and re-subscribe — losing messages during the transition.
+3. **Keepalive overhead.** WebSocket requires application-level PING/PONG (30s interval per ADR-004). Each ping is a round trip on the wire, separate from the transport-layer keepalive.
+4. **Browser transport ceiling.** Browsers are limited to WebSocket for bidirectional streaming. WebSocket over HTTP/1.1 doesn't benefit from HTTP/2 multiplexing or HTTP/3 (QUIC). The WebTransport API gives browsers access to QUIC-like semantics (independent streams, datagrams) over HTTP/3.
+5. **IoT exclusion.** Constrained devices (§10.16) that operate on UDP-based duty cycles cannot use WebSocket at all.
+
+### Decision
+
+Spec and implement three new Tier 1 transport bindings, all using the same MessagePack wire format defined in ADR-004.
+
+#### QUIC Transport Binding (§10.14)
+
+QUIC replaces WebSocket for native (non-browser) clients. One QUIC connection per relay replaces one WebSocket per relay. SCP operations map to per-operation QUIC streams:
+
+| Operation | QUIC mapping |
+|-----------|-------------|
+| PUBLISH | New bidirectional stream → send → ACK → close |
+| SUBSCRIBE | Long-lived bidirectional stream → receive BLOBs until unsubscribe |
+| UNSUBSCRIBE | Close the subscription's stream (clean FIN) |
+| QUERY | New bidirectional stream → send → results + query_complete → close |
+| DELETE | New bidirectional stream → send → ACK → close |
+| PING/PONG | Not needed — QUIC native keepalive (PATH_CHALLENGE/PATH_RESPONSE) |
+
+Benefits: 0-RTT reconnect (session tickets), connection migration (IP change without reconnect), no head-of-line blocking (independent streams), no PING/PONG overhead, no `ref_id` correlation (responses scoped to their stream).
+
+Relay advertises QUIC via `.well-known/scp` `relay_config.transports` array. Client probes QUIC first, falls back to WebSocket on timeout.
+
+#### WebTransport Binding (§10.15)
+
+WebTransport is the browser-facing equivalent of QUIC. The WASM binding uses the browser's `WebTransport` API over HTTP/3. Server-side, relay handles both QUIC and WebTransport sessions — they're both QUIC underneath.
+
+Fallback chain: WebTransport → WebSocket → error. The WASM binding attempts WebTransport first, falls back to WebSocket when the `WebTransport` API is unavailable or connection fails.
+
+HTTP/3 is also the relay's HTTP upgrade path for all endpoints (`.well-known/scp`, dev API, broadcast projection), advertised via `Alt-Svc` header and ALPN negotiation.
+
+#### UDP/DTLS Binding (§10.16)
+
+For IoT and constrained devices that cannot sustain TCP connections. Two options:
+
+- **MessagePack-over-DTLS:** SCP-native, connectionless DTLS 1.3 datagrams, same wire format as ADR-004. Session resumption via DTLS session tickets.
+- **CoAP-over-DTLS:** IoT interop, CoAP (RFC 7252) as framing layer. Maps SCP operations to CoAP methods (POST→PUBLISH, GET→QUERY, DELETE→DELETE). CoAP Observe (RFC 7641) for lightweight subscription.
+
+Both options: no persistent subscriptions (poll via QUERY), no cover traffic, single relay, MTU-constrained blob size.
+
+### Rationale
+
+- **QUIC over HTTP/2:** HTTP/2 multiplexing solves head-of-line blocking at the HTTP layer but not at TCP. QUIC solves it at the transport layer. HTTP/2 also doesn't provide connection migration.
+- **Per-operation streams over single-stream emulation:** Running the same single-stream protocol over QUIC (as some WebSocket-to-QUIC migrations do) wastes QUIC's stream model. Per-operation streams eliminate `ref_id` correlation, enable natural flow control per operation, and make subscribe/unsubscribe map cleanly to stream lifecycle.
+- **WebTransport over raw QUIC in browser:** Browsers don't expose raw QUIC sockets. WebTransport is the standardized API for QUIC-like semantics in browsers. Server-side, it's the same QUIC stack.
+- **Two constrained options over one:** MessagePack-over-DTLS is simpler and native to SCP. CoAP-over-DTLS enables interop with existing IoT infrastructure (LwM2M, CoAP proxies). Different IoT ecosystems prefer different approaches.
+- **Same wire format across all bindings:** All four Tier 1 adapters use ADR-004's MessagePack wire format. The only differences are framing (WebSocket frames vs. QUIC streams vs. DTLS datagrams vs. CoAP messages) and connection lifecycle. This means the relay's blob storage, subscription registry, and authentication are shared across all transports.
+
+### Rejected Alternatives
+
+1. **gRPC-based transport.** gRPC provides strong typing and streaming but adds a Protobuf dependency, doesn't support connection migration, and doesn't solve head-of-line blocking (it runs on HTTP/2 over TCP). Also doesn't work in constrained environments.
+2. **Custom UDP protocol without DTLS.** SCP requires transport encryption (§9.9). Rolling a custom encryption layer over raw UDP would be security-critical code with no review history. DTLS is standardized and audited.
+3. **WebSocket-only with proxy-based QUIC.** A QUIC-to-WebSocket proxy at the relay would give clients QUIC benefits for the first hop but still suffer TCP limitations at the relay. End-to-end QUIC is strictly better.
+4. **MQTT as the constrained device transport.** MQTT is a good fit for IoT pub/sub but adds a broker dependency and doesn't provide the connectionless semantics that truly constrained devices need. MQTT is available as a Tier 2 adapter (§10.5.2) for environments where a broker already exists.
+
+### Dependencies
+
+- **ADR-004 (Native Relay):** MessagePack wire format, relay operations (PUBLISH/SUBSCRIBE/QUERY/DELETE), blob storage, subscription registry.
+- **ADR-005 (Transport Trait):** `TransportAdapter` trait that all bindings implement.
+- **ADR-036 (Transport Profiles):** Profile-aware connection behavior, cover traffic tiers.
+- **§10.14 (QUIC Transport Binding):** Specification for QUIC adapter.
+- **§10.15 (HTTP/3 and WebTransport):** Specification for HTTP/3 and WebTransport.
+- **§10.16 (Constrained Device Transport):** Specification for UDP/DTLS adapters.
+
+### Acceptance Criteria
+
+1. **`QuicAdapter` implements `TransportAdapter`.** Uses `quinn` crate. Per-operation bidirectional streams for PUBLISH/QUERY/DELETE. Long-lived bidirectional stream for SUBSCRIBE. Same MessagePack wire format as ADR-004. Passes `transport_conformance!()`.
+2. **QUIC connection lifecycle.** 0-RTT resumption via session tickets. Connection migration on IP change. Profile-aware reconnect backoff. QUIC native keepalive replaces PING/PONG.
+3. **Relay multi-transport listener.** `RelayServer` accepts WebSocket, QUIC, and WebTransport connections. ALPN negotiation. Shared subscription registry and blob storage across all transport handlers.
+4. **WebTransport server-side session handling.** Relay accepts WebTransport sessions at `/scp/v1`. Streams map to SCP operations (same model as QUIC). HTTP/3 served via ALPN on TLS port. `Alt-Svc` header advertises HTTP/3.
+5. **`UdpDtlsAdapter` implements `TransportAdapter`.** DTLS 1.3 session management. Connectionless PUBLISH/QUERY/DELETE as DTLS datagrams. `subscribe()` returns error (not supported — poll via QUERY). Session resumption via DTLS session tickets. Passes `transport_conformance!()` for supported operations.
+6. **`.well-known/scp` transport advertisement.** `relay_config.transports` array lists all supported transport types. Relay auto-detects based on enabled listeners.
+
+### Scope
+
+**New files:**
+
+| File | Purpose |
+|------|---------|
+| `crates/scp-transport/src/quic/mod.rs` | QUIC adapter module |
+| `crates/scp-transport/src/quic/adapter.rs` | `QuicAdapter` implementing `TransportAdapter` |
+| `crates/scp-transport/src/quic/streams.rs` | Per-operation stream management |
+| `crates/scp-transport/src/quic/connection.rs` | Connection lifecycle (0-RTT, migration, reconnect) |
+| `crates/scp-transport/src/quic/listener.rs` | Relay-side QUIC listener |
+| `crates/scp-transport/src/webtransport/mod.rs` | WebTransport adapter module |
+| `crates/scp-transport/src/webtransport/session.rs` | Server-side WebTransport session handling |
+| `crates/scp-transport/src/webtransport/adapter.rs` | Client-side WebTransport adapter (WASM) |
+| `crates/scp-transport/src/udp/mod.rs` | UDP/DTLS adapter module |
+| `crates/scp-transport/src/udp/adapter.rs` | `UdpDtlsAdapter` implementing `TransportAdapter` |
+| `crates/scp-transport/src/udp/coap.rs` | CoAP-over-DTLS framing |
+| `crates/scp-transport/src/udp/listener.rs` | Relay-side UDP/DTLS listener |
+
+**Modified files:**
+
+| File | Change |
+|------|--------|
+| `crates/scp-transport/Cargo.toml` | Add `quinn` (feature = "quic"), DTLS crate (feature = "udp"), CoAP crate (feature = "coap") |
+| `crates/scp-transport/src/lib.rs` | Re-export new adapter modules |
+| `crates/scp-transport/src/native/server.rs` | Multi-transport listener (WebSocket + QUIC + WebTransport + UDP/DTLS) |
+| `crates/scp-node/src/well_known.rs` | `transports` field in `.well-known/scp` response |
+| `crates/scp-node/src/http.rs` | HTTP/3 via ALPN, `Alt-Svc` header |
+| `crates/scp-ffi/wasm/src/transport.rs` | WebTransport API usage with WebSocket fallback |
+
+**Estimated functions:** ~40-50 public functions, ~30-40 internal helpers across all new and modified files.

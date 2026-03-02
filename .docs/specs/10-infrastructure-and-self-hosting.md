@@ -100,7 +100,7 @@ Below the abstraction, **transport bindings** adapt SCP's requirements to specif
 - Transport abstraction interface (SCP's responsibility — the contract bindings must implement)
 - SCP native relay protocol (SCP specifies this — the simplest possible store-and-forward relay purpose-built for SCP envelopes)
 - Reference relay implementation (SCP ships this — a minimal relay for self-hosters)
-- Transport adapter implementations for existing infrastructure (Nostr, Matrix, Holepunch/Hyperswarm, libp2p, WebSocket, WebRTC, QUIC, BLE, Tor, I2P, SSB, MQTT, NATS, ZeroMQ, Yggdrasil, cjdns)
+- Transport adapter implementations organized by specification depth (§10.5.1). Tier 1 bindings are fully specified with wire mappings and conformance requirements. Tier 2 bindings have documented TransportAdapter mappings. Tier 3 bindings are feasibility-confirmed.
 
 The SCP native relay is the canonical reference — the simplest possible thing that satisfies SCP's transport needs: accept encrypted blobs, store them, forward to subscribers by context ID and/or recipient DID, respond with delivery receipts, honor deletion requests. All other adapters map the transport abstraction to their respective protocols.
 
@@ -126,6 +126,133 @@ This is architecturally distinct from member removal, which IS a group action: M
 - **Removal** (MLS epoch advancement): Group action. Affects all members. Removed party loses access to all future messages. O(log n) via MLS tree ratcheting.
 
 The sender-side key layer works as follows: each member maintains a personal sender key alongside their MLS leaf key. Messages are double-encrypted — first with the sender's personal key, then with the MLS group key. All members hold all other members' sender keys (distributed via MLS application messages). When a block is issued, the blocker generates a new sender key and distributes it to all members except the blocked party via individual MLS application messages. The blocked party can still decrypt the MLS layer but encounters ciphertext from the blocker that they cannot decrypt.
+
+### 10.5.1 Adapter Tiers
+
+Transport adapters are organized into three tiers by specification depth:
+
+| Tier | Adapters | Spec level |
+|------|----------|------------|
+| **Tier 1: Fully specified** | SCP native relay (ADR-004), QUIC (§10.14), WebTransport (§10.15), UDP/DTLS (§10.16) | Wire format mapping, conformance suite, fallback behavior |
+| **Tier 2: Mapping defined** | Nostr, Matrix, libp2p, Hyperswarm, WebRTC, MQTT, NATS, Tor, I2P, BLE, Yggdrasil/cjdns, ZeroMQ | TransportAdapter method mapping documented per adapter (§10.5.2) |
+| **Tier 3: Named** | SSB | Feasibility confirmed; mapping complex (gossip/append-only model diverges from SCP's request/response semantics) |
+
+**Tier requirements:**
+- **Tier 1:** Must pass `transport_conformance!()` (§16.12.1). Full wire format specification. Fallback chain documented.
+- **Tier 2:** Must document how each of the 5 `TransportAdapter` methods maps to the adapter's native primitives, plus connection model and key constraints.
+- **Tier 3:** Feasibility confirmed through analysis. Spec pending.
+
+**Transport advertisement.** Relays advertise supported transport bindings in `.well-known/scp` under `relay_config.transports`:
+
+```json
+{
+  "relay_config": {
+    "transports": ["websocket", "quic", "webtransport", "udp-dtls"]
+  }
+}
+```
+
+Clients use this to select the best available transport. `"websocket"` is always present (mandatory baseline). Other transports are optional. Clients SHOULD prefer QUIC over WebSocket when both are available (lower overhead, connection migration). Browser clients SHOULD prefer WebTransport over WebSocket when the `WebTransport` API is available.
+
+### 10.5.2 Tier 2 Adapter Mapping Briefs
+
+Each Tier 2 adapter documents how `TransportAdapter`'s 5 methods (`send`, `subscribe`, `unsubscribe`, `query`, `delete`) map to the adapter's native primitives, the connection model, and key constraints. These briefs are sufficient for implementation; detailed wire format specifications are not required for Tier 2.
+
+**Nostr** (NIP-01 relay protocol)
+- `send` → publish Nostr event (kind=30078 or custom). `routing_id` in event tag. Encrypted blob in `.content`.
+- `subscribe` → `REQ` with filter on kind + routing_id tag. Stream of `EVENT` messages.
+- `unsubscribe` → `CLOSE` on the subscription.
+- `query` → `REQ` with `since` timestamp filter, collect results until `EOSE`.
+- `delete` → NIP-09 deletion event referencing the blob's event ID. Best-effort (relay MAY ignore).
+- **Connection model:** WebSocket to Nostr relay. Existing Nostr infrastructure reusable as-is. No code changes to Nostr relays.
+- **Constraints:** Nostr events are JSON (not MessagePack) — blob is base64-encoded in `.content`, adding ~33% overhead. Max event size varies by relay (typically 64KB–1MB). No server-side TTL enforcement (relay purging is operator policy).
+
+**Matrix** (Client-Server API v1.11+)
+- `send` → `PUT /_matrix/client/v3/rooms/{roomId}/send/scp.blob`. Blob in event content.
+- `subscribe` → `/sync` long-poll with room filter. BLOBs arrive as timeline events.
+- `unsubscribe` → Remove room from sync filter.
+- `query` → `GET /_matrix/client/v3/rooms/{roomId}/messages` with `from` token and `dir=f`.
+- `delete` → Redact event. Best-effort (federated servers may retain).
+- **Connection model:** HTTPS to Matrix homeserver. Auth via Matrix access token. One "room" per routing_id.
+- **Constraints:** JSON event format (base64 blob). Federation delays add latency. Homeserver stores all history (no TTL — use redaction). Rate limits vary by homeserver.
+
+**libp2p** (peer-to-peer networking stack)
+- `send` → Publish to GossipSub topic (topic = hex(routing_id)). Envelope as raw bytes.
+- `subscribe` → GossipSub subscribe to topic. Stream of messages.
+- `unsubscribe` → GossipSub unsubscribe from topic.
+- `query` → Not natively supported. Requires a DHT or custom request/response protocol. Fall back to peer exchange.
+- `delete` → Not supported (P2P, no central store).
+- **Connection model:** Peer-to-peer. Connection multiplexed via yamux/mplex. Peer discovery via mDNS (LAN) or Kademlia DHT.
+- **Constraints:** No durable storage (messages lost if no peers online). No backfill. Best for real-time P2P use cases with online peers. `query` requires custom protocol or external storage.
+
+**Hyperswarm** (Holepunch/Hypercore ecosystem)
+- `send` → Write to Hypercore append-only log (one log per routing_id). Envelope as log entry.
+- `subscribe` → Replicate Hypercore log, stream new entries.
+- `unsubscribe` → Stop replication.
+- `query` → Read Hypercore log entries with sequence number filtering.
+- `delete` → Not supported (append-only). Can mark as tombstoned via subsequent entry.
+- **Connection model:** P2P via Hyperswarm DHT. NAT traversal built in. Connection established by "joining" a topic (derived from routing_id).
+- **Constraints:** Append-only (no true delete). Log creator must be online for initial replication. Hypercore is single-writer — each participant needs their own log, routing_id maps to a "discovery key" that finds all relevant logs.
+
+**WebRTC** (data channels for SCP operations)
+- `send` → Send on DataChannel (label = hex(routing_id)). Binary message.
+- `subscribe` → Open DataChannel with label = hex(routing_id), `ondatachannel` for inbound.
+- `unsubscribe` → Close DataChannel.
+- `query` → Request/response over DataChannel (application-level, no native query).
+- `delete` → Not applicable (P2P, no central store).
+- **Connection model:** P2P via ICE (STUN/TURN). Signaling via SCP relay (bootstrap: use native relay to exchange SDP offers). DTLS-SRTP encryption. One PeerConnection per peer, multiple DataChannels per connection.
+- **Constraints:** Requires signaling channel (SCP relay or out-of-band). P2P only — no durable storage, no backfill. NAT traversal via ICE. Battery-intensive on mobile (frequent STUN keepalives). Best for real-time P2P between online peers.
+
+**MQTT** (v5.0, topic-based pub/sub)
+- `send` → `PUBLISH` to topic `scp/{hex(routing_id)}`. QoS 1 (at-least-once). Blob as payload.
+- `subscribe` → `SUBSCRIBE` to topic `scp/{hex(routing_id)}`. Broker delivers matching messages.
+- `unsubscribe` → `UNSUBSCRIBE` from topic.
+- `query` → MQTT 5.0 Request/Response with correlation data. Or: use retained messages (broker stores last message per topic).
+- `delete` → Publish empty retained message to clear (limited — only clears retained, not queued).
+- **Connection model:** TCP/TLS to MQTT broker. Persistent session (CleanStart=false) enables offline message queuing. Lightweight keepalive (PINGREQ).
+- **Constraints:** MQTT retained messages store only the last message per topic — no full backfill. For full `query` support, need MQTT 5.0 + broker-side plugin or external storage. Binary payloads natively supported (no base64). Good fit for IoT (§10.16 constrained devices can use MQTT instead of raw UDP/DTLS).
+
+**NATS** (lightweight messaging)
+- `send` → `PUB scp.{hex(routing_id)}`. Blob as payload.
+- `subscribe` → `SUB scp.{hex(routing_id)}`. Stream of messages.
+- `unsubscribe` → `UNSUB`.
+- `query` → NATS JetStream: `Consumer.Fetch` with `DeliverPolicy::ByStartTime(since)`.
+- `delete` → JetStream message delete by sequence number.
+- **Connection model:** TCP/TLS to NATS server. Lightweight text protocol. JetStream for persistence (required for `query`/`delete`).
+- **Constraints:** Core NATS is fire-and-forget (no persistence) — JetStream required for SCP semantics. JetStream adds operational complexity. Very low latency (<1ms local). Binary payloads supported.
+
+**Tor** (onion-routed transport)
+- All 5 methods → delegate to underlying adapter (WebSocket or QUIC) routed through Tor.
+- **Connection model:** SOCKS5 proxy to Tor circuit. WebSocket-over-Tor or QUIC-over-Tor (experimental). Relay can run as Tor hidden service (.onion address).
+- **Constraints:** High latency (200–800ms per hop × 3 hops). No UDP (Tor is TCP-only — QUIC requires experimental Tor UDP support). Cover traffic less useful (Tor already provides traffic analysis resistance at the network layer). Relay .onion address replaces DNS — DID document uses `.onion` URL.
+
+**I2P** (invisible internet protocol)
+- All 5 methods → delegate to underlying adapter routed through I2P.
+- **Connection model:** I2P streaming library (TCP-like) or I2P datagrams (UDP-like). Relay runs as I2P "eepsite" with b32.i2p address.
+- **Constraints:** Similar to Tor but fully distributed (no exit nodes). Higher latency. Smaller network. I2P datagrams enable UDP-like transport. DID document uses `.b32.i2p` URL.
+
+**BLE** (Bluetooth Low Energy, proximity transport)
+- `send` → Write to GATT characteristic (UUID derived from routing_id). Blob fragmented across writes (BLE MTU typically 247 bytes).
+- `subscribe` → Enable GATT notifications on characteristic.
+- `unsubscribe` → Disable GATT notifications.
+- `query` → Read GATT characteristic (returns latest stored blob only — no history).
+- `delete` → Not supported (peripheral manages storage).
+- **Connection model:** Central (client) connects to Peripheral (device). One GATT service per SCP instance. Characteristics per routing_id. Range: ~10–100m.
+- **Constraints:** MTU 247 bytes (fragmentation required for blobs >~200 bytes). No backfill. No persistent connection guarantee (BLE connections are short-lived by design). Battery-efficient (designed for IoT). Local proximity only — not a network transport.
+
+**Yggdrasil / cjdns** (encrypted mesh networking)
+- All 5 methods → delegate to underlying adapter (WebSocket, QUIC, or direct TCP) running over the mesh network's IPv6 overlay.
+- **Connection model:** Yggdrasil/cjdns provides an encrypted IPv6 overlay network. SCP adapter connects to relay using the relay's Yggdrasil/cjdns IPv6 address instead of a public IP. No special adapter logic — just network-layer routing.
+- **Constraints:** Requires Yggdrasil/cjdns daemon running on both client and relay. Relay advertises mesh IPv6 address in DID document. Latency depends on mesh topology. Provides NAT traversal for free (overlay addresses are globally routable within the mesh).
+
+**ZeroMQ** (broker-less messaging)
+- `send` → `zmq_send` on PUB socket bound to `tcp://*:port` (or connect to XPUB/XSUB proxy).
+- `subscribe` → `zmq_connect` SUB socket, `zmq_setsockopt(ZMQ_SUBSCRIBE, routing_id)`.
+- `unsubscribe` → `zmq_setsockopt(ZMQ_UNSUBSCRIBE, routing_id)`.
+- `query` → REQ/REP pattern to a storage service (not native to ZeroMQ).
+- `delete` → Not natively supported (fire-and-forget).
+- **Connection model:** Broker-less PUB/SUB or brokered via XPUB/XSUB proxy device. TCP or IPC transport. No built-in encryption (use CurveZMQ for transport security).
+- **Constraints:** No durable storage (fire-and-forget PUB/SUB). `query`/`delete` require external storage service. Best for high-throughput LAN/datacenter use cases. CurveZMQ adds 25519-based encryption but is not TLS.
 
 ## 10.6 Content and Data Sovereignty
 
@@ -476,3 +603,169 @@ The reachability tiers introduce attack surfaces beyond the standard relay threa
 | STUN service on SCP relays | Phase 3 | `scp-transport` | Coexists with WebSocket endpoint |
 
 Phase 2 delivers the zero-config floor: a self-hosted relay behind most consumer NATs becomes reachable without any manual configuration. Phase 3 closes the remaining ~15% (symmetric NAT) with bridge relaying and adds STUN service to the relay fleet, making the network self-reinforcing. Domain-based deployment (Tier 4) is already specified in Phase 2 via §18.6.
+
+## 10.13 Transport Profiles
+
+A transport profile bundles connection strategy, cover traffic tier (§9.10.6), relay count, reconnect behavior, and connection budget for a device class. The SDK infers a profile from the platform and exposes it as a configurable parameter.
+
+### 10.13.1 Profile Definitions
+
+| Profile | Connections | Cover traffic | Min relays | Reconnect | Max connections |
+|---------|------------|---------------|------------|-----------|----------------|
+| `server` | Persistent to all assigned relays | `full` (§9.10.6) | 3 | Aggressive (1–30s exponential backoff) | Unlimited |
+| `desktop` | Persistent to all assigned relays | `full` (§9.10.6) | 3 | Aggressive (1–30s exponential backoff) | 50 |
+| `mobile` | Active contexts only; push bridge (§10.7) for inactive | `reduced` (§9.10.6) | 2 | Conservative (5–60s exponential backoff) | 10 |
+| `constrained` | On-demand only; poll via QUERY | `off` (§9.10.6) | 1 | None (poll-based) | 2 |
+
+**Platform inference.** The SDK selects a default profile based on the compilation target:
+- `#[cfg(target_os = "linux")]` or `#[cfg(target_os = "windows")]` or `#[cfg(target_os = "macos")]` → `desktop`
+- `#[cfg(target_os = "ios")]` or `#[cfg(target_os = "android")]` → `mobile`
+- `#[cfg(target_arch = "wasm32")]` → `desktop` (browser tabs behave like desktop)
+- Explicit `.profile(TransportProfile::Server)` overrides inference
+
+**Suppression resistance trade-offs.** The `mobile` profile accepts a 2-relay minimum, reducing suppression detection capability (§9.9.2) — a 30s cross-check window with 2 relays detects suppression only when one relay is fully compromised, not when both selectively suppress. The `constrained` profile accepts a single relay with no suppression detection. Both trade-offs are explicit and acceptable for their device classes: mobile devices have push notification bridging as a secondary delivery path, and constrained devices are typically behind a gateway agent that participates in full-profile contexts.
+
+### 10.13.2 Connection Pooling
+
+A single adapter connection to a relay is shared by all contexts assigned to that relay. Subscriptions for different contexts multiplex over the same connection (up to `max_subscriptions_per_connection`, default 100 per ADR-004).
+
+1. **Per-relay deduplication.** `TransportManager` maintains at most one connection per relay URL, regardless of how many contexts use that relay.
+2. **Reuse on assignment.** When a context is assigned a relay that already has an active connection, it reuses the existing adapter — no new connection is opened.
+3. **Cross-manager sharing.** When multiple `TransportManager` instances exist in the same process (e.g., multiple `ApplicationNode` instances), they SHOULD share connections to the same relay via a shared connection pool. The pool is keyed by `(relay_url, transport_type)`.
+4. **QUIC multiplexing.** QUIC (§10.14) makes pooling even more natural: multiple QUIC streams over a single QUIC connection, each stream independent. No head-of-line blocking between contexts sharing a connection.
+
+### 10.13.3 Connection Budget
+
+Each profile defines a maximum total connection count across all adapters. When the budget is reached:
+
+1. **LRU eviction.** The least-recently-used connection (by last message send or receive timestamp) is closed.
+2. **Subscription migration.** Subscriptions on the evicted connection are migrated to a surviving connection to the same relay (if one exists) or to a different relay in the context's relay set (via relay reassignment).
+3. **Mobile shedding.** The `mobile` profile proactively sheds connections for inactive contexts (no sends or receives in the last 5 minutes) and relies on the push notification bridge (§10.7) to wake the connection on new messages.
+
+Connection budgets are soft limits. The SDK MAY temporarily exceed the budget during relay set reassignment or context join operations, then converge back within the budget within 30 seconds.
+
+## 10.14 QUIC Transport Binding
+
+QUIC replaces WebSocket for native (non-browser) clients. Same relay, same MessagePack wire format (ADR-004), different framing. QUIC connections use per-operation streams rather than multiplexing all operations over a single bidirectional channel.
+
+### 10.14.1 Operation Mapping
+
+| ADR-004 Operation | WebSocket | QUIC |
+|---|---|---|
+| PUBLISH | Binary frame on shared connection; correlate via `ref_id` | New bidirectional stream → send PUBLISH → receive ACK/ERR → close stream |
+| SUBSCRIBE | Binary frame; BLOBs arrive on shared connection tagged with `routing_id` | Open long-lived bidirectional stream → send SUBSCRIBE → receive BLOBs on same stream until close |
+| UNSUBSCRIBE | Binary frame | Close the subscription's stream (clean FIN) |
+| QUERY | Binary frame; results arrive tagged with `ref_id` | New bidirectional stream → send QUERY → receive results + `query_complete` → close stream |
+| DELETE | Binary frame; correlate via `ref_id` | New bidirectional stream → send DELETE → receive ACK/ERR → close stream |
+| PING/PONG | WebSocket frames, 30s interval | Not needed — QUIC has native keepalive (PATH_CHALLENGE/PATH_RESPONSE) |
+
+**Wire format.** Each QUIC stream carries the same MessagePack-encoded messages specified in ADR-004. The `op` field, field types, and validation rules are identical. The only difference is framing: WebSocket uses binary frames on a shared connection with `ref_id` correlation; QUIC uses independent streams where responses are scoped to their stream, making `ref_id` unnecessary (though it MAY still be included for logging/debugging).
+
+**Cover traffic over QUIC.** Same profile tier applies (§10.13). Dummies are sent as short-lived bidirectional streams identical in structure to PUBLISH operations — the relay cannot distinguish dummy streams from real PUBLISH streams. One QUIC connection covers all streams, so cover traffic cost is amortized.
+
+### 10.14.2 Connection Lifecycle
+
+1. **Initial connection.** Client opens a QUIC connection to the relay using `quinn` (or equivalent QUIC implementation). TLS 1.3 is built into QUIC — no separate TLS handshake.
+2. **0-RTT resumption.** Resumed QUIC sessions use 0-RTT to skip the full handshake, reducing reconnection latency to a single round-trip. Session tickets are stored locally and rotated per the QUIC specification.
+3. **Connection migration.** When the client's IP address changes (e.g., WiFi → cellular), QUIC migrates the connection without closing it. Active subscription streams continue uninterrupted. This is critical for mobile profiles where network transitions are frequent.
+4. **Reconnection.** On connection loss, the client uses profile-aware exponential backoff (§10.13.1). After reconnection, the client re-opens subscription streams with `since = last_received_stored_at - 5s` overlap (same gap-fill strategy as WebSocket, per ADR-004).
+5. **Keepalive.** QUIC's native PATH_CHALLENGE/PATH_RESPONSE mechanism replaces WebSocket PING/PONG. No application-level keepalive is needed.
+
+### 10.14.3 Relay QUIC Support
+
+Relays that support QUIC:
+
+1. **Listener.** Accept QUIC connections alongside WebSocket on the same TLS port via ALPN negotiation. The relay's TLS certificate covers both protocols.
+2. **Shared state.** QUIC and WebSocket handlers share the same subscription registry, blob storage, rate limiters, and delivery jitter configuration.
+3. **Advertisement.** Relay advertises QUIC support in `.well-known/scp` under `relay_config.transports` (§10.5.1).
+4. **Fallback.** If a relay does not advertise QUIC, clients fall back to WebSocket. The client MAY probe QUIC with a single initial packet; if no response within 3 seconds, it falls back to WebSocket without further QUIC attempts for that relay until the next `.well-known/scp` refresh.
+
+QUIC support is RECOMMENDED for production relays. WebSocket remains the mandatory baseline.
+
+## 10.15 HTTP/3 and WebTransport
+
+HTTP/3 (QUIC-based HTTP) serves two roles in SCP: as the relay's HTTP upgrade path for all HTTP endpoints, and as the foundation for WebTransport — the browser-facing equivalent of the QUIC transport binding (§10.14).
+
+### 10.15.1 Relay HTTP/3 Upgrade Path
+
+All relay HTTP endpoints benefit from HTTP/3:
+
+- `.well-known/scp` — 0-RTT on repeat visits, faster relay discovery
+- `/scp/dev/v1/*` — local dev API (§18.10) with multiplexed requests
+- `/scp/v1/feed/*` — broadcast projection (§18.11) with multiplexed polling
+- WebSocket upgrade — HTTP/3 supports WebSocket bootstrapping via RFC 9220
+
+**Deployment model:**
+1. Relay serves HTTP/1.1 + HTTP/2 + HTTP/3 on the same TLS port via ALPN negotiation.
+2. HTTP/3 is advertised via `Alt-Svc` header on HTTP/1.1 and HTTP/2 responses.
+3. Clients that support HTTP/3 upgrade transparently — no application-level protocol change.
+4. `ApplicationNode::serve()` gains HTTP/3 support when the underlying server supports it (hyper + h3).
+
+**Relay requirement:** HTTP/3 support is RECOMMENDED for public relays (improves latency for discovery and projection endpoints). Not required — HTTP/1.1 remains the baseline.
+
+### 10.15.2 WebTransport for Browser Clients
+
+WebTransport is the browser-facing equivalent of §10.14 (QUIC), using the WebTransport API over HTTP/3.
+
+**Distinction from QUIC.** WebTransport is mediated by the browser's network stack. The SCP WASM binding uses the `WebTransport` API. Non-browser clients use QUIC directly (§10.14). Server-side, the relay handles both — QUIC connections and WebTransport sessions are both QUIC underneath, sharing the same subscription registry and blob storage.
+
+**Connection model:**
+1. Browser opens `new WebTransport("https://<host>/scp/v1")` — establishes HTTP/3 + WebTransport session.
+2. Same per-operation stream model as §10.14.1.
+3. Server must support HTTP/3 and advertise via `Alt-Svc` header.
+
+**Relay requirements:**
+- Serve HTTP/3 on the same port as HTTPS (ALPN + Alt-Svc).
+- Accept WebTransport sessions at `/scp/v1`.
+- Advertise in `.well-known/scp`: `relay_config.transports` includes `"webtransport"`.
+- WebTransport support is OPTIONAL for relays. WebSocket remains mandatory for browser compatibility.
+
+### 10.15.3 Fallback Chain
+
+Browser clients follow this transport selection order:
+
+1. **WebTransport** — attempt `new WebTransport(url)`. If the `WebTransport` API is unavailable (Safari, older browsers) or the connection fails (relay doesn't support HTTP/3), fall through.
+2. **WebSocket** — fall back to `new WebSocket("wss://<host>/scp/v1")`. This is the mandatory baseline that all relays support.
+3. **Error** — if WebSocket also fails, report connection failure.
+
+The fallback is transparent to `TransportAdapter` callers. The WASM binding wraps both transports behind the same adapter interface. Connection upgrade from WebSocket to WebTransport MAY occur mid-session if the relay advertises WebTransport support via `Alt-Svc` after the initial WebSocket connection.
+
+## 10.16 Constrained Device Transport
+
+For IoT, embedded, and resource-limited devices that cannot sustain TCP connections. Two options are provided; implementors choose based on their ecosystem.
+
+### 10.16.1 MessagePack-over-DTLS
+
+The SCP-native option for constrained devices. Uses the same MessagePack wire format as ADR-004 over DTLS 1.3 datagrams instead of WebSocket frames.
+
+1. **DTLS 1.3 session.** Client establishes a DTLS 1.3 session with the relay. TLS 1.3 security guarantees apply.
+2. **Connectionless semantics.** Each operation (PUBLISH, QUERY, DELETE) is a DTLS datagram (or datagram sequence for payloads exceeding the path MTU). No persistent connection state is held between operations.
+3. **Session resumption.** DTLS session tickets enable 0-RTT reconnection, avoiding a full handshake on subsequent operations.
+4. **Max datagram size.** Constrained by path MTU (~1200 bytes typical). Envelopes exceeding the MTU require fragmentation at the DTLS layer. Recommended max blob size: 1024 bytes for single-datagram delivery.
+5. **No SUBSCRIBE.** `subscribe()` is not supported over UDP (no persistent connection for push delivery). Constrained devices poll via QUERY at configurable intervals. `subscribe()` returns `TransportError::NotSupported`.
+
+### 10.16.2 CoAP-over-DTLS
+
+The IoT interoperability option. Uses CoAP (RFC 7252) as a framing layer over DTLS, enabling integration with existing IoT infrastructure (CoAP proxies, LwM2M, etc.).
+
+1. **Operation mapping.** SCP operations map to CoAP methods:
+   - PUBLISH → `POST /scp/{hex(routing_id)}` with blob as payload
+   - QUERY → `GET /scp/{hex(routing_id)}?since={timestamp}&limit={n}`
+   - DELETE → `DELETE /scp/{hex(routing_id)}/{blob_id}`
+2. **CoAP Observe.** RFC 7641 Observe provides lightweight subscription: client registers observation on a resource, server pushes new blobs as notifications. This is best-effort — the server MAY stop notifying at any time, and the client must re-register. Not equivalent to persistent SUBSCRIBE.
+3. **Confirmable messages.** CoAP CON messages provide at-least-once delivery semantics for PUBLISH and DELETE. NON messages may be used for QUERY when loss is acceptable.
+4. **Interoperability.** CoAP proxies can bridge between constrained devices and SCP relays, translating CoAP requests to the relay's native protocol (WebSocket or QUIC).
+
+### 10.16.3 Trade-offs
+
+Constrained device transport makes explicit trade-offs:
+
+| Property | Full profile (§10.13) | Constrained profile |
+|----------|----------------------|-------------------|
+| Cover traffic | Full or reduced (§9.10.6) | Off |
+| Suppression resistance | 3+ relays with cross-check | Single relay, no cross-check |
+| Real-time delivery | Persistent subscription streams | Poll-based (QUERY interval) or CoAP Observe (best-effort) |
+| Connection overhead | Persistent TCP/QUIC + keepalive | Connectionless UDP datagrams |
+| Metadata privacy | Pseudonyms + padding + jitter | Pseudonyms only (no padding budget, no jitter) |
+
+These trade-offs are acceptable because constrained devices typically operate behind a **gateway agent** — a full-profile participant (desktop or server) that bridges between the constrained device's local transport (BLE, MQTT, or UDP/DTLS) and the full SCP relay network. The gateway provides the suppression resistance, cover traffic, and real-time delivery that the constrained device cannot sustain on its own.
