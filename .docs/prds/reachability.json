@@ -10,8 +10,8 @@
       "stories": [
         "SCP-228",
         "SCP-229",
-        "SCP-230",
-        "SCP-231",
+        "SCP-240",
+        "SCP-241",
         "SCP-232",
         "SCP-233"
       ]
@@ -111,7 +111,7 @@
       }
     },
     {
-      "id": "SCP-230",
+      "id": "SCP-240",
       "title": "Support ws:// transport for DHT-discovered relays",
       "gate": "gate-reachability-1",
       "priority": "P0",
@@ -149,7 +149,7 @@
       }
     },
     {
-      "id": "SCP-231",
+      "id": "SCP-241",
       "title": "Implement .no_domain() ApplicationNode builder mode",
       "gate": "gate-reachability-1",
       "priority": "P0",
@@ -185,7 +185,7 @@
       "blockedBy": [
         "SCP-228",
         "SCP-229",
-        "SCP-230"
+        "SCP-240"
       ],
       "sources": [
         { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.8 ApplicationNode Integration" }
