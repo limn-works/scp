@@ -39,6 +39,7 @@ use scp_core::context::{
     ContextHandle, ContextParams, ContextState, MemoryScope, RoleDefinition as ParamsRoleDef,
     ToolRegistration as ParamsToolReg,
 };
+use scp_core::event_log::KeyCustodySigner;
 use scp_event_log::checkpoint::{CheckpointComparison, compare_checkpoint, generate_checkpoint};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
@@ -638,12 +639,19 @@ async fn phase2_end_to_end_integration() {
         .await
         .expect("generate bob checkpoint key");
 
-    let alice_checkpoint =
-        generate_checkpoint(&alice_log, &alice_did, 1, &custody, &alice_checkpoint_key)
-            .await
-            .expect("Alice checkpoint");
+    let alice_signer = KeyCustodySigner {
+        custody: &custody,
+        key: &alice_checkpoint_key,
+    };
+    let alice_checkpoint = generate_checkpoint(&alice_log, &alice_did, 1, &alice_signer)
+        .await
+        .expect("Alice checkpoint");
 
-    let bob_checkpoint = generate_checkpoint(&bob_log, &bob_did, 1, &custody, &bob_checkpoint_key)
+    let bob_signer = KeyCustodySigner {
+        custody: &custody,
+        key: &bob_checkpoint_key,
+    };
+    let bob_checkpoint = generate_checkpoint(&bob_log, &bob_did, 1, &bob_signer)
         .await
         .expect("Bob checkpoint");
 

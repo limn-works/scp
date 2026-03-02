@@ -1022,13 +1022,11 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         .filter(|s| s.service_type == "SCPRelay")
         .count();
 
-    document
-        .service
-        .push(scp_identity::document::Service {
-            id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
-            service_type: "SCPRelay".to_owned(),
-            service_endpoint: relay_url.clone(),
-        });
+    document.service.push(scp_identity::document::Service {
+        id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
+        service_type: "SCPRelay".to_owned(),
+        service_endpoint: relay_url.clone(),
+    });
 
     // 4. Publish DID document.
     did_method.publish(&identity, &document).await?;
