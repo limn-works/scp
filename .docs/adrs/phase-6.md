@@ -2556,6 +2556,17 @@ pub enum GovernanceAction {
     ResetMember { did: DID, reason: String },
     /// Resolve a governance conflict (see section 7).
     ResolveConflict { conflicting_proposal_id: ProposalId, resolution: ConflictResolution },
+    /// Promote a context from ephemeral to persistent (§5.10).
+    /// Requires unanimous consent from ALL current members regardless of
+    /// governance model — protocol-level override enforced by ContextManager.
+    PromoteContext,
+    /// Block an author in a broadcast context (§5.14.8).
+    /// Removes the author's sender key and revokes publishing authority.
+    /// Governance-gated because author removal is a membership change.
+    /// NOTE: UnblockAuthor and context-level key governance actions will be
+    /// added when the unblock mechanism (Task 3) and context-as-channel
+    /// publishing model (Task 2) designs are finalized.
+    BlockAuthor { author_did: DID, reason: Option<String> },
 }
 ```
 
@@ -2872,9 +2883,10 @@ GovernanceDeadlockRecovery {
    - Detects voter departures and adjusts tallies.
    - Detects deadlock conditions (consecutive missed voting windows per voter).
 
-9. **Protocol-level unanimity override for TTL extension:**
+9. **Protocol-level unanimity override for TTL extension and context promotion:**
 
    - When a `GovernanceAction::ExtendTtl` proposal is created in a non-Unanimity context, the `ContextManager` overrides the governance model's resolution rules and requires approval from ALL current members (not just governance voters). This enforces §5.10's requirement that TTL extension requires unanimous consent.
+   - When a `GovernanceAction::PromoteContext` proposal is created in a non-Unanimity context, the same unanimity override applies. This enforces §5.10's requirement that promotion from ephemeral to persistent requires consent from all current members.
 
 10. **Integration test:**
 

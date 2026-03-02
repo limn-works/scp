@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Governance-manager integration: wire GovernanceEngine into ContextManager so all governance-gated operations are exclusively routed through the engine with no bypass.",
+  "description": "Governance-manager integration: wire GovernanceEngine into ContextManager so all governance-gated operations are exclusively routed through the engine with no bypass. Covers engine storage, CM method exposure, action variant expansion, execution wiring, timeout/deadlock handling, conflict resolution, checkpoint cosignatures, and integration testing.",
   "gates": [
     {
       "id": "gate-gov-wiring",
@@ -8,17 +8,20 @@
       "priority": "P1",
       "status": "pending",
       "stories": [
-        "SCP-250",
-        "SCP-251",
-        "SCP-252",
-        "SCP-253",
-        "SCP-254"
+        "SCP-267",
+        "SCP-268",
+        "SCP-269",
+        "SCP-270",
+        "SCP-271",
+        "SCP-272",
+        "SCP-273",
+        "SCP-274"
       ]
     }
   ],
   "stories": [
     {
-      "id": "SCP-250",
+      "id": "SCP-267",
       "title": "Store GovernanceEngine in PerContextState and construct in builder",
       "gate": "gate-gov-wiring",
       "priority": "P1",
@@ -27,28 +30,37 @@
       "files": [
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/builder.rs",
-        "crates/scp-core/src/context/mod.rs"
+        "crates/scp-core/src/context/mod.rs",
+        "crates/scp-core/src/context/params.rs",
+        "crates/scp-core/src/context/governance/mod.rs"
       ],
-      "description": "Add a `governance_engine: Box<dyn GovernanceEngine>` field to `PerContextState` in manager.rs. In the builder (`create_context`), construct the appropriate engine variant based on `ContextParams::governance_model` (`GovernanceModelConfig`): `SingleAdmin` -> `SingleAdminEngine`, `Threshold` -> `ThresholdEngine`, `Majority` -> `MajorityVoteEngine`, `Unanimity` -> `UnanimityEngine`. The builder.rs placeholder at line 416 ('ContextParams always has a governance field, so this is a placeholder for future governance model validation') should be replaced with actual engine construction. The engine is immutable for the context's lifetime (per ADR-031 line 2314). Re-export `GovernanceModelConfig` from context/mod.rs if not already exported.",
+      "description": "Add a `governance_engine: Mutex<Box<dyn GovernanceEngine>>` field to `PerContextState` in manager.rs. The engine is wrapped in its own Mutex (separate from the global `contexts: Mutex<HashMap>`) so governance operations do not hold the global lock during engine calls.\n\nTwo type systems coexist by design: `GovernanceModel` (simple variant-only enum in params.rs, derives Eq, lives in ContextParams) selects which model; `GovernanceModelConfig` (rich enum with data in governance/mod.rs) configures the engine. Currently `GovernanceModel` only has `SingleAdmin` — expand it to have all four variants (SingleAdmin, Threshold, Majority, Unanimity) matching GovernanceModelConfig. The builder maps `GovernanceModel` + creation arguments (creator_did, signers, threshold, etc.) to the appropriate `GovernanceModelConfig` and constructs the engine.\n\nAlso change `GovernanceModelConfig::Majority.min_participation` from `f64` to `u32` basis points (e.g., 5000 = 50%) so GovernanceModelConfig can derive `Eq`.\n\nReplace the builder.rs governance validation placeholder comment ('ContextParams always has a governance field, so this is a placeholder for future governance model validation') with actual engine construction and validation logic.\n\nAt creation time, mint `GovernancePropose` and `GovernanceVote` UCAN tokens for designated voters per ADR-031 §6: Threshold signers each receive both; Majority/Unanimity members with GovernanceVote role capability receive them at role assignment.\n\nThe engine is immutable for the context's lifetime (per ADR-031 §4). Re-export `GovernanceModelConfig` from context/mod.rs if not already exported.",
       "acceptanceCriteria": [
-        "PerContextState has a `governance_engine: Box<dyn GovernanceEngine>` field",
-        "create_context() constructs SingleAdminEngine when GovernanceModelConfig::SingleAdmin is specified",
-        "create_context() constructs ThresholdEngine when GovernanceModelConfig::Threshold is specified with signers and threshold",
-        "create_context() constructs MajorityVoteEngine when GovernanceModelConfig::Majority is specified",
-        "create_context() constructs UnanimityEngine when GovernanceModelConfig::Unanimity is specified",
-        "builder.rs placeholder comment at line 416 is replaced with actual engine construction",
-        "GovernanceModelConfig with invalid parameters (e.g., threshold > signers.len()) returns ContextCreationError",
+        "PerContextState has a `governance_engine: Mutex<Box<dyn GovernanceEngine>>` field (per-engine lock, separate from global contexts Mutex)",
+        "GovernanceModel enum in params.rs has four variants: SingleAdmin, Threshold, Majority, Unanimity (no associated data, derives Eq)",
+        "GovernanceModelConfig::Majority.min_participation is u32 basis points (not f64), and GovernanceModelConfig derives Eq",
+        "create_context() constructs SingleAdminEngine when GovernanceModel::SingleAdmin is specified, using creator_did as admin_did",
+        "create_context() constructs ThresholdEngine when GovernanceModel::Threshold is specified, requiring signers and threshold arguments",
+        "create_context() constructs MajorityVoteEngine when GovernanceModel::Majority is specified, requiring voting_window_secs and min_participation_bps arguments",
+        "create_context() constructs UnanimityEngine when GovernanceModel::Unanimity is specified",
+        "GovernanceModelConfig with invalid parameters (e.g., threshold > signers.len(), threshold == 0, empty signers for Threshold, min_participation_bps > 10000) returns ContextCreationError",
+        "Builder governance validation placeholder comment is replaced with actual engine construction and GovernanceModelConfig validation",
+        "At creation, GovernancePropose and GovernanceVote UCAN tokens are minted for designated voters per ADR-031 §6",
         "Tests verify engine construction for each of the four governance model variants",
-        "Tests verify invalid GovernanceModelConfig is rejected at creation time"
+        "Tests verify invalid GovernanceModelConfig is rejected at creation time",
+        "Tests verify UCAN token minting for Threshold signers"
       ],
       "actionItems": [
-        "Add governance_engine field to PerContextState",
+        "Expand GovernanceModel enum in params.rs to four variants",
+        "Change GovernanceModelConfig::Majority.min_participation from f64 to u32 basis points",
+        "Add governance_engine: Mutex<Box<dyn GovernanceEngine>> field to PerContextState",
         "Import GovernanceEngine trait and all four engine implementations in builder.rs",
-        "Replace builder.rs placeholder with match on GovernanceModelConfig that constructs the correct engine",
-        "Validate GovernanceModelConfig parameters (threshold <= signers.len(), non-empty signers for Threshold, etc.)",
-        "Initialize governance_engine in PerContextState construction",
+        "Replace builder.rs placeholder with match on GovernanceModel that constructs the correct GovernanceModelConfig and engine",
+        "Validate GovernanceModelConfig parameters at creation time",
+        "Mint initial governance UCAN tokens for designated voters",
         "Add unit tests for each engine variant construction",
-        "Add unit tests for invalid config rejection"
+        "Add unit tests for invalid config rejection",
+        "Add unit tests for UCAN minting"
       ],
       "blockedBy": [],
       "sources": [
@@ -58,7 +70,7 @@
       "details": {}
     },
     {
-      "id": "SCP-251",
+      "id": "SCP-268",
       "title": "Expose propose/approve/reject/withdraw on ContextManager",
       "gate": "gate-gov-wiring",
       "priority": "P1",
@@ -68,77 +80,90 @@
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/mod.rs"
       ],
-      "description": "Add public methods on ContextManager that delegate to the stored GovernanceEngine: `propose_governance_action()`, `approve_governance_proposal()`, `reject_governance_proposal()`, `withdraw_governance_vote()`. Each method acquires the per-context lock, retrieves the engine, constructs a GovernanceContext snapshot from PerContextState, delegates to the engine's corresponding method, and records the governance event in the event log. The propose method validates that the proposer holds `GovernancePropose` capability (UCAN). The approve/reject methods validate that the voter holds `GovernanceVote` capability. Per ADR-031 line 2564, SingleAdmin.propose() simultaneously creates and approves. Per sketch.md §6, these are the three-method mandatory protocol contract. When a proposal reaches `Approved` status after a vote, the manager automatically calls `execute_governance_action()` (from SCP-253).",
+      "description": "Add public methods on ContextManager that delegate to the stored GovernanceEngine: `propose_governance_action()`, `approve_governance_proposal()`, `reject_governance_proposal()`, `withdraw_governance_vote()`. Each method acquires the global contexts lock briefly to get the PerContextState reference, then acquires the per-engine Mutex<Box<dyn GovernanceEngine>> lock for engine delegation. This two-lock approach prevents the global lock from being held during engine operations.\n\nEach method constructs a GovernanceContext snapshot from PerContextState, delegates to the engine's corresponding method, and records governance events in the event log. The propose method validates that the proposer holds `GovernancePropose` capability (UCAN). The approve/reject methods validate that the voter holds `GovernanceVote` capability.\n\nSigning key plumbing: propose, approve, and reject methods accept a `signing_key: &ed25519_dalek::SigningKey` parameter (required by the GovernanceEngine trait for Ed25519 vote signatures). withdraw_governance_vote does NOT take a signing key (per the trait definition — withdrawal is the voter's privileged operation on their own vote).\n\nReturn types: propose_governance_action returns `ProposalOutcome { proposal: GovernanceProposal, status: ProposalStatus, execution_result: Option<GovernanceActionResult> }`. The execution_result field is always None in this story — it exists so SCP-270 can populate it when auto-execution is wired without changing the struct. approve/reject/withdraw return `Result<ProposalStatus, ContextError>`.\n\nPer ADR-031 §4a, SingleAdmin.propose() simultaneously creates and approves (status = Approved). Per sketch.md §6, these are the three-method mandatory protocol contract.\n\nAuto-execution (calling execute_governance_action when status becomes Approved and populating execution_result) is NOT wired in this story — that is SCP-270's responsibility where the action dispatch lives.",
       "acceptanceCriteria": [
-        "ContextManager exposes `propose_governance_action(context_id, proposer_did, action) -> Result<ProposalId, ContextError>`",
-        "ContextManager exposes `approve_governance_proposal(context_id, proposal_id, voter_did) -> Result<ProposalStatus, ContextError>`",
-        "ContextManager exposes `reject_governance_proposal(context_id, proposal_id, voter_did) -> Result<ProposalStatus, ContextError>`",
-        "ContextManager exposes `withdraw_governance_vote(context_id, proposal_id, voter_did) -> Result<ProposalStatus, ContextError>`",
+        "ContextManager exposes `propose_governance_action(context_id, proposer_did, action, signing_key) -> Result<ProposalOutcome, ContextError>` where ProposalOutcome contains proposal, status, and optional execution_result",
+        "ContextManager exposes `approve_governance_proposal(context_id, proposal_id, voter_did, signing_key) -> Result<ProposalStatus, ContextError>`",
+        "ContextManager exposes `reject_governance_proposal(context_id, proposal_id, voter_did, signing_key) -> Result<ProposalStatus, ContextError>`",
+        "ContextManager exposes `withdraw_governance_vote(context_id, proposal_id, voter_did) -> Result<ProposalStatus, ContextError>` (no signing_key parameter)",
         "propose validates proposer holds GovernancePropose capability before delegating to engine",
         "approve/reject validate voter holds GovernanceVote capability before delegating to engine",
         "All governance operations are recorded in the context event log via event_log.append_context_event()",
-        "GovernanceContext snapshot is correctly constructed from PerContextState (member list, role state, params)",
-        "SingleAdmin.propose() returns Approved status immediately (auto-approve per ADR-031 §4a)",
-        "When approve/reject returns Approved status, execute_governance_action() is called automatically",
+        "GovernanceContext snapshot contains context_id from ContextHandle, members from MembershipState, admin_dids from GovernanceModelConfig, current_epoch from ContextHandle, now from SystemTime::now()",
+        "SingleAdmin.propose() returns ProposalOutcome with Approved status and execution_result: None (auto-approve per ADR-031 §4a; execution wired in SCP-270)",
         "Proposing on a non-existent or non-Active context returns ContextError::ContextNotActive",
+        "Governance methods acquire the global contexts Mutex briefly, then acquire per-engine Mutex for engine calls — global lock is NOT held during engine operations",
         "Tests verify propose/approve/reject lifecycle for SingleAdmin (auto-approve)",
         "Tests verify propose/approve/reject lifecycle for Threshold (multi-vote)",
         "Tests verify capability validation rejects unauthorized proposers/voters"
       ],
       "actionItems": [
-        "Implement propose_governance_action on ContextManager",
-        "Implement approve_governance_proposal on ContextManager",
-        "Implement reject_governance_proposal on ContextManager",
-        "Implement withdraw_governance_vote on ContextManager",
+        "Define ProposalOutcome struct in mod.rs",
+        "Implement propose_governance_action on ContextManager with signing_key parameter",
+        "Implement approve_governance_proposal on ContextManager with signing_key parameter",
+        "Implement reject_governance_proposal on ContextManager with signing_key parameter",
+        "Implement withdraw_governance_vote on ContextManager (no signing_key)",
         "Construct GovernanceContext from PerContextState for engine delegation",
         "Add UCAN capability validation for GovernancePropose and GovernanceVote",
         "Add event log recording for all governance operations",
-        "Wire auto-execution on Approved status",
+        "Implement two-lock pattern: global contexts lock then per-engine lock",
         "Add tests for each lifecycle path"
       ],
-      "blockedBy": ["SCP-250"],
+      "blockedBy": ["SCP-267"],
       "sources": [
         { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
-        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" }
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" },
+        { "file": ".docs/sketch.md", "section": "## 6. Governance" }
       ],
       "details": {}
     },
     {
-      "id": "SCP-252",
-      "title": "Wire all GovernanceAction variants through execute_governance_action",
+      "id": "SCP-269",
+      "title": "Expand GovernanceAction enum, add governance event types and proposal persistence",
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "critical",
       "status": "pending",
       "files": [
-        "crates/scp-core/src/context/manager.rs",
-        "crates/scp-core/src/context/mod.rs"
+        "crates/scp-core/src/context/governance/mod.rs",
+        "crates/scp-core/src/context/mod.rs",
+        "crates/scp-core/src/event_log/mod.rs",
+        "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Extend `execute_governance_action()` to handle all GovernanceAction variants, not just BlockAuthor (which was wired in PR #243). For each variant, implement the internal execution method and add a corresponding GovernanceActionResult variant. Remove or restrict any standalone public methods that bypass governance. Specifically: `close_context()` must route through governance for multi-admin models (SingleAdmin can still close directly via auto-approve). All GovernanceAction variants listed in ADR-031 must have execution paths. The catch-all arm that returns PermissionDenied('not yet supported') must be replaced with actual dispatch.\n\nGovernanceAction variants to wire: AddMember, RemoveMember, ChangeRole, RegisterTool, RemoveTool, ModifyCeiling, CloseContext, ExtendTtl, TransferAdmin, CreateChildContext. BlockAuthor is already wired. Per ADR-031 line 2591, ExtendTtl and PromoteContext always require unanimity regardless of the context's governance model — this override is enforced by the ContextManager.\n\nKey constraint from Alec: all governed actions MUST be exclusively available through GovernanceEngine. No standalone bypass methods. The engine cannot be circumvented.",
+      "description": "ADR-031 specifies 19 GovernanceAction variants; the code currently has 11. Add the 8 missing variants: ModifyPruningPolicy, AddSigner, RemoveSigner, ModifyThreshold, EstablishToolInterface, ResetMember, ResolveConflict, PromoteContext. BlockAuthor already exists in code.\n\nAdd GovernanceActionResult variants for each new action type so execute_governance_action (SCP-270) can return typed results.\n\nAdd all 7 governance event types to the EventType enum per ADR-031 §1 acceptance criteria (lines 2829-2866): GovernanceProposalCreated, GovernanceVoteCast, GovernanceVoteWithdrawn, GovernanceProposalResolved, GovernanceConflictDetected, GovernanceConflictResolved, GovernanceDeadlockRecovery.\n\nAdd supporting types per ADR-031 §§7,10: ReconfigureGovernance, GovernanceReconfigAction (RemoveInactiveSigner, ReduceThreshold), DeadlockJustification, ConflictResolution (AcceptProposal, InvalidateBoth).\n\nAdd ProtocolStore key conventions for proposal persistence per ADR-031 §1 (lines 2764-2769): context/{context_id}/governance/config, context/{context_id}/governance/proposal/{proposal_id_hex}, context/{context_id}/governance/proposal_index/pending, context/{context_id}/governance/proposal_index/resolved, context/{context_id}/governance/deadlock_state.\n\nPrecondition: SCP-267 changes GovernanceModelConfig::Majority.min_participation from f64 to u32 basis points and adds Eq derive. This story uses the already-updated type.",
       "acceptanceCriteria": [
-        "execute_governance_action() dispatches all GovernanceAction variants (no catch-all 'not supported' arm)",
-        "GovernanceActionResult has variants for each action type (MemberAdded, MemberRemoved, RoleChanged, ToolRegistered, ToolRemoved, CeilingModified, ContextClosed, TtlExtended, AdminTransferred, ChildContextCreated, AuthorBlocked)",
-        "close_context() for multi-admin models routes through governance (propose -> vote -> execute)",
-        "close_context() for SingleAdmin still works (auto-approve) but goes through the engine",
-        "ExtendTtl execution enforces unanimity override regardless of governance model per ADR-031 §4d and §5.10",
-        "No standalone public method on ContextManager directly executes a governance-gated operation without going through the engine",
-        "RemoveMember execution triggers MLS Remove Commit (classified as MlsImpact::RequiresMlsCommit in mls_integration.rs)",
-        "AddMember execution triggers MLS Add (MlsImpact::RequiresMlsCommit)",
-        "Tests verify execution of each GovernanceAction variant through the governance path",
-        "Tests verify close_context through governance for Threshold model (requires M-of-N approval)",
-        "Tests verify ExtendTtl unanimity override"
+        "GovernanceAction enum has all 19 variants: AddMember, RemoveMember, ChangeRole, RegisterTool, RemoveTool, ModifyCeiling, CloseContext, ExtendTtl, ModifyPruningPolicy, TransferAdmin, AddSigner, RemoveSigner, ModifyThreshold, CreateChildContext, EstablishToolInterface, ResetMember, ResolveConflict, PromoteContext, BlockAuthor",
+        "GovernanceActionResult enum has variants: MemberAdded, MemberRemoved, RoleChanged, ToolRegistered, ToolRemoved, CeilingModified, ContextClosed, TtlExtended, PruningPolicyModified, AdminTransferred, SignerAdded, SignerRemoved, ThresholdModified, ChildContextCreated, ToolInterfaceEstablished, MemberReset, ConflictResolved, ContextPromoted, AuthorBlocked",
+        "EventType enum includes GovernanceProposalCreated with fields: proposal_id, proposer_did, action, voting_deadline",
+        "EventType enum includes GovernanceVoteCast with fields: proposal_id, voter_did, vote",
+        "EventType enum includes GovernanceVoteWithdrawn with fields: proposal_id, voter_did",
+        "EventType enum includes GovernanceProposalResolved with fields: proposal_id, status, executor_did, resulting_epoch",
+        "EventType enum includes GovernanceConflictDetected with fields: proposal_a, proposal_b",
+        "EventType enum includes GovernanceConflictResolved with fields: winner_id, resolution",
+        "EventType enum includes GovernanceDeadlockRecovery with fields: justification, changes",
+        "ReconfigureGovernance struct exists with changes: Vec<GovernanceReconfigAction> and justification: DeadlockJustification",
+        "GovernanceReconfigAction enum has RemoveInactiveSigner { did } and ReduceThreshold { new_threshold }",
+        "DeadlockJustification struct has unavailable_dids, missed_windows, detected_at fields",
+        "ConflictResolution enum has AcceptProposal { winner_id } and InvalidateBoth",
+        "ProtocolStore key constants defined for governance config, proposals, proposal indices, and deadlock state",
+        "GovernanceModelConfig::Majority.min_participation is u32 (basis points, 0-10000) — changed in SCP-267, verified here",
+        "All new types derive Debug, Clone, Serialize, Deserialize",
+        "All new types are re-exported from context/mod.rs",
+        "Tests verify serialization round-trip for each new GovernanceAction variant",
+        "Tests verify serialization round-trip for each new EventType variant"
       ],
       "actionItems": [
-        "Add internal execution methods for each GovernanceAction variant",
-        "Add GovernanceActionResult variants for each action",
-        "Wire each variant in execute_governance_action() match arm",
-        "Restrict close_context() to route through governance",
-        "Implement ExtendTtl unanimity override in ContextManager",
-        "Remove or make private any standalone methods that bypass governance",
-        "Add tests for each execution path",
-        "Add tests for governance bypass prevention"
+        "Add 8 missing GovernanceAction variants to the enum in governance/mod.rs",
+        "Add GovernanceActionResult variants for all 19 action types",
+        "Add 7 governance EventType variants to event_log/mod.rs",
+        "Add ReconfigureGovernance, GovernanceReconfigAction, DeadlockJustification types",
+        "Add ConflictResolution enum",
+        "Define ProtocolStore key constants for proposal persistence",
+        "Change min_participation from f64 to u32 basis points",
+        "Re-export all new types from context/mod.rs",
+        "Add serialization round-trip tests for all new types"
       ],
-      "blockedBy": ["SCP-251"],
+      "blockedBy": ["SCP-267"],
       "sources": [
         { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
         { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" },
@@ -147,8 +172,63 @@
       "details": {}
     },
     {
-      "id": "SCP-253",
-      "title": "Implement governance proposal timeout task",
+      "id": "SCP-270",
+      "title": "Wire all GovernanceAction variants through execute_governance_action with auto-execution",
+      "gate": "gate-gov-wiring",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs",
+        "crates/scp-core/src/context/mod.rs"
+      ],
+      "description": "Extend `execute_governance_action()` to handle all 19 GovernanceAction variants. For each variant, implement the internal execution method. The catch-all arm that returns PermissionDenied('not yet supported') must be replaced with actual dispatch for every variant.\n\nWire auto-execution: when the GovernanceEngine returns Approved status (from propose for SingleAdmin, from approve/reject for multi-admin models), ContextManager automatically calls execute_governance_action(). This was moved from SCP-268 to this story because action dispatch lives here.\n\nRemove or restrict any standalone public methods that bypass governance. All governed actions MUST be exclusively available through GovernanceEngine — the engine cannot be circumvented. Specifically: close_context() for multi-admin models must route through governance (propose -> vote -> execute). SingleAdmin close_context() still works via auto-approve but goes through the engine.\n\nProtocol-level unanimity overrides (enforced by ContextManager, not the engine): ExtendTtl and PromoteContext always require unanimous consent from ALL current members regardless of governance model, per spec §5.10 and ADR-031 §4d.\n\nUCAN updates on signer changes per ADR-031 §6: AddSigner execution mints GovernanceVote + GovernancePropose UCANs for the new signer. RemoveSigner execution revokes governance UCANs and validates threshold <= remaining signers.len().\n\nGovernance actions that result in membership changes (AddMember, RemoveMember) trigger MLS operations per ADR-031 §8: AddMember triggers MLS add_member() Commit, RemoveMember triggers MLS remove_member() Commit. The sequence is: proposal approved -> ContextManager executes membership change -> MLS Commit advances epoch -> GovernanceActionExecuted event appended.",
+      "acceptanceCriteria": [
+        "execute_governance_action() dispatches all 19 GovernanceAction variants (no catch-all 'not supported' arm)",
+        "GovernanceActionResult returned for each variant matches the enum defined in SCP-269",
+        "When GovernanceEngine returns Approved status from propose (SingleAdmin) or approve/reject (multi-admin), ContextManager automatically calls execute_governance_action()",
+        "close_context() for multi-admin models routes through governance (propose -> vote -> execute)",
+        "close_context() for SingleAdmin goes through the engine (auto-approve)",
+        "ExtendTtl execution enforces unanimity override regardless of governance model per ADR-031 §4d and spec §5.10",
+        "PromoteContext execution enforces unanimity override regardless of governance model per ADR-031 §4d and spec §5.10",
+        "No standalone public method on ContextManager directly executes a governance-gated operation without going through the engine",
+        "AddMember execution triggers MLS Add Commit (MlsImpact::RequiresMlsCommit per mls_integration.rs)",
+        "RemoveMember execution triggers MLS Remove Commit (MlsImpact::RequiresMlsCommit)",
+        "AddSigner execution mints GovernanceVote + GovernancePropose UCANs for the new signer per ADR-031 §6",
+        "RemoveSigner execution revokes governance UCANs and validates threshold <= remaining signers.len()",
+        "GovernanceActionExecuted event appended after each successful execution with proposal_id, action, executor_did, resulting_epoch",
+        "Tests verify execution of each GovernanceAction variant through the governance path",
+        "Tests verify auto-execution on Approved status for SingleAdmin and Threshold models",
+        "Tests verify close_context through governance for Threshold model (requires M-of-N approval)",
+        "Tests verify ExtendTtl unanimity override",
+        "Tests verify PromoteContext unanimity override",
+        "Tests verify governance bypass prevention (standalone methods return error or are private)"
+      ],
+      "actionItems": [
+        "Add internal execution methods for each GovernanceAction variant",
+        "Wire each variant in execute_governance_action() match arm",
+        "Wire auto-execution: check Approved status after propose/approve/reject and call execute_governance_action()",
+        "Restrict close_context() to route through governance",
+        "Implement ExtendTtl and PromoteContext unanimity overrides in ContextManager",
+        "Implement UCAN minting/revocation for AddSigner/RemoveSigner per ADR-031 §6",
+        "Wire MLS operations for AddMember/RemoveMember per ADR-031 §8",
+        "Remove or make private any standalone methods that bypass governance",
+        "Add tests for each execution path",
+        "Add tests for auto-execution",
+        "Add tests for unanimity overrides",
+        "Add tests for governance bypass prevention"
+      ],
+      "blockedBy": ["SCP-268", "SCP-269"],
+      "sources": [
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" },
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.10 Context TTL (Time-to-Live)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-271",
+      "title": "Implement governance proposal timeout task with deadlock detection",
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "major",
@@ -157,36 +237,132 @@
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/governance/mod.rs"
       ],
-      "description": "Implement the GovernanceTimeoutTask specified in ADR-031 §5. The SDK runs a background task that checks active proposals every 60 seconds. When a proposal's voting_deadline passes without resolution, the task calls resolve() which transitions the proposal to Expired or Rejected (model-specific rules). The timeout task also handles: proposer departure (Pending -> Invalidated), voter departure (vote removed, quorum recalculated), and epoch reset (votes invalidated per ADR-029 Tier 3). The task runs per-context and is started when the context enters Active state. It stops when the context is closed.",
+      "description": "Implement the GovernanceTimeoutTask specified in ADR-031 §5. The SDK runs a background task that checks active proposals every 60 seconds. When a proposal's voting_deadline passes without resolution, the task calls resolve() which transitions the proposal to Expired or Rejected (model-specific rules per ADR-031 §4b-4d). The timeout task uses the per-engine Mutex (from SCP-267) — it acquires the global contexts lock briefly to get the PerContextState reference, then acquires the per-engine lock for resolve() calls.\n\nThe timeout task also handles per ADR-031 §5: proposer departure (Pending -> Invalidated), voter departure (vote removed, quorum recalculated), and epoch reset (votes invalidated per ADR-029 Tier 3 — group state reset changes the member's epoch context).\n\nDeadlock detection and recovery per ADR-031 §10: The task detects deadlock conditions: Threshold (fewer than threshold signers active), Majority (fewer than ceil(eligible_voters * min_participation_bps / 10000) responsive over 3 consecutive windows), Unanimity (eligible voter offline beyond Tier 3 threshold of 7+ days). On deadlock detection, any member with GovernancePropose capability can propose a ReconfigureGovernance meta-action. The recovery uses fallback quorum: majority-of-active, regardless of original model. Requires >= 2 active voters. Recovery proposals have 48-hour voting window (double default). Model TYPE never changes. Logged as GovernanceDeadlockRecovery event.\n\nThe task runs per-context and is started when the context enters Active state. It stops when the context is closed.",
       "acceptanceCriteria": [
         "Background task checks all active proposals in a context on a 60-second interval",
-        "Expired proposals (now > voting_deadline) transition to Expired or Rejected per model-specific rules",
+        "Expired proposals (now > voting_deadline) transition to Expired or Rejected per model-specific rules (ADR-031 §4b-4d)",
         "Proposer departure while proposal is Pending transitions proposal to Invalidated",
         "Voter departure removes their vote and recalculates quorum (may change resolution)",
-        "Epoch reset (ADR-029 Tier 3) invalidates affected votes on pending proposals",
+        "Epoch reset (ADR-029 Tier 3 group state reset) invalidates affected votes on pending proposals",
+        "Deadlock detected for Threshold when fewer than threshold signers are active context members",
+        "Deadlock detected for Majority when fewer than ceil(eligible_voters * min_participation_bps / 10000) members are responsive over 3 consecutive voting windows",
+        "Deadlock detected for Unanimity when any eligible voter has been offline beyond Tier 3 threshold (7+ days)",
+        "ReconfigureGovernance meta-action uses fallback quorum (majority-of-active) regardless of original model",
+        "Fallback quorum requires >= 2 active voters; if only 1 remains, single-admin authority is logged",
+        "Deadlock recovery proposals have 48-hour voting window (double default)",
+        "Governance model TYPE never changes during deadlock recovery",
+        "GovernanceDeadlockRecovery event logged with full DeadlockJustification",
         "Task starts when context enters Active state",
         "Task stops when context is closed or dropped",
+        "Timeout task acquires per-engine Mutex for resolve() calls (not global contexts lock)",
         "Tests verify timeout expiration transitions for each governance model",
         "Tests verify proposer departure invalidation",
-        "Tests verify voter departure quorum recalculation"
+        "Tests verify voter departure quorum recalculation",
+        "Tests verify deadlock detection for Threshold model",
+        "Tests verify ReconfigureGovernance fallback quorum"
       ],
       "actionItems": [
         "Implement GovernanceTimeoutTask as a tokio background task",
         "Add proposal deadline checking with resolve() delegation",
         "Handle proposer departure detection and proposal invalidation",
         "Handle voter departure and quorum recalculation",
-        "Handle epoch reset vote invalidation",
+        "Handle epoch reset vote invalidation (ADR-029 Tier 3)",
+        "Implement deadlock detection criteria for each governance model",
+        "Implement ReconfigureGovernance meta-action with fallback quorum",
+        "Log GovernanceDeadlockRecovery events with DeadlockJustification",
         "Start task on context activation, stop on close",
-        "Add tests for timeout, departure, and epoch reset scenarios"
+        "Add tests for timeout, departure, epoch reset, and deadlock scenarios"
       ],
-      "blockedBy": ["SCP-251"],
+      "blockedBy": ["SCP-268", "SCP-269"],
+      "sources": [
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-029: Offline/Sync Strategy" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-272",
+      "title": "Implement governance conflict detection and resolution",
+      "gate": "gate-gov-wiring",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs",
+        "crates/scp-core/src/context/governance/mod.rs"
+      ],
+      "description": "Implement the governance conflict resolution protocol specified in ADR-031 §7. Conflicts arise when two approved proposals in the event log are incompatible: mutual RemoveMember (targeting each other's proposers), competing ChangeRole (same DID, different roles), competing ModifyCeiling (different ceiling sets), or RemoveMember + ChangeRole for the same DID.\n\nSequential conflicts (different event log sequence numbers): the proposal with the lower sequence number wins. The loser becomes Invalidated with reason 'Conflicting proposal {winner_id} committed first'. A GovernanceConflict event is appended.\n\nSimultaneous conflicts (same sequence number, extremely rare): the context is frozen for new governance actions (no new proposals accepted). Message sending and tool invocation continue normally. A GovernanceConflictDetected event is emitted. Resolution requires an explicit ResolveConflict governance action from any DID with GovernanceVote capability. The resolution specifies AcceptProposal { winner_id } or InvalidateBoth. The ResolveConflict action itself follows the context's governance model. If no resolution is reached within the voting window (48 hours), both proposals are invalidated and the freeze is lifted.",
+      "acceptanceCriteria": [
+        "Conflict detection identifies incompatible approved proposals: mutual RemoveMember, competing ChangeRole for same DID, competing ModifyCeiling, RemoveMember + ChangeRole for same DID",
+        "Sequential conflict (different sequence numbers): lower sequence number wins, loser becomes Invalidated",
+        "GovernanceConflict event appended for sequential conflicts with both proposal IDs, winner, and resolution method",
+        "Simultaneous conflict (same sequence number): context frozen for new governance actions",
+        "GovernanceConflictDetected event emitted for simultaneous conflicts",
+        "Message sending and tool invocation continue during governance freeze",
+        "ResolveConflict governance action accepts AcceptProposal or InvalidateBoth",
+        "ResolveConflict follows the context's governance model (threshold/majority/unanimity voting)",
+        "If no resolution within 48-hour voting window, both proposals invalidated and freeze lifted",
+        "GovernanceConflictResolved event emitted after resolution with winner_id and resolution type",
+        "Tests verify sequential conflict resolution (lower sequence wins)",
+        "Tests verify simultaneous conflict freeze and resolution via ResolveConflict",
+        "Tests verify 48-hour timeout invalidates both proposals",
+        "Tests verify non-governance operations continue during freeze"
+      ],
+      "actionItems": [
+        "Implement conflict detection logic in ContextManager (check for incompatible proposals)",
+        "Implement sequential conflict resolution (compare event log sequence numbers)",
+        "Implement governance freeze state for simultaneous conflicts",
+        "Wire ResolveConflict execution in execute_governance_action",
+        "Implement 48-hour timeout for unresolved simultaneous conflicts",
+        "Emit GovernanceConflict, GovernanceConflictDetected, GovernanceConflictResolved events",
+        "Add tests for each conflict scenario"
+      ],
+      "blockedBy": ["SCP-270"],
       "sources": [
         { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" }
       ],
       "details": {}
     },
     {
-      "id": "SCP-254",
+      "id": "SCP-273",
+      "title": "Implement governance-aware checkpoint cosignatures",
+      "gate": "gate-gov-wiring",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/mod.rs",
+        "crates/scp-core/src/context/governance/mod.rs"
+      ],
+      "description": "Implement model-specific checkpoint cosignature requirements per ADR-031 §9. The checkpointing system must know the governance model to determine the signature quorum for checkpoint attestation.\n\nSingleAdmin: only the admin signs checkpoints; cosignatures field is empty. Threshold: checkpoints require threshold signatures from the signer set. The checkpoint creator distributes the checkpoint hash to other signers, who verify and cosign. Majority: checkpoints require signatures from >50% of eligible voters. Unanimity: checkpoints require signatures from all eligible voters.\n\nCosignature collection follows the same voting-window pattern as governance proposals but with a shorter default window of 1 hour. If cosignature quorum is not reached within the window, the checkpoint is still valid with the creator's signature alone but is flagged as PartiallyAttested — members can decide how much weight to give it.\n\nThis depends on SCP-267 (governance model must be available in PerContextState) but is otherwise independent of the governance method exposure and action wiring stories.",
+      "acceptanceCriteria": [
+        "SingleAdmin checkpoints are signed by admin only; cosignatures field is empty",
+        "Threshold checkpoints require threshold cosignatures from the signer set",
+        "Majority checkpoints require cosignatures from >50% of eligible voters",
+        "Unanimity checkpoints require cosignatures from all eligible voters",
+        "Cosignature collection uses a 1-hour default voting window",
+        "If cosignature quorum not reached, checkpoint is valid with creator's signature alone and flagged as PartiallyAttested",
+        "Checkpoint hash is distributed to eligible cosigners for verification",
+        "Tests verify cosignature quorum for each governance model",
+        "Tests verify PartiallyAttested flag when quorum not reached",
+        "Tests verify SingleAdmin cosignatures field is empty"
+      ],
+      "actionItems": [
+        "Add governance model query to checkpoint creation flow",
+        "Implement cosignature quorum calculation per governance model",
+        "Implement cosignature collection with 1-hour voting window",
+        "Add PartiallyAttested flag for checkpoints below quorum",
+        "Distribute checkpoint hash to eligible cosigners",
+        "Add tests for each governance model's cosignature requirements"
+      ],
+      "blockedBy": ["SCP-267"],
+      "sources": [
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-274",
       "title": "Governance-manager integration test: full lifecycle across all models",
       "gate": "gate-gov-wiring",
       "priority": "P1",
@@ -195,18 +371,23 @@
       "files": [
         "crates/scp-core/tests/governance_integration.rs"
       ],
-      "description": "Integration test that exercises the full governance lifecycle through ContextManager for all four governance models. Tests context creation with each model, proposal submission, voting, approval/rejection, and action execution. Verifies that governance-gated operations cannot be performed without going through the engine. Verifies event log auditability of all governance operations. This is the comprehensive test that SCP-160 (economic governance integration test) was for economic fields — this is for the core governance-manager wiring.",
+      "description": "Integration test that exercises the full governance lifecycle through ContextManager for all four governance models. Tests context creation with each model, proposal submission, voting, approval/rejection, action execution, conflict resolution, deadlock detection, and checkpoint cosignatures. Verifies that governance-gated operations cannot be performed without going through the engine. Verifies event log auditability of all governance operations.",
       "acceptanceCriteria": [
-        "Integration test creates contexts with each of the four governance models",
+        "Integration test creates contexts with each of the four governance models (SingleAdmin, Threshold, Majority, Unanimity)",
         "SingleAdmin: propose auto-approves, action executes immediately",
         "Threshold: propose -> collect M approvals -> action executes",
         "Majority: propose -> collect majority votes -> action executes",
         "Unanimity: propose -> all members approve -> action executes",
         "Rejected proposals do not execute actions",
         "Expired proposals do not execute actions",
-        "All governance events appear in the context event log in correct order",
+        "All 7 governance event types (GovernanceProposalCreated, GovernanceVoteCast, GovernanceVoteWithdrawn, GovernanceProposalResolved, GovernanceConflictDetected, GovernanceConflictResolved, GovernanceDeadlockRecovery) appear in the context event log when triggered",
         "Attempting governance-gated operations through non-governance paths returns errors",
-        "Test exercises at least 3 different GovernanceAction variants (e.g., RemoveMember, ChangeRole, CloseContext)"
+        "Test exercises at least 5 different GovernanceAction variants (RemoveMember, ChangeRole, CloseContext, AddSigner, ExtendTtl)",
+        "Test verifies ExtendTtl unanimity override in a Threshold context",
+        "Test verifies PromoteContext unanimity override in a Majority context",
+        "Test verifies conflict detection and resolution for competing ChangeRole proposals",
+        "Test verifies deadlock detection for Threshold model with insufficient active signers",
+        "Test verifies checkpoint cosignature quorum for Threshold model"
       ],
       "actionItems": [
         "Create integration test file",
@@ -215,10 +396,14 @@
         "Test Majority full lifecycle (propose -> majority votes -> execute)",
         "Test Unanimity full lifecycle (propose -> all approve -> execute)",
         "Test rejection and expiration paths",
-        "Test event log audit trail",
-        "Test bypass prevention"
+        "Test event log audit trail for all 7 event types",
+        "Test bypass prevention",
+        "Test ExtendTtl and PromoteContext unanimity overrides",
+        "Test conflict resolution",
+        "Test deadlock detection and recovery",
+        "Test checkpoint cosignatures"
       ],
-      "blockedBy": ["SCP-252", "SCP-253"],
+      "blockedBy": ["SCP-270", "SCP-271", "SCP-272", "SCP-273"],
       "sources": [
         { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
         { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" }
