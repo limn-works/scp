@@ -698,9 +698,15 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             return Ok(None);
         };
 
-        let commitment = hex_decode(hex_str).map_err(|e| {
+        let commitment_vec = hex::decode(hex_str).map_err(|e| {
             IdentityError::KeyRotationFailed(format!(
                 "failed to decode pre-rotation commitment: {e}"
+            ))
+        })?;
+        let commitment: [u8; 32] = commitment_vec.try_into().map_err(|v: Vec<u8>| {
+            IdentityError::KeyRotationFailed(format!(
+                "pre-rotation commitment must be 32 bytes, got {}",
+                v.len()
             ))
         })?;
         let new_identity_bytes: [u8; 32] =
@@ -1012,37 +1018,6 @@ pub fn verify_migration(
     }
 
     Ok(true)
-}
-
-/// Decodes a lowercase hexadecimal string to bytes.
-///
-/// # Errors
-///
-/// Returns an error if the string length is odd or contains non-hex characters.
-fn hex_decode(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!("expected 64 hex chars, got {}", hex.len()));
-    }
-
-    let mut result = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0])
-            .ok_or_else(|| format!("invalid hex character: {}", chunk[0] as char))?;
-        let lo = hex_nibble(chunk[1])
-            .ok_or_else(|| format!("invalid hex character: {}", chunk[1] as char))?;
-        result[i] = (hi << 4) | lo;
-    }
-    Ok(result)
-}
-
-/// Converts a single hex ASCII byte to its numeric value (0-15).
-const fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -2156,31 +2131,6 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: DidRotationEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, parsed);
-    }
-
-    // -----------------------------------------------------------------------
-    // SCP-008 tests — hex_decode helper
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn hex_decode_valid() {
-        let hex_str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
-        let decoded = hex_decode(hex_str).unwrap();
-        assert_eq!(decoded[0], 0xDE);
-        assert_eq!(decoded[1], 0xAD);
-    }
-
-    #[test]
-    fn hex_decode_rejects_wrong_length() {
-        let result = hex_decode("abcdef");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn hex_decode_rejects_invalid_characters() {
-        let hex_str = "zzzzzzzz00112233445566778899aabbccddeeff00112233445566778899aabb";
-        let result = hex_decode(hex_str);
-        assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------
