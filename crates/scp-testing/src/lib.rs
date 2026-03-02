@@ -8,6 +8,8 @@
 //!
 //! - [`payment_adapter_conformance!`] — 8 tests for [`PaymentAdapter`]
 //!   implementations (spec section 19.2.6).
+//! - [`storage_conformance!`] — 13 tests for [`Storage`](scp_platform::Storage)
+//!   implementations (spec sections 17.11, 17.13).
 //!
 //! # Integration tests
 //!
