@@ -961,6 +961,238 @@ mod tests {
         assert_eq!(config.auth_token.as_deref(), Some("my-secret"));
     }
 
+    // -- Auth middleware integration tests ------------------------------------
+
+    /// Helper: build an authenticated router (`auth_token` = "test-secret").
+    fn auth_router() -> Router {
+        let server = McpServer::new(MockProvider::default());
+        let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+        config.auth_token = Some("test-secret".to_owned());
+        sse_router(server, &config)
+    }
+
+    /// Helper: build an unauthenticated router (`auth_token` = None).
+    fn noauth_router() -> Router {
+        let server = McpServer::new(MockProvider::default());
+        let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+        sse_router(server, &config)
+    }
+
+    /// Helper: send a request through the router and return the status code.
+    async fn request_status(router: Router, req: Request<Body>) -> StatusCode {
+        use tower::ServiceExt;
+
+        let response = router.oneshot(req).await.unwrap();
+        response.status()
+    }
+
+    #[tokio::test]
+    async fn auth_valid_bearer_sse_accepted() {
+        let router = auth_router();
+        let req = Request::builder()
+            .uri("/sse")
+            .header("Authorization", "Bearer test-secret")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_valid_bearer_post_accepted() {
+        let router = auth_router();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_PING,
+            "id": 1
+        })
+        .to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("Authorization", "Bearer test-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn auth_missing_bearer_sse_rejected() {
+        let router = auth_router();
+        let req = Request::builder()
+            .uri("/sse")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_missing_bearer_post_rejected() {
+        let router = auth_router();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_PING,
+            "id": 1
+        })
+        .to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_wrong_bearer_sse_rejected() {
+        let router = auth_router();
+        let req = Request::builder()
+            .uri("/sse")
+            .header("Authorization", "Bearer wrong-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_wrong_bearer_post_rejected() {
+        let router = auth_router();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_PING,
+            "id": 1
+        })
+        .to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("Authorization", "Bearer wrong-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_empty_bearer_rejected() {
+        let router = auth_router();
+        let req = Request::builder()
+            .uri("/sse")
+            .header("Authorization", "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_malformed_header_rejected() {
+        let router = auth_router();
+        // "Basic" scheme instead of "Bearer"
+        let req = Request::builder()
+            .uri("/sse")
+            .header("Authorization", "Basic dXNlcjpwYXNz")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_bearer_without_space_rejected() {
+        let router = auth_router();
+        // Missing space after "Bearer"
+        let req = Request::builder()
+            .uri("/sse")
+            .header("Authorization", "Bearertest-secret")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn noauth_allows_requests_without_header() {
+        let router = noauth_router();
+        // SSE endpoint should work without any auth header when auth is disabled
+        let req = Request::builder()
+            .uri("/sse")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn noauth_post_allows_requests_without_header() {
+        let router = noauth_router();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_PING,
+            "id": 1
+        })
+        .to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn auth_token_prefix_not_accepted() {
+        let router = auth_router();
+        // Token is "test-secret" but we send "test-secret-extended" -- should
+        // fail because constant-time comparison requires exact match.
+        let req = Request::builder()
+            .uri("/sse")
+            .header("Authorization", "Bearer test-secret-extended")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_token_substring_not_accepted() {
+        let router = auth_router();
+        // Token is "test-secret" but we send "test-secre" (substring)
+        let req = Request::builder()
+            .uri("/sse")
+            .header("Authorization", "Bearer test-secre")
+            .body(Body::empty())
+            .unwrap();
+
+        let status = request_status(router, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
     // -- Synthetic request IDs ------------------------------------------------
 
     #[tokio::test]
