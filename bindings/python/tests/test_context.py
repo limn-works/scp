@@ -289,11 +289,11 @@ class TestContextCreate:
             await Context.create(
                 creator=_MockIdentity(),
                 ceiling=["MessagesRead"],
-                template_id="public_broadcast",
+                template_id="PublicBroadcast",
             )
 
         params = mock_bridge.py_context_create.call_args[0][1]
-        assert params["template_id"] == "public_broadcast"
+        assert params["template_id"] == "PublicBroadcast"
 
     async def test_create_passes_economic_policy(self) -> None:
         mock_bridge = MagicMock()

@@ -297,18 +297,19 @@ impl PyContextParams {
 
 /// Valid template ID strings accepted from the Python bridge layer.
 ///
-/// These correspond to the `TemplateId` variants in scp-core, serialized
-/// as lowercase-with-hyphens to match the Python API convention.
+/// These correspond to the `TemplateId` variants in scp-core, using the
+/// exact serde serialization format: `PascalCase` for base templates, and
+/// `scp:template/<name>` URIs for variants with explicit `#[serde(rename)]`.
 const VALID_TEMPLATE_IDS: &[&str] = &[
-    "bilateral_ephemeral",
-    "bilateral_persistent",
-    "coordination",
-    "group_discussion",
-    "public_broadcast",
-    "gated_broadcast",
-    "tool_interface",
-    "paid_service",
-    "paid_broadcast",
+    "BilateralEphemeral",
+    "BilateralPersistent",
+    "Coordination",
+    "GroupDiscussion",
+    "PublicBroadcast",
+    "GatedBroadcast",
+    "scp:template/tool-interface",
+    "scp:template/paid-service",
+    "scp:template/paid-broadcast",
 ];
 
 impl PyContextParams {
@@ -1341,10 +1342,10 @@ mod tests {
     #[test]
     fn params_template_id_present() {
         let p = PyContextParams {
-            template_id: Some("public_broadcast".to_owned()),
+            template_id: Some("PublicBroadcast".to_owned()),
             ..default_params()
         };
-        assert_eq!(p.template_id.as_deref(), Some("public_broadcast"));
+        assert_eq!(p.template_id.as_deref(), Some("PublicBroadcast"));
     }
 
     #[test]
@@ -1377,7 +1378,7 @@ mod tests {
             mode: "broadcast".to_owned(),
             ceiling_policy: "governed".to_owned(),
             promotion_policy: "promotable".to_owned(),
-            template_id: Some("coordination".to_owned()),
+            template_id: Some("Coordination".to_owned()),
             economic_policy: Some("{}".to_owned()),
             ..default_params()
         };
@@ -1392,7 +1393,7 @@ mod tests {
             "repr should include promotion_policy"
         );
         assert!(
-            repr.contains("coordination"),
+            repr.contains("Coordination"),
             "repr should include template_id"
         );
     }
@@ -1456,11 +1457,11 @@ mod tests {
             "ctx-5".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
-                template_id: Some("bilateral_ephemeral".to_owned()),
+                template_id: Some("BilateralEphemeral".to_owned()),
                 ..default_params()
             },
         );
-        assert_eq!(handle.template_id(), Some("bilateral_ephemeral"));
+        assert_eq!(handle.template_id(), Some("BilateralEphemeral"));
     }
 
     #[test]
