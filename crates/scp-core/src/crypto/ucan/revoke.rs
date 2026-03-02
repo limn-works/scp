@@ -23,11 +23,29 @@
 //! the local revocation is rolled back so there is no split-brain between the
 //! revoker and other context members.
 //!
+//! # Propagation confirmation and bounding
+//!
+//! The [`PropagationTracker`] solves the propagation window problem (issue #72):
+//! between local revocation and MLS distribution completing, revoked tokens
+//! remain valid on some members. The tracker provides:
+//!
+//! - **TTL-bounded propagation** -- Each revocation carries a deadline. If the
+//!   deadline expires before all members acknowledge, the propagation is flagged
+//!   as timed out via [`PropagationStatus::TimedOut`].
+//! - **Acknowledgment tracking** -- Members send [`RevocationAck`] messages back
+//!   to the revoker confirming receipt. The revoker tracks per-member ack state.
+//! - **Bounded retry** -- The distributor can retry delivery to members that have
+//!   not yet acknowledged, up to a configurable maximum retry count.
+//!
 //! # Types
 //!
 //! - [`RevocationList`] -- Per-context set of revoked token CIDs with merge
 //!   support for MLS-distributed synchronization.
 //! - [`RevocationState`] -- Per-token revocation state.
+//! - [`RevocationRecord`] -- Metadata for a revocation: timestamp, TTL, revoker.
+//! - [`RevocationAck`] -- Acknowledgment from a member confirming receipt.
+//! - [`PropagationTracker`] -- Tracks propagation status per revocation.
+//! - [`PropagationStatus`] -- Summary of propagation state.
 //!
 //! # Traits
 //!
@@ -40,13 +58,25 @@
 //!
 //! See ADR-016 acceptance criterion 5 and 7.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{UcanError, UcanPayload};
 use crate::event_log::ContextId;
+
+/// Default TTL for revocation propagation: 30 seconds.
+///
+/// This bounds the window during which revoked tokens may remain valid on
+/// members that have not yet received the revocation message. After this
+/// period, the propagation is flagged as timed out, signaling that the
+/// revoker should escalate (e.g., force key rotation, remove member).
+pub const DEFAULT_REVOCATION_TTL_SECS: u64 = 30;
+
+/// Maximum number of retry attempts for revocation distribution to a single
+/// member before giving up.
+pub const MAX_DISTRIBUTION_RETRIES: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // RevocationState
@@ -76,6 +106,280 @@ pub enum RevocationState {
     RevocationPending,
     /// Revocation is fully committed: local revocation + MLS distribution.
     Revoked,
+}
+
+// ---------------------------------------------------------------------------
+// RevocationRecord
+// ---------------------------------------------------------------------------
+
+/// Metadata for a single revocation entry.
+///
+/// Captures when the revocation was initiated, the propagation deadline, the
+/// revoker's identity, and how many distribution attempts have been made.
+/// This enables the [`PropagationTracker`] to bound the propagation window
+/// and detect stale/timed-out revocations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationRecord {
+    /// The revoked token's content-hash CID.
+    pub token_cid: String,
+    /// Unix timestamp (seconds) when the revocation was initiated.
+    pub revoked_at: u64,
+    /// Unix timestamp (seconds) deadline for propagation to complete.
+    /// Computed as `revoked_at + ttl_secs`.
+    pub deadline: u64,
+    /// DID of the entity that initiated the revocation.
+    pub revoker_did: String,
+    /// Number of distribution attempts made so far.
+    pub retry_count: u32,
+}
+
+// ---------------------------------------------------------------------------
+// RevocationAck
+// ---------------------------------------------------------------------------
+
+/// Acknowledgment from a context member confirming receipt of a revocation.
+///
+/// Members send this back to the revoker (via MLS application message) after
+/// applying a revocation to their local revocation list. The revoker uses
+/// these to track propagation completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationAck {
+    /// The revoked token's CID being acknowledged.
+    pub token_cid: String,
+    /// DID of the member sending the acknowledgment.
+    pub member_did: String,
+    /// Unix timestamp (seconds) when the member applied the revocation.
+    pub acked_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// PropagationStatus
+// ---------------------------------------------------------------------------
+
+/// Summary of revocation propagation state.
+///
+/// Returned by [`PropagationTracker::status`] to describe the current
+/// propagation state of a specific revocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropagationStatus {
+    /// All expected members have acknowledged the revocation.
+    FullyPropagated,
+    /// Propagation is still in progress: some members have not acknowledged
+    /// yet, but the deadline has not expired.
+    InProgress {
+        /// DIDs of members that have not yet acknowledged.
+        pending_members: Vec<String>,
+        /// Seconds remaining until the deadline.
+        remaining_secs: u64,
+    },
+    /// The propagation deadline has expired and some members have not
+    /// acknowledged. The revoker should escalate (e.g., force key rotation).
+    TimedOut {
+        /// DIDs of members that did not acknowledge before the deadline.
+        unacked_members: Vec<String>,
+    },
+    /// No propagation tracking exists for this token CID.
+    Unknown,
+}
+
+// ---------------------------------------------------------------------------
+// PropagationTracker
+// ---------------------------------------------------------------------------
+
+/// Tracks per-revocation propagation status across context members.
+///
+/// The tracker maintains a record of each revocation and which members have
+/// acknowledged it. It supports:
+///
+/// - **Deadline enforcement** -- each revocation has a TTL-bounded deadline.
+/// - **Acknowledgment recording** -- members confirm receipt.
+/// - **Status queries** -- the revoker can check if propagation is complete,
+///   in progress, or timed out.
+/// - **Retry tracking** -- counts distribution attempts per revocation.
+///
+/// This addresses the propagation window gap identified in issue #72.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropagationTracker {
+    /// Map of token CID to its revocation record.
+    records: HashMap<String, RevocationRecord>,
+    /// Map of token CID to set of member DIDs that have acknowledged.
+    acks: HashMap<String, HashSet<String>>,
+    /// Set of all expected member DIDs in the context (excluding the revoker).
+    expected_members: HashSet<String>,
+    /// The context this tracker belongs to.
+    context_id: ContextId,
+}
+
+impl PropagationTracker {
+    /// Creates a new propagation tracker for the given context.
+    ///
+    /// `expected_members` should contain the DIDs of all context members
+    /// (excluding the revoker) who need to receive the revocation.
+    #[must_use]
+    pub fn new(context_id: ContextId, expected_members: HashSet<String>) -> Self {
+        Self {
+            records: HashMap::new(),
+            acks: HashMap::new(),
+            expected_members,
+            context_id,
+        }
+    }
+
+    /// Returns the context ID this tracker belongs to.
+    #[must_use]
+    pub fn context_id(&self) -> &str {
+        &self.context_id
+    }
+
+    /// Begins tracking a new revocation.
+    ///
+    /// Records the revocation metadata and initializes the acknowledgment set.
+    /// The deadline is computed as `now + ttl_secs`.
+    pub fn track_revocation(
+        &mut self,
+        token_cid: String,
+        revoker_did: String,
+        now: u64,
+        ttl_secs: u64,
+    ) {
+        let record = RevocationRecord {
+            token_cid: token_cid.clone(),
+            revoked_at: now,
+            deadline: now.saturating_add(ttl_secs),
+            revoker_did,
+            retry_count: 1,
+        };
+        self.records.insert(token_cid.clone(), record);
+        self.acks.insert(token_cid, HashSet::new());
+    }
+
+    /// Records an acknowledgment from a member.
+    ///
+    /// Returns `true` if this was a new acknowledgment (not a duplicate).
+    /// Returns `false` if the member already acknowledged or the token CID
+    /// is not being tracked.
+    pub fn record_ack(&mut self, ack: &RevocationAck) -> bool {
+        self.acks
+            .get_mut(&ack.token_cid)
+            .is_some_and(|ack_set| ack_set.insert(ack.member_did.clone()))
+    }
+
+    /// Returns the current propagation status for a revocation.
+    ///
+    /// `now` is the current Unix timestamp in seconds, used to determine
+    /// whether the deadline has expired.
+    #[must_use]
+    pub fn status(&self, token_cid: &str, now: u64) -> PropagationStatus {
+        let Some(record) = self.records.get(token_cid) else {
+            return PropagationStatus::Unknown;
+        };
+
+        let acked = self.acks.get(token_cid).cloned().unwrap_or_default();
+
+        let pending: Vec<String> = self
+            .expected_members
+            .iter()
+            .filter(|m| !acked.contains(*m) && **m != record.revoker_did)
+            .cloned()
+            .collect();
+
+        if pending.is_empty() {
+            PropagationStatus::FullyPropagated
+        } else if now >= record.deadline {
+            PropagationStatus::TimedOut {
+                unacked_members: pending,
+            }
+        } else {
+            PropagationStatus::InProgress {
+                pending_members: pending,
+                remaining_secs: record.deadline.saturating_sub(now),
+            }
+        }
+    }
+
+    /// Returns the set of member DIDs that have not yet acknowledged a
+    /// revocation. Returns an empty set if the token CID is not tracked.
+    #[must_use]
+    pub fn unacked_members(&self, token_cid: &str) -> Vec<String> {
+        let Some(record) = self.records.get(token_cid) else {
+            return Vec::new();
+        };
+        let acked = self.acks.get(token_cid).cloned().unwrap_or_default();
+        self.expected_members
+            .iter()
+            .filter(|m| !acked.contains(*m) && **m != record.revoker_did)
+            .cloned()
+            .collect()
+    }
+
+    /// Increments the retry count for a revocation and returns the new count.
+    ///
+    /// Returns `None` if the token CID is not being tracked.
+    pub fn increment_retry(&mut self, token_cid: &str) -> Option<u32> {
+        self.records.get_mut(token_cid).map(|r| {
+            r.retry_count = r.retry_count.saturating_add(1);
+            r.retry_count
+        })
+    }
+
+    /// Returns `true` if the retry count for the given revocation has reached
+    /// or exceeded [`MAX_DISTRIBUTION_RETRIES`].
+    #[must_use]
+    pub fn retries_exhausted(&self, token_cid: &str) -> bool {
+        self.records
+            .get(token_cid)
+            .is_some_and(|r| r.retry_count >= MAX_DISTRIBUTION_RETRIES)
+    }
+
+    /// Returns the revocation record for a token CID, if tracked.
+    #[must_use]
+    pub fn record(&self, token_cid: &str) -> Option<&RevocationRecord> {
+        self.records.get(token_cid)
+    }
+
+    /// Returns `true` if propagation tracking has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Returns the number of revocations being tracked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Updates the expected member set (e.g., after a member joins or leaves).
+    pub fn set_expected_members(&mut self, members: HashSet<String>) {
+        self.expected_members = members;
+    }
+
+    /// Removes tracking for a fully-propagated or abandoned revocation.
+    ///
+    /// Returns `true` if an entry was removed.
+    pub fn remove(&mut self, token_cid: &str) -> bool {
+        let removed_record = self.records.remove(token_cid).is_some();
+        self.acks.remove(token_cid);
+        removed_record
+    }
+
+    /// Returns all token CIDs whose propagation deadline has expired and
+    /// still have unacknowledged members.
+    #[must_use]
+    pub fn timed_out_revocations(&self, now: u64) -> Vec<String> {
+        self.records
+            .iter()
+            .filter(|(cid, record)| {
+                now >= record.deadline && {
+                    let acked = self.acks.get(*cid).cloned().unwrap_or_default();
+                    self.expected_members
+                        .iter()
+                        .any(|m| !acked.contains(m) && *m != record.revoker_did)
+                }
+            })
+            .map(|(cid, _)| cid.clone())
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +685,160 @@ pub fn revoke_ucan(
     revocation_list.confirm_revocation(&token_cid);
 
     // Step 6: Append TokenRevoked event.
+    event_logger.log_token_revoked(&context_id, &token_cid, revoker_did)?;
+
+    Ok(token_cid)
+}
+
+// ---------------------------------------------------------------------------
+// Distribution retry helper
+// ---------------------------------------------------------------------------
+
+/// Attempts to distribute a revocation with bounded retry.
+///
+/// Makes up to [`MAX_DISTRIBUTION_RETRIES`] attempts, incrementing the retry
+/// count in the tracker after the first attempt. Returns `Ok(())` on the first
+/// successful attempt, or the last error after all attempts are exhausted.
+fn distribute_with_retry(
+    context_id: &str,
+    token_cid: &str,
+    distributor: &impl RevocationDistributor,
+    tracker: &mut PropagationTracker,
+) -> Result<(), UcanError> {
+    let mut last_err =
+        UcanError::RevocationFailed("distribution failed after all retries".to_owned());
+
+    for attempt in 0..MAX_DISTRIBUTION_RETRIES {
+        if attempt > 0 {
+            tracker.increment_retry(token_cid);
+        }
+        match distributor.distribute_revocation(context_id, token_cid) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = e,
+        }
+    }
+
+    Err(last_err)
+}
+
+// ---------------------------------------------------------------------------
+// PropagationConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for TTL-bounded revocation propagation.
+///
+/// Bundles the timing parameters needed by [`revoke_ucan_with_propagation`]
+/// to track and bound the revocation propagation window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropagationConfig {
+    /// Current Unix timestamp in seconds.
+    pub now: u64,
+    /// Propagation deadline in seconds from `now`. After `now + ttl_secs`,
+    /// unacknowledged members are flagged as timed out.
+    pub ttl_secs: u64,
+}
+
+impl PropagationConfig {
+    /// Creates a new propagation config with the given timestamp and TTL.
+    #[must_use]
+    pub const fn new(now: u64, ttl_secs: u64) -> Self {
+        Self { now, ttl_secs }
+    }
+
+    /// Creates a propagation config with the default TTL
+    /// ([`DEFAULT_REVOCATION_TTL_SECS`]).
+    #[must_use]
+    pub const fn with_default_ttl(now: u64) -> Self {
+        Self {
+            now,
+            ttl_secs: DEFAULT_REVOCATION_TTL_SECS,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// revoke_ucan_with_propagation
+// ---------------------------------------------------------------------------
+
+/// Revokes a UCAN token with propagation tracking and bounded retry.
+///
+/// This extends [`revoke_ucan`] with confirmation and bounding mechanisms
+/// for the propagation window (issue #72). In addition to the base revocation
+/// flow, this function:
+///
+/// 1. Registers the revocation with the [`PropagationTracker`], recording the
+///    current timestamp and TTL-bounded deadline.
+/// 2. On initial distribution failure, retries up to [`MAX_DISTRIBUTION_RETRIES`]
+///    times before rolling back.
+/// 3. Returns the token CID on success; the caller should poll
+///    [`PropagationTracker::status`] to confirm full propagation.
+///
+/// # Arguments
+///
+/// * `revocation_list` - The context's mutable revocation list.
+/// * `tracker` - The context's mutable propagation tracker.
+/// * `payload` - The UCAN token's payload, used to compute the revocation CID.
+/// * `revoker_did` - The DID of the entity requesting the revocation.
+/// * `authorizer` - Verifies the revoker is authorized.
+/// * `distributor` - Distributes the revocation to context members.
+/// * `event_logger` - Appends the `TokenRevoked` event.
+/// * `config` - Propagation timing configuration (timestamp and TTL).
+///
+/// # Returns
+///
+/// Returns the computed revocation CID on success. The caller should use
+/// [`PropagationTracker::status`] to check whether all members have
+/// acknowledged the revocation before the deadline.
+///
+/// # Errors
+///
+/// Returns [`UcanError::RevocationUnauthorized`] if the revoker is not
+/// authorized.
+/// Returns [`UcanError::RevocationFailed`] if distribution fails after all
+/// retry attempts, or if logging fails.
+#[allow(clippy::too_many_arguments)] // Revocation flow requires all 8 parameters: mutable state (2), token data (2), trait deps (3), config (1).
+pub fn revoke_ucan_with_propagation(
+    revocation_list: &mut RevocationList,
+    tracker: &mut PropagationTracker,
+    payload: &UcanPayload,
+    revoker_did: &str,
+    authorizer: &impl RevocationAuthorizer,
+    distributor: &impl RevocationDistributor,
+    event_logger: &impl RevocationEventLogger,
+    config: PropagationConfig,
+) -> Result<String, UcanError> {
+    // Step 1: Compute content-hash CID from payload.
+    let token_cid = compute_revocation_cid(payload);
+
+    // Step 2: Verify authorization.
+    authorizer.authorize_revocation(&token_cid, revoker_did)?;
+
+    // Step 3: Mark as RevocationPending (fail-closed).
+    revocation_list.mark_pending(token_cid.clone());
+
+    // Step 4: Register with propagation tracker.
+    tracker.track_revocation(
+        token_cid.clone(),
+        revoker_did.to_owned(),
+        config.now,
+        config.ttl_secs,
+    );
+
+    // Step 5: Distribute via MLS with bounded retry.
+    let context_id = revocation_list.context_id().to_owned();
+    let distribution_result = distribute_with_retry(&context_id, &token_cid, distributor, tracker);
+
+    if let Err(e) = distribution_result {
+        // All retries exhausted. Roll back.
+        revocation_list.rollback_revocation(&token_cid);
+        tracker.remove(&token_cid);
+        return Err(e);
+    }
+
+    // Step 6: Commit -- Pending to Revoked.
+    revocation_list.confirm_revocation(&token_cid);
+
+    // Step 7: Append TokenRevoked event.
     event_logger.log_token_revoked(&context_id, &token_cid, revoker_did)?;
 
     Ok(token_cid)
@@ -1126,6 +1584,655 @@ mod tests {
             list.is_revoked(&recomputed_cid),
             "re-computed CID must match stored revocation"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PropagationTracker -- construction
+    // -----------------------------------------------------------------------
+
+    fn test_members() -> HashSet<String> {
+        let mut members = HashSet::new();
+        members.insert("did:dht:z6MkMemberA".to_owned());
+        members.insert("did:dht:z6MkMemberB".to_owned());
+        members.insert("did:dht:z6MkMemberC".to_owned());
+        members
+    }
+
+    #[test]
+    fn propagation_tracker_new_is_empty() {
+        let tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
+        assert_eq!(tracker.context_id(), "ctx-1");
+    }
+
+    // -----------------------------------------------------------------------
+    // PropagationTracker -- track_revocation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn track_revocation_records_entry() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        assert_eq!(tracker.len(), 1);
+        let record = tracker.record("cid-a").unwrap();
+        assert_eq!(record.token_cid, "cid-a");
+        assert_eq!(record.revoked_at, 1_000_000);
+        assert_eq!(record.deadline, 1_000_030);
+        assert_eq!(record.revoker_did, "did:dht:z6MkIssuer");
+        assert_eq!(record.retry_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // PropagationTracker -- acknowledgments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_ack_returns_true_for_new_ack() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        let ack = RevocationAck {
+            token_cid: "cid-a".to_owned(),
+            member_did: "did:dht:z6MkMemberA".to_owned(),
+            acked_at: 1_000_005,
+        };
+        assert!(tracker.record_ack(&ack));
+    }
+
+    #[test]
+    fn record_ack_returns_false_for_duplicate() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        let ack = RevocationAck {
+            token_cid: "cid-a".to_owned(),
+            member_did: "did:dht:z6MkMemberA".to_owned(),
+            acked_at: 1_000_005,
+        };
+        assert!(tracker.record_ack(&ack));
+        assert!(!tracker.record_ack(&ack));
+    }
+
+    #[test]
+    fn record_ack_returns_false_for_untracked_cid() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        let ack = RevocationAck {
+            token_cid: "cid-unknown".to_owned(),
+            member_did: "did:dht:z6MkMemberA".to_owned(),
+            acked_at: 1_000_005,
+        };
+        assert!(!tracker.record_ack(&ack));
+    }
+
+    // -----------------------------------------------------------------------
+    // PropagationTracker -- status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn status_unknown_for_untracked_cid() {
+        let tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        assert_eq!(
+            tracker.status("cid-unknown", 1_000_000),
+            PropagationStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn status_in_progress_before_deadline() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        let status = tracker.status("cid-a", 1_000_010);
+        match status {
+            PropagationStatus::InProgress {
+                pending_members,
+                remaining_secs,
+            } => {
+                assert_eq!(pending_members.len(), 3);
+                assert_eq!(remaining_secs, 20);
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_fully_propagated_after_all_acks() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        for member in &[
+            "did:dht:z6MkMemberA",
+            "did:dht:z6MkMemberB",
+            "did:dht:z6MkMemberC",
+        ] {
+            let ack = RevocationAck {
+                token_cid: "cid-a".to_owned(),
+                member_did: (*member).to_owned(),
+                acked_at: 1_000_010,
+            };
+            tracker.record_ack(&ack);
+        }
+        assert_eq!(
+            tracker.status("cid-a", 1_000_015),
+            PropagationStatus::FullyPropagated
+        );
+    }
+
+    #[test]
+    fn status_timed_out_after_deadline() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        // Only one member acks.
+        let ack = RevocationAck {
+            token_cid: "cid-a".to_owned(),
+            member_did: "did:dht:z6MkMemberA".to_owned(),
+            acked_at: 1_000_010,
+        };
+        tracker.record_ack(&ack);
+
+        let status = tracker.status("cid-a", 1_000_031);
+        match status {
+            PropagationStatus::TimedOut { unacked_members } => {
+                assert_eq!(unacked_members.len(), 2);
+                assert!(unacked_members.contains(&"did:dht:z6MkMemberB".to_owned()));
+                assert!(unacked_members.contains(&"did:dht:z6MkMemberC".to_owned()));
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_excludes_revoker_from_expected() {
+        let mut members = HashSet::new();
+        members.insert("did:dht:z6MkIssuer".to_owned());
+        members.insert("did:dht:z6MkMemberA".to_owned());
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), members);
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        // Only MemberA needs to ack; the revoker (Issuer) is excluded.
+        let ack = RevocationAck {
+            token_cid: "cid-a".to_owned(),
+            member_did: "did:dht:z6MkMemberA".to_owned(),
+            acked_at: 1_000_005,
+        };
+        tracker.record_ack(&ack);
+        assert_eq!(
+            tracker.status("cid-a", 1_000_010),
+            PropagationStatus::FullyPropagated
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PropagationTracker -- retry tracking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn increment_retry_increases_count() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        assert_eq!(tracker.record("cid-a").unwrap().retry_count, 1);
+        assert_eq!(tracker.increment_retry("cid-a"), Some(2));
+        assert_eq!(tracker.increment_retry("cid-a"), Some(3));
+    }
+
+    #[test]
+    fn retries_exhausted_after_max() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        assert!(!tracker.retries_exhausted("cid-a"));
+        tracker.increment_retry("cid-a"); // count = 2
+        assert!(!tracker.retries_exhausted("cid-a"));
+        tracker.increment_retry("cid-a"); // count = 3 = MAX
+        assert!(tracker.retries_exhausted("cid-a"));
+    }
+
+    #[test]
+    fn increment_retry_returns_none_for_untracked() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        assert_eq!(tracker.increment_retry("cid-unknown"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // PropagationTracker -- unacked_members and timed_out_revocations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unacked_members_returns_all_initially() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        let unacked = tracker.unacked_members("cid-a");
+        assert_eq!(unacked.len(), 3);
+    }
+
+    #[test]
+    fn unacked_members_shrinks_as_acks_arrive() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        let ack = RevocationAck {
+            token_cid: "cid-a".to_owned(),
+            member_did: "did:dht:z6MkMemberA".to_owned(),
+            acked_at: 1_000_005,
+        };
+        tracker.record_ack(&ack);
+        let unacked = tracker.unacked_members("cid-a");
+        assert_eq!(unacked.len(), 2);
+        assert!(!unacked.contains(&"did:dht:z6MkMemberA".to_owned()));
+    }
+
+    #[test]
+    fn timed_out_revocations_returns_expired_cids() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        tracker.track_revocation(
+            "cid-b".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            60,
+        );
+        // At t=1_000_035, only cid-a has expired.
+        let timed_out = tracker.timed_out_revocations(1_000_035);
+        assert_eq!(timed_out.len(), 1);
+        assert!(timed_out.contains(&"cid-a".to_owned()));
+    }
+
+    // -----------------------------------------------------------------------
+    // PropagationTracker -- remove
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remove_cleans_up_tracking() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        assert!(tracker.remove("cid-a"));
+        assert!(tracker.is_empty());
+        assert_eq!(
+            tracker.status("cid-a", 1_000_010),
+            PropagationStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn remove_returns_false_for_untracked() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        assert!(!tracker.remove("cid-unknown"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PropagationTracker -- set_expected_members
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_expected_members_updates_pending_calculation() {
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        tracker.track_revocation(
+            "cid-a".to_owned(),
+            "did:dht:z6MkIssuer".to_owned(),
+            1_000_000,
+            30,
+        );
+        // Reduce members to just one.
+        let mut new_members = HashSet::new();
+        new_members.insert("did:dht:z6MkMemberA".to_owned());
+        tracker.set_expected_members(new_members);
+
+        let ack = RevocationAck {
+            token_cid: "cid-a".to_owned(),
+            member_did: "did:dht:z6MkMemberA".to_owned(),
+            acked_at: 1_000_005,
+        };
+        tracker.record_ack(&ack);
+        assert_eq!(
+            tracker.status("cid-a", 1_000_010),
+            PropagationStatus::FullyPropagated
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RevocationRecord -- serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revocation_record_serialization_roundtrip() {
+        let record = RevocationRecord {
+            token_cid: "cid-a".to_owned(),
+            revoked_at: 1_000_000,
+            deadline: 1_000_030,
+            revoker_did: "did:dht:z6MkIssuer".to_owned(),
+            retry_count: 2,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: RevocationRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, deserialized);
+    }
+
+    // -----------------------------------------------------------------------
+    // RevocationAck -- serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revocation_ack_serialization_roundtrip() {
+        let ack = RevocationAck {
+            token_cid: "cid-a".to_owned(),
+            member_did: "did:dht:z6MkMemberA".to_owned(),
+            acked_at: 1_000_005,
+        };
+        let json = serde_json::to_string(&ack).unwrap();
+        let deserialized: RevocationAck = serde_json::from_str(&json).unwrap();
+        assert_eq!(ack, deserialized);
+    }
+
+    // -----------------------------------------------------------------------
+    // revoke_ucan_with_propagation -- success path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revoke_with_propagation_success() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        let authorizer = MockAuthorizer {
+            issuer_did: "did:dht:z6MkIssuer".to_owned(),
+            creator_did: "did:dht:z6MkCreator".to_owned(),
+        };
+        let distributor = MockDistributor::new();
+        let logger = MockEventLogger::new();
+        let payload = test_payload();
+        let expected_cid = compute_revocation_cid(&payload);
+
+        let result = revoke_ucan_with_propagation(
+            &mut list,
+            &mut tracker,
+            &payload,
+            "did:dht:z6MkIssuer",
+            &authorizer,
+            &distributor,
+            &logger,
+            PropagationConfig::with_default_ttl(1_000_000),
+        );
+
+        assert!(result.is_ok());
+        let returned_cid = result.unwrap();
+        assert_eq!(returned_cid, expected_cid);
+        assert!(list.is_revoked(&expected_cid));
+        assert_eq!(list.state(&expected_cid), RevocationState::Revoked);
+
+        // Propagation tracking should be active.
+        let record = tracker.record(&expected_cid).unwrap();
+        assert_eq!(record.revoked_at, 1_000_000);
+        assert_eq!(record.deadline, 1_000_030);
+
+        // Before any acks, status should be InProgress.
+        match tracker.status(&expected_cid, 1_000_010) {
+            PropagationStatus::InProgress {
+                pending_members,
+                remaining_secs,
+            } => {
+                assert_eq!(pending_members.len(), 3);
+                assert_eq!(remaining_secs, 20);
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // revoke_ucan_with_propagation -- bounded retry on distribution failure
+    // -----------------------------------------------------------------------
+
+    /// A distributor that fails the first N times, then succeeds.
+    struct FailNThenSucceedDistributor {
+        failures_remaining: RefCell<u32>,
+        distributed: RefCell<Vec<(String, String)>>,
+    }
+
+    impl FailNThenSucceedDistributor {
+        fn new(fail_count: u32) -> Self {
+            Self {
+                failures_remaining: RefCell::new(fail_count),
+                distributed: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RevocationDistributor for FailNThenSucceedDistributor {
+        fn distribute_revocation(
+            &self,
+            context_id: &str,
+            token_cid: &str,
+        ) -> Result<(), UcanError> {
+            let mut remaining = self.failures_remaining.borrow_mut();
+            if *remaining > 0 {
+                *remaining -= 1;
+                Err(UcanError::RevocationFailed(
+                    "transient MLS failure".to_owned(),
+                ))
+            } else {
+                self.distributed
+                    .borrow_mut()
+                    .push((context_id.to_owned(), token_cid.to_owned()));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn revoke_with_propagation_retries_on_transient_failure() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        let authorizer = MockAuthorizer {
+            issuer_did: "did:dht:z6MkIssuer".to_owned(),
+            creator_did: "did:dht:z6MkCreator".to_owned(),
+        };
+        // Fail first attempt, succeed on retry.
+        let distributor = FailNThenSucceedDistributor::new(1);
+        let logger = MockEventLogger::new();
+        let payload = test_payload();
+        let expected_cid = compute_revocation_cid(&payload);
+
+        let result = revoke_ucan_with_propagation(
+            &mut list,
+            &mut tracker,
+            &payload,
+            "did:dht:z6MkIssuer",
+            &authorizer,
+            &distributor,
+            &logger,
+            PropagationConfig::with_default_ttl(1_000_000),
+        );
+
+        assert!(result.is_ok());
+        assert!(list.is_revoked(&expected_cid));
+        // Should have retried.
+        let record = tracker.record(&expected_cid).unwrap();
+        assert_eq!(record.retry_count, 2);
+    }
+
+    #[test]
+    fn revoke_with_propagation_rolls_back_after_all_retries_fail() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        let authorizer = MockAuthorizer {
+            issuer_did: "did:dht:z6MkIssuer".to_owned(),
+            creator_did: "did:dht:z6MkCreator".to_owned(),
+        };
+        let distributor = FailingDistributor;
+        let logger = MockEventLogger::new();
+        let payload = test_payload();
+        let expected_cid = compute_revocation_cid(&payload);
+
+        let result = revoke_ucan_with_propagation(
+            &mut list,
+            &mut tracker,
+            &payload,
+            "did:dht:z6MkIssuer",
+            &authorizer,
+            &distributor,
+            &logger,
+            PropagationConfig::with_default_ttl(1_000_000),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            UcanError::RevocationFailed(_)
+        ));
+        // Revocation list should be rolled back.
+        assert!(!list.is_revoked(&expected_cid));
+        assert!(list.is_empty());
+        // Tracker should be cleaned up.
+        assert!(tracker.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // revoke_ucan_with_propagation -- authorization failure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revoke_with_propagation_rejects_unauthorized() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        let authorizer = RejectingAuthorizer;
+        let distributor = MockDistributor::new();
+        let logger = MockEventLogger::new();
+        let payload = test_payload();
+
+        let result = revoke_ucan_with_propagation(
+            &mut list,
+            &mut tracker,
+            &payload,
+            "did:dht:z6MkUnauthorized",
+            &authorizer,
+            &distributor,
+            &logger,
+            PropagationConfig::with_default_ttl(1_000_000),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            UcanError::RevocationUnauthorized(_)
+        ));
+        assert!(list.is_empty());
+        assert!(tracker.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: full propagation lifecycle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn full_propagation_lifecycle() {
+        let mut list = RevocationList::new("ctx-1".to_owned());
+        let mut tracker = PropagationTracker::new("ctx-1".to_owned(), test_members());
+        let authorizer = MockAuthorizer {
+            issuer_did: "did:dht:z6MkIssuer".to_owned(),
+            creator_did: "did:dht:z6MkCreator".to_owned(),
+        };
+        let distributor = MockDistributor::new();
+        let logger = MockEventLogger::new();
+        let payload = test_payload();
+
+        // Step 1: Revoke with propagation tracking.
+        let cid = revoke_ucan_with_propagation(
+            &mut list,
+            &mut tracker,
+            &payload,
+            "did:dht:z6MkIssuer",
+            &authorizer,
+            &distributor,
+            &logger,
+            PropagationConfig::with_default_ttl(1_000_000),
+        )
+        .unwrap();
+
+        // Step 2: Status is InProgress (no acks yet).
+        assert!(matches!(
+            tracker.status(&cid, 1_000_005),
+            PropagationStatus::InProgress { .. }
+        ));
+
+        // Step 3: Members acknowledge one by one.
+        for member in &[
+            "did:dht:z6MkMemberA",
+            "did:dht:z6MkMemberB",
+            "did:dht:z6MkMemberC",
+        ] {
+            let ack = RevocationAck {
+                token_cid: cid.clone(),
+                member_did: (*member).to_owned(),
+                acked_at: 1_000_010,
+            };
+            tracker.record_ack(&ack);
+        }
+
+        // Step 4: Status is FullyPropagated.
+        assert_eq!(
+            tracker.status(&cid, 1_000_015),
+            PropagationStatus::FullyPropagated
+        );
+
+        // Step 5: Cleanup.
+        assert!(tracker.remove(&cid));
+        assert!(tracker.is_empty());
     }
 
     // -----------------------------------------------------------------------
