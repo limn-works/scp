@@ -40,6 +40,7 @@ bs58 = { workspace = true }
 uuid = { workspace = true }
 jsonschema = { workspace = true, features = ["resolve-http", "resolve-file"] }
 lru = { workspace = true }
+tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
