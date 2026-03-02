@@ -125,6 +125,15 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
+    fn derive_rotatable_pseudonym(
+        &self,
+        _key: &KeyHandle,
+        _context_id: &[u8],
+        _pseudonym_epoch: u64,
+    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
+
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }
@@ -134,6 +143,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
 async fn start_relay() -> SocketAddr {
     let config = RelayConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        delivery_jitter_ms: 0,
         ..RelayConfig::default()
     };
     let storage = InMemoryBlobStorage::new();

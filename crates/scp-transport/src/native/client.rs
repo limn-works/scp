@@ -1193,6 +1193,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();

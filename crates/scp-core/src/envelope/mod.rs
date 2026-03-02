@@ -33,7 +33,7 @@ pub use inner::{
 };
 pub use outer::{OuterEnvelope, create_outer_envelope, open_envelope, seal_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
-pub use pseudonym::derive_pseudonym;
+pub use pseudonym::{derive_pseudonym, derive_rotatable_pseudonym};
 
 /// Errors produced by envelope operations.
 ///

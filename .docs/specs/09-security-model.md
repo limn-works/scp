@@ -502,6 +502,7 @@ The protocol provides layered metadata privacy protections. Each layer addresses
 - **Push layer:** Fully opaque push notifications (§10.7)
 - **Blocking layer:** AES-256 sender-side keys enable cryptographic blocking without MLS group changes (§9.16)
 - **Cross-context key isolation:** Independent MLS key material per context (§9.10.9)
+- **Delivery layer:** Relay-side delivery jitter breaks timing correlation between PUBLISH and delivery (§9.10.11)
 
 This section specifies what the protocol protects, how it protects it, and what residual risks remain.
 
@@ -555,6 +556,23 @@ context_pseudonym = context_keypair.public_key
 - **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses the raw Ed25519 public key bytes (ADR-027 amendment: public key bytes ensure cross-platform determinism with hardware TEE keys that cannot export private bytes). All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
 - **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a publicly derivable identifier: `metadata_routing_id = SHA-256(context_id || "scp-metadata")`. This identifier is distinct from the per-member pseudonyms used for message routing and does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the `metadata_routing_id` on the context's relays.
 
+#### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)
+
+To mitigate long-term pseudonym-level traffic analysis by a compromised relay (BLACK-001), pseudonyms support epoch-based rotation. The v2 derivation includes a rotation epoch:
+
+```
+context_seed_v2 = HMAC-SHA256(identity_key_material, context_id || epoch_BE || "scp-pseudonym-v2")
+context_keypair_v2 = Ed25519_keygen(context_seed_v2[0..32])
+```
+
+where `epoch_BE` is a 64-bit big-endian pseudonym rotation epoch (distinct from MLS epochs).
+
+- **Domain separation:** The v2 domain separator `"scp-pseudonym-v2"` differs from v1's `"scp-pseudonym"`, so v2 epoch 0 produces a different pseudonym than v1. This prevents accidental domain confusion.
+- **Rotation trigger:** Context governance policy determines rotation frequency (e.g., daily, weekly, on membership change). The SDK manages rotation timing.
+- **Transition protocol:** During rotation, the client subscribes to BOTH the old and new `routing_id` for a grace period (recommended: 2x the context's blob TTL) to avoid missing messages from peers who have not yet learned the new pseudonym. The sender announces the new `routing_id` to group members via an MLS application message containing `{ pseudonym_epoch: N, routing_id: <new_routing_id> }`.
+- **Backward compatibility:** Contexts that do not opt into rotation continue using v1 derivation with static pseudonyms. The existing mitigations (cover traffic, padding, relay partitioning) provide substantial protection for these contexts.
+- **HSM compatibility:** Same as v1 — `KeyCustody::derive_rotatable_pseudonym(identity_key_handle, context_id, pseudonym_epoch)` delegates the HMAC to the custody boundary.
+
 ### 9.10.5 Connection Privacy
 
 1. **Persistent connections mandatory on desktop/workstation/server.** Constant connection to each relay regardless of activity. Prevents connection-timing correlation.
@@ -592,7 +610,15 @@ Cover traffic is **enabled by default and configurable per-client.** The SDK shi
 
 Each SCP context is a separate MLS group with independent key material. Compromising one context's keys reveals nothing about any other context's keys. The identity key (Ed25519) is shared across contexts but signs actions — it never directly encrypts group content. MLS handles group encryption with ephemeral key material derived independently per group. Per-context pseudonyms (§9.10.4) prevent the identity key from being visible outside encrypted payloads.
 
-### 9.10.10 Residual Risks
+### 9.10.11 Relay Delivery Jitter (BLACK-001 Mitigation)
+
+Relays add a uniformly random delay in `[0, delivery_jitter_ms)` (default: 50ms) before forwarding each stored blob to its subscribers. This breaks the timing correlation between PUBLISH arrival and subscriber delivery, making it harder for a compromised relay to infer communication patterns between specific pseudonyms.
+
+1. **Per-subscriber jitter.** The delay is applied independently for each subscriber of a `routing_id`, so even subscribers on the same routing ID receive blobs at slightly different times. This prevents a relay from using delivery ordering as a correlation signal.
+2. **Configurable.** Relay operators can tune the jitter range via `RelayConfig::delivery_jitter_ms`. Higher values provide stronger timing decorrelation at the cost of delivery latency. Set to 0 to disable (useful for low-latency deployments that accept the residual risk).
+3. **Complements cover traffic.** Delivery jitter addresses the relay-to-subscriber path. Cover traffic (§9.10.6) addresses the client-to-relay path. Together they reduce timing correlation on both legs of the relay.
+
+### 9.10.12 Residual Risks
 
 Even with all protections in this section, the following metadata leaks remain:
 
