@@ -495,13 +495,20 @@ mod tests {
         format!("did:key:{hex}")
     }
 
+    /// Must match the production `compute_event_canonical_hash` in `tree.rs`.
     fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
         let mut hasher = Sha256::new();
+        hasher.update(b"SCP-EVENT-V1:");
+        #[allow(clippy::cast_possible_truncation)]
+        let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+            hasher.update((bytes.len() as u32).to_be_bytes());
+            hasher.update(bytes);
+        };
         hasher.update(event_type_tag(&event.event_type).to_be_bytes());
-        hasher.update(event.actor_did.as_bytes());
+        length_prefix(&mut hasher, event.actor_did.as_bytes());
         hasher.update(event.timestamp.to_be_bytes());
         hasher.update(event.sequence.to_be_bytes());
-        hasher.update(&event.payload.data);
+        length_prefix(&mut hasher, &event.payload.data);
         hasher.update(event.prev_hash);
         hasher.finalize().to_vec()
     }

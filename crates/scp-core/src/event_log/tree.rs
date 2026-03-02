@@ -212,19 +212,33 @@ fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
 /// Computes the canonical hash of an event for signature purposes.
 ///
 /// ```text
-/// SHA-256(event_type_tag || actor_did || timestamp_BE || sequence_BE
-///         || payload || prev_hash)
+/// SHA-256("SCP-EVENT-V1:" || event_type_tag || len(actor_did) || actor_did
+///         || timestamp_BE || sequence_BE || len(payload) || payload
+///         || prev_hash)
 /// ```
+///
+/// Variable-length fields (`actor_did`, `payload.data`) are prefixed with
+/// their length as a 4-byte big-endian u32 to prevent field-boundary
+/// ambiguity. The `SCP-EVENT-V1:` domain separator prevents cross-protocol
+/// hash confusion.
 fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
     let mut hasher = Sha256::new();
+    hasher.update(b"SCP-EVENT-V1:");
 
-    // Event type as a tag byte.
+    // Length-prefix closure for variable-length fields.
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+
+    // Event type as a tag byte (fixed-width u16).
     hasher.update(event_type_tag(&event.event_type).to_be_bytes());
-    hasher.update(event.actor_did.as_bytes());
+    length_prefix(&mut hasher, event.actor_did.as_bytes());
     hasher.update(event.timestamp.to_be_bytes());
     hasher.update(event.sequence.to_be_bytes());
-    hasher.update(&event.payload.data);
-    hasher.update(event.prev_hash);
+    length_prefix(&mut hasher, &event.payload.data);
+    hasher.update(event.prev_hash); // 32B fixed
 
     hasher.finalize().to_vec()
 }
@@ -865,5 +879,46 @@ mod tests {
             current = next;
         }
         current[0]
+    }
+
+    // -----------------------------------------------------------------------
+    // length prefix prevents field boundary ambiguity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn length_prefix_prevents_field_boundary_ambiguity() {
+        // Two events that differ only by shifting bytes between actor_did
+        // and payload. Without length prefixes these would hash identically.
+        let event_a = Event {
+            event_type: EventType::MessageSent,
+            actor_did: "did:key:AB".into(),
+            timestamp: 1000,
+            sequence: 0,
+            payload: EventPayload {
+                data: b"CD".to_vec(),
+            },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        };
+
+        let event_b = Event {
+            event_type: EventType::MessageSent,
+            actor_did: "did:key:ABC".into(),
+            timestamp: 1000,
+            sequence: 0,
+            payload: EventPayload {
+                data: b"D".to_vec(),
+            },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        };
+
+        let hash_a = compute_event_canonical_hash(&event_a);
+        let hash_b = compute_event_canonical_hash(&event_b);
+
+        assert_ne!(
+            hash_a, hash_b,
+            "shifting bytes between actor_did and payload must produce different hashes"
+        );
     }
 }

@@ -740,17 +740,35 @@ fn aes128gcm_decrypt(key: &[u8; 16], sealed: &[u8]) -> Result<Vec<u8>, SenderKey
 // Hash helpers
 // ---------------------------------------------------------------------------
 
-/// Computes `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE)`.
+/// Computes `SHA-256("SCP-EPOCH-ADVANCE-V1:" || len(context_id) || context_id
+///   || len(sender_did) || sender_did || "key_epoch" || epoch_BE)`.
+///
+/// Variable-length fields are prefixed with their length as a 4-byte
+/// big-endian u32 to prevent field-boundary ambiguity. The domain separator
+/// prevents cross-protocol hash confusion.
 fn compute_epoch_advance_hash(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hasher.update(context_id.as_bytes());
-    hasher.update(sender_did.as_bytes());
+    hasher.update(b"SCP-EPOCH-ADVANCE-V1:");
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+    length_prefix(&mut hasher, context_id.as_bytes());
+    length_prefix(&mut hasher, sender_did.as_bytes());
     hasher.update(b"key_epoch");
     hasher.update(epoch.to_be_bytes());
     hasher.finalize().to_vec()
 }
 
-/// Computes `SHA-256(requester_did || sender_did || epoch_BE || wrapping_pubkey)`.
+/// Computes `SHA-256("SCP-KEY-REQUEST-V1:" || len(requester_did) || requester_did
+///   || len(sender_did) || sender_did || epoch_BE || len(wrapping_pubkey)
+///   || wrapping_pubkey || nonce || timestamp_BE)`.
+///
+/// Variable-length fields are prefixed with their length as a 4-byte
+/// big-endian u32 to prevent field-boundary ambiguity. The domain separator
+/// prevents cross-protocol hash confusion. `nonce` is fixed-size
+/// (`REQUEST_NONCE_SIZE`) and needs no prefix.
 fn compute_request_hash(
     requester_did: &str,
     sender_did: &str,
@@ -760,16 +778,28 @@ fn compute_request_hash(
     timestamp: u64,
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hasher.update(requester_did.as_bytes());
-    hasher.update(sender_did.as_bytes());
+    hasher.update(b"SCP-KEY-REQUEST-V1:");
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+    length_prefix(&mut hasher, requester_did.as_bytes());
+    length_prefix(&mut hasher, sender_did.as_bytes());
     hasher.update(epoch.to_be_bytes());
-    hasher.update(wrapping_pubkey);
+    length_prefix(&mut hasher, wrapping_pubkey);
     hasher.update(nonce);
     hasher.update(timestamp.to_be_bytes());
     hasher.finalize().to_vec()
 }
 
-/// Computes `SHA-256(context_id || "block" || blocker_did || blocked_did || timestamp_BE)`.
+/// Computes `SHA-256("SCP-BLOCK-NOTIFICATION-V1:" || len(context_id) || context_id
+///   || len(blocker_did) || blocker_did || len(blocked_did) || blocked_did
+///   || timestamp_BE)`.
+///
+/// Variable-length fields are prefixed with their length as a 4-byte
+/// big-endian u32 to prevent field-boundary ambiguity. The domain separator
+/// prevents cross-protocol hash confusion.
 #[allow(clippy::similar_names)] // blocker_did/blocked_did are domain terms
 fn compute_block_notification_hash(
     context_id: &str,
@@ -778,10 +808,15 @@ fn compute_block_notification_hash(
     timestamp: u64,
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hasher.update(context_id.as_bytes());
-    hasher.update(b"block");
-    hasher.update(blocker_did.as_bytes());
-    hasher.update(blocked_did.as_bytes());
+    hasher.update(b"SCP-BLOCK-NOTIFICATION-V1:");
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+    length_prefix(&mut hasher, context_id.as_bytes());
+    length_prefix(&mut hasher, blocker_did.as_bytes());
+    length_prefix(&mut hasher, blocked_did.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.finalize().to_vec()
 }
@@ -1588,6 +1623,41 @@ mod tests {
         assert_eq!(
             response.request_nonce, original_nonce,
             "response must echo the request nonce"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // length prefix prevents field boundary ambiguity
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn epoch_advance_hash_boundary_shift_produces_different_hash() {
+        let hash_a = compute_epoch_advance_hash("ctx-AB", "did:key:CD", 1);
+        let hash_b = compute_epoch_advance_hash("ctx-ABC", "did:key:D", 1);
+        assert_ne!(
+            hash_a, hash_b,
+            "shifting bytes between context_id and sender_did must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn request_hash_boundary_shift_produces_different_hash() {
+        let nonce = [0u8; REQUEST_NONCE_SIZE];
+        let hash_a = compute_request_hash("did:key:AB", "did:key:CD", 1, &[0xAA], &nonce, 100);
+        let hash_b = compute_request_hash("did:key:ABC", "did:key:D", 1, &[0xAA], &nonce, 100);
+        assert_ne!(
+            hash_a, hash_b,
+            "shifting bytes between requester_did and sender_did must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn block_notification_hash_boundary_shift_produces_different_hash() {
+        let hash_a = compute_block_notification_hash("ctx-1", "did:key:AB", "did:key:CD", 100);
+        let hash_b = compute_block_notification_hash("ctx-1", "did:key:ABC", "did:key:D", 100);
+        assert_ne!(
+            hash_a, hash_b,
+            "shifting bytes between blocker_did and blocked_did must produce different hashes"
         );
     }
 }

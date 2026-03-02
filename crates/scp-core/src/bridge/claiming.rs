@@ -240,12 +240,19 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
 /// Computes the canonical SHA-256 hash of a claim request's content
 /// (excluding the signature field).
 ///
-/// Fields hashed in order: `shadow_id`, `claimant_did`, `platform_handle`,
-/// `attestation_id`, `timestamp`. Variable-length fields are prefixed with
-/// their length as a 4-byte big-endian u32 to prevent field boundary
-/// ambiguity (e.g., `"abc" || "def"` vs `"abcd" || "ef"`).
+/// ```text
+/// SHA-256("SCP-CLAIM-V1:" || len(shadow_id) || shadow_id
+///         || len(claimant_did) || claimant_did
+///         || len(platform_handle) || platform_handle
+///         || len(attestation_id) || attestation_id || timestamp_BE)
+/// ```
+///
+/// Variable-length fields are prefixed with their length as a 4-byte
+/// big-endian u32 to prevent field boundary ambiguity. The domain separator
+/// prevents cross-protocol hash confusion.
 fn compute_claim_canonical_hash(request: &ClaimRequest) -> Vec<u8> {
     let mut hasher = Sha256::new();
+    hasher.update(b"SCP-CLAIM-V1:");
     // Length-prefix closure for variable-length fields. Field values (DIDs,
     // handles, IDs) are short strings; truncation is not a concern.
     #[allow(clippy::cast_possible_truncation)]
