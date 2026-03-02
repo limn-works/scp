@@ -228,6 +228,52 @@ pub fn verify_vote(
         .map_err(|e| GovernanceError::VerificationFailed(e.to_string()))
 }
 
+/// Verifies all vote signatures in a governance proposal.
+///
+/// Checks every vote in the proposal's `approvals` and `rejections` lists
+/// against the corresponding voter's public key. This function should be
+/// called after deserializing a proposal from untrusted input (persistence
+/// or network sync) to ensure that no vote signatures have been tampered
+/// with.
+///
+/// The `key_resolver` closure maps a voter's DID to their Ed25519 verifying
+/// key. If a voter's key cannot be resolved, that vote is treated as
+/// unverifiable and an error is returned.
+///
+/// # Errors
+///
+/// Returns [`GovernanceError::VerificationFailed`] if any vote signature is
+/// invalid, or if a voter's public key cannot be resolved.
+pub fn verify_proposal_votes<F>(
+    proposal: &GovernanceProposal,
+    key_resolver: F,
+) -> Result<(), GovernanceError>
+where
+    F: Fn(&DID) -> Option<ed25519_dalek::VerifyingKey>,
+{
+    for vote in &proposal.approvals {
+        let vk = key_resolver(&vote.voter_did).ok_or_else(|| {
+            GovernanceError::VerificationFailed(format!(
+                "cannot resolve public key for voter {}",
+                vote.voter_did
+            ))
+        })?;
+        verify_vote(&proposal.proposal_id, vote, &vk)?;
+    }
+
+    for vote in &proposal.rejections {
+        let vk = key_resolver(&vote.voter_did).ok_or_else(|| {
+            GovernanceError::VerificationFailed(format!(
+                "cannot resolve public key for voter {}",
+                vote.voter_did
+            ))
+        })?;
+        verify_vote(&proposal.proposal_id, vote, &vk)?;
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // GovernanceAction
 // ---------------------------------------------------------------------------
@@ -773,6 +819,9 @@ impl GovernanceEngine for SingleAdminEngine {
             context.now,
             signing_key,
         )?;
+
+        // Defense-in-depth: verify the admin's vote signature before accepting it.
+        verify_vote(&proposal_id, &admin_vote, &signing_key.verifying_key())?;
 
         // In single-admin mode, the proposal is immediately approved.
         let proposal = GovernanceProposal {
@@ -1942,5 +1991,124 @@ mod tests {
         assert_eq!(vote.signature.len(), 64);
         verify_vote(&proposal.proposal_id, vote, &vk)
             .expect("vote produced by propose should be verifiable");
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_proposal_votes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_proposal_votes_accepts_valid_proposal() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+
+        let action = GovernanceAction::CloseContext { reason: None };
+        let (proposal, _) = engine.propose(&admin, action, &ctx, &sk).expect("propose");
+
+        // All votes should verify successfully.
+        verify_proposal_votes(&proposal, |did| if *did == admin { Some(vk) } else { None })
+            .expect("valid proposal should pass vote verification");
+    }
+
+    #[test]
+    fn verify_proposal_votes_rejects_tampered_signature() {
+        let sk = test_signing_key();
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+
+        let action = GovernanceAction::CloseContext { reason: None };
+        let (mut proposal, _) = engine.propose(&admin, action, &ctx, &sk).expect("propose");
+
+        // Tamper with the vote signature.
+        proposal.approvals[0].signature[0] ^= 0xff;
+
+        let vk = sk.verifying_key();
+        let result =
+            verify_proposal_votes(&proposal, |did| if *did == admin { Some(vk) } else { None });
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VerificationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn verify_proposal_votes_rejects_unknown_voter_key() {
+        let sk = test_signing_key();
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+
+        let action = GovernanceAction::CloseContext { reason: None };
+        let (proposal, _) = engine.propose(&admin, action, &ctx, &sk).expect("propose");
+
+        // Key resolver returns None for all DIDs -- simulates unresolvable key.
+        let result = verify_proposal_votes(&proposal, |_did| None);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VerificationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn verify_proposal_votes_rejects_wrong_key() {
+        let sk = test_signing_key();
+        let wrong_vk = test_signing_key_2().verifying_key();
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+
+        let action = GovernanceAction::CloseContext { reason: None };
+        let (proposal, _) = engine.propose(&admin, action, &ctx, &sk).expect("propose");
+
+        // Resolve all voters to the wrong key.
+        let result = verify_proposal_votes(&proposal, |_did| Some(wrong_vk));
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VerificationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn verify_proposal_votes_rejects_tampered_vote_type_in_deserialized_proposal() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+
+        let action = GovernanceAction::CloseContext { reason: None };
+        let (proposal, _) = engine.propose(&admin, action, &ctx, &sk).expect("propose");
+
+        // Serialize and deserialize the proposal (simulates persistence/sync).
+        let json = serde_json::to_string(&proposal).expect("serialize");
+        let mut deserialized: GovernanceProposal =
+            serde_json::from_str(&json).expect("deserialize");
+
+        // Tamper with the vote type after deserialization.
+        deserialized.approvals[0].vote = VoteType::Reject;
+
+        let result =
+            verify_proposal_votes(
+                &deserialized,
+                |did| {
+                    if *did == admin { Some(vk) } else { None }
+                },
+            );
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VerificationFailed(_)
+        ));
     }
 }
