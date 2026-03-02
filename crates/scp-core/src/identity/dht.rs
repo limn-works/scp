@@ -38,6 +38,10 @@ use super::{DidMethod, IdentityError, ScpIdentity};
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
 
+/// Domain separator for migration proof hashes, preventing cross-protocol
+/// signature confusion. See issue #78.
+const DOMAIN_MIGRATION_V1: &[u8] = b"SCP-MIGRATION-V1:";
+
 /// Type alias for the signing function stored in `DidDht`.
 ///
 /// Takes a key handle ID and data to sign, returns the 64-byte Ed25519
@@ -637,7 +641,8 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         Ok((new_active_key, commitment, document))
     }
 
-    /// Builds a migration proof by signing `SHA-256(old_did || new_did || rotated_at)`
+    /// Builds a migration proof by signing
+    /// `SHA-256("SCP-MIGRATION-V1:" || old_did || new_did || rotated_at)`
     /// with the old Identity Key.
     async fn build_migration_proof(
         identity: &ScpIdentity,
@@ -646,6 +651,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         key_custody: &impl KeyCustody,
     ) -> Result<MigrationProof, IdentityError> {
         let mut hasher = Sha256::new();
+        hasher.update(DOMAIN_MIGRATION_V1);
         hasher.update(identity.did.as_bytes());
         hasher.update(new_did.as_bytes());
         hasher.update(rotated_at.to_be_bytes());
@@ -952,7 +958,7 @@ pub fn verify_did(did_string: &str, public_key: &[u8]) -> bool {
 /// # Verification Steps
 ///
 /// 1. **Migration proof (MODERATE assurance):** Verifies that the old Identity
-///    Key signed `SHA-256(old_did || new_did || rotated_at)`.
+///    Key signed `SHA-256("SCP-MIGRATION-V1:" || old_did || new_did || rotated_at)`.
 /// 2. **Pre-rotation proof (STRONG assurance, optional):** If present, verifies
 ///    that `SHA-256(new_identity_key_public) == commitment` from the old DID
 ///    document's `PreRotationCommitment` service.
@@ -983,8 +989,9 @@ pub fn verify_migration(
     rotated_at: u64,
 ) -> Result<bool, IdentityError> {
     // Step 1: Verify the migration proof signature.
-    // Reconstruct the signed digest: SHA-256(old_did || new_did || rotated_at).
+    // Reconstruct the signed digest: SHA-256(DOMAIN_MIGRATION_V1 || old_did || new_did || rotated_at).
     let mut hasher = Sha256::new();
+    hasher.update(DOMAIN_MIGRATION_V1);
     hasher.update(old_did.as_bytes());
     hasher.update(new_did.as_bytes());
     hasher.update(rotated_at.to_be_bytes());
