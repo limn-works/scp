@@ -35,3 +35,122 @@ pub fn verify_ed25519_signature(
         .verify(message, &sig)
         .map_err(|e| format!("signature verification failed: {e}"))
 }
+
+// ---------------------------------------------------------------------------
+// Tests — mirrors scp-core::crypto::ed25519 tests to prevent silent divergence
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use ed25519_dalek::Signer;
+
+    use super::*;
+
+    fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
+        let mut rng = rand::thread_rng();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        (verifying_key, signing_key)
+    }
+
+    #[test]
+    fn valid_signature_verifies() {
+        let (vk, sk) = test_keypair();
+        let message = b"hello SCP";
+        let sig = sk.sign(message);
+
+        let result = verify_ed25519_signature(vk.as_bytes(), message, &sig.to_bytes());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn tampered_signature_rejected() {
+        let (vk, sk) = test_keypair();
+        let message = b"hello SCP";
+        let sig = sk.sign(message);
+        let mut sig_bytes = sig.to_bytes();
+        sig_bytes[0] ^= 0xff;
+
+        let result = verify_ed25519_signature(vk.as_bytes(), message, &sig_bytes);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("signature verification failed"),
+            "unexpected error message"
+        );
+    }
+
+    #[test]
+    fn wrong_key_rejected() {
+        let (_, sk) = test_keypair();
+        let (other_vk, _) = test_keypair();
+        let message = b"hello SCP";
+        let sig = sk.sign(message);
+
+        let result = verify_ed25519_signature(other_vk.as_bytes(), message, &sig.to_bytes());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wrong_message_rejected() {
+        let (vk, sk) = test_keypair();
+        let sig = sk.sign(b"original message");
+
+        let result =
+            verify_ed25519_signature(vk.as_bytes(), b"different message", &sig.to_bytes());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn short_public_key_rejected() {
+        let result = verify_ed25519_signature(&[0u8; 16], b"msg", &[0u8; 64]);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("public key must be 32 bytes"),
+            "unexpected error message"
+        );
+    }
+
+    #[test]
+    fn short_signature_rejected() {
+        let (vk, _) = test_keypair();
+        let result = verify_ed25519_signature(vk.as_bytes(), b"msg", &[0u8; 32]);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("signature must be 64 bytes"),
+            "unexpected error message"
+        );
+    }
+
+    #[test]
+    fn empty_public_key_rejected() {
+        let result = verify_ed25519_signature(&[], b"msg", &[0u8; 64]);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("public key must be 32 bytes"),
+            "unexpected error message"
+        );
+    }
+
+    #[test]
+    fn empty_signature_rejected() {
+        let (vk, _) = test_keypair();
+        let result = verify_ed25519_signature(vk.as_bytes(), b"msg", &[]);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("signature must be 64 bytes"),
+            "unexpected error message"
+        );
+    }
+
+    #[test]
+    fn empty_message_works() {
+        let (vk, sk) = test_keypair();
+        let sig = sk.sign(b"");
+
+        let result = verify_ed25519_signature(vk.as_bytes(), b"", &sig.to_bytes());
+        assert!(result.is_ok());
+    }
+}
