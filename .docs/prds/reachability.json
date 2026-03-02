@@ -8,12 +8,12 @@
       "priority": "P1",
       "status": "pending",
       "stories": [
-        "SCP-228",
-        "SCP-229",
-        "SCP-240",
-        "SCP-241",
         "SCP-232",
-        "SCP-233"
+        "SCP-233",
+        "SCP-234",
+        "SCP-235",
+        "SCP-236",
+        "SCP-237"
       ]
     },
     {
@@ -22,16 +22,16 @@
       "priority": "P1",
       "status": "pending",
       "stories": [
-        "SCP-234",
-        "SCP-235",
-        "SCP-236",
-        "SCP-237"
+        "SCP-238",
+        "SCP-239",
+        "SCP-240",
+        "SCP-241"
       ]
     }
   ],
   "stories": [
     {
-      "id": "SCP-228",
+      "id": "SCP-232",
       "title": "Implement STUN NAT type probing in scp-transport",
       "gate": "gate-reachability-1",
       "priority": "P0",
@@ -42,7 +42,7 @@
         "crates/scp-transport/src/nat/stun.rs",
         "crates/scp-transport/src/nat/types.rs"
       ],
-      "description": "Implement STUN binding requests (RFC 8489) in scp-transport to determine NAT type and external address on startup. NAT type classification (full-cone, address-restricted, port-restricted, symmetric) drives reachability tier selection (§10.12.1). STUN probing is performed against known SCP relays that serve as STUN endpoints. The result determines whether hole punching (Tier 2) is viable or bridge fallback (Tier 3) is required. 25-second keepalive maintains NAT mapping for non-symmetric NATs.",
+      "description": "Implement STUN binding requests (RFC 8489) in scp-transport to determine NAT type and external address on startup. NAT type classification (full-cone, address-restricted, port-restricted, symmetric) drives reachability tier selection (\u00a710.12.1). STUN probing is performed against known SCP relays that serve as STUN endpoints. The result determines whether hole punching (Tier 2) is viable or bridge fallback (Tier 3) is required. 25-second keepalive maintains NAT mapping for non-symmetric NATs.",
       "acceptanceCriteria": [
         "STUN binding request sent to at least one STUN-capable relay on startup",
         "NAT type classified as one of: full-cone, address-restricted, port-restricted, symmetric",
@@ -62,8 +62,14 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.3 Tier 2: STUN Hole Punching" },
-        { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.1 Reachability Tiers" }
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.3 Tier 2: STUN Hole Punching"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.1 Reachability Tiers"
+        }
       ],
       "details": {
         "phase": 2,
@@ -71,7 +77,7 @@
       }
     },
     {
-      "id": "SCP-229",
+      "id": "SCP-233",
       "title": "Implement UPnP/NAT-PMP port mapping in scp-transport",
       "gate": "gate-reachability-1",
       "priority": "P0",
@@ -81,7 +87,7 @@
         "crates/scp-transport/src/nat/upnp.rs",
         "crates/scp-transport/src/nat/mod.rs"
       ],
-      "description": "Implement UPnP-IGD and NAT-PMP/PCP port mapping as Tier 1 reachability (§10.12.2). On relay startup, the SDK attempts to map the relay's listening port through the router. If successful, the router's external IP and assigned port become the relay's advertised address. Lease renewal at 50% TTL. Mapping loss triggers re-probe and potential tier change. Uses the igd-next crate for UPnP-IGD and natpmp crate for NAT-PMP/PCP.",
+      "description": "Implement UPnP-IGD and NAT-PMP/PCP port mapping as Tier 1 reachability (\u00a710.12.2). On relay startup, the SDK attempts to map the relay's listening port through the router. If successful, the router's external IP and assigned port become the relay's advertised address. Lease renewal at 50% TTL. Mapping loss triggers re-probe and potential tier change. Uses the igd-next crate for UPnP-IGD and natpmp crate for NAT-PMP/PCP.",
       "acceptanceCriteria": [
         "UPnP-IGD port mapping attempted on relay startup",
         "NAT-PMP/PCP port mapping attempted if UPnP-IGD fails or is unavailable",
@@ -103,7 +109,10 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.2 Tier 1: UPnP/NAT-PMP Port Mapping" }
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.2 Tier 1: UPnP/NAT-PMP Port Mapping"
+        }
       ],
       "details": {
         "phase": 2,
@@ -111,7 +120,7 @@
       }
     },
     {
-      "id": "SCP-240",
+      "id": "SCP-234",
       "title": "Support ws:// transport for DHT-discovered relays",
       "gate": "gate-reachability-1",
       "priority": "P0",
@@ -121,7 +130,7 @@
         "crates/scp-transport/src/relay/connection.rs",
         "crates/scp-transport/src/relay/mod.rs"
       ],
-      "description": "Extend the relay WebSocket transport to accept ws:// (plaintext) connections for relay URLs obtained from DHT-resolved DID documents (§10.12.6). The SDK MUST reject ws:// relay URLs obtained from .well-known/scp or any non-DHT source. MLS provides the confidentiality boundary; TLS on a dumb pipe is defense-in-depth, not the security layer. This enables self-hosted relays behind NAT with no domain to be reachable without requiring TLS certificates.",
+      "description": "Extend the relay WebSocket transport to accept ws:// (plaintext) connections for relay URLs obtained from DHT-resolved DID documents (\u00a710.12.6). The SDK MUST reject ws:// relay URLs obtained from .well-known/scp or any non-DHT source. MLS provides the confidentiality boundary; TLS on a dumb pipe is defense-in-depth, not the security layer. This enables self-hosted relays behind NAT with no domain to be reachable without requiring TLS certificates.",
       "acceptanceCriteria": [
         "WebSocket transport connects to ws:// URLs when source is DHT-resolved DID document",
         "SDK rejects ws:// URLs when source is .well-known/scp (returns error, does not connect)",
@@ -140,8 +149,14 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.6 Transport Security for Self-Hosted Relays" },
-        { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.7 DID Document Relay URL Encoding" }
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.6 Transport Security for Self-Hosted Relays"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.7 DID Document Relay URL Encoding"
+        }
       ],
       "details": {
         "phase": 2,
@@ -149,7 +164,7 @@
       }
     },
     {
-      "id": "SCP-241",
+      "id": "SCP-235",
       "title": "Implement .no_domain() ApplicationNode builder mode",
       "gate": "gate-reachability-1",
       "priority": "P0",
@@ -159,7 +174,7 @@
         "crates/scp-node/src/builder.rs",
         "crates/scp-node/src/node.rs"
       ],
-      "description": "Add .no_domain() to ApplicationNodeBuilder (§10.12.8). When set: skip ACME TLS provisioning, probe NAT type via STUN, attempt UPnP (Tier 1), fallback to STUN address (Tier 2), register with bridge (Tier 3), publish DID document with ws:// relay URL, do NOT serve .well-known/scp. Also adds .stun_server() and .bridge_relay() builder methods for override configuration. This is the zero-config deployment path for self-hosted relays behind residential NAT.",
+      "description": "Add .no_domain() to ApplicationNodeBuilder (\u00a710.12.8). When set: skip ACME TLS provisioning, probe NAT type via STUN, attempt UPnP (Tier 1), fallback to STUN address (Tier 2), register with bridge (Tier 3), publish DID document with ws:// relay URL, do NOT serve .well-known/scp. Also adds .stun_server() and .bridge_relay() builder methods for override configuration. This is the zero-config deployment path for self-hosted relays behind residential NAT.",
       "acceptanceCriteria": [
         ".no_domain() method exists on ApplicationNodeBuilder and sets zero-config NAT-traversed mode",
         ".stun_server(url) method exists and overrides the default STUN endpoint",
@@ -183,12 +198,15 @@
         "Add tests for both modes and fallthrough"
       ],
       "blockedBy": [
-        "SCP-228",
-        "SCP-229",
-        "SCP-240"
+        "SCP-232",
+        "SCP-233",
+        "SCP-234"
       ],
       "sources": [
-        { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.8 ApplicationNode Integration" }
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.8 ApplicationNode Integration"
+        }
       ],
       "details": {
         "phase": 2,
@@ -196,7 +214,7 @@
       }
     },
     {
-      "id": "SCP-232",
+      "id": "SCP-236",
       "title": "Implement BRIDGE relay operation for symmetric NAT fallback",
       "gate": "gate-reachability-1",
       "priority": "P1",
@@ -207,7 +225,7 @@
         "crates/scp-transport/src/relay/operations.rs",
         "crates/scp-transport/src/relay/mod.rs"
       ],
-      "description": "Implement the BRIDGE operation (§10.12.4) as Tier 3 fallback for symmetric NAT (~15% of home routers). A willing SCP relay acts as a transparent bridge, proxying blobs bidirectionally to the target self-hosted relay. The bridge does NOT inspect, modify, or cache proxied blobs. Bridge relays see the same metadata as any relay (§9.9.1). Any SCP relay MAY offer bridge service via supports_bridge configuration. Phase 3 component.",
+      "description": "Implement the BRIDGE operation (\u00a710.12.4) as Tier 3 fallback for symmetric NAT (~15% of home routers). A willing SCP relay acts as a transparent bridge, proxying blobs bidirectionally to the target self-hosted relay. The bridge does NOT inspect, modify, or cache proxied blobs. Bridge relays see the same metadata as any relay (\u00a79.9.1). Any SCP relay MAY offer bridge service via supports_bridge configuration. Phase 3 component.",
       "acceptanceCriteria": [
         "BRIDGE operation defined with target_routing_id and target_relay_hint fields",
         "Bridge relay opens connection to target self-hosted relay and proxies blobs bidirectionally",
@@ -227,10 +245,13 @@
         "Add unit and integration tests"
       ],
       "blockedBy": [
-        "SCP-228"
+        "SCP-232"
       ],
       "sources": [
-        { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.4 Tier 3: Relay Bridging" }
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        }
       ],
       "details": {
         "phase": 3,
@@ -238,7 +259,7 @@
       }
     },
     {
-      "id": "SCP-233",
+      "id": "SCP-237",
       "title": "Implement STUN service on SCP relays",
       "gate": "gate-reachability-1",
       "priority": "P1",
@@ -248,7 +269,7 @@
         "crates/scp-transport/src/relay/stun_service.rs",
         "crates/scp-transport/src/relay/mod.rs"
       ],
-      "description": "Any SCP relay MAY serve as a STUN endpoint (§10.12.3). STUN service is lightweight, stateless, and uses a single UDP socket. Bootstrap relays (§18.5) MUST include at least one STUN-capable relay. Self-hosted relays MAY also offer STUN, creating a self-reinforcing network where more relays means more STUN servers available for NAT probing. Phase 3 component.",
+      "description": "Any SCP relay MAY serve as a STUN endpoint (\u00a710.12.3). STUN service is lightweight, stateless, and uses a single UDP socket. Bootstrap relays (\u00a718.5) MUST include at least one STUN-capable relay. Self-hosted relays MAY also offer STUN, creating a self-reinforcing network where more relays means more STUN servers available for NAT probing. Phase 3 component.",
       "acceptanceCriteria": [
         "Relay exposes optional STUN service on a configurable UDP port",
         "STUN service handles RFC 8489 Binding requests and returns XOR-MAPPED-ADDRESS",
@@ -266,7 +287,10 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/specs/10-infrastructure-and-self-hosting.md", "section": "### 10.12.3 Tier 2: STUN Hole Punching" }
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.3 Tier 2: STUN Hole Punching"
+        }
       ],
       "details": {
         "phase": 3,
@@ -274,7 +298,7 @@
       }
     },
     {
-      "id": "SCP-234",
+      "id": "SCP-238",
       "title": "Implement did_routing_id derivation function",
       "gate": "gate-reachability-2",
       "priority": "P0",
@@ -284,7 +308,7 @@
         "crates/scp-core/src/identity/resolution.rs",
         "crates/scp-core/src/identity/mod.rs"
       ],
-      "description": "Implement the did_routing_id derivation (§3.10.2): SHA-256(\"scp:did:\" || did_string). The \"scp:did:\" domain separator prevents collision with context routing IDs (HMAC-SHA256(identity_key, context_id) per §5.7.1) and broadcast routing IDs (SHA-256(context_id) per §5.14). This is a pure function with no dependencies — the building block for relay-based DID resolution.",
+      "description": "Implement the did_routing_id derivation (\u00a73.10.2): SHA-256(\"scp:did:\" || did_string). The \"scp:did:\" domain separator prevents collision with context routing IDs (HMAC-SHA256(identity_key, context_id) per \u00a75.7.1) and broadcast routing IDs (SHA-256(context_id) per \u00a75.14). This is a pure function with no dependencies \u2014 the building block for relay-based DID resolution.",
       "acceptanceCriteria": [
         "did_routing_id(did_string) returns SHA-256(\"scp:did:\" || did_string) as 32 bytes",
         "Domain separator is exactly \"scp:did:\" (prevents collision with context and broadcast routing IDs)",
@@ -301,7 +325,10 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/specs/03-identity.md", "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution" }
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+        }
       ],
       "details": {
         "phase": "1-patch",
@@ -309,7 +336,7 @@
       }
     },
     {
-      "id": "SCP-235",
+      "id": "SCP-239",
       "title": "Implement DID document PUBLISH to SCP relays via RepublishManager",
       "gate": "gate-reachability-2",
       "priority": "P0",
@@ -319,7 +346,7 @@
         "crates/scp-core/src/identity/resolution.rs",
         "crates/scp-core/src/identity/republish.rs"
       ],
-      "description": "Extend RepublishManager to publish DID documents to SCP relays using existing PUBLISH operation (§3.10.5). DID documents are published as standard blobs with routing_id = did_routing_id(did_string) and blob_ttl = 604800 (7 days). Identity owners SHOULD publish to their own relays plus bootstrap relays. RepublishManager schedules relay republishing on a 6-day cycle (1-day margin before TTL expiry). Publishing to both SCP relays and Mainline DHT is a MUST per the anti-segmentation invariant (§3.10.6).",
+      "description": "Extend RepublishManager to publish DID documents to SCP relays using existing PUBLISH operation (\u00a73.10.5). DID documents are published as standard blobs with routing_id = did_routing_id(did_string) and blob_ttl = 604800 (7 days). Identity owners SHOULD publish to their own relays plus bootstrap relays. RepublishManager schedules relay republishing on a 6-day cycle (1-day margin before TTL expiry). Publishing to both SCP relays and Mainline DHT is a MUST per the anti-segmentation invariant (\u00a73.10.6).",
       "acceptanceCriteria": [
         "DID document PUBLISH uses routing_id = did_routing_id(did_string)",
         "DID document PUBLISH uses blob_ttl = 604800 (7 days)",
@@ -339,11 +366,17 @@
         "Add tests for publish operation parameters and republish timing"
       ],
       "blockedBy": [
-        "SCP-234"
+        "SCP-238"
       ],
       "sources": [
-        { "file": ".docs/specs/03-identity.md", "section": "### 3.10.5 Publishing Protocol" },
-        { "file": ".docs/specs/03-identity.md", "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution" }
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.5 Publishing Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+        }
       ],
       "details": {
         "phase": 2,
@@ -351,7 +384,7 @@
       }
     },
     {
-      "id": "SCP-236",
+      "id": "SCP-240",
       "title": "Implement DID document QUERY from SCP relays",
       "gate": "gate-reachability-2",
       "priority": "P0",
@@ -360,7 +393,7 @@
       "files": [
         "crates/scp-core/src/identity/resolution.rs"
       ],
-      "description": "Implement relay-based DID document resolution using existing QUERY operation (§3.10.4). Resolver computes did_routing_id, queries known SCP relays (identity's relays if known, else bootstrap relays), verifies BEP44 signature against the public key encoded in the DID string, and checks seq >= last_known_seq. This is the relay layer of the dual-layer resolution protocol. Cache results per §9.10.7 (24h active, 7d inactive).",
+      "description": "Implement relay-based DID document resolution using existing QUERY operation (\u00a73.10.4). Resolver computes did_routing_id, queries known SCP relays (identity's relays if known, else bootstrap relays), verifies BEP44 signature against the public key encoded in the DID string, and checks seq >= last_known_seq. This is the relay layer of the dual-layer resolution protocol. Cache results per \u00a79.10.7 (24h active, 7d inactive).",
       "acceptanceCriteria": [
         "QUERY operation sent with routing_id = did_routing_id(did_string) and limit = 1",
         "Response blob parsed as BEP44-signed DID document",
@@ -381,11 +414,17 @@
         "Add tests for valid, invalid-sig, and stale-seq cases"
       ],
       "blockedBy": [
-        "SCP-234"
+        "SCP-238"
       ],
       "sources": [
-        { "file": ".docs/specs/03-identity.md", "section": "### 3.10.4 Resolution Protocol" },
-        { "file": ".docs/specs/03-identity.md", "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution" }
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+        }
       ],
       "details": {
         "phase": 2,
@@ -393,7 +432,7 @@
       }
     },
     {
-      "id": "SCP-237",
+      "id": "SCP-241",
       "title": "Implement DidResolver trait with parallel dual-layer resolution",
       "gate": "gate-reachability-2",
       "priority": "P0",
@@ -403,7 +442,7 @@
         "crates/scp-core/src/identity/resolver.rs",
         "crates/scp-core/src/identity/mod.rs"
       ],
-      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel; first valid response wins. Valid means BEP44 signature verifies AND sequence number >= last known. When both return valid documents, highest sequence number wins. Slower query is cancelled once first valid response arrives. ResolutionSource enum tracks whether the result came from an SCP relay, Mainline DHT, or cache.",
+      "description": "Implement the DidResolver trait (\u00a73.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel; first valid response wins. Valid means BEP44 signature verifies AND sequence number >= last known. When both return valid documents, highest sequence number wins. Slower query is cancelled once first valid response arrives. ResolutionSource enum tracks whether the result came from an SCP relay, Mainline DHT, or cache.",
       "acceptanceCriteria": [
         "DidResolver trait defined with resolve(&self, did: &str) -> Result<Option<ResolvedDidDocument>>",
         "ResolvedDidDocument contains document, seq, and source fields",
@@ -428,11 +467,17 @@
         "Add tests for all resolution scenarios"
       ],
       "blockedBy": [
-        "SCP-236"
+        "SCP-240"
       ],
       "sources": [
-        { "file": ".docs/specs/03-identity.md", "section": "### 3.10.10 DidResolver Trait" },
-        { "file": ".docs/specs/03-identity.md", "section": "### 3.10.4 Resolution Protocol" }
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 DidResolver Trait"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        }
       ],
       "details": {
         "phase": 2,
