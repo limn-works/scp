@@ -6,6 +6,12 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+# Enables non-standard did:key:{hex} DID format acceptance. Only for
+# integration tests that run outside `#[cfg(test)]`. Production builds
+# must never enable this feature. See issue #128.
+testing = []
+
 [dependencies]
 openmls = { workspace = true }
 openmls_traits = { workspace = true }
@@ -41,6 +47,22 @@ scp-platform = { path = "../scp-platform", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 scp-media = { path = "../scp-media" }
+
+[[test]]
+name = "economy_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "phase2_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "phase5_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "wasm_conformance"
+required-features = ["testing"]
 
 [lints]
 workspace = true
