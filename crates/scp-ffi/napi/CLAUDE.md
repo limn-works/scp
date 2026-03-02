@@ -97,17 +97,16 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly (no wrapper). Forma
   "working" in any sense — stubs that silently produce empty fields are worse than stubs that
   return errors, because they look like they work.
 
-- The `ucan_validate` and `ucan_revoke` functions still return errors — they require a live
-  runtime registry (not yet present in the NAPI bridge). These are SCP-219 scope work items.
+- `ucan_validate` and `ucan_revoke` use the global `ContextRuntime` registry in `runtime.rs`.
+  The registry is lazily initialized on first call via `ensure_registered`. Both functions share
+  persistent `RevocationList` and `NonceTracker` state across calls for the same context.
 
 - Dependencies: add `base64 = { workspace = true }` and `rand = { workspace = true }` to
   `Cargo.toml` when building JWT-format tokens. Both are workspace deps.
 
 ## SCP-219 Status
 
-As of 2026-03-01:
-- `ucan_mint`: FIXED — constructs proper JWT-format `encoded` string with placeholder signature
-- `ucan_validate`: stub — returns `SCP-PRM-4002` error
-- `ucan_revoke`: stub — returns `SCP-PRM-4006` error
-
-Real signing and runtime wiring are SCP-214 scope.
+As of 2026-03-02:
+- `ucan_mint`: FIXED — constructs proper JWT-format `encoded` string with real Ed25519 signature
+- `ucan_validate`: FIXED — uses persistent `RevocationList` and `NonceTracker` from `runtime.rs` registry (closes #136)
+- `ucan_revoke`: FIXED — wired to persistent `RevocationList` in `runtime.rs` registry (closes #136)

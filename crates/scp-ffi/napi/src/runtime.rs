@@ -138,3 +138,30 @@ where
 pub fn remove_context(context_id: &str) {
     registry().remove(context_id);
 }
+
+/// Registers a test context directly in the runtime registry.
+///
+/// Creates a `ContextRuntime` with the default ceiling, the given creator DID,
+/// and empty event log, revocation list, and nonce tracker. This is for unit
+/// tests that need to exercise runtime state without constructing a full
+/// `NapiContextHandle`.
+#[cfg(test)]
+pub fn register_test_context(context_id: &str, creator_did: &str) {
+    let map = registry();
+
+    let ceiling_strings = default_ceiling()
+        .capabilities
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<HashSet<String>>();
+
+    let runtime = ContextRuntime {
+        event_log: EventLog::new(context_id.to_owned()),
+        revocation_list: RevocationList::new(context_id.to_owned()),
+        nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
+        ceiling_strings,
+        creator_did: creator_did.to_owned(),
+    };
+
+    map.entry(context_id.to_owned()).or_insert(runtime);
+}

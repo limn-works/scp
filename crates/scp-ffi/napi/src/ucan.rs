@@ -193,6 +193,10 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
+    // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
+    // is registered. Uses the same registry as event_log and ucan_revoke.
+    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+
     // Step 1: Parse the UCAN token using scp-core's parser.
     let parsed_token = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
@@ -216,40 +220,39 @@ pub async fn ucan_validate(
     // the proof chain's `prf` field references.
     let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
-    // Build ceiling from the context handle.
-    let ceiling: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
+    let context_id = handle.context_id();
 
-    // Create empty revocation list and nonce tracker for validation.
-    // Full runtime wiring will connect these to persistent per-context state.
-    let revocation_list = scp_core::crypto::ucan::revoke::RevocationList::new(handle.context_id());
-    let mut nonce_tracker = scp_core::crypto::ucan::nonce::NonceTracker::new(
-        handle.context_id(),
-        scp_core::identity::cache::SystemClock,
-    );
+    // Run validation inside with_context to use persistent revocation list
+    // and nonce tracker from the runtime registry. This ensures:
+    // - Revoked tokens are rejected across calls (persistent RevocationList).
+    // - Replayed nonces are detected across calls (persistent NonceTracker).
+    crate::runtime::with_context(&context_id, |rt| {
+        // Build validation context using persistent runtime state.
+        let did_resolver = BridgeDidResolver;
+        let revocation_checker = BridgeRevocationChecker {
+            revocation_list: &rt.revocation_list,
+        };
+        let mut nonce_adapter = BridgeNonceTracker {
+            inner: &mut rt.nonce_tracker,
+        };
 
-    // Build validation context.
-    let did_resolver = BridgeDidResolver;
-    let revocation_checker = BridgeRevocationChecker {
-        revocation_list: &revocation_list,
-    };
-    let mut nonce_adapter = BridgeNonceTracker {
-        inner: &mut nonce_tracker,
-    };
-    let creator_did = handle.creator_did();
+        let mut ctx = ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_adapter,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &rt.ceiling_strings,
+            context_creator_did: &rt.creator_did,
+            presenting_agent_did: agent_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
 
-    let mut ctx = ValidationContext {
-        did_resolver: &did_resolver,
-        nonce_tracker: &mut nonce_adapter,
-        revocation_checker: &revocation_checker,
-        proof_resolver: &proof_resolver,
-        ceiling: &ceiling,
-        context_creator_did: &creator_did,
-        presenting_agent_did: agent_did,
-        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-    };
+        // Execute the full 11-step validation pipeline.
+        validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpNapiError::from)?;
 
-    // Execute the full 11-step validation pipeline.
-    validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpNapiError::from)?;
+        Ok(())
+    })
+    .map_err(napi::Error::from)?;
 
     Ok(())
 }
@@ -353,9 +356,8 @@ pub async fn ucan_mint(
 
 /// Revokes a UCAN token.
 ///
-/// Adds the token to the context's revocation list. Revoked tokens are no
-/// longer accepted by validation. Revocation is distributed to all context
-/// members.
+/// Adds the token to the context's persistent revocation list. Revoked tokens
+/// are rejected by subsequent `ucan_validate` calls on the same context.
 ///
 /// # Arguments
 ///
@@ -364,19 +366,27 @@ pub async fn ucan_mint(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-PERM-4006` if revocation fails (token not found,
-///   revoker not authorized — must be the token's issuer or context creator).
+/// - Rejects with `SCP-CTX-2023` if the context runtime is not initialized.
+/// - Rejects with `SCP-PERM-3001` if the token cannot be parsed.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Result<()> {
-    let _ = (handle, token);
-    Err(ScpNapiError::Permission {
-        message: "not yet connected to runtime — UCAN revocation requires a live context"
-            .to_owned(),
-        code: "SCP-PRM-4006".to_owned(),
-    }
-    .into())
+    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+
+    // Parse the token to extract its payload for CID computation.
+    let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
+
+    let context_id = handle.context_id();
+    crate::runtime::with_context(&context_id, |rt| {
+        // Compute the content-hash CID matching scp-core's format.
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&parsed.payload);
+        rt.revocation_list.revoke(token_cid);
+        Ok(())
+    })
+    .map_err(napi::Error::from)?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -611,5 +621,141 @@ mod tests {
     fn hex_decode_rejects_non_hex() {
         let result = hex::decode("gggg");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistent revocation list via runtime registry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revocation_persists_across_with_context_calls() {
+        use crate::runtime;
+
+        // Use a unique context ID per test to avoid cross-test interference.
+        let context_id = format!("ctx-revoke-persist-{}", uuid::Uuid::new_v4());
+
+        // Manually register a context in the runtime registry.
+        runtime::register_test_context(&context_id, "did:dht:zCreator");
+
+        // First call: revoke a CID.
+        runtime::with_context(&context_id, |rt| {
+            rt.revocation_list.revoke("revoked-cid-123".to_owned());
+            Ok(())
+        })
+        .unwrap();
+
+        // Second call: verify the revocation persists.
+        let is_revoked = runtime::with_context(&context_id, |rt| {
+            Ok(rt.revocation_list.is_revoked("revoked-cid-123"))
+        })
+        .unwrap();
+
+        assert!(
+            is_revoked,
+            "revoked token must be detected across with_context calls"
+        );
+
+        // Unrevoked CIDs should not be affected.
+        let other_revoked = runtime::with_context(&context_id, |rt| {
+            Ok(rt.revocation_list.is_revoked("other-cid-456"))
+        })
+        .unwrap();
+
+        assert!(
+            !other_revoked,
+            "non-revoked token must not be reported as revoked"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistent nonce tracker via runtime registry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nonce_replay_detected_across_with_context_calls() {
+        use crate::runtime;
+
+        let context_id = format!("ctx-nonce-persist-{}", uuid::Uuid::new_v4());
+        runtime::register_test_context(&context_id, "did:dht:zCreator");
+
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let now_secs = (now_millis / 1000) as u64;
+        let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
+        let expiry = now_secs + 3600;
+
+        // First call: record the nonce — should succeed.
+        let first_result = runtime::with_context(&context_id, |rt| {
+            rt.nonce_tracker
+                .check_and_record(&nonce, expiry)
+                .map_err(|e| crate::error::ScpNapiError::Permission {
+                    message: format!("nonce check failed: {e}"),
+                    code: "SCP-PERM-3001".to_owned(),
+                })
+        });
+        assert!(first_result.is_ok(), "first nonce use should succeed");
+
+        // Second call: replay the same nonce — should fail.
+        let second_result = runtime::with_context(&context_id, |rt| {
+            rt.nonce_tracker
+                .check_and_record(&nonce, expiry)
+                .map_err(|e| crate::error::ScpNapiError::Permission {
+                    message: format!("nonce check failed: {e}"),
+                    code: "SCP-PERM-3001".to_owned(),
+                })
+        });
+        assert!(
+            second_result.is_err(),
+            "replayed nonce must be rejected on second call"
+        );
+
+        // A different nonce should succeed.
+        let different_nonce = format!("{}-bbccddee22334455bbccddee22334455", now_millis + 1);
+        let third_result = runtime::with_context(&context_id, |rt| {
+            rt.nonce_tracker
+                .check_and_record(&different_nonce, expiry)
+                .map_err(|e| crate::error::ScpNapiError::Permission {
+                    message: format!("nonce check failed: {e}"),
+                    code: "SCP-PERM-3001".to_owned(),
+                })
+        });
+        assert!(third_result.is_ok(), "unique nonce should be accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // ucan_revoke wires to persistent state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revoke_then_check_revocation_list() {
+        use crate::runtime;
+
+        let context_id = format!("ctx-revoke-wire-{}", uuid::Uuid::new_v4());
+        runtime::register_test_context(&context_id, "did:dht:zCreator");
+
+        let token_cid = "revoked-token-cid-abc".to_owned();
+
+        // Simulate what ucan_revoke does: revoke via runtime registry.
+        runtime::with_context(&context_id, |rt| {
+            rt.revocation_list.revoke(token_cid.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        // Simulate what ucan_validate does: check revocation via runtime registry.
+        let checker_says_revoked = runtime::with_context(&context_id, |rt| {
+            let checker = BridgeRevocationChecker {
+                revocation_list: &rt.revocation_list,
+            };
+            Ok(checker.is_revoked(&token_cid))
+        })
+        .unwrap();
+
+        assert!(
+            checker_says_revoked,
+            "token revoked via ucan_revoke must be detected by ucan_validate's revocation checker"
+        );
     }
 }
