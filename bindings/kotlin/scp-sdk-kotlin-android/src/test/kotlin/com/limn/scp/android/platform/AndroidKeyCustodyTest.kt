@@ -220,7 +220,8 @@ class AndroidKeyCustodyTest {
             // Bouncy Castle's Ed25519 SubjectPublicKeyInfo encoding must be exactly 44 bytes
             // (12-byte ASN.1 header + 32-byte raw key). This is the fixed encoding from RFC 8410 §3.
             val handle = custody.generateKeypair(KeyType.ED25519)
-            val keyPair = custody.softwareKeys[handle.id]!!
+            val keyPair = custody.softwareKeys[handle.id]
+                ?: error("softwareKeys missing key for ${handle.id}")
             val pubKeyParams = keyPair.public as Ed25519PublicKeyParameters
 
             // Build the X.509 SubjectPublicKeyInfo encoding the same way Android Keystore would
