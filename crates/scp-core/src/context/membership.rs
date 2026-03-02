@@ -203,6 +203,16 @@ pub enum ContextEvent {
         /// The DID of the participant who initiated the close, if any.
         initiator_did: DID,
     },
+    /// A subscriber was blocked by an author in a broadcast context (SCP-227).
+    ///
+    /// The author's broadcast key has been rotated; the blocked subscriber
+    /// will not receive key material for future epochs.
+    MemberBlocked {
+        /// The DID of the blocked subscriber.
+        blocked_did: DID,
+        /// The DID of the author who performed the block.
+        author_did: DID,
+    },
     /// The context expired due to TTL.
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.
