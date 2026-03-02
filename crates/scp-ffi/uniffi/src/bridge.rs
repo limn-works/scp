@@ -1239,8 +1239,20 @@ pub async fn context_close(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let mut state = handle.state.lock().await;
+            // Authorization: only the context creator can close the context.
+            let identity_did = identity.did.clone();
+            if identity_did != handle.creator_did {
+                return Err(ScpError::Permission {
+                    message: format!(
+                        "identity '{identity_did}' is not authorized to close this context \
+                         — only the context creator ('{}') can close it",
+                        handle.creator_did
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                });
+            }
 
+            let mut state = handle.state.lock().await;
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Context {
                     message: format!(
@@ -1250,8 +1262,6 @@ pub async fn context_close(
                     code: "SCP-CTX-2017".to_owned(),
                 });
             }
-
-            let _ = identity;
             *state = ContextState::Closed;
             drop(state);
 

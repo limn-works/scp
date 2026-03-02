@@ -400,6 +400,19 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
+    // Authorization: only the context creator can close the context.
+    if identity_did != handle.creator_did {
+        return Err(ScpNapiError::Permission {
+            message: format!(
+                "identity '{identity_did}' is not authorized to close this context \
+                 — only the context creator ('{}') can close it",
+                handle.creator_did
+            ),
+            code: "SCP-PERM-3000".to_owned(),
+        }
+        .into());
+    }
+
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
@@ -411,7 +424,6 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
         .into());
     }
     handle.set_closed().map_err(NapiError::from)?;
-    let _ = identity_did;
     Ok(())
 }
 
