@@ -688,12 +688,10 @@ impl ContextProvider for FfiBridgeProvider {
             })?;
 
             // Clone handler Arc and output schema so we can release the lock.
-            Ok(rt.tool_handlers.get(tool_name).map(|handler| {
-                (
-                    handler.clone(),
-                    registration.schema.output_schema.clone(),
-                )
-            }))
+            Ok(rt
+                .tool_handlers
+                .get(tool_name)
+                .map(|handler| (handler.clone(), registration.schema.output_schema.clone())))
         })
         .map_err(|e| format!("{e}"))?;
 
@@ -704,18 +702,15 @@ impl ContextProvider for FfiBridgeProvider {
             Some((handler, output_schema)) => {
                 // Call the handler with validated input. The handler is a sync
                 // closure wrapping a Python callable (acquired via GIL).
-                let output = handler(arguments).map_err(|e| {
-                    format!("tool handler for '{tool_name}' failed: {e}")
-                })?;
+                let output = handler(arguments)
+                    .map_err(|e| format!("tool handler for '{tool_name}' failed: {e}"))?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
                 scp_core::context::tools::schema::validate_value_against_schema(
                     &output,
                     &output_schema,
                 )
-                .map_err(|msg| {
-                    format!("output validation failed for tool '{tool_name}': {msg}")
-                })?;
+                .map_err(|msg| format!("output validation failed for tool '{tool_name}': {msg}"))?;
 
                 Ok(output)
             }
