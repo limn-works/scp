@@ -61,8 +61,183 @@ pub type ContextId = String;
 pub type Ed25519Signature = Vec<u8>;
 
 // ---------------------------------------------------------------------------
-// Constants (ADR-029)
+// SyncPolicy (ADR-029)
 // ---------------------------------------------------------------------------
+
+/// Configurable sync policy controlling offline recovery behavior.
+///
+/// Different contexts have different activity patterns — a high-frequency
+/// trading chat needs different sync tuning than a weekly project standup.
+/// `SyncPolicy` extracts the hardcoded constants from ADR-029 into a
+/// configurable struct, following the same pattern as
+/// [`CheckpointPolicy`](crate::event_log::checkpoint::CheckpointPolicy).
+///
+/// Use [`SyncPolicy::default()`] for the standard ADR-029 values. Use the
+/// `with_*` builder methods for per-context customization.
+///
+/// See ADR-029 in `.docs/adrs/phase-6.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncPolicy {
+    /// Tier 1 upper bound in seconds.
+    ///
+    /// Offline durations at or below this threshold are handled by relay
+    /// buffering and sequential MLS catch-up. Default: 14,400 (4 hours).
+    /// See ADR-029 section 1.
+    pub tier_1_threshold_secs: u64,
+
+    /// Tier 2 upper bound in seconds.
+    ///
+    /// Offline durations between `tier_1_threshold_secs` and this value use
+    /// state snapshot comparison and delta sync with selective epoch
+    /// reconstruction. Default: 604,800 (7 days). See ADR-029 section 1.
+    pub tier_2_threshold_secs: u64,
+
+    /// Gap timeout for the reorder buffer.
+    ///
+    /// If a gap in the message sequence is not filled within this duration,
+    /// the buffer delivers what it has and marks the gap. Default: 30 seconds.
+    /// See spec §9.8.5.
+    pub gap_timeout: Duration,
+
+    /// Maximum number of messages held in the reorder buffer.
+    ///
+    /// When the buffer reaches capacity, the oldest buffered messages are
+    /// delivered in order regardless of gaps. Default: 100.
+    /// See spec §9.8.5.
+    pub reorder_buffer_capacity: usize,
+
+    /// Maximum number of sequential MLS Commits processed during epoch
+    /// catch-up.
+    ///
+    /// Beyond this limit the SDK falls back to Welcome-based fast-forward.
+    /// Default: 100. See ADR-029 section 3.
+    pub max_sequential_commits: u64,
+
+    /// Per-Commit processing timeout during epoch catch-up.
+    ///
+    /// Commits that fail to process within this duration are logged as
+    /// `EpochCatchUpFailure` and the SDK falls through to the next recovery
+    /// source. Default: 5 seconds. See ADR-029 section 3.
+    pub commit_process_timeout: Duration,
+
+    /// Timeout for sender key re-acquisition after missed rotations.
+    ///
+    /// Messages encrypted with missed sender key epochs are buffered until
+    /// the key is obtained or this timeout expires. Default: 60 seconds.
+    /// See ADR-029 section 2, Phase 4.
+    pub sender_key_timeout: Duration,
+
+    /// Multi-device reconnection deduplication window.
+    ///
+    /// Devices observing another device's reconnection event within this
+    /// window defer their own MLS Update to avoid redundant epoch advances.
+    /// Default: 30 seconds. See ADR-029 section 7.
+    pub reconnection_dedup_window: Duration,
+}
+
+impl Default for SyncPolicy {
+    fn default() -> Self {
+        Self {
+            tier_1_threshold_secs: TIER_1_THRESHOLD_SECS,
+            tier_2_threshold_secs: TIER_2_THRESHOLD_SECS,
+            gap_timeout: GAP_TIMEOUT,
+            reorder_buffer_capacity: REORDER_BUFFER_CAPACITY,
+            max_sequential_commits: MAX_SEQUENTIAL_COMMITS,
+            commit_process_timeout: COMMIT_PROCESS_TIMEOUT,
+            sender_key_timeout: SENDER_KEY_TIMEOUT,
+            reconnection_dedup_window: RECONNECTION_DEDUP_WINDOW,
+        }
+    }
+}
+
+impl SyncPolicy {
+    /// Sets the Tier 1 threshold (short offline upper bound) in seconds.
+    #[must_use]
+    pub const fn with_tier_1_threshold_secs(mut self, secs: u64) -> Self {
+        self.tier_1_threshold_secs = secs;
+        self
+    }
+
+    /// Sets the Tier 2 threshold (extended offline upper bound) in seconds.
+    #[must_use]
+    pub const fn with_tier_2_threshold_secs(mut self, secs: u64) -> Self {
+        self.tier_2_threshold_secs = secs;
+        self
+    }
+
+    /// Sets the gap timeout for the reorder buffer.
+    #[must_use]
+    pub const fn with_gap_timeout(mut self, timeout: Duration) -> Self {
+        self.gap_timeout = timeout;
+        self
+    }
+
+    /// Sets the reorder buffer capacity.
+    #[must_use]
+    pub const fn with_reorder_buffer_capacity(mut self, capacity: usize) -> Self {
+        self.reorder_buffer_capacity = capacity;
+        self
+    }
+
+    /// Sets the maximum number of sequential MLS Commits for epoch catch-up.
+    #[must_use]
+    pub const fn with_max_sequential_commits(mut self, max: u64) -> Self {
+        self.max_sequential_commits = max;
+        self
+    }
+
+    /// Sets the per-Commit processing timeout.
+    #[must_use]
+    pub const fn with_commit_process_timeout(mut self, timeout: Duration) -> Self {
+        self.commit_process_timeout = timeout;
+        self
+    }
+
+    /// Sets the sender key re-acquisition timeout.
+    #[must_use]
+    pub const fn with_sender_key_timeout(mut self, timeout: Duration) -> Self {
+        self.sender_key_timeout = timeout;
+        self
+    }
+
+    /// Sets the multi-device reconnection deduplication window.
+    #[must_use]
+    pub const fn with_reconnection_dedup_window(mut self, window: Duration) -> Self {
+        self.reconnection_dedup_window = window;
+        self
+    }
+
+    /// Classifies the offline duration into the appropriate recovery tier
+    /// using this policy's thresholds.
+    ///
+    /// Uses `saturating_sub` to avoid underflow if timestamps are out of
+    /// order (SCP does not require synchronized clocks per §9.8.3).
+    ///
+    /// See ADR-029 section 1.
+    #[must_use]
+    pub const fn classify_offline_duration(
+        &self,
+        last_relay_contact: u64,
+        now: u64,
+    ) -> OfflineTier {
+        let duration_secs = now.saturating_sub(last_relay_contact);
+        if duration_secs <= self.tier_1_threshold_secs {
+            OfflineTier::Short
+        } else if duration_secs <= self.tier_2_threshold_secs {
+            OfflineTier::Extended
+        } else {
+            OfflineTier::Long
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy constants (ADR-029)
+// ---------------------------------------------------------------------------
+//
+// Retained as public constants so that `SyncPolicy::default()` values are
+// named and discoverable. These also serve as the canonical defaults
+// referenced throughout documentation and tests.
 
 /// Tier 1 upper bound: 4 hours in seconds.
 ///
@@ -143,20 +318,18 @@ impl std::fmt::Display for OfflineTier {
     }
 }
 
-/// Classifies the offline duration into the appropriate recovery tier.
+/// Classifies the offline duration into the appropriate recovery tier
+/// using the default [`SyncPolicy`].
 ///
 /// Uses `saturating_sub` to avoid underflow if timestamps are out of order
 /// (SCP does not require synchronized clocks per §9.8.3).
 ///
+/// For custom thresholds, use [`SyncPolicy::classify_offline_duration`].
+///
 /// See ADR-029 section 1.
 #[must_use]
-pub const fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTier {
-    let duration_secs = now.saturating_sub(last_relay_contact);
-    match duration_secs {
-        0..=14_400 => OfflineTier::Short,
-        14_401..=604_800 => OfflineTier::Extended,
-        _ => OfflineTier::Long,
-    }
+pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTier {
+    SyncPolicy::default().classify_offline_duration(last_relay_contact, now)
 }
 
 // ---------------------------------------------------------------------------
@@ -459,5 +632,90 @@ mod tests {
     #[test]
     fn max_sequential_commits_is_one_hundred() {
         assert_eq!(MAX_SEQUENTIAL_COMMITS, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // SyncPolicy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sync_policy_default_matches_constants() {
+        let policy = SyncPolicy::default();
+        assert_eq!(policy.tier_1_threshold_secs, TIER_1_THRESHOLD_SECS);
+        assert_eq!(policy.tier_2_threshold_secs, TIER_2_THRESHOLD_SECS);
+        assert_eq!(policy.gap_timeout, GAP_TIMEOUT);
+        assert_eq!(policy.reorder_buffer_capacity, REORDER_BUFFER_CAPACITY);
+        assert_eq!(policy.max_sequential_commits, MAX_SEQUENTIAL_COMMITS);
+        assert_eq!(policy.commit_process_timeout, COMMIT_PROCESS_TIMEOUT);
+        assert_eq!(policy.sender_key_timeout, SENDER_KEY_TIMEOUT);
+        assert_eq!(policy.reconnection_dedup_window, RECONNECTION_DEDUP_WINDOW);
+    }
+
+    #[test]
+    fn sync_policy_builder_methods() {
+        let policy = SyncPolicy::default()
+            .with_tier_1_threshold_secs(7_200)
+            .with_tier_2_threshold_secs(259_200)
+            .with_gap_timeout(Duration::from_secs(10))
+            .with_reorder_buffer_capacity(50)
+            .with_max_sequential_commits(200)
+            .with_commit_process_timeout(Duration::from_secs(10))
+            .with_sender_key_timeout(Duration::from_secs(120))
+            .with_reconnection_dedup_window(Duration::from_secs(15));
+
+        assert_eq!(policy.tier_1_threshold_secs, 7_200);
+        assert_eq!(policy.tier_2_threshold_secs, 259_200);
+        assert_eq!(policy.gap_timeout, Duration::from_secs(10));
+        assert_eq!(policy.reorder_buffer_capacity, 50);
+        assert_eq!(policy.max_sequential_commits, 200);
+        assert_eq!(policy.commit_process_timeout, Duration::from_secs(10));
+        assert_eq!(policy.sender_key_timeout, Duration::from_secs(120));
+        assert_eq!(policy.reconnection_dedup_window, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn sync_policy_classify_with_custom_thresholds() {
+        // Custom policy: Tier 1 = 2 hours, Tier 2 = 3 days.
+        let policy = SyncPolicy::default()
+            .with_tier_1_threshold_secs(7_200)
+            .with_tier_2_threshold_secs(259_200);
+
+        // 1 hour offline → Short (under custom 2h threshold).
+        assert_eq!(
+            policy.classify_offline_duration(1_000_000, 1_003_600),
+            OfflineTier::Short,
+        );
+        // 3 hours offline → Extended (over custom 2h, under custom 3d).
+        assert_eq!(
+            policy.classify_offline_duration(1_000_000, 1_010_800),
+            OfflineTier::Extended,
+        );
+        // 5 days offline → Long (over custom 3d threshold).
+        assert_eq!(
+            policy.classify_offline_duration(1_000_000, 1_432_000),
+            OfflineTier::Long,
+        );
+    }
+
+    #[test]
+    fn sync_policy_classify_matches_free_function() {
+        // Default policy classification must match the free function.
+        let policy = SyncPolicy::default();
+        let cases = [
+            (1_000_000, 1_000_000), // 0s
+            (1_000_000, 1_003_600), // 1h
+            (1_000_000, 1_014_400), // 4h boundary
+            (1_000_000, 1_014_401), // just over 4h
+            (1_000_000, 1_604_800), // 7d boundary
+            (1_000_000, 1_604_801), // just over 7d
+            (2_000_000, 1_000_000), // clock skew
+        ];
+        for (last, now) in cases {
+            assert_eq!(
+                policy.classify_offline_duration(last, now),
+                classify_offline_duration(last, now),
+                "mismatch for last={last}, now={now}",
+            );
+        }
     }
 }
