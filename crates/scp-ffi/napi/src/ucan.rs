@@ -430,6 +430,9 @@ fn encode_hex(bytes: &[u8]) -> String {
 )]
 mod tests {
     use super::*;
+    use scp_core::crypto::ucan::validate::{
+        DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
+    };
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver
@@ -586,26 +589,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // decode_hex / encode_hex
+    // hex encode/decode roundtrip
     // -----------------------------------------------------------------------
 
     #[test]
-    fn decode_hex_roundtrip() {
+    fn hex_roundtrip() {
         let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let hex = encode_hex(&bytes);
-        let decoded = decode_hex(&hex).unwrap();
-        assert_eq!(decoded, bytes);
+        let hex_str = encode_hex(&bytes);
+        let decoded = hex::decode(&hex_str).unwrap();
+        assert_eq!(decoded, bytes.to_vec());
     }
 
     #[test]
-    fn decode_hex_rejects_odd_length() {
-        let result = decode_hex("abc");
+    fn hex_decode_rejects_odd_length() {
+        let result = hex::decode("abc");
         assert!(result.is_err());
     }
 
     #[test]
-    fn decode_hex_rejects_non_hex() {
-        let result = decode_hex("gggg");
+    fn hex_decode_rejects_non_hex() {
+        let result = hex::decode("gggg");
         assert!(result.is_err());
     }
 }
