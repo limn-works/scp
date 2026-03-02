@@ -22,10 +22,12 @@ tokio-util = { workspace = true }
 lru = { workspace = true }
 
 [dev-dependencies]
+scp-core = { path = "../scp-core" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
 rmpv = { version = "1", features = ["with-serde"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
 workspace = true
