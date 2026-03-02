@@ -2429,4 +2429,85 @@ mod tests {
         let reply = recv_msg(&mut stream).await;
         assert_eq!(reply, RelayMessage::Pong { ts: 42 });
     }
+
+    /// Smoke test for the `tokio::spawn` jitter delivery path in
+    /// `deliver_to_subscribers`. All other tests use `delivery_jitter_ms: 0`,
+    /// which takes the sequential fast-path. This test uses 1ms jitter —
+    /// negligible delay but exercises the spawn-per-subscriber branch.
+    #[tokio::test]
+    async fn jitter_delivery_path_delivers_correctly() {
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 1,
+            ..RelayConfig::default()
+        };
+        let storage = InMemoryBlobStorage::new();
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+
+        let routing_id = [0xEE; 32];
+        let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        // Client 1: subscribe to the routing ID.
+        let (mut sink1, mut stream1) = connect_client(addr).await;
+        let subscribe = ClientMessage::Subscribe {
+            ref_id: Some("sub-jitter".to_string()),
+            routing_id,
+            since: None,
+        };
+        send_msg(&mut sink1, &subscribe).await;
+        let ok = recv_msg(&mut stream1).await;
+        assert!(matches!(ok, RelayMessage::Ok { .. }));
+
+        // Client 2: also subscribe (verifies delivery to multiple subscribers).
+        let (mut sink2, mut stream2) = connect_client(addr).await;
+        let subscribe2 = ClientMessage::Subscribe {
+            ref_id: Some("sub-jitter-2".to_string()),
+            routing_id,
+            since: None,
+        };
+        send_msg(&mut sink2, &subscribe2).await;
+        let ok2 = recv_msg(&mut stream2).await;
+        assert!(matches!(ok2, RelayMessage::Ok { .. }));
+
+        // Client 3: publish a blob.
+        let (mut sink3, mut stream3) = connect_client(addr).await;
+        let publish = ClientMessage::Publish {
+            ref_id: Some("pub-jitter".to_string()),
+            routing_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: blob_data.clone(),
+        };
+        send_msg(&mut sink3, &publish).await;
+        let pub_ok = recv_msg(&mut stream3).await;
+        assert!(matches!(pub_ok, RelayMessage::Ok { .. }));
+
+        // Both subscribers should receive the blob via the jitter spawn path.
+        let blob1 = recv_msg(&mut stream1).await;
+        match &blob1 {
+            RelayMessage::Blob {
+                routing_id: rid,
+                blob: data,
+                ..
+            } => {
+                assert_eq!(rid, &routing_id);
+                assert_eq!(data, &blob_data);
+            }
+            other => panic!("subscriber 1: expected BLOB, got {other:?}"),
+        }
+
+        let blob2 = recv_msg(&mut stream2).await;
+        match &blob2 {
+            RelayMessage::Blob {
+                routing_id: rid,
+                blob: data,
+                ..
+            } => {
+                assert_eq!(rid, &routing_id);
+                assert_eq!(data, &blob_data);
+            }
+            other => panic!("subscriber 2: expected BLOB, got {other:?}"),
+        }
+    }
 }
