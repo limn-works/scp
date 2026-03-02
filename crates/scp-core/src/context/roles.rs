@@ -567,7 +567,7 @@ pub struct RoleAssignment {
 /// all the state needed for role assignment operations without requiring
 /// access to `ContextHandle` internals. It is the primary input for
 /// [`assign_role`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextRoleState {
     /// The context's unique identifier.
     pub context_id: String,
@@ -1591,5 +1591,42 @@ mod tests {
         // Bob is observer -- no write.
         assert!(!state.member_has_capability("did:dht:bob", &Capability::MessagesWrite));
         assert!(state.member_has_capability("did:dht:bob", &Capability::MessagesRead));
+    }
+
+    // -----------------------------------------------------------------------
+    // MessagePack roundtrip -- SCP-PERSIST-001
+    // -----------------------------------------------------------------------
+
+    /// SCP-PERSIST-001: `ContextRoleState` survives MessagePack roundtrip.
+    #[test]
+    fn context_role_state_msgpack_roundtrip() {
+        let ceiling = test_ceiling();
+        let custom = RoleDefinition::new(
+            "moderator",
+            HashSet::from([
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::MemberRemove,
+            ]),
+            &ceiling,
+        )
+        .unwrap();
+
+        let mut state =
+            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap();
+
+        // Add a second member with a non-admin role.
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(&mut state, "did:dht:alice", "moderator", "did:dht:creator").unwrap();
+
+        // Serialize to MessagePack.
+        let bytes = rmp_serde::to_vec(&state).expect("ContextRoleState serialization failed");
+        assert!(!bytes.is_empty());
+
+        // Deserialize back.
+        let decoded: ContextRoleState =
+            rmp_serde::from_slice(&bytes).expect("ContextRoleState deserialization failed");
+
+        assert_eq!(state, decoded);
     }
 }

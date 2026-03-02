@@ -83,7 +83,7 @@ pub struct MemberInfo {
 /// Provides member list queries, member count, and role assignment per member.
 /// Designed to be held inside a `ContextHandle`'s inner state or alongside it
 /// in the `ContextManager`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipState {
     /// Members indexed by DID.
     members: HashMap<DID, MemberInfo>,
@@ -777,5 +777,47 @@ mod tests {
 
         let second = buffer.pop().unwrap();
         assert_eq!(second, ContextEvent::Expired);
+    }
+
+    // -----------------------------------------------------------------------
+    // MessagePack roundtrip -- SCP-PERSIST-001
+    // -----------------------------------------------------------------------
+
+    /// SCP-PERSIST-001: `MembershipState` survives MessagePack roundtrip.
+    #[test]
+    fn membership_state_msgpack_roundtrip() {
+        use crate::context::roles::{UcanAttestation, UcanToken};
+
+        let mut state = MembershipState::new();
+
+        // Add members with various roles and tokens.
+        state.add_member("did:key:alice".into(), "admin".into(), vec![
+            UcanToken {
+                iss: "did:dht:creator".to_owned(),
+                aud: "did:key:alice".to_owned(),
+                att: vec![UcanAttestation {
+                    with: "scp:ctx:ctx-1/messages:read".to_owned(),
+                    can: "invoke".to_owned(),
+                }],
+                nnc: "1708646400000-aabbccdd".to_owned(),
+            },
+        ]);
+        state.add_member("did:key:bob".into(), "member".into(), vec![]);
+        state.add_member("did:key:carol".into(), "observer".into(), vec![]);
+
+        // Advance sequence numbers so they are non-zero.
+        state.next_sequence_number("did:key:alice");
+        state.next_sequence_number("did:key:alice");
+        state.next_sequence_number("did:key:bob");
+
+        // Serialize to MessagePack.
+        let bytes = rmp_serde::to_vec(&state).expect("MembershipState serialization failed");
+        assert!(!bytes.is_empty());
+
+        // Deserialize back.
+        let decoded: MembershipState =
+            rmp_serde::from_slice(&bytes).expect("MembershipState deserialization failed");
+
+        assert_eq!(state, decoded);
     }
 }
