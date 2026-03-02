@@ -246,10 +246,8 @@ pub fn py_event_log_query(
         actor_did: String::new(),
         #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
         timestamp: {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| ScpPyError::ContextError(format!("system clock error: {e}")))?
-                .as_secs() as f64
+            scp_core::time::now_secs()
+                .map_err(|e| ScpPyError::ContextError(format!("{e}")))? as f64
         },
         payload,
         sequence: event_count.saturating_sub(1),

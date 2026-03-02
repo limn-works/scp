@@ -359,20 +359,18 @@ impl NativeRelayClient {
 
                     // Plausibility check: warn if relay timestamp deviates
                     // significantly from local wall-clock time.
-                    let local_now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let deviation = local_now.abs_diff(*stored_at);
-                    if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
-                        tracing::warn!(
-                            relay_stored_at = *stored_at,
-                            local_time = local_now,
-                            deviation_secs = deviation,
-                            "relay stored_at deviates from local time by more \
-                             than {RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS}s; \
-                             possible malicious relay"
-                        );
+                    if let Ok(local_now) = scp_core::time::now_secs() {
+                        let deviation = local_now.abs_diff(*stored_at);
+                        if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
+                            tracing::warn!(
+                                relay_stored_at = *stored_at,
+                                local_time = local_now,
+                                deviation_secs = deviation,
+                                "relay stored_at deviates from local time by more \
+                                 than {RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS}s; \
+                                 possible malicious relay"
+                            );
+                        }
                     }
 
                     let _ = sub.tx.send(SubscriptionMessage::Relay(msg)).await;
@@ -420,10 +418,10 @@ impl NativeRelayClient {
                         break;
                     }
 
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let Ok(ts) = scp_core::time::now_secs() else {
+                        // Clock unavailable — skip this ping cycle.
+                        continue;
+                    };
 
                     let ping = ClientMessage::Ping { ts };
                     if let Ok(bytes) = ping.to_bytes() {
@@ -756,15 +754,14 @@ impl NativeRelayClient {
                     for (routing_id, last_local_receive) in subs_snapshot {
                         // Use local receive time (immune to relay timestamp
                         // manipulation) to compute the reconnect window.
-                        let since = last_local_receive.map(|instant| {
+                        let since = last_local_receive.and_then(|instant| {
                             let elapsed = instant.elapsed();
-                            let now_unix = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            now_unix
-                                .saturating_sub(elapsed.as_secs())
-                                .saturating_sub(RECONNECT_OVERLAP.as_secs())
+                            let now_unix = scp_core::time::now_secs().ok()?;
+                            Some(
+                                now_unix
+                                    .saturating_sub(elapsed.as_secs())
+                                    .saturating_sub(RECONNECT_OVERLAP.as_secs()),
+                            )
                         });
 
                         let msg = ClientMessage::Subscribe {

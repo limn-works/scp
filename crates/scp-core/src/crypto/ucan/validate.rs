@@ -2092,10 +2092,7 @@ mod tests {
     #[test]
     fn nonce_tracker_rejects_reused_nonce() {
         let mut tracker = InMemoryNonceTracker::new();
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        let now_millis = crate::time::now_millis().expect("clock unavailable in test");
 
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs().unwrap() + 3600;
@@ -2123,10 +2120,7 @@ mod tests {
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
 
         // Hex suffix too short.
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        let now_millis = crate::time::now_millis().expect("clock unavailable in test");
         let result = tracker.check_and_record(&format!("{now_millis}-aabb"), expiry);
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
     }

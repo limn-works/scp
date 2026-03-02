@@ -612,10 +612,8 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 .await
                 .map_err(|e| ScpPyError::IdentityError(format!("key generation failed: {e}")))?;
 
-            let rotated_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| ScpPyError::IdentityError(format!("system clock error: {e}")))?
-                .as_secs();
+            let rotated_at = scp_core::time::now_secs()
+                .map_err(|e| ScpPyError::IdentityError(format!("{e}")))?;
 
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,

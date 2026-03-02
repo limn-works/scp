@@ -520,12 +520,12 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
                 ))
             })?;
 
+            #[allow(clippy::cast_precision_loss)]
+            // Unix timestamp seconds fit in f64 mantissa for centuries.
             let overflow_warning = PyMessage::new(
                 "scp:system".to_owned(),
                 b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64()),
+                scp_core::time::now_secs().map_or(0.0, |s| s as f64),
                 context_id.to_owned(),
             );
             let _ = tx.try_send(overflow_warning);
