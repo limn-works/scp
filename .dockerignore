@@ -1,0 +1,10 @@
+target/
+.git/
+.claude/
+.loom/
+.docs/
+bindings/
+node_modules/
+.github/
+scripts/
+*.md

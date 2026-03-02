@@ -173,6 +173,78 @@ If Homebrew-installed Kotlin or OpenJDK are detected, the setup script warns but
 
 Reports the state of every tool without making changes. Exit code 0 = all good, 1 = something missing.
 
+### Running the Relay
+
+SCP provides two binary entrypoints for local development and testing:
+
+| Binary | What | Use case |
+|---|---|---|
+| `scp-relay` | Bare relay server (dumb pipe) | Integration tests, transport-level testing |
+| `scp-node` | Full application node (identity + relay + HTTP) | End-to-end tests, `.well-known/scp` discovery |
+
+#### From source
+
+```sh
+# Bare relay — listens on 0.0.0.0:9000
+cargo run --release -p scp-relay
+
+# Full application node — requires SCP_NODE_DOMAIN
+SCP_NODE_DOMAIN=localhost cargo run --release -p scp-node
+
+# Relay-only mode via scp-node
+cargo run --release -p scp-node -- --relay-only
+```
+
+#### With Docker
+
+```sh
+# Build the image (both binaries)
+docker compose build
+
+# Start bare relay (port 9000)
+docker compose up relay
+
+# Start full node (port 9001)
+docker compose up node
+
+# Or use the convenience script
+./scripts/docker.sh relay up
+./scripts/docker.sh node up
+./scripts/docker.sh down
+```
+
+#### Health checks
+
+Both binaries support `--health` for container health probes:
+
+```sh
+# From inside the container
+scp-relay --health
+scp-node --health
+```
+
+#### Environment variables
+
+**Relay configuration** (both binaries):
+
+| Variable | Default | Description |
+|---|---|---|
+| `SCP_RELAY_BIND_ADDR` | `0.0.0.0:9000` | Listen address |
+| `SCP_RELAY_MAX_BLOB_SIZE` | `262144` | Max blob size (bytes) |
+| `SCP_RELAY_MAX_BLOB_TTL` | `604800` | Max blob TTL (seconds) |
+| `SCP_RELAY_MAX_CONNECTIONS` | `1000` | Max total connections |
+| `SCP_RELAY_MAX_CONNECTIONS_PER_IP` | `10` | Max connections per IP |
+| `SCP_RELAY_RATE_LIMIT` | `100` | Publishes/sec/IP |
+| `SCP_RELAY_LOG_FORMAT` | `pretty` | `pretty` or `json` |
+| `SCP_RELAY_LOG_LEVEL` | `info` | Default log level (`RUST_LOG` takes precedence) |
+
+**Node-only configuration** (`scp-node` in full mode):
+
+| Variable | Default | Description |
+|---|---|---|
+| `SCP_NODE_DOMAIN` | *(required)* | Domain for DID document and relay URL |
+| `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP listen address |
+
 ## License
 
 SCP uses a split license designed for maximum adoption with infrastructure protection:

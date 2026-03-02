@@ -1,0 +1,19 @@
+services:
+  relay:
+    build: .
+    entrypoint: ["/usr/local/bin/scp-relay"]
+    ports:
+      - "9000:9000"
+    environment:
+      SCP_RELAY_LOG_FORMAT: "pretty"
+      SCP_RELAY_LOG_LEVEL: "info"
+
+  node:
+    build: .
+    entrypoint: ["/usr/local/bin/scp-node"]
+    ports:
+      - "9001:9000"
+    environment:
+      SCP_NODE_DOMAIN: "localhost"
+      SCP_RELAY_LOG_FORMAT: "pretty"
+      SCP_RELAY_LOG_LEVEL: "info"

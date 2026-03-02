@@ -1,0 +1,20 @@
+[package]
+name = "scp-relay"
+version = "0.1.0"
+description = "Standalone SCP native relay server binary"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scp-relay"
+path = "src/main.rs"
+
+[dependencies]
+scp-transport = { path = "../scp-transport" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[lints]
+workspace = true
