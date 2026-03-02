@@ -14,7 +14,7 @@ Similarly, `tokio::runtime::Runtime::block_on()` panics with "Cannot drop a runt
 
 Use `try_lock()` instead of `blocking_lock()` for sync access to `tokio::sync::Mutex` from code that may run inside a tokio runtime. `try_lock()` returns immediately with `Err` if the lock is held, which is acceptable for best-effort operations like oldest-drop overflow.
 
-For `__anext__` (called from Python, not from tokio), `py.allow_threads()` + `runtime().block_on(rx.lock().await.recv().await)` is safe because Python threads are not tokio worker threads.
+For `__anext__` (called from Python), the recv is spawned on the tokio runtime and resolved via `asyncio.Future` + `call_soon_threadsafe`, so the asyncio event loop thread is never blocked (#138).
 
 ## Rule
 
@@ -26,4 +26,4 @@ For `__anext__` (called from Python, not from tokio), `py.allow_threads()` + `ru
 ## Files
 
 - `crates/scp-ffi/src/runtime.rs` -- `deliver_message` uses `try_lock()`
-- `crates/scp-ffi/src/context.rs` -- `__anext__` uses `runtime().block_on()` from Python thread
+- `crates/scp-ffi/src/context.rs` -- `__anext__` spawns on tokio runtime, resolves via `asyncio.Future`

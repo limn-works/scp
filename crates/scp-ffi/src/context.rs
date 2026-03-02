@@ -386,21 +386,47 @@ impl PyMessageReceiver {
         slf
     }
 
-    /// Returns the next message from the channel (SCP-216).
+    /// Returns the next message from the channel as a Python awaitable (SCP-216).
     ///
-    /// Performs an async `recv()` on the channel. When the channel is empty,
-    /// the coroutine suspends until a message arrives (releases the Python GIL
-    /// while waiting). When the channel is closed (sender dropped), returns
-    /// `None` which `PyO3` translates to `StopAsyncIteration`.
-    fn __anext__(&self, py: Python<'_>) -> PyResult<Option<PyMessage>> {
+    /// Creates a Python `asyncio.Future`, spawns the `recv()` on the tokio
+    /// runtime, and resolves the future via `call_soon_threadsafe` when a
+    /// message arrives. This allows the asyncio event loop to run other
+    /// coroutines while waiting for messages (fixes #138).
+    ///
+    /// When the channel is closed (sender dropped), the future resolves to
+    /// `None` which the Python wrapper translates to `StopAsyncIteration`.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rx = Arc::clone(&self.rx);
-        py.allow_threads(|| {
-            let rt = crate::runtime()?;
-            rt.block_on(async move {
+        let rt = crate::runtime()?;
+
+        // Get the running asyncio event loop.
+        let asyncio = py.import("asyncio")?;
+        let event_loop = asyncio.call_method0("get_running_loop")?;
+
+        // Create a Future on the running loop.
+        let future = event_loop.call_method0("create_future")?;
+
+        // Clone references for the spawned task.
+        let future_ref = future.clone().unbind();
+        let loop_ref = event_loop.clone().unbind();
+
+        // Spawn the recv on the tokio runtime. The task runs on a tokio
+        // worker thread, not the Python event loop thread.
+        rt.spawn(async move {
+            let result = {
                 let mut guard = rx.lock().await;
-                Ok(guard.recv().await)
-            })
-        })
+                guard.recv().await
+            };
+
+            // Resolve the Python future from the tokio thread using
+            // call_soon_threadsafe, which is the only thread-safe way
+            // to resolve an asyncio.Future from a non-event-loop thread.
+            Python::with_gil(|py| {
+                resolve_future(py, &future_ref, &loop_ref, result);
+            });
+        });
+
+        Ok(future)
     }
 }
 
@@ -413,6 +439,62 @@ impl PyMessageReceiver {
     #[must_use]
     pub const fn from_shared_rx(rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>) -> Self {
         Self { rx }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async future resolution helper
+// ---------------------------------------------------------------------------
+
+/// Resolves a Python `asyncio.Future` with the result of a channel recv.
+///
+/// Called from a tokio worker thread inside `Python::with_gil`. Uses
+/// `call_soon_threadsafe` to schedule the resolution on the asyncio event
+/// loop thread. If any Python operation fails (which should not happen in
+/// practice), the error is set as an exception on the future.
+fn resolve_future(
+    py: Python<'_>,
+    future_ref: &Py<PyAny>,
+    loop_ref: &Py<PyAny>,
+    result: Option<PyMessage>,
+) {
+    let future = future_ref.bind(py);
+    let event_loop = loop_ref.bind(py);
+
+    // Obtain the set_result method. If this fails, something is
+    // fundamentally wrong with the asyncio.Future object.
+    let set_result = match future.getattr("set_result") {
+        Ok(method) => method,
+        Err(e) => {
+            tracing::error!("failed to get set_result on asyncio.Future: {e}");
+            // Try to set the exception on the future as a last resort.
+            if let Ok(set_exception) = future.getattr("set_exception") {
+                let _ = event_loop.call_method1("call_soon_threadsafe", (set_exception, e));
+            }
+            return;
+        }
+    };
+
+    match result {
+        Some(msg) => {
+            match Py::new(py, msg) {
+                Ok(msg_obj) => {
+                    // call_soon_threadsafe(future.set_result, value)
+                    let _ = event_loop.call_method1("call_soon_threadsafe", (set_result, msg_obj));
+                }
+                Err(e) => {
+                    // Failed to wrap message in PyObject — set exception.
+                    if let Ok(set_exception) = future.getattr("set_exception") {
+                        let _ = event_loop.call_method1("call_soon_threadsafe", (set_exception, e));
+                    }
+                }
+            }
+        }
+        None => {
+            // Channel closed — set None as the result. The Python
+            // wrapper raises StopAsyncIteration when it sees None.
+            let _ = event_loop.call_method1("call_soon_threadsafe", (set_result, py.None()));
+        }
     }
 }
 

@@ -17,9 +17,7 @@ canonical design.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import warnings
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -75,14 +73,15 @@ class Membership:
 
 
 class _ReceiveIterator(AsyncIterator[Message]):
-    """Async iterator over incoming messages with bounded buffer.
+    """Async iterator over incoming messages from an SCP context.
 
-    Wraps the bridge-level ``PyMessageReceiver`` and buffers events for
-    the application layer.  When the consumer falls behind:
+    Wraps the bridge-level ``PyMessageReceiver`` which returns
+    ``asyncio.Future`` objects from ``__anext__``.  Each await yields
+    control back to the asyncio event loop so other coroutines can
+    make progress while waiting for messages.
 
-    1. The oldest unconsumed event is dropped (not the newest).
-    2. A ``BufferOverflow`` :class:`warnings.Warning` is emitted with
-       the dropped count.
+    Oldest-drop overflow semantics are handled at the Rust bridge
+    level (see ``deliver_message`` in ``runtime.rs``).
 
     Buffer size defaults to :data:`_DEFAULT_BUFFER_SIZE` (1,000) and is
     configurable via :meth:`Context.create` or :meth:`Context.configure`.
@@ -92,7 +91,6 @@ class _ReceiveIterator(AsyncIterator[Message]):
         self._receiver = bridge_receiver
         self._buffer: deque[Message] = deque(maxlen=buffer_size)
         self._buffer_size = buffer_size
-        self._overflow_count = 0
         self._closed = False
 
     def __aiter__(self) -> _ReceiveIterator:
@@ -102,61 +100,28 @@ class _ReceiveIterator(AsyncIterator[Message]):
         if self._closed:
             raise StopAsyncIteration
 
-        # Drain any pending messages from the bridge into the buffer.
-        self._poll_bridge()
-
-        # If the buffer has messages, return the oldest.
+        # Return buffered messages first.
         if self._buffer:
             return self._buffer.popleft()
 
-        # No messages available -- yield control and retry.
-        # In a real transport scenario this would await a notification
-        # from the bridge.  For the current bridge layer (no live
-        # transport), we stop iteration when the channel is exhausted.
-        await asyncio.sleep(0)
-        self._poll_bridge()
+        # Await the bridge receiver's __anext__, which returns an
+        # asyncio.Future that resolves when a message arrives on the
+        # tokio channel.  This yields control to the asyncio event loop
+        # so other coroutines can make progress while waiting (fixes #138).
+        raw = await self._receiver.__anext__()
 
-        if self._buffer:
-            return self._buffer.popleft()
+        if raw is None:
+            # Channel closed (sender dropped) -- stop iteration.
+            self._closed = True
+            raise StopAsyncIteration
 
-        raise StopAsyncIteration
-
-    def _poll_bridge(self) -> None:
-        """Pull messages from the bridge receiver into the local buffer.
-
-        Applies oldest-drop overflow semantics: when the buffer is full,
-        the oldest unconsumed event is discarded and a
-        ``BufferOverflow`` warning is emitted.
-        """
-        while True:
-            try:
-                raw = self._receiver.__anext__()
-            except StopIteration:
-                break
-
-            if raw is None:
-                # Channel exhausted or empty.
-                break
-
-            msg = Message(
-                sender_did=raw.sender_did,
-                content=raw.payload,
-                timestamp=raw.timestamp,
-                sequence=0,
-                context_id=raw.context_id,
-            )
-
-            if len(self._buffer) >= self._buffer_size:
-                # Drop oldest.
-                self._buffer.popleft()
-                self._overflow_count += 1
-                warnings.warn(
-                    f"BufferOverflow: dropped {self._overflow_count} event(s) "
-                    f"(buffer capacity: {self._buffer_size})",
-                    stacklevel=2,
-                )
-
-            self._buffer.append(msg)
+        return Message(
+            sender_did=raw.sender_did,
+            content=raw.payload,
+            timestamp=raw.timestamp,
+            sequence=0,
+            context_id=raw.context_id,
+        )
 
     def close(self) -> None:
         """Mark the iterator as closed; subsequent iteration will stop."""
