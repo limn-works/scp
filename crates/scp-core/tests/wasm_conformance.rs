@@ -1840,7 +1840,7 @@ fn wasm_attenuation_malformed_parent_capability_rejects() {
 
 /// Test: child claims capability not in (malformed) parent -- error, not silent pass.
 /// With fail-open (old behavior), the malformed parent capability would be silently
-/// dropped, leaving an empty parent_caps list, and the child capability would appear
+/// dropped, leaving an empty `parent_caps` list, and the child capability would appear
 /// to have no parent to compare against. This tests the complete attack scenario.
 #[test]
 fn wasm_attenuation_child_claims_capability_with_malformed_parent_rejects() {
