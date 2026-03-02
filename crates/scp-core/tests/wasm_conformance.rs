@@ -2988,7 +2988,7 @@ fn wasm_and_core_revocation_cid_match_after_jwt_roundtrip() {
 
     // Create a payload with all fields populated.
     let payload = wasm_ucan_mirror::UcanPayload {
-        iss: did.clone(),
+        iss: did,
         aud: "did:dht:z6MkSomeAudience".to_owned(),
         exp: 1_700_000_000,
         nbf: Some(1_699_990_000),

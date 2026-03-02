@@ -1550,7 +1550,7 @@ mod tests {
     /// stable CID for a fixed payload. This value serves as the canonical
     /// reference for cross-bridge consistency tests.
     ///
-    /// All bridge implementations (PyO3, NAPI, WASM) must produce this exact
+    /// All bridge implementations (`PyO3`, NAPI, WASM) must produce this exact
     /// CID when computing the revocation CID for the same payload. The WASM
     /// bridge re-implements this function locally (cannot depend on scp-core
     /// due to tokio incompatibility), so the golden value guards against
@@ -1567,6 +1567,16 @@ mod tests {
     #[test]
     fn revocation_cid_golden_value() {
         use super::super::Attenuation;
+
+        // Golden CID: SHA-256 hex of the JSON-serialized payload.
+        //
+        // To recompute: serialize the payload with serde_json::to_vec (compact,
+        // no whitespace, struct field order), then SHA-256, then lowercase hex.
+        //
+        // This value MUST match:
+        //   - wasm_conformance::wasm_and_core_revocation_cid_match_golden_value
+        //   - Any future bridge-specific revocation CID tests
+        const GOLDEN_CID: &str = "570e8e588aef5a19ea59cf74f9fd0fec33c1aa32819aa6b48f76e4a21b3132ae";
 
         // Golden payload: fixed values, no optional fields.
         let payload = UcanPayload {
@@ -1585,16 +1595,6 @@ mod tests {
 
         let cid = compute_revocation_cid(&payload);
 
-        // Golden CID: SHA-256 hex of the JSON-serialized payload.
-        //
-        // To recompute: serialize the payload with serde_json::to_vec (compact,
-        // no whitespace, struct field order), then SHA-256, then lowercase hex.
-        //
-        // This value MUST match:
-        //   - wasm_conformance::wasm_and_core_revocation_cid_match_golden_value
-        //   - Any future bridge-specific revocation CID tests
-        const GOLDEN_CID: &str = "570e8e588aef5a19ea59cf74f9fd0fec33c1aa32819aa6b48f76e4a21b3132ae";
-
         assert_eq!(
             cid, GOLDEN_CID,
             "revocation CID does not match golden value — if the algorithm \
@@ -1612,6 +1612,11 @@ mod tests {
     fn revocation_cid_golden_value_with_optional_fields() {
         use super::super::Attenuation;
 
+        // With optional fields present, the CID must differ from the
+        // no-optionals golden value and must be stable.
+        const GOLDEN_CID_WITH_OPTIONALS: &str =
+            "b5e50448d6d2e9331158cbeb1269a33f5dc1dfa561105584ab2332f0a53fe330";
+
         let payload = UcanPayload {
             iss: "did:dht:z6MkGoldenTest".to_owned(),
             aud: "did:dht:z6MkGoldenAudience".to_owned(),
@@ -1627,11 +1632,6 @@ mod tests {
         };
 
         let cid = compute_revocation_cid(&payload);
-
-        // With optional fields present, the CID must differ from the
-        // no-optionals golden value and must be stable.
-        const GOLDEN_CID_WITH_OPTIONALS: &str =
-            "b5e50448d6d2e9331158cbeb1269a33f5dc1dfa561105584ab2332f0a53fe330";
 
         // First: verify it differs from the no-optionals golden value.
         assert_ne!(
