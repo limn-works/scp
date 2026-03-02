@@ -13,6 +13,7 @@
 
 use super::templates::validate_against_template;
 use super::{ContextError, ContextHandle, ContextMode, ContextParams, ContextState};
+use crate::crypto::sender_keys::BroadcastEnvelope;
 
 // ---------------------------------------------------------------------------
 // ContextCreationError -- errors specific to context creation
@@ -185,6 +186,24 @@ pub trait ContextCryptoProvider: Send + Sync {
         sender_did: &str,
         payload: &[u8],
     ) -> Result<Vec<u8>, ContextError>;
+
+    /// Seals a payload into a [`BroadcastEnvelope`] using the author's current
+    /// broadcast key (AES-256-GCM, per §5.14.5).
+    ///
+    /// Called only when `mode == Broadcast`. The provider looks up the
+    /// broadcast key for `author_did` within the given context and encrypts
+    /// the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the broadcast key is missing
+    /// or encryption fails.
+    fn seal_broadcast_message(
+        &self,
+        context_id: &[u8; 32],
+        author_did: &str,
+        payload: &[u8],
+    ) -> Result<BroadcastEnvelope, ContextError>;
 }
 
 /// Provides transport operations needed during context creation.
@@ -706,6 +725,19 @@ mod tests {
             payload: &[u8],
         ) -> Result<Vec<u8>, ContextError> {
             Ok(payload.to_vec())
+        }
+
+        fn seal_broadcast_message(
+            &self,
+            _context_id: &[u8; 32],
+            author_did: &str,
+            payload: &[u8],
+        ) -> Result<BroadcastEnvelope, ContextError> {
+            Ok(BroadcastEnvelope {
+                author_did: author_did.to_owned(),
+                key_epoch: 0,
+                encrypted_content: payload.to_vec(),
+            })
         }
     }
 

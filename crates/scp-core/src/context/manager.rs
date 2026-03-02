@@ -20,7 +20,8 @@ use super::builder::{
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
 use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
-use super::{ContextError, ContextHandle, ContextParams, ContextState};
+use super::{ContextError, ContextHandle, ContextMode, ContextParams, ContextState};
+use crate::crypto::sender_keys::BroadcastEnvelope;
 use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -412,10 +413,16 @@ impl ContextManager {
 
     /// Sends a message within a context.
     ///
+    /// Sends a message in an `Encrypted`-mode context.
+    ///
     /// Validates the context is `Active`, validates the sender's UCAN for
     /// `messages:write` capability, assigns a per-sender monotonic SCP
     /// sequence number, encrypts the message (sender key + MLS + envelopes),
     /// sends via transport, and appends a `MessageSent` event.
+    ///
+    /// For broadcast mode, this delegates to [`BroadcastContext::publish`]
+    /// internally. Use [`publish_broadcast`](Self::publish_broadcast) directly
+    /// if you need the raw [`BroadcastEnvelope`].
     ///
     /// See ADR-008 acceptance criterion 8.
     ///
@@ -485,6 +492,90 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "MessageSent")?;
 
         Ok(())
+    }
+
+    /// Publishes a message in a `Broadcast`-mode context and returns the
+    /// sealed [`BroadcastEnvelope`].
+    ///
+    /// Returns the raw `BroadcastEnvelope` for callers that need to handle
+    /// transport themselves. For the standard send path that auto-detects
+    /// mode, use [`send_message`](Self::send_message) instead.
+    ///
+    /// Validates the context is `Active`, verifies the author holds the
+    /// `messages:write` capability, assigns a per-sender monotonic sequence
+    /// number, seals the payload with the author's broadcast key
+    /// (AES-256-GCM, per section 5.14.5), and appends a `MessageSent` event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if:
+    /// - The context is not in `Active` state.
+    /// - The context is not in `Broadcast` mode.
+    /// - The author lacks `messages:write` capability.
+    /// - Any crypto or event log operation fails.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn publish_broadcast(
+        &self,
+        handle: &ContextHandle,
+        author_did: &DID,
+        payload: &[u8],
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        let context_id = handle.context_id().to_owned();
+        let context_id_bytes = context_id_to_bytes(&context_id);
+
+        // Verify mode is Broadcast.
+        if handle.params().mode != ContextMode::Broadcast {
+            return Err(ContextError::PermissionDenied(
+                "publish_broadcast requires a Broadcast-mode context".into(),
+            ));
+        }
+
+        // Atomic state check + capability check + sequence assignment + event
+        // emission, all within a single lock acquisition.
+        {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(&context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            // State check inside lock -- eliminates TOCTOU race.
+            require_active(&ctx.handle)?;
+
+            // Check messages:write capability.
+            if !ctx
+                .role_state
+                .member_has_capability(author_did, &Capability::MessagesWrite)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {author_did} does not have messages:write capability"
+                )));
+            }
+
+            // Assign per-sender monotonic sequence number.
+            let seq = ctx
+                .membership
+                .next_sequence_number(author_did)
+                .ok_or_else(|| ContextError::MemberNotFound(author_did.to_string()))?;
+
+            // Emit MessageSent event to receive buffer.
+            ctx.receive_buffer.push(ContextEvent::MessageSent {
+                sender_did: author_did.clone(),
+                sequence_number: seq,
+                payload: payload.to_vec(),
+            });
+        }
+        // Lock dropped before crypto/event-log calls.
+
+        // Seal with the author's broadcast key (AES-256-GCM).
+        let envelope = self
+            .crypto
+            .seal_broadcast_message(&context_id_bytes, author_did, payload)?;
+
+        // Append MessageSent event to event log.
+        self.event_log
+            .append_context_event(&context_id_bytes, "MessageSent")?;
+
+        Ok(envelope)
     }
 
     /// Returns the current member count for a context.
@@ -928,6 +1019,19 @@ mod tests {
                 .push(payload.to_vec());
             // Mock: return payload as-is (no real encryption).
             Ok(payload.to_vec())
+        }
+
+        fn seal_broadcast_message(
+            &self,
+            _context_id: &[u8; 32],
+            author_did: &str,
+            payload: &[u8],
+        ) -> Result<crate::crypto::sender_keys::BroadcastEnvelope, ContextError> {
+            Ok(crate::crypto::sender_keys::BroadcastEnvelope {
+                author_did: author_did.to_owned(),
+                key_epoch: 0,
+                encrypted_content: payload.to_vec(),
+            })
         }
     }
 

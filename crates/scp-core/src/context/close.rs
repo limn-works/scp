@@ -578,6 +578,19 @@ mod tests {
         ) -> Result<Vec<u8>, ContextError> {
             Ok(vec![])
         }
+
+        fn seal_broadcast_message(
+            &self,
+            _context_id: &[u8; 32],
+            author_did: &str,
+            payload: &[u8],
+        ) -> Result<crate::crypto::sender_keys::BroadcastEnvelope, ContextError> {
+            Ok(crate::crypto::sender_keys::BroadcastEnvelope {
+                author_did: author_did.to_owned(),
+                key_epoch: 0,
+                encrypted_content: payload.to_vec(),
+            })
+        }
     }
 
     // -----------------------------------------------------------------------
