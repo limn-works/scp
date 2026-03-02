@@ -72,8 +72,10 @@ fn init_tracing() {
 
 /// Builds a [`RelayConfig`] from `SCP_RELAY_*` environment variables.
 fn relay_config_from_env() -> RelayConfig {
-    let bind_addr: SocketAddr =
-        env_or("SCP_RELAY_BIND_ADDR", SocketAddr::from(([0, 0, 0, 0], 9000)));
+    let bind_addr: SocketAddr = env_or(
+        "SCP_RELAY_BIND_ADDR",
+        SocketAddr::from(([0, 0, 0, 0], 9000)),
+    );
 
     RelayConfig {
         bind_addr,
@@ -109,15 +111,14 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .unwrap_or_else(|_| {
-                    // If we cannot register SIGTERM, fall back to ctrl_c only.
-                    // This is unreachable on any standard Unix system but
-                    // satisfies the no-panic lint without process::exit.
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .unwrap_or_else(|_| std::process::exit(1))
-                });
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .unwrap_or_else(|_| {
+                // If we cannot register SIGTERM, fall back to ctrl_c only.
+                // This is unreachable on any standard Unix system but
+                // satisfies the no-panic lint without process::exit.
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .unwrap_or_else(|_| std::process::exit(1))
+            });
         tokio::select! {
             _ = ctrl_c => {}
             _ = sigterm.recv() => {}
@@ -178,10 +179,8 @@ async fn run_full_node() {
         }
     };
 
-    let http_addr: SocketAddr = env_or(
-        "SCP_NODE_BIND_ADDR",
-        SocketAddr::from(([0, 0, 0, 0], 9000)),
-    );
+    let http_addr: SocketAddr =
+        env_or("SCP_NODE_BIND_ADDR", SocketAddr::from(([0, 0, 0, 0], 9000)));
 
     tracing::info!(
         domain = %domain,

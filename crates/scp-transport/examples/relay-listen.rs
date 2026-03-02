@@ -2,11 +2,11 @@
 //! envelope in real time.
 //!
 //! Usage:
-//!   cargo run -p scp-transport --example relay-listen -- [RELAY_URL] [ROUTING_ID_HEX]
+//!   `cargo run -p scp-transport --example relay-listen -- [RELAY_URL] [ROUTING_ID_HEX]`
 //!
 //! Defaults:
-//!   RELAY_URL      = ws://127.0.0.1:19000/scp/v1
-//!   ROUTING_ID_HEX = a]a…a (32 bytes of 0xaa)
+//!   `RELAY_URL`      = `ws://127.0.0.1:19000/scp/v1`
+//!   `ROUTING_ID_HEX` = aa…aa (32 bytes of 0xaa)
 
 use futures::StreamExt;
 use scp_transport::native::NativeRelayAdapter;
@@ -22,7 +22,11 @@ fn hex_to_32(hex: &str) -> [u8; 32] {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[tokio::main]
@@ -35,29 +39,24 @@ async fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    let url = args.get(1).map_or("ws://127.0.0.1:19000/scp/v1", |s| s.as_str());
-    let routing_id = args
-        .get(2)
-        .map_or([0xaa; 32], |h| hex_to_32(h));
+    let url = args
+        .get(1)
+        .map_or("ws://127.0.0.1:19000/scp/v1", |s| s.as_str());
+    let routing_id = args.get(2).map_or([0xaa; 32], |h| hex_to_32(h));
 
     let rid = RoutingId::new(routing_id);
 
     eprintln!("Connecting to {url}...");
-    let adapter = NativeRelayAdapter::connect(url)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("connection failed: {e}");
-            std::process::exit(1);
-        });
+    let adapter = NativeRelayAdapter::connect(url).await.unwrap_or_else(|e| {
+        eprintln!("connection failed: {e}");
+        std::process::exit(1);
+    });
 
     eprintln!("Subscribing to routing_id {}...", hex(&routing_id));
-    let mut stream = adapter
-        .subscribe(&rid, None)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("subscribe failed: {e}");
-            std::process::exit(1);
-        });
+    let mut stream = adapter.subscribe(&rid, None).await.unwrap_or_else(|e| {
+        eprintln!("subscribe failed: {e}");
+        std::process::exit(1);
+    });
 
     eprintln!("Listening. Press Ctrl-C to stop.\n");
 
@@ -86,9 +85,7 @@ async fn main() {
             TransportEvent::Error(e) => {
                 println!("[ERROR] {e}");
             }
-            _ => {
-                // Future event types — log and continue.
-            }
+            TransportEvent::SuppressionDetected(_) => {}
         }
     }
 }

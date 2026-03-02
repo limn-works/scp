@@ -4,11 +4,11 @@
 //! stdin input to send messages in real time.
 //!
 //! Usage:
-//!   cargo run -p scp-transport --example relay-chat -- [RELAY_URL] [ROUTING_ID_HEX]
+//!   `cargo run -p scp-transport --example relay-chat -- [RELAY_URL] [ROUTING_ID_HEX]`
 //!
 //! Defaults:
-//!   RELAY_URL      = ws://127.0.0.1:9000/scp/v1
-//!   ROUTING_ID_HEX = aa…aa (32 bytes of 0xaa)
+//!   `RELAY_URL`      = `ws://127.0.0.1:9000/scp/v1`
+//!   `ROUTING_ID_HEX` = aa…aa (32 bytes of 0xaa)
 
 use futures::StreamExt;
 use scp_core::envelope::create_outer_envelope;
@@ -27,7 +27,11 @@ fn hex_to_32(hex: &str) -> [u8; 32] {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[tokio::main]
@@ -47,23 +51,16 @@ async fn main() {
     let rid = RoutingId::new(routing_id);
 
     eprintln!("Connecting to {url}...");
-    let adapter = Arc::new(
-        NativeRelayAdapter::connect(url)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("connection failed: {e}");
-                std::process::exit(1);
-            }),
-    );
+    let adapter = Arc::new(NativeRelayAdapter::connect(url).await.unwrap_or_else(|e| {
+        eprintln!("connection failed: {e}");
+        std::process::exit(1);
+    }));
 
     eprintln!("Subscribing to routing_id {}...", hex(&routing_id));
-    let mut stream = adapter
-        .subscribe(&rid, None)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("subscribe failed: {e}");
-            std::process::exit(1);
-        });
+    let mut stream = adapter.subscribe(&rid, None).await.unwrap_or_else(|e| {
+        eprintln!("subscribe failed: {e}");
+        std::process::exit(1);
+    });
 
     eprintln!("Ready. Type a message and press Enter to send. Ctrl-C to quit.\n");
 
@@ -83,7 +80,9 @@ async fn main() {
                 TransportEvent::Error(e) => {
                     eprintln!("\r[error: {e}]");
                 }
-                _ => {}
+                TransportEvent::SuppressionDetected(_)
+                | TransportEvent::BackfillComplete
+                | TransportEvent::Reconnected => {}
             }
         }
     });
@@ -100,12 +99,11 @@ async fn main() {
             continue;
         }
 
-        let envelope =
-            create_outer_envelope(&routing_id, None, 60, text.as_bytes().to_vec())
-                .unwrap_or_else(|e| {
-                    eprintln!("[envelope error: {e}]");
-                    std::process::exit(1);
-                });
+        let envelope = create_outer_envelope(&routing_id, None, 60, text.as_bytes().to_vec())
+            .unwrap_or_else(|e| {
+                eprintln!("[envelope error: {e}]");
+                std::process::exit(1);
+            });
 
         match adapter.send(&envelope).await {
             Ok(_) => {}

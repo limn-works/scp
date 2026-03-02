@@ -1,13 +1,13 @@
 //! Publishes messages to a routing ID on an SCP relay.
 //!
 //! Usage:
-//!   cargo run -p scp-transport --example relay-send -- [RELAY_URL] [ROUTING_ID_HEX] "message"
+//!   `cargo run -p scp-transport --example relay-send -- [RELAY_URL] [ROUTING_ID_HEX] "message"`
 //!
 //! If no message is given, sends a series of demo messages.
 //!
 //! Defaults:
-//!   RELAY_URL      = ws://127.0.0.1:19000/scp/v1
-//!   ROUTING_ID_HEX = aa…aa (32 bytes of 0xaa)
+//!   `RELAY_URL`      = `ws://127.0.0.1:19000/scp/v1`
+//!   `ROUTING_ID_HEX` = aa…aa (32 bytes of 0xaa)
 
 use scp_core::envelope::create_outer_envelope;
 use scp_transport::native::NativeRelayAdapter;
@@ -23,14 +23,14 @@ fn hex_to_32(hex: &str) -> [u8; 32] {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
-async fn send_message(
-    adapter: &NativeRelayAdapter,
-    routing_id: &[u8; 32],
-    text: &str,
-) {
+async fn send_message(adapter: &NativeRelayAdapter, routing_id: &[u8; 32], text: &str) {
     let envelope = create_outer_envelope(routing_id, None, 60, text.as_bytes().to_vec())
         .unwrap_or_else(|e| {
             eprintln!("failed to create envelope: {e}");
@@ -61,18 +61,18 @@ async fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    let url = args.get(1).map_or("ws://127.0.0.1:19000/scp/v1", |s| s.as_str());
+    let url = args
+        .get(1)
+        .map_or("ws://127.0.0.1:19000/scp/v1", |s| s.as_str());
     let routing_id = args.get(2).map_or([0xaa; 32], |h| hex_to_32(h));
 
     let rid_hex = hex(&routing_id);
 
     eprintln!("Connecting to {url}...");
-    let adapter = NativeRelayAdapter::connect(url)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("connection failed: {e}");
-            std::process::exit(1);
-        });
+    let adapter = NativeRelayAdapter::connect(url).await.unwrap_or_else(|e| {
+        eprintln!("connection failed: {e}");
+        std::process::exit(1);
+    });
 
     eprintln!("Connected. Routing ID: {rid_hex}\n");
 

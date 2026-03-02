@@ -27,8 +27,10 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 /// Builds a [`RelayConfig`] from `SCP_RELAY_*` environment variables.
 fn config_from_env() -> RelayConfig {
-    let bind_addr: SocketAddr =
-        env_or("SCP_RELAY_BIND_ADDR", SocketAddr::from(([0, 0, 0, 0], 9000)));
+    let bind_addr: SocketAddr = env_or(
+        "SCP_RELAY_BIND_ADDR",
+        SocketAddr::from(([0, 0, 0, 0], 9000)),
+    );
 
     RelayConfig {
         bind_addr,
@@ -56,7 +58,10 @@ fn init_tracing() {
     let format = env::var("SCP_RELAY_LOG_FORMAT").unwrap_or_else(|_| "pretty".into());
 
     if format == "json" {
-        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
@@ -76,8 +81,10 @@ async fn main() {
     // Check for --health before initializing tracing (keep probe quiet).
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|a| a == "--health") {
-        let addr: SocketAddr =
-            env_or("SCP_RELAY_BIND_ADDR", SocketAddr::from(([127, 0, 0, 1], 9000)));
+        let addr: SocketAddr = env_or(
+            "SCP_RELAY_BIND_ADDR",
+            SocketAddr::from(([127, 0, 0, 1], 9000)),
+        );
         health_check(addr).await;
         // health_check always calls process::exit, but satisfy the compiler.
         return;
@@ -120,15 +127,14 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .unwrap_or_else(|_| {
-                    // If we cannot register SIGTERM, fall back to ctrl_c only.
-                    // This is unreachable on any standard Unix system but
-                    // satisfies the no-panic lint without process::exit.
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .unwrap_or_else(|_| std::process::exit(1))
-                });
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .unwrap_or_else(|_| {
+                // If we cannot register SIGTERM, fall back to ctrl_c only.
+                // This is unreachable on any standard Unix system but
+                // satisfies the no-panic lint without process::exit.
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .unwrap_or_else(|_| std::process::exit(1))
+            });
         tokio::select! {
             _ = ctrl_c => {}
             _ = sigterm.recv() => {}
