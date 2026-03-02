@@ -8,7 +8,7 @@
 //! testable with mock implementations. See ADR-008 in
 //! `.docs/adrs/phase-2.md` for the full context lifecycle specification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
-use super::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
+use super::governance::{GovernanceAction, GovernanceProposal, ProposalId, ProposalStatus};
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
 use super::params::{ContextMode, TemplateId};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
@@ -74,6 +74,9 @@ struct PerContextState {
     /// `None` for `ContextMode::Encrypted`. Broadcast contexts do not use MLS;
     /// they use per-author AES-256-GCM keys managed by [`BroadcastContext`].
     broadcast_context: Option<BroadcastContext>,
+    /// Proposal IDs that have already been executed. Prevents replay of
+    /// approved governance proposals (defense-in-depth).
+    executed_proposals: HashSet<ProposalId>,
 }
 
 /// Reads the context state synchronously via [`ContextHandle::try_read_state`].
@@ -250,6 +253,7 @@ impl ContextManager {
             ttl_timer: TtlTimer::new(),
             ttl_extension: None,
             broadcast_context,
+            executed_proposals: HashSet::new(),
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -926,10 +930,18 @@ impl ContextManager {
             )));
         }
 
+        // Gate: proposal must target this context.
+        if proposal.context_id != context_id {
+            return Err(ContextError::PermissionDenied(format!(
+                "governance proposal targets context '{}' but was submitted to '{}'",
+                proposal.context_id, context_id
+            )));
+        }
+
         match &proposal.action {
             GovernanceAction::BlockAuthor { author_did, .. } => {
                 let result = self
-                    .block_broadcast_author_internal(context_id, author_did)
+                    .block_broadcast_author_internal(context_id, author_did, proposal.proposal_id)
                     .await?;
                 Ok(GovernanceActionResult::AuthorBlocked(result))
             }
@@ -956,6 +968,8 @@ impl ContextManager {
     ///
     /// # Errors
     ///
+    /// - [`ContextError::PermissionDenied`] if the proposal has already been
+    ///   executed (replay protection).
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context.
@@ -965,6 +979,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         author_did: &DID,
+        proposal_id: ProposalId,
     ) -> Result<AuthorBlockResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -973,6 +988,13 @@ impl ContextManager {
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            // Gate: reject replayed proposals (defense-in-depth).
+            if ctx.executed_proposals.contains(&proposal_id) {
+                return Err(ContextError::PermissionDenied(
+                    "governance proposal has already been executed".into(),
+                ));
+            }
 
             require_active(&ctx.handle)?;
 
@@ -987,6 +1009,9 @@ impl ContextManager {
             ctx.receive_buffer.push(ContextEvent::AuthorBlocked {
                 author_did: author_did.clone(),
             });
+
+            // Record the proposal as executed (inside lock scope).
+            ctx.executed_proposals.insert(proposal_id);
 
             result
         };
@@ -3200,5 +3225,55 @@ mod tests {
             .execute_governance_action("test-ctx", &proposal)
             .await;
         assert!(result.is_err());
+    }
+
+    /// Defense-in-depth: a proposal approved for context A must not be
+    /// executable against context B.
+    #[tokio::test]
+    async fn governance_action_rejects_wrong_context_id() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // Create a proposal targeting a different context.
+        let proposal = approved_block_author_proposal(
+            &"did:key:alice".into(),
+            "ctx-a-other",
+            &"did:key:bob".into(),
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_err(),
+            "proposal targeting a different context must be rejected"
+        );
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(_)),
+            "should return PermissionDenied for context mismatch"
+        );
+    }
+
+    /// Defense-in-depth: replaying the same approved proposal a second time
+    /// is rejected with an explicit error rather than relying on downstream
+    /// `MemberNotFound`.
+    #[tokio::test]
+    async fn governance_action_rejects_replayed_proposal() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        let proposal =
+            approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
+
+        // First execution should succeed.
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "first execution should succeed");
+
+        // Second execution of the same proposal should fail (replay).
+        let replay_result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(replay_result.is_err(), "replayed proposal must be rejected");
+        assert!(
+            matches!(
+                replay_result.unwrap_err(),
+                ContextError::PermissionDenied(_)
+            ),
+            "should return PermissionDenied for replayed proposal"
+        );
     }
 }
