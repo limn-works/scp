@@ -1036,11 +1036,7 @@ mod tests {
             },
         }];
 
-        cache.insert(
-            "alice".to_owned(),
-            results,
-            Duration::from_secs(3600),
-        );
+        cache.insert("alice".to_owned(), results, Duration::from_secs(3600));
 
         let cached = cache.get("alice").unwrap();
         assert_eq!(cached.len(), 1);

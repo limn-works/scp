@@ -788,7 +788,12 @@ fn absence_proofs_identical() {
 
         for query_hash in &test_hashes {
             // Skip if the hash happens to be present (unlikely but possible).
-            if core_log.sorted_leaves().iter().map(|(h, _)| *h).any(|x| x == *query_hash) {
+            if core_log
+                .sorted_leaves()
+                .iter()
+                .map(|(h, _)| *h)
+                .any(|x| x == *query_hash)
+            {
                 continue;
             }
 
