@@ -154,10 +154,8 @@ impl CertificateData {
     /// Returns [`TlsError::Certificate`] if the expiry cannot be determined.
     pub fn needs_renewal(&self) -> Result<bool, TlsError> {
         let expiry = self.expiry_timestamp()?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| TlsError::Certificate(format!("system time error: {e}")))?
-            .as_secs()
+        let now = scp_core::time::now_secs()
+            .map_err(|e| TlsError::Certificate(format!("{e}")))?
             .cast_signed();
 
         let threshold = RENEWAL_THRESHOLD_DAYS * 24 * 60 * 60;
@@ -734,10 +732,7 @@ mod tests {
     fn expiry_timestamp_is_in_future() {
         let cert = generate_self_signed("test.example.com").unwrap();
         let expiry = cert.expiry_timestamp().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = scp_core::time::now_secs().expect("clock unavailable in test") as i64;
         assert!(expiry > now, "self-signed cert should expire in the future");
     }
 

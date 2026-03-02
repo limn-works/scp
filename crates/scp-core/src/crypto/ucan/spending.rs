@@ -1403,10 +1403,7 @@ mod tests {
 
     /// Helper to build a spending UCAN token for testing.
     fn make_spending_token(cap: &SpendingCapability, scope_uri: &str) -> UcanToken {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = crate::time::now_secs().expect("clock unavailable in test");
 
         UcanToken {
             header: super::super::UcanHeader::new(),
@@ -1591,10 +1588,7 @@ mod tests {
 
         // Use budget tracker to enforce limits.
         let mut tracker = BudgetTracker::new(validated_cap);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = crate::time::now_secs().expect("clock unavailable in test");
 
         // Spend 1000 three times (total 3000 = max_total).
         assert!(

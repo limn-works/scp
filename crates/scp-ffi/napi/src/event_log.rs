@@ -123,14 +123,12 @@ pub async fn event_log_query(
     .to_string();
 
     #[allow(clippy::cast_precision_loss)]
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let timestamp = scp_core::time::now_secs()
         .map_err(|e| ScpNapiError::Context {
-            message: format!("system clock error: {e}"),
+            message: format!("{e}"),
             code: "SCP-CTX-2023".to_owned(),
         })
-        .map_err(napi::Error::from)?
-        .as_secs() as f64;
+        .map_err(napi::Error::from)? as f64;
 
     let summary_event = NapiEvent {
         event_type: "LogSummary".to_owned(),

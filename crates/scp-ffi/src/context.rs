@@ -498,10 +498,8 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
             }
         };
 
-        let last_seen = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| PyRuntimeError::new_err(format!("system clock error: {e}")))?
-            .as_secs();
+        let last_seen =
+            scp_core::time::now_secs().map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
         let known = crate::runtime::KnownContext {
             routing_id,
@@ -709,13 +707,8 @@ fn py_context_send(
 
     let rt = crate::runtime()?;
     crate::runtime::with_identity(&identity_did_owned, |entry| {
-        #[allow(clippy::cast_possible_truncation)] // Unix ms timestamps fit in u64 for centuries.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| {
-                crate::error::ScpPyError::ContextError(format!("system clock error: {e}"))
-            })?
-            .as_millis() as u64;
+        let now_ms = scp_core::time::now_millis()
+            .map_err(|e| crate::error::ScpPyError::ContextError(format!("{e}")))?;
 
         let inner_result = rt.block_on(async {
             let params = scp_core::envelope::InnerEnvelopeParams {

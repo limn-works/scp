@@ -173,11 +173,13 @@ fn deterministic_id(counter: u64) -> [u8; 32] {
 }
 
 /// Returns the current unix timestamp in seconds.
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+///
+/// # Errors
+///
+/// Returns [`PaymentError::AdapterError`] if the system clock is unavailable.
+fn now_secs() -> Result<u64, PaymentError> {
+    scp_core::time::now_secs()
+        .map_err(|e| PaymentError::AdapterError(format!("clock error: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +267,7 @@ impl PaymentAdapter for TestAdapter {
         );
 
         drop(ledger);
-        let ts = now_secs();
+        let ts = now_secs()?;
 
         Ok(PaymentAuthorization {
             auth_id,
@@ -332,7 +334,7 @@ impl PaymentAdapter for TestAdapter {
             context_id: None,
             adapter_id: "test".to_owned(),
             adapter_proof,
-            timestamp: now_secs(),
+            timestamp: now_secs()?,
             signature: Vec::new(), // Test adapter: no real signature.
         };
 
@@ -415,7 +417,7 @@ impl PaymentAdapter for TestAdapter {
             adapter_id: "test".to_owned(),
             verified_amount: receipt.amount,
             verified_currency: receipt.currency,
-            verification_timestamp: now_secs(),
+            verification_timestamp: now_secs()?,
         })
     }
 
