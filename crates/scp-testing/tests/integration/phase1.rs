@@ -488,6 +488,96 @@ async fn native_relay_adapter_send_receive_roundtrip() {
     assert_eq!(got.encrypted_blob, outer.encrypted_blob);
 }
 
+/// Integration test: ws:// relay connection with provenance-based validation (SCP-234, AC7).
+///
+/// Tests that the `connect_sourced` path:
+/// 1. Permits ws:// from DHT-resolved sources (self-hosted relay behind NAT)
+/// 2. Rejects ws:// from non-DHT sources at runtime (not just in unit tests)
+/// 3. Delivers messages end-to-end over a ws:// relay when provenance is valid
+///
+/// This ensures `validate_relay_url` is wired into the actual connection path,
+/// not just exercised in isolation by unit tests.
+#[tokio::test]
+async fn ws_relay_connect_sourced_validation_scp234() {
+    use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+    let relay_addr = start_relay().await;
+    let relay_url = format!("ws://{relay_addr}/scp/v1");
+
+    // --- 1. ws:// from DhtResolved is permitted and delivers messages ---
+    let dht_sourced = SourcedRelayUrl {
+        url: relay_url.clone(),
+        source: RelayUrlSource::DhtResolved,
+    };
+
+    let send_adapter = NativeRelayAdapter::connect_sourced(&dht_sourced)
+        .await
+        .expect("ws:// from DhtResolved should be permitted");
+    let recv_adapter = NativeRelayAdapter::connect_sourced(&dht_sourced)
+        .await
+        .expect("ws:// from DhtResolved should be permitted");
+
+    // Create a minimal outer envelope for transport testing.
+    let routing_id = [0xBB; 32];
+    let outer = scp_core::envelope::outer::create_outer_envelope(
+        &routing_id,
+        None,
+        3600,
+        vec![0x10, 0x20, 0x30],
+    )
+    .unwrap();
+
+    // Subscribe first, then send.
+    let routing = RoutingId::new(routing_id);
+    let mut stream = recv_adapter.subscribe(&routing, None).await.unwrap();
+
+    let blob_id = send_adapter.send(&outer).await.unwrap();
+    assert_eq!(blob_id.as_bytes().len(), 32, "blob_id must be 32 bytes");
+
+    // Receive the envelope — proves end-to-end delivery over ws://.
+    let got = receive_envelope(&mut stream).await;
+    assert_eq!(got.routing_id, outer.routing_id);
+    assert_eq!(got.encrypted_blob, outer.encrypted_blob);
+
+    // --- 2. ws:// from WellKnown is rejected at runtime ---
+    let wellknown_sourced = SourcedRelayUrl {
+        url: relay_url.clone(),
+        source: RelayUrlSource::WellKnown,
+    };
+    let result = NativeRelayAdapter::connect_sourced(&wellknown_sourced).await;
+    assert!(
+        result.is_err(),
+        "ws:// from WellKnown must be rejected at runtime"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("ws://") && err.contains("WellKnown"),
+        "error must describe the rejection reason, got: {err}"
+    );
+
+    // --- 3. ws:// from Explicit is rejected at runtime ---
+    let explicit_sourced = SourcedRelayUrl {
+        url: relay_url.clone(),
+        source: RelayUrlSource::Explicit,
+    };
+    let result = NativeRelayAdapter::connect_sourced(&explicit_sourced).await;
+    assert!(
+        result.is_err(),
+        "ws:// from Explicit must be rejected at runtime"
+    );
+
+    // --- 4. ws:// from PeerDiscovered is rejected at runtime ---
+    let peer_sourced = SourcedRelayUrl {
+        url: relay_url,
+        source: RelayUrlSource::PeerDiscovered,
+    };
+    let result = NativeRelayAdapter::connect_sourced(&peer_sourced).await;
+    assert!(
+        result.is_err(),
+        "ws:// from PeerDiscovered must be rejected at runtime"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
