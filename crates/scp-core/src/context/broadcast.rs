@@ -2345,4 +2345,70 @@ mod tests {
         let pre_block_still_ok = open_broadcast(&pre_block_key, &pre_block_envelope).unwrap();
         assert_eq!(pre_block_still_ok, pre_block_msg);
     }
+
+    // =======================================================================
+    // Broadcast MemberJoined event log persistence
+    // =======================================================================
+
+    /// Verifies that a `MemberJoined` event produced by
+    /// `BroadcastContext::subscribe` can be persisted to an `EventLog` via
+    /// `append_unsigned_event`, maintaining hash-chain integrity and a
+    /// non-zero Merkle root.
+    ///
+    /// This is an integration smoke test bridging the broadcast subscription
+    /// layer (spec section 5.14.3) with the event log layer (ADR-011).
+    #[test]
+    fn broadcast_subscribe_member_joined_persists_to_event_log() {
+        use crate::context::membership::ContextEvent;
+        use crate::event_log::tree::{append_unsigned_event, event_count, root, GENESIS_PREV_HASH};
+        use crate::event_log::{Event, EventLog, EventPayload, EventType};
+
+        // 1. Create an open broadcast context and subscribe a DID.
+        let mut ctx = make_open_ctx();
+        let subscriber_did = "did:example:subscriber-1";
+        let result = subscribe_open(&mut ctx, subscriber_did, None, 1_700_000_000).unwrap();
+
+        // 2. Verify the subscription produced a MemberJoined event.
+        assert!(
+            matches!(
+                &result.event,
+                ContextEvent::MemberJoined {
+                    member_did,
+                    role_name,
+                } if member_did.0 == subscriber_did && role_name == "subscriber"
+            ),
+            "subscribe must produce MemberJoined with role 'subscriber'"
+        );
+
+        // 3. Convert the ContextEvent into an event-log Event.
+        //    In production, ContextManager would do this conversion and sign
+        //    the event. Here we use append_unsigned_event (the MCP FFI path).
+        let event = Event {
+            event_type: EventType::MemberJoined,
+            actor_did: DID(subscriber_did.to_owned()),
+            timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: EventPayload {
+                data: b"role:subscriber".to_vec(),
+            },
+            prev_hash: GENESIS_PREV_HASH,
+            signature: Vec::new(),
+        };
+
+        // 4. Create an EventLog and append the unsigned event.
+        let mut log = EventLog::new("ctx-broadcast-1".to_owned());
+        let leaf_index = append_unsigned_event(&mut log, &event).unwrap();
+        assert_eq!(leaf_index, 0, "first event should be at index 0");
+
+        // 5. Verify the event log has exactly 1 entry.
+        assert_eq!(event_count(&log), 1, "event log should contain 1 event");
+
+        // 6. Verify the Merkle root is non-zero (a real commitment exists).
+        let merkle_root = root(&log);
+        assert_ne!(
+            merkle_root,
+            [0u8; 32],
+            "Merkle root must be non-zero after appending an event"
+        );
+    }
 }
