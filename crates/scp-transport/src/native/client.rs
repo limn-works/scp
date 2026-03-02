@@ -397,7 +397,9 @@ impl NativeRelayClient {
             }
 
             // PONG is handled silently (keepalive acknowledged).
-            RelayMessage::Pong { .. } => {}
+            // BRIDGE_DATA is forwarded to the bridge service layer (if present);
+            // the native relay client does not handle bridge data directly.
+            RelayMessage::Pong { .. } | RelayMessage::BridgeData { .. } => {}
         }
     }
 
@@ -834,7 +836,9 @@ fn assign_ref_id(msg: &mut ClientMessage, ref_id: &str) {
         | ClientMessage::Subscribe { ref_id: r, .. }
         | ClientMessage::Unsubscribe { ref_id: r, .. }
         | ClientMessage::Query { ref_id: r, .. }
-        | ClientMessage::Delete { ref_id: r, .. } => {
+        | ClientMessage::Delete { ref_id: r, .. }
+        | ClientMessage::BridgeRegister { ref_id: r, .. }
+        | ClientMessage::BridgeData { ref_id: r, .. } => {
             *r = Some(ref_id.to_string());
         }
         ClientMessage::Ack { .. } | ClientMessage::Ping { .. } => {

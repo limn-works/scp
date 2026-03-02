@@ -46,6 +46,16 @@ pub mod code {
     /// The client has too many active subscriptions on this connection.
     pub const TOO_MANY_SUBSCRIPTIONS: u16 = 4021;
 
+    /// The relay does not support the BRIDGE operation (section 10.12.4).
+    /// The client should try a different relay that has `supports_bridge: true`.
+    pub const BRIDGE_NOT_SUPPORTED: u16 = 4030;
+
+    /// The bridge registration limit has been exceeded for this connection.
+    pub const BRIDGE_LIMIT_EXCEEDED: u16 = 4031;
+
+    /// The target routing ID is not registered on this bridge relay.
+    pub const BRIDGE_TARGET_NOT_FOUND: u16 = 4032;
+
     // -----------------------------------------------------------------------
     // Server errors (5xxx) -- retry with backoff or switch relay
     // -----------------------------------------------------------------------
@@ -113,6 +123,9 @@ mod tests {
             code::LIMIT_EXCEEDED,
             code::RATE_LIMITED,
             code::TOO_MANY_SUBSCRIPTIONS,
+            code::BRIDGE_NOT_SUPPORTED,
+            code::BRIDGE_LIMIT_EXCEEDED,
+            code::BRIDGE_TARGET_NOT_FOUND,
         ];
 
         for c in client_codes {
@@ -174,6 +187,9 @@ mod tests {
         assert_eq!(code::LIMIT_EXCEEDED, 4012);
         assert_eq!(code::RATE_LIMITED, 4020);
         assert_eq!(code::TOO_MANY_SUBSCRIPTIONS, 4021);
+        assert_eq!(code::BRIDGE_NOT_SUPPORTED, 4030);
+        assert_eq!(code::BRIDGE_LIMIT_EXCEEDED, 4031);
+        assert_eq!(code::BRIDGE_TARGET_NOT_FOUND, 4032);
         assert_eq!(code::INTERNAL_ERROR, 5000);
         assert_eq!(code::STORAGE_FULL, 5001);
         assert_eq!(code::SHUTTING_DOWN, 5002);
