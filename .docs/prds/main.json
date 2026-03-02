@@ -10270,7 +10270,7 @@
       "gate": "gate-audit",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "blockedBy": [
         "SCP-224"
       ],
@@ -10278,7 +10278,7 @@
         "crates/scp-core/src/context/broadcast.rs",
         "crates/scp-core/src/context/mod.rs"
       ],
-      "description": "With broadcast key lifecycle implemented (SCP-224), this story adds subscriber registration (\u00a75.14.3), open vs. gated admission (\u00a75.14.4), broadcast-specific blocking via sender key revocation (\u00a75.14.8), broadcast capabilities and routing (\u00a75.14.6, \u00a75.14.9), and an integration test proving end-to-end: author publishes, N subscribers receive.",
+      "description": "With broadcast key lifecycle implemented (SCP-224), this story adds subscriber registration (\u00a75.14.3), open vs. gated admission (\u00a75.14.4), broadcast-specific blocking via sender key revocation (\u00a75.14.8), broadcast capabilities and routing (\u00a75.14.6, \u00a75.14.9), and an integration test proving end-to-end: author publishes, N subscribers receive. Module-level implementation is complete: subscribe, unsubscribe, publish with capability enforcement, block, key request, and integration tests all pass. ContextManager wiring is in progress (separate PR). Related PRs: #165, #180, #190, #218, #219.",
       "acceptanceCriteria": [
         "subscribe_broadcast(context_id, subscriber_did) registers subscriber and returns current author key epoch",
         "Open broadcast: any DID can subscribe without UCAN per \u00a75.14.4",
