@@ -1,36 +1,18 @@
-//! Verifiable event log (Merkle tree) for SCP contexts.
+//! Event log adapter for SCP contexts.
 //!
-//! This module re-exports the standalone [`scp_event_log`] crate for full
-//! backward compatibility. All types, functions, and submodules are available
-//! at their original paths (`crate::event_log::*`).
+//! Re-exports removed — import directly from [`scp_event_log`].
+//! SCP has not shipped, so no backward compatibility is needed.
 //!
 //! The `KeyCustodySigner` adapter bridges `scp-platform`'s `KeyCustody`/`KeyHandle`
-//! to the [`EventLogSigner`] trait defined in `scp-event-log`.
+//! to the [`EventLogSigner`](scp_event_log::EventLogSigner) trait defined in `scp-event-log`.
 //!
 //! See ADR-011 in `.docs/adrs/phase-2.md` for the full design.
-
-// Re-export all public items from scp-event-log.
-pub use scp_event_log::checkpoint;
-pub use scp_event_log::metrics;
-pub use scp_event_log::proof;
-pub use scp_event_log::pruning;
-pub use scp_event_log::tiered_storage;
-pub use scp_event_log::tree;
-pub use scp_event_log::{
-    ContextId, DID, Ed25519Signature, Event, EventLog, EventLogError, EventLogSigner, EventPayload,
-    EventType,
-};
-
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-pub(crate) mod test_helpers {
-    pub use scp_event_log::test_helpers::*;
-}
 
 // ---------------------------------------------------------------------------
 // KeyCustodySigner adapter
 // ---------------------------------------------------------------------------
 
+use scp_event_log::EventLogSigner;
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
 /// Adapter bridging `scp-platform`'s [`KeyCustody`]/[`KeyHandle`] to the

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     CatchUpStatus, ContextId, Ed25519Signature, OfflineTier, SyncError, SyncOutcome, SyncPolicy,
 };
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // RelayMessageBuffer

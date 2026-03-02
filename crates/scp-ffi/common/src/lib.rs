@@ -11,7 +11,7 @@ use scp_core::crypto::ucan::UcanToken;
 use scp_core::crypto::ucan::validate::{
     DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
 };
-use scp_core::identity::cache::Clock;
+use scp_identity::cache::Clock;
 
 // ---------------------------------------------------------------------------
 // BridgeDidResolver

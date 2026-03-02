@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::adapter::{PaymentError, PaymentReceipt, VerificationResult};
-use crate::event_log::{Event, EventType};
+use scp_event_log::{Event, EventType};
 
 // ---------------------------------------------------------------------------
 // PaymentVerifier
@@ -134,8 +134,8 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
 mod tests {
     use super::*;
     use crate::economy::types::{Amount, CurrencyCode, PaidActionType};
-    use crate::event_log::{EventPayload, EventType};
-    use crate::identity::DID;
+    use scp_event_log::{EventPayload, EventType};
+    use scp_identity::DID;
 
     /// Creates a test `PaymentReceipt`.
     fn make_receipt(payer: &str, payee: &str, amount: u64, timestamp: u64) -> PaymentReceipt {

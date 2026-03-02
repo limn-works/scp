@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::roles::{Capability, CapabilityCeiling};
-use crate::identity::DID;
+use scp_identity::DID;
 
 /// Context identifier (string alias used throughout the context module).
 pub type ContextId = String;

@@ -430,7 +430,7 @@ mod tests {
         Coefficient, PricingFormula, PricingMetric, PricingVariable, SubscriptionCost,
         SubscriptionPeriod,
     };
-    use crate::identity::DID;
+    use scp_identity::DID;
 
     // --- Helpers ---
 

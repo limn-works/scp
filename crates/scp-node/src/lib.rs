@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use scp_core::identity::document::DidDocument;
-use scp_core::identity::{DidMethod, IdentityError, ScpIdentity};
+use scp_identity::document::DidDocument;
+use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
@@ -843,10 +843,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use scp_core::identity::DidCache;
-    use scp_core::identity::cache::SystemClock;
-    use scp_core::identity::dht::DidDht;
-    use scp_core::identity::dht_client::InMemoryDhtClient;
+    use scp_identity::DidCache;
+    use scp_identity::cache::SystemClock;
+    use scp_identity::dht::DidDht;
+    use scp_identity::dht_client::InMemoryDhtClient;
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
     /// The concrete `DidDht` type used in tests (with in-memory DHT and system clock).

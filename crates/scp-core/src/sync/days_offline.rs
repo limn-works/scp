@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome, SyncPolicy};
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // Constants

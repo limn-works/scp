@@ -19,8 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DID;
 use crate::provenance::DataProvenance;
+use scp_identity::DID;
 
 /// Type alias for tool invocation provenance.
 ///

@@ -39,12 +39,10 @@ use scp_core::context::{
     ContextHandle, ContextParams, ContextState, MemoryScope, RoleDefinition as ParamsRoleDef,
     ToolRegistration as ParamsToolReg,
 };
-use scp_core::event_log::checkpoint::{
-    CheckpointComparison, compare_checkpoint, generate_checkpoint,
-};
-use scp_core::event_log::tree::{self, GENESIS_PREV_HASH};
-use scp_core::event_log::{Event, EventLog, EventPayload, EventType};
-use scp_core::identity::DID;
+use scp_event_log::checkpoint::{CheckpointComparison, compare_checkpoint, generate_checkpoint};
+use scp_event_log::tree::{self, GENESIS_PREV_HASH};
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
+use scp_identity::DID;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 

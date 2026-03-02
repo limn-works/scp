@@ -22,8 +22,8 @@ use dashmap::DashMap;
 use scp_core::context::roles::default_ceiling;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
-use scp_core::event_log::EventLog;
-use scp_core::identity::cache::SystemClock;
+use scp_event_log::EventLog;
+use scp_identity::cache::SystemClock;
 
 use crate::bridge::ScpError;
 

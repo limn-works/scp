@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::economy::types::{Amount, CurrencyCode, PaymentAdapterRef};
-use crate::identity::DidMethod;
+use scp_identity::DidMethod;
 
 /// The `.well-known/scp` JSON document.
 ///
@@ -318,8 +318,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::identity::document::{DidDocument, Service};
-    use crate::identity::{DidMethod, IdentityError, ScpIdentity};
+    use scp_identity::document::{DidDocument, Service};
+    use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 
     use scp_platform::traits::KeyCustody;
 

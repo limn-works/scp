@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::event_log::{ContextId, Event, EventType};
-use crate::identity::DID;
+use scp_event_log::{ContextId, Event, EventType};
+use scp_identity::DID;
 
 use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolId, TrustError};
 
@@ -259,7 +259,7 @@ fn extract_target_did_from_payload(data: &[u8]) -> Option<DID> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::event_log::EventPayload;
+    use scp_event_log::EventPayload;
 
     /// Creates a test event with the given parameters. The signature and
     /// `prev_hash` are set to dummy values since `compute_behavioral_record`

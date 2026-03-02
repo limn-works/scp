@@ -1254,7 +1254,7 @@ mod tests {
             },
             payment_adapters: vec!["x402".to_owned()],
             pricing_formula: None,
-            payee: crate::identity::DID::from("did:dht:z6MkTestPayee"),
+            payee: scp_identity::DID::from("did:dht:z6MkTestPayee"),
         }
     }
 
@@ -1276,7 +1276,7 @@ mod tests {
             },
             payment_adapters: vec!["x402".to_owned()],
             pricing_formula: None,
-            payee: crate::identity::DID::from("did:dht:z6MkTestPayee"),
+            payee: scp_identity::DID::from("did:dht:z6MkTestPayee"),
         }
     }
 

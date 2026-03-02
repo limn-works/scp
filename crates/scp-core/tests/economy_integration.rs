@@ -50,11 +50,11 @@ use scp_core::economy::types::{
     Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
     PricingFormula, PricingMetric, PricingVariable,
 };
-use scp_core::event_log::proof::{prove_inclusion, verify_inclusion};
-use scp_core::event_log::tree;
-use scp_core::event_log::{Event, EventLog, EventPayload, EventType};
-use scp_core::identity::DID;
 use scp_core::well_known::{RelayConfig, RelayEconomicConfig, WellKnownScp};
+use scp_event_log::proof::{prove_inclusion, verify_inclusion};
+use scp_event_log::tree;
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
+use scp_identity::DID;
 
 // ===========================================================================
 // Test adapter -- in-memory, no real money, for integration tests

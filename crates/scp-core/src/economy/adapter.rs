@@ -14,7 +14,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 use super::types::{Amount, CurrencyCode, PaidActionType};
 

@@ -22,8 +22,8 @@
 
 use std::collections::HashMap;
 
-use crate::event_log::Event;
-use crate::identity::cache::Clock;
+use scp_event_log::Event;
+use scp_identity::cache::Clock;
 
 use super::attestation::{
     Attestation, AttestorInfo, DidPublicKeyResolver, FreshnessStatus, ThresholdRequirement,
@@ -450,9 +450,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::event_log::{EventPayload, EventType};
-    use crate::identity::cache::TestClock;
     use crate::trust::attestation::RevocationStatus;
+    use scp_event_log::{EventPayload, EventType};
+    use scp_identity::cache::TestClock;
 
     // -----------------------------------------------------------------------
     // Test helpers: InMemoryTrustStore

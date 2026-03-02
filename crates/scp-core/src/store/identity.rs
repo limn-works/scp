@@ -13,7 +13,7 @@
 
 use scp_platform::traits::Storage;
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 use super::{ProtocolStore, StoreError};
 

@@ -24,9 +24,9 @@ use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
 use scp_core::context::tools::schema;
-use scp_core::event_log::proof as core_proof;
-use scp_core::event_log::tree as core_tree;
-use scp_core::event_log::{Event, EventLog, EventPayload, EventType};
+use scp_event_log::proof as core_proof;
+use scp_event_log::tree as core_tree;
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
 
 // ===========================================================================
 // WASM algorithm mirror (verbatim from scp-ffi-wasm/src/runtime.rs)

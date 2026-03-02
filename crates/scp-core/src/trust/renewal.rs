@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use super::TrustError;
 use super::attestation::{Attestation, DidPublicKeyResolver, verify_attestation};
-use crate::identity::cache::Clock;
+use scp_identity::cache::Clock;
 
 // ---------------------------------------------------------------------------
 // RenewalError
@@ -186,9 +186,9 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
-    use crate::identity::cache::TestClock;
     use crate::trust::AttestationType;
     use crate::trust::attestation::{RevocationStatus, canonical_attestation_bytes};
+    use scp_identity::cache::TestClock;
 
     struct TestResolver {
         keys: HashMap<String, Vec<u8>>,

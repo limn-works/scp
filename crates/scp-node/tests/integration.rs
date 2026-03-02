@@ -18,12 +18,12 @@ use hyper::Request;
 use tower::ServiceExt;
 
 use scp_core::context::ContextMode;
-use scp_core::identity::cache::SystemClock;
-use scp_core::identity::dht::DidDht;
-use scp_core::identity::dht_client::InMemoryDhtClient;
-use scp_core::identity::{DidCache, DidMethod};
 use scp_core::uri::ScpUri;
 use scp_core::well_known::WellKnownScp;
+use scp_identity::cache::SystemClock;
+use scp_identity::dht::DidDht;
+use scp_identity::dht_client::InMemoryDhtClient;
+use scp_identity::{DidCache, DidMethod};
 use scp_node::ApplicationNodeBuilder;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::protocol::{ClientMessage, RelayMessage};

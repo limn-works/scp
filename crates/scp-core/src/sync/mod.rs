@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // Type aliases for domain clarity
@@ -70,7 +70,7 @@ pub type Ed25519Signature = Vec<u8>;
 /// trading chat needs different sync tuning than a weekly project standup.
 /// `SyncPolicy` extracts the hardcoded constants from ADR-029 into a
 /// configurable struct, following the same pattern as
-/// [`CheckpointPolicy`](crate::event_log::checkpoint::CheckpointPolicy).
+/// [`CheckpointPolicy`](scp_event_log::checkpoint::CheckpointPolicy).
 ///
 /// Use [`SyncPolicy::default()`] for the standard ADR-029 values. Use the
 /// `with_*` builder methods for per-context customization.

@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::event_log::{Event, EventType};
-use crate::identity::DID;
+use scp_event_log::{Event, EventType};
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // ConsequenceTrigger
@@ -273,7 +273,7 @@ fn payload_starts_with(data: &[u8], prefix: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::event_log::EventPayload;
+    use scp_event_log::EventPayload;
 
     /// Creates a test event with the given parameters. Signature and `prev_hash`
     /// are set to dummy values since `evaluate_consequence_rules` does not

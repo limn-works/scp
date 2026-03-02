@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{UcanError, UcanPayload};
-use crate::event_log::ContextId;
+use scp_event_log::ContextId;
 
 /// Default TTL for revocation propagation: 30 seconds.
 ///

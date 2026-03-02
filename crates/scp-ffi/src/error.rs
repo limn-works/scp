@@ -141,8 +141,8 @@ impl From<ScpPyError> for PyErr {
 
 // Identity errors → ScpPyError::IdentityError
 
-impl From<scp_core::identity::IdentityError> for ScpPyError {
-    fn from(e: scp_core::identity::IdentityError) -> Self {
+impl From<scp_identity::IdentityError> for ScpPyError {
+    fn from(e: scp_identity::IdentityError) -> Self {
         Self::IdentityError(format!(
             "{e} — check DID format, key custody configuration, or DHT connectivity"
         ))
@@ -265,8 +265,8 @@ impl From<scp_core::envelope::EnvelopeError> for ScpPyError {
 
 // Event log errors → ScpPyError::ContextError (event logs belong to contexts)
 
-impl From<scp_core::event_log::EventLogError> for ScpPyError {
-    fn from(e: scp_core::event_log::EventLogError) -> Self {
+impl From<scp_event_log::EventLogError> for ScpPyError {
+    fn from(e: scp_event_log::EventLogError) -> Self {
         Self::ContextError(format!(
             "event log operation failed: {e} — verify log integrity and sequence numbers"
         ))

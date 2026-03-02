@@ -16,7 +16,7 @@
 use scp_platform::traits::Storage;
 
 use crate::economy::credentials::{AdapterCredential, AdapterCredentialStore, CredentialError};
-use crate::identity::DID;
+use scp_identity::DID;
 
 use super::{ProtocolStore, StoreError};
 

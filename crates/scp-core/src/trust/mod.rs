@@ -65,7 +65,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 // Re-export all public types from submodules.
 pub use attestation::{

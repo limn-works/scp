@@ -21,7 +21,7 @@ use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
 use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use super::{ContextError, ContextHandle, ContextParams, ContextState};
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // PerContextState -- internal per-context tracking

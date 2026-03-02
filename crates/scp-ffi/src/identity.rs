@@ -15,12 +15,12 @@
 //! # Opaque types
 //!
 //! [`PyIdentity`] stores the DID string and custody type — NOT the raw
-//! [`ScpIdentity`](scp_core::identity::ScpIdentity), which contains
+//! [`ScpIdentity`](scp_identity::ScpIdentity), which contains
 //! [`KeyHandle`](scp_platform::KeyHandle)s that are not safe to hold across
 //! Python GIL boundaries. Crypto operations reconstruct state from stored
 //! metadata when the full runtime is wired.
 //!
-//! [`PyDIDDocument`] wraps [`DidDocument`](scp_core::identity::DidDocument)
+//! [`PyDIDDocument`] wraps [`DidDocument`](scp_identity::DidDocument)
 //! and exposes safe getters for the document's public fields.
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` for the full specification.
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use scp_core::identity::{DidDht, DidDocument, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidDocument, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
 

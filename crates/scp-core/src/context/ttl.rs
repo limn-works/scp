@@ -50,8 +50,8 @@ use super::membership::ContextEvent;
 use super::params::GovernanceModel;
 use super::roles::{self, ContextRoleState};
 use super::{ContextError, ContextHandle, ContextState, MemoryScope};
-use crate::identity::DID;
-use crate::identity::cache::Clock;
+use scp_identity::DID;
+use scp_identity::cache::Clock;
 
 // ---------------------------------------------------------------------------
 // context_id_to_bytes helper (mirrors manager.rs)
@@ -791,7 +791,7 @@ mod tests {
     };
     use crate::context::params::ContextParams;
     use crate::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-    use crate::identity::cache::TestClock;
+    use scp_identity::cache::TestClock;
 
     #[derive(Default)]
     struct MockCrypto {

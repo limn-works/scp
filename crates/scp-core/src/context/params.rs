@@ -459,7 +459,7 @@ mod tests {
             Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PricingFormula,
             PricingMetric, PricingVariable,
         };
-        use crate::identity::DID;
+        use scp_identity::DID;
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
