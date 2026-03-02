@@ -214,16 +214,29 @@ pub trait ChallengeSigner {
 }
 
 // ---------------------------------------------------------------------------
+// Domain separators (issue #78)
+// ---------------------------------------------------------------------------
+
+/// Domain separator for challenge request canonical bytes.
+const DOMAIN_CHALLENGE_REQ_V1: &[u8] = b"SCP-CHALLENGE-REQ-V1:";
+
+/// Domain separator for challenge response canonical bytes.
+const DOMAIN_CHALLENGE_RESP_V1: &[u8] = b"SCP-CHALLENGE-RESP-V1:";
+
+// ---------------------------------------------------------------------------
 // Canonical byte construction
 // ---------------------------------------------------------------------------
 
 /// Builds the canonical byte representation of a challenge request for signing.
 ///
-/// The canonical form is: `challenge_id || challenge_type || challenger_did
-/// || subject_did || parameters || timeout_secs`. This ensures signatures
-/// cover all semantically meaningful fields.
+/// The canonical form is: `"SCP-CHALLENGE-REQ-V1:" || challenge_id
+/// || challenge_type || challenger_did || subject_did || parameters
+/// || timeout_secs`. The domain separator prevents cross-protocol signature
+/// confusion. This ensures signatures cover all semantically meaningful
+/// fields.
 fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(DOMAIN_CHALLENGE_REQ_V1);
     bytes.extend_from_slice(request.challenge_id.as_bytes());
     bytes.extend_from_slice(challenge_type_tag(&request.challenge_type).as_bytes());
     bytes.extend_from_slice(request.challenger_did.as_bytes());
@@ -240,11 +253,13 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
 
 /// Builds the canonical byte representation of a challenge response for signing.
 ///
-/// The canonical form is: `challenge_id || responder_did || result ||
-/// completed_at`. This ensures signatures cover all semantically meaningful
-/// fields.
+/// The canonical form is: `"SCP-CHALLENGE-RESP-V1:" || challenge_id
+/// || responder_did || result || completed_at`. The domain separator
+/// prevents cross-protocol signature confusion. This ensures signatures
+/// cover all semantically meaningful fields.
 fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(DOMAIN_CHALLENGE_RESP_V1);
     bytes.extend_from_slice(response.challenge_id.as_bytes());
     bytes.extend_from_slice(response.responder_did.as_bytes());
 

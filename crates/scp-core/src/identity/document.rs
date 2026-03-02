@@ -409,15 +409,18 @@ pub struct DidRotationEvent {
 
 /// Proof that the old Identity Key authorized a migration to a new DID.
 ///
-/// The signature covers `SHA-256(old_did || new_did || rotated_at)` and is
-/// signed by the old Identity Key. This provides MODERATE assurance that the
-/// migration was authorized by the DID owner.
+/// The signature covers `SHA-256("SCP-MIGRATION-V1:" || old_did || new_did
+/// || rotated_at)` and is signed by the old Identity Key. This provides
+/// MODERATE assurance that the migration was authorized by the DID owner.
+/// The `SCP-MIGRATION-V1:` domain separator prevents cross-protocol
+/// signature confusion.
 ///
 /// See ADR-003 acceptance criterion 4c.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MigrationProof {
-    /// Ed25519 signature of `SHA-256(old_did || new_did || rotated_at)`
-    /// signed by the old Identity Key. Must be exactly 64 bytes (Ed25519).
+    /// Ed25519 signature of `SHA-256("SCP-MIGRATION-V1:" || old_did
+    /// || new_did || rotated_at)` signed by the old Identity Key. Must be
+    /// exactly 64 bytes (Ed25519).
     #[serde(with = "serde_signature_64")]
     pub signature: [u8; 64],
     /// The old Identity Key's public bytes, for verification without resolving

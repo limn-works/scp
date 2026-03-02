@@ -395,6 +395,10 @@ pub fn check_threshold_attestation(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Domain separator for attestation canonical bytes, preventing cross-protocol
+/// signature confusion. See issue #78.
+const DOMAIN_ATTESTATION_V1: &[u8] = b"SCP-ATTESTATION-V1:";
+
 /// Computes the canonical byte representation of an attestation for signing.
 ///
 /// ```text

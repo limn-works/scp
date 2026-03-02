@@ -240,6 +240,10 @@ fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
     )
 }
 
+/// Domain separator for event canonical hashes, preventing cross-protocol
+/// signature confusion. See issue #78.
+const DOMAIN_EVENT_V1: &[u8] = b"SCP-EVENT-V1:";
+
 /// Computes the canonical hash of an event for signature purposes.
 ///
 /// This is the content that must be signed by the actor's Ed25519 key.
@@ -285,7 +289,7 @@ pub fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
 ///
 /// Used in canonical hash computation. The tag values are protocol constants
 /// and must never change.
-const fn event_type_tag(event_type: &EventType) -> u16 {
+pub(crate) const fn event_type_tag(event_type: &EventType) -> u16 {
     match event_type {
         EventType::ContextCreated => 0,
         EventType::ContextClosing => 1,
