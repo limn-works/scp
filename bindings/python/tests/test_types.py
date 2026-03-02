@@ -27,9 +27,12 @@ from scp_sdk.errors import (
 from scp_sdk.tools import TestVector, ToolDefinition
 from scp_sdk.types import (
     Capability,
+    CeilingPolicy,
+    ContextMode,
     DiscoveryMethod,
     MemoryScope,
     Message,
+    PromotionPolicy,
     Provenance,
     ProvenanceQuality,
     SourceType,
@@ -368,6 +371,39 @@ class TestToolDefinition:
 # -----------------------------------------------------------------------
 # Enum tests
 # -----------------------------------------------------------------------
+
+
+class TestContextMode:
+    """Tests for the ContextMode enum (spec section 5.1)."""
+
+    def test_all_variants_exist(self) -> None:
+        assert ContextMode.ENCRYPTED.value == "encrypted"
+        assert ContextMode.BROADCAST.value == "broadcast"
+
+    def test_variant_count(self) -> None:
+        assert len(ContextMode) == 2
+
+
+class TestCeilingPolicy:
+    """Tests for the CeilingPolicy enum (spec section 5.3)."""
+
+    def test_all_variants_exist(self) -> None:
+        assert CeilingPolicy.IMMUTABLE.value == "immutable"
+        assert CeilingPolicy.GOVERNED.value == "governed"
+
+    def test_variant_count(self) -> None:
+        assert len(CeilingPolicy) == 2
+
+
+class TestPromotionPolicy:
+    """Tests for the PromotionPolicy enum (spec section 5.10)."""
+
+    def test_all_variants_exist(self) -> None:
+        assert PromotionPolicy.NO_PROMOTION.value == "no_promotion"
+        assert PromotionPolicy.PROMOTABLE.value == "promotable"
+
+    def test_variant_count(self) -> None:
+        assert len(PromotionPolicy) == 2
 
 
 class TestMemoryScope:

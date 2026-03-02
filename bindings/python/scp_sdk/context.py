@@ -26,7 +26,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from scp_sdk.errors import ContextError
-from scp_sdk.types import Capability, MemoryScope, Message
+from scp_sdk.types import (
+    Capability,
+    CeilingPolicy,
+    ContextMode,
+    MemoryScope,
+    Message,
+    PromotionPolicy,
+)
 
 if TYPE_CHECKING:
     from scp_sdk.identity import Identity
@@ -210,6 +217,11 @@ class Context:
         ttl: float | None = None,
         memory_scope: MemoryScope | str = MemoryScope.FULL,
         governance: str = "single_admin",
+        mode: ContextMode | str = ContextMode.ENCRYPTED,
+        ceiling_policy: CeilingPolicy | str = CeilingPolicy.IMMUTABLE,
+        promotion_policy: PromotionPolicy | str = PromotionPolicy.NO_PROMOTION,
+        template_id: str | None = None,
+        economic_policy: str | None = None,
         buffer_size: int = _DEFAULT_BUFFER_SIZE,
     ) -> Context:
         """Create a new SCP context.
@@ -228,6 +240,23 @@ class Context:
                 :attr:`MemoryScope.FULL`.
             governance: Governance model.  Defaults to
                 ``'single_admin'``.
+            mode: Context mode (spec section 5.1).  Accepts a
+                :class:`ContextMode` enum member or a raw string
+                (``'encrypted'``, ``'broadcast'``).  Defaults to
+                :attr:`ContextMode.ENCRYPTED`.
+            ceiling_policy: Ceiling mutability policy (spec section 5.3).
+                Accepts a :class:`CeilingPolicy` enum member or a raw
+                string (``'immutable'``, ``'governed'``).  Defaults to
+                :attr:`CeilingPolicy.IMMUTABLE`.
+            promotion_policy: Promotion policy (spec section 5.10).
+                Accepts a :class:`PromotionPolicy` enum member or a raw
+                string (``'no_promotion'``, ``'promotable'``).  Defaults
+                to :attr:`PromotionPolicy.NO_PROMOTION`.
+            template_id: Optional well-known template identifier
+                (spec section 5.14).  When present, all other fields
+                must match the template definition.
+            economic_policy: Optional economic policy as a JSON string
+                (spec section 19).  ``None`` means free context.
             buffer_size: Receive buffer capacity.  Defaults to 1,000.
                 Must be between 100 and 10,000.
 
@@ -250,6 +279,15 @@ class Context:
 
         ceiling_strs = [c.value if isinstance(c, Capability) else c for c in ceiling]
         scope_str = memory_scope.value if isinstance(memory_scope, MemoryScope) else memory_scope
+        mode_str = mode.value if isinstance(mode, ContextMode) else mode
+        ceiling_policy_str = (
+            ceiling_policy.value if isinstance(ceiling_policy, CeilingPolicy) else ceiling_policy
+        )
+        promotion_policy_str = (
+            promotion_policy.value
+            if isinstance(promotion_policy, PromotionPolicy)
+            else promotion_policy
+        )
 
         params: dict[str, Any] = {
             "ceiling": ceiling_strs,
@@ -258,6 +296,11 @@ class Context:
             "ttl": ttl,
             "memory_scope": scope_str,
             "governance": governance,
+            "mode": mode_str,
+            "ceiling_policy": ceiling_policy_str,
+            "promotion_policy": promotion_policy_str,
+            "template_id": template_id,
+            "economic_policy": economic_policy,
         }
 
         handle = _scp_core.py_context_create(creator.did, params)

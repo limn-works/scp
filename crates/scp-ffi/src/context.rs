@@ -43,12 +43,14 @@ use crate::validate;
 
 /// Opaque handle to an SCP context.
 ///
-/// Stores context metadata: unique ID, lifecycle state, and the DID of the
-/// context creator. The actual context runtime (MLS group, transport
-/// connections) lives in scp-core and will be connected in future stories.
+/// Stores context metadata: unique ID, lifecycle state, the DID of the
+/// context creator, and creation-time parameters. The actual context runtime
+/// (MLS group, transport connections) lives in scp-core and will be connected
+/// in future stories.
 ///
 /// Exposed to Python as `_scp_core.PyContextHandle` with read-only properties
-/// for `context_id` and `state`.
+/// for `context_id`, `state`, and spec §5.7 metadata (`mode`, `ceiling_policy`,
+/// `promotion_policy`, `template_id`, `economic_policy`).
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyContextHandle {
@@ -58,6 +60,8 @@ pub struct PyContextHandle {
     state: Arc<Mutex<String>>,
     /// DID of the context creator.
     creator_did: String,
+    /// Creation-time context parameters, retained for spec §5.7 metadata visibility.
+    params: PyContextParams,
 }
 
 #[pymethods]
@@ -86,14 +90,45 @@ impl PyContextHandle {
         &self.creator_did
     }
 
+    /// Returns the context mode: "encrypted" or "broadcast" (spec §5.1).
+    #[getter]
+    fn mode(&self) -> &str {
+        &self.params.mode
+    }
+
+    /// Returns the ceiling policy: "immutable" or "governed" (spec §5.3).
+    #[getter]
+    fn ceiling_policy(&self) -> &str {
+        &self.params.ceiling_policy
+    }
+
+    /// Returns the promotion policy: `"no_promotion"` or `"promotable"` (spec §5.10).
+    #[getter]
+    fn promotion_policy(&self) -> &str {
+        &self.params.promotion_policy
+    }
+
+    /// Returns the template ID if the context was created from a template, or `None`.
+    #[getter]
+    fn template_id(&self) -> Option<&str> {
+        self.params.template_id.as_deref()
+    }
+
+    /// Returns the economic policy as a JSON string, or `None` if the context
+    /// is free (no economic policy). See spec §19.
+    #[getter]
+    fn economic_policy(&self) -> Option<&str> {
+        self.params.economic_policy.as_deref()
+    }
+
     fn __repr__(&self) -> PyResult<String> {
         let state = self
             .state
             .lock()
             .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
         let repr = format!(
-            "PyContextHandle(context_id='{}', state='{}', creator_did='{}')",
-            self.context_id, *state, self.creator_did
+            "PyContextHandle(context_id='{}', state='{}', creator_did='{}', mode='{}')",
+            self.context_id, *state, self.creator_did, self.params.mode
         );
         drop(state);
         Ok(repr)
@@ -101,12 +136,13 @@ impl PyContextHandle {
 }
 
 impl PyContextHandle {
-    /// Creates a new handle in the "creating" state.
-    fn new(context_id: String, creator_did: String) -> Self {
+    /// Creates a new handle in the "creating" state with associated params.
+    fn new(context_id: String, creator_did: String, params: PyContextParams) -> Self {
         Self {
             context_id,
             state: Arc::new(Mutex::new("creating".to_owned())),
             creator_did,
+            params,
         }
     }
 }
@@ -124,6 +160,11 @@ impl PyContextHandle {
 /// - `ttl` -- float (seconds) or `None`
 /// - `memory_scope` -- string: "ephemeral", "summary", "full"
 /// - `governance` -- string: `"single_admin"`
+/// - `mode` -- string: "encrypted" (default), "broadcast" (spec §5.1)
+/// - `ceiling_policy` -- string: "immutable" (default), "governed" (spec §5.3)
+/// - `promotion_policy` -- string: `"no_promotion"` (default), `"promotable"` (spec §5.10)
+/// - `template_id` -- optional string: template identifier (spec §5.14)
+/// - `economic_policy` -- optional JSON string: economic policy (spec §19)
 ///
 /// Unrecognized keys are silently ignored. Missing keys use protocol defaults.
 #[pyclass]
@@ -141,6 +182,16 @@ pub struct PyContextParams {
     memory_scope: String,
     /// Governance model: `"single_admin"`.
     governance: String,
+    /// Context mode: "encrypted" (default) or "broadcast" (spec §5.1).
+    mode: String,
+    /// Ceiling policy: "immutable" (default) or "governed" (spec §5.3).
+    ceiling_policy: String,
+    /// Promotion policy: `"no_promotion"` (default) or `"promotable"` (spec §5.10).
+    promotion_policy: String,
+    /// Optional template identifier (spec §5.14).
+    template_id: Option<String>,
+    /// Optional economic policy as a JSON string (spec §19).
+    economic_policy: Option<String>,
 }
 
 #[pymethods]
@@ -150,7 +201,9 @@ impl PyContextParams {
     /// # Arguments
     ///
     /// * `params` -- A Python dict with optional keys: `ceiling`, `roles`,
-    ///   `tools`, `ttl`, `memory_scope`, `governance`.
+    ///   `tools`, `ttl`, `memory_scope`, `governance`, `mode`,
+    ///   `ceiling_policy`, `promotion_policy`, `template_id`,
+    ///   `economic_policy`.
     ///
     /// # Errors
     ///
@@ -192,14 +245,74 @@ impl PyContextParams {
         &self.governance
     }
 
+    /// Returns the context mode: "encrypted" or "broadcast" (spec §5.1).
+    #[getter]
+    fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    /// Returns the ceiling policy: "immutable" or "governed" (spec §5.3).
+    #[getter]
+    fn ceiling_policy(&self) -> &str {
+        &self.ceiling_policy
+    }
+
+    /// Returns the promotion policy: `"no_promotion"` or `"promotable"` (spec §5.10).
+    #[getter]
+    fn promotion_policy(&self) -> &str {
+        &self.promotion_policy
+    }
+
+    /// Returns the template ID, or `None` if the context was not created
+    /// from a template (spec §5.14).
+    #[getter]
+    fn template_id(&self) -> Option<&str> {
+        self.template_id.as_deref()
+    }
+
+    /// Returns the economic policy as a JSON string, or `None` if the context
+    /// is free (spec §19).
+    #[getter]
+    fn economic_policy(&self) -> Option<&str> {
+        self.economic_policy.as_deref()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, tools={:?}, ttl={:?}, \
-             memory_scope='{}', governance='{}')",
-            self.ceiling, self.roles, self.tools, self.ttl, self.memory_scope, self.governance
+             memory_scope='{}', governance='{}', mode='{}', ceiling_policy='{}', \
+             promotion_policy='{}', template_id={:?}, economic_policy={:?})",
+            self.ceiling,
+            self.roles,
+            self.tools,
+            self.ttl,
+            self.memory_scope,
+            self.governance,
+            self.mode,
+            self.ceiling_policy,
+            self.promotion_policy,
+            self.template_id,
+            self.economic_policy,
         )
     }
 }
+
+/// Valid template ID strings accepted from the Python bridge layer.
+///
+/// These correspond to the `TemplateId` variants in scp-core, using the
+/// exact serde serialization format: `PascalCase` for base templates, and
+/// `scp:template/<name>` URIs for variants with explicit `#[serde(rename)]`.
+const VALID_TEMPLATE_IDS: &[&str] = &[
+    "BilateralEphemeral",
+    "BilateralPersistent",
+    "Coordination",
+    "GroupDiscussion",
+    "PublicBroadcast",
+    "GatedBroadcast",
+    "scp:template/tool-interface",
+    "scp:template/paid-service",
+    "scp:template/paid-broadcast",
+];
 
 impl PyContextParams {
     /// Extracts context parameters from a Python dict using `PyO3`'s native
@@ -207,6 +320,7 @@ impl PyContextParams {
     ///
     /// This avoids depending on `crate::types::py_dict_to_json` (which may be
     /// implemented by a parallel subagent) and uses `PyO3` extraction directly.
+    #[allow(clippy::too_many_lines)] // Flat field-by-field extraction with validation.
     fn from_py_dict(dict: &Bound<'_, PyDict>) -> PyResult<Self> {
         // ceiling: list[str] (default: empty)
         let ceiling: Vec<String> = match dict.get_item("ceiling")? {
@@ -266,6 +380,81 @@ impl PyContextParams {
             None => "single_admin".to_owned(),
         };
 
+        // mode: str (default: "encrypted") -- spec §5.1
+        let mode: String = match dict.get_item("mode")? {
+            Some(val) => {
+                let m: String = val.extract()?;
+                match m.as_str() {
+                    "encrypted" | "broadcast" => m,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "invalid mode '{m}': expected 'encrypted' or 'broadcast'"
+                        )));
+                    }
+                }
+            }
+            None => "encrypted".to_owned(),
+        };
+
+        // ceiling_policy: str (default: "immutable") -- spec §5.3
+        let ceiling_policy: String = match dict.get_item("ceiling_policy")? {
+            Some(val) => {
+                let cp: String = val.extract()?;
+                match cp.as_str() {
+                    "immutable" | "governed" => cp,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "invalid ceiling_policy '{cp}': \
+                             expected 'immutable' or 'governed'"
+                        )));
+                    }
+                }
+            }
+            None => "immutable".to_owned(),
+        };
+
+        // promotion_policy: str (default: "no_promotion") -- spec §5.10
+        let promotion_policy: String = match dict.get_item("promotion_policy")? {
+            Some(val) => {
+                let pp: String = val.extract()?;
+                match pp.as_str() {
+                    "no_promotion" | "promotable" => pp,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "invalid promotion_policy '{pp}': \
+                             expected 'no_promotion' or 'promotable'"
+                        )));
+                    }
+                }
+            }
+            None => "no_promotion".to_owned(),
+        };
+
+        // template_id: Optional[str] (default: None) -- spec §5.14
+        let template_id: Option<String> = match dict.get_item("template_id")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => {
+                let tid: String = val.extract()?;
+                if !VALID_TEMPLATE_IDS.contains(&tid.as_str()) {
+                    return Err(PyValueError::new_err(format!(
+                        "invalid template_id '{tid}': expected one of {VALID_TEMPLATE_IDS:?}"
+                    )));
+                }
+                Some(tid)
+            }
+            None => None,
+        };
+
+        // economic_policy: Optional[str] (JSON string, default: None) -- spec §19
+        let economic_policy: Option<String> = match dict.get_item("economic_policy")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => {
+                let ep: String = val.extract()?;
+                Some(ep)
+            }
+            None => None,
+        };
+
         Ok(Self {
             ceiling,
             roles,
@@ -273,6 +462,11 @@ impl PyContextParams {
             ttl,
             memory_scope,
             governance,
+            mode,
+            ceiling_policy,
+            promotion_policy,
+            template_id,
+            economic_policy,
         })
     }
 }
@@ -444,7 +638,7 @@ impl PyMessageReceiver {
 fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult<PyContextHandle> {
     validate::validate_did(identity_did)?;
     // Validate params eagerly (before any async work).
-    let _parsed = PyContextParams::from_py_dict(params)?;
+    let parsed = PyContextParams::from_py_dict(params)?;
 
     // Generate a context ID using cryptographic randomness. In the full
     // runtime this would come from scp-core's builder flow (MLS group
@@ -452,7 +646,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     // for embedding in scp://context/<id> URIs.
     let context_id = crate::types::generate_context_id();
 
-    let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned());
+    let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned(), parsed);
 
     // Register runtime objects (ToolRegistry, EventLog, RoleState, RevocationList)
     // in the global runtime registry so that tools/UCAN/event_log bridge functions
@@ -1092,5 +1286,240 @@ mod tests {
         );
 
         crate::runtime::remove_context(context_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // PyContextParams field tests (issue #109)
+    // -----------------------------------------------------------------------
+
+    /// Helper to build a `PyContextParams` with all defaults.
+    fn default_params() -> PyContextParams {
+        PyContextParams {
+            ceiling: Vec::new(),
+            roles: HashMap::new(),
+            tools: Vec::new(),
+            ttl: None,
+            memory_scope: "ephemeral".to_owned(),
+            governance: "single_admin".to_owned(),
+            mode: "encrypted".to_owned(),
+            ceiling_policy: "immutable".to_owned(),
+            promotion_policy: "no_promotion".to_owned(),
+            template_id: None,
+            economic_policy: None,
+        }
+    }
+
+    #[test]
+    fn params_defaults_match_spec() {
+        let p = default_params();
+        assert_eq!(p.mode, "encrypted");
+        assert_eq!(p.ceiling_policy, "immutable");
+        assert_eq!(p.promotion_policy, "no_promotion");
+        assert!(p.template_id.is_none());
+        assert!(p.economic_policy.is_none());
+    }
+
+    #[test]
+    fn params_mode_broadcast() {
+        let p = PyContextParams {
+            mode: "broadcast".to_owned(),
+            ..default_params()
+        };
+        assert_eq!(p.mode, "broadcast");
+    }
+
+    #[test]
+    fn params_ceiling_policy_governed() {
+        let p = PyContextParams {
+            ceiling_policy: "governed".to_owned(),
+            ..default_params()
+        };
+        assert_eq!(p.ceiling_policy, "governed");
+    }
+
+    #[test]
+    fn params_promotion_policy_promotable() {
+        let p = PyContextParams {
+            promotion_policy: "promotable".to_owned(),
+            ..default_params()
+        };
+        assert_eq!(p.promotion_policy, "promotable");
+    }
+
+    #[test]
+    fn params_template_id_present() {
+        let p = PyContextParams {
+            template_id: Some("PublicBroadcast".to_owned()),
+            ..default_params()
+        };
+        assert_eq!(p.template_id.as_deref(), Some("PublicBroadcast"));
+    }
+
+    #[test]
+    fn params_economic_policy_present() {
+        let json = r#"{"locked":false,"cost_schedule":{}}"#;
+        let p = PyContextParams {
+            economic_policy: Some(json.to_owned()),
+            ..default_params()
+        };
+        assert_eq!(p.economic_policy.as_deref(), Some(json));
+    }
+
+    #[test]
+    fn valid_template_ids_constant_covers_all_variants() {
+        // Ensure every entry in VALID_TEMPLATE_IDS is non-empty and unique.
+        let set: std::collections::HashSet<&str> = VALID_TEMPLATE_IDS.iter().copied().collect();
+        assert_eq!(
+            set.len(),
+            VALID_TEMPLATE_IDS.len(),
+            "duplicate template IDs"
+        );
+        for id in VALID_TEMPLATE_IDS {
+            assert!(!id.is_empty(), "empty template ID in VALID_TEMPLATE_IDS");
+        }
+    }
+
+    #[test]
+    fn params_repr_includes_new_fields() {
+        let p = PyContextParams {
+            mode: "broadcast".to_owned(),
+            ceiling_policy: "governed".to_owned(),
+            promotion_policy: "promotable".to_owned(),
+            template_id: Some("Coordination".to_owned()),
+            economic_policy: Some("{}".to_owned()),
+            ..default_params()
+        };
+        let repr = p.__repr__();
+        assert!(repr.contains("broadcast"), "repr should include mode");
+        assert!(
+            repr.contains("governed"),
+            "repr should include ceiling_policy"
+        );
+        assert!(
+            repr.contains("promotable"),
+            "repr should include promotion_policy"
+        );
+        assert!(
+            repr.contains("Coordination"),
+            "repr should include template_id"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PyContextHandle metadata getter tests (spec §5.7, issue #109)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_exposes_mode() {
+        let handle = PyContextHandle::new(
+            "ctx-1".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                mode: "broadcast".to_owned(),
+                ..default_params()
+            },
+        );
+        assert_eq!(handle.mode(), "broadcast");
+    }
+
+    #[test]
+    fn handle_exposes_ceiling_policy() {
+        let handle = PyContextHandle::new(
+            "ctx-2".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                ceiling_policy: "governed".to_owned(),
+                ..default_params()
+            },
+        );
+        assert_eq!(handle.ceiling_policy(), "governed");
+    }
+
+    #[test]
+    fn handle_exposes_promotion_policy() {
+        let handle = PyContextHandle::new(
+            "ctx-3".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                promotion_policy: "promotable".to_owned(),
+                ..default_params()
+            },
+        );
+        assert_eq!(handle.promotion_policy(), "promotable");
+    }
+
+    #[test]
+    fn handle_exposes_template_id_none() {
+        let handle = PyContextHandle::new(
+            "ctx-4".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+        assert!(handle.template_id().is_none());
+    }
+
+    #[test]
+    fn handle_exposes_template_id_some() {
+        let handle = PyContextHandle::new(
+            "ctx-5".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                template_id: Some("BilateralEphemeral".to_owned()),
+                ..default_params()
+            },
+        );
+        assert_eq!(handle.template_id(), Some("BilateralEphemeral"));
+    }
+
+    #[test]
+    fn handle_exposes_economic_policy_none() {
+        let handle = PyContextHandle::new(
+            "ctx-6".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+        assert!(handle.economic_policy().is_none());
+    }
+
+    #[test]
+    fn handle_exposes_economic_policy_some() {
+        let json = r#"{"locked":true}"#;
+        let handle = PyContextHandle::new(
+            "ctx-7".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                economic_policy: Some(json.to_owned()),
+                ..default_params()
+            },
+        );
+        assert_eq!(handle.economic_policy(), Some(json));
+    }
+
+    #[test]
+    fn handle_repr_includes_mode() {
+        let handle = PyContextHandle::new(
+            "ctx-repr".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                mode: "broadcast".to_owned(),
+                ..default_params()
+            },
+        );
+        let repr = handle.__repr__().unwrap();
+        assert!(repr.contains("broadcast"), "repr should include mode");
+    }
+
+    #[test]
+    fn handle_defaults_encrypted_immutable_no_promotion() {
+        let handle = PyContextHandle::new(
+            "ctx-defaults".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+        assert_eq!(handle.mode(), "encrypted");
+        assert_eq!(handle.ceiling_policy(), "immutable");
+        assert_eq!(handle.promotion_policy(), "no_promotion");
+        assert!(handle.template_id().is_none());
+        assert!(handle.economic_policy().is_none());
     }
 }

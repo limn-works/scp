@@ -239,6 +239,142 @@ class TestContextCreate:
                 buffer_size=50,
             )
 
+    async def test_create_passes_mode(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                mode="broadcast",
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["mode"] == "broadcast"
+
+    async def test_create_passes_ceiling_policy(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                ceiling_policy="governed",
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["ceiling_policy"] == "governed"
+
+    async def test_create_passes_promotion_policy(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                promotion_policy="promotable",
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["promotion_policy"] == "promotable"
+
+    async def test_create_passes_template_id(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                template_id="PublicBroadcast",
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["template_id"] == "PublicBroadcast"
+
+    async def test_create_passes_economic_policy(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        ep_json = '{"locked": false, "cost_schedule": {}}'
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                economic_policy=ep_json,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["economic_policy"] == ep_json
+
+    async def test_create_default_new_fields(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["mode"] == "encrypted"
+        assert params["ceiling_policy"] == "immutable"
+        assert params["promotion_policy"] == "no_promotion"
+        assert params["template_id"] is None
+        assert params["economic_policy"] is None
+
+    async def test_create_accepts_enum_mode(self) -> None:
+        from scp_sdk.types import ContextMode
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                mode=ContextMode.BROADCAST,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["mode"] == "broadcast"
+
+    async def test_create_accepts_enum_ceiling_policy(self) -> None:
+        from scp_sdk.types import CeilingPolicy
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                ceiling_policy=CeilingPolicy.GOVERNED,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["ceiling_policy"] == "governed"
+
+    async def test_create_accepts_enum_promotion_policy(self) -> None:
+        from scp_sdk.types import PromotionPolicy
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                promotion_policy=PromotionPolicy.PROMOTABLE,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["promotion_policy"] == "promotable"
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle method tests (join, leave, close)
