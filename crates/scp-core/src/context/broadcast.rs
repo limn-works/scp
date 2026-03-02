@@ -1522,6 +1522,7 @@ mod tests {
             ceiling: &setup.ceiling,
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         let result = ctx
