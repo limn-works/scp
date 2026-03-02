@@ -24,6 +24,7 @@
 //! live in `scp-transport`; tests use [`InMemoryRelayQuerier`].
 
 use sha2::{Digest, Sha256};
+use tracing::{debug, warn};
 
 use crate::cache::DidCache;
 use crate::dht::{extract_public_key, verify_bep44_signature};
@@ -164,27 +165,45 @@ pub async fn relay_resolve<Q: RelayQuerier, C: Clock>(
 
     // Step 3: Query relays in order, return first valid response.
     for relay_url in relay_urls {
-        let Ok(Some(record)) = querier.query(relay_url, &routing_id).await else {
-            continue; // No result or failed relay — try next.
+        let record = match querier.query(relay_url, &routing_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                debug!(relay_url, did = did_string, "relay has no matching blob");
+                continue;
+            }
+            Err(e) => {
+                warn!(relay_url, did = did_string, error = %e, "relay query failed");
+                continue;
+            }
         };
 
         // Step 3a: Verify BEP44 signature.
-        if verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)
-            .is_err()
+        if let Err(e) =
+            verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)
         {
-            continue; // Invalid signature, try next relay.
+            warn!(relay_url, did = did_string, error = %e, "BEP44 signature verification failed");
+            continue;
         }
 
         // Step 3b: Check sequence number freshness.
         if record.seq < last_known_seq {
-            continue; // Stale document, try next relay.
+            debug!(
+                relay_url,
+                did = did_string,
+                record_seq = record.seq,
+                last_known_seq,
+                "stale document (seq < last known)"
+            );
+            continue;
         }
 
         // Step 3c: Deserialize the DID document.
         let Ok(doc_json) = String::from_utf8(record.value) else {
+            warn!(relay_url, did = did_string, "relay returned non-UTF8 blob");
             continue;
         };
         let Ok(document) = DidDocument::from_json(&doc_json) else {
+            warn!(relay_url, did = did_string, "relay returned invalid DID document JSON");
             continue;
         };
 
