@@ -399,7 +399,7 @@ fn recompute_tree(log: &mut EventLog) {
 /// This is the RFC 6962 Section 2.1 interior node hash function. The `0x01`
 /// prefix provides domain separation from leaf hashes (which use `0x00`),
 /// preventing second preimage attacks.
-fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update([0x01]);
     hasher.update(left);
@@ -414,69 +414,11 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use ed25519_dalek::Signer;
-    use sha2::{Digest, Sha256};
-
     use super::*;
-    use crate::event_log::{EventPayload, EventType};
-
-    /// Helper: create a signing keypair and return (`verifying_key`, `signing_key`).
-    fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
-        let mut rng = rand::thread_rng();
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
-        let verifying_key = signing_key.verifying_key();
-        (verifying_key, signing_key)
-    }
-
-    /// Helper: encode a public key as a test DID (`did:key:<hex>`).
-    fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
-        let hex: String = verifying_key
-            .as_bytes()
-            .iter()
-            .fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        format!("did:key:{hex}")
-    }
-
-    /// Helper: sign an event and return the completed event.
-    fn sign_event(
-        event_type: EventType,
-        actor_did: &str,
-        timestamp: u64,
-        sequence: u64,
-        payload: Vec<u8>,
-        prev_hash: [u8; 32],
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> Event {
-        let mut event = Event {
-            event_type,
-            actor_did: actor_did.into(),
-            timestamp,
-            sequence,
-            payload: EventPayload { data: payload },
-            prev_hash,
-            signature: Vec::new(),
-        };
-
-        // Compute canonical hash and sign.
-        let canonical_hash = compute_event_canonical_hash(&event);
-        let signature = signing_key.sign(&canonical_hash);
-        event.signature = signature.to_bytes().to_vec();
-
-        event
-    }
-
-    /// Compute a leaf hash with the 0x00 domain separation prefix (RFC 6962).
-    fn leaf_hash_from_event(event: &Event) -> [u8; 32] {
-        let serialized = rmp_serde::to_vec(event).unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update([0x00]);
-        hasher.update(&serialized);
-        hasher.finalize().into()
-    }
+    use crate::event_log::EventPayload;
+    use crate::event_log::test_helpers::{
+        did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair,
+    };
 
     // -----------------------------------------------------------------------
     // append updates tree and root correctly

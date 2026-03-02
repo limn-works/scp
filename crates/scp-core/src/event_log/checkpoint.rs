@@ -1164,119 +1164,23 @@ fn current_timestamp() -> Result<u64, crate::time::ClockError> {
     clippy::needless_range_loop
 )]
 mod tests {
-    use ed25519_dalek::{Signer, Verifier};
-    use sha2::{Digest, Sha256};
+    use ed25519_dalek::Verifier;
 
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::KeyType;
 
     use super::*;
+    use crate::event_log::test_helpers::{
+        did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair,
+    };
     use crate::event_log::tree::{self, GENESIS_PREV_HASH};
-    use crate::event_log::{Event, EventLog, EventPayload, EventType};
+    use crate::event_log::{Event, EventLog, EventType};
     use crate::identity::DID;
     use crate::trust::compute_behavioral_record;
 
     // -------------------------------------------------------------------
-    // Test helpers
+    // Test helpers (checkpoint-specific)
     // -------------------------------------------------------------------
-
-    /// Helper: create a signing keypair.
-    fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
-        let mut rng = rand::thread_rng();
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
-        let verifying_key = signing_key.verifying_key();
-        (verifying_key, signing_key)
-    }
-
-    /// Helper: encode a public key as a test DID (`did:key:<hex>`).
-    fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
-        let hex: String = verifying_key
-            .as_bytes()
-            .iter()
-            .fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        format!("did:key:{hex}").into()
-    }
-
-    /// Helper: compute the canonical hash for signing an event.
-    /// Must match the production `compute_event_canonical_hash` in `tree.rs`.
-    fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update(b"SCP-EVENT-V1:");
-        #[allow(clippy::cast_possible_truncation)]
-        let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-            hasher.update((bytes.len() as u32).to_be_bytes());
-            hasher.update(bytes);
-        };
-        hasher.update(event_type_tag(&event.event_type).to_be_bytes());
-        length_prefix(&mut hasher, event.actor_did.as_bytes());
-        hasher.update(event.timestamp.to_be_bytes());
-        hasher.update(event.sequence.to_be_bytes());
-        length_prefix(&mut hasher, &event.payload.data);
-        hasher.update(event.prev_hash);
-        hasher.finalize().to_vec()
-    }
-
-    /// Returns a stable numeric tag for each event type variant.
-    const fn event_type_tag(event_type: &EventType) -> u16 {
-        match event_type {
-            EventType::ContextCreated => 0,
-            EventType::ContextClosing => 1,
-            EventType::ContextClosed => 2,
-            EventType::ContextExpired => 3,
-            EventType::MemberJoined => 4,
-            EventType::MemberLeft => 5,
-            EventType::RoleAssigned => 6,
-            EventType::TokenRevoked => 7,
-            EventType::MessageSent => 8,
-            EventType::ToolRegistered => 9,
-            EventType::ToolUpdated => 10,
-            EventType::ToolInvoked => 11,
-            EventType::ToolVerified => 12,
-            EventType::ToolInterfaceEstablished => 13,
-            EventType::GovernanceAction => 14,
-            EventType::ConsistencyCheckpoint => 15,
-            EventType::AbsenceProofRequested => 16,
-            EventType::MemberBlocked => 17,
-            EventType::KeyEpochAdvance => 18,
-            EventType::MediaSessionStarted => 19,
-            EventType::MediaSessionEnded => 20,
-            EventType::PaymentReceived => 21,
-            EventType::EconomicPolicyChanged => 22,
-            EventType::SpendingUcanGranted => 23,
-            EventType::SpendingUcanRevoked => 24,
-        }
-    }
-
-    /// Helper: sign an event.
-    fn sign_event(
-        event_type: EventType,
-        actor_did: &str,
-        timestamp: u64,
-        sequence: u64,
-        payload: Vec<u8>,
-        prev_hash: [u8; 32],
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> Event {
-        let mut event = Event {
-            event_type,
-            actor_did: actor_did.into(),
-            timestamp,
-            sequence,
-            payload: EventPayload { data: payload },
-            prev_hash,
-            signature: Vec::new(),
-        };
-
-        let canonical_hash = compute_event_canonical_hash(&event);
-        let signature = signing_key.sign(&canonical_hash);
-        event.signature = signature.to_bytes().to_vec();
-
-        event
-    }
 
     /// Helper: build a log with `n` events and return the log, leaf hashes,
     /// and the DID used for signing.
@@ -1298,12 +1202,7 @@ mod tests {
                 &signing_key,
             );
             tree::append(&mut log, &event).unwrap();
-            let leaf_hash: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event).unwrap());
-                h.finalize().into()
-            };
+            let leaf_hash = leaf_hash_from_event(&event);
             leaf_hashes.push(leaf_hash);
             prev_hash = leaf_hash;
         }
@@ -1331,12 +1230,7 @@ mod tests {
             );
             tree::append(&mut log_a, &event).unwrap();
             tree::append(&mut log_b, &event).unwrap();
-            let leaf_hash: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event).unwrap());
-                h.finalize().into()
-            };
+            let leaf_hash = leaf_hash_from_event(&event);
             prev_hash = leaf_hash;
         }
 

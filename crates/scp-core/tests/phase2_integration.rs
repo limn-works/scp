@@ -73,7 +73,11 @@ fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
     format!("did:key:{hex}").into()
 }
 
-/// Computes the canonical hash for signing an event (matches `tree.rs` internals).
+/// Computes the canonical hash for signing an event.
+///
+/// This mirrors the production `tree::compute_event_canonical_hash` exactly.
+/// Integration tests (`tests/`) cannot access `pub(crate)` items, so this
+/// copy is necessary. See issue #79 for context.
 fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"SCP-EVENT-V1:");
@@ -92,6 +96,10 @@ fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
 }
 
 /// Returns a stable numeric tag for each event type variant.
+///
+/// This mirrors the production `tree::event_type_tag` exactly.
+/// Integration tests (`tests/`) cannot access `pub(crate)` items, so this
+/// copy is necessary. See issue #79 for context.
 const fn event_type_tag(event_type: &EventType) -> u16 {
     match event_type {
         EventType::ContextCreated => 0,

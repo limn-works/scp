@@ -525,109 +525,16 @@ fn mean_memory(profiles: &[ProofProfile]) -> Option<u64> {
 mod tests {
     use std::time::Duration;
 
-    use ed25519_dalek::Signer;
-    use sha2::{Digest, Sha256};
-
     use super::*;
+    use crate::event_log::test_helpers::{
+        did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair,
+    };
     use crate::event_log::tree::{self, GENESIS_PREV_HASH};
-    use crate::event_log::{Event, EventLog, EventPayload, EventType};
+    use crate::event_log::{EventLog, EventType};
 
     // -------------------------------------------------------------------
-    // Test helpers
+    // Test helpers (metrics-specific)
     // -------------------------------------------------------------------
-
-    fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
-        let mut rng = rand::thread_rng();
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
-        let verifying_key = signing_key.verifying_key();
-        (verifying_key, signing_key)
-    }
-
-    fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
-        let hex: String = verifying_key
-            .as_bytes()
-            .iter()
-            .fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        format!("did:key:{hex}")
-    }
-
-    /// Must match the production `compute_event_canonical_hash` in `tree.rs`.
-    fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update(b"SCP-EVENT-V1:");
-        #[allow(clippy::cast_possible_truncation)]
-        let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-            hasher.update((bytes.len() as u32).to_be_bytes());
-            hasher.update(bytes);
-        };
-        hasher.update(event_type_tag(&event.event_type).to_be_bytes());
-        length_prefix(&mut hasher, event.actor_did.as_bytes());
-        hasher.update(event.timestamp.to_be_bytes());
-        hasher.update(event.sequence.to_be_bytes());
-        length_prefix(&mut hasher, &event.payload.data);
-        hasher.update(event.prev_hash);
-        hasher.finalize().to_vec()
-    }
-
-    const fn event_type_tag(event_type: &EventType) -> u16 {
-        match event_type {
-            EventType::ContextCreated => 0,
-            EventType::ContextClosing => 1,
-            EventType::ContextClosed => 2,
-            EventType::ContextExpired => 3,
-            EventType::MemberJoined => 4,
-            EventType::MemberLeft => 5,
-            EventType::RoleAssigned => 6,
-            EventType::TokenRevoked => 7,
-            EventType::MessageSent => 8,
-            EventType::ToolRegistered => 9,
-            EventType::ToolUpdated => 10,
-            EventType::ToolInvoked => 11,
-            EventType::ToolVerified => 12,
-            EventType::ToolInterfaceEstablished => 13,
-            EventType::GovernanceAction => 14,
-            EventType::ConsistencyCheckpoint => 15,
-            EventType::AbsenceProofRequested => 16,
-            EventType::MemberBlocked => 17,
-            EventType::KeyEpochAdvance => 18,
-            EventType::MediaSessionStarted => 19,
-            EventType::MediaSessionEnded => 20,
-            EventType::PaymentReceived => 21,
-            EventType::EconomicPolicyChanged => 22,
-            EventType::SpendingUcanGranted => 23,
-            EventType::SpendingUcanRevoked => 24,
-        }
-    }
-
-    fn sign_event(
-        event_type: EventType,
-        actor_did: &str,
-        timestamp: u64,
-        sequence: u64,
-        payload: Vec<u8>,
-        prev_hash: [u8; 32],
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> Event {
-        let mut event = Event {
-            event_type,
-            actor_did: actor_did.into(),
-            timestamp,
-            sequence,
-            payload: EventPayload { data: payload },
-            prev_hash,
-            signature: Vec::new(),
-        };
-
-        let canonical_hash = compute_event_canonical_hash(&event);
-        let signature = signing_key.sign(&canonical_hash);
-        event.signature = signature.to_bytes().to_vec();
-
-        event
-    }
 
     /// Build a log with `n` events. Returns the log and serialized event sizes.
     fn build_log(n: u64) -> (EventLog, Vec<u64>) {
@@ -650,12 +557,7 @@ mod tests {
             let serialized = rmp_serde::to_vec(&event).unwrap();
             sizes.push(serialized.len() as u64);
             tree::append(&mut log, &event).unwrap();
-            let leaf_hash: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(&serialized);
-                h.finalize().into()
-            };
+            let leaf_hash = leaf_hash_from_event(&event);
             prev_hash = leaf_hash;
         }
 
