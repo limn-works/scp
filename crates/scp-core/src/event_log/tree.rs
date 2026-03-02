@@ -95,6 +95,64 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     Ok(leaf_index)
 }
 
+/// Appends an event to the event log **without** signature verification.
+///
+/// Performs the same sequence and `prev_hash` checks as [`append`], but skips
+/// the Ed25519 signature verification step. Intended for trusted in-process
+/// callers (FFI bridge layers, testing) where the event source is the process
+/// itself and signing key material may not be available in the sync context.
+///
+/// The event is still serialized and hashed with the RFC 6962 leaf domain
+/// prefix, so it produces the same leaf hash as a signed event with identical
+/// content would.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::SequenceMismatch`] if the sequence is wrong.
+/// Returns [`EventLogError::PrevHashMismatch`] if the hash chain is broken.
+/// Returns [`EventLogError::SerializationFailed`] if serialization fails.
+pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
+    let expected_sequence = event_count(log);
+
+    // 1. Verify sequence.
+    if event.sequence != expected_sequence {
+        return Err(EventLogError::SequenceMismatch {
+            expected: expected_sequence,
+            actual: event.sequence,
+        });
+    }
+
+    // 2. Verify prev_hash.
+    let expected_prev_hash = if log.leaves.is_empty() {
+        GENESIS_PREV_HASH
+    } else {
+        log.leaves[log.leaves.len() - 1]
+    };
+
+    if event.prev_hash != expected_prev_hash {
+        return Err(EventLogError::PrevHashMismatch {
+            sequence: event.sequence,
+        });
+    }
+
+    // 3. Serialize and hash with 0x00 leaf domain prefix (RFC 6962 §2.1).
+    let serialized = serialize_event_for_hashing(event)?;
+    let mut hasher = Sha256::new();
+    hasher.update([0x00]);
+    hasher.update(&serialized);
+    let leaf_hash: [u8; 32] = hasher.finalize().into();
+
+    // 4. Append leaf and recompute tree.
+    let leaf_index = log.leaves.len() as u64;
+    log.leaves.push(leaf_hash);
+    recompute_tree(log);
+
+    // 5. Insert into sorted index.
+    log.sorted_leaves.insert((leaf_hash, leaf_index));
+
+    Ok(leaf_index)
+}
+
 /// Returns the current Merkle root hash.
 ///
 /// - If the log is empty, returns `[0u8; 32]`.
@@ -184,6 +242,9 @@ fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
 
 /// Computes the canonical hash of an event for signature purposes.
 ///
+/// This is the content that must be signed by the actor's Ed25519 key.
+/// The hash covers all event fields except the signature itself.
+///
 /// ```text
 /// SHA-256("SCP-EVENT-V1:" || event_type_tag || len(actor_did) || actor_did
 ///         || timestamp_BE || sequence_BE || len(payload) || payload
@@ -194,7 +255,11 @@ fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
 /// their length as a 4-byte big-endian u32 to prevent field-boundary
 /// ambiguity. The `SCP-EVENT-V1:` domain separator prevents cross-protocol
 /// hash confusion.
-fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
+///
+/// Used by [`append`] for signature verification and by FFI bridge layers
+/// that need to sign events before appending.
+#[must_use]
+pub fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"SCP-EVENT-V1:");
 
@@ -877,5 +942,143 @@ mod tests {
             hash_a, hash_b,
             "shifting bytes between actor_did and payload must produce different hashes"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // append_unsigned_event: happy path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn append_unsigned_event_records_leaf_and_updates_root() {
+        let mut log = EventLog::new("ctx-unsigned-test".to_owned());
+
+        let event = Event {
+            event_type: EventType::ToolInvoked,
+            actor_did: "did:dht:z6MkTest".into(),
+            timestamp: 1_000_000,
+            sequence: 0,
+            payload: EventPayload {
+                data: b"tool invoked payload".to_vec(),
+            },
+            prev_hash: GENESIS_PREV_HASH,
+            signature: Vec::new(), // No signature required.
+        };
+
+        let idx = append_unsigned_event(&mut log, &event).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(event_count(&log), 1);
+        assert_ne!(
+            root(&log),
+            [0u8; 32],
+            "root should be non-zero after append"
+        );
+
+        // Verify leaf hash uses the RFC 6962 domain prefix.
+        let serialized = rmp_serde::to_vec(&event).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update([0x00]);
+        hasher.update(&serialized);
+        let expected_leaf: [u8; 32] = hasher.finalize().into();
+        assert_eq!(log.leaves()[0], expected_leaf);
+    }
+
+    // -----------------------------------------------------------------------
+    // append_unsigned_event: sequential appends
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn append_unsigned_event_sequential_appends() {
+        let mut log = EventLog::new("ctx-unsigned-seq".to_owned());
+
+        let event0 = Event {
+            event_type: EventType::ToolInvoked,
+            actor_did: "did:dht:z6MkTest".into(),
+            timestamp: 1_000_000,
+            sequence: 0,
+            payload: EventPayload {
+                data: b"first".to_vec(),
+            },
+            prev_hash: GENESIS_PREV_HASH,
+            signature: Vec::new(),
+        };
+
+        let idx0 = append_unsigned_event(&mut log, &event0).unwrap();
+        assert_eq!(idx0, 0);
+
+        // Second event with correct prev_hash.
+        let event1 = Event {
+            event_type: EventType::ToolInvoked,
+            actor_did: "did:dht:z6MkTest".into(),
+            timestamp: 1_000_001,
+            sequence: 1,
+            payload: EventPayload {
+                data: b"second".to_vec(),
+            },
+            prev_hash: log.leaves()[0],
+            signature: Vec::new(),
+        };
+
+        let idx1 = append_unsigned_event(&mut log, &event1).unwrap();
+        assert_eq!(idx1, 1);
+        assert_eq!(event_count(&log), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // append_unsigned_event: rejects wrong sequence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn append_unsigned_event_rejects_wrong_sequence() {
+        let mut log = EventLog::new("ctx-unsigned-seq-err".to_owned());
+
+        let event = Event {
+            event_type: EventType::ToolInvoked,
+            actor_did: "did:dht:z6MkTest".into(),
+            timestamp: 1_000_000,
+            sequence: 5, // Wrong: should be 0.
+            payload: EventPayload {
+                data: b"bad".to_vec(),
+            },
+            prev_hash: GENESIS_PREV_HASH,
+            signature: Vec::new(),
+        };
+
+        let result = append_unsigned_event(&mut log, &event);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EventLogError::SequenceMismatch {
+                expected: 0,
+                actual: 5
+            }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // append_unsigned_event: rejects wrong prev_hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn append_unsigned_event_rejects_wrong_prev_hash() {
+        let mut log = EventLog::new("ctx-unsigned-prev-err".to_owned());
+
+        let event = Event {
+            event_type: EventType::ToolInvoked,
+            actor_did: "did:dht:z6MkTest".into(),
+            timestamp: 1_000_000,
+            sequence: 0,
+            payload: EventPayload {
+                data: b"bad".to_vec(),
+            },
+            prev_hash: [0xFF; 32], // Wrong: should be GENESIS_PREV_HASH.
+            signature: Vec::new(),
+        };
+
+        let result = append_unsigned_event(&mut log, &event);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EventLogError::PrevHashMismatch { .. }
+        ));
     }
 }
