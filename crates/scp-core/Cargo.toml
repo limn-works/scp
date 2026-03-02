@@ -69,5 +69,9 @@ required-features = ["testing"]
 name = "wasm_conformance"
 required-features = ["testing"]
 
+[[test]]
+name = "behavioral_event_log"
+required-features = ["testing"]
+
 [lints]
 workspace = true
