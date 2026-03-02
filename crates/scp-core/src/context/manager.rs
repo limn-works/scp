@@ -9,18 +9,29 @@
 //! `.docs/adrs/phase-2.md` for the full context lifecycle specification.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use super::broadcast::{
+    BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision, SubscriptionResult,
+    UnsubscribeResult,
+};
 use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
+use super::params::{ContextMode, TemplateId};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
 use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use super::{ContextError, ContextHandle, ContextParams, ContextState};
+use crate::crypto::sender_keys::BroadcastEnvelope;
+use crate::crypto::ucan::UcanToken;
+use crate::crypto::ucan::validate::{
+    DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
+};
 use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -42,6 +53,10 @@ struct PerContextState {
     /// Active TTL extension proposal, if any (SCP-021).
     #[allow(dead_code)]
     ttl_extension: Option<TtlExtension>,
+    /// Broadcast context state (SCP-227). `Some` for `ContextMode::Broadcast`,
+    /// `None` for `ContextMode::Encrypted`. Broadcast contexts do not use MLS;
+    /// they use per-author AES-256-GCM keys managed by [`BroadcastContext`].
+    broadcast_context: Option<BroadcastContext>,
 }
 
 /// Reads the context state synchronously via [`ContextHandle::try_read_state`].
@@ -187,7 +202,28 @@ impl ContextManager {
             .get(creator_did.as_ref())
             .map(|a| a.tokens.clone())
             .unwrap_or_default();
-        membership.add_member(creator_did, "admin".into(), creator_tokens);
+        membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
+
+        // Initialize broadcast context for Broadcast mode (SCP-227).
+        // Derives admission policy from template_id: PublicBroadcast/PaidBroadcast
+        // → Open, GatedBroadcast → Gated. Defaults to Open when no template.
+        let broadcast_context = if params.mode == ContextMode::Broadcast {
+            let admission = match params.template_id {
+                Some(TemplateId::GatedBroadcast) => BroadcastAdmission::Gated,
+                Some(TemplateId::PublicBroadcast | TemplateId::PaidBroadcast) => {
+                    BroadcastAdmission::Open
+                }
+                _ => BroadcastAdmission::Open,
+            };
+            let mut bc = BroadcastContext::new(context_id.clone(), &params.mode, admission)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            // Register the creator as the first author (messagesWrite).
+            bc.add_author(&creator_did)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Some(bc)
+        } else {
+            None
+        };
 
         let per_context = PerContextState {
             handle: handle.clone(),
@@ -196,6 +232,7 @@ impl ContextManager {
             receive_buffer: ReceiveBuffer::new(),
             ttl_timer: TtlTimer::new(),
             ttl_extension: None,
+            broadcast_context,
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -345,6 +382,15 @@ impl ContextManager {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
 
+        // Determine if this is a broadcast context (lock, read, drop).
+        let is_broadcast = {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(&context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            ctx.broadcast_context.is_some()
+        };
+
         // Authorization check: self-removal is always allowed; otherwise
         // the caller must hold MemberRemove capability.
         if caller_did != member_did {
@@ -363,10 +409,12 @@ impl ContextManager {
             drop(contexts);
         }
 
-        // Crypto operations -- no lock held.
-        self.crypto.remove_member(&context_id_bytes, member_did)?;
-        self.crypto
-            .remove_member_sender_key(&context_id_bytes, member_did)?;
+        // Crypto operations -- no lock held. Skip for broadcast mode (no MLS).
+        if !is_broadcast {
+            self.crypto.remove_member(&context_id_bytes, member_did)?;
+            self.crypto
+                .remove_member_sender_key(&context_id_bytes, member_did)?;
+        }
 
         // Atomic state check + membership removal + count check within single lock.
         let should_close = {
@@ -377,6 +425,14 @@ impl ContextManager {
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
+
+            // For broadcast contexts, unsubscribe from the BroadcastContext.
+            // rotate_keys=true for forward secrecy after departure.
+            if let Some(ref mut bc) = ctx.broadcast_context {
+                // Ignore MemberNotFound for unsubscribe -- the member may be
+                // an author who was never a subscriber.
+                let _ = bc.unsubscribe(member_did, true);
+            }
 
             if !ctx.membership.remove_member(member_did) {
                 return Err(ContextError::MemberNotFound(member_did.to_string()));
@@ -412,10 +468,14 @@ impl ContextManager {
 
     /// Sends a message within a context.
     ///
-    /// Validates the context is `Active`, validates the sender's UCAN for
-    /// `messages:write` capability, assigns a per-sender monotonic SCP
-    /// sequence number, encrypts the message (sender key + MLS + envelopes),
-    /// sends via transport, and appends a `MessageSent` event.
+    /// For encrypted contexts: validates the context is `Active`, validates the
+    /// sender's UCAN for `messages:write` capability, assigns a per-sender
+    /// monotonic SCP sequence number, encrypts the message (sender key + MLS +
+    /// envelopes), sends via transport, and appends a `MessageSent` event.
+    ///
+    /// For broadcast contexts: validates `Active` state, checks `can_write`
+    /// via `BroadcastContext::publish`, assigns sequence number, and sends
+    /// the broadcast envelope via transport.
     ///
     /// See ADR-008 acceptance criterion 8.
     ///
@@ -435,9 +495,8 @@ impl ContextManager {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
 
-        // Atomic state check + capability check + sequence assignment + event
-        // emission, all within a single lock acquisition.
-        {
+        // Determine if broadcast and, if so, produce the envelope under lock.
+        let broadcast_envelope: Option<BroadcastEnvelope> = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
@@ -446,36 +505,60 @@ impl ContextManager {
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
 
-            // Check messages:write capability.
-            if !ctx
-                .role_state
-                .member_has_capability(sender_did, &Capability::MessagesWrite)
-            {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {sender_did} does not have messages:write capability"
-                )));
+            if let Some(ref bc) = ctx.broadcast_context {
+                // Broadcast path: capability check + seal under lock.
+                let envelope = bc.publish(sender_did, payload)?;
+
+                // Assign per-sender monotonic sequence number.
+                let seq = ctx
+                    .membership
+                    .next_sequence_number(sender_did)
+                    .ok_or_else(|| ContextError::MemberNotFound(sender_did.to_string()))?;
+
+                // Emit MessageSent event to receive buffer.
+                ctx.receive_buffer.push(ContextEvent::MessageSent {
+                    sender_did: sender_did.clone(),
+                    sequence_number: seq,
+                    payload: payload.to_vec(),
+                });
+
+                Some(envelope)
+            } else {
+                // Encrypted path: role-based capability check + seq under lock.
+                if !ctx
+                    .role_state
+                    .member_has_capability(sender_did, &Capability::MessagesWrite)
+                {
+                    return Err(ContextError::PermissionDenied(format!(
+                        "member {sender_did} does not have messages:write capability"
+                    )));
+                }
+
+                let seq = ctx
+                    .membership
+                    .next_sequence_number(sender_did)
+                    .ok_or_else(|| ContextError::MemberNotFound(sender_did.to_string()))?;
+
+                ctx.receive_buffer.push(ContextEvent::MessageSent {
+                    sender_did: sender_did.clone(),
+                    sequence_number: seq,
+                    payload: payload.to_vec(),
+                });
+
+                None
             }
-
-            // Assign per-sender monotonic sequence number.
-            let seq = ctx
-                .membership
-                .next_sequence_number(sender_did)
-                .ok_or_else(|| ContextError::MemberNotFound(sender_did.to_string()))?;
-
-            // Emit MessageSent event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MessageSent {
-                sender_did: sender_did.clone(),
-                sequence_number: seq,
-                payload: payload.to_vec(),
-            });
-        }
+        };
         // Lock dropped before crypto/transport/event-log calls.
 
-        // Encrypt: sender key (ADR-007) -> inner envelope (ADR-002) ->
-        // MLS (ADR-001) -> outer envelope.
-        let encrypted = self
-            .crypto
-            .encrypt_message(&context_id_bytes, sender_did, payload)?;
+        let encrypted = if let Some(envelope) = broadcast_envelope {
+            // Broadcast: serialize envelope for transport.
+            envelope.encrypted_content
+        } else {
+            // Encrypted: sender key (ADR-007) -> inner envelope (ADR-002) ->
+            // MLS (ADR-001) -> outer envelope.
+            self.crypto
+                .encrypt_message(&context_id_bytes, sender_did, payload)?
+        };
 
         // Send via transport.
         self.transport.send_message(&context_id_bytes, &encrypted)?;
@@ -544,6 +627,318 @@ impl ContextManager {
     }
 
     // -------------------------------------------------------------------
+    // Broadcast context operations (SCP-227)
+    // -------------------------------------------------------------------
+
+    /// Subscribes a DID to a broadcast context.
+    ///
+    /// For open broadcast contexts, any DID can subscribe without a UCAN.
+    /// For gated contexts, a valid `messagesRead` UCAN is required and
+    /// validated through the full 11-step pipeline (ADR-016).
+    ///
+    /// Returns the current author key epochs so the subscriber knows which
+    /// epochs to request keys for.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
+    ///   context or the subscriber is already registered.
+    /// - [`ContextError::PermissionDenied`] if the context is gated and no
+    ///   UCAN is provided, or the UCAN fails validation.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn subscribe_broadcast<D, N, R, P, S>(
+        &self,
+        context_id: &str,
+        subscriber_did: &DID,
+        ucan: Option<&UcanToken>,
+        timestamp: u64,
+        validation_ctx: Option<&mut ValidationContext<'_, D, N, R, P, S>>,
+    ) -> Result<SubscriptionResult, ContextError>
+    where
+        D: DidResolver + Send + Sync,
+        N: NonceTracker + Send + Sync,
+        R: RevocationChecker + Send + Sync,
+        P: ProofResolver + Send + Sync,
+        S: BuildHasher + Send + Sync,
+    {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let result = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            let bc = ctx
+                .broadcast_context
+                .as_mut()
+                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+            let result = bc.subscribe(subscriber_did, ucan, timestamp, validation_ctx)?;
+
+            // Add subscriber to membership tracking (role = "subscriber").
+            ctx.membership
+                .add_member(subscriber_did.clone(), "subscriber".into(), vec![]);
+
+            // Push event to receive buffer.
+            ctx.receive_buffer.push(result.event.clone());
+
+            result
+        };
+        // Lock dropped.
+
+        // Append event to persistent event log.
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberJoined")?;
+
+        Ok(result)
+    }
+
+    /// Unsubscribes a DID from a broadcast context.
+    ///
+    /// When `rotate_keys` is `true`, all authors rotate their broadcast keys
+    /// to ensure forward secrecy (the departed subscriber cannot decrypt
+    /// future content).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
+    ///   context.
+    /// - [`ContextError::MemberNotFound`] if the subscriber is not registered.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn unsubscribe_broadcast(
+        &self,
+        context_id: &str,
+        subscriber_did: &DID,
+        rotate_keys: bool,
+    ) -> Result<UnsubscribeResult, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let result = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            let bc = ctx
+                .broadcast_context
+                .as_mut()
+                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+            let result = bc.unsubscribe(subscriber_did, rotate_keys)?;
+
+            // Remove from membership tracking.
+            ctx.membership.remove_member(subscriber_did);
+
+            // Emit MemberLeft event to receive buffer.
+            ctx.receive_buffer.push(ContextEvent::MemberLeft {
+                member_did: subscriber_did.clone(),
+            });
+
+            result
+        };
+        // Lock dropped.
+
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberLeft")?;
+
+        Ok(result)
+    }
+
+    /// Publishes a message to a broadcast context.
+    ///
+    /// Validates that the sender is a registered author (`messagesWrite`),
+    /// seals the payload with the author's broadcast key, assigns a sequence
+    /// number, and sends via transport.
+    ///
+    /// This is the broadcast-specific publish path. For a unified API, use
+    /// [`send_message`](Self::send_message) which routes to this path
+    /// automatically for broadcast contexts.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
+    /// - [`ContextError::PermissionDenied`] if the sender is not an author.
+    /// - [`ContextError::CryptoFailed`] if encryption fails.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn publish_broadcast(
+        &self,
+        context_id: &str,
+        author_did: &DID,
+        payload: &[u8],
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let envelope = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            let bc = ctx
+                .broadcast_context
+                .as_ref()
+                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+            let envelope = bc.publish(author_did, payload)?;
+
+            // Assign per-sender monotonic sequence number.
+            let seq = ctx
+                .membership
+                .next_sequence_number(author_did)
+                .ok_or_else(|| ContextError::MemberNotFound(author_did.to_string()))?;
+
+            ctx.receive_buffer.push(ContextEvent::MessageSent {
+                sender_did: author_did.clone(),
+                sequence_number: seq,
+                payload: payload.to_vec(),
+            });
+
+            envelope
+        };
+        // Lock dropped.
+
+        // Send via transport.
+        self.transport
+            .send_message(&context_id_bytes, &envelope.encrypted_content)?;
+
+        // Append event to persistent event log.
+        self.event_log
+            .append_context_event(&context_id_bytes, "MessageSent")?;
+
+        Ok(envelope)
+    }
+
+    /// Blocks a subscriber from receiving future broadcast keys from a
+    /// specific author.
+    ///
+    /// The author's broadcast key is rotated and the subscriber is added to
+    /// the author's block list. The blocked subscriber receives no response
+    /// to future key requests and cannot decrypt content encrypted with the
+    /// new key.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
+    /// - [`ContextError::MemberNotFound`] if the author is not registered.
+    /// - [`ContextError::CryptoFailed`] if key rotation fails.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn block_broadcast_subscriber(
+        &self,
+        context_id: &str,
+        author_did: &DID,
+        subscriber_did: &DID,
+    ) -> Result<BlockResult, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let result = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            let bc = ctx
+                .broadcast_context
+                .as_mut()
+                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+            let result = bc.block_subscriber(author_did, subscriber_did)?;
+
+            // Emit block event to receive buffer.
+            ctx.receive_buffer.push(ContextEvent::MemberBlocked {
+                blocked_did: subscriber_did.clone(),
+                author_did: author_did.clone(),
+            });
+
+            result
+        };
+        // Lock dropped.
+
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberBlocked")?;
+
+        Ok(result)
+    }
+
+    /// Evaluates whether a subscriber's broadcast key request should be
+    /// granted or denied.
+    ///
+    /// This is the author-side decision function for the pull-based key
+    /// distribution protocol (spec section 9.16.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::MembershipFailed`] if the context is not
+    /// registered or not a broadcast context.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn handle_broadcast_key_request(
+        &self,
+        context_id: &str,
+        author_did: &DID,
+        requester_did: &DID,
+    ) -> Result<KeyRequestDecision, ContextError> {
+        let contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+        let bc = ctx
+            .broadcast_context
+            .as_ref()
+            .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+        Ok(bc.handle_key_request(author_did, requester_did))
+    }
+
+    /// Returns the number of subscribers in a broadcast context.
+    ///
+    /// Returns `None` if the context is not registered or not broadcast.
+    pub async fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
+        self.contexts.lock().await.get(context_id).and_then(|ctx| {
+            ctx.broadcast_context
+                .as_ref()
+                .map(BroadcastContext::subscriber_count)
+        })
+    }
+
+    /// Returns `true` if the given DID is a subscriber in a broadcast context.
+    pub async fn is_broadcast_subscriber(&self, context_id: &str, did: &str) -> bool {
+        self.contexts
+            .lock()
+            .await
+            .get(context_id)
+            .and_then(|ctx| {
+                ctx.broadcast_context
+                    .as_ref()
+                    .map(|bc| bc.is_subscriber(did))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Returns the admission policy for a broadcast context.
+    ///
+    /// Returns `None` if the context is not registered or not broadcast.
+    pub async fn broadcast_admission(&self, context_id: &str) -> Option<BroadcastAdmission> {
+        self.contexts.lock().await.get(context_id).and_then(|ctx| {
+            ctx.broadcast_context
+                .as_ref()
+                .map(BroadcastContext::admission)
+        })
+    }
+
+    // -------------------------------------------------------------------
     // Close / Finalize / TTL Expiry (SCP-021)
     // -------------------------------------------------------------------
 
@@ -586,11 +981,14 @@ impl ContextManager {
         let result =
             ttl::close_context(handle, initiator_did, &role_state, self.event_log.as_ref()).await?;
 
-        // Cancel TTL timer and emit close notification (second lock acquisition).
+        // Cancel TTL timer, drop broadcast state, and emit close notification
+        // (second lock acquisition).
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
                 ctx.ttl_timer.cancel();
+                // Drop broadcast context state -- keys are zeroed by Zeroize.
+                ctx.broadcast_context = None;
                 ctx.receive_buffer.push(ContextEvent::SystemClose {
                     initiator_did: initiator_did.clone(),
                 });
@@ -1677,5 +2075,641 @@ mod tests {
         let join_result = manager.join_context(&handle_clone, kp).await;
         assert!(join_result.is_ok(), "join after panic should succeed");
         assert_eq!(manager.member_count("panic-ctx").await, Some(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Broadcast context integration tests (SCP-227)
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates a broadcast context with open admission and returns
+    /// the manager, handle, and `context_id`.
+    async fn setup_broadcast_context() -> (ContextManager, ContextHandle, String) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("broadcast-ctx".into(), params, "did:key:author1".into())
+            .await
+            .unwrap();
+
+        (manager, handle, "broadcast-ctx".into())
+    }
+
+    /// SCP-227 AC1: `subscribe_broadcast` registers subscriber and returns
+    /// current author key epoch.
+    #[tokio::test]
+    async fn broadcast_subscribe_registers_and_returns_epoch() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        let result = manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "subscribe should succeed on open context");
+        let result = result.unwrap();
+
+        // Author key epoch should be 0 (fresh author).
+        assert_eq!(result.author_epochs.len(), 1);
+        assert_eq!(result.author_epochs.get("did:key:author1"), Some(&0));
+
+        // Event should be MemberJoined with role subscriber.
+        assert!(matches!(
+            result.event,
+            ContextEvent::MemberJoined { ref role_name, .. } if role_name == "subscriber"
+        ));
+
+        // Manager should track the subscriber.
+        assert!(
+            manager
+                .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
+                .await
+        );
+        assert_eq!(manager.broadcast_subscriber_count(&ctx_id).await, Some(1));
+    }
+
+    /// SCP-227 AC2: open broadcast allows subscription without UCAN.
+    #[tokio::test]
+    async fn broadcast_open_subscribe_no_ucan_required() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe without UCAN on open context -- should succeed.
+        let result = manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await;
+        assert!(result.is_ok());
+
+        // Admission should be Open.
+        assert_eq!(
+            manager.broadcast_admission(&ctx_id).await,
+            Some(super::BroadcastAdmission::Open)
+        );
+    }
+
+    /// SCP-227 AC4: `block_broadcast_author` revokes sender key.
+    #[tokio::test]
+    async fn broadcast_block_revokes_key() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe a victim.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:victim".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Block the victim.
+        let block_result = manager
+            .block_broadcast_subscriber(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:victim".into(),
+            )
+            .await;
+
+        assert!(block_result.is_ok());
+        let block_result = block_result.unwrap();
+
+        // New epoch should be 1 (rotated from 0).
+        assert_eq!(block_result.new_epoch, 1);
+        assert!(block_result.block_list.contains("did:key:victim"));
+
+        // Key request from blocked subscriber should be denied.
+        let decision = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:victim".into(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(decision, super::KeyRequestDecision::Deny { .. }));
+    }
+
+    /// SCP-227 AC5: broadcast capabilities enforce `MessagesWrite` restricted
+    /// to authors, `MessagesRead` open to subscribers.
+    #[tokio::test]
+    async fn broadcast_capabilities_enforced() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe a subscriber.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Author can publish (send_message routes to broadcast publish).
+        let result = manager
+            .send_message(&handle, &"did:key:author1".into(), b"hello broadcast")
+            .await;
+        assert!(result.is_ok(), "author should be able to publish");
+
+        // Non-author subscriber cannot publish.
+        let result = manager
+            .send_message(&handle, &"did:key:sub1".into(), b"unauthorized")
+            .await;
+        assert!(result.is_err(), "subscriber should not be able to publish");
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+    }
+
+    /// SCP-227 AC6: integration test -- author publishes, 3 subscribers
+    /// receive and can request keys for decryption.
+    #[tokio::test]
+    async fn broadcast_publish_3_subscribers_decrypt() {
+        use crate::crypto::sender_keys::open_broadcast;
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe 3 subscribers.
+        for name in &["sub1", "sub2", "sub3"] {
+            manager
+                .subscribe_broadcast::<
+                    InMemoryDidResolver,
+                    InMemoryNonceTracker,
+                    InMemoryRevocationChecker,
+                    InMemoryProofResolver,
+                    RandomState,
+                >(
+                    &ctx_id,
+                    &DID(format!("did:key:{name}")),
+                    None,
+                    1000,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(manager.broadcast_subscriber_count(&ctx_id).await, Some(3));
+
+        // Author publishes a message.
+        let plaintext = b"hello all subscribers!";
+        let envelope = manager
+            .publish_broadcast(&ctx_id, &"did:key:author1".into(), plaintext)
+            .await
+            .unwrap();
+
+        // Each subscriber requests the key and decrypts.
+        for name in &["sub1", "sub2", "sub3"] {
+            let decision = manager
+                .handle_broadcast_key_request(
+                    &ctx_id,
+                    &"did:key:author1".into(),
+                    &DID(format!("did:key:{name}")),
+                )
+                .await
+                .unwrap();
+
+            match decision {
+                super::KeyRequestDecision::Grant {
+                    key_bytes, epoch, ..
+                } => {
+                    assert_eq!(epoch, 0);
+                    // Reconstruct broadcast key and decrypt.
+                    let broadcast_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
+                        crate::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
+                        epoch,
+                        "did:key:author1".to_owned(),
+                    );
+                    let decrypted = open_broadcast(&broadcast_key, &envelope).unwrap();
+                    assert_eq!(decrypted, plaintext);
+                }
+                super::KeyRequestDecision::Deny { reason } => {
+                    panic!("key request should be granted for {name}: {reason}");
+                }
+            }
+        }
+
+        // Verify MessageSent event was emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        let msg_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ContextEvent::MessageSent { .. }))
+            .collect();
+        assert_eq!(msg_events.len(), 1);
+    }
+
+    /// SCP-227 AC7: integration test -- blocked author's subsequent messages
+    /// are undecryptable by blocked subscriber.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn broadcast_blocked_subscriber_cannot_decrypt() {
+        use crate::crypto::sender_keys::open_broadcast;
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe 2 subscribers.
+        for name in &["good-sub", "bad-sub"] {
+            manager
+                .subscribe_broadcast::<
+                    InMemoryDidResolver,
+                    InMemoryNonceTracker,
+                    InMemoryRevocationChecker,
+                    InMemoryProofResolver,
+                    RandomState,
+                >(
+                    &ctx_id,
+                    &DID(format!("did:key:{name}")),
+                    None,
+                    1000,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Author publishes first message (both can decrypt).
+        let msg1 = b"pre-block message";
+        let envelope1 = manager
+            .publish_broadcast(&ctx_id, &"did:key:author1".into(), msg1)
+            .await
+            .unwrap();
+
+        // Get the pre-block key for "bad-sub".
+        let pre_block_decision = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:bad-sub".into(),
+            )
+            .await
+            .unwrap();
+        let super::KeyRequestDecision::Grant {
+            key_bytes: pre_block_key_bytes,
+            epoch: pre_block_epoch,
+        } = pre_block_decision
+        else {
+            panic!("should be granted before block")
+        };
+
+        // Verify bad-sub can decrypt the pre-block message.
+        let pre_block_broadcast_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
+            crate::crypto::sender_keys::SenderKey::from_bytes(*pre_block_key_bytes),
+            pre_block_epoch,
+            "did:key:author1".to_owned(),
+        );
+        let decrypted = open_broadcast(&pre_block_broadcast_key, &envelope1).unwrap();
+        assert_eq!(decrypted, msg1);
+
+        // Block bad-sub.
+        manager
+            .block_broadcast_subscriber(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:bad-sub".into(),
+            )
+            .await
+            .unwrap();
+
+        // Author publishes post-block message.
+        let msg2 = b"post-block secret";
+        let envelope2 = manager
+            .publish_broadcast(&ctx_id, &"did:key:author1".into(), msg2)
+            .await
+            .unwrap();
+
+        // bad-sub's key request is now denied.
+        let post_block_decision = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:bad-sub".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(post_block_decision, super::KeyRequestDecision::Deny { .. }),
+            "blocked subscriber should be denied"
+        );
+
+        // bad-sub tries to decrypt with the old key -- should fail because
+        // the message was encrypted with the new (post-rotation) key.
+        let decrypt_attempt = open_broadcast(&pre_block_broadcast_key, &envelope2);
+        assert!(
+            decrypt_attempt.is_err(),
+            "blocked subscriber should not be able to decrypt post-block messages"
+        );
+
+        // good-sub can still get the new key and decrypt.
+        let good_decision = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:good-sub".into(),
+            )
+            .await
+            .unwrap();
+        match good_decision {
+            super::KeyRequestDecision::Grant {
+                key_bytes, epoch, ..
+            } => {
+                assert_eq!(epoch, 1, "epoch should be 1 after rotation");
+                let new_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
+                    crate::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
+                    epoch,
+                    "did:key:author1".to_owned(),
+                );
+                let decrypted = open_broadcast(&new_key, &envelope2).unwrap();
+                assert_eq!(decrypted, msg2);
+            }
+            super::KeyRequestDecision::Deny { reason } => {
+                panic!("good-sub should be granted: {reason}");
+            }
+        }
+    }
+
+    /// SCP-227: non-author publish is rejected.
+    #[tokio::test]
+    async fn broadcast_non_author_publish_rejected() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Subscriber tries to publish -- should fail.
+        let result = manager
+            .publish_broadcast(&ctx_id, &"did:key:sub1".into(), b"nope")
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+    }
+
+    /// SCP-227: `create_context` initializes `broadcast_context` for broadcast mode.
+    #[tokio::test]
+    async fn broadcast_create_context_initializes_broadcast_state() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Admission should be Open (default for no template_id).
+        assert_eq!(
+            manager.broadcast_admission(&ctx_id).await,
+            Some(super::BroadcastAdmission::Open)
+        );
+
+        // Subscriber count should be 0 initially.
+        assert_eq!(manager.broadcast_subscriber_count(&ctx_id).await, Some(0));
+
+        // Author should be able to publish.
+        let result = manager
+            .publish_broadcast(&ctx_id, &"did:key:author1".into(), b"test")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    /// SCP-227: `leave_context` on broadcast context cleans up subscriber.
+    #[tokio::test]
+    async fn broadcast_leave_context_unsubscribes() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
+                .await
+        );
+
+        // Leave via leave_context (self-removal).
+        let result = manager
+            .leave_context(&handle, &"did:key:sub1".into(), &"did:key:sub1".into())
+            .await;
+        assert!(result.is_ok());
+
+        // Subscriber should be removed from broadcast context.
+        assert!(
+            !manager
+                .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
+                .await
+        );
+    }
+
+    /// SCP-227: `close_context` drops broadcast state.
+    #[tokio::test]
+    async fn broadcast_close_context_drops_state() {
+        // Need context:close capability for the admin.
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("context:close"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context(
+                "broadcast-close-ctx".into(),
+                params,
+                "did:key:author1".into(),
+            )
+            .await
+            .unwrap();
+        let ctx_id = "broadcast-close-ctx";
+
+        // Close the context.
+        let result = manager
+            .close_context(&handle, &"did:key:author1".into())
+            .await;
+        assert!(result.is_ok());
+
+        // Broadcast state should be None (dropped on close).
+        assert_eq!(manager.broadcast_admission(ctx_id).await, None);
+        assert_eq!(manager.broadcast_subscriber_count(ctx_id).await, None);
+    }
+
+    /// SCP-227: `unsubscribe_broadcast` removes subscriber and optionally rotates keys.
+    #[tokio::test]
+    async fn broadcast_unsubscribe_with_key_rotation() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Unsubscribe with key rotation.
+        let result = manager
+            .unsubscribe_broadcast(&ctx_id, &"did:key:sub1".into(), true)
+            .await;
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.subscriber_did, "did:key:sub1");
+        // Key rotation should have happened (one rotation per author).
+        assert_eq!(result.key_rotations.len(), 1);
+        assert_eq!(result.key_rotations[0].new_epoch, 1);
+
+        // Subscriber should no longer be tracked.
+        assert!(
+            !manager
+                .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
+                .await
+        );
     }
 }

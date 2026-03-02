@@ -98,8 +98,7 @@ mod tests {
         let (vk, sk) = test_keypair();
         let sig = sk.sign(b"original message");
 
-        let result =
-            verify_ed25519_signature(vk.as_bytes(), b"different message", &sig.to_bytes());
+        let result = verify_ed25519_signature(vk.as_bytes(), b"different message", &sig.to_bytes());
         assert!(result.is_err());
     }
 
