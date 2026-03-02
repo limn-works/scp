@@ -34,12 +34,16 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
-#[cfg(feature = "software_platform")]
+// In-memory platform adapters — gated by the `testing` feature, NOT by
+// `software_platform`. This ensures production mobile builds can enable
+// `software_platform` (for crypto primitives) without compiling in insecure
+// in-memory key storage. See GitHub issue #88 and ADR-006.
+#[cfg(feature = "testing")]
 pub mod testing;
-// `software` is an alias for `testing` that matches the feature name. New code
-// should prefer `scp_platform::software::*`; existing `testing::*` paths remain
+// `software` is an alias for `testing` that matches the historical path. New
+// code should prefer `scp_platform::testing::*`; `software::*` paths remain
 // valid for backwards compatibility.
-#[cfg(feature = "software_platform")]
+#[cfg(feature = "testing")]
 pub use testing as software;
 #[cfg(target_os = "android")]
 pub mod android;

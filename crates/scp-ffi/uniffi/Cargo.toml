@@ -14,6 +14,15 @@ crate-type = ["cdylib", "staticlib"]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
+[features]
+default = []
+# Enables the `"in_memory"` custody path in `identity_create`, which uses
+# `InMemoryKeyCustody` from `scp-platform/testing`. This stores private key
+# material in unprotected heap memory — suitable for testing, CLI, and desktop
+# contexts but NOT for production mobile builds (iOS/Android). Mobile CI MUST
+# NOT enable this feature. See GitHub issue #88 and ADR-006.
+allow_in_memory_custody = ["scp-platform/testing"]
+
 [dependencies]
 uniffi = { version = "0.29", features = ["tokio", "cli"] }
 async-trait = { workspace = true }
@@ -22,10 +31,10 @@ thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-ffi-common = { path = "../common" }
 hex = { workspace = true }
-# The `testing` feature enables InMemoryKeyCustody, used by the `"in_memory"`
-# custody path in `identity_create`. This is an intentional bridge-layer
-# dependency: the in-memory custody path is needed for testing, CLI use, and
-# desktop contexts where no hardware security module is available.
+# Only `software_platform` is enabled by default — provides crypto primitives
+# (Ed25519, X25519) without pulling in the insecure in-memory adapters.
+# The `allow_in_memory_custody` feature above adds `scp-platform/testing`
+# for dev/test/desktop builds.
 scp-platform = { path = "../../scp-platform", features = ["software_platform"] }
 scp-transport = { path = "../../scp-transport" }
 base64 = { workspace = true }
@@ -37,7 +46,8 @@ rand = { workspace = true }
 z-base-32 = { workspace = true }
 
 [dev-dependencies]
-scp-platform = { path = "../../scp-platform", features = ["software_platform"] }
+# Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
+scp-platform = { path = "../../scp-platform", features = ["testing"] }
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build", "tokio"] }

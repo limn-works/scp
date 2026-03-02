@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 scp-core = { path = "../scp-core" }
 scp-transport = { path = "../scp-transport" }
-scp-platform = { path = "../scp-platform", features = ["software_platform"] }
+scp-platform = { path = "../scp-platform", features = ["testing"] }
 axum = { workspace = true, features = ["ws"] }
 instant-acme = "0.8"
 rcgen = "0.14"
@@ -33,7 +33,7 @@ x509-parser = "0.16"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
-scp-platform = { path = "../scp-platform", features = ["software_platform"] }
+scp-platform = { path = "../scp-platform", features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1"

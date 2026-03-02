@@ -15,6 +15,11 @@ software_platform = [
     "dep:sha2",
     "dep:uuid",
 ]
+# In-memory platform adapters for testing and development (ADR-006).
+# Separate from `software_platform` so that crates needing crypto primitives
+# (Ed25519, X25519) can enable `software_platform` without pulling in the
+# insecure in-memory implementations. See GitHub issue #88.
+testing = ["software_platform"]
 
 [dependencies]
 serde = { workspace = true }

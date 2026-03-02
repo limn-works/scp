@@ -554,7 +554,9 @@ mod tests {
     /// `did:dht:` prefix using the real `scp-core` identity stack.
     ///
     /// Conformance: identity bridge must produce a valid, self-certifying DID.
+    /// Requires the `allow_in_memory_custody` feature.
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn identity_create_in_memory_produces_did_dht_prefix() {
         let rt = runtime();
         let result = rt.block_on(identity_create("in_memory".to_owned()));
@@ -566,11 +568,37 @@ mod tests {
         );
     }
 
+    /// Verifies that `identity_create("in_memory")` is rejected when the
+    /// `allow_in_memory_custody` feature is NOT enabled, returning
+    /// `ScpError::Identity` with code `SCP-IDN-1008`.
+    ///
+    /// See GitHub issue #88 — acceptance criterion 2.
+    #[test]
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    fn identity_create_in_memory_rejected_without_feature() {
+        let rt = runtime();
+        let result = rt.block_on(identity_create("in_memory".to_owned()));
+        match result {
+            Err(ScpError::Identity { code, .. }) => {
+                assert_eq!(
+                    code, "SCP-IDN-1008",
+                    "expected SCP-IDN-1008 error code when in_memory custody is disabled"
+                );
+            }
+            Ok(_) => panic!(
+                "identity_create(\"in_memory\") should fail without allow_in_memory_custody feature"
+            ),
+            Err(other) => panic!("expected ScpError::Identity with SCP-IDN-1008, got: {other:?}"),
+        }
+    }
+
     /// Verifies that `context_create` produces an `Active` context handle
     /// with a non-empty context ID.
     ///
     /// Conformance: context bridge must produce an active handle on creation.
+    /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn context_create_returns_active_context() {
         let rt = runtime();
 
@@ -607,7 +635,9 @@ mod tests {
     ///
     /// Conformance: subscribe bridge must accept a callback interface and
     /// signal completion without panicking.
+    /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn context_subscribe_accepts_mock_listener() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -664,7 +694,9 @@ mod tests {
     ///
     /// Note: This test uses a local baseline rather than asserting an absolute
     /// zero, because other tests may run concurrently and hold handles.
+    /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn handle_count_tracks_live_opaque_objects() {
         let rt = runtime();
 
