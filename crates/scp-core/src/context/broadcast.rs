@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::context::ContextError;
 use crate::context::membership::ContextEvent;
@@ -178,7 +179,9 @@ pub enum KeyRequestDecision {
     /// broadcast key bytes and epoch for HPKE wrapping.
     Grant {
         /// The raw 32-byte AES-256 broadcast key material.
-        key_bytes: [u8; 32],
+        /// Wrapped in [`Zeroizing`] for defense-in-depth: key material is
+        /// overwritten with zeros when the decision value is dropped.
+        key_bytes: Zeroizing<[u8; 32]>,
         /// The current key epoch.
         epoch: u64,
     },
@@ -680,7 +683,7 @@ impl BroadcastContext {
         }
 
         KeyRequestDecision::Grant {
-            key_bytes: *author.broadcast_key.as_bytes(),
+            key_bytes: Zeroizing::new(*author.broadcast_key.as_bytes()),
             epoch: author.epoch,
         }
     }
@@ -1842,7 +1845,7 @@ mod tests {
             KeyRequestDecision::Grant { key_bytes, epoch } => {
                 assert_eq!(epoch, 0);
                 assert_eq!(
-                    key_bytes,
+                    *key_bytes,
                     *ctx.get_author("did:example:alice")
                         .unwrap()
                         .broadcast_key
@@ -2017,7 +2020,7 @@ mod tests {
         let author_key = &ctx.get_author("did:example:alice").unwrap().broadcast_key;
         let plaintext = b"Hello broadcast subscribers!";
         let ciphertext = encrypt_sender_layer(author_key, plaintext).unwrap();
-        let received_key = SenderKey::from_bytes(key_bytes);
+        let received_key = SenderKey::from_bytes(*key_bytes);
         let decrypted = decrypt_sender_layer(&received_key, &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
 
@@ -2144,7 +2147,7 @@ mod tests {
     #[test]
     fn key_request_decision_debug_redacts_key_bytes() {
         let decision = KeyRequestDecision::Grant {
-            key_bytes: [42u8; 32],
+            key_bytes: Zeroizing::new([42u8; 32]),
             epoch: 5,
         };
         let debug = format!("{decision:?}");
