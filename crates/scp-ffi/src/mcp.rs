@@ -659,7 +659,17 @@ impl ContextProvider for FfiBridgeProvider {
         // sync and Python handlers are GIL-bound (inherently sync). The async
         // invoke_tool in scp-core is for contexts where Rust itself executes
         // tools. See SCP-212, ADR-010, ADR-015.
-        crate::runtime::with_context(context_id, |rt| {
+        //
+        // IMPORTANT: The handler Arc and output schema are extracted inside the
+        // DashMap shard lock (via with_context), then the lock is released
+        // BEFORE calling the handler. This prevents holding the shard lock
+        // during Python GIL acquisition, which would block concurrent
+        // same-context operations for the duration of the handler. See #122.
+
+        // Phase 1: Validate input and extract handler + output schema under
+        // the DashMap shard lock. The lock is released when with_context
+        // returns.
+        let dispatch = crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::ContextError(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
@@ -677,39 +687,49 @@ impl ContextProvider for FfiBridgeProvider {
                 ))
             })?;
 
-            // Dispatch to registered handler if available.
-            if let Some(handler) = rt.tool_handlers.get(tool_name) {
-                let handler = handler.clone();
+            // Clone handler Arc and output schema so we can release the lock.
+            Ok(rt.tool_handlers.get(tool_name).map(|handler| {
+                (
+                    handler.clone(),
+                    registration.schema.output_schema.clone(),
+                )
+            }))
+        })
+        .map_err(|e| format!("{e}"))?;
+
+        // Phase 2: Execute handler OUTSIDE the DashMap shard lock so that
+        // concurrent same-context operations are not blocked during Python
+        // GIL acquisition and handler execution.
+        match dispatch {
+            Some((handler, output_schema)) => {
                 // Call the handler with validated input. The handler is a sync
                 // closure wrapping a Python callable (acquired via GIL).
                 let output = handler(arguments).map_err(|e| {
-                    ScpPyError::ContextError(format!("tool handler for '{tool_name}' failed: {e}"))
+                    format!("tool handler for '{tool_name}' failed: {e}")
                 })?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
                 scp_core::context::tools::schema::validate_value_against_schema(
                     &output,
-                    &registration.schema.output_schema,
+                    &output_schema,
                 )
                 .map_err(|msg| {
-                    ScpPyError::ValidationError(format!(
-                        "output validation failed for tool '{tool_name}': {msg}"
-                    ))
+                    format!("output validation failed for tool '{tool_name}': {msg}")
                 })?;
 
-                return Ok(output);
+                Ok(output)
             }
-
-            // No handler registered -- fall back to echo mode.
-            Ok(serde_json::json!({
-                "tool": tool_name,
-                "context": context_id,
-                "status": "validated",
-                "input_valid": true,
-                "validated_input": arguments,
-            }))
-        })
-        .map_err(|e| format!("{e}"))
+            None => {
+                // No handler registered -- fall back to echo mode.
+                Ok(serde_json::json!({
+                    "tool": tool_name,
+                    "context": context_id,
+                    "status": "validated",
+                    "input_valid": true,
+                    "validated_input": arguments,
+                }))
+            }
+        }
     }
 
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
