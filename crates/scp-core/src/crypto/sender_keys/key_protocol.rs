@@ -343,11 +343,28 @@ pub fn verify_sender_key_request(
 // ---------------------------------------------------------------------------
 
 /// Handles an incoming [`SenderKeyRequest`]: verifies the signature, checks
-/// the block list, and HPKE-encrypts the sender key to the requester's
-/// wrapping public key.
+/// membership and the block list, and HPKE-encrypts the sender key to the
+/// requester's wrapping public key.
 ///
 /// Returns `None` if the requester is blocked (no response, the requester
 /// cannot obtain the key). Returns `Some(serialized_response)` otherwise.
+///
+/// # Sybil Resistance (BLACK-006, §9.16.6)
+///
+/// When `context_members` is `Some`, the requester's DID must be in the
+/// membership set or the request is rejected with
+/// [`SenderKeyError::NotContextMember`]. This is the primary mechanical
+/// defense against Sybil block bypass: a Sybil DID that has not been
+/// admitted to the context through normal admission controls cannot obtain
+/// sender keys, even though it is not on the block list.
+///
+/// In **Encrypted** contexts, MLS group membership already gates who can
+/// see application messages, so `context_members` is a defense-in-depth
+/// redundancy. In **Broadcast** contexts, where key requests travel as
+/// relay messages outside MLS, `context_members` is the primary gate.
+///
+/// Callers SHOULD always provide `context_members`. Passing `None` is
+/// permitted for backward compatibility but disables the membership check.
 ///
 /// # HPKE Assembly
 ///
@@ -359,8 +376,11 @@ pub fn verify_sender_key_request(
 ///
 /// # Errors
 ///
+/// Returns [`SenderKeyError::NotContextMember`] if `context_members` is
+/// provided and the requester is not a member.
 /// Returns [`SenderKeyError::VerificationFailed`] if the request signature
 /// is invalid or malformed. Returns other variants for HPKE failures.
+#[allow(clippy::implicit_hasher)] // context_members uses default hasher for ergonomic None inference
 pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
     request: &SenderKeyRequest,
     requester_public_key: &[u8],
@@ -368,6 +388,7 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
     sender_did: &str,
     epoch: u64,
     block_list: &HashSet<String, S>,
+    context_members: Option<&HashSet<String>>,
 ) -> Result<Option<Vec<u8>>, SenderKeyError> {
     // Verify the request signature.
     let valid = verify_sender_key_request(request, requester_public_key)?;
@@ -375,6 +396,20 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         return Err(SenderKeyError::VerificationFailed(
             "sender key request signature verification failed".to_owned(),
         ));
+    }
+
+    // Membership gate (BLACK-006, §9.16.6): reject requests from DIDs
+    // that are not context members. This prevents Sybil identities —
+    // which bypass per-DID block lists by definition — from obtaining
+    // sender keys. The Sybil DID must first pass the context's admission
+    // controls (MLS membership, UCAN gating, earned capacity thresholds)
+    // before it can even request a key.
+    if let Some(members) = context_members
+        && !members.contains(&request.requester_did)
+    {
+        return Err(SenderKeyError::NotContextMember {
+            did: request.requester_did.clone(),
+        });
     }
 
     // Check block list: if requester is blocked, return None (no response).
@@ -405,6 +440,65 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
 
     Ok(Some(message))
+}
+
+// ---------------------------------------------------------------------------
+// Expand block list with identity-linked DIDs (BLACK-006, §9.16.6)
+// ---------------------------------------------------------------------------
+
+/// Expands a block list to include identity-linked DIDs (Sybil defense).
+///
+/// Given a block list and a resolver that maps each blocked DID to its
+/// identity-linked DIDs (e.g., other DIDs attested to the same human via
+/// attestation chains, or DIDs flagged by context governance as Sybil
+/// aliases), returns a new `HashSet` containing the union of the original
+/// block list and all linked DIDs.
+///
+/// This function is the caller's integration point for identity-group
+/// blocking (§9.16.6). The `identity_links` callback is deliberately
+/// abstract: it may consult attestation chains (§3.5, §7.4), governance
+/// records, or any context-specific Sybil detection mechanism. The sender
+/// key layer does not prescribe the linking strategy — it provides the
+/// expansion mechanism.
+///
+/// # Example
+///
+/// ```
+/// use std::collections::{HashMap, HashSet};
+/// use scp_core::crypto::sender_keys::key_protocol::expand_block_list;
+///
+/// let mut block_list = HashSet::new();
+/// block_list.insert("did:dht:dave".to_owned());
+///
+/// // Identity resolver: dave has a known Sybil alias
+/// let mut links: HashMap<String, Vec<String>> = HashMap::new();
+/// links.insert(
+///     "did:dht:dave".to_owned(),
+///     vec!["did:dht:dave-alt".to_owned()],
+/// );
+///
+/// let expanded = expand_block_list(&block_list, |did| {
+///     links.get(did).cloned().unwrap_or_default()
+/// });
+///
+/// assert!(expanded.contains("did:dht:dave"));
+/// assert!(expanded.contains("did:dht:dave-alt"));
+/// ```
+#[must_use]
+pub fn expand_block_list<F, S: BuildHasher>(
+    block_list: &HashSet<String, S>,
+    identity_links: F,
+) -> HashSet<String>
+where
+    F: Fn(&str) -> Vec<String>,
+{
+    let mut expanded: HashSet<String> = block_list.iter().cloned().collect();
+    for did in block_list {
+        for linked in identity_links(did) {
+            expanded.insert(linked);
+        }
+    }
+    expanded
 }
 
 // ---------------------------------------------------------------------------
@@ -986,7 +1080,7 @@ mod tests {
         let request: SenderKeyRequest =
             serde_json::from_slice(&request_result.request_message).unwrap();
 
-        // Alice handles the request.
+        // Alice handles the request (no membership gate — backward compat).
         let block_list = HashSet::new();
         let response_bytes = handle_sender_key_request(
             &request,
@@ -995,6 +1089,7 @@ mod tests {
             "did:dht:alice",
             1,
             &block_list,
+            None,
         )
         .await
         .unwrap();
@@ -1093,6 +1188,7 @@ mod tests {
             "did:dht:alice",
             1,
             &block_list,
+            None,
         )
         .await
         .unwrap();
@@ -1138,6 +1234,7 @@ mod tests {
             "did:dht:alice",
             1,
             &block_list,
+            None,
         )
         .await
         .unwrap();
@@ -1145,6 +1242,220 @@ mod tests {
         assert!(
             response.is_some(),
             "unblocked requester should receive a response"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Membership gate — Sybil defense (BLACK-006)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn non_member_rejected_when_context_members_provided() {
+        let sybil_custody = InMemoryKeyCustody::new();
+        let sybil_signing_key = sybil_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let sybil_pubkey = sybil_custody.public_key(&sybil_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+
+        // Sybil identity creates a request.
+        let request_result = request_sender_key(
+            &sybil_custody,
+            &sybil_signing_key,
+            "did:dht:sybil",
+            "did:dht:alice",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            serde_json::from_slice(&request_result.request_message).unwrap();
+
+        let block_list: HashSet<String> = HashSet::new();
+
+        // Context members do NOT include the Sybil identity.
+        let mut members = HashSet::new();
+        members.insert("did:dht:alice".to_owned());
+        members.insert("did:dht:bob".to_owned());
+
+        let result = handle_sender_key_request(
+            &request,
+            sybil_pubkey.as_bytes(),
+            &sender_key,
+            "did:dht:alice",
+            1,
+            &block_list,
+            Some(&members),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SenderKeyError::NotContextMember { .. })),
+            "non-member Sybil DID should be rejected, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_allowed_when_context_members_provided() {
+        let bob_custody = InMemoryKeyCustody::new();
+        let bob_signing_key = bob_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let bob_pubkey = bob_custody.public_key(&bob_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            serde_json::from_slice(&request_result.request_message).unwrap();
+
+        let block_list: HashSet<String> = HashSet::new();
+
+        // Context members include Bob.
+        let mut members = HashSet::new();
+        members.insert("did:dht:alice".to_owned());
+        members.insert("did:dht:bob".to_owned());
+
+        let response = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &sender_key,
+            "did:dht:alice",
+            1,
+            &block_list,
+            Some(&members),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.is_some(),
+            "member should receive a response when context_members is provided"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // expand_block_list — identity-linked blocking (BLACK-006)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn expand_block_list_adds_linked_dids() {
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:dave".to_owned());
+
+        let expanded = expand_block_list(&block_list, |did| {
+            if did == "did:dht:dave" {
+                vec!["did:dht:dave-alt".to_owned(), "did:dht:dave-bot".to_owned()]
+            } else {
+                vec![]
+            }
+        });
+
+        assert!(expanded.contains("did:dht:dave"));
+        assert!(expanded.contains("did:dht:dave-alt"));
+        assert!(expanded.contains("did:dht:dave-bot"));
+        assert_eq!(expanded.len(), 3);
+    }
+
+    #[test]
+    fn expand_block_list_no_links_returns_original() {
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:dave".to_owned());
+
+        let expanded = expand_block_list(&block_list, |_| vec![]);
+
+        assert_eq!(expanded, block_list);
+    }
+
+    #[test]
+    fn expand_block_list_deduplicates() {
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:dave".to_owned());
+        block_list.insert("did:dht:eve".to_owned());
+
+        // Both dave and eve link to the same alias.
+        let expanded = expand_block_list(&block_list, |did| {
+            if did == "did:dht:dave" || did == "did:dht:eve" {
+                vec!["did:dht:shared-alias".to_owned()]
+            } else {
+                vec![]
+            }
+        });
+
+        assert!(expanded.contains("did:dht:dave"));
+        assert!(expanded.contains("did:dht:eve"));
+        assert!(expanded.contains("did:dht:shared-alias"));
+        assert_eq!(expanded.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn expanded_block_list_blocks_sybil_identity() {
+        // End-to-end: Dave is blocked. Dave's Sybil alias is linked.
+        // The expanded block list should block the Sybil alias too.
+        let sybil_custody = InMemoryKeyCustody::new();
+        let sybil_signing_key = sybil_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let sybil_pubkey = sybil_custody.public_key(&sybil_signing_key).await.unwrap();
+
+        let sender_key = generate_sender_key();
+
+        // Sybil identity requests the key.
+        let request_result = request_sender_key(
+            &sybil_custody,
+            &sybil_signing_key,
+            "did:dht:dave-alt",
+            "did:dht:alice",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            serde_json::from_slice(&request_result.request_message).unwrap();
+
+        // Original block list only has Dave.
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:dave".to_owned());
+
+        // Expand with identity links.
+        let expanded = expand_block_list(&block_list, |did| {
+            if did == "did:dht:dave" {
+                vec!["did:dht:dave-alt".to_owned()]
+            } else {
+                vec![]
+            }
+        });
+
+        let response = handle_sender_key_request(
+            &request,
+            sybil_pubkey.as_bytes(),
+            &sender_key,
+            "did:dht:alice",
+            1,
+            &expanded,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.is_none(),
+            "Sybil alias should be blocked via expanded block list"
         );
     }
 
@@ -1355,6 +1666,7 @@ mod tests {
             "did:dht:alice",
             rotate_result.new_epoch,
             &block_list,
+            None,
         )
         .await
         .unwrap();
@@ -1618,6 +1930,7 @@ mod tests {
             "did:dht:alice",
             1,
             &block_list,
+            None,
         )
         .await
         .unwrap()
