@@ -689,6 +689,31 @@ impl ContextProvider for FfiBridgeProvider {
         // misbehaving handler from blocking the tokio runtime indefinitely.
         // Uses std::thread::spawn + mpsc::recv_timeout (sync timeout) because
         // ContextProvider::invoke_tool is a sync trait method. See issue #123.
+        //
+        // KNOWN LIMITATION — thread leak on timeout: When `recv_timeout`
+        // expires, the spawned `std::thread` continues running in the
+        // background until the handler returns naturally. Rust threads
+        // cannot be forcibly cancelled — there is no `pthread_cancel`
+        // equivalent and `JoinHandle` has no `abort()`. The leaked thread
+        // holds an `Arc<dyn Fn>` (the handler closure) and, for Python
+        // handlers, will hold the GIL until the handler completes. However:
+        //
+        //   1. No DashMap shard locks are held during handler execution
+        //      (two-phase design from #122), so the leaked thread does not
+        //      block other context operations.
+        //   2. The only contended resource is the Python GIL, which is
+        //      released when the handler eventually returns.
+        //   3. Cooperative cancellation (e.g., polling a CancellationToken)
+        //      would require handler authors to interleave cancellation
+        //      checks into their logic — an unreasonable API burden for an
+        //      exceptional case.
+        //   4. Timeouts are exceptional in well-behaved systems; the default
+        //      `tool_timeout_ms` is generous. Repeated timeouts indicate a
+        //      broken handler, not a protocol issue.
+        //
+        // If this becomes a problem in practice, the mitigation path is
+        // process-level isolation (subprocess handlers), not in-process
+        // thread cancellation. See PR #170 review discussion.
         let start = std::time::Instant::now();
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
