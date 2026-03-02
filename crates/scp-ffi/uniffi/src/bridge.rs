@@ -24,10 +24,12 @@
 //!
 //! See ADR-021 in `.docs/adrs/phase-4.md`.
 
+#[cfg(feature = "allow_in_memory_custody")]
 use std::fmt;
 use std::sync::Arc;
 
 use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
+#[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 use uuid::Uuid;
 
@@ -35,8 +37,14 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 
 /// Wrapper for [`InMemoryKeyCustody`] that implements [`Debug`] with a
 /// redacted representation, preventing key material from appearing in logs.
+///
+/// Only available when the `allow_in_memory_custody` feature is enabled.
+/// Production mobile builds (iOS/Android) MUST NOT enable this feature.
+/// See GitHub issue #88 and ADR-006.
+#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) InMemoryKeyCustody);
 
+#[cfg(feature = "allow_in_memory_custody")]
 impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("InMemoryKeyCustody([redacted])")
@@ -652,7 +660,9 @@ pub struct Identity {
     /// Retained `InMemoryKeyCustody` for in-memory custody paths.
     ///
     /// Key material lives here. Dropping this destroys all private keys.
+    /// Only available when `allow_in_memory_custody` is enabled.
     #[allow(dead_code)]
+    #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
 }
 
@@ -735,7 +745,9 @@ pub struct ContextHandle {
     ///
     /// Set during `context_create` from the creating identity's custody.
     /// Used by `ucan_mint` to produce real Ed25519 signatures.
+    /// Only available when `allow_in_memory_custody` is enabled.
     #[allow(dead_code)]
+    #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
     /// Handle to the creator's active signing key for UCAN minting (RED-102).
     ///
@@ -910,7 +922,15 @@ impl Drop for TransportManager {
 ///
 /// # Arguments
 ///
-/// * `custody` — The custody type string: `"in_memory"` or `"platform"`.
+/// * `custody` — The custody type string. Accepted values depend on the build
+///   configuration:
+///   - `"platform"` — always accepted; requires a wired `KeyCustodyProvider`.
+///   - `"software"` — always accepted; requires a wired `KeyCustodyProvider`.
+///   - `"in_memory"` — **only** accepted when the `allow_in_memory_custody`
+///     feature is enabled at compile time. Returns `ScpError::Identity` with
+///     code `SCP-IDN-1008` otherwise. Stores key material in unprotected heap
+///     memory; suitable for testing and development but NOT for production use
+///     on mobile devices.
 ///
 /// # Returns
 ///
@@ -919,19 +939,21 @@ impl Drop for TransportManager {
 /// # Errors
 ///
 /// Returns `ScpError::Identity` if key generation or DID creation fails.
+/// Returns `ScpError::Identity` with code `SCP-IDN-1008` if `"in_memory"` is
+/// requested but the `allow_in_memory_custody` feature is not enabled.
 /// Returns `ScpError::Validation` if the custody string is not recognized.
 ///
-/// # In-memory custody
+/// # In-memory custody (feature-gated)
 ///
-/// When `custody` is `"in_memory"`, this function creates a real
-/// `did:dht` identity using [`scp_core::identity::DidDht`] backed by
-/// [`scp_platform::testing::InMemoryKeyCustody`]. The returned DID is
-/// self-certifying and has the `did:dht:z` prefix.
+/// When `custody` is `"in_memory"` and the `allow_in_memory_custody` feature
+/// is enabled, this function creates a real `did:dht` identity using
+/// [`scp_core::identity::DidDht`] backed by `InMemoryKeyCustody`. The
+/// returned DID is self-certifying and has the `did:dht:z` prefix.
 ///
 /// `"in_memory"` custody stores key material in unprotected heap memory.
 /// It is suitable for testing and development but NOT for production use
 /// on mobile devices — use `"platform"` (Secure Enclave / Android Keystore)
-/// in production.
+/// in production. See GitHub issue #88 and ADR-006.
 #[uniffi::export]
 pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> {
     let custody_method = parse_custody_method(&custody)?;
@@ -940,28 +962,48 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
         .spawn(async move {
             match custody_method {
                 CustodyMethod::InMemory => {
-                    // Wire to real scp-core using InMemoryKeyCustody.
-                    // The `testing` feature is always available in dev/test
-                    // builds; production builds use the "platform" custody path.
-                    //
-                    // IMPORTANT: both `core_identity` and `key_custody` must be
-                    // retained in the handle. `ScpIdentity` holds `KeyHandle`s
-                    // that are indices into `key_custody`'s internal store.
-                    // Dropping `key_custody` destroys all private key material
-                    // and renders those handles dangling.
-                    let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
-                    let dht = DidDht::new();
-                    let (identity, _document) =
-                        dht.create(&key_custody.0).await.map_err(ScpError::from)?;
+                    // Gate: `"in_memory"` custody is only available when the
+                    // `allow_in_memory_custody` feature is enabled. Production
+                    // mobile builds MUST NOT enable this feature. See #88.
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    {
+                        Err(ScpError::Identity {
+                            message: "\"in_memory\" custody is not available in this build \
+                                      — enable the \"allow_in_memory_custody\" feature for \
+                                      dev/desktop use. Production mobile builds must use \
+                                      \"platform\" custody (Secure Enclave / Android Keystore)."
+                                .to_owned(),
+                            code: "SCP-IDN-1008".to_owned(),
+                        })
+                    }
 
-                    let handle = Arc::new(Identity {
-                        did: identity.did.clone(),
-                        custody_type: CustodyMethod::InMemory,
-                        core_id: Some(identity),
-                        in_memory_custody: Some(key_custody),
-                    });
-                    increment_handle_count();
-                    Ok(handle)
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        // Wire to real scp-core using InMemoryKeyCustody.
+                        // The `testing` feature is available in dev/test/desktop
+                        // builds; production mobile builds use the "platform"
+                        // custody path via KeyCustodyProvider callback.
+                        //
+                        // IMPORTANT: both `core_identity` and `key_custody` must be
+                        // retained in the handle. `ScpIdentity` holds `KeyHandle`s
+                        // that are indices into `key_custody`'s internal store.
+                        // Dropping `key_custody` destroys all private key material
+                        // and renders those handles dangling.
+                        let key_custody =
+                            Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+                        let dht = DidDht::new();
+                        let (identity, _document) =
+                            dht.create(&key_custody.0).await.map_err(ScpError::from)?;
+
+                        let handle = Arc::new(Identity {
+                            did: identity.did.clone(),
+                            custody_type: CustodyMethod::InMemory,
+                            core_id: Some(identity),
+                            in_memory_custody: Some(key_custody),
+                        });
+                        increment_handle_count();
+                        Ok(handle)
+                    }
                 }
                 CustodyMethod::Platform | CustodyMethod::Software => {
                     // Platform and software custody require a wired
@@ -1031,6 +1073,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                 did,
                 custody_type: CustodyMethod::External,
                 core_id: None,
+                #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
             });
             increment_handle_count();
@@ -1116,6 +1159,7 @@ pub async fn context_create(
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
             // Extract key custody and signing key from the identity (RED-102).
+            #[cfg(feature = "allow_in_memory_custody")]
             let in_memory_custody = identity.in_memory_custody.clone();
             let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
 
@@ -1123,6 +1167,7 @@ pub async fn context_create(
                 context_id,
                 state: tokio::sync::Mutex::new(ContextState::Active),
                 creator_did: identity.did.clone(),
+                #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody,
                 signing_key,
             });
@@ -1629,14 +1674,20 @@ pub async fn ucan_validate(
 
 /// Mints a new UCAN token for a context member with real Ed25519 signing.
 ///
-/// Uses the context creator's [`InMemoryKeyCustody`] and active signing key
+/// Uses the context creator's key custody and active signing key
 /// (retained on the context handle during `context_create`) to produce a
 /// properly signed UCAN token via `scp_core::crypto::ucan::mint::mint_ucan`.
+///
+/// When the `allow_in_memory_custody` feature is enabled, uses the
+/// `InMemoryKeyCustody` retained on the context handle. When disabled,
+/// UCAN minting requires a wired `KeyCustodyProvider` (not yet
+/// implemented — returns an error).
 ///
 /// # Arguments
 ///
 /// * `handle` — The context to mint the token for (must have key custody
-///   from `context_create` with an `in_memory` identity).
+///   from `context_create` with an `in_memory` identity, or a wired
+///   `KeyCustodyProvider`).
 /// * `member_did` — The DID of the member receiving the token.
 /// * `capabilities` — List of capability strings to grant (e.g.,
 ///   `"messages:write"`). Scoped to the context automatically.
@@ -1655,6 +1706,16 @@ pub async fn ucan_validate(
 /// See RED-102 for the `KeyCustody` wiring story.
 #[uniffi::export]
 pub async fn ucan_mint(
+    handle: Arc<ContextHandle>,
+    member_did: String,
+    capabilities: Vec<String>,
+) -> Result<Arc<UcanToken>, ScpError> {
+    ucan_mint_impl(handle, member_did, capabilities).await
+}
+
+/// Inner implementation of [`ucan_mint`], split out for cfg-gating clarity.
+#[cfg(feature = "allow_in_memory_custody")]
+async fn ucan_mint_impl(
     handle: Arc<ContextHandle>,
     member_did: String,
     capabilities: Vec<String>,
@@ -1714,6 +1775,23 @@ pub async fn ucan_mint(
             message: format!("tokio task join error during UCAN mint: {e}"),
             code: "SCP-PERM-3005".to_owned(),
         })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)] // Must be async to match the cfg(feature) variant's signature.
+async fn ucan_mint_impl(
+    _handle: Arc<ContextHandle>,
+    _member_did: String,
+    _capabilities: Vec<String>,
+) -> Result<Arc<UcanToken>, ScpError> {
+    Err(ScpError::Permission {
+        message: "UCAN minting requires key custody — the in_memory custody path \
+                  is not available in this build. Enable the \
+                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
+                  a KeyCustodyProvider for production."
+            .to_owned(),
+        code: "SCP-PERM-3004".to_owned(),
+    })
 }
 
 /// Revokes a UCAN token.
