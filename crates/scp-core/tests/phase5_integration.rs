@@ -201,10 +201,9 @@ fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
         bytes.extend_from_slice(data);
     };
     length_prefix(&mut bytes, attestation.id.as_bytes());
-    length_prefix(
-        &mut bytes,
-        format!("{:?}", attestation.attestation_type).as_bytes(),
-    );
+    bytes.extend_from_slice(
+        &scp_core::trust::attestation_type_tag(&attestation.attestation_type).to_be_bytes(),
+    ); // fixed-width u16, no length prefix needed
     length_prefix(&mut bytes, attestation.issuer.as_bytes());
     length_prefix(&mut bytes, attestation.subject.as_bytes());
     length_prefix(&mut bytes, attestation.claim.to_string().as_bytes());

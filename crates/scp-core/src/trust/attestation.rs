@@ -398,15 +398,17 @@ pub fn check_threshold_attestation(
 /// Computes the canonical byte representation of an attestation for signing.
 ///
 /// ```text
-/// "SCP-ATTESTATION-V1:" || len(id) || id || len(attestation_type) || attestation_type
+/// "SCP-ATTESTATION-V1:" || len(id) || id || attestation_type_tag_BE
 ///     || len(issuer) || issuer || len(subject) || subject
 ///     || len(claim_json) || claim_json || issued_at_BE
 /// ```
 ///
 /// Variable-length fields are prefixed with their length as a 4-byte
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
-/// prevents cross-protocol hash confusion. `issued_at` uses big-endian
-/// encoding, consistent with all other canonical hash functions.
+/// prevents cross-protocol hash confusion. `attestation_type` uses a stable
+/// numeric tag (u16 big-endian) instead of Debug formatting for
+/// cross-version determinism. `issued_at` uses big-endian encoding,
+/// consistent with all other canonical hash functions.
 pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"SCP-ATTESTATION-V1:");
@@ -419,10 +421,9 @@ pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> 
     };
 
     length_prefix(&mut bytes, attestation.id.as_bytes());
-    length_prefix(
-        &mut bytes,
-        format!("{:?}", attestation.attestation_type).as_bytes(),
-    );
+    bytes.extend_from_slice(
+        &super::attestation_type_tag(&attestation.attestation_type).to_be_bytes(),
+    ); // fixed-width u16, no length prefix needed
     length_prefix(&mut bytes, attestation.issuer.as_bytes());
     length_prefix(&mut bytes, attestation.subject.as_bytes());
     length_prefix(&mut bytes, attestation.claim.to_string().as_bytes());
