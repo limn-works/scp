@@ -1521,9 +1521,13 @@ fn context_registry_default_ceiling_populated() {
 mod wasm_ucan_mirror {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::{Signer, VerifyingKey};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+
+    /// Maximum delegation chain depth to prevent infinite loops.
+    const MAX_CHAIN_DEPTH: usize = 32;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct UcanHeader {
@@ -1737,6 +1741,170 @@ mod wasm_ucan_mirror {
         let sig_b64 = URL_SAFE_NO_PAD.encode(b"fakesig");
         format!("{header_b64}.{payload_b64}.{sig_b64}")
     }
+
+    // -----------------------------------------------------------------------
+    // Circular delegation detection (issue #134)
+    // -----------------------------------------------------------------------
+
+    fn resolve_public_key(did: &str) -> Result<[u8; 32], String> {
+        if let Some(hex_str) = did.strip_prefix("did:key:") {
+            let bytes: Vec<u8> = (0..hex_str.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&hex_str[i..i + 2], 16)
+                        .map_err(|e| format!("hex decode error: {e}"))
+                })
+                .collect::<Result<Vec<u8>, String>>()?;
+            let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+                format!("DID public key must be 32 bytes, got {}", v.len())
+            })?;
+            return Ok(pk);
+        }
+        Err(format!("unsupported DID method: {did}"))
+    }
+
+    pub fn verify_signature(token: &ParsedUcanToken) -> Result<(), String> {
+        let pk_bytes = resolve_public_key(&token.payload.iss)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&pk_bytes).map_err(|e| format!("invalid public key: {e}"))?;
+
+        let signing_input = token
+            .encoded
+            .rfind('.')
+            .map(|pos| &token.encoded[..pos])
+            .ok_or_else(|| "missing signature segment".to_owned())?;
+
+        let sig_bytes: [u8; 64] =
+            token.signature.as_slice().try_into().map_err(|_| {
+                format!("signature must be 64 bytes, got {}", token.signature.len())
+            })?;
+
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        verifying_key
+            .verify_strict(signing_input.as_bytes(), &signature)
+            .map_err(|_| "signature verification failed".to_owned())
+    }
+
+    /// Verbatim mirror of WASM `verify_delegation_chain`.
+    pub fn verify_delegation_chain(
+        token: &ParsedUcanToken,
+        proof_tokens: Option<&[String]>,
+    ) -> Result<String, String> {
+        if token.payload.prf.is_empty() {
+            return Ok(token.payload.iss.clone());
+        }
+
+        let proofs = proof_tokens.unwrap_or(&[]);
+
+        let mut proof_map: HashMap<String, ParsedUcanToken> = HashMap::new();
+        for encoded in proofs {
+            let parsed = parse_ucan(encoded)?;
+            let cid = compute_token_cid(encoded);
+            proof_map.insert(cid, parsed);
+        }
+
+        let mut seen_issuers = HashSet::new();
+        seen_issuers.insert(token.payload.iss.clone());
+
+        verify_chain_recursive(token, &proof_map, 0, &mut seen_issuers)
+    }
+
+    /// Verbatim mirror of WASM `verify_chain_recursive` with circular
+    /// delegation detection (issue #134 fix).
+    pub fn verify_chain_recursive(
+        token: &ParsedUcanToken,
+        proof_map: &HashMap<String, ParsedUcanToken>,
+        depth: usize,
+        seen_issuers: &mut HashSet<String>,
+    ) -> Result<String, String> {
+        if depth > MAX_CHAIN_DEPTH {
+            return Err("delegation chain too deep".to_owned());
+        }
+
+        if token.payload.prf.is_empty() {
+            verify_signature(token)?;
+            return Ok(token.payload.iss.clone());
+        }
+
+        let mut root_issuer = None;
+        for proof_cid in &token.payload.prf {
+            let parent = proof_map.get(proof_cid).ok_or_else(|| {
+                format!("delegation chain broken: proof CID not found: {proof_cid}")
+            })?;
+
+            if !seen_issuers.insert(parent.payload.iss.clone()) {
+                return Err(format!(
+                    "circular delegation detected: issuer '{}' appears multiple times in the delegation chain",
+                    parent.payload.iss
+                ));
+            }
+
+            verify_signature(parent)?;
+
+            if parent.payload.aud != token.payload.iss {
+                return Err(format!(
+                    "delegation chain broken: parent aud '{}' does not match child iss '{}'",
+                    parent.payload.aud, token.payload.iss
+                ));
+            }
+
+            let issuer = verify_chain_recursive(parent, proof_map, depth + 1, seen_issuers)?;
+            root_issuer = Some(issuer);
+        }
+
+        root_issuer.ok_or_else(|| "delegation chain empty".to_owned())
+    }
+
+    /// Helper to create a signed UCAN JWT for test purposes.
+    pub fn mint_test_token(
+        signing_key: &ed25519_dalek::SigningKey,
+        iss: &str,
+        aud: &str,
+        proofs: Vec<String>,
+    ) -> String {
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+        };
+        let payload = UcanPayload {
+            iss: iss.to_owned(),
+            aud: aud.to_owned(),
+            exp: u64::MAX / 2,
+            nbf: None,
+            nnc: format!("nonce-{iss}-{aud}"),
+            att: vec![Attenuation {
+                with: "scp:ctx:test/messages:write".to_owned(),
+                can: "messages:write".to_owned(),
+            }],
+            prf: proofs,
+            fct: None,
+        };
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig = signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    /// Helper to build a did:key DID from an Ed25519 public key.
+    pub fn did_from_key(key: &ed25519_dalek::SigningKey) -> String {
+        let pk = key.verifying_key();
+        let hex_str: String = pk
+            .as_bytes()
+            .iter()
+            .fold(String::with_capacity(64), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
+        format!("did:key:{hex_str}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1944,5 +2112,188 @@ fn wasm_attenuation_child_subset_of_valid_parent_passes() {
     assert!(
         result.is_ok(),
         "child with subset of valid parent caps should pass: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Circular delegation detection tests (issue #134)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn circular_delegation_a_b_a_detected() {
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let did_a = wasm_ucan_mirror::did_from_key(&key_a);
+    let did_b = wasm_ucan_mirror::did_from_key(&key_b);
+
+    let token_a_to_b = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_b, vec![]);
+    let cid_a_to_b = wasm_ucan_mirror::compute_token_cid(&token_a_to_b);
+
+    let token_b_to_a = wasm_ucan_mirror::mint_test_token(&key_b, &did_b, &did_a, vec![cid_a_to_b]);
+    let cid_b_to_a = wasm_ucan_mirror::compute_token_cid(&token_b_to_a);
+
+    let token_a_final = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_b, vec![cid_b_to_a]);
+
+    let proof_tokens = vec![token_a_to_b, token_b_to_a];
+    let parsed = wasm_ucan_mirror::parse_ucan(&token_a_final).unwrap();
+
+    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, Some(&proof_tokens));
+
+    assert!(
+        result.is_err(),
+        "A->B->A cycle must be rejected: {result:?}"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("circular delegation detected"),
+        "error should mention circular delegation: {err_msg}"
+    );
+}
+
+#[test]
+fn self_delegation_a_a_detected() {
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let did_a = wasm_ucan_mirror::did_from_key(&key_a);
+
+    let root_token = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_a, vec![]);
+    let root_cid = wasm_ucan_mirror::compute_token_cid(&root_token);
+
+    let child_token = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_a, vec![root_cid]);
+
+    let proof_tokens = vec![root_token];
+    let parsed = wasm_ucan_mirror::parse_ucan(&child_token).unwrap();
+
+    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, Some(&proof_tokens));
+
+    assert!(
+        result.is_err(),
+        "self-delegation A->A must be rejected: {result:?}"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("circular delegation detected"),
+        "error should mention circular delegation: {err_msg}"
+    );
+}
+
+#[test]
+fn diamond_delegation_not_circular() {
+    let key_root = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let did_root = wasm_ucan_mirror::did_from_key(&key_root);
+    let did_b = wasm_ucan_mirror::did_from_key(&key_b);
+
+    let root_token = wasm_ucan_mirror::mint_test_token(&key_root, &did_root, &did_b, vec![]);
+    let root_cid = wasm_ucan_mirror::compute_token_cid(&root_token);
+
+    let key_c = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+    let did_c = wasm_ucan_mirror::did_from_key(&key_c);
+
+    let child_token = wasm_ucan_mirror::mint_test_token(&key_b, &did_b, &did_c, vec![root_cid]);
+
+    let proof_tokens = vec![root_token];
+    let parsed = wasm_ucan_mirror::parse_ucan(&child_token).unwrap();
+
+    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, Some(&proof_tokens));
+
+    assert!(
+        result.is_ok(),
+        "linear delegation chain should pass: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap(),
+        did_root,
+        "root issuer should be the original root"
+    );
+}
+
+#[test]
+fn three_node_circular_delegation_detected() {
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let key_c = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+    let did_a = wasm_ucan_mirror::did_from_key(&key_a);
+    let did_b = wasm_ucan_mirror::did_from_key(&key_b);
+    let did_c = wasm_ucan_mirror::did_from_key(&key_c);
+
+    let token_a_to_b = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_b, vec![]);
+    let cid_a_to_b = wasm_ucan_mirror::compute_token_cid(&token_a_to_b);
+
+    let token_b_to_c = wasm_ucan_mirror::mint_test_token(&key_b, &did_b, &did_c, vec![cid_a_to_b]);
+    let cid_b_to_c = wasm_ucan_mirror::compute_token_cid(&token_b_to_c);
+
+    let token_c_to_a = wasm_ucan_mirror::mint_test_token(&key_c, &did_c, &did_a, vec![cid_b_to_c]);
+    let cid_c_to_a = wasm_ucan_mirror::compute_token_cid(&token_c_to_a);
+
+    let final_token = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_b, vec![cid_c_to_a]);
+
+    let proof_tokens = vec![token_a_to_b, token_b_to_c, token_c_to_a];
+    let parsed = wasm_ucan_mirror::parse_ucan(&final_token).unwrap();
+
+    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, Some(&proof_tokens));
+
+    assert!(
+        result.is_err(),
+        "A->B->C->A cycle must be rejected: {result:?}"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("circular delegation detected"),
+        "error should mention circular delegation: {err_msg}"
+    );
+}
+
+#[test]
+fn root_token_no_proofs_passes() {
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let did_a = wasm_ucan_mirror::did_from_key(&key_a);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let did_b = wasm_ucan_mirror::did_from_key(&key_b);
+
+    let root_token = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_b, vec![]);
+    let parsed = wasm_ucan_mirror::parse_ucan(&root_token).unwrap();
+
+    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, None);
+
+    assert!(result.is_ok(), "root token should pass: {result:?}");
+    assert_eq!(result.unwrap(), did_a, "root issuer should be A");
+}
+
+#[test]
+fn wasm_circular_delegation_error_matches_core_format() {
+    use scp_core::crypto::ucan::UcanError;
+
+    let core_err =
+        UcanError::CircularDelegation("issuer 'did:key:abc' appears multiple times".to_owned());
+    let core_msg = format!("{core_err}");
+
+    assert!(
+        core_msg.starts_with("circular delegation detected:"),
+        "core error format unexpected: {core_msg}"
+    );
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let did_a = wasm_ucan_mirror::did_from_key(&key_a);
+    let did_b = wasm_ucan_mirror::did_from_key(&key_b);
+
+    let token_a_to_b = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_b, vec![]);
+    let cid_a_to_b = wasm_ucan_mirror::compute_token_cid(&token_a_to_b);
+
+    let token_b_to_a = wasm_ucan_mirror::mint_test_token(&key_b, &did_b, &did_a, vec![cid_a_to_b]);
+    let cid_b_to_a = wasm_ucan_mirror::compute_token_cid(&token_b_to_a);
+
+    let final_token = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_b, vec![cid_b_to_a]);
+
+    let proof_tokens = vec![token_a_to_b, token_b_to_a];
+    let parsed_wasm = wasm_ucan_mirror::parse_ucan(&final_token).unwrap();
+    let wasm_result = wasm_ucan_mirror::verify_delegation_chain(&parsed_wasm, Some(&proof_tokens));
+
+    assert!(wasm_result.is_err(), "WASM must reject circular delegation");
+    let wasm_err = wasm_result.unwrap_err();
+
+    assert!(
+        wasm_err.starts_with("circular delegation detected:"),
+        "WASM error must match core format prefix. Got: {wasm_err}"
     );
 }
