@@ -23,6 +23,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 scp-platform = { path = "../scp-platform" }
+scp-identity = { path = "../scp-identity" }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
