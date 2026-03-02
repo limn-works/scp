@@ -133,6 +133,12 @@ Contexts support multiple governance models for who can change roles, settings, 
 
 The governance model is declared at creation and visible to all. Governance implementations are **pluggable** — the protocol defines the `GovernanceEngine` trait (propose, approve, reject) with four concrete models: `SingleAdmin` (single-admin authority), `Threshold` (M-of-N approval), `Majority` (majority vote), and `Unanimity` (full consensus). See ADR-008 (context lifecycle state machine with single-admin governance), ADR-009 (role assignment and capability ceiling enforcement), and ADR-031 (multi-admin governance models) for full specification. Context creators select a governance model at creation; the selection is visible in context metadata (§5.7) and cannot be changed after creation unless the model itself defines a governance transition mechanism.
 
+**Governance execution invariants.** When the `ContextManager` executes an approved governance action, two protocol-level invariants MUST hold:
+
+1. **Proposal-context binding.** A governance proposal's `context_id` MUST match the context it is submitted to for execution. A proposal approved for context A MUST NOT be executable against context B. This prevents cross-context proposal injection — an attacker who obtains an approved proposal from one context cannot replay it against a different context.
+
+2. **Proposal replay protection.** Each context MUST track the set of executed proposal IDs. A proposal that has already been executed MUST be rejected on subsequent submission. This prevents double-execution of approved proposals — even when the underlying operation is idempotent (e.g., blocking an already-blocked author returns `MemberNotFound`), explicit replay detection provides a clean error path and prevents side effects from re-executing event log entries or notifications.
+
 ## 5.10 Context TTL (Time-to-Live)
 
 Contexts gain an optional time-to-live — a declared lifespan after which the context closes automatically. TTL is set at creation and visible in context metadata (visible before opt-in).
@@ -882,6 +888,8 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
 
+**Author removal.** Removing an author from a broadcast context (revoking their sender key and preventing future publishing) is a governance-gated action. Author removal MUST go through the context's governance model (`GovernanceAction::BlockAuthor` proposal → governance approval → execution). There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers. Same rules as any human-bound participant." A direct bypass of governance for author removal would be the vulnerability, not the feature. When the governance proposal is approved and executed, the author's sender key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and an `AuthorBlocked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages.
+
 **Sybil resistance.** Broadcast contexts are the primary target for Sybil block bypass because key requests travel as relay messages (not MLS application messages). The membership gate in `handle_sender_key_request` verifies that the requester is a registered subscriber before distributing keys. Identity-linked block expansion and group blocking further mitigate Sybil attacks. See §9.16.6 for the full mitigation specification.
 
 ### 5.14.9 Capabilities
@@ -899,7 +907,8 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 - `MessageSent` — reused for broadcast (same event, mode determines semantics)
 - `roleAssigned` — reused for author grant (role: `author`) and subscriber registration (role: `subscriber`)
 - `MemberJoined` — reused for subscriber registration
-- `TokenRevoked` — reused for author removal and gated subscriber revocation
+- `TokenRevoked` — reused for gated subscriber revocation
+- **`AuthorBlocked { author_did }`** — emitted when a governance-approved author removal executes. The author's sender key is destroyed. Distinct from `TokenRevoked` (which has different semantics: UCAN revocation).
 - **`KeyEpochAdvance { sender_did, epoch }`** — NEW event type, shared across both Encrypted and Broadcast modes
 
 `ConsistencyCheckpoint.epoch` becomes `Option<u64>` (`None` for broadcast contexts, which have no MLS epoch).

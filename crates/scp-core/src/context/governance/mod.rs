@@ -305,6 +305,18 @@ pub enum GovernanceAction {
     TransferAdmin { new_admin: DID },
     /// Create a child context (spec section 5.13).
     CreateChildContext { params: Box<ContextParams> },
+    /// Block an author in a broadcast context (spec section 5.14.8).
+    ///
+    /// Removes the author from the broadcast context, destroying their sender
+    /// key and preventing future publishing. Requires governance approval
+    /// because author removal is a membership change that must go through
+    /// the context's governance model. See spec section 5.14.8.
+    BlockAuthor {
+        /// The DID of the author to block.
+        author_did: DID,
+        /// Optional reason for the block.
+        reason: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,6 +1104,10 @@ mod tests {
                 additional_secs: 3600,
             },
             GovernanceAction::TransferAdmin { new_admin: bob() },
+            GovernanceAction::BlockAuthor {
+                author_did: bob(),
+                reason: Some("spam".to_owned()),
+            },
         ];
 
         for action in &actions {

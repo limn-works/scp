@@ -99,7 +99,7 @@ pub use builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle, create_context,
 };
-pub use manager::ContextManager;
+pub use manager::{ContextManager, GovernanceActionResult};
 
 // Re-export membership types.
 pub use membership::{
@@ -146,8 +146,8 @@ pub use governance::{
 
 // Re-export broadcast context types (SCP-227, spec section 5.14, #101).
 pub use broadcast::{
-    AuthorState, BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision,
-    SubscriberRecord, SubscriptionResult, UnsubscribeResult,
+    AuthorBlockResult, AuthorState, BlockResult, BroadcastAdmission, BroadcastContext,
+    KeyRequestDecision, SubscriberRecord, SubscriptionResult, UnsubscribeResult,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).
