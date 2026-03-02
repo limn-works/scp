@@ -46,11 +46,13 @@ fn adapter_credentials_prefix(did: &DID) -> String {
 impl<S: Storage> ProtocolStore<S> {
     /// Stores adapter credentials for an identity.
     ///
-    /// Stores raw credential bytes under
-    /// `identity/{did}/adapter_credentials/{adapter_id}`.
+    /// Serializes credential bytes under
+    /// `identity/{did}/adapter_credentials/{adapter_id}` wrapped
+    /// in a `StoredValue` version envelope.
     ///
     /// # Errors
     ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage write fails.
     pub async fn store_adapter_credentials(
         &self,
@@ -59,8 +61,7 @@ impl<S: Storage> ProtocolStore<S> {
         credentials: &[u8],
     ) -> Result<(), StoreError> {
         let key = adapter_credential_key(did, adapter_id);
-        self.storage.store(&key, credentials).await?;
-        Ok(())
+        self.store_value(&key, &credentials).await
     }
 
     /// Loads adapter credentials for an identity and adapter.
@@ -76,7 +77,7 @@ impl<S: Storage> ProtocolStore<S> {
         adapter_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let key = adapter_credential_key(did, adapter_id);
-        Ok(self.storage.retrieve(&key).await?)
+        self.load_value(&key).await
     }
 
     /// Lists all configured adapter IDs for an identity.
