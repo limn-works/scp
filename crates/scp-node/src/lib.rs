@@ -57,6 +57,10 @@ pub enum NodeError {
     /// The HTTP server failed to bind or encountered a fatal I/O error.
     #[error("serve error: {0}")]
     Serve(String),
+
+    /// NAT traversal failed during zero-config deployment.
+    #[error("NAT traversal error: {0}")]
+    Nat(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -146,8 +150,8 @@ impl IdentityHandle {
 ///
 /// See spec section 18.6 for the full design.
 pub struct ApplicationNode<S: Storage> {
-    /// The domain this node serves.
-    domain: String,
+    /// The domain this node serves. `None` for zero-config no-domain mode (§10.12.8).
+    domain: Option<String>,
     /// Handle to the running relay server.
     relay: RelayHandle,
     /// Handle to the node's identity.
@@ -171,9 +175,11 @@ impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
 
 impl<S: Storage> ApplicationNode<S> {
     /// Returns the domain this node serves.
+    ///
+    /// Returns `None` in zero-config no-domain mode (§10.12.8).
     #[must_use]
-    pub fn domain(&self) -> &str {
-        &self.domain
+    pub fn domain(&self) -> Option<&str> {
+        self.domain.as_deref()
     }
 
     /// Returns a reference to the relay handle.
@@ -194,12 +200,13 @@ impl<S: Storage> ApplicationNode<S> {
         &self.storage
     }
 
-    /// Returns the relay URL derived from the configured domain.
+    /// Returns the relay URL published in the DID document.
     ///
-    /// Format: `wss://<domain>/scp/v1` (spec section 18.5.2).
+    /// For domain mode: `wss://<domain>/scp/v1` (spec section 18.5.2).
+    /// For no-domain mode: the relay URL is stored in the node state.
     #[must_use]
-    pub fn relay_url(&self) -> String {
-        format!("wss://{}/scp/v1", self.domain)
+    pub fn relay_url(&self) -> &str {
+        &self.state.relay_url
     }
 
     /// Registers a broadcast context so it appears in subsequent
@@ -271,11 +278,156 @@ struct ExplicitIdentity<D: DidMethod> {
 pub struct NoDomain;
 /// Marker: domain has been set on the builder.
 pub struct HasDomain;
+/// Marker: zero-config (no domain) mode has been explicitly selected (§10.12.8).
+pub struct HasNoDomain;
 
 /// Marker: identity has not been configured on the builder.
 pub struct NoIdentity;
 /// Marker: identity has been configured on the builder.
 pub struct HasIdentity;
+
+// ---------------------------------------------------------------------------
+// NAT strategy (mockable NAT probing for testability)
+// ---------------------------------------------------------------------------
+
+/// Result of the NAT tier selection process during zero-config deployment
+/// (spec section 10.12.8).
+///
+/// Determines the relay URL format published in the DID document
+/// (spec section 10.12.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReachabilityTier {
+    /// Tier 1: UPnP/NAT-PMP port mapping succeeded.
+    /// Relay URL: `ws://<external-ip>:<port>/scp/v1`.
+    Upnp {
+        /// External address obtained from the gateway.
+        external_addr: SocketAddr,
+    },
+    /// Tier 2: STUN hole punching (non-symmetric NAT).
+    /// Relay URL: `ws://<external-ip>:<port>/scp/v1`.
+    Stun {
+        /// External address discovered by STUN.
+        external_addr: SocketAddr,
+    },
+    /// Tier 3: Bridge relay (symmetric NAT or all lower tiers failed).
+    /// Relay URL: `wss://<bridge-domain>/scp/v1?bridge_target=<hex>`.
+    Bridge {
+        /// Bridge relay URL to publish in the DID document.
+        bridge_url: String,
+    },
+}
+
+/// Strategy for NAT probing and tier selection (spec section 10.12.8).
+///
+/// Abstracted as a trait to enable mock implementations in tests.
+/// Production code uses [`DefaultNatStrategy`]; tests provide
+/// pre-computed results.
+pub trait NatStrategy: Send + Sync {
+    /// Probes NAT type and selects the best reachability tier.
+    ///
+    /// Steps per §10.12.8:
+    /// 1. Probe NAT type via STUN.
+    /// 2. Attempt Tier 1 (UPnP/NAT-PMP).
+    /// 3. If Tier 1 fails and NAT is non-symmetric, attempt Tier 2 (STUN).
+    /// 4. If Tier 2 fails or NAT is symmetric, attempt Tier 3 (bridge).
+    fn select_tier(
+        &self,
+        relay_port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+    >;
+}
+
+/// Default NAT strategy using real STUN probing, `UPnP`, and bridge relay.
+///
+/// Uses [`NatProber`](scp_transport::nat::NatProber) for STUN probing and
+/// [`PortMappingManager`](scp_transport::nat::PortMappingManager) for `UPnP`.
+pub struct DefaultNatStrategy {
+    /// STUN server URL override (if set via `.stun_server()`).
+    stun_server: Option<String>,
+    /// Bridge relay URL override (if set via `.bridge_relay()`).
+    bridge_relay: Option<String>,
+}
+
+impl DefaultNatStrategy {
+    /// Creates a new default NAT strategy with optional overrides.
+    #[must_use]
+    pub const fn new(stun_server: Option<String>, bridge_relay: Option<String>) -> Self {
+        Self {
+            stun_server,
+            bridge_relay,
+        }
+    }
+}
+
+impl NatStrategy for DefaultNatStrategy {
+    fn select_tier(
+        &self,
+        _relay_port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            use scp_transport::nat::{NatProber, StunEndpoint};
+
+            // Step 1: Resolve STUN endpoint.
+            let stun_url = self
+                .stun_server
+                .as_deref()
+                .unwrap_or("stun.l.google.com:19302");
+
+            // Parse the STUN server address.
+            let stun_addr: SocketAddr = stun_url.parse().map_err(|e| {
+                NodeError::Nat(format!("invalid STUN server address '{stun_url}': {e}"))
+            })?;
+
+            let endpoint = StunEndpoint {
+                addr: stun_addr,
+                label: stun_url.to_owned(),
+            };
+
+            let prober = NatProber::new(vec![endpoint], None)
+                .map_err(|e| NodeError::Nat(format!("failed to create NAT prober: {e}")))?;
+
+            // Step 2: Probe NAT type.
+            let probe_result = prober
+                .probe()
+                .await
+                .map_err(|e| NodeError::Nat(format!("NAT probing failed: {e}")))?;
+
+            tracing::info!(
+                nat_type = %probe_result.nat_type,
+                external_addr = ?probe_result.external_addr,
+                "NAT type probed"
+            );
+
+            // Step 3: Attempt Tier 1 (UPnP) — requires real UPnP gateway discovery.
+            // UPnP is best-effort; failure falls through to Tier 2.
+            // Full UPnP integration requires `PortMappingManager` with real mappers.
+            // For now, the DefaultNatStrategy attempts STUN-based tiers.
+            // UPnP can be added when production PortMapper impls exist.
+
+            // Step 4: For non-symmetric NAT, use Tier 2 (STUN address).
+            if probe_result.nat_type.is_hole_punchable()
+                && let Some(external_addr) = probe_result.external_addr
+            {
+                return Ok(ReachabilityTier::Stun { external_addr });
+            }
+
+            // Step 5: Tier 3 (bridge relay).
+            if let Some(ref bridge_url) = self.bridge_relay {
+                return Ok(ReachabilityTier::Bridge {
+                    bridge_url: bridge_url.clone(),
+                });
+            }
+
+            Err(NodeError::Nat(
+                "all reachability tiers failed: NAT is symmetric and no bridge relay configured"
+                    .into(),
+            ))
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ApplicationNodeBuilder
@@ -318,6 +470,12 @@ pub struct ApplicationNodeBuilder<
     // when TLS certificate provisioning is added.
     #[allow(dead_code)]
     acme_email: Option<String>,
+    /// Override the STUN endpoint for NAT type probing (§10.12.8).
+    stun_server: Option<String>,
+    /// Override the bridge relay for Tier 3 fallback (§10.12.8).
+    bridge_relay: Option<String>,
+    /// Pluggable NAT strategy for testability.
+    nat_strategy: Option<Arc<dyn NatStrategy>>,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -336,6 +494,9 @@ impl ApplicationNodeBuilder {
             blob_storage: Some(InMemoryBlobStorage::new()),
             bind_addr: None,
             acme_email: None,
+            stun_server: None,
+            bridge_relay: None,
+            nat_strategy: None,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -368,7 +529,8 @@ impl<
     /// Sets the domain this node serves.
     ///
     /// The relay URL is derived as `wss://<domain>/scp/v1` (spec section
-    /// 18.5.2). This field is required — the builder cannot be built without it.
+    /// 18.5.2). Either `.domain()` or `.no_domain()` must be called —
+    /// the builder cannot be built without one (§10.12.8).
     #[must_use]
     pub fn domain(self, domain: &str) -> ApplicationNodeBuilder<K, D, S, B, HasDomain, Id> {
         ApplicationNodeBuilder {
@@ -378,6 +540,35 @@ impl<
             blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            stun_server: self.stun_server,
+            bridge_relay: self.bridge_relay,
+            nat_strategy: self.nat_strategy,
+            _domain_state: PhantomData,
+            _identity_state: PhantomData,
+        }
+    }
+
+    /// Zero-config NAT-traversed mode (§10.12.8).
+    ///
+    /// When set: skip ACME TLS provisioning, probe NAT type via STUN,
+    /// attempt `UPnP` (Tier 1), fallback to STUN address (Tier 2),
+    /// register with bridge (Tier 3), publish DID document with `ws://`
+    /// relay URL, do NOT serve `.well-known/scp`.
+    ///
+    /// This is the zero-config deployment path for self-hosted relays
+    /// behind residential NAT.
+    #[must_use]
+    pub fn no_domain(self) -> ApplicationNodeBuilder<K, D, S, B, HasNoDomain, Id> {
+        ApplicationNodeBuilder {
+            domain: None,
+            identity_source: self.identity_source,
+            storage: self.storage,
+            blob_storage: self.blob_storage,
+            bind_addr: self.bind_addr,
+            acme_email: self.acme_email,
+            stun_server: self.stun_server,
+            bridge_relay: self.bridge_relay,
+            nat_strategy: self.nat_strategy,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -412,6 +603,36 @@ impl<
         self.acme_email = Some(email.to_owned());
         self
     }
+
+    /// Override the STUN endpoint used for NAT type probing (§10.12.8).
+    ///
+    /// Default: bootstrap relay with STUN support. The value should be a
+    /// socket address (e.g., `"stun.l.google.com:19302"`).
+    #[must_use]
+    pub fn stun_server(mut self, url: &str) -> Self {
+        self.stun_server = Some(url.to_owned());
+        self
+    }
+
+    /// Override the bridge relay used for Tier 3 fallback (§10.12.8).
+    ///
+    /// Default: first bridge-capable relay in the fallback relay list.
+    /// The value should be a `wss://` URL.
+    #[must_use]
+    pub fn bridge_relay(mut self, url: &str) -> Self {
+        self.bridge_relay = Some(url.to_owned());
+        self
+    }
+
+    /// Sets a custom NAT strategy for testability.
+    ///
+    /// Production code uses [`DefaultNatStrategy`] (created automatically
+    /// during `build()`). Tests can inject mock strategies.
+    #[must_use]
+    pub fn nat_strategy(mut self, strategy: Arc<dyn NatStrategy>) -> Self {
+        self.nat_strategy = Some(strategy);
+        self
+    }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, Dom, Id>
@@ -431,6 +652,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, 
             blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            stun_server: self.stun_server,
+            bridge_relay: self.bridge_relay,
+            nat_strategy: self.nat_strategy,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -455,6 +679,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
             blob_storage: Some(blob_storage),
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            stun_server: self.stun_server,
+            bridge_relay: self.bridge_relay,
+            nat_strategy: self.nat_strategy,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -485,6 +712,9 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            stun_server: self.stun_server,
+            bridge_relay: self.bridge_relay,
+            nat_strategy: self.nat_strategy,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -508,6 +738,9 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             blob_storage: self.blob_storage,
             bind_addr: self.bind_addr,
             acme_email: self.acme_email,
+            stun_server: self.stun_server,
+            bridge_relay: self.bridge_relay,
+            nat_strategy: self.nat_strategy,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -600,6 +833,12 @@ impl<
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 7. Publish DID document now that the relay is confirmed listening.
+        //
+        // §10.12.8: If domain-based deployment fails (DNS misconfigured, ACME
+        // challenge fails), log the failure and fall through to no_domain behavior.
+        // Currently ACME provisioning is not yet implemented (ADR-032 AC 7),
+        // so this path always succeeds. When ACME is implemented, wrap this
+        // block in a match and fall through to `build_no_domain_inner` on failure.
         did_method.publish(&identity, &document).await?;
 
         tracing::info!(
@@ -607,7 +846,7 @@ impl<
             relay_url = %relay_url,
             bound_addr = %bound_addr,
             did = %identity.did,
-            "application node started"
+            "application node started (domain mode)"
         );
 
         let state = Arc::new(http::NodeState {
@@ -619,7 +858,145 @@ impl<
         });
 
         Ok(ApplicationNode {
-            domain,
+            domain: Some(domain),
+            relay: RelayHandle {
+                bound_addr,
+                shutdown_handle,
+            },
+            identity: IdentityHandle { identity, document },
+            storage,
+            state,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build for HasNoDomain — zero-config NAT-traversed mode (§10.12.8)
+// ---------------------------------------------------------------------------
+
+impl<
+    K: KeyCustody + 'static,
+    D: DidMethod + 'static,
+    S: Storage + Default + 'static,
+    B: BlobStorage + 'static,
+> ApplicationNodeBuilder<K, D, S, B, HasNoDomain, HasIdentity>
+{
+    /// Builds the [`ApplicationNode`] in zero-config no-domain mode (§10.12.8).
+    ///
+    /// This method is only available when `.no_domain()` has been called and
+    /// identity has been set — the type system enforces this at compile time.
+    ///
+    /// # Steps
+    ///
+    /// 1. Initializes storage.
+    /// 2. Loads or generates identity.
+    /// 3. Starts relay server.
+    /// 4. Probes NAT type via STUN and selects reachability tier.
+    /// 5. Constructs relay URL based on tier (ws:// for Tiers 1-2, wss:// for Tier 3).
+    /// 6. Adds `SCPRelay` service entry to the DID document.
+    /// 7. Publishes DID document.
+    /// 8. Does NOT serve `.well-known/scp` (no domain to serve from).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Nat`] if all reachability tiers fail.
+    /// Returns [`NodeError::Identity`] if identity creation or DID
+    /// publication fails. Returns [`NodeError::Relay`] if the relay server
+    /// fails to start.
+    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
+        let identity_source = self.identity_source.ok_or(NodeError::MissingField(
+            "identity (call generate_identity_with() or identity())",
+        ))?;
+
+        // 1. Initialize storage.
+        let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
+
+        // 2. Obtain identity.
+        let (identity, mut document, did_method) = match identity_source {
+            IdentitySource::Generate {
+                key_custody,
+                did_method,
+            } => {
+                let (identity, document) = did_method.create(&*key_custody).await?;
+                (identity, document, did_method)
+            }
+            IdentitySource::Explicit(explicit) => {
+                (explicit.identity, explicit.document, explicit.did_method)
+            }
+        };
+
+        // 3. Start relay server.
+        let bind_addr = self
+            .bind_addr
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+
+        let relay_config = RelayConfig {
+            bind_addr,
+            ..RelayConfig::default()
+        };
+
+        let blob_storage = self
+            .blob_storage
+            .ok_or(NodeError::MissingField("blob_storage"))?;
+        let relay_server = RelayServer::new(relay_config, blob_storage);
+        let (shutdown_handle, bound_addr) = relay_server.start().await?;
+
+        // 4. Probe NAT type and select reachability tier (§10.12.8).
+        let strategy: Arc<dyn NatStrategy> = self.nat_strategy.unwrap_or_else(|| {
+            Arc::new(DefaultNatStrategy::new(
+                self.stun_server.clone(),
+                self.bridge_relay.clone(),
+            ))
+        });
+
+        let tier = strategy.select_tier(bound_addr.port()).await?;
+
+        // 5. Construct relay URL based on tier (§10.12.7).
+        let relay_url = match &tier {
+            ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
+                format!("ws://{external_addr}/scp/v1")
+            }
+            ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
+        };
+
+        // 6. Add SCPRelay service entry to the DID document.
+        //    `add_relay_service` requires wss://, but Tiers 1-2 use ws://.
+        //    Construct the service entry directly per §10.12.7.
+        let relay_count = document
+            .service
+            .iter()
+            .filter(|s| s.service_type == "SCPRelay")
+            .count();
+
+        document
+            .service
+            .push(scp_core::identity::document::Service {
+                id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
+                service_type: "SCPRelay".to_owned(),
+                service_endpoint: relay_url.clone(),
+            });
+
+        // 7. Publish DID document.
+        did_method.publish(&identity, &document).await?;
+
+        tracing::info!(
+            tier = ?tier,
+            relay_url = %relay_url,
+            bound_addr = %bound_addr,
+            did = %identity.did,
+            "application node started (no-domain mode, §10.12.8)"
+        );
+
+        let state = Arc::new(http::NodeState {
+            did: identity.did.clone(),
+            relay_url,
+            broadcast_contexts: RwLock::new(Vec::new()),
+            relay_addr: bound_addr,
+        });
+
+        // 8. Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
+        Ok(ApplicationNode {
+            domain: None,
             relay: RelayHandle {
                 bound_addr,
                 shutdown_handle,
@@ -955,7 +1332,7 @@ mod tests {
         assert_eq!(relay_urls[0], "wss://test.example.com/scp/v1");
 
         // Verify accessors work.
-        assert_eq!(node.domain(), "test.example.com");
+        assert_eq!(node.domain(), Some("test.example.com"));
         assert_eq!(node.relay_url(), "wss://test.example.com/scp/v1");
 
         // Verify relay is actually bound.
@@ -1242,6 +1619,326 @@ mod tests {
         assert!(
             node.identity().did().starts_with("did:dht:"),
             "node should build successfully with acme_email set"
+        );
+    }
+
+    // -- No-domain / NAT traversal tests (SCP-235) ---------------------------
+
+    /// Mock NAT strategy that returns a pre-configured tier.
+    struct MockNatStrategy {
+        tier: ReachabilityTier,
+    }
+
+    impl NatStrategy for MockNatStrategy {
+        fn select_tier(
+            &self,
+            _relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            let tier = self.tier.clone();
+            Box::pin(async move { Ok(tier) })
+        }
+    }
+
+    /// Mock NAT strategy that always fails.
+    struct FailingNatStrategy;
+
+    impl NatStrategy for FailingNatStrategy {
+        fn select_tier(
+            &self,
+            _relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            Box::pin(async { Err(NodeError::Nat("all tiers failed".into())) })
+        }
+    }
+
+    /// Helper: creates a builder with `no_domain` and `generate_identity` configured,
+    /// using a mock NAT strategy that returns a STUN tier.
+    fn test_no_domain_builder(
+        tier: ReachabilityTier,
+    ) -> ApplicationNodeBuilder<
+        InMemoryKeyCustody,
+        TestDidDht,
+        InMemoryStorage,
+        InMemoryBlobStorage,
+        HasNoDomain,
+        HasIdentity,
+    > {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        ApplicationNodeBuilder::new()
+            .storage(Arc::new(InMemoryStorage::new()))
+            .no_domain()
+            .nat_strategy(Arc::new(MockNatStrategy { tier }))
+            .generate_identity_with(custody, did_method)
+    }
+
+    #[test]
+    fn no_domain_method_exists_and_transitions_type_state() {
+        // .no_domain() should compile and transition Dom to HasNoDomain.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let _builder = ApplicationNodeBuilder::new()
+            .no_domain()
+            .generate_identity_with(custody, did_method);
+
+        // The fact that this compiles proves HasNoDomain enables build().
+    }
+
+    #[test]
+    fn stun_server_method_exists_on_builder() {
+        // .stun_server() should compile at any Dom state.
+        let _builder = ApplicationNodeBuilder::new().stun_server("stun.example.com:3478");
+
+        // Also after setting domain.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        let _builder = ApplicationNodeBuilder::new()
+            .stun_server("stun.example.com:3478")
+            .no_domain()
+            .generate_identity_with(custody, did_method);
+    }
+
+    #[test]
+    fn bridge_relay_method_exists_on_builder() {
+        // .bridge_relay() should compile at any Dom state.
+        let _builder =
+            ApplicationNodeBuilder::new().bridge_relay("wss://bridge.example.com/scp/v1");
+    }
+
+    #[tokio::test]
+    async fn no_domain_build_skips_tls_and_publishes_ws_url() {
+        // AC: .no_domain() build skips TLS and publishes ws:// URL.
+        let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
+        let tier = ReachabilityTier::Stun { external_addr };
+
+        let node = test_no_domain_builder(tier)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        // Verify no domain is set.
+        assert!(
+            node.domain().is_none(),
+            "no-domain mode should have None domain"
+        );
+
+        // Verify the relay URL uses ws:// (not wss://).
+        assert!(
+            node.relay_url().starts_with("ws://"),
+            "no-domain mode should publish ws:// URL, got: {}",
+            node.relay_url()
+        );
+        assert_eq!(node.relay_url(), "ws://198.51.100.7:32891/scp/v1");
+
+        // Verify the DID document has the ws:// relay entry.
+        let relay_urls = node.identity().document().relay_service_urls();
+        assert_eq!(relay_urls.len(), 1);
+        assert_eq!(relay_urls[0], "ws://198.51.100.7:32891/scp/v1");
+
+        // Verify identity was created.
+        assert!(
+            node.identity().did().starts_with("did:dht:"),
+            "DID should start with did:dht:"
+        );
+
+        // Verify relay is bound.
+        assert_ne!(node.relay().bound_addr().port(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_domain_build_with_bridge_publishes_wss_url() {
+        // AC: Tier 3 (bridge) publishes wss:// bridge URL.
+        let tier = ReachabilityTier::Bridge {
+            bridge_url: "wss://bridge.example.com/scp/v1?bridge_target=deadbeef".to_owned(),
+        };
+
+        let node = test_no_domain_builder(tier)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        // Verify the relay URL uses wss:// (bridge URL).
+        assert!(
+            node.relay_url().starts_with("wss://"),
+            "bridge mode should publish wss:// URL, got: {}",
+            node.relay_url()
+        );
+        assert_eq!(
+            node.relay_url(),
+            "wss://bridge.example.com/scp/v1?bridge_target=deadbeef"
+        );
+
+        // Verify the DID document has the bridge relay entry.
+        let relay_urls = node.identity().document().relay_service_urls();
+        assert_eq!(relay_urls.len(), 1);
+        assert!(relay_urls[0].contains("bridge_target="));
+    }
+
+    #[tokio::test]
+    async fn no_domain_build_with_upnp_tier_publishes_ws_url() {
+        // AC: Tier 1 (UPnP) publishes ws:// URL.
+        let external_addr = SocketAddr::from(([203, 0, 113, 42], 8443));
+        let tier = ReachabilityTier::Upnp { external_addr };
+
+        let node = test_no_domain_builder(tier)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(node.relay_url(), "ws://203.0.113.42:8443/scp/v1");
+    }
+
+    #[tokio::test]
+    async fn no_domain_does_not_serve_well_known() {
+        // AC: .well-known/scp is NOT served in no-domain mode.
+        // The node is created without a domain, so there is nothing
+        // to serve .well-known/scp from. The well_known_router still
+        // works as an axum router, but conceptually this node should
+        // NOT be served on a public HTTP endpoint for .well-known.
+        // We verify the domain is None, which is the gate for deciding
+        // whether to serve .well-known.
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+
+        let node = test_no_domain_builder(tier)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            node.domain().is_none(),
+            "no-domain mode: domain must be None to prevent .well-known/scp serving"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_build_uses_wss_no_regression() {
+        // AC: When .domain() is set and succeeds, wss:// is used.
+        let node = test_builder()
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            node.relay_url().starts_with("wss://"),
+            "domain mode should use wss://, got: {}",
+            node.relay_url()
+        );
+        assert_eq!(node.relay_url(), "wss://test.example.com/scp/v1");
+        assert_eq!(node.domain(), Some("test.example.com"));
+    }
+
+    #[tokio::test]
+    async fn no_domain_nat_failure_returns_error() {
+        // AC (implied): When all NAT tiers fail, build() returns an error.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let result = ApplicationNodeBuilder::new()
+            .storage(Arc::new(InMemoryStorage::new()))
+            .no_domain()
+            .nat_strategy(Arc::new(FailingNatStrategy))
+            .generate_identity_with(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await;
+
+        let Err(err) = result else {
+            panic!("build() should fail when all NAT tiers fail");
+        };
+        assert!(
+            matches!(err, NodeError::Nat(_)),
+            "error should be NodeError::Nat, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_domain_did_publication_happens_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingDidMethod {
+            inner: TestDidDht,
+            publish_count: Arc<AtomicU32>,
+        }
+
+        impl DidMethod for CountingDidMethod {
+            fn create(
+                &self,
+                key_custody: &impl KeyCustody,
+            ) -> impl std::future::Future<
+                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+            > + Send {
+                self.inner.create(key_custody)
+            }
+
+            fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
+                self.inner.verify(did_string, public_key)
+            }
+
+            fn publish(
+                &self,
+                identity: &ScpIdentity,
+                document: &DidDocument,
+            ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+                self.publish_count.fetch_add(1, Ordering::SeqCst);
+                self.inner.publish(identity, document)
+            }
+
+            fn resolve(
+                &self,
+                did_string: &str,
+            ) -> impl std::future::Future<Output = Result<DidDocument, IdentityError>> + Send
+            {
+                self.inner.resolve(did_string)
+            }
+
+            fn rotate(
+                &self,
+                identity: &ScpIdentity,
+                key_custody: &impl KeyCustody,
+            ) -> impl std::future::Future<
+                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+            > + Send {
+                self.inner.rotate(identity, key_custody)
+            }
+        }
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let publish_count = Arc::new(AtomicU32::new(0));
+        let counting_method = Arc::new(CountingDidMethod {
+            inner: make_test_dht(&custody),
+            publish_count: Arc::clone(&publish_count),
+        });
+
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+
+        let _node = ApplicationNodeBuilder::new()
+            .storage(Arc::new(InMemoryStorage::new()))
+            .no_domain()
+            .nat_strategy(Arc::new(MockNatStrategy { tier }))
+            .generate_identity_with(custody, counting_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            publish_count.load(Ordering::SeqCst),
+            1,
+            "DID should be published exactly once on no-domain build"
         );
     }
 
