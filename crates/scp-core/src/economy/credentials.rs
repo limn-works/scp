@@ -22,6 +22,7 @@
 //! Discovery and Configuration), and 19.11 (SDK Surface).
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::identity::DID;
 
@@ -45,7 +46,7 @@ use super::adapter::PaymentAdapter;
 ///
 /// See spec section 3.7 (Identity Private State) and 19.2.5 (Adapter
 /// Credential Management).
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedBlob(Vec<u8>);
 
 impl EncryptedBlob {
@@ -66,9 +67,12 @@ impl EncryptedBlob {
     }
 
     /// Consumes the wrapper and returns the inner encrypted bytes.
+    ///
+    /// The inner `Vec` is swapped out before drop so that `ZeroizeOnDrop`
+    /// zeroes an empty vec (no-op) rather than the returned data.
     #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
     }
 
     /// Returns the length of the encrypted data.
