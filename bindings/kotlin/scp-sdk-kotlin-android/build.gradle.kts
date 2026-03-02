@@ -23,6 +23,16 @@ android {
     defaultConfig {
         minSdk = 26
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles("consumer-rules.pro")
+    }
+
+    buildTypes {
+        release {
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
     }
 
     compileOptions {
@@ -107,7 +117,9 @@ dependencies {
 
     // Compose testing (SCP-118)
     testImplementation("androidx.compose.ui:ui-test-junit4")
-    debugImplementation("androidx.compose.ui:ui-test-manifest")
+    // Available in all variants so Robolectric can resolve ComponentActivity
+    // in release unit tests (see #144 — debugImplementation excluded it from release)
+    implementation("androidx.compose.ui:ui-test-manifest")
 }
 
 detekt {
