@@ -472,8 +472,7 @@ impl ResolutionCache {
     pub fn new() -> Self {
         Self {
             entries: lru::LruCache::new(
-                std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY)
-                    .expect("constant is non-zero"),
+                std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("constant is non-zero"),
             ),
         }
     }

@@ -65,13 +65,18 @@
 - MEDIUM: generate_nonce uses thread_rng() instead of OsRng (diverges from NAPI)
 - MEDIUM: custody_type() returns Hardware as silent default on lock contention
 
-### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 + PR#127
-- FIXED (PR#127): ucan_validate now has Ed25519 signature verification via verify_strict
-- REMAINING (MEDIUM): ucan_mint returns unsigned tokens (metadata-only, no Ed25519 signing) -- SCP-218 scope
+### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 + PR#127 R2
+- FIXED (SA-01): Full 11-step UCAN validation pipeline in wasm/ucan.rs with Ed25519 verify_strict, delegation chain, aud/iss/ceiling/nonce/revocation
+- FIXED (SA-01): compute_revocation_cid returns Result<String, String> instead of unwrap_or_default()
+- REMAINING (HIGH): did:key: hex format in production resolve_public_key (line 274) -- not gated behind cfg(test)
+- REMAINING (MEDIUM): ucan_mint returns error stub (metadata-only, no Ed25519 signing) -- SCP-218 scope
+- NEW (MEDIUM): WasmUcanContextState default empty creator_did could bypass root issuer check
+- NEW (MEDIUM): UCAN nonce state (seen_nonces HashSet) unbounded per context
 - HIGH: runtime.rs reimplements scp-core logic (Merkle tree, schema, tool registry) -- divergence risk
 - MEDIUM: context_send base64 check is_empty() only; panic hook leaks file paths
 - MEDIUM: Context IDs use UUID format not crypto-random hex per spec 18.4.1
-- MEDIUM: compute_revocation_cid uses unwrap_or_default() on serde_json -- silent CID collision on serialize failure
+- GOOD: RED-105 trailing-slash prefix collision protection in CapabilityUri::matches_context_scope
+- GOOD: MAX_CHAIN_DEPTH=32 and MAX_EXPIRY_SECS=86400 match scp-core limits
 
 ### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86 + PR#127
 - CRITICAL: ucan_mint uses [0u8; 64] placeholder zero signature
@@ -116,9 +121,11 @@
 - CoroutineBridge awaitClose uses runBlocking(ioDispatcher) -- safe for Dispatchers.IO but deadlock risk on single-threaded test dispatchers
 - callbackFlow subscribe/unsubscribe pattern is correct; trySend with overflow detection is good
 
-### Governance Engines (PR#127 -- `scp-core/src/context/governance/`)
-- HIGH: SignedVote.signature always Vec::new() -- votes never signed or verified
-- HIGH: compute_proposal_id concatenation without length prefixes -- collision risk
+### Governance Engines (PR#127 R2 -- `scp-core/src/context/governance/`)
+- FIXED (SA-09): SignedVote now has real Ed25519 signatures via sign_vote() with SCP-VOTE-V1: domain separator
+- FIXED (SA-05): compute_proposal_id now has SCP-PROPOSAL-V1: domain separator + u32 BE length prefixes
+- NEW (HIGH): compute_vote_hash omits proposal_id -- cross-proposal vote replay risk. Fix: add proposal_id as first hashed field
+- NEW (MEDIUM): verify_vote() defined and tested but never called in any engine -- votes produced but never verified on receipt
 - GOOD: Deadline guards on approve/reject/withdraw in all engines (multisig, unanimity, majority)
 - GOOD: Duplicate proposal rejection; deterministic proposal IDs; early resolution rules correct
 - GOOD: All engines are Send + Sync; GovernanceEngine trait is object-safe
@@ -133,16 +140,16 @@
 - GOOD: rust-deny job runs cargo-deny for supply chain security
 - GOOD: PyPI uses OIDC Trusted Publishers (no stored token)
 
-### Broadcast Context (`scp-core/src/context/broadcast.rs`) -- PR#127
-- MEDIUM: validate_messages_read_ucan checks aud + att only -- no expiry, signature, revocation, or chain verification
-- MEDIUM: subscribers/authors/block_list HashMaps unbounded -- Sybil risk on open broadcast contexts
+### Broadcast Context (`scp-core/src/context/broadcast.rs`) -- PR#127 R2
+- FIXED (SA-04): validate_messages_read_ucan now delegates to full 11-step validate_ucan from scp-core
+- REMAINING (MEDIUM): subscribers/authors/block_list HashMaps unbounded -- Sybil risk on open broadcast contexts
 - GOOD: Wildcard UCAN rejection (RED-012); epoch overflow via checked_add; per-author key isolation
 
-### Event Log Checkpoint (`scp-core/src/event_log/checkpoint.rs`) -- PR#127
-- HIGH: compute_checkpoint_canonical_hash lacks length prefixes and domain separator
-- MEDIUM: current_timestamp() uses unwrap_or(0) on clock failure -- zero-timestamp checkpoints
-- MEDIUM: CheckpointManager::checkpoints Vec unbounded growth
-- GOOD: Cross-checkpoint verification; pruned inclusion proofs; RFC 6962 interior node hashing
+### Event Log Checkpoint (`scp-core/src/event_log/checkpoint.rs`) -- PR#127 R2
+- FIXED (SA-05): compute_checkpoint_canonical_hash now has SCP-CHECKPOINT-V1: domain separator + u32 BE length prefixes
+- FIXED (SA-06): current_timestamp() now returns Result<u64, ClockError> via crate::time::now_secs()
+- REMAINING (MEDIUM): CheckpointManager::checkpoints Vec unbounded growth
+- GOOD: Cross-checkpoint verification; pruned inclusion proofs; RFC 6962 interior node hashing; epoch Option encoded as flag byte
 
 ### PyO3 UCAN Bridge (PR#127)
 - GOOD: Full 11-step ADR-016 pipeline via scp-core delegation with real Ed25519 signing

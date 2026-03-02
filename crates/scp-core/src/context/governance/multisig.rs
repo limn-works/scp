@@ -333,7 +333,13 @@ impl GovernanceEngine for ThresholdEngine {
         }
 
         // Record the signed vote.
-        let vote = sign_vote(proposal_id, &VoteType::Approve, voter.as_ref(), context.now, signing_key)?;
+        let vote = sign_vote(
+            proposal_id,
+            &VoteType::Approve,
+            voter.as_ref(),
+            context.now,
+            signing_key,
+        )?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -394,7 +400,13 @@ impl GovernanceEngine for ThresholdEngine {
         }
 
         // Record the signed rejection vote.
-        let vote = sign_vote(proposal_id, &VoteType::Reject, voter.as_ref(), context.now, signing_key)?;
+        let vote = sign_vote(
+            proposal_id,
+            &VoteType::Reject,
+            voter.as_ref(),
+            context.now,
+            signing_key,
+        )?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {

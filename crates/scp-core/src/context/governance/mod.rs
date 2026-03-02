@@ -207,7 +207,12 @@ pub fn verify_vote(
     vote: &SignedVote,
     voter_public_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<(), GovernanceError> {
-    let hash = compute_vote_hash(proposal_id, vote.voter_did.as_ref(), &vote.vote, vote.timestamp)?;
+    let hash = compute_vote_hash(
+        proposal_id,
+        vote.voter_did.as_ref(),
+        &vote.vote,
+        vote.timestamp,
+    )?;
 
     let sig_bytes: [u8; 64] = vote.signature.as_slice().try_into().map_err(|_| {
         GovernanceError::VerificationFailed(format!(
@@ -1751,8 +1756,14 @@ mod tests {
     #[test]
     fn sign_vote_produces_64_byte_signature() {
         let sk = test_signing_key();
-        let sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
+        let sv = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
 
         assert_eq!(sv.signature.len(), 64);
         assert_eq!(sv.voter_did, alice());
@@ -1765,8 +1776,14 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
+        let sv = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
         verify_vote(&[0u8; 32], &sv, &vk).expect("verify_vote should succeed");
     }
 
@@ -1775,8 +1792,14 @@ mod tests {
         let sk = test_signing_key();
         let wrong_vk = test_signing_key_2().verifying_key();
 
-        let sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
+        let sv = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
         let result = verify_vote(&[0u8; 32], &sv, &wrong_vk);
         assert!(result.is_err());
         assert!(matches!(
@@ -1790,8 +1813,14 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let mut sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
+        let mut sv = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
         sv.voter_did = bob();
 
         let result = verify_vote(&[0u8; 32], &sv, &vk);
@@ -1803,8 +1832,14 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let mut sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
+        let mut sv = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
         sv.vote = VoteType::Reject;
 
         let result = verify_vote(&[0u8; 32], &sv, &vk);
@@ -1816,8 +1851,14 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let mut sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
+        let mut sv = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
         sv.timestamp = 1_700_000_001;
 
         let result = verify_vote(&[0u8; 32], &sv, &vk);
@@ -1829,8 +1870,14 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let mut sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
+        let mut sv = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
         sv.signature = Vec::new();
 
         let result = verify_vote(&[0u8; 32], &sv, &vk);
@@ -1844,24 +1891,60 @@ mod tests {
     #[test]
     fn sign_vote_is_deterministic() {
         let sk = test_signing_key();
-        let sv1 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
-        let sv2 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
+        let sv1 = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
+        let sv2 = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
         assert_eq!(sv1.signature, sv2.signature);
     }
 
     #[test]
     fn sign_vote_different_inputs_produce_different_signatures() {
         let sk = test_signing_key();
-        let sv1 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
-        let sv2 = sign_vote(&[0u8; 32], &VoteType::Reject, "did:dht:z6MkAlice", 1_700_000_000, &sk)
-            .expect("sign_vote");
-        let sv3 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkBob", 1_700_000_000, &sk)
-            .expect("sign_vote");
-        let sv4 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_001, &sk)
-            .expect("sign_vote");
+        let sv1 = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
+        let sv2 = sign_vote(
+            &[0u8; 32],
+            &VoteType::Reject,
+            "did:dht:z6MkAlice",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
+        let sv3 = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkBob",
+            1_700_000_000,
+            &sk,
+        )
+        .expect("sign_vote");
+        let sv4 = sign_vote(
+            &[0u8; 32],
+            &VoteType::Approve,
+            "did:dht:z6MkAlice",
+            1_700_000_001,
+            &sk,
+        )
+        .expect("sign_vote");
 
         assert_ne!(sv1.signature, sv2.signature);
         assert_ne!(sv1.signature, sv3.signature);
@@ -1883,6 +1966,7 @@ mod tests {
         assert_eq!(proposal.approvals.len(), 1);
         let vote = &proposal.approvals[0];
         assert_eq!(vote.signature.len(), 64);
-        verify_vote(&proposal.proposal_id, vote, &vk).expect("vote produced by propose should be verifiable");
+        verify_vote(&proposal.proposal_id, vote, &vk)
+            .expect("vote produced by propose should be verifiable");
     }
 }

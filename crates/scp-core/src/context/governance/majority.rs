@@ -405,7 +405,13 @@ impl GovernanceEngine for MajorityVoteEngine {
         }
 
         // Record the signed vote. Get mutable reference for mutation.
-        let signed_vote = sign_vote(proposal_id, &VoteType::Approve, voter.as_ref(), context.now, signing_key)?;
+        let signed_vote = sign_vote(
+            proposal_id,
+            &VoteType::Approve,
+            voter.as_ref(),
+            context.now,
+            signing_key,
+        )?;
 
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
@@ -479,7 +485,13 @@ impl GovernanceEngine for MajorityVoteEngine {
         }
 
         // Record the signed vote. Get mutable reference for mutation.
-        let signed_vote = sign_vote(proposal_id, &VoteType::Reject, voter.as_ref(), context.now, signing_key)?;
+        let signed_vote = sign_vote(
+            proposal_id,
+            &VoteType::Reject,
+            voter.as_ref(),
+            context.now,
+            signing_key,
+        )?;
 
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
