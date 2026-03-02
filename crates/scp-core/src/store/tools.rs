@@ -30,23 +30,28 @@ type ToolId = String;
 ///
 /// Format: `context/{context_id}/tool/{tool_id}`
 /// See spec section 17.3.
-fn tool_key(context_id: &str, tool_id: &str) -> String {
-    format!("context/{context_id}/tool/{tool_id}")
+fn tool_key(context_id: &str, tool_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let tool = super::sanitize_key_component(tool_id)?;
+    Ok(format!("context/{ctx}/tool/{tool}"))
 }
 
 /// Builds the prefix for listing all tools in a context.
 ///
 /// Format: `context/{context_id}/tool/`
-fn tools_prefix(context_id: &str) -> String {
-    format!("context/{context_id}/tool/")
+fn tools_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/tool/"))
 }
 
 /// Builds the storage key for a tool session.
 ///
 /// Format: `context/{context_id}/tool_session/{session_id}`
 /// See spec section 17.3.
-fn tool_session_key(context_id: &str, session_id: &str) -> String {
-    format!("context/{context_id}/tool_session/{session_id}")
+fn tool_session_key(context_id: &str, session_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let sess = super::sanitize_key_component(session_id)?;
+    Ok(format!("context/{ctx}/tool_session/{sess}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -69,7 +74,7 @@ impl<S: Storage> ProtocolStore<S> {
         tool_id: &str,
         registration: &[u8],
     ) -> Result<(), StoreError> {
-        let key = tool_key(context_id, tool_id);
+        let key = tool_key(context_id, tool_id)?;
         self.store_value(&key, &registration.to_vec()).await
     }
 
@@ -86,7 +91,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         tool_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = tool_key(context_id, tool_id);
+        let key = tool_key(context_id, tool_id)?;
         self.load_value(&key).await
     }
 
@@ -98,7 +103,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn list_tools(&self, context_id: &str) -> Result<Vec<ToolId>, StoreError> {
-        let prefix = tools_prefix(context_id);
+        let prefix = tools_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
         let tool_ids: Vec<ToolId> = keys
             .into_iter()
@@ -115,7 +120,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
     pub async fn delete_tool(&self, context_id: &str, tool_id: &str) -> Result<(), StoreError> {
-        let key = tool_key(context_id, tool_id);
+        let key = tool_key(context_id, tool_id)?;
         self.storage.delete(&key).await?;
         Ok(())
     }
@@ -135,7 +140,7 @@ impl<S: Storage> ProtocolStore<S> {
         session_id: &str,
         session: &[u8],
     ) -> Result<(), StoreError> {
-        let key = tool_session_key(context_id, session_id);
+        let key = tool_session_key(context_id, session_id)?;
         self.store_value(&key, &session.to_vec()).await
     }
 
@@ -152,7 +157,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         session_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = tool_session_key(context_id, session_id);
+        let key = tool_session_key(context_id, session_id)?;
         self.load_value(&key).await
     }
 
@@ -168,7 +173,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         session_id: &str,
     ) -> Result<(), StoreError> {
-        let key = tool_session_key(context_id, session_id);
+        let key = tool_session_key(context_id, session_id)?;
         self.storage.delete(&key).await?;
         Ok(())
     }
@@ -318,7 +323,7 @@ mod tests {
     #[test]
     fn tool_key_follows_convention() {
         assert_eq!(
-            tool_key("ctx-123", "tool-abc"),
+            tool_key("ctx-123", "tool-abc").unwrap(),
             "context/ctx-123/tool/tool-abc"
         );
     }
@@ -326,7 +331,7 @@ mod tests {
     #[test]
     fn tool_session_key_follows_convention() {
         assert_eq!(
-            tool_session_key("ctx-123", "sess-456"),
+            tool_session_key("ctx-123", "sess-456").unwrap(),
             "context/ctx-123/tool_session/sess-456"
         );
     }

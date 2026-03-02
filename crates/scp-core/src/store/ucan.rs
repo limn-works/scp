@@ -74,16 +74,18 @@ fn revocation_key(context_id: &str, token_id: &str) -> Result<String, super::Sto
 ///
 /// Format: `context/{context_id}/nonce/{nonce_hash_hex}`
 /// The nonce hash is encoded as lowercase hex. See spec section 17.3.
-fn nonce_key(context_id: &str, nonce_hash: &[u8; 32]) -> String {
+fn nonce_key(context_id: &str, nonce_hash: &[u8; 32]) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
     let hex_str = hex::encode(nonce_hash);
-    format!("context/{context_id}/nonce/{hex_str}")
+    Ok(format!("context/{ctx}/nonce/{hex_str}"))
 }
 
 /// Builds the prefix for listing all nonces in a context.
 ///
 /// Format: `context/{context_id}/nonce/`
-fn nonce_prefix(context_id: &str) -> String {
-    format!("context/{context_id}/nonce/")
+fn nonce_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/nonce/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +236,7 @@ impl<S: Storage> ProtocolStore<S> {
         first_seen: u64,
         token_expiry: u64,
     ) -> Result<bool, StoreError> {
-        let key = nonce_key(context_id, nonce_hash);
+        let key = nonce_key(context_id, nonce_hash)?;
 
         // If a record already exists, reject immediately without
         // overwriting the existing record's timestamps.
@@ -277,7 +279,7 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         now: u64,
     ) -> Result<u64, StoreError> {
-        let prefix = nonce_prefix(context_id);
+        let prefix = nonce_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
         let mut pruned = 0u64;
         for key in keys {
@@ -605,7 +607,7 @@ mod tests {
     fn nonce_key_uses_hex_encoded_hash() {
         let mut h = [0u8; 32];
         h[0] = 0xFF;
-        let key = nonce_key("ctx-1", &h);
+        let key = nonce_key("ctx-1", &h).unwrap();
         assert!(key.starts_with("context/ctx-1/nonce/"));
         assert!(key.ends_with("00"));
         assert!(key.contains("ff"));
