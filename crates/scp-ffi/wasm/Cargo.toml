@@ -9,6 +9,11 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Enables the did:key:{hex} DID format in resolve_public_key. This is a
+# non-standard test convenience — production builds must resolve via did:dht:z.
+testing = []
+
 [dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

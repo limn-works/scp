@@ -41,6 +41,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 pyo3 = { version = "0.23", features = ["auto-initialize"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+scp-ffi-common = { path = "common", features = ["testing"] }
 
 [lints]
 workspace = true

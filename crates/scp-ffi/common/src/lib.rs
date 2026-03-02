@@ -21,7 +21,7 @@ use scp_core::identity::cache::Clock;
 ///
 /// Supports:
 /// - `did:dht:z{z-base-32-encoded-pubkey}` -- production format.
-/// - `did:key:{hex-encoded-pubkey}` -- testing format.
+/// - `did:key:{hex-encoded-pubkey}` -- testing only (requires `testing` feature).
 ///
 /// This resolver operates in-memory with no network calls. `did:dht:` DIDs
 /// encode the public key directly in the DID string using z-base-32, so
@@ -43,6 +43,10 @@ impl DidResolver for BridgeDidResolver {
             return Ok(bytes);
         }
 
+        // did:key:{hex} is a non-standard test convenience. Gated behind the
+        // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
+        // builds. See: https://github.com/limn-works/scp/issues/128
+        #[cfg(any(test, feature = "testing"))]
         if let Some(hex_str) = did.strip_prefix("did:key:") {
             let bytes = hex::decode(hex_str).map_err(|e| {
                 CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
@@ -57,7 +61,7 @@ impl DidResolver for BridgeDidResolver {
         }
 
         Err(CoreUcanError::MalformedToken(format!(
-            "unsupported DID method: {did} (expected did:dht: or did:key:)"
+            "unsupported DID method: {did} (expected did:dht:)"
         )))
     }
 }

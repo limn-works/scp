@@ -270,7 +270,10 @@ fn resolve_public_key(did: &str) -> Result<[u8; 32], String> {
         return Ok(bytes);
     }
 
-    // did:key:{hex-encoded-pubkey} (testing format)
+    // did:key:{hex} is a non-standard test convenience. Gated behind the
+    // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
+    // builds. See: https://github.com/limn-works/scp/issues/128
+    #[cfg(any(test, feature = "testing"))]
     if let Some(hex_str) = did.strip_prefix("did:key:") {
         let bytes =
             decode_hex(hex_str).map_err(|e| format!("hex decode failed for did:key DID: {e}"))?;
@@ -280,9 +283,7 @@ fn resolve_public_key(did: &str) -> Result<[u8; 32], String> {
         return Ok(pk);
     }
 
-    Err(format!(
-        "unsupported DID method: {did} (expected did:dht: or did:key:)"
-    ))
+    Err(format!("unsupported DID method: {did} (expected did:dht:)"))
 }
 
 /// Verifies the Ed25519 signature over `base64url(header).base64url(payload)`.
@@ -315,6 +316,7 @@ fn verify_signature(token: &ParsedUcanToken) -> Result<(), String> {
 // Hex / zbase32 helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(any(test, feature = "testing"))]
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     if !hex.len().is_multiple_of(2) {
         return Err(format!("hex string has odd length: {}", hex.len()));
