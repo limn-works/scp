@@ -400,6 +400,9 @@ impl NatStrategy for DefaultNatStrategy {
                 DEFAULT_STUN_ENDPOINTS
                     .iter()
                     .map(|(addr_str, label)| {
+                        // SAFETY: DEFAULT_STUN_ENDPOINTS are compile-time string literals
+                        // verified by the `default_stun_endpoints_parseable` unit test.
+                        #[allow(clippy::expect_used)]
                         let addr: SocketAddr = addr_str
                             .parse()
                             .expect("DEFAULT_STUN_ENDPOINTS contains valid SocketAddr literals");
@@ -471,7 +474,11 @@ pub trait TlsProvider: Send + Sync {
     fn provision(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>> + Send + '_>,
+        Box<
+            dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>>
+                + Send
+                + '_,
+        >,
     >;
 }
 
@@ -480,7 +487,11 @@ impl<S: Storage + 'static> TlsProvider for tls::AcmeProvider<S> {
     fn provision(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>> + Send + '_>,
+        Box<
+            dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>>
+                + Send
+                + '_,
+        >,
     > {
         Box::pin(self.load_or_provision())
     }
@@ -906,14 +917,13 @@ impl<
         //    (wss://, .well-known/scp). If it fails (DNS misconfigured, ACME
         //    challenge fails, port 80/443 unreachable), log the failure and fall
         //    through to no_domain behavior (NAT probing, Tiers 1-3).
-        let tls_provider: Arc<dyn TlsProvider> =
-            self.tls_provider.unwrap_or_else(|| {
-                let mut provider = tls::AcmeProvider::new(&domain, Arc::clone(&storage));
-                if let Some(ref email) = self.acme_email {
-                    provider = provider.with_email(email);
-                }
-                Arc::new(provider)
-            });
+        let tls_provider: Arc<dyn TlsProvider> = self.tls_provider.unwrap_or_else(|| {
+            let mut provider = tls::AcmeProvider::new(&domain, Arc::clone(&storage));
+            if let Some(ref email) = self.acme_email {
+                provider = provider.with_email(email);
+            }
+            Arc::new(provider)
+        });
 
         match tls_provider.provision().await {
             Ok(_cert_data) => {
@@ -959,13 +969,12 @@ impl<
                     "domain-based TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
                 );
 
-                let strategy: Arc<dyn NatStrategy> =
-                    self.nat_strategy.unwrap_or_else(|| {
-                        Arc::new(DefaultNatStrategy::new(
-                            self.stun_server.clone(),
-                            self.bridge_relay.clone(),
-                        ))
-                    });
+                let strategy: Arc<dyn NatStrategy> = self.nat_strategy.unwrap_or_else(|| {
+                    Arc::new(DefaultNatStrategy::new(
+                        self.stun_server.clone(),
+                        self.bridge_relay.clone(),
+                    ))
+                });
 
                 build_no_domain_inner(
                     identity,

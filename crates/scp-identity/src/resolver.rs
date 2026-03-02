@@ -416,12 +416,12 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use crate::*;
-    use crate::identity::cache::{DidCache, TestClock};
-    use crate::identity::dht::bep44_signable;
-    use crate::identity::dht_client::{DhtRecord, InMemoryDhtClient};
-    use crate::identity::document::DidDocument;
-    use crate::identity::resolution::did_routing_id;
+    use super::*;
+    use crate::cache::{DidCache, TestClock};
+    use crate::dht::bep44_signable;
+    use crate::dht_client::{DhtRecord, InMemoryDhtClient};
+    use crate::document::DidDocument;
+    use crate::resolution::did_routing_id;
 
     // -----------------------------------------------------------------------
     // Test helpers

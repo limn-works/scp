@@ -288,10 +288,13 @@ impl RelayQuerier for InMemoryRelayQuerier {
 mod tests {
     use std::sync::Arc;
 
+    use sha2::{Digest, Sha256};
+
+    use super::DID_ROUTING_DOMAIN_SEPARATOR;
+    use crate::cache::TestClock;
+    use crate::dht::bep44_signable;
+    use crate::document::DidDocument;
     use crate::*;
-    use crate::identity::cache::TestClock;
-    use crate::identity::dht::bep44_signable;
-    use crate::identity::document::DidDocument;
 
     /// Helper: create an Ed25519 signing keypair and return (`public_key`, `signing_key`).
     fn make_ed25519_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
