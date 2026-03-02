@@ -65,6 +65,13 @@ pub struct RelayConfig {
     pub max_total_connections: usize,
     /// Maximum PUBLISH operations per second per IP address (default: 100).
     pub rate_limit_publishes_per_second: u32,
+    /// Maximum SUBSCRIBE operations per minute per connection (default: 20).
+    ///
+    /// Per ADR-004: `rate_limit_subscribe: 20/min`. This limits the rate at
+    /// which a single connection can issue SUBSCRIBE operations, preventing
+    /// subscribe/unsubscribe churn that causes write-lock contention on the
+    /// `SubscriptionRegistry`.
+    pub rate_limit_subscribes_per_minute: u32,
 }
 
 impl Default for RelayConfig {
@@ -79,6 +86,7 @@ impl Default for RelayConfig {
             max_connections_per_ip: 10,
             max_total_connections: 1000,
             rate_limit_publishes_per_second: 100,
+            rate_limit_subscribes_per_minute: 20,
         }
     }
 }
@@ -423,6 +431,53 @@ async fn decrement_connection(tracker: &ConnectionTracker, ip: IpAddr) {
     }
 }
 
+/// Per-connection token-bucket rate limiter for subscribe operations.
+///
+/// Unlike the publish rate limiter (which is per-IP and shared across
+/// connections), the subscribe rate limiter is per-connection per ADR-004.
+/// Each connection owns its own bucket -- no shared state required.
+struct SubscribeRateLimiter {
+    /// Remaining tokens in this bucket.
+    tokens: f64,
+    /// Last time tokens were refilled.
+    last_refill: Instant,
+    /// Tokens per second (derived from the per-minute rate).
+    rate_per_second: f64,
+    /// Maximum bucket capacity (equal to the per-minute rate, allowing short bursts).
+    capacity: f64,
+}
+
+impl SubscribeRateLimiter {
+    /// Creates a new subscribe rate limiter with the given per-minute rate.
+    fn new(rate_per_minute: u32) -> Self {
+        let capacity = f64::from(rate_per_minute);
+        Self {
+            tokens: capacity,
+            last_refill: Instant::now(),
+            rate_per_second: capacity / 60.0,
+            capacity,
+        }
+    }
+
+    /// Checks whether a subscribe operation is allowed. Returns `true` if the
+    /// operation should proceed, `false` if rate-limited.
+    fn check(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = elapsed
+            .mul_add(self.rate_per_second, self.tokens)
+            .min(self.capacity);
+        self.last_refill = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Checks whether a publish is allowed under the per-IP token-bucket rate
 /// limit. Returns `true` if the publish should proceed, `false` if rate-limited.
 async fn check_publish_rate_limit(
@@ -477,6 +532,10 @@ async fn handle_connection<S: BlobStorage + 'static>(
     // Track this connection's subscriptions for cleanup.
     let my_subscriptions: Arc<RwLock<HashSet<[u8; 32]>>> = Arc::new(RwLock::new(HashSet::new()));
 
+    // Per-connection subscribe rate limiter (ADR-004: 20/min per connection).
+    let mut subscribe_rate_limiter =
+        SubscribeRateLimiter::new(config.rate_limit_subscribes_per_minute);
+
     // Spawn a task to forward relay messages from the channel to the WebSocket.
     let forward_handle = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -518,6 +577,7 @@ async fn handle_connection<S: BlobStorage + 'static>(
                     &my_subscriptions,
                     &config,
                     &rate_limiter,
+                    &mut subscribe_rate_limiter,
                 )
                 .await;
             }
@@ -576,6 +636,7 @@ async fn handle_client_message<S: BlobStorage>(
     my_subscriptions: &Arc<RwLock<HashSet<[u8; 32]>>>,
     config: &RelayConfig,
     rate_limiter: &PublishRateLimiter,
+    subscribe_rate_limiter: &mut SubscribeRateLimiter,
 ) {
     match msg {
         ClientMessage::Publish {
@@ -615,6 +676,7 @@ async fn handle_client_message<S: BlobStorage>(
                 subscriptions,
                 my_subscriptions,
                 config,
+                subscribe_rate_limiter,
             )
             .await;
         }
@@ -819,7 +881,23 @@ async fn handle_subscribe<S: BlobStorage>(
     subscriptions: &SubscriptionRegistry,
     my_subscriptions: &Arc<RwLock<HashSet<[u8; 32]>>>,
     config: &RelayConfig,
+    subscribe_rate_limiter: &mut SubscribeRateLimiter,
 ) {
+    // Check subscribe rate limit (ADR-004: 20/min per connection).
+    if !subscribe_rate_limiter.check() {
+        tracing::warn!(
+            connection_id = connection_id,
+            "subscribe rate limit exceeded"
+        );
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::RATE_LIMITED,
+            msg: "subscribe rate limit exceeded".to_string(),
+        };
+        let _ = tx.send(err).await;
+        return;
+    }
+
     // Check subscription limit.
     {
         let my_subs = my_subscriptions.read().await;
@@ -1829,6 +1907,170 @@ mod tests {
             }
             other => panic!("expected RATE_LIMITED error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_rate_limit_rejects_excess() {
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            rate_limit_subscribes_per_minute: 3,
+            ttl_check_interval: Duration::from_millis(100),
+            ..RelayConfig::default()
+        };
+        let storage = InMemoryBlobStorage::new();
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        // Send 3 subscribes (should succeed -- 3 tokens available).
+        for i in 0u8..3 {
+            let routing_id = [i; 32];
+            let subscribe = ClientMessage::Subscribe {
+                ref_id: Some(format!("s-{i}")),
+                routing_id,
+                since: None,
+            };
+            send_msg(&mut sink, &subscribe).await;
+            let reply = recv_msg(&mut stream).await;
+            assert!(
+                matches!(reply, RelayMessage::Ok { .. }),
+                "subscribe {i} should succeed, got {reply:?}"
+            );
+        }
+
+        // The 4th subscribe should be rate-limited.
+        let subscribe = ClientMessage::Subscribe {
+            ref_id: Some("s-excess".to_string()),
+            routing_id: [0xFF; 32],
+            since: None,
+        };
+        send_msg(&mut sink, &subscribe).await;
+        let reply = recv_msg(&mut stream).await;
+        match reply {
+            RelayMessage::Err { code: c, .. } => {
+                assert_eq!(c, code::RATE_LIMITED);
+            }
+            other => panic!("expected RATE_LIMITED error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_rate_limit_recovers_after_time() {
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            // 60/min = 1/sec for easy testing
+            rate_limit_subscribes_per_minute: 60,
+            ttl_check_interval: Duration::from_millis(100),
+            ..RelayConfig::default()
+        };
+        let storage = InMemoryBlobStorage::new();
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        // Exhaust all 60 tokens.
+        for i in 0u8..60 {
+            let routing_id = {
+                let mut id = [0u8; 32];
+                id[0] = i;
+                id
+            };
+            let subscribe = ClientMessage::Subscribe {
+                ref_id: Some(format!("s-{i}")),
+                routing_id,
+                since: None,
+            };
+            send_msg(&mut sink, &subscribe).await;
+            let reply = recv_msg(&mut stream).await;
+            assert!(
+                matches!(reply, RelayMessage::Ok { .. }),
+                "subscribe {i} should succeed, got {reply:?}"
+            );
+        }
+
+        // Should be rate-limited now.
+        let subscribe = ClientMessage::Subscribe {
+            ref_id: Some("s-blocked".to_string()),
+            routing_id: [0xFE; 32],
+            since: None,
+        };
+        send_msg(&mut sink, &subscribe).await;
+        let reply = recv_msg(&mut stream).await;
+        assert!(
+            matches!(reply, RelayMessage::Err { code, .. } if code == code::RATE_LIMITED),
+            "should be rate-limited, got {reply:?}"
+        );
+
+        // Wait for token replenishment (1 token/sec at 60/min).
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        // Should succeed again after waiting.
+        let subscribe = ClientMessage::Subscribe {
+            ref_id: Some("s-recovered".to_string()),
+            routing_id: [0xFD; 32],
+            since: None,
+        };
+        send_msg(&mut sink, &subscribe).await;
+        let reply = recv_msg(&mut stream).await;
+        assert!(
+            matches!(reply, RelayMessage::Ok { .. }),
+            "subscribe should succeed after rate limit recovery, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_rate_limit_is_per_connection() {
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            rate_limit_subscribes_per_minute: 2,
+            ttl_check_interval: Duration::from_millis(100),
+            ..RelayConfig::default()
+        };
+        let storage = InMemoryBlobStorage::new();
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+
+        // Connection 1: exhaust its rate limit.
+        let (mut sink1, mut stream1) = connect_client(addr).await;
+        for i in 0u8..2 {
+            let subscribe = ClientMessage::Subscribe {
+                ref_id: Some(format!("c1-s-{i}")),
+                routing_id: [i; 32],
+                since: None,
+            };
+            send_msg(&mut sink1, &subscribe).await;
+            let reply = recv_msg(&mut stream1).await;
+            assert!(matches!(reply, RelayMessage::Ok { .. }));
+        }
+
+        // Connection 1 should be rate-limited.
+        let subscribe = ClientMessage::Subscribe {
+            ref_id: Some("c1-excess".to_string()),
+            routing_id: [0xFF; 32],
+            since: None,
+        };
+        send_msg(&mut sink1, &subscribe).await;
+        let reply = recv_msg(&mut stream1).await;
+        assert!(
+            matches!(reply, RelayMessage::Err { code, .. } if code == code::RATE_LIMITED),
+            "connection 1 should be rate-limited, got {reply:?}"
+        );
+
+        // Connection 2: should have its own independent rate limit.
+        let (mut sink2, mut stream2) = connect_client(addr).await;
+        let subscribe = ClientMessage::Subscribe {
+            ref_id: Some("c2-s-0".to_string()),
+            routing_id: [0xAA; 32],
+            since: None,
+        };
+        send_msg(&mut sink2, &subscribe).await;
+        let reply = recv_msg(&mut stream2).await;
+        assert!(
+            matches!(reply, RelayMessage::Ok { .. }),
+            "connection 2 should succeed (independent rate limit), got {reply:?}"
+        );
     }
 
     #[tokio::test]
