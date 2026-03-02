@@ -2671,6 +2671,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         let server = McpServer::new(provider);
         let server = Arc::new(Mutex::new(server));
@@ -2715,6 +2716,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         let server = McpServer::new(provider);
         let server = Arc::new(Mutex::new(server));
