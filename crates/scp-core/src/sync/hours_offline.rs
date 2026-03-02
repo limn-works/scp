@@ -29,8 +29,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CatchUpStatus, ContextId, Ed25519Signature, GAP_TIMEOUT, MAX_SEQUENTIAL_COMMITS, OfflineTier,
-    REORDER_BUFFER_CAPACITY, SyncError, SyncOutcome,
+    CatchUpStatus, ContextId, Ed25519Signature, OfflineTier, SyncError, SyncOutcome, SyncPolicy,
 };
 use crate::identity::DID;
 
@@ -162,7 +161,7 @@ impl RelayMessageBuffer {
 /// MLS requires sequential epoch processing — each Commit depends on the
 /// previous epoch's key schedule. An offline member at epoch E who reconnects
 /// to find the group at epoch E+N must process all N intermediate Commits in
-/// order. The SDK processes at most [`MAX_SEQUENTIAL_COMMITS`] Commits per
+/// order. The SDK processes at most [`SyncPolicy::max_sequential_commits`] Commits per
 /// catch-up attempt; beyond that it falls back to Welcome-based fast-forward.
 ///
 /// See ADR-029 section 3.
@@ -207,8 +206,8 @@ impl EpochCatchUpState {
     /// When this returns `true`, the SDK should fall back to Welcome-based
     /// fast-forward instead of continuing sequential processing.
     #[must_use]
-    pub const fn exceeds_sequential_limit(&self) -> bool {
-        self.target_epoch.saturating_sub(self.local_epoch) > MAX_SEQUENTIAL_COMMITS
+    pub const fn exceeds_sequential_limit(&self, policy: &SyncPolicy) -> bool {
+        self.target_epoch.saturating_sub(self.local_epoch) > policy.max_sequential_commits
     }
 
     /// Records a successfully processed Commit and advances the catch-up state.
@@ -309,8 +308,8 @@ pub struct ReorderEntry {
 ///
 /// - Messages are delivered in strict sequence order.
 /// - A gap (missing sequence number) is tolerated for up to
-///   [`GAP_TIMEOUT`] (30 seconds).
-/// - The buffer holds at most [`REORDER_BUFFER_CAPACITY`] (100) messages.
+///   [`SyncPolicy::gap_timeout`] (default 30 seconds).
+/// - The buffer holds at most [`SyncPolicy::reorder_buffer_capacity`] (default 100) messages.
 ///   When full, the oldest messages are force-delivered regardless of gaps.
 ///
 /// See ADR-029 and spec §9.8.5.
@@ -329,21 +328,23 @@ pub struct ReorderBuffer {
 }
 
 impl ReorderBuffer {
-    /// Creates a new reorder buffer for a context.
+    /// Creates a new reorder buffer for a context using the given
+    /// [`SyncPolicy`].
     ///
     /// # Arguments
     ///
     /// * `context_id` — The context this buffer serves.
     /// * `next_expected` — The first sequence number expected for in-order
     ///   delivery.
+    /// * `policy` — Sync policy providing buffer capacity and gap timeout.
     #[must_use]
-    pub const fn new(context_id: ContextId, next_expected: u64) -> Self {
+    pub const fn new(context_id: ContextId, next_expected: u64, policy: &SyncPolicy) -> Self {
         Self {
             context_id,
             next_expected,
             entries: BTreeMap::new(),
-            capacity: REORDER_BUFFER_CAPACITY,
-            gap_timeout: GAP_TIMEOUT,
+            capacity: policy.reorder_buffer_capacity,
+            gap_timeout: policy.gap_timeout,
         }
     }
 
@@ -437,7 +438,7 @@ impl ReorderBuffer {
 
     /// Checks for gap timeouts and force-delivers timed-out entries.
     ///
-    /// Any gap that has persisted longer than [`GAP_TIMEOUT`] causes all
+    /// Any gap that has persisted longer than [`SyncPolicy::gap_timeout`] causes all
     /// entries up to and including the first available entry after the gap
     /// to be delivered in order. The gap sequence numbers are skipped.
     ///
@@ -655,10 +656,13 @@ pub struct ReconnectionCoordinator {
     last_relay_contacts: std::collections::HashMap<ContextId, u64>,
     /// Overall timeout for the reconnection protocol.
     overall_timeout: Duration,
+    /// Sync policy governing recovery behavior.
+    policy: SyncPolicy,
 }
 
 impl ReconnectionCoordinator {
-    /// Creates a new reconnection coordinator.
+    /// Creates a new reconnection coordinator with the default
+    /// [`SyncPolicy`].
     ///
     /// # Arguments
     ///
@@ -668,16 +672,42 @@ impl ReconnectionCoordinator {
     ///   (persisted in `ProtocolStore` under
     ///   `sync/{context_id}/last_relay_contact`).
     #[must_use]
-    pub const fn new(
+    pub fn new(
         member_did: DID,
         context_ids: Vec<ContextId>,
         last_relay_contacts: std::collections::HashMap<ContextId, u64>,
+    ) -> Self {
+        Self::with_policy(
+            member_did,
+            context_ids,
+            last_relay_contacts,
+            SyncPolicy::default(),
+        )
+    }
+
+    /// Creates a new reconnection coordinator with a custom [`SyncPolicy`].
+    ///
+    /// # Arguments
+    ///
+    /// * `member_did` — The DID of the reconnecting member.
+    /// * `context_ids` — Active context IDs to sync.
+    /// * `last_relay_contacts` — Per-context last relay contact timestamps
+    ///   (persisted in `ProtocolStore` under
+    ///   `sync/{context_id}/last_relay_contact`).
+    /// * `policy` — Sync policy governing recovery behavior.
+    #[must_use]
+    pub const fn with_policy(
+        member_did: DID,
+        context_ids: Vec<ContextId>,
+        last_relay_contacts: std::collections::HashMap<ContextId, u64>,
+        policy: SyncPolicy,
     ) -> Self {
         Self {
             member_did,
             context_ids,
             last_relay_contacts,
             overall_timeout: Duration::from_secs(120),
+            policy,
         }
     }
 
@@ -699,6 +729,12 @@ impl ReconnectionCoordinator {
         self.overall_timeout
     }
 
+    /// Returns a reference to the sync policy.
+    #[must_use]
+    pub const fn policy(&self) -> &SyncPolicy {
+        &self.policy
+    }
+
     /// Classifies the offline tier for a specific context.
     ///
     /// Uses the per-context last relay contact timestamp and the provided
@@ -710,7 +746,7 @@ impl ReconnectionCoordinator {
             .get(context_id)
             .copied()
             .unwrap_or(0);
-        super::classify_offline_duration(last_contact, now)
+        self.policy.classify_offline_duration(last_contact, now)
     }
 
     /// Plans the reconnection by classifying each context and producing
@@ -1037,19 +1073,19 @@ mod tests {
     #[test]
     fn epoch_catch_up_exceeds_limit_for_large_gap() {
         let state = EpochCatchUpState::new("ctx-1".to_owned(), 0, 150);
-        assert!(state.exceeds_sequential_limit());
+        assert!(state.exceeds_sequential_limit(&SyncPolicy::default()));
     }
 
     #[test]
     fn epoch_catch_up_within_limit_for_small_gap() {
         let state = EpochCatchUpState::new("ctx-1".to_owned(), 0, 50);
-        assert!(!state.exceeds_sequential_limit());
+        assert!(!state.exceeds_sequential_limit(&SyncPolicy::default()));
     }
 
     #[test]
     fn epoch_catch_up_at_boundary_does_not_exceed() {
         let state = EpochCatchUpState::new("ctx-1".to_owned(), 0, 100);
-        assert!(!state.exceeds_sequential_limit());
+        assert!(!state.exceeds_sequential_limit(&SyncPolicy::default()));
     }
 
     #[test]
@@ -1085,7 +1121,7 @@ mod tests {
 
     #[test]
     fn reorder_buffer_delivers_consecutive_messages_immediately() {
-        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0);
+        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0, &SyncPolicy::default());
         let entry = ReorderEntry {
             sequence: 0,
             payload: vec![0],
@@ -1099,7 +1135,7 @@ mod tests {
 
     #[test]
     fn reorder_buffer_buffers_out_of_order_messages() {
-        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0);
+        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0, &SyncPolicy::default());
 
         // Insert seq 2 first (out of order).
         let delivered = buf
@@ -1140,7 +1176,7 @@ mod tests {
 
     #[test]
     fn reorder_buffer_discards_old_sequence_numbers() {
-        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 5);
+        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 5, &SyncPolicy::default());
         let delivered = buf
             .insert(ReorderEntry {
                 sequence: 3,
@@ -1154,7 +1190,7 @@ mod tests {
 
     #[test]
     fn reorder_buffer_gap_timeout_delivers_after_wait() {
-        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0);
+        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0, &SyncPolicy::default());
 
         // Buffer seq 2 (gap at seq 0 and 1).
         let _ = buf.insert(ReorderEntry {
@@ -1176,7 +1212,7 @@ mod tests {
 
     #[test]
     fn reorder_buffer_gap_timeout_delivers_consecutive_run() {
-        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0);
+        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0, &SyncPolicy::default());
 
         // Buffer seq 2 and 3 (gap at 0, 1).
         let _ = buf.insert(ReorderEntry {
@@ -1200,7 +1236,8 @@ mod tests {
 
     #[test]
     fn reorder_buffer_overflow_returns_error() {
-        let mut buf = ReorderBuffer::with_config("ctx-1".to_owned(), 0, 3, GAP_TIMEOUT);
+        let mut buf =
+            ReorderBuffer::with_config("ctx-1".to_owned(), 0, 3, SyncPolicy::default().gap_timeout);
 
         // Fill to capacity (seq 1, 2, 3 — gap at 0).
         let _ = buf.insert(ReorderEntry {
@@ -1230,7 +1267,7 @@ mod tests {
 
     #[test]
     fn reorder_buffer_force_drain_delivers_all() {
-        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0);
+        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0, &SyncPolicy::default());
         let _ = buf.insert(ReorderEntry {
             sequence: 5,
             payload: vec![5],
@@ -1514,7 +1551,7 @@ mod tests {
     fn network_simulator_epoch_catch_up_within_limit() {
         // Simulate an offline period with 50 epoch advances.
         let mut catch_up = EpochCatchUpState::new("ctx-1".to_owned(), 10, 60);
-        assert!(!catch_up.exceeds_sequential_limit());
+        assert!(!catch_up.exceeds_sequential_limit(&SyncPolicy::default()));
         assert_eq!(catch_up.epochs_remaining(), 50);
 
         // Process all 50 Commits.
@@ -1531,10 +1568,10 @@ mod tests {
     fn network_simulator_epoch_catch_up_exceeds_limit_falls_back() {
         // Simulate an offline period with 150 epoch advances.
         let mut catch_up = EpochCatchUpState::new("ctx-1".to_owned(), 10, 160);
-        assert!(catch_up.exceeds_sequential_limit());
+        assert!(catch_up.exceeds_sequential_limit(&SyncPolicy::default()));
 
         // Process up to the limit.
-        for _ in 0..MAX_SEQUENTIAL_COMMITS {
+        for _ in 0..SyncPolicy::default().max_sequential_commits {
             catch_up.record_commit_processed();
         }
         // Still not complete because target is 160.
@@ -1554,7 +1591,7 @@ mod tests {
 
     #[test]
     fn network_simulator_reorder_buffer_stress() {
-        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0);
+        let mut buf = ReorderBuffer::new("ctx-1".to_owned(), 0, &SyncPolicy::default());
 
         // Insert messages in reverse order (worst case for reordering).
         let count = 50u64;
@@ -1624,7 +1661,7 @@ mod tests {
         // Epoch catch-up (max epoch in messages).
         let max_epoch = messages.iter().filter_map(|m| m.epoch).max().unwrap_or(1);
         let mut catch_up = EpochCatchUpState::new("ctx-1".to_owned(), 1, max_epoch);
-        assert!(!catch_up.exceeds_sequential_limit());
+        assert!(!catch_up.exceeds_sequential_limit(&SyncPolicy::default()));
 
         // Process epochs.
         let epochs_to_process = max_epoch.saturating_sub(1);
@@ -1634,7 +1671,7 @@ mod tests {
         assert_eq!(catch_up.status, CatchUpStatus::Complete);
 
         // Reorder buffer (simulate out-of-order delivery).
-        let mut reorder = ReorderBuffer::new("ctx-1".to_owned(), 0);
+        let mut reorder = ReorderBuffer::new("ctx-1".to_owned(), 0, &SyncPolicy::default());
         let sorted_messages = relay_buf.drain_sorted();
         for (i, msg) in sorted_messages.iter().enumerate() {
             let seq = u64::try_from(i).unwrap_or(0);
