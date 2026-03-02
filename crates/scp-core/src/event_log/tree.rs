@@ -112,9 +112,10 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 ///   index, preventing out-of-order insertion.
 /// - **Hash chain integrity**: `prev_hash` must match the last leaf hash (or
 ///   the genesis sentinel for the first event), preserving append-only ordering.
-/// - **Merkle commitment**: the event is serialized and hashed with the RFC 6962
-///   `0x00` leaf domain prefix, producing the same leaf hash as a signed event
-///   with identical content would. The event is committed to the Merkle tree.
+/// - **Merkle commitment**: the event is serialized and hashed with the same
+///   RFC 6962 `0x00` leaf domain prefix mechanism used by [`append`], but the
+///   empty signature means leaf hashes will differ from equivalent signed
+///   events. The event is committed to the Merkle tree.
 ///
 /// # Security limitation
 ///
