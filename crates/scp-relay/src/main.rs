@@ -39,7 +39,7 @@ fn config_from_env() -> RelayConfig {
         max_blob_ttl: env_or("SCP_RELAY_MAX_BLOB_TTL", 604_800),
         max_total_connections: env_or("SCP_RELAY_MAX_CONNECTIONS", 1_000),
         max_connections_per_ip: env_or("SCP_RELAY_MAX_CONNECTIONS_PER_IP", 10),
-        rate_limit_publishes_per_second: env_or("SCP_RELAY_RATE_LIMIT", 100),
+        rate_limit_publishes_per_second: env_or("SCP_RELAY_RATE_LIMIT", 1),
         ..RelayConfig::default()
     }
 }

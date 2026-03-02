@@ -292,8 +292,8 @@ async fn bearer_auth_middleware(
         .and_then(|v| v.to_str().ok());
 
     match auth_header {
-        Some(value) if value.starts_with("Bearer ") => {
-            let provided = &value["Bearer ".len()..];
+        Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => {
+            let provided = &value[7..];
             if bool::from(provided.as_bytes().ct_eq(expected_token.as_bytes())) {
                 next.run(req).await.into_response()
             } else {
