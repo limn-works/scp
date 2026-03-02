@@ -4,11 +4,15 @@
 // is not available in JVM unit tests. The Keystore path (API 33+, CustodyType.HARDWARE)
 // requires an Android device or emulator and is tested via instrumented tests.
 //
+// Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
+// allowing verification of Ed25519 key persistence without the Android framework (#119).
+//
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // SCP-110 (Implement Android Keystore KeyCustody trait).
 
 package com.limn.scp.android.platform
 
+import android.content.SharedPreferences
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.junit.jupiter.api.Assertions.assertArrayEquals
@@ -20,6 +24,69 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * In-memory [SharedPreferences] test double for [AndroidKeyCustody] persistence tests.
+ *
+ * Provides the minimal SharedPreferences contract needed by AndroidKeyCustody:
+ * [getAll], [getString], [edit] with [putString], [remove], and [apply]/[commit].
+ * All other SharedPreferences methods throw [UnsupportedOperationException].
+ */
+private class InMemorySharedPreferences : SharedPreferences {
+    private val store = ConcurrentHashMap<String, Any?>()
+
+    override fun getAll(): MutableMap<String, *> = store.toMutableMap()
+
+    override fun getString(key: String?, defValue: String?): String? =
+        store[key] as? String ?: defValue
+
+    override fun contains(key: String?): Boolean = store.containsKey(key)
+
+    override fun edit(): SharedPreferences.Editor = InMemoryEditor(store)
+
+    override fun getStringSet(key: String?, defValues: MutableSet<String>?) = defValues
+    override fun getInt(key: String?, defValue: Int) = defValue
+    override fun getLong(key: String?, defValue: Long) = defValue
+    override fun getFloat(key: String?, defValue: Float) = defValue
+    override fun getBoolean(key: String?, defValue: Boolean) = defValue
+    override fun registerOnSharedPreferenceChangeListener(
+        listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+    ) = Unit
+    override fun unregisterOnSharedPreferenceChangeListener(
+        listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+    ) = Unit
+
+    private class InMemoryEditor(
+        private val store: ConcurrentHashMap<String, Any?>,
+    ) : SharedPreferences.Editor {
+        private val pending = mutableMapOf<String, Any?>()
+        private val removals = mutableSetOf<String>()
+
+        override fun putString(key: String?, value: String?): SharedPreferences.Editor {
+            if (key != null) { pending[key] = value; removals.remove(key) }
+            return this
+        }
+        override fun remove(key: String?): SharedPreferences.Editor {
+            if (key != null) { removals.add(key); pending.remove(key) }
+            return this
+        }
+        override fun apply() { commit() }
+        override fun commit(): Boolean {
+            removals.forEach { store.remove(it) }
+            pending.forEach { (k, v) -> if (v != null) store[k] = v else store.remove(k) }
+            removals.clear()
+            pending.clear()
+            return true
+        }
+        override fun clear(): SharedPreferences.Editor { store.clear(); return this }
+        override fun putStringSet(k: String?, v: MutableSet<String>?) = this
+        override fun putInt(k: String?, v: Int) = this
+        override fun putLong(k: String?, v: Long) = this
+        override fun putFloat(k: String?, v: Float) = this
+        override fun putBoolean(k: String?, v: Boolean) = this
+    }
+}
 
 /**
  * Unit tests for [AndroidKeyCustody] software fallback path.
@@ -30,17 +97,20 @@ import org.junit.jupiter.api.assertThrows
  * - Pseudonym derivation determinism
  * - Key destruction
  * - Error handling (key not found, wrong key type)
+ * - Ed25519 key persistence to EncryptedSharedPreferences (#119)
  *
  * The Build.VERSION.SDK_INT in JVM tests defaults to 0, which is below
  * API 33 (TIRAMISU), so all Ed25519 keys will use the software path.
  */
 class AndroidKeyCustodyTest {
 
+    private lateinit var prefs: InMemorySharedPreferences
     private lateinit var custody: AndroidKeyCustody
 
     @BeforeEach
     fun setUp() {
-        custody = AndroidKeyCustody()
+        prefs = InMemorySharedPreferences()
+        custody = AndroidKeyCustody(prefs)
     }
 
     // -------------------------------------------------------------------
@@ -592,6 +662,114 @@ class AndroidKeyCustodyTest {
             assertThrows<ScpException> {
                 custody.sign(handle1, data)
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Ed25519 key persistence (#119)
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class Ed25519Persistence {
+
+        @Test
+        fun `generateKeypair ED25519 persists key to SharedPreferences`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val prefsKey = "scp.ed25519.${handle.id}"
+            assertTrue(prefs.contains(prefsKey))
+            assertNotNull(prefs.getString(prefsKey, null))
+        }
+
+        @Test
+        fun `generateKeypair X25519 does NOT persist to SharedPreferences`() {
+            val handle = custody.generateKeypair(KeyType.X25519)
+            val prefsKey = "scp.ed25519.${handle.id}"
+            assertTrue(!prefs.contains(prefsKey))
+        }
+
+        @Test
+        fun `restored Ed25519 key produces same public key`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val originalPubKey = custody.publicKey(handle)
+
+            // Simulate process death: create a new AndroidKeyCustody with the same prefs
+            val restored = AndroidKeyCustody(prefs)
+            val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
+            val restoredPubKey = restored.publicKey(restoredHandle)
+
+            assertArrayEquals(originalPubKey, restoredPubKey)
+        }
+
+        @Test
+        fun `restored Ed25519 key produces valid signatures`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val originalPubKey = custody.publicKey(handle)
+
+            // Simulate process death
+            val restored = AndroidKeyCustody(prefs)
+            val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
+            val data = "signed after restore".toByteArray(Charsets.UTF_8)
+            val signature = restored.sign(restoredHandle, data)
+
+            // Verify with the original public key
+            val pubKeyParams = Ed25519PublicKeyParameters(originalPubKey, 0)
+            val verifier = Ed25519Signer()
+            verifier.init(false, pubKeyParams)
+            verifier.update(data, 0, data.size)
+            assertTrue(verifier.verifySignature(signature))
+        }
+
+        @Test
+        fun `destroyKey removes Ed25519 key from SharedPreferences`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val prefsKey = "scp.ed25519.${handle.id}"
+            assertTrue(prefs.contains(prefsKey))
+
+            custody.destroyKey(handle)
+            assertTrue(!prefs.contains(prefsKey))
+        }
+
+        @Test
+        fun `destroyKey prevents restoration of Ed25519 key`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            custody.destroyKey(handle)
+
+            // Simulate process death — destroyed key should not be restored
+            val restored = AndroidKeyCustody(prefs)
+            assertThrows<ScpException> {
+                restored.publicKey(
+                    KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE),
+                )
+            }
+        }
+
+        @Test
+        fun `multiple Ed25519 keys are all persisted and restored`() {
+            val handles = (1..5).map { custody.generateKeypair(KeyType.ED25519) }
+            val pubKeys = handles.map { custody.publicKey(it) }
+
+            // Simulate process death
+            val restored = AndroidKeyCustody(prefs)
+            handles.forEachIndexed { idx, handle ->
+                val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
+                val restoredPubKey = restored.publicKey(restoredHandle)
+                assertArrayEquals(pubKeys[idx], restoredPubKey)
+            }
+        }
+
+        @Test
+        fun `pseudonym keys are NOT persisted to SharedPreferences`() {
+            val identityHandle = custody.generateKeypair(KeyType.ED25519)
+            val pseudonym = custody.derivePseudonym(
+                identityHandle,
+                "test-ctx".toByteArray(Charsets.UTF_8),
+            )
+
+            // Only the identity key should be persisted, not the pseudonym
+            val identityPrefsKey = "scp.ed25519.${identityHandle.id}"
+            val pseudonymPrefsKey = "scp.ed25519.${pseudonym.id}"
+            assertTrue(prefs.contains(identityPrefsKey))
+            assertTrue(!prefs.contains(pseudonymPrefsKey))
         }
     }
 }
