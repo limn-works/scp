@@ -35,6 +35,8 @@ use scp_core::context::roles::Capability;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
+use crate::validate;
+
 // ---------------------------------------------------------------------------
 // PyContextHandle
 // ---------------------------------------------------------------------------
@@ -440,6 +442,7 @@ impl PyMessageReceiver {
 #[pyfunction]
 #[pyo3(signature = (identity_did, params))]
 fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult<PyContextHandle> {
+    validate::validate_did(identity_did)?;
     // Validate params eagerly (before any async work).
     let _parsed = PyContextParams::from_py_dict(params)?;
 
@@ -538,6 +541,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+    validate::validate_did(identity_did)?;
     let state = handle
         .state
         .lock()
@@ -572,6 +576,7 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+    validate::validate_did(identity_did)?;
     let state = handle
         .state
         .lock()
@@ -617,6 +622,7 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+    validate::validate_did(identity_did)?;
     let mut state = handle
         .state
         .lock()
@@ -677,6 +683,7 @@ fn py_context_send(
     identity_did: &str,
     payload: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
+    validate::validate_did(identity_did)?;
     let state = handle
         .state
         .lock()

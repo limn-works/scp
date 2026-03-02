@@ -50,6 +50,7 @@ pub mod tools;
 pub mod transport;
 pub mod types;
 pub mod ucan;
+pub mod validate;
 
 /// Global tokio runtime, created once at module import.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();

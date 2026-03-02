@@ -51,6 +51,7 @@ use scp_mcp::server::{ContextProvider, ContextToolInfo, McpServer, MemberInfo};
 
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // Bounded read_line — prevents OOM from unbounded line reads
@@ -905,12 +906,10 @@ pub fn py_mcp_serve(
     context_ids: Vec<String>,
     transport: &str,
 ) -> PyResult<String> {
-    // Validate transport mode.
-    if transport != "stdio" && transport != "sse" {
-        return Err(ScpPyError::ValidationError(format!(
-            "transport must be 'stdio' or 'sse', got '{transport}'"
-        ))
-        .into());
+    validate::validate_did(identity_did)?;
+    validate::validate_transport_mode(transport)?;
+    for ctx_id in &context_ids {
+        validate::validate_context_id(ctx_id)?;
     }
 
     // Validate that all context IDs are registered in the runtime.
@@ -1081,6 +1080,7 @@ pub fn py_mcp_serve(
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_stop")]
 pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
+    validate::validate_mcp_handle(handle)?;
     let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
     })?;
@@ -1119,6 +1119,7 @@ pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_wait")]
 pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
+    validate::validate_mcp_handle(handle)?;
     // Extract the task handle if available.
     let task_handle = {
         let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
@@ -1161,6 +1162,7 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_info")]
 pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+    validate::validate_mcp_handle(handle)?;
     let entry = server_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
     })?;
@@ -1190,6 +1192,7 @@ pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_info")]
 pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+    validate::validate_mcp_handle(handle)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
@@ -1279,11 +1282,7 @@ pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_connect_sse")]
 pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
-    if url.is_empty() {
-        return Err(
-            ScpPyError::ValidationError("url must be a non-empty string".to_owned()).into(),
-        );
-    }
+    validate::validate_relay_url(url)?;
 
     // Connect to the SSE endpoint.
     let transport = SseClientTransport::connect(url)
@@ -1326,6 +1325,7 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_disconnect")]
 pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
+    validate::validate_mcp_handle(handle)?;
     let (_, state) = client_registry().remove(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
@@ -1360,6 +1360,7 @@ pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_list_tools")]
 pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+    validate::validate_mcp_handle(handle)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
@@ -1424,6 +1425,10 @@ pub fn py_mcp_client_invoke(
     context_id: &str,
     identity_did: &str,
 ) -> PyResult<PyObject> {
+    validate::validate_mcp_handle(handle)?;
+    validate::validate_tool_name(tool_name)?;
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(identity_did)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
@@ -1507,6 +1512,7 @@ pub fn py_mcp_load_contexts(
     identity_did: &str,
     _relay_url: &str,
 ) -> PyResult<Vec<PyObject>> {
+    validate::validate_did(identity_did)?;
     // Step 1: Collect contexts from the local runtime registry.
     let local_context_ids = crate::runtime::context_ids_for_member(identity_did);
 
@@ -1761,6 +1767,8 @@ pub fn py_register_tool_handler(
     tool_name: &str,
     handler: PyObject,
 ) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_tool_name(tool_name)?;
     // Verify the handler is callable before storing it.
     if !handler.bind(py).is_callable() {
         return Err(ScpPyError::ValidationError("handler must be callable".to_owned()).into());
