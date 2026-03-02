@@ -87,9 +87,10 @@ jobs:
           # feature. See GitHub issue #88.
           cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-core/testing -- -D warnings
 
+  # Matrix jobs must always expand so each OS variant reports a status
+  # to branch protection. Step-level `if` skips the heavy work instead.
   rust-test:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
     name: Rust / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -98,13 +99,19 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.rust == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.rust == 'true'
       - uses: actions/setup-python@v5
+        if: needs.changes.outputs.rust == 'true'
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.rust == 'true'
       - uses: taiki-e/install-action@nextest
+        if: needs.changes.outputs.rust == 'true'
       - name: Run tests
+        if: needs.changes.outputs.rust == 'true'
         run: |
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
