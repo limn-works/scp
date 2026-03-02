@@ -244,7 +244,7 @@ pub fn py_ucan_mint(
             capabilities: &capabilities,
             lifetime_secs: 3600,
             not_before: None,
-            proofs: Vec::new(),
+            proofs: proofs.unwrap_or_default(),
             facts: None,
         };
 
