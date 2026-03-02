@@ -255,12 +255,11 @@ pub(crate) fn recompute_raw(log: &mut EventLog) {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Serializes an event for hashing. The signature field is excluded from
-/// the hash computation to avoid circular dependency (the signature covers
-/// the serialized content, and the hash covers the serialized event).
+/// Serializes the full event (including signature) for Merkle leaf hashing.
 ///
-/// We serialize all fields except `signature` to produce a deterministic
-/// byte sequence for hashing.
+/// The leaf hash is a commitment to the complete, signed event. This is
+/// distinct from [`compute_event_canonical_hash`], which excludes the
+/// signature field to produce the message that gets signed.
 fn serialize_event_for_hashing(event: &Event) -> Result<Vec<u8>, EventLogError> {
     // We serialize the full event including signature for the leaf hash.
     // The leaf hash is a commitment to the complete event (including its
