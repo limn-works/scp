@@ -169,7 +169,7 @@ struct UcanTests {
         var receivedToken: String?
         var receivedCapability: String?
 
-        let mockValidate: UcanBridge.ValidateFn = { _, token, capability in
+        let mockValidate: UcanBridge.ValidateFn = { _, token, capability, _, _ in
             receivedToken = token
             receivedCapability = capability
         }
@@ -239,7 +239,7 @@ struct UcanTests {
 
     @Test("legacy validate returns UcanValidationResult via bridge")
     func legacyValidateRoundtrip() async throws {
-        let mockValidate: UcanBridge.ValidateFn = { _, _, _ in }
+        let mockValidate: UcanBridge.ValidateFn = { _, _, _, _, _ in }
 
         let result = try await validate(
             encoded: "eyJhbGciOiJFZERTQSJ9.test.sig",
