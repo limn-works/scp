@@ -262,7 +262,7 @@ pub fn py_ucan_mint(
         capabilities: capability_uris,
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),
-        proofs: token.payload.prf.clone(),
+        proofs: token.payload.prf,
     })
 }
 
@@ -355,7 +355,7 @@ pub fn py_ucan_delegate(
         capabilities: capability_uris,
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),
-        proofs: token.payload.prf.clone(),
+        proofs: token.payload.prf,
     })
 }
 
