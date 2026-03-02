@@ -15,10 +15,10 @@
 //!
 //! See ADR-011 in `.docs/adrs/phase-2.md`.
 
-use ed25519_dalek::Verifier;
 use sha2::{Digest, Sha256};
 
 use super::{Event, EventLog, EventLogError, EventType};
+use crate::crypto::ed25519::verify_ed25519_signature;
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
 ///
@@ -167,46 +167,19 @@ fn serialize_event_for_hashing(event: &Event) -> Result<Vec<u8>, EventLogError> 
 /// The signature covers a canonical hash of all event fields except the
 /// signature itself.
 fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
-    // Extract the public key from the DID.
     let public_key_bytes = extract_public_key_from_did(&event.actor_did).map_err(|reason| {
         EventLogError::InvalidSignature {
             sequence: event.sequence,
             reason,
         }
     })?;
-
-    // Parse the verifying key.
-    let verifying_key =
-        ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-            EventLogError::InvalidSignature {
-                sequence: event.sequence,
-                reason: format!("invalid public key: {e}"),
-            }
-        })?;
-
-    // Parse the signature.
-    let sig_bytes: [u8; 64] =
-        event
-            .signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| EventLogError::InvalidSignature {
-                sequence: event.sequence,
-                reason: format!("signature must be 64 bytes, got {}", event.signature.len()),
-            })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    // Compute the canonical hash of the event content (excluding signature).
     let canonical_hash = compute_event_canonical_hash(event);
-
-    // Verify.
-    verifying_key
-        .verify(&canonical_hash, &signature)
-        .map_err(|e| EventLogError::InvalidSignature {
+    verify_ed25519_signature(&public_key_bytes, &canonical_hash, &event.signature).map_err(
+        |reason| EventLogError::InvalidSignature {
             sequence: event.sequence,
-            reason: format!("signature verification failed: {e}"),
-        })
+            reason,
+        },
+    )
 }
 
 /// Computes the canonical hash of an event for signature purposes.

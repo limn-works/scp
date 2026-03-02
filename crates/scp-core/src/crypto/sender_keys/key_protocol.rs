@@ -23,7 +23,6 @@ use std::hash::BuildHasher;
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
-use ed25519_dalek::Verifier;
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -932,28 +931,20 @@ fn verify_ed25519_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, SenderKeyError> {
-    let pk_bytes: [u8; 32] = public_key.try_into().map_err(|_| {
-        SenderKeyError::VerificationFailed(format!(
-            "public key must be 32 bytes, got {}",
-            public_key.len()
-        ))
-    })?;
-
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
-        .map_err(|e| SenderKeyError::VerificationFailed(e.to_string()))?;
-
-    let sig_bytes: [u8; 64] = signature.try_into().map_err(|_| {
-        SenderKeyError::VerificationFailed(format!(
-            "signature must be 64 bytes, got {}",
-            signature.len()
-        ))
-    })?;
-
-    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    match verifying_key.verify(message, &sig) {
+    match crate::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
         Ok(()) => Ok(true),
-        Err(_) => Ok(false),
+        Err(reason) => {
+            // Distinguish malformed inputs (public key / signature byte length
+            // errors) from valid-but-non-matching signatures.
+            if reason.contains("must be 32 bytes")
+                || reason.contains("must be 64 bytes")
+                || reason.contains("invalid public key")
+            {
+                Err(SenderKeyError::VerificationFailed(reason))
+            } else {
+                Ok(false)
+            }
+        }
     }
 }
 
