@@ -9,15 +9,24 @@
 // inside this class. The Rust engine calls through UniFFI callback interfaces with data
 // to sign and receives signatures back. Raw private key bytes stay inside the Kotlin adapter.
 //
+// Software Ed25519 keys (API 26-32 fallback) are persisted to EncryptedSharedPreferences
+// (Jetpack Security) so they survive process death. Without this, API 26-32 users would
+// lose their DID identity key on every process restart — causing identity loss, context
+// membership loss, and UCAN delegation loss. See issue #119.
+//
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference), section 9.12 (Compromise Recovery),
 // section 9.15 (Key Destruction Verification).
 
 package com.limn.scp.android.platform
 
+import android.content.Context
+import android.content.SharedPreferences
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKeys
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
@@ -31,6 +40,7 @@ import org.bouncycastle.crypto.agreement.X25519Agreement
 import org.bouncycastle.crypto.generators.Ed25519KeyPairGenerator
 import org.bouncycastle.crypto.generators.X25519KeyPairGenerator
 import org.bouncycastle.crypto.params.Ed25519KeyGenerationParameters
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.params.X25519KeyGenerationParameters
 import org.bouncycastle.crypto.params.X25519PublicKeyParameters
@@ -83,8 +93,31 @@ import java.security.SecureRandom
  *   6. Destroy compromised key via [destroyKey]
  *
  * See ADR-027 for the full Android platform adapter design.
+ *
+ * @property encryptedPrefs Persistent storage for software Ed25519 private key seeds.
+ *   In production, this is an [EncryptedSharedPreferences] instance backed by Android
+ *   Keystore. In tests, a plain [SharedPreferences] can be injected.
  */
-class AndroidKeyCustody : KeyCustodyProvider {
+class AndroidKeyCustody internal constructor(
+    private val encryptedPrefs: SharedPreferences,
+) : KeyCustodyProvider {
+
+    /**
+     * Production constructor — creates [EncryptedSharedPreferences] backed by Android
+     * Keystore for persisting software Ed25519 keys (ADR-027, #119).
+     *
+     * @param context Android application context. Must be an application context
+     *   (not an activity context) to avoid memory leaks from long-lived references.
+     */
+    constructor(context: Context) : this(
+        EncryptedSharedPreferences.create(
+            PREFS_FILENAME,
+            MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
+            context.applicationContext,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+        ),
+    )
 
     // -----------------------------------------------------------------------
     // Software key storage — used for API 26-32 Ed25519 and all X25519 keys
@@ -99,6 +132,9 @@ class AndroidKeyCustody : KeyCustodyProvider {
      * This map is only used for keys that cannot be stored in Android Keystore:
      * - Ed25519 keys on API 26-32 (no Keystore EdDSA support)
      * - X25519 keys on all API levels (no Keystore X25519 support)
+     *
+     * Ed25519 identity keys are additionally backed by [encryptedPrefs] so they
+     * survive process death. X25519 wrapping keys are ephemeral.
      */
     internal val softwareKeys = ConcurrentHashMap<String, AsymmetricCipherKeyPair>()
 
@@ -108,6 +144,10 @@ class AndroidKeyCustody : KeyCustodyProvider {
      * Used to enforce type safety in [sign] and [dhAgree] operations.
      */
     private val softwareKeyTypes = ConcurrentHashMap<String, KeyType>()
+
+    init {
+        restorePersistedEd25519Keys()
+    }
 
     // -----------------------------------------------------------------------
     // KeyCustodyProvider implementation
@@ -442,7 +482,13 @@ class AndroidKeyCustody : KeyCustodyProvider {
      * Generates a software-backed Ed25519 keypair using Bouncy Castle.
      *
      * Used as fallback on API 26-32 where Android Keystore does not support EdDSA.
-     * The key pair is stored in [softwareKeys] and tracked in [softwareKeyTypes].
+     * The key pair is stored in [softwareKeys], tracked in [softwareKeyTypes], and
+     * the private key seed is persisted to [encryptedPrefs] so it survives process
+     * death (ADR-027, #119).
+     *
+     * The 32-byte Ed25519 private key seed is written to EncryptedSharedPreferences
+     * under the key `scp.ed25519.<keyId>`. After writing, the local byte array copy
+     * is zeroed to minimize the window of plaintext key material in memory.
      */
     private fun generateSoftwareEd25519(keyId: String): KeyHandle {
         val keyPair = Ed25519KeyPairGenerator().apply {
@@ -450,6 +496,10 @@ class AndroidKeyCustody : KeyCustodyProvider {
         }.generateKeyPair()
         softwareKeys[keyId] = keyPair
         softwareKeyTypes[keyId] = KeyType.ED25519
+
+        // Persist the 32-byte Ed25519 private key seed to EncryptedSharedPreferences
+        persistEd25519Key(keyId, keyPair)
+
         return KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
     }
 
@@ -518,14 +568,20 @@ class AndroidKeyCustody : KeyCustodyProvider {
     }
 
     /**
-     * Destroys a software-backed key by removing it from the in-memory map.
+     * Destroys a software-backed key by removing it from both the in-memory map
+     * and [encryptedPrefs].
      *
      * Returns [DestructionMethod.SOFTWARE_ONLY] because the key material was stored
-     * in software (Bouncy Castle in-memory) without hardware protection.
+     * in software (Bouncy Castle in-memory + EncryptedSharedPreferences) without
+     * hardware protection.
      */
     private fun destroySoftwareKey(keyHandle: KeyHandle): DestructionAttestation {
         val removed = softwareKeys.remove(keyHandle.id)
         softwareKeyTypes.remove(keyHandle.id)
+
+        // Remove from EncryptedSharedPreferences (no-op if not an Ed25519 identity key)
+        val prefsKey = "$PREFS_KEY_PREFIX${keyHandle.id}"
+        encryptedPrefs.edit().remove(prefsKey).apply()
 
         if (removed == null) {
             throw ScpException(
@@ -548,11 +604,67 @@ class AndroidKeyCustody : KeyCustodyProvider {
         )
     }
 
+    // -----------------------------------------------------------------------
+    // Private: EncryptedSharedPreferences persistence (ADR-027, #119)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Persists an Ed25519 private key seed to [encryptedPrefs].
+     *
+     * Extracts the 32-byte seed from the Bouncy Castle [Ed25519PrivateKeyParameters],
+     * encodes it as a Base64 string, writes it to EncryptedSharedPreferences, and then
+     * zeroes the local byte array copy to minimize plaintext key material in memory.
+     */
+    private fun persistEd25519Key(keyId: String, keyPair: AsymmetricCipherKeyPair) {
+        val privateParams = keyPair.private as Ed25519PrivateKeyParameters
+        val seed = privateParams.encoded
+        try {
+            val encoded = java.util.Base64.getEncoder().encodeToString(seed)
+            encryptedPrefs.edit().putString("$PREFS_KEY_PREFIX$keyId", encoded).apply()
+        } finally {
+            seed.fill(0)
+        }
+    }
+
+    /**
+     * Restores all persisted Ed25519 keys from [encryptedPrefs] into [softwareKeys].
+     *
+     * Called once during [init]. For each entry matching the [PREFS_KEY_PREFIX], decodes
+     * the Base64-encoded 32-byte seed, reconstructs the Bouncy Castle Ed25519 keypair
+     * using [FixedSecureRandom] for deterministic derivation from the seed, and places
+     * the key pair into [softwareKeys] and [softwareKeyTypes].
+     *
+     * The decoded seed bytes are zeroed after keypair reconstruction.
+     */
+    private fun restorePersistedEd25519Keys() {
+        encryptedPrefs.all
+            .filter { (key, value) -> key.startsWith(PREFS_KEY_PREFIX) && value is String }
+            .forEach { (prefsKey, value) ->
+                val keyId = prefsKey.removePrefix(PREFS_KEY_PREFIX)
+                val seed = java.util.Base64.getDecoder().decode(value as String)
+                try {
+                    val keyPair = Ed25519KeyPairGenerator().apply {
+                        init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
+                    }.generateKeyPair()
+                    softwareKeys[keyId] = keyPair
+                    softwareKeyTypes[keyId] = KeyType.ED25519
+                } finally {
+                    seed.fill(0)
+                }
+            }
+    }
+
     companion object {
         /** Raw Ed25519 public key size in bytes. */
         private const val RAW_ED25519_KEY_SIZE = 32
 
         /** X.509 SubjectPublicKeyInfo encoding size for Ed25519 (RFC 8410 §3): 12-byte ASN.1 header + 32-byte key. */
         private const val X509_ED25519_SPKI_SIZE = 44
+
+        /** Filename for the EncryptedSharedPreferences storing software Ed25519 keys. */
+        private const val PREFS_FILENAME = "scp_key_custody"
+
+        /** Key prefix for Ed25519 private key entries in EncryptedSharedPreferences. */
+        private const val PREFS_KEY_PREFIX = "scp.ed25519."
     }
 }

@@ -47,7 +47,7 @@ data class AndroidPlatformAdapterImpl(
  *
  * ## Provider construction
  *
- * - [AndroidKeyCustody] requires no context (Android Keystore is a system service).
+ * - [AndroidKeyCustody] requires context for EncryptedSharedPreferences access (#119).
  * - [AndroidDeviceAttestation] requires context for Play Integrity API access.
  * - [AndroidPushProvider] requires context for FCM token retrieval.
  * - [AndroidStorage] requires context for database file and Keystore access.
@@ -65,7 +65,7 @@ object AndroidPlatformAdapter {
      */
     fun make(context: Context): AndroidPlatformAdapterImpl {
         return AndroidPlatformAdapterImpl(
-            keyCustody = AndroidKeyCustody(),
+            keyCustody = AndroidKeyCustody(context),
             deviceAttestation = AndroidDeviceAttestation(context),
             push = AndroidPushProvider(context),
             storage = AndroidStorage(context),
