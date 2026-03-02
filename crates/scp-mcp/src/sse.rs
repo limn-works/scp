@@ -50,6 +50,7 @@ use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
+use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -293,7 +294,7 @@ async fn bearer_auth_middleware(
     match auth_header {
         Some(value) if value.starts_with("Bearer ") => {
             let provided = &value["Bearer ".len()..];
-            if provided == expected_token {
+            if bool::from(provided.as_bytes().ct_eq(expected_token.as_bytes())) {
                 next.run(req).await.into_response()
             } else {
                 StatusCode::UNAUTHORIZED.into_response()
