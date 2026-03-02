@@ -41,7 +41,7 @@ PyO3 is the established Rust-Python FFI framework, and maturin is the standard b
 
 ### Decision
 
-Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. The bridge exposes a flat set of `#[pyfunction]` and `#[pyclass]` definitions that map directly to scp-core's public API. Async operations use synchronous `#[pyfunction]` with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the Python GIL. PyO3's experimental native async (`#[pyfunction] async fn`) was evaluated but rejected: it holds the GIL during `Future::poll` and does not integrate with the tokio runtime. Rust `Result<T, E>` types are mapped to Python exceptions via a unified error hierarchy. All SCP domain types (Identity, ContextHandle, OuterEnvelope, UcanToken, etc.) are exposed as opaque Python objects with attribute access — no raw structs, no Rust generics, no lifetime markers visible to Python.
+Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The bridge exposes a flat set of `#[pyfunction]` and `#[pyclass]` definitions that map directly to scp-core's public API. Async operations use synchronous `#[pyfunction]` with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the Python GIL. PyO3's experimental native async (`#[pyfunction] async fn`) was evaluated but rejected: it holds the GIL during `Future::poll` and does not integrate with the tokio runtime. Rust `Result<T, E>` types are mapped to Python exceptions via a unified error hierarchy. All SCP domain types (Identity, ContextHandle, OuterEnvelope, UcanToken, etc.) are exposed as opaque Python objects with attribute access — no raw structs, no Rust generics, no lifetime markers visible to Python.
 
 ### Rationale
 
@@ -56,7 +56,7 @@ Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. Th
 - **Language:** Rust (PyO3 macros) + Python (type stubs)
 - **Libraries:** `pyo3` (0.22+), `maturin` (build tool)
 - **Crate:** `scp-ffi` (workspace member)
-- **Module:** `scp-ffi/pyo3/`
+- **Module:** `crates/scp-ffi/src/`
 - **Build output:** Python extension module `_scp_core` (imported by the `scp_sdk` Python package)
 - **Async runtime:** A single tokio `Runtime` is created at module import time and shared across all async calls. Bridge functions use `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the GIL.
 - **Platform wheels:** maturin builds wheels for manylinux (x86_64, aarch64), macOS (x86_64, arm64 universal2), and Windows (x86_64). CI/CD via GitHub Actions with maturin's `maturin-action`.
@@ -169,15 +169,15 @@ Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. Th
 
 | File | Purpose |
 |------|---------|
-| `scp-ffi/pyo3/lib.rs` | PyO3 module definition, `#[pymodule]` entry point, tokio runtime initialization |
-| `scp-ffi/pyo3/identity.rs` | `PyIdentity`, `PyDIDDocument` classes, identity bridge functions |
-| `scp-ffi/pyo3/context.rs` | `PyContextHandle`, `PyContextParams` classes, context bridge functions |
-| `scp-ffi/pyo3/tools.rs` | Tool bridge functions, `PyToolRegistration`, `PyToolVerificationResult` |
-| `scp-ffi/pyo3/transport.rs` | Transport bridge functions, `PyTransportStatus` |
-| `scp-ffi/pyo3/ucan.rs` | UCAN bridge functions, `PyUcanToken` |
-| `scp-ffi/pyo3/event_log.rs` | Event log bridge functions, `PyEvent`, `PyProof` |
-| `scp-ffi/pyo3/error.rs` | `ScpPyError` enum, Python exception class hierarchy, `From` conversions |
-| `scp-ffi/pyo3/types.rs` | Shared type conversions: Python dict <-> Rust struct, JSON <-> serde_json |
+| `crates/scp-ffi/src/lib.rs` | PyO3 module definition, `#[pymodule]` entry point, tokio runtime initialization |
+| `crates/scp-ffi/src/identity.rs` | `PyIdentity`, `PyDIDDocument` classes, identity bridge functions |
+| `crates/scp-ffi/src/context.rs` | `PyContextHandle`, `PyContextParams` classes, context bridge functions |
+| `crates/scp-ffi/src/tools.rs` | Tool bridge functions, `PyToolRegistration`, `PyToolVerificationResult` |
+| `crates/scp-ffi/src/transport.rs` | Transport bridge functions, `PyTransportStatus` |
+| `crates/scp-ffi/src/ucan.rs` | UCAN bridge functions, `PyUcanToken` |
+| `crates/scp-ffi/src/event_log.rs` | Event log bridge functions, `PyEvent`, `PyProof` |
+| `crates/scp-ffi/src/error.rs` | `ScpPyError` enum, Python exception class hierarchy, `From` conversions |
+| `crates/scp-ffi/src/types.rs` | Shared type conversions: Python dict <-> Rust struct, JSON <-> serde_json |
 
 **Estimated functions:** ~25-30 bridge functions, ~15-20 type classes, ~10-15 conversion helpers.
 
