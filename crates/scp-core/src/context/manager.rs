@@ -15,8 +15,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::broadcast::{
-    BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision, SubscriptionResult,
-    UnsubscribeResult,
+    AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision,
+    SubscriptionResult, UnsubscribeResult,
 };
 use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
@@ -872,6 +872,62 @@ impl ContextManager {
 
         self.event_log
             .append_context_event(&context_id_bytes, "MemberBlocked")?;
+
+        Ok(result)
+    }
+
+    /// Blocks an author from publishing in a broadcast context.
+    ///
+    /// Removes the author from the broadcast context's author map, destroying
+    /// their sender key. After this call:
+    ///
+    /// - `publish_broadcast()` by this author returns `PermissionDenied`.
+    /// - `handle_broadcast_key_request()` for this author returns `Deny`.
+    /// - Subscribers who cached the author's old key can still decrypt old
+    ///   messages, but no new messages can be sealed.
+    ///
+    /// Emits an `AuthorBlocked` event. See SCP-227 AC4 and spec section 5.14.8.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
+    ///   context.
+    /// - [`ContextError::MemberNotFound`] if the author DID is not registered.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn block_broadcast_author(
+        &self,
+        context_id: &str,
+        author_did: &DID,
+    ) -> Result<AuthorBlockResult, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let result = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            let bc = ctx
+                .broadcast_context
+                .as_mut()
+                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+            let result = bc.block_author(author_did)?;
+
+            // Emit block event to receive buffer.
+            ctx.receive_buffer.push(ContextEvent::AuthorBlocked {
+                author_did: author_did.clone(),
+            });
+
+            result
+        };
+        // Lock dropped.
+
+        self.event_log
+            .append_context_event(&context_id_bytes, "AuthorBlocked")?;
 
         Ok(result)
     }
@@ -2715,5 +2771,293 @@ mod tests {
                 .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
                 .await
         );
+    }
+
+    // ===================================================================
+    // Author blocking (SCP-227 AC4 + AC7)
+    // ===================================================================
+
+    /// Helper to create a broadcast context with two authors (alice + bob).
+    ///
+    /// Both authors are registered in the `BroadcastContext` (for publish
+    /// capability) and in `MembershipState` (for sequence number tracking).
+    async fn setup_broadcast_context_two_authors() -> (ContextManager, ContextHandle, String) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("broadcast-2auth-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+
+        // Add bob as a second author: both in BroadcastContext and membership.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("broadcast-2auth-ctx").unwrap();
+            let bc = ctx.broadcast_context.as_mut().unwrap();
+            bc.add_author("did:key:bob").unwrap();
+            // Also add to membership tracking so sequence numbers work.
+            ctx.membership
+                .add_member("did:key:bob".into(), "author".into(), vec![]);
+        }
+
+        let ctx_id = "broadcast-2auth-ctx".to_owned();
+        (manager, handle, ctx_id)
+    }
+
+    /// SCP-227 AC4: `block_broadcast_author(author_did)` revokes sender key,
+    /// preventing the blocked author from publishing.
+    #[tokio::test]
+    async fn broadcast_block_author_revokes_publish() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // Subscribe 2 subscribers.
+        for name in &["sub1", "sub2"] {
+            manager
+                .subscribe_broadcast::<
+                    InMemoryDidResolver,
+                    InMemoryNonceTracker,
+                    InMemoryRevocationChecker,
+                    InMemoryProofResolver,
+                    RandomState,
+                >(
+                    &ctx_id,
+                    &DID(format!("did:key:{name}")),
+                    None,
+                    1000,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Both authors can publish before blocking.
+        assert!(
+            manager
+                .publish_broadcast(&ctx_id, &"did:key:alice".into(), b"alice msg")
+                .await
+                .is_ok()
+        );
+        assert!(
+            manager
+                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob msg")
+                .await
+                .is_ok()
+        );
+
+        // Block bob (admin action).
+        let block_result = manager
+            .block_broadcast_author(&ctx_id, &"did:key:bob".into())
+            .await;
+        assert!(block_result.is_ok());
+        let block_result = block_result.unwrap();
+        assert_eq!(block_result.author_did, "did:key:bob");
+        assert_eq!(block_result.final_epoch, 0);
+
+        // Alice can still publish (unaffected).
+        assert!(
+            manager
+                .publish_broadcast(&ctx_id, &"did:key:alice".into(), b"alice still ok")
+                .await
+                .is_ok(),
+            "unblocked author should still be able to publish"
+        );
+
+        // Bob cannot publish (PermissionDenied).
+        let bob_result = manager
+            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob tries")
+            .await;
+        assert!(
+            bob_result.is_err(),
+            "blocked author should not be able to publish"
+        );
+        assert!(matches!(
+            bob_result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+
+        // Key request for bob returns Deny (author not found).
+        let decision = manager
+            .handle_broadcast_key_request(&ctx_id, &"did:key:bob".into(), &"did:key:sub1".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(decision, super::KeyRequestDecision::Deny { .. }),
+            "key request for blocked author should be denied"
+        );
+
+        // Key request for alice still works.
+        let decision = manager
+            .handle_broadcast_key_request(&ctx_id, &"did:key:alice".into(), &"did:key:sub1".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(decision, super::KeyRequestDecision::Grant { .. }),
+            "key request for unblocked author should succeed"
+        );
+    }
+
+    /// SCP-227 AC7: integration test -- after blocking an author, their
+    /// subsequent messages are undecryptable by subscribers (because the
+    /// author can no longer produce them).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn broadcast_blocked_author_messages_undecryptable() {
+        use crate::crypto::sender_keys::open_broadcast;
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // Subscribe 2 subscribers.
+        for name in &["sub1", "sub2"] {
+            manager
+                .subscribe_broadcast::<
+                    InMemoryDidResolver,
+                    InMemoryNonceTracker,
+                    InMemoryRevocationChecker,
+                    InMemoryProofResolver,
+                    RandomState,
+                >(
+                    &ctx_id,
+                    &DID(format!("did:key:{name}")),
+                    None,
+                    1000,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Alice publishes — both subscribers can get key and decrypt.
+        let alice_msg1 = b"Alice before block";
+        let _alice_envelope1 = manager
+            .publish_broadcast(&ctx_id, &"did:key:alice".into(), alice_msg1)
+            .await
+            .unwrap();
+
+        // Bob publishes — both subscribers can get key and decrypt.
+        let bob_msg1 = b"Bob before block";
+        let bob_envelope1 = manager
+            .publish_broadcast(&ctx_id, &"did:key:bob".into(), bob_msg1)
+            .await
+            .unwrap();
+
+        // Get Bob's key before blocking (sub1 perspective).
+        let bob_pre_block_decision = manager
+            .handle_broadcast_key_request(&ctx_id, &"did:key:bob".into(), &"did:key:sub1".into())
+            .await
+            .unwrap();
+        let super::KeyRequestDecision::Grant {
+            key_bytes: bob_pre_key,
+            epoch: bob_pre_epoch,
+        } = bob_pre_block_decision
+        else {
+            panic!("bob key should be granted before block")
+        };
+
+        // Verify sub1 can decrypt Bob's pre-block message.
+        let bob_broadcast_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
+            crate::crypto::sender_keys::SenderKey::from_bytes(*bob_pre_key),
+            bob_pre_epoch,
+            "did:key:bob".to_owned(),
+        );
+        let decrypted = open_broadcast(&bob_broadcast_key, &bob_envelope1).unwrap();
+        assert_eq!(decrypted, bob_msg1);
+
+        // Block Bob (admin action).
+        manager
+            .block_broadcast_author(&ctx_id, &"did:key:bob".into())
+            .await
+            .unwrap();
+
+        // Bob tries to publish — PermissionDenied.
+        let bob_result = manager
+            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob after block")
+            .await;
+        assert!(
+            bob_result.is_err(),
+            "blocked author should not be able to publish"
+        );
+
+        // Alice can still publish after Bob is blocked.
+        let alice_msg2 = b"Alice after Bob blocked";
+        let alice_envelope2 = manager
+            .publish_broadcast(&ctx_id, &"did:key:alice".into(), alice_msg2)
+            .await
+            .unwrap();
+
+        // Sub1 can still get Alice's key and decrypt.
+        let alice_decision = manager
+            .handle_broadcast_key_request(&ctx_id, &"did:key:alice".into(), &"did:key:sub1".into())
+            .await
+            .unwrap();
+        match alice_decision {
+            super::KeyRequestDecision::Grant {
+                key_bytes, epoch, ..
+            } => {
+                let alice_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
+                    crate::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
+                    epoch,
+                    "did:key:alice".to_owned(),
+                );
+                let decrypted = open_broadcast(&alice_key, &alice_envelope2).unwrap();
+                assert_eq!(decrypted, alice_msg2);
+            }
+            super::KeyRequestDecision::Deny { reason } => {
+                panic!("alice key should be granted: {reason}");
+            }
+        }
+
+        // Sub1 requests Bob's key — Deny (author no longer exists).
+        let bob_post_decision = manager
+            .handle_broadcast_key_request(&ctx_id, &"did:key:bob".into(), &"did:key:sub1".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(bob_post_decision, super::KeyRequestDecision::Deny { .. }),
+            "key request for blocked author must be denied"
+        );
+
+        // Old messages from Bob are still decryptable with cached key
+        // (forward access to historical content is preserved).
+        let old_decrypted = open_broadcast(&bob_broadcast_key, &bob_envelope1).unwrap();
+        assert_eq!(old_decrypted, bob_msg1);
+    }
+
+    /// SCP-227: `block_broadcast_author` on non-broadcast context returns error.
+    #[tokio::test]
+    async fn broadcast_block_author_on_encrypted_context_fails() {
+        let (manager, _handle) = setup_active_context().await;
+
+        let result: Result<super::AuthorBlockResult, _> = manager
+            .block_broadcast_author(
+                "test-ctx",
+                &"did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".into(),
+            )
+            .await;
+        assert!(result.is_err());
     }
 }
