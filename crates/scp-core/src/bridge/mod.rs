@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 // Type aliases for domain clarity
 // ---------------------------------------------------------------------------
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 /// A context identifier string.
 ///

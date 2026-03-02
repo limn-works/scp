@@ -12,8 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DidMethod;
 use crate::well_known::{WellKnownScp, WellKnownValidationError};
+use scp_identity::DidMethod;
 
 use super::{ContextId, DiscoveryError};
 

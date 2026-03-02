@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::keys::MediaError;
 
-use scp_core::identity::DID;
+use scp_identity::DID;
 
 /// A context identifier string.
 pub type ContextId = String;
@@ -150,7 +150,7 @@ pub struct SessionMetadata {
 
 impl SessionMetadata {
     /// Serializes the metadata to JSON bytes for use as an
-    /// [`EventPayload`](scp_core::event_log::EventPayload).
+    /// `scp_event_log::EventPayload`.
     ///
     /// # Errors
     ///
@@ -325,7 +325,7 @@ pub fn join_media_session(
 ///
 /// The returned metadata contains participants, capabilities, and timing
 /// information suitable for serialization into an
-/// [`EventPayload`](scp_core::event_log::EventPayload) (ADR-024 AC 8).
+/// `scp_event_log::EventPayload` (ADR-024 AC 8).
 ///
 /// # Arguments
 ///

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use super::MemoryScope;
 use super::memory_scope::ContextId;
 use super::params::PromotionPolicy;
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // PromotionError

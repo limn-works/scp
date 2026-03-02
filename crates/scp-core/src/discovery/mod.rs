@@ -75,7 +75,7 @@ pub use search::{ContactCache, ContextQuerier, unified_search};
 // Type aliases (match event_log/mod.rs pattern)
 // ---------------------------------------------------------------------------
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 /// A context identifier string.
 pub type ContextId = String;

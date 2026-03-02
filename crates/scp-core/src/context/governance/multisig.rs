@@ -28,7 +28,7 @@ use super::{
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
     VoteType, compute_proposal_id, sign_vote, verify_vote,
 };
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // ThresholdEngine

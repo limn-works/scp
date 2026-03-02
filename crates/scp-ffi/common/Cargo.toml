@@ -13,6 +13,7 @@ testing = []
 
 [dependencies]
 scp-core = { path = "../../scp-core" }
+scp-identity = { path = "../../scp-identity" }
 hex = { workspace = true }
 z-base-32 = { workspace = true }
 

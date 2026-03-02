@@ -13,7 +13,7 @@ use scp_core::economy::{
     AdapterCapabilities, Amount, CurrencyCode, PaymentAdapter, PaymentAuthorization, PaymentError,
     PaymentMetadata, PaymentReceipt, RefundConfirmation, VerificationResult,
 };
-use scp_core::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // Internal ledger types
@@ -86,7 +86,7 @@ fn lock_ledger(mutex: &Mutex<Ledger>) -> Result<MutexGuard<'_, Ledger>, PaymentE
 /// ```
 /// use scp_testing::TestAdapter;
 /// use scp_core::economy::{Amount, CurrencyCode};
-/// use scp_core::identity::DID;
+/// use scp_identity::DID;
 ///
 /// let adapter = TestAdapter::new();
 /// adapter.seed_balance(

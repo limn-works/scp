@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::context::params::{Capability, ContextParams, TemplateId};
-use crate::identity::DID;
+use scp_identity::DID;
 use scp_platform::PlatformError;
 use scp_platform::traits::Storage;
 

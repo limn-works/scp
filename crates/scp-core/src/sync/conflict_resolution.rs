@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ContextId;
 use crate::context::governance::{GovernanceAction, GovernanceModelConfig, ProposalId};
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // MerkleRoot type alias

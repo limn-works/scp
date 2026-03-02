@@ -155,7 +155,7 @@ pub struct TestVector {
 
 /// An append-only Merkle tree for a single SCP context.
 ///
-/// Mirrors `scp_core::event_log::EventLog`. Follows Certificate Transparency
+/// Mirrors `scp_event_log::EventLog`. Follows Certificate Transparency
 /// (RFC 6962) structure with SHA-256 hashing and domain separation prefixes.
 /// Leaf nodes use `0x00` prefix, interior nodes use `0x01` prefix.
 pub struct WasmEventLog {

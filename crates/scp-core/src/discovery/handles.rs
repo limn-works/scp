@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 use super::ContextId;
 use super::addressing::HandleTarget;

@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 
 use crate::error::{ScpNapiError, validate_custody_type};

@@ -24,7 +24,7 @@ use crate::crypto::ucan::capability::CapabilityUri;
 use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, validate_ucan,
 };
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // BroadcastAdmission
@@ -2360,8 +2360,8 @@ mod tests {
     #[test]
     fn broadcast_subscribe_member_joined_persists_to_event_log() {
         use crate::context::membership::ContextEvent;
-        use crate::event_log::tree::{GENESIS_PREV_HASH, append_unsigned_event, event_count, root};
-        use crate::event_log::{Event, EventLog, EventPayload, EventType};
+        use scp_event_log::tree::{GENESIS_PREV_HASH, append_unsigned_event, event_count, root};
+        use scp_event_log::{Event, EventLog, EventPayload, EventType};
 
         // 1. Create an open broadcast context and subscribe a DID.
         let mut ctx = make_open_ctx();

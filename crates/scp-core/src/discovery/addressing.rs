@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 use super::ContextId;
 

@@ -37,12 +37,12 @@ use scp_core::bridge::registration::{
 use scp_core::bridge::shadow::{ShadowRegistry, create_shadow};
 use scp_core::bridge::{BridgeMode, BridgeStatus, ShadowProvenanceStatus};
 use scp_core::context::MemoryScope;
-use scp_core::event_log::tree::{self, GENESIS_PREV_HASH};
-use scp_core::event_log::{Event, EventLog, EventPayload, EventType};
-use scp_core::identity::DID;
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_core::trust::attestation::{AttestationEvidence, RevocationStatus};
 use scp_core::trust::{Attestation, AttestationType};
+use scp_event_log::tree::{self, GENESIS_PREV_HASH};
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
+use scp_identity::DID;
 
 use scp_media::keys::export_media_keys;
 use scp_media::session::{

@@ -38,9 +38,9 @@ use sha2::{Digest, Sha256};
 
 use super::{ContextId, DID, ShadowProvenanceStatus};
 use crate::crypto::ed25519::verify_ed25519_signature;
-use crate::event_log::Ed25519Signature;
 use crate::trust::AttestationType;
 use crate::trust::attestation::{Attestation, RevocationStatus};
+use scp_event_log::Ed25519Signature;
 
 use super::shadow::ShadowRegistry;
 
@@ -456,7 +456,7 @@ mod tests {
     // Crypto helpers (imported from shared test helpers)
     // -------------------------------------------------------------------
 
-    use crate::event_log::test_helpers::{did_from_pubkey, test_keypair};
+    use scp_event_log::test_helpers::{did_from_pubkey, test_keypair};
 
     // -------------------------------------------------------------------
     // Helpers

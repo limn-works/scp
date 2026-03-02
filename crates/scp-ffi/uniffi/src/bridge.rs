@@ -28,7 +28,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidMethod, ScpIdentity};
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 use uuid::Uuid;
@@ -102,8 +102,8 @@ pub enum ScpError {
 // From<scp-core error types> for ScpError
 // ---------------------------------------------------------------------------
 
-impl From<scp_core::identity::IdentityError> for ScpError {
-    fn from(e: scp_core::identity::IdentityError) -> Self {
+impl From<scp_identity::IdentityError> for ScpError {
+    fn from(e: scp_identity::IdentityError) -> Self {
         Self::Identity {
             message: format!(
                 "{e} — check DID format, key custody configuration, or DHT connectivity"
@@ -254,8 +254,8 @@ impl From<scp_core::envelope::EnvelopeError> for ScpError {
     }
 }
 
-impl From<scp_core::event_log::EventLogError> for ScpError {
-    fn from(e: scp_core::event_log::EventLogError) -> Self {
+impl From<scp_event_log::EventLogError> for ScpError {
+    fn from(e: scp_event_log::EventLogError) -> Self {
         Self::Context {
             message: format!(
                 "event log operation failed: {e} — verify log integrity and sequence numbers"
@@ -947,7 +947,7 @@ impl Drop for TransportManager {
 ///
 /// When `custody` is `"in_memory"` and the `allow_in_memory_custody` feature
 /// is enabled, this function creates a real `did:dht` identity using
-/// [`scp_core::identity::DidDht`] backed by `InMemoryKeyCustody`. The
+/// [`scp_identity::DidDht`] backed by `InMemoryKeyCustody`. The
 /// returned DID is self-certifying and has the `did:dht:z` prefix.
 ///
 /// `"in_memory"` custody stores key material in unprotected heap memory.

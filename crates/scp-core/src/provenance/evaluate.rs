@@ -140,8 +140,8 @@ mod tests {
 
     use super::*;
     use crate::context::MemoryScope;
-    use crate::identity::DID;
     use crate::provenance::DiscoveryMethod;
+    use scp_identity::DID;
 
     fn make_provenance(source_type: SourceType, counterparties: Vec<DID>) -> DataProvenance {
         DataProvenance {

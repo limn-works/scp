@@ -30,9 +30,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::ed25519::verify_ed25519_signature;
-use crate::event_log::Ed25519Signature;
-use crate::identity::DID;
-use crate::identity::cache::Clock;
+use scp_event_log::Ed25519Signature;
+use scp_identity::DID;
+use scp_identity::cache::Clock;
 
 use super::{AttestationType, TrustError};
 
@@ -547,8 +547,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::identity::cache::TestClock;
     use ed25519_dalek::{Signer, SigningKey};
+    use scp_identity::cache::TestClock;
 
     /// A test resolver that maps DIDs to public key bytes.
     struct TestResolver {

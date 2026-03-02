@@ -99,8 +99,8 @@ pub async fn event_log_query(
 
     let context_id = handle.context_id();
     let (event_count, merkle_root_hex) = crate::runtime::with_context(&context_id, |rt| {
-        let count = scp_core::event_log::tree::event_count(&rt.event_log);
-        let root = scp_core::event_log::tree::root(&rt.event_log);
+        let count = scp_event_log::tree::event_count(&rt.event_log);
+        let root = scp_event_log::tree::root(&rt.event_log);
         Ok((count, hex::encode(root)))
     })
     .map_err(napi::Error::from)?;
@@ -209,20 +209,20 @@ pub async fn event_log_verify(
                 .map_err(napi::Error::from)?;
 
             let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
-                let proof = scp_core::event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
+                let proof = scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
                     .map_err(|e| ScpNapiError::Context {
                         message: format!("inclusion proof failed: {e}"),
                         code: "SCP-CTX-2025".to_owned(),
                     })?;
-                let verified = scp_core::event_log::proof::verify_inclusion(&proof);
+                let verified = scp_event_log::proof::verify_inclusion(&proof);
 
                 let path_steps: Vec<serde_json::Value> = proof
                     .path
                     .iter()
                     .map(|step| {
                         let direction = match step.direction {
-                            scp_core::event_log::proof::Direction::Left => "left",
-                            scp_core::event_log::proof::Direction::Right => "right",
+                            scp_event_log::proof::Direction::Left => "left",
+                            scp_event_log::proof::Direction::Right => "right",
                         };
                         serde_json::json!({
                             "sibling_hash": hex::encode(step.sibling_hash),
@@ -266,46 +266,47 @@ pub async fn event_log_verify(
                 })
             })?;
 
-            let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
-                let proof = scp_core::event_log::proof::prove_absence(&rt.event_log, &event_hash)
-                    .map_err(|e| ScpNapiError::Context {
-                    message: format!("absence proof failed: {e}"),
-                    code: "SCP-CTX-2025".to_owned(),
-                })?;
+            let (verified, details_json) =
+                crate::runtime::with_context(&context_id, |rt| {
+                    let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
+                        .map_err(|e| ScpNapiError::Context {
+                            message: format!("absence proof failed: {e}"),
+                            code: "SCP-CTX-2025".to_owned(),
+                        })?;
 
-                let lower = proof.lower.as_ref().map(|lwp| {
-                    serde_json::json!({
-                        "leaf_hash": hex::encode(lwp.leaf_hash),
-                        "leaf_index": lwp.leaf_index,
-                    })
-                });
+                    let lower = proof.lower.as_ref().map(|lwp| {
+                        serde_json::json!({
+                            "leaf_hash": hex::encode(lwp.leaf_hash),
+                            "leaf_index": lwp.leaf_index,
+                        })
+                    });
 
-                let upper = proof.upper.as_ref().map(|uwp| {
-                    serde_json::json!({
-                        "leaf_hash": hex::encode(uwp.leaf_hash),
-                        "leaf_index": uwp.leaf_index,
-                    })
-                });
+                    let upper = proof.upper.as_ref().map(|uwp| {
+                        serde_json::json!({
+                            "leaf_hash": hex::encode(uwp.leaf_hash),
+                            "leaf_index": uwp.leaf_index,
+                        })
+                    });
 
-                let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
-                    scp_core::event_log::proof::verify_inclusion(&lwp.inclusion_proof)
-                });
-                let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
-                    scp_core::event_log::proof::verify_inclusion(&uwp.inclusion_proof)
-                });
-                let verified = lower_verified && upper_verified;
+                    let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
+                        scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof)
+                    });
+                    let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
+                        scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof)
+                    });
+                    let verified = lower_verified && upper_verified;
 
-                let details = serde_json::json!({
-                    "query_hash": hex::encode(proof.query_hash),
-                    "root": hex::encode(proof.root),
-                    "leaf_count": proof.leaf_count,
-                    "lower": lower,
-                    "upper": upper,
-                });
+                    let details = serde_json::json!({
+                        "query_hash": hex::encode(proof.query_hash),
+                        "root": hex::encode(proof.root),
+                        "leaf_count": proof.leaf_count,
+                        "lower": lower,
+                        "upper": upper,
+                    });
 
-                Ok((verified, details.to_string()))
-            })
-            .map_err(napi::Error::from)?;
+                    Ok((verified, details.to_string()))
+                })
+                .map_err(napi::Error::from)?;
 
             Ok(NapiProof {
                 verified,

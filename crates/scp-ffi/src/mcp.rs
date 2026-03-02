@@ -841,26 +841,26 @@ impl ContextProvider for FfiBridgeProvider {
 
         // Re-acquire the DashMap lock briefly to append the event.
         if let Err(e) = crate::runtime::with_context(context_id, |rt| {
-            let sequence = scp_core::event_log::tree::event_count(&rt.event_log);
+            let sequence = scp_event_log::tree::event_count(&rt.event_log);
             let prev_hash = if rt.event_log.leaves().is_empty() {
-                scp_core::event_log::tree::GENESIS_PREV_HASH
+                scp_event_log::tree::GENESIS_PREV_HASH
             } else {
                 rt.event_log.leaves()[rt.event_log.leaves().len() - 1]
             };
 
-            let event = scp_core::event_log::Event {
-                event_type: scp_core::event_log::EventType::ToolInvoked,
+            let event = scp_event_log::Event {
+                event_type: scp_event_log::EventType::ToolInvoked,
                 actor_did: agent_did.into(),
                 timestamp,
                 sequence,
-                payload: scp_core::event_log::EventPayload {
+                payload: scp_event_log::EventPayload {
                     data: payload_data.clone(),
                 },
                 prev_hash,
                 signature: Vec::new(),
             };
 
-            scp_core::event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
+            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
                 .map_err(|e| ScpPyError::ContextError(e.to_string()))?;
             Ok(())
         }) {
@@ -903,7 +903,7 @@ impl ContextProvider for FfiBridgeProvider {
         // Return the event count and Merkle root as metadata.
         crate::runtime::with_context(context_id, |rt| {
             let leaf_count = rt.event_log.leaves().len();
-            let root = scp_core::event_log::tree::root(&rt.event_log);
+            let root = scp_event_log::tree::root(&rt.event_log);
             Ok(serde_json::json!({
                 "event_count": leaf_count,
                 "merkle_root": crate::types::encode_hex(&root),
@@ -2340,7 +2340,7 @@ mod tests {
 
         // Verify the event log is initially empty.
         let initial_count = crate::runtime::with_context(&ctx_id, |rt| {
-            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+            Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(initial_count, 0, "event log should start empty");
@@ -2358,7 +2358,7 @@ mod tests {
 
         // Verify the event log now has one event.
         let after_count = crate::runtime::with_context(&ctx_id, |rt| {
-            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+            Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(
@@ -2372,7 +2372,7 @@ mod tests {
         assert!(result2.is_ok());
 
         let final_count = crate::runtime::with_context(&ctx_id, |rt| {
-            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+            Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(
@@ -2410,14 +2410,14 @@ mod tests {
 
         // Verify event was logged.
         let count = crate::runtime::with_context(&ctx_id, |rt| {
-            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+            Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(count, 1, "handler path should also append to event log");
 
         // Verify the merkle root is non-zero (tree was actually built).
         let root = crate::runtime::with_context(&ctx_id, |rt| {
-            Ok(scp_core::event_log::tree::root(&rt.event_log))
+            Ok(scp_event_log::tree::root(&rt.event_log))
         })
         .unwrap();
         assert_ne!(
@@ -2446,7 +2446,7 @@ mod tests {
 
         // Event log should still be empty (no event appended on error).
         let count = crate::runtime::with_context(&ctx_id, |rt| {
-            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+            Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(

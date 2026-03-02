@@ -74,7 +74,7 @@ pub use schema::{SchemaValidationError, validate_schema, validate_value_against_
 /// module-local clarity. These are the same underlying type (`String`).
 pub type ToolId = String;
 
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // ToolError

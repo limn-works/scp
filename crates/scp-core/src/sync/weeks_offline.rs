@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome};
-use crate::identity::DID;
+use scp_identity::DID;
 
 /// Safely compare a `u64` against a `usize` without truncation.
 ///

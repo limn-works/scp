@@ -45,7 +45,7 @@ use scp_core::envelope::inner::{InnerEnvelopeParams, create_inner_envelope};
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
 use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
-use scp_core::identity::{DidDht, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{

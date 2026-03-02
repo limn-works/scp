@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use super::builder::{ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider};
 use super::templates::template_params;
 use super::{ContextError, ContextHandle, ContextState, TemplateId};
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // StandingChannelError

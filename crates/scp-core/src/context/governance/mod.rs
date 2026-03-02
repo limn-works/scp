@@ -56,8 +56,8 @@ use sha2::{Digest, Sha256};
 
 use super::params::{Capability, ContextParams, ToolRegistration};
 use super::roles::ToolId;
-use crate::event_log::{ContextId, Ed25519Signature};
-use crate::identity::DID;
+use scp_event_log::{ContextId, Ed25519Signature};
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // ProposalId

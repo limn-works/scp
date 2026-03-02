@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use scp_core::envelope::MessageType;
-use scp_core::identity::DID;
+use scp_identity::DID;
 
 /// Errors from signaling operations.
 #[derive(Debug, thiserror::Error)]

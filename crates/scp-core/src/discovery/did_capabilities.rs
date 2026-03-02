@@ -8,9 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::dht_client::DhtClient;
-use crate::identity::document::DidDocument;
-use crate::identity::{DidDht, DidMethod};
+use scp_identity::dht_client::DhtClient;
+use scp_identity::document::DidDocument;
+use scp_identity::{DidDht, DidMethod};
 
 use super::{DID, DiscoveryError};
 
@@ -165,10 +165,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::identity::cache::{DidCache, SystemClock};
-    use crate::identity::dht_client::InMemoryDhtClient;
-    use crate::identity::document::DidDocument;
-    use crate::identity::{DidDht, DidMethod};
+    use scp_identity::cache::{DidCache, SystemClock};
+    use scp_identity::dht_client::InMemoryDhtClient;
+    use scp_identity::document::DidDocument;
+    use scp_identity::{DidDht, DidMethod};
 
     use scp_platform::testing::InMemoryKeyCustody;
 
@@ -191,7 +191,7 @@ mod tests {
 
         // Add SCPCapabilities service.
         let cap_str = capabilities.join(",");
-        let service = crate::identity::document::Service {
+        let service = scp_identity::document::Service {
             id: format!("{}#scp-capabilities", document.id),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: format!("scp:capabilities:{cap_str}"),
@@ -250,7 +250,7 @@ mod tests {
         let did = "did:dht:zTestDid";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        doc.service.push(crate::identity::document::Service {
+        doc.service.push(scp_identity::document::Service {
             id: format!("{did}#scp-capabilities"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: "scp:capabilities:code_review,testing".to_owned(),
@@ -268,12 +268,12 @@ mod tests {
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         // Two services with overlapping capabilities.
-        doc.service.push(crate::identity::document::Service {
+        doc.service.push(scp_identity::document::Service {
             id: format!("{did}#scp-capabilities-1"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: "scp:capabilities:code_review,testing".to_owned(),
         });
-        doc.service.push(crate::identity::document::Service {
+        doc.service.push(scp_identity::document::Service {
             id: format!("{did}#scp-capabilities-2"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: "scp:capabilities:testing,translation".to_owned(),

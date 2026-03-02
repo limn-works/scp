@@ -27,9 +27,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::ed25519::verify_ed25519_signature;
-use crate::event_log::Ed25519Signature;
-use crate::identity::DID;
-use crate::identity::cache::Clock;
+use scp_event_log::Ed25519Signature;
+use scp_identity::DID;
+use scp_identity::cache::Clock;
 
 use super::TrustError;
 use super::attestation::DidPublicKeyResolver;
@@ -441,7 +441,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
-    use crate::identity::cache::TestClock;
+    use scp_identity::cache::TestClock;
 
     // -----------------------------------------------------------------------
     // Test helpers

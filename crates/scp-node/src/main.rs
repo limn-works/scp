@@ -14,8 +14,8 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use scp_core::identity::cache::SystemClock;
-use scp_core::identity::{DidCache, DidDht, InMemoryDhtClient};
+use scp_identity::cache::SystemClock;
+use scp_identity::{DidCache, DidDht, InMemoryDhtClient};
 use scp_node::ApplicationNodeBuilder;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::server::{RelayConfig, RelayServer};

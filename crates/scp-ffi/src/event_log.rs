@@ -215,8 +215,8 @@ pub fn py_event_log_query(
     validate::validate_context_id(context_id)?;
     // Look up the context's event log from the runtime registry.
     let (event_count, merkle_root_hex) = crate::runtime::with_context(context_id, |rt| {
-        let count = scp_core::event_log::tree::event_count(&rt.event_log);
-        let root = scp_core::event_log::tree::root(&rt.event_log);
+        let count = scp_event_log::tree::event_count(&rt.event_log);
+        let root = scp_event_log::tree::root(&rt.event_log);
         Ok((count, encode_hex(&root)))
     })?;
 
@@ -325,19 +325,19 @@ pub fn py_event_log_verify(
 
             // Generate and verify the inclusion proof via scp-core.
             let proof_result = crate::runtime::with_context(context_id, |rt| {
-                let proof = scp_core::event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
+                let proof = scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
                     .map_err(|e| {
                         ScpPyError::ContextError(format!("inclusion proof failed: {e}"))
                     })?;
-                let verified = scp_core::event_log::proof::verify_inclusion(&proof);
+                let verified = scp_event_log::proof::verify_inclusion(&proof);
 
                 let path_steps: Vec<serde_json::Value> = proof
                     .path
                     .iter()
                     .map(|step| {
                         let direction = match step.direction {
-                            scp_core::event_log::proof::Direction::Left => "left",
-                            scp_core::event_log::proof::Direction::Right => "right",
+                            scp_event_log::proof::Direction::Left => "left",
+                            scp_event_log::proof::Direction::Right => "right",
                         };
                         serde_json::json!({
                             "sibling_hash": encode_hex(&step.sibling_hash),
@@ -382,10 +382,8 @@ pub fn py_event_log_verify(
 
             // Generate the absence proof via scp-core.
             let proof_result = crate::runtime::with_context(context_id, |rt| {
-                let proof = scp_core::event_log::proof::prove_absence(&rt.event_log, &event_hash)
-                    .map_err(|e| {
-                    ScpPyError::ContextError(format!("absence proof failed: {e}"))
-                })?;
+                let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
+                    .map_err(|e| ScpPyError::ContextError(format!("absence proof failed: {e}")))?;
 
                 let lower = proof.lower.as_ref().map(|lwp| {
                     serde_json::json!({
@@ -402,12 +400,14 @@ pub fn py_event_log_verify(
                 });
 
                 // Verify the neighbor inclusion proofs.
-                let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
-                    scp_core::event_log::proof::verify_inclusion(&lwp.inclusion_proof)
-                });
-                let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
-                    scp_core::event_log::proof::verify_inclusion(&uwp.inclusion_proof)
-                });
+                let lower_verified = proof
+                    .lower
+                    .as_ref()
+                    .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
+                let upper_verified = proof
+                    .upper
+                    .as_ref()
+                    .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
                 let verified = lower_verified && upper_verified;
 
                 let details = serde_json::json!({
@@ -476,7 +476,7 @@ pub fn py_event_log_checkpoint(
     let context_id_owned = context_id.to_owned();
     let identity_did_owned = identity_did.to_owned();
 
-    let sender_did = scp_core::identity::DID(identity_did_owned.clone());
+    let sender_did = scp_identity::DID(identity_did_owned.clone());
 
     let checkpoint = crate::runtime::with_identity(&identity_did_owned, |entry| {
         crate::runtime::with_context(&context_id_owned, |ctx_rt| {
@@ -485,7 +485,7 @@ pub fn py_event_log_checkpoint(
                     custody: entry.custody.as_ref(),
                     key: &entry.identity.active_signing_key,
                 };
-                scp_core::event_log::checkpoint::generate_checkpoint(
+                scp_event_log::checkpoint::generate_checkpoint(
                     &ctx_rt.event_log,
                     &sender_did,
                     epoch,

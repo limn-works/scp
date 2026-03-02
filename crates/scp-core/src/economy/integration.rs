@@ -22,7 +22,7 @@ use super::adapter::{
 };
 use super::policy::{ObservableMetrics, evaluate_cost, verify_cost_sufficiency};
 use super::types::{Amount, EconomicPolicy, PaidActionType};
-use crate::identity::DID;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // IntegrationError
