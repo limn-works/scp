@@ -886,7 +886,7 @@ impl ContextManager {
     /// - Subscribers who cached the author's old key can still decrypt old
     ///   messages, but no new messages can be sealed.
     ///
-    /// Emits a `MemberBlocked` event. See SCP-227 AC4 and spec section 5.14.8.
+    /// Emits an `AuthorBlocked` event. See SCP-227 AC4 and spec section 5.14.8.
     ///
     /// # Errors
     ///
@@ -918,8 +918,7 @@ impl ContextManager {
             let result = bc.block_author(author_did)?;
 
             // Emit block event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberBlocked {
-                blocked_did: author_did.clone(),
+            ctx.receive_buffer.push(ContextEvent::AuthorBlocked {
                 author_did: author_did.clone(),
             });
 
@@ -928,7 +927,7 @@ impl ContextManager {
         // Lock dropped.
 
         self.event_log
-            .append_context_event(&context_id_bytes, "MemberBlocked")?;
+            .append_context_event(&context_id_bytes, "AuthorBlocked")?;
 
         Ok(result)
     }

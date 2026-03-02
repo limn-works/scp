@@ -1334,6 +1334,46 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Blocking the only author leaves the context in a valid but authorless
+    /// state: no authors remain, subscribers are still registered, and
+    /// `can_write` returns `false` for the blocked author.
+    #[test]
+    fn block_last_author_leaves_valid_authorless_state() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:sole-author").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+
+        // Verify pre-condition: one author, one subscriber.
+        assert_eq!(ctx.author_dids().count(), 1);
+        assert_eq!(ctx.subscriber_count(), 1);
+        assert!(ctx.is_author("did:example:sole-author"));
+        assert!(ctx.can_write("did:example:sole-author"));
+
+        // Block the only author.
+        let result = ctx.block_author("did:example:sole-author").unwrap();
+        assert_eq!(result.author_did, "did:example:sole-author");
+        assert_eq!(result.final_epoch, 0);
+
+        // Context is now authorless.
+        assert_eq!(ctx.author_dids().count(), 0);
+        assert!(!ctx.is_author("did:example:sole-author"));
+        assert!(!ctx.can_write("did:example:sole-author"));
+
+        // Subscriber is still registered and can read.
+        assert_eq!(ctx.subscriber_count(), 1);
+        assert!(ctx.can_read("did:example:sub1"));
+
+        // Publishing fails (no author).
+        let publish_result = ctx.publish("did:example:sole-author", b"after block");
+        assert!(publish_result.is_err());
+
+        // Key request for the blocked author returns Deny.
+        assert!(matches!(
+            ctx.handle_key_request("did:example:sole-author", "did:example:sub1"),
+            KeyRequestDecision::Deny { .. }
+        ));
+    }
+
     #[test]
     fn block_author_publish_returns_permission_denied() {
         let mut ctx = make_open_ctx();

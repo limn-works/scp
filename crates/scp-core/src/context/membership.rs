@@ -213,6 +213,15 @@ pub enum ContextEvent {
         /// The DID of the author who performed the block.
         author_did: DID,
     },
+    /// An author was blocked from publishing in a broadcast context (SCP-227).
+    ///
+    /// The author's sender key has been destroyed; they can no longer publish
+    /// new messages. Subscribers who cached the author's old key can still
+    /// decrypt historical messages. See spec section 5.14.8.
+    AuthorBlocked {
+        /// The DID of the blocked author.
+        author_did: DID,
+    },
     /// The context expired due to TTL.
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.
