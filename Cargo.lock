@@ -3705,6 +3705,7 @@ name = "scp-testing"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hex",
  "openmls",
  "rmp-serde",
  "scp-core",
@@ -3719,6 +3720,7 @@ name = "scp-transport"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hex",
  "lru",
  "rand 0.8.5",
  "rmp-serde",

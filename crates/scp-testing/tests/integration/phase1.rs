@@ -29,7 +29,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashSet;
-use std::fmt::Write;
 use std::net::SocketAddr;
 
 use futures::StreamExt;
@@ -414,7 +413,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // context ID — unlinkable to Alice's DID without the identity key material.
 
     // Verify the routing_id is NOT Alice's DID or any recognizable identifier.
-    let routing_hex = hex_encode(&received_outer.routing_id);
+    let routing_hex = hex::encode(&received_outer.routing_id);
     assert!(
         !routing_hex.contains(&alice_id.did),
         "routing_id must not contain Alice's DID"
@@ -481,16 +480,6 @@ async fn native_relay_adapter_send_receive_roundtrip() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Hex-encodes bytes for assertion messages.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
-}
 
 /// Checks if `haystack` contains `needle` as a contiguous subsequence.
 fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {

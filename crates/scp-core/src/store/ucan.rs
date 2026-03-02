@@ -75,8 +75,8 @@ fn revocation_key(context_id: &str, token_id: &str) -> Result<String, super::Sto
 /// Format: `context/{context_id}/nonce/{nonce_hash_hex}`
 /// The nonce hash is encoded as lowercase hex. See spec section 17.3.
 fn nonce_key(context_id: &str, nonce_hash: &[u8; 32]) -> String {
-    let hex = hex_encode(nonce_hash);
-    format!("context/{context_id}/nonce/{hex}")
+    let hex_str = hex::encode(nonce_hash);
+    format!("context/{context_id}/nonce/{hex_str}")
 }
 
 /// Builds the prefix for listing all nonces in a context.
@@ -84,17 +84,6 @@ fn nonce_key(context_id: &str, nonce_hash: &[u8; 32]) -> String {
 /// Format: `context/{context_id}/nonce/`
 fn nonce_prefix(context_id: &str) -> String {
     format!("context/{context_id}/nonce/")
-}
-
-/// Encodes a byte slice as lowercase hexadecimal.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }
 
 // ---------------------------------------------------------------------------

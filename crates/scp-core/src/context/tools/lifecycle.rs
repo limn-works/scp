@@ -302,17 +302,7 @@ pub fn sha256_json(value: &serde_json::Value) -> String {
     // empty string.
     let bytes = serde_json::to_string(value).unwrap_or_default();
     let hash = Sha256::digest(bytes.as_bytes());
-    hex_encode(&hash)
-}
-
-/// Encodes a byte slice as a lowercase hex string.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{byte:02x}");
-    }
-    s
+    hex::encode(hash)
 }
 
 // ---------------------------------------------------------------------------

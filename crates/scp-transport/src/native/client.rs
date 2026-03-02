@@ -313,8 +313,8 @@ impl NativeRelayClient {
                 // Verify blob integrity: SHA-256(blob) must match relay-provided blob_id.
                 let computed_hash: [u8; 32] = Sha256::digest(blob).into();
                 if computed_hash != *blob_id {
-                    let expected = hex_encode(blob_id);
-                    let actual = hex_encode(&computed_hash);
+                    let expected = hex::encode(blob_id);
+                    let actual = hex::encode(computed_hash);
                     tracing::warn!(
                         expected = %expected,
                         actual = %actual,
@@ -830,17 +830,6 @@ impl NativeRelayClient {
     }
 }
 
-/// Hex-encodes a byte slice into a lowercase hex string.
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
-}
-
 /// Assigns a `ref_id` to a [`ClientMessage`] for request-response correlation.
 fn assign_ref_id(msg: &mut ClientMessage, ref_id: &str) {
     match msg {
@@ -1062,17 +1051,6 @@ mod tests {
         );
 
         assert!(inner.read().await.seen_blob_ids.contains(&correct_blob_id));
-    }
-
-    #[test]
-    fn hex_encode_produces_lowercase_hex() {
-        let bytes = [0xAB, 0xCD, 0xEF, 0x01];
-        assert_eq!(hex_encode(&bytes), "abcdef01");
-    }
-
-    #[test]
-    fn hex_encode_empty_is_empty() {
-        assert_eq!(hex_encode(&[]), "");
     }
 
     // -----------------------------------------------------------------------

@@ -295,7 +295,7 @@ fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
 
     // Support did:key:<hex> format for testing.
     if let Some(hex_str) = did.strip_prefix("did:key:") {
-        let decoded = hex_decode(hex_str)?;
+        let decoded = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
         let bytes: [u8; 32] = decoded
             .try_into()
             .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
@@ -303,22 +303,6 @@ fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
     }
 
     Err(format!("unsupported DID format: {did}"))
-}
-
-/// Decodes a hexadecimal string to bytes.
-fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length: {}", hex.len()));
-    }
-
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte_str = &hex[i..i + 2];
-        let byte =
-            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
-        bytes.push(byte);
-    }
-    Ok(bytes)
 }
 
 /// Recomputes the entire interior tree from the leaf layer.
