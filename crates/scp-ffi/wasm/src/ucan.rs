@@ -692,9 +692,19 @@ fn verify_chain_recursive(
         }
 
         // Recurse up the chain.
-        let issuer =
+        let found_root =
             verify_chain_recursive(parent, proof_map, revoked_cids, depth + 1, seen_issuers)?;
-        root_issuer = Some(issuer);
+
+        // All proof chains must converge to the same root issuer.
+        if let Some(ref existing_root) = root_issuer {
+            if *existing_root != found_root {
+                return Err(format!(
+                    "divergent root issuers: '{existing_root}' and '{found_root}'"
+                ));
+            }
+        } else {
+            root_issuer = Some(found_root);
+        }
     }
 
     root_issuer.ok_or_else(|| "delegation chain empty".to_owned())

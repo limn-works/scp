@@ -1913,9 +1913,19 @@ mod wasm_ucan_mirror {
                 return Err(format!("token revoked: {parent_revocation_cid}"));
             }
 
-            let issuer =
+            let found_root =
                 verify_chain_recursive(parent, proof_map, revoked_cids, depth + 1, seen_issuers)?;
-            root_issuer = Some(issuer);
+
+            // All proof chains must converge to the same root issuer.
+            if let Some(ref existing_root) = root_issuer {
+                if *existing_root != found_root {
+                    return Err(format!(
+                        "divergent root issuers: '{existing_root}' and '{found_root}'"
+                    ));
+                }
+            } else {
+                root_issuer = Some(found_root);
+            }
         }
 
         root_issuer.ok_or_else(|| "delegation chain empty".to_owned())
@@ -2605,5 +2615,220 @@ fn wasm_delegation_chain_accepts_valid_parent() {
         result.unwrap(),
         root_did,
         "root issuer must be the parent's issuer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Divergent root issuer tests (scp-core validate.rs:714-723 parity)
+// ---------------------------------------------------------------------------
+
+/// Test: multi-proof token where both proof chains converge to the same root
+/// issuer DID is rejected by circular delegation detection (the root DID
+/// appears in `seen_issuers` from the first chain and is encountered again
+/// in the second chain). This matches scp-core behavior -- multi-proof
+/// convergence to the same root necessarily re-visits an issuer DID.
+///
+/// This test confirms that multi-proof with same root is rejected by circular
+/// delegation detection BEFORE the divergent root check can fire, and that
+/// WASM matches scp-core's behavior.
+#[test]
+fn wasm_multi_proof_same_root_triggers_circular_detection() {
+    use std::collections::HashSet;
+
+    // Root -> child (proof 1)
+    // Root -> B -> child (proof 2)
+    // Child has prf: [cid_a, cid_b]
+    // When processing proof 2, root_did is already in seen_issuers.
+    let root_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+    let b_key = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+    let child_key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+
+    let root_did = wasm_ucan_mirror::did_from_key(&root_key);
+    let b_did = wasm_ucan_mirror::did_from_key(&b_key);
+    let child_did = wasm_ucan_mirror::did_from_key(&child_key);
+
+    let now = wasm_ucan_mirror::now_secs();
+
+    // Root -> child: direct delegation.
+    let proof_a_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_did.clone(),
+        aud: child_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "nonce-same-root-a".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let proof_a_jwt = make_signed_ucan(&proof_a_payload, &root_key);
+    let proof_a_cid = wasm_ucan_mirror::compute_token_cid(&proof_a_jwt);
+
+    // Root -> B.
+    let root_to_b_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_did.clone(),
+        aud: b_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "nonce-same-root-b-parent".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let root_to_b_jwt = make_signed_ucan(&root_to_b_payload, &root_key);
+    let root_to_b_cid = wasm_ucan_mirror::compute_token_cid(&root_to_b_jwt);
+
+    // B -> child, referencing root->B.
+    let b_to_child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: b_did,
+        aud: child_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "nonce-same-root-b-child".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![root_to_b_cid],
+        fct: None,
+    };
+    let proof_b_jwt = make_signed_ucan(&b_to_child_payload, &b_key);
+    let proof_b_cid = wasm_ucan_mirror::compute_token_cid(&proof_b_jwt);
+
+    // Child token: references both proof chains.
+    let child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: child_did,
+        aud: "did:key:deadbeef00000000000000000000000000000000000000000000000000000000".to_owned(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "nonce-same-root-child".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![proof_a_cid, proof_b_cid],
+        fct: None,
+    };
+    let child_jwt = make_signed_ucan(&child_payload, &child_key);
+    let child_token = wasm_ucan_mirror::parse_ucan(&child_jwt).unwrap();
+
+    let revoked_cids = HashSet::new();
+    let result = wasm_ucan_mirror::verify_delegation_chain(
+        &child_token,
+        Some(&[proof_a_jwt, proof_b_jwt, root_to_b_jwt]),
+        &revoked_cids,
+    );
+
+    // Multi-proof convergence triggers circular delegation detection because
+    // the root DID appears in both branches of the proof walk.
+    assert!(
+        result.is_err(),
+        "multi-proof with converging root must be rejected: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("circular delegation detected"),
+        "error must mention 'circular delegation detected', got: {err}"
+    );
+}
+
+/// Test: multi-proof token where proof chains trace to different root issuers
+/// is rejected with "divergent root issuers" error.
+///
+/// This is the security fix: scp-core rejects this at validate.rs:714-723,
+/// and the WASM bridge must match.
+#[test]
+fn wasm_multi_proof_divergent_root_issuers_rejected() {
+    use std::collections::HashSet;
+
+    // Root A -> child (proof 1)
+    // Root B -> child (proof 2)  <-- different root!
+    // Child has prf: [cid_a, cid_b]
+    let root_a_key = ed25519_dalek::SigningKey::from_bytes(&[20u8; 32]);
+    let root_b_key = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+    let child_key = ed25519_dalek::SigningKey::from_bytes(&[22u8; 32]);
+
+    let root_a_did = wasm_ucan_mirror::did_from_key(&root_a_key);
+    let root_b_did = wasm_ucan_mirror::did_from_key(&root_b_key);
+    let child_did = wasm_ucan_mirror::did_from_key(&child_key);
+
+    let now = wasm_ucan_mirror::now_secs();
+
+    // Root A -> child.
+    let proof_a_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_a_did.clone(),
+        aud: child_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "nonce-divergent-a".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let proof_a_jwt = make_signed_ucan(&proof_a_payload, &root_a_key);
+    let proof_a_cid = wasm_ucan_mirror::compute_token_cid(&proof_a_jwt);
+
+    // Root B -> child (different root!).
+    let proof_b_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_b_did.clone(),
+        aud: child_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "nonce-divergent-b".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let proof_b_jwt = make_signed_ucan(&proof_b_payload, &root_b_key);
+    let proof_b_cid = wasm_ucan_mirror::compute_token_cid(&proof_b_jwt);
+
+    // Child token: references both proofs from different roots.
+    let child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: child_did,
+        aud: "did:key:deadbeef00000000000000000000000000000000000000000000000000000000".to_owned(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "nonce-divergent-child".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![proof_a_cid, proof_b_cid],
+        fct: None,
+    };
+    let child_jwt = make_signed_ucan(&child_payload, &child_key);
+    let child_token = wasm_ucan_mirror::parse_ucan(&child_jwt).unwrap();
+
+    let revoked_cids = HashSet::new();
+    let result = wasm_ucan_mirror::verify_delegation_chain(
+        &child_token,
+        Some(&[proof_a_jwt, proof_b_jwt]),
+        &revoked_cids,
+    );
+
+    assert!(
+        result.is_err(),
+        "multi-proof with divergent root issuers must be rejected"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("divergent root issuers"),
+        "error must mention 'divergent root issuers', got: {err}"
+    );
+    // Verify both root DIDs are mentioned in the error.
+    assert!(
+        err.contains(&root_a_did) && err.contains(&root_b_did),
+        "error must include both root DIDs, got: {err}"
     );
 }
