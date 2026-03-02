@@ -235,6 +235,7 @@ impl GovernanceEngine for ThresholdEngine {
 
         // The proposer's vote counts as the first approval.
         let proposer_vote = sign_vote(
+            &proposal_id,
             &VoteType::Approve,
             proposer.as_ref(),
             context.now,
@@ -332,7 +333,7 @@ impl GovernanceEngine for ThresholdEngine {
         }
 
         // Record the signed vote.
-        let vote = sign_vote(&VoteType::Approve, voter.as_ref(), context.now, signing_key)?;
+        let vote = sign_vote(proposal_id, &VoteType::Approve, voter.as_ref(), context.now, signing_key)?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -393,7 +394,7 @@ impl GovernanceEngine for ThresholdEngine {
         }
 
         // Record the signed rejection vote.
-        let vote = sign_vote(&VoteType::Reject, voter.as_ref(), context.now, signing_key)?;
+        let vote = sign_vote(proposal_id, &VoteType::Reject, voter.as_ref(), context.now, signing_key)?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {

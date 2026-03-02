@@ -119,14 +119,20 @@ const VOTE_DOMAIN_SEPARATOR: &[u8] = b"SCP-VOTE-V1:";
 /// Uses SHA-256 with a domain separator and length-prefixed fields:
 /// ```text
 /// SHA-256(VOTE_DOMAIN_SEPARATOR
+///         || proposal_id (32 bytes, fixed-length)
 ///         || len(voter_did) as u32 BE || voter_did
 ///         || len(vote_json) as u32 BE || vote_json
 ///         || timestamp BE)
 /// ```
 ///
+/// `proposal_id` is included first (after the domain separator) to bind
+/// the vote signature to a specific proposal, preventing cross-proposal
+/// replay attacks.
+///
 /// Length prefixes prevent ambiguity when concatenating variable-length fields.
 #[allow(clippy::similar_names)] // voter_did_bytes vs vote_type_bytes are semantically distinct
 fn compute_vote_hash(
+    proposal_id: &ProposalId,
     voter_did: &str,
     vote: &VoteType,
     timestamp: u64,
@@ -138,6 +144,8 @@ fn compute_vote_hash(
 
     let mut hasher = Sha256::new();
     hasher.update(VOTE_DOMAIN_SEPARATOR);
+    // Proposal ID (32-byte SHA-256 hash, fixed-length — no length prefix needed).
+    hasher.update(proposal_id);
     // Length-prefixed voter DID.
     #[allow(clippy::cast_possible_truncation)] // DID strings are always < 4 GiB
     let voter_len = voter_did_bytes.len() as u32;
@@ -155,21 +163,23 @@ fn compute_vote_hash(
 
 /// Creates a signed vote with a real Ed25519 signature.
 ///
-/// Computes a canonical hash over `(voter_did, vote, timestamp)` with a
-/// `SCP-VOTE-V1:` domain separator and length-prefixed fields, then signs
-/// it with the provided Ed25519 signing key.
+/// Computes a canonical hash over `(proposal_id, voter_did, vote, timestamp)`
+/// with a `SCP-VOTE-V1:` domain separator and length-prefixed fields, then
+/// signs it with the provided Ed25519 signing key. The `proposal_id` binds
+/// the signature to a specific proposal, preventing cross-proposal replay.
 ///
 /// # Errors
 ///
 /// Returns [`GovernanceError::SerializationFailed`] if the vote type cannot
 /// be serialized.
 pub fn sign_vote(
+    proposal_id: &ProposalId,
     vote: &VoteType,
     voter_did: &str,
     timestamp: u64,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<SignedVote, GovernanceError> {
-    let hash = compute_vote_hash(voter_did, vote, timestamp)?;
+    let hash = compute_vote_hash(proposal_id, voter_did, vote, timestamp)?;
     let signature = signing_key.sign(&hash);
 
     Ok(SignedVote {
@@ -193,10 +203,11 @@ pub fn sign_vote(
 /// - The signature does not match the recomputed hash.
 /// - The vote type cannot be serialized for hash recomputation.
 pub fn verify_vote(
+    proposal_id: &ProposalId,
     vote: &SignedVote,
     voter_public_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<(), GovernanceError> {
-    let hash = compute_vote_hash(vote.voter_did.as_ref(), &vote.vote, vote.timestamp)?;
+    let hash = compute_vote_hash(proposal_id, vote.voter_did.as_ref(), &vote.vote, vote.timestamp)?;
 
     let sig_bytes: [u8; 64] = vote.signature.as_slice().try_into().map_err(|_| {
         GovernanceError::VerificationFailed(format!(
@@ -751,6 +762,7 @@ impl GovernanceEngine for SingleAdminEngine {
 
         // Sign the proposer's implicit approval vote.
         let admin_vote = sign_vote(
+            &proposal_id,
             &VoteType::Approve,
             proposer.as_ref(),
             context.now,
@@ -1739,7 +1751,7 @@ mod tests {
     #[test]
     fn sign_vote_produces_64_byte_signature() {
         let sk = test_signing_key();
-        let sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
 
         assert_eq!(sv.signature.len(), 64);
@@ -1753,9 +1765,9 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
-        verify_vote(&sv, &vk).expect("verify_vote should succeed");
+        verify_vote(&[0u8; 32], &sv, &vk).expect("verify_vote should succeed");
     }
 
     #[test]
@@ -1763,9 +1775,9 @@ mod tests {
         let sk = test_signing_key();
         let wrong_vk = test_signing_key_2().verifying_key();
 
-        let sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
-        let result = verify_vote(&sv, &wrong_vk);
+        let result = verify_vote(&[0u8; 32], &sv, &wrong_vk);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1778,11 +1790,11 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let mut sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let mut sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
         sv.voter_did = bob();
 
-        let result = verify_vote(&sv, &vk);
+        let result = verify_vote(&[0u8; 32], &sv, &vk);
         assert!(result.is_err());
     }
 
@@ -1791,11 +1803,11 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let mut sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let mut sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
         sv.vote = VoteType::Reject;
 
-        let result = verify_vote(&sv, &vk);
+        let result = verify_vote(&[0u8; 32], &sv, &vk);
         assert!(result.is_err());
     }
 
@@ -1804,11 +1816,11 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let mut sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let mut sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
         sv.timestamp = 1_700_000_001;
 
-        let result = verify_vote(&sv, &vk);
+        let result = verify_vote(&[0u8; 32], &sv, &vk);
         assert!(result.is_err());
     }
 
@@ -1817,11 +1829,11 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
 
-        let mut sv = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let mut sv = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
         sv.signature = Vec::new();
 
-        let result = verify_vote(&sv, &vk);
+        let result = verify_vote(&[0u8; 32], &sv, &vk);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1832,9 +1844,9 @@ mod tests {
     #[test]
     fn sign_vote_is_deterministic() {
         let sk = test_signing_key();
-        let sv1 = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let sv1 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
-        let sv2 = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let sv2 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
         assert_eq!(sv1.signature, sv2.signature);
     }
@@ -1842,13 +1854,13 @@ mod tests {
     #[test]
     fn sign_vote_different_inputs_produce_different_signatures() {
         let sk = test_signing_key();
-        let sv1 = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let sv1 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
-        let sv2 = sign_vote(&VoteType::Reject, "did:dht:z6MkAlice", 1_700_000_000, &sk)
+        let sv2 = sign_vote(&[0u8; 32], &VoteType::Reject, "did:dht:z6MkAlice", 1_700_000_000, &sk)
             .expect("sign_vote");
-        let sv3 = sign_vote(&VoteType::Approve, "did:dht:z6MkBob", 1_700_000_000, &sk)
+        let sv3 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkBob", 1_700_000_000, &sk)
             .expect("sign_vote");
-        let sv4 = sign_vote(&VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_001, &sk)
+        let sv4 = sign_vote(&[0u8; 32], &VoteType::Approve, "did:dht:z6MkAlice", 1_700_000_001, &sk)
             .expect("sign_vote");
 
         assert_ne!(sv1.signature, sv2.signature);
@@ -1871,6 +1883,6 @@ mod tests {
         assert_eq!(proposal.approvals.len(), 1);
         let vote = &proposal.approvals[0];
         assert_eq!(vote.signature.len(), 64);
-        verify_vote(vote, &vk).expect("vote produced by propose should be verifiable");
+        verify_vote(&proposal.proposal_id, vote, &vk).expect("vote produced by propose should be verifiable");
     }
 }

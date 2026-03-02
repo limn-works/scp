@@ -478,6 +478,7 @@ mod tests {
             voting_deadline: 1_700_086_400,
             approvals: vec![
                 sign_vote(
+                    &[1u8; 32],
                     &VoteType::Approve,
                     alice().as_ref(),
                     1_700_000_000,
