@@ -714,7 +714,7 @@ fn verify_attenuation(
 /// Computes the CID of a token as the hex-encoded SHA-256 of the encoded JWT string.
 fn compute_token_cid(encoded: &str) -> String {
     let hash = Sha256::digest(encoded.as_bytes());
-    encode_hex(&hash)
+    format!("bafyrei{}", encode_hex(&hash))
 }
 
 /// Returns the current Unix timestamp in seconds.
