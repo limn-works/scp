@@ -93,6 +93,11 @@ pub struct RelayConfig {
     ///
     /// See GitHub issue #85 for the threat model.
     pub bridge_secret: Option<[u8; 32]>,
+    /// Whether this relay supports the BRIDGE operation for symmetric NAT
+    /// fallback (spec section 10.12.4). When `true`, the relay accepts
+    /// `BRIDGE_REGISTER` operations from self-hosted relays behind NAT
+    /// and proxies traffic for registered routing IDs.
+    pub supports_bridge: bool,
 }
 
 impl Default for RelayConfig {
@@ -110,6 +115,7 @@ impl Default for RelayConfig {
             rate_limit_subscribes_per_minute: 20,
             delivery_jitter_ms: 50,
             bridge_secret: None,
+            supports_bridge: false,
         }
     }
 }
@@ -757,7 +763,7 @@ async fn handle_connection<S: BlobStorage + 'static>(
 }
 
 /// Dispatches a client message to the appropriate handler.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_client_message<S: BlobStorage>(
     msg: &ClientMessage,
     connection_id: u64,
@@ -849,6 +855,48 @@ async fn handle_client_message<S: BlobStorage>(
         ClientMessage::Ping { ts } => {
             let pong = RelayMessage::Pong { ts: *ts };
             let _ = tx.send(pong).await;
+        }
+        ClientMessage::BridgeRegister { ref_id, .. } => {
+            // Bridge registration requires a BridgeRegistry, which is
+            // managed separately from the standard relay server.
+            if config.supports_bridge {
+                // Bridge registration is handled by the bridge service
+                // layer (relay::bridge::BridgeRegistry) which wraps the
+                // server. Respond with OK as acknowledgement -- actual
+                // registration state is managed externally.
+                let ok_msg = RelayMessage::Ok {
+                    ref_id: ref_id.clone(),
+                    blob_id: None,
+                };
+                let _ = tx.send(ok_msg).await;
+            } else {
+                let err_msg = RelayMessage::Err {
+                    ref_id: ref_id.clone(),
+                    code: code::BRIDGE_NOT_SUPPORTED,
+                    msg: "this relay does not support BRIDGE operations".to_string(),
+                };
+                let _ = tx.send(err_msg).await;
+            }
+        }
+        ClientMessage::BridgeData { ref_id, .. } => {
+            // Bridge data forwarding requires the bridge service layer.
+            if config.supports_bridge {
+                // Bridge data forwarding is handled by the bridge service
+                // layer. The server acknowledges receipt; actual forwarding
+                // is done by BridgeRegistry.lookup() + channel send.
+                let ok_msg = RelayMessage::Ok {
+                    ref_id: ref_id.clone(),
+                    blob_id: None,
+                };
+                let _ = tx.send(ok_msg).await;
+            } else {
+                let err_msg = RelayMessage::Err {
+                    ref_id: ref_id.clone(),
+                    code: code::BRIDGE_NOT_SUPPORTED,
+                    msg: "this relay does not support BRIDGE operations".to_string(),
+                };
+                let _ = tx.send(err_msg).await;
+            }
         }
     }
 }

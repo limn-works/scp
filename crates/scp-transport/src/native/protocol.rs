@@ -112,6 +112,8 @@ mod byte_array_32_opt {
 /// | [`Delete`](ClientMessage::Delete) | `DELETE` | Request blob deletion |
 /// | [`Ack`](ClientMessage::Ack) | `ACK` | Delivery receipt |
 /// | [`Ping`](ClientMessage::Ping) | `PING` | Keepalive |
+/// | [`BridgeRegister`](ClientMessage::BridgeRegister) | `BRIDGE_REGISTER` | Register a routing ID for bridge proxying (section 10.12.4) |
+/// | [`BridgeData`](ClientMessage::BridgeData) | `BRIDGE_DATA` | Send proxied data through a bridge (section 10.12.4) |
 ///
 /// See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +240,52 @@ pub enum ClientMessage {
         /// Client-chosen timestamp (typically current unix epoch seconds).
         ts: u64,
     },
+
+    /// Register a routing ID for bridge proxying (spec section 10.12.4).
+    ///
+    /// Sent by a self-hosted relay behind symmetric NAT to a bridge relay.
+    /// The self-hosted relay connects outbound to the bridge and registers
+    /// its routing ID so the bridge can forward traffic for that ID over
+    /// this connection.
+    ///
+    /// The relay responds with `OK` on success or `ERR` if bridging is
+    /// not supported or the registration limit is exceeded.
+    #[serde(rename = "BRIDGE_REGISTER")]
+    BridgeRegister {
+        /// Client-assigned request ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+
+        /// The routing ID to register for bridge proxying (32 bytes).
+        #[serde(with = "serde_bytes")]
+        routing_id: [u8; 32],
+
+        /// URL hint for reaching this self-hosted relay directly (used for
+        /// informational purposes and potential future direct connection).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_relay_hint: Option<String>,
+    },
+
+    /// Send proxied data through a bridge to a registered self-hosted relay
+    /// (spec section 10.12.4).
+    ///
+    /// Sent by peers to a bridge relay. The bridge forwards the payload
+    /// to the registered self-hosted relay without inspection, modification,
+    /// or caching — a transparent pipe.
+    #[serde(rename = "BRIDGE_DATA")]
+    BridgeData {
+        /// Client-assigned request ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+
+        /// The routing ID of the target self-hosted relay (32 bytes).
+        #[serde(with = "serde_bytes")]
+        target_routing_id: [u8; 32],
+
+        /// Opaque payload to forward. The bridge does NOT inspect this.
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+    },
 }
 
 impl ClientMessage {
@@ -308,6 +356,21 @@ impl ClientMessage {
                 }
             }
             Self::Ack { .. } | Self::Ping { .. } => {}
+            Self::BridgeRegister { ref_id, .. } => {
+                validate_ref_id(ref_id)?;
+            }
+            Self::BridgeData {
+                ref_id, payload, ..
+            } => {
+                validate_ref_id(ref_id)?;
+                // Bridge payload has the same max size as a blob.
+                if payload.is_empty() || payload.len() > MAX_BLOB_SIZE {
+                    return Err(NativeProtocolError::ValidationFailed(format!(
+                        "bridge payload must be 1-{MAX_BLOB_SIZE} bytes, got {}",
+                        payload.len()
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -333,6 +396,7 @@ impl ClientMessage {
 /// | [`Blob`](RelayMessage::Blob) | `BLOB` | Blob delivery |
 /// | [`Event`](RelayMessage::Event) | `EVENT` | Protocol event |
 /// | [`Pong`](RelayMessage::Pong) | `PONG` | Keepalive response |
+/// | [`BridgeData`](RelayMessage::BridgeData) | `BRIDGE_DATA` | Proxied data from bridge (section 10.12.4) |
 ///
 /// See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +495,22 @@ pub enum RelayMessage {
     Pong {
         /// The timestamp from the client's `PING`.
         ts: u64,
+    },
+
+    /// Proxied data delivered through a bridge relay (spec section 10.12.4).
+    ///
+    /// The bridge relay forwards this opaque payload from a peer or
+    /// self-hosted relay. The bridge does NOT inspect, modify, or cache
+    /// the payload.
+    #[serde(rename = "BRIDGE_DATA")]
+    BridgeData {
+        /// The routing ID of the source (32 bytes).
+        #[serde(with = "serde_bytes")]
+        source_routing_id: [u8; 32],
+
+        /// Opaque payload forwarded through the bridge.
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
     },
 }
 
@@ -643,6 +723,45 @@ mod tests {
         assert_eq!(msg, restored);
     }
 
+    #[test]
+    fn bridge_register_roundtrip() {
+        let msg = ClientMessage::BridgeRegister {
+            ref_id: Some("br-1".to_string()),
+            routing_id: [0xBB; 32],
+            target_relay_hint: Some("ws://192.168.1.1:9000/scp/v1".to_string()),
+        };
+
+        let bytes = msg.to_bytes().unwrap();
+        let restored = ClientMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, restored);
+    }
+
+    #[test]
+    fn bridge_register_no_optional_fields_roundtrip() {
+        let msg = ClientMessage::BridgeRegister {
+            ref_id: None,
+            routing_id: [0xCC; 32],
+            target_relay_hint: None,
+        };
+
+        let bytes = msg.to_bytes().unwrap();
+        let restored = ClientMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, restored);
+    }
+
+    #[test]
+    fn bridge_data_client_roundtrip() {
+        let msg = ClientMessage::BridgeData {
+            ref_id: Some("bd-1".to_string()),
+            target_routing_id: [0xDD; 32],
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+
+        let bytes = msg.to_bytes().unwrap();
+        let restored = ClientMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, restored);
+    }
+
     // -----------------------------------------------------------------------
     // RelayMessage roundtrip tests
     // -----------------------------------------------------------------------
@@ -768,6 +887,18 @@ mod tests {
     #[test]
     fn pong_roundtrip() {
         let msg = RelayMessage::Pong { ts: 1_700_000_000 };
+
+        let bytes = msg.to_bytes().unwrap();
+        let restored = RelayMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, restored);
+    }
+
+    #[test]
+    fn bridge_data_relay_roundtrip() {
+        let msg = RelayMessage::BridgeData {
+            source_routing_id: [0xEE; 32],
+            payload: vec![0x01, 0x02, 0x03, 0x04],
+        };
 
         let bytes = msg.to_bytes().unwrap();
         let restored = RelayMessage::from_bytes(&bytes).unwrap();
@@ -1029,6 +1160,59 @@ mod tests {
         assert!(msg.validate().is_ok());
     }
 
+    #[test]
+    fn validate_bridge_register_valid() {
+        let msg = ClientMessage::BridgeRegister {
+            ref_id: Some("br-1".to_string()),
+            routing_id: [0x00; 32],
+            target_relay_hint: Some("ws://192.168.1.1:9000/scp/v1".to_string()),
+        };
+        assert!(msg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_bridge_register_ref_id_too_long() {
+        let msg = ClientMessage::BridgeRegister {
+            ref_id: Some("x".repeat(MAX_REF_ID_LEN + 1)),
+            routing_id: [0x00; 32],
+            target_relay_hint: None,
+        };
+        let err = msg.validate().unwrap_err();
+        assert!(err.to_string().contains("ref_id"));
+    }
+
+    #[test]
+    fn validate_bridge_data_valid() {
+        let msg = ClientMessage::BridgeData {
+            ref_id: None,
+            target_routing_id: [0x00; 32],
+            payload: vec![0x01, 0x02],
+        };
+        assert!(msg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_bridge_data_empty_payload() {
+        let msg = ClientMessage::BridgeData {
+            ref_id: None,
+            target_routing_id: [0x00; 32],
+            payload: vec![],
+        };
+        let err = msg.validate().unwrap_err();
+        assert!(err.to_string().contains("bridge payload"));
+    }
+
+    #[test]
+    fn validate_bridge_data_payload_too_large() {
+        let msg = ClientMessage::BridgeData {
+            ref_id: None,
+            target_routing_id: [0x00; 32],
+            payload: vec![0x00; MAX_BLOB_SIZE + 1],
+        };
+        let err = msg.validate().unwrap_err();
+        assert!(err.to_string().contains("bridge payload"));
+    }
+
     // -----------------------------------------------------------------------
     // Op field serialization
     // -----------------------------------------------------------------------
@@ -1104,6 +1288,22 @@ mod tests {
             ),
             (ClientMessage::Ack { blob_id: [0; 32] }, "ACK"),
             (ClientMessage::Ping { ts: 0 }, "PING"),
+            (
+                ClientMessage::BridgeRegister {
+                    ref_id: None,
+                    routing_id: [0; 32],
+                    target_relay_hint: None,
+                },
+                "BRIDGE_REGISTER",
+            ),
+            (
+                ClientMessage::BridgeData {
+                    ref_id: None,
+                    target_routing_id: [0; 32],
+                    payload: vec![0x01],
+                },
+                "BRIDGE_DATA",
+            ),
         ];
 
         for (msg, expected_op) in cases {
@@ -1152,6 +1352,13 @@ mod tests {
                 "EVENT",
             ),
             (RelayMessage::Pong { ts: 0 }, "PONG"),
+            (
+                RelayMessage::BridgeData {
+                    source_routing_id: [0; 32],
+                    payload: vec![0x01],
+                },
+                "BRIDGE_DATA",
+            ),
         ];
 
         for (msg, expected_op) in cases {
