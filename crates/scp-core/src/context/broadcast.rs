@@ -162,6 +162,25 @@ pub struct UnsubscribeResult {
 }
 
 // ---------------------------------------------------------------------------
+// AuthorBlockResult
+// ---------------------------------------------------------------------------
+
+/// Result returned by [`BroadcastContext::block_author`].
+///
+/// Contains the blocked author's DID for event emission. The author's sender
+/// key is destroyed (removed from state), so subscribers who cached that key
+/// can still decrypt old messages but no new messages can be sealed by the
+/// blocked author. See SCP-227 AC4 and spec section 5.14.8.
+#[derive(Debug, Clone)]
+pub struct AuthorBlockResult {
+    /// The DID of the blocked author.
+    pub author_did: String,
+    /// The key epoch at the time the author was blocked. Subscribers can
+    /// use this to identify which key material is now invalid.
+    pub final_epoch: u64,
+}
+
+// ---------------------------------------------------------------------------
 // KeyRequestDecision
 // ---------------------------------------------------------------------------
 
@@ -308,6 +327,40 @@ impl BroadcastContext {
     #[must_use]
     pub fn get_author(&self, author_did: &str) -> Option<&AuthorState> {
         self.authors.get(author_did)
+    }
+
+    /// Returns `true` if the given DID is a registered author.
+    #[must_use]
+    pub fn is_author(&self, did: &str) -> bool {
+        self.authors.contains_key(did)
+    }
+
+    /// Blocks an author, revoking their ability to publish.
+    ///
+    /// Removes the author from the `authors` map, destroying their sender key
+    /// and making `can_write(author_did)` return `false`. Subsequent calls to
+    /// `publish()` by this author return [`ContextError::PermissionDenied`].
+    ///
+    /// Subscribers who cached the author's key can still decrypt old messages,
+    /// but no new messages can be sealed because the key is destroyed and the
+    /// author is no longer authorized. This is the admin-facing counterpart to
+    /// `block_subscriber()` (which blocks a subscriber from receiving keys).
+    ///
+    /// See SCP-227 AC4 and spec section 5.14.8.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::MemberNotFound`] if the author DID is not
+    /// registered.
+    pub fn block_author(&mut self, author_did: &str) -> Result<AuthorBlockResult, ContextError> {
+        let author_state = self.authors.remove(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        Ok(AuthorBlockResult {
+            author_did: author_did.to_owned(),
+            final_epoch: author_state.epoch,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1233,6 +1286,144 @@ mod tests {
         let mut ctx = make_open_ctx();
         let result = ctx.block_subscriber("did:example:unknown", "did:example:dave");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Author blocking (AC 4 — block_author)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_author_removes_from_authors_map() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+
+        assert!(ctx.is_author("did:example:bob"));
+        assert!(ctx.can_write("did:example:bob"));
+
+        let result = ctx.block_author("did:example:bob").unwrap();
+
+        assert_eq!(result.author_did, "did:example:bob");
+        assert_eq!(result.final_epoch, 0);
+        assert!(!ctx.is_author("did:example:bob"));
+        assert!(!ctx.can_write("did:example:bob"));
+        // Alice is unaffected.
+        assert!(ctx.is_author("did:example:alice"));
+        assert!(ctx.can_write("did:example:alice"));
+    }
+
+    #[test]
+    fn block_author_returns_final_epoch() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+
+        // Advance Alice's epoch by blocking a subscriber.
+        ctx.block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+        assert_eq!(ctx.get_author("did:example:alice").unwrap().epoch, 1);
+
+        let result = ctx.block_author("did:example:alice").unwrap();
+        assert_eq!(result.final_epoch, 1);
+    }
+
+    #[test]
+    fn block_author_unknown_returns_error() {
+        let mut ctx = make_open_ctx();
+        let result = ctx.block_author("did:example:unknown");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn block_author_publish_returns_permission_denied() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+
+        // Alice can publish before block.
+        assert!(ctx.publish("did:example:alice", b"hello").is_ok());
+
+        ctx.block_author("did:example:alice").unwrap();
+
+        // Alice cannot publish after block.
+        let result = ctx.publish("did:example:alice", b"hello again");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn block_author_key_request_returns_deny() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+
+        // Key request succeeds before block.
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            KeyRequestDecision::Grant { .. }
+        ));
+
+        ctx.block_author("did:example:alice").unwrap();
+
+        // Key request fails after block (author not found).
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            KeyRequestDecision::Deny { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration test: blocked author's messages undecryptable (AC 7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn integration_blocked_author_cannot_publish_and_subscribers_unaffected() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub2", None, 1001).unwrap();
+
+        // Both authors can publish.
+        let alice_author = ctx.get_author("did:example:alice").unwrap();
+        let alice_key = alice_author.broadcast_key.clone();
+        let bob_author = ctx.get_author("did:example:bob").unwrap();
+        let bob_key = bob_author.broadcast_key.clone();
+
+        let alice_msg = b"Alice's message";
+        let alice_ct = encrypt_sender_layer(&alice_key, alice_msg).unwrap();
+        let bob_msg = b"Bob's message";
+        let bob_ct = encrypt_sender_layer(&bob_key, bob_msg).unwrap();
+
+        // Both subscribers can decrypt both authors.
+        assert_eq!(
+            decrypt_sender_layer(&alice_key, &alice_ct).unwrap(),
+            alice_msg
+        );
+        assert_eq!(decrypt_sender_layer(&bob_key, &bob_ct).unwrap(), bob_msg);
+
+        // Block Bob (admin action).
+        ctx.block_author("did:example:bob").unwrap();
+
+        // Alice can still publish (unaffected).
+        let alice_msg2 = b"Alice's second message";
+        let _alice_envelope = ctx.publish("did:example:alice", alice_msg2).unwrap();
+
+        // Subscribers can still decrypt Alice's messages via key request.
+        let alice_decision = ctx.handle_key_request("did:example:alice", "did:example:sub1");
+        assert!(matches!(alice_decision, KeyRequestDecision::Grant { .. }));
+
+        // Bob cannot publish (PermissionDenied).
+        let bob_result = ctx.publish("did:example:bob", b"Bob tries to publish");
+        assert!(bob_result.is_err());
+
+        // Key request for Bob returns Deny (author not found).
+        let bob_decision = ctx.handle_key_request("did:example:bob", "did:example:sub1");
+        assert!(matches!(bob_decision, KeyRequestDecision::Deny { .. }));
+
+        // Subscribers cannot get Bob's key at any epoch — his key is destroyed.
+        // Old messages encrypted with Bob's key are still decryptable with the
+        // cached key, but no new messages can be produced.
+        assert_eq!(decrypt_sender_layer(&bob_key, &bob_ct).unwrap(), bob_msg);
     }
 
     // -----------------------------------------------------------------------
