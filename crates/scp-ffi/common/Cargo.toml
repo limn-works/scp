@@ -6,6 +6,11 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+# Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
+# non-standard test convenience — production builds must resolve via did:dht:z.
+testing = []
+
 [dependencies]
 scp-core = { path = "../../scp-core" }
 hex = { workspace = true }
