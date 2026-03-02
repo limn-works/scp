@@ -42,6 +42,8 @@ from scp_sdk.mcp import (
     disable_stdio_allowlist,
     get_stdio_allowlist,
     register_tool_handler,
+    registry_cleanup,
+    registry_stats,
     reset_stdio_allowlist,
     serve_mcp,
 )
@@ -126,6 +128,8 @@ __all__ = [
     "get_stdio_allowlist",
     "mint",
     "register_tool_handler",
+    "registry_cleanup",
+    "registry_stats",
     "relay_status",
     "reset_stdio_allowlist",
     "revoke",

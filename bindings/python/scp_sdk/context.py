@@ -552,6 +552,30 @@ class Context:
                 exc_info=True,
             )
 
+    # -- Finalizer (GC safety for long-running processes) -------------------
+
+    def __del__(self) -> None:
+        """Release registry resources if the context was not properly closed.
+
+        Called by the garbage collector when the ``Context`` object is
+        reclaimed.  This is a last-resort cleanup for processes that do
+        not use ``async with`` or forget to call :meth:`close`.
+
+        Errors are silently suppressed -- ``__del__`` must never raise.
+        """
+        try:
+            import _scp_core
+
+            if hasattr(self, "_handle") and self._handle is not None:
+                if self.state == "active":
+                    try:
+                        _scp_core.py_context_close(self._handle, self._creator_did)
+                    except Exception:
+                        # Best-effort: context may already be closed.
+                        pass
+        except Exception:
+            pass
+
     # -- Representation -----------------------------------------------------
 
     def __repr__(self) -> str:
