@@ -1240,7 +1240,7 @@ Introduce named transport profiles and tiered cover traffic configuration to ada
 
 ### Acceptance Criteria
 
-1. **`TransportProfile` enum** with `Server`, `Desktop`, `Mobile`, `Constrained` variants. Each variant carries default values for `min_relays`, `max_connections`, `reconnect_backoff_range`, and `cover_traffic_tier`. Platform inference via `#[cfg(target_os)]`.
+1. **`TransportProfile` enum** with `Server`, `Desktop`, `Mobile`, `Constrained` variants. Each variant carries default values for `min_relays`, `max_connections`, `reconnect_backoff_range`, and `cover_traffic_tier`. Platform inference via `#[cfg(target_os)]` with runtime refinement for Linux (server/constrained/desktop heuristics per §10.13.1).
 2. **`CoverTrafficTier` enum** with `Full`, `Reduced`, `Off`, `Custom { interval: Duration, padding_bytes: usize }` variants. `CoverTrafficConfig` uses `tier: CoverTrafficTier` instead of `enabled: bool`. `from_profile()` method maps profile to tier. All existing callers updated.
 3. **`ConnectionPool`** keyed by `(relay_url, transport_type)`. `TransportManager` uses the pool for adapter lookup and reuse. Single connection per relay per transport type. `Arc<ConnectionPool>` for cross-manager sharing.
 4. **Connection budget enforcement.** `TransportManager` tracks total active connections. When `max_connections` exceeded, LRU connection is closed. Subscriptions on evicted connections are migrated to surviving connections to the same relay, or trigger relay reassignment.

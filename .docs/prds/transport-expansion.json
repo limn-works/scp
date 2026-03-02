@@ -77,7 +77,7 @@
       "acceptanceCriteria": [
         "TransportProfile enum with Server, Desktop, Mobile, Constrained variants in profile.rs",
         "Each variant carries default min_relays (Server=3, Desktop=3, Mobile=2, Constrained=1), max_connections (Server=usize::MAX, Desktop=50, Mobile=10, Constrained=2), reconnect_backoff range",
-        "Platform inference via #[cfg(target_os)]: macOS/Windows/Linux -> Desktop, iOS/Android -> Mobile, default -> Desktop",
+        "Platform inference via #[cfg(target_os)] with runtime refinement for Linux: headless + >2GB RAM -> Server, <256MB RAM or small arch -> Constrained, fallback -> Desktop. iOS/Android -> Mobile. macOS/Windows -> Desktop",
         "TransportConfig has profile: TransportProfile field with platform-inferred default",
         "profile.rs re-exported from scp-transport/src/lib.rs",
         "Unit test: platform default is Desktop on macOS, profile defaults are correct per variant"
