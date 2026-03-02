@@ -8,12 +8,14 @@
 //! # Async runtime
 //!
 //! A single tokio [`Runtime`] is created at module import time and stored in a
-//! [`OnceLock`]. All async bridge functions use synchronous `#[pyfunction]`
+//! [`OnceLock`]. Most async bridge functions use synchronous `#[pyfunction]`
 //! with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while
-//! releasing the Python GIL. This pattern is preferred over `PyO3`'s
-//! experimental native async (`#[pyfunction] async fn`) because native async
-//! holds the GIL during `Future::poll` and does not integrate with the tokio
-//! runtime.
+//! releasing the Python GIL.
+//!
+//! The exception is `PyMessageReceiver::__anext__`, which returns an
+//! `asyncio.Future` and spawns the recv on the tokio runtime, resolving the
+//! future via `call_soon_threadsafe`. This avoids blocking the asyncio event
+//! loop thread while waiting for messages (#138).
 //!
 //! The tokio runtime is **never** accessed via `block_on` from within a tokio
 //! async context (which would panic). Sync-to-async bridging is handled in the
