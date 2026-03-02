@@ -92,7 +92,8 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::CloseContext { .. }
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
-        | GovernanceAction::CreateChildContext { .. } => MlsImpact::NoMlsChange,
+        | GovernanceAction::CreateChildContext { .. }
+        | GovernanceAction::BlockAuthor { .. } => MlsImpact::NoMlsChange,
     }
 }
 

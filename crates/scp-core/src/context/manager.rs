@@ -22,6 +22,7 @@ use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
+use super::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
 use super::params::{ContextMode, TemplateId};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
@@ -33,6 +34,22 @@ use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
 use scp_identity::DID;
+
+// ---------------------------------------------------------------------------
+// GovernanceActionResult
+// ---------------------------------------------------------------------------
+
+/// Result of executing an approved governance action via
+/// [`ContextManager::execute_governance_action`].
+///
+/// Each variant wraps the result type from the underlying operation. This
+/// allows callers to pattern-match on the specific action that was executed
+/// and access its result.
+#[derive(Debug)]
+pub enum GovernanceActionResult {
+    /// An author was blocked from a broadcast context (spec section 5.14.8).
+    AuthorBlocked(AuthorBlockResult),
+}
 
 // ---------------------------------------------------------------------------
 // PerContextState -- internal per-context tracking
@@ -876,7 +893,56 @@ impl ContextManager {
         Ok(result)
     }
 
-    /// Blocks an author from publishing in a broadcast context.
+    /// Executes an approved governance action on a broadcast context.
+    ///
+    /// This is the sole entry point for governance-gated operations. The caller
+    /// must provide a [`GovernanceProposal`] that has been approved through the
+    /// context's governance model (e.g., `SingleAdminEngine::propose()` for
+    /// single-admin contexts, or `ThresholdEngine::approve()` reaching quorum).
+    ///
+    /// Currently supports:
+    /// - [`GovernanceAction::BlockAuthor`]: removes an author from a broadcast
+    ///   context, destroying their sender key. See spec section 5.14.8.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if the proposal is not in
+    ///   `Approved` status.
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
+    ///   context (for `BlockAuthor`).
+    /// - [`ContextError::MemberNotFound`] if the target DID is not registered.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn execute_governance_action(
+        &self,
+        context_id: &str,
+        proposal: &GovernanceProposal,
+    ) -> Result<GovernanceActionResult, ContextError> {
+        // Gate: only approved proposals can be executed.
+        if !matches!(proposal.status, ProposalStatus::Approved) {
+            return Err(ContextError::PermissionDenied(format!(
+                "governance proposal is not approved (status: {:?})",
+                proposal.status
+            )));
+        }
+
+        match &proposal.action {
+            GovernanceAction::BlockAuthor { author_did, .. } => {
+                let result = self
+                    .block_broadcast_author_internal(context_id, author_did)
+                    .await?;
+                Ok(GovernanceActionResult::AuthorBlocked(result))
+            }
+            action => Err(ContextError::PermissionDenied(format!(
+                "governance action not yet supported for execution: {action:?}"
+            ))),
+        }
+    }
+
+    /// Internal implementation of author blocking. Only callable within the
+    /// crate -- external callers must go through [`execute_governance_action`]
+    /// with an approved [`GovernanceProposal`] containing a
+    /// [`GovernanceAction::BlockAuthor`] action.
     ///
     /// Removes the author from the broadcast context's author map, destroying
     /// their sender key. After this call:
@@ -895,7 +961,7 @@ impl ContextManager {
     ///   context.
     /// - [`ContextError::MemberNotFound`] if the author DID is not registered.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn block_broadcast_author(
+    async fn block_broadcast_author_internal(
         &self,
         context_id: &str,
         author_did: &DID,
@@ -2774,8 +2840,45 @@ mod tests {
     }
 
     // ===================================================================
-    // Author blocking (SCP-227 AC4 + AC7)
+    // Author blocking (SCP-227 AC4 + AC7) — governance-gated
     // ===================================================================
+
+    /// Helper: creates an approved `BlockAuthor` governance proposal using
+    /// `SingleAdminEngine` (admin = `admin_did`). Returns the approved
+    /// proposal that can be passed to `execute_governance_action()`.
+    fn approved_block_author_proposal(
+        admin_did: &DID,
+        context_id: &str,
+        target_did: &DID,
+    ) -> super::GovernanceProposal {
+        use crate::context::governance::{
+            GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
+        };
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let mut engine = SingleAdminEngine::new(admin_did.clone());
+        let gov_ctx = GovernanceContext {
+            context_id: context_id.to_owned(),
+            members: vec![
+                (admin_did.clone(), "admin".to_owned()),
+                (target_did.clone(), "author".to_owned()),
+            ],
+            admin_dids: vec![admin_did.clone()],
+            current_epoch: None,
+            now: 1000,
+        };
+
+        let action = GovernanceAction::BlockAuthor {
+            author_did: target_did.clone(),
+            reason: Some("governance test".to_owned()),
+        };
+
+        let (proposal, _events) = engine
+            .propose(admin_did, action, &gov_ctx, &signing_key)
+            .unwrap();
+        assert!(matches!(proposal.status, super::ProposalStatus::Approved));
+        proposal
+    }
 
     /// Helper to create a broadcast context with two authors (alice + bob).
     ///
@@ -2818,10 +2921,10 @@ mod tests {
         (manager, handle, ctx_id)
     }
 
-    /// SCP-227 AC4: `block_broadcast_author(author_did)` revokes sender key,
-    /// preventing the blocked author from publishing.
+    /// SCP-227 AC4: governance-approved `BlockAuthor` proposal revokes sender
+    /// key, preventing the blocked author from publishing.
     #[tokio::test]
-    async fn broadcast_block_author_revokes_publish() {
+    async fn broadcast_block_author_via_governance_revokes_publish() {
         use crate::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
@@ -2864,12 +2967,12 @@ mod tests {
                 .is_ok()
         );
 
-        // Block bob (admin action).
-        let block_result = manager
-            .block_broadcast_author(&ctx_id, &"did:key:bob".into())
-            .await;
-        assert!(block_result.is_ok());
-        let block_result = block_result.unwrap();
+        // Block bob via governance: admin proposes, auto-approved.
+        let proposal =
+            approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
+        let action_result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(action_result.is_ok());
+        let super::GovernanceActionResult::AuthorBlocked(block_result) = action_result.unwrap();
         assert_eq!(block_result.author_did, "did:key:bob");
         assert_eq!(block_result.final_epoch, 0);
 
@@ -2913,6 +3016,40 @@ mod tests {
         assert!(
             matches!(decision, super::KeyRequestDecision::Grant { .. }),
             "key request for unblocked author should succeed"
+        );
+    }
+
+    /// Attempting to block an author with a non-approved proposal is rejected.
+    #[tokio::test]
+    async fn broadcast_block_author_rejects_pending_proposal() {
+        use crate::context::governance::{GovernanceProposal, ProposalStatus};
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // Construct a proposal that is NOT approved (still Pending).
+        let pending_proposal = GovernanceProposal {
+            proposal_id: [0u8; 32],
+            context_id: ctx_id.clone(),
+            proposer_did: "did:key:alice".into(),
+            action: super::GovernanceAction::BlockAuthor {
+                author_did: "did:key:bob".into(),
+                reason: None,
+            },
+            status: ProposalStatus::Pending,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: Vec::new(),
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action(&ctx_id, &pending_proposal)
+            .await;
+        assert!(result.is_err(), "pending proposal must not execute");
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(_)),
+            "should return PermissionDenied for non-approved proposal"
         );
     }
 
@@ -2987,9 +3124,11 @@ mod tests {
         let decrypted = open_broadcast(&bob_broadcast_key, &bob_envelope1).unwrap();
         assert_eq!(decrypted, bob_msg1);
 
-        // Block Bob (admin action).
+        // Block Bob via governance (admin proposes, auto-approved).
+        let proposal =
+            approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
         manager
-            .block_broadcast_author(&ctx_id, &"did:key:bob".into())
+            .execute_governance_action(&ctx_id, &proposal)
             .await
             .unwrap();
 
@@ -3047,16 +3186,18 @@ mod tests {
         assert_eq!(old_decrypted, bob_msg1);
     }
 
-    /// SCP-227: `block_broadcast_author` on non-broadcast context returns error.
+    /// SCP-227: governance-approved `BlockAuthor` on non-broadcast context
+    /// returns error (the action only applies to broadcast contexts).
     #[tokio::test]
     async fn broadcast_block_author_on_encrypted_context_fails() {
         let (manager, _handle) = setup_active_context().await;
 
-        let result: Result<super::AuthorBlockResult, _> = manager
-            .block_broadcast_author(
-                "test-ctx",
-                &"did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".into(),
-            )
+        let target_did: DID = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".into();
+        let admin_did: DID = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".into();
+
+        let proposal = approved_block_author_proposal(&admin_did, "test-ctx", &target_did);
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
             .await;
         assert!(result.is_err());
     }
