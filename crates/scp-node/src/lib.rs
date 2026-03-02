@@ -19,8 +19,6 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
-
 use scp_identity::document::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
@@ -954,9 +952,9 @@ impl<
         // prevents reaching this code without both fields configured.
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
 
-        let identity_source = self.identity_source.ok_or(NodeError::MissingField(
-            "identity (call generate_identity_with() or identity())",
-        ))?;
+        let identity_source = self
+            .identity_source
+            .ok_or(NodeError::MissingField("identity"))?;
 
         // 2. Initialize storage.
         let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
@@ -970,62 +968,33 @@ impl<
                 let (identity, document) = did_method.create(&*key_custody).await?;
                 (identity, document, did_method)
             }
-            IdentitySource::Explicit(explicit) => {
-                (explicit.identity, explicit.document, explicit.did_method)
-            }
+            IdentitySource::Explicit(e) => (e.identity, e.document, e.did_method),
         };
 
-        // 4. Generate a shared secret for the internal WebSocket bridge.
-        //    The axum handler includes this token when connecting to the relay;
-        //    the relay rejects connections without it (defense-in-depth, #85).
+        // 4. Bridge secret for internal WebSocket relay connection (#85).
         let bridge_secret: [u8; 32] = rand::random();
 
-        // 6. Start relay server — must be listening before we publish the DID
-        //    so that clients resolving the DID can immediately connect.
-        let bind_addr = self
-            .bind_addr
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
-
+        // 6. Start relay server — must be listening before DID publish.
         let relay_config = RelayConfig {
-            bind_addr,
+            bind_addr: self
+                .bind_addr
+                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
             bridge_secret: Some(bridge_secret),
             ..RelayConfig::default()
         };
 
-        let blob_storage = self
-            .blob_storage
-            .ok_or(NodeError::MissingField("blob_storage"))?;
-        let blob_storage = Arc::new(blob_storage);
+        let blob_storage = Arc::new(
+            self.blob_storage
+                .ok_or(NodeError::MissingField("blob_storage"))?,
+        );
         let relay_server = RelayServer::new(relay_config, Arc::clone(&blob_storage));
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 7. Generate dev API token if local_api was configured.
-        //    16 random bytes → 32 hex chars (spec §18.10.2).
-        //    OsRng for cryptographic quality (not thread_rng).
-        let dev_token = self.local_api_addr.map(|_| {
-            use rand::RngCore;
-            let mut bytes = [0u8; 16];
-            rand::rngs::OsRng.fill_bytes(&mut bytes);
-            let hex = hex::encode(bytes);
-            format!("scp_local_token_{hex}")
-        });
-
-        if let Some(ref token) = dev_token {
-            // Log only the prefix — never expose the full token in logs.
-            let masked = &token[..("scp_local_token_".len() + 8)];
-            tracing::info!(
-                token_prefix = %masked,
-                dev_bind_addr = ?self.local_api_addr,
-                "dev API token generated (use node.dev_token() for full value)"
-            );
-        }
+        let dev_token = self.local_api_addr.map(generate_dev_token);
 
         // 8. Attempt TLS provisioning (§10.12.8 step 4).
-        //
-        //    If TLS provisioning succeeds, proceed with domain-based deployment
-        //    (wss://, .well-known/scp). If it fails (DNS misconfigured, ACME
-        //    challenge fails, port 80/443 unreachable), log the failure and fall
-        //    through to no_domain behavior (NAT probing, Tiers 1-3).
+        //    Success → domain deployment; failure → NAT-traversed fallthrough.
         let tls_provider: Arc<dyn TlsProvider> = self.tls_provider.unwrap_or_else(|| {
             let mut provider = tls::AcmeProvider::new(&domain, Arc::clone(&storage));
             if let Some(ref email) = self.acme_email {
@@ -1052,18 +1021,15 @@ impl<
                     "application node started (domain mode)"
                 );
 
-                let state = Arc::new(http::NodeState {
-                    did: identity.did.clone(),
-                    relay_url: relay_url.clone(),
-                    broadcast_contexts: RwLock::new(Vec::new()),
-                    relay_addr: bound_addr,
+                let state = Arc::new(http::NodeState::new(
+                    identity.did.clone(),
+                    relay_url.clone(),
+                    bound_addr,
                     bridge_secret,
                     dev_token,
-                    dev_bind_addr: self.local_api_addr,
-                    projected_contexts: RwLock::new(std::collections::HashMap::new()),
+                    self.local_api_addr,
                     blob_storage,
-                    start_time: std::time::Instant::now(),
-                });
+                ));
 
                 Ok(ApplicationNode {
                     domain: Some(domain),
@@ -1107,6 +1073,29 @@ impl<
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dev API token generation (spec §18.10.2)
+// ---------------------------------------------------------------------------
+
+/// Generate a random bearer token for the dev API.
+///
+/// 16 random bytes from `OsRng` → 32 hex chars (spec §18.10.2).
+/// Logs a masked prefix — never the full token.
+fn generate_dev_token(addr: SocketAddr) -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let hex = hex::encode(bytes);
+    let token = format!("scp_local_token_{hex}");
+    let masked = &token[..("scp_local_token_".len() + 8)];
+    tracing::info!(
+        token_prefix = %masked,
+        dev_bind_addr = ?addr,
+        "dev API token generated (use node.dev_token() for full value)"
+    );
+    token
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,18 +1152,15 @@ async fn build_no_domain_inner<
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    let state = Arc::new(http::NodeState {
-        did: identity.did.clone(),
+    let state = Arc::new(http::NodeState::new(
+        identity.did.clone(),
         relay_url,
-        broadcast_contexts: RwLock::new(Vec::new()),
-        relay_addr: bound_addr,
+        bound_addr,
         bridge_secret,
         dev_token,
         dev_bind_addr,
-        projected_contexts: RwLock::new(std::collections::HashMap::new()),
         blob_storage,
-        start_time: std::time::Instant::now(),
-    });
+    ));
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
     Ok(ApplicationNode {
@@ -1223,9 +1209,9 @@ impl<
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
     pub async fn build(self) -> Result<ApplicationNode<S, B>, NodeError> {
-        let identity_source = self.identity_source.ok_or(NodeError::MissingField(
-            "identity (call generate_identity_with() or identity())",
-        ))?;
+        let identity_source = self
+            .identity_source
+            .ok_or(NodeError::MissingField("identity"))?;
 
         // 1. Initialize storage.
         let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
@@ -1239,9 +1225,7 @@ impl<
                 let (identity, document) = did_method.create(&*key_custody).await?;
                 (identity, document, did_method)
             }
-            IdentitySource::Explicit(explicit) => {
-                (explicit.identity, explicit.document, explicit.did_method)
-            }
+            IdentitySource::Explicit(e) => (e.identity, e.document, e.did_method),
         };
 
         // 3. Start relay server.
@@ -1256,30 +1240,15 @@ impl<
             ..RelayConfig::default()
         };
 
-        let blob_storage = self
-            .blob_storage
-            .ok_or(NodeError::MissingField("blob_storage"))?;
-        let blob_storage = Arc::new(blob_storage);
+        let blob_storage = Arc::new(
+            self.blob_storage
+                .ok_or(NodeError::MissingField("blob_storage"))?,
+        );
         let relay_server = RelayServer::new(relay_config, Arc::clone(&blob_storage));
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 4. Generate dev API token if local_api was configured.
-        let dev_token = self.local_api_addr.map(|_| {
-            use rand::RngCore;
-            let mut bytes = [0u8; 16];
-            rand::rngs::OsRng.fill_bytes(&mut bytes);
-            let hex = hex::encode(bytes);
-            format!("scp_local_token_{hex}")
-        });
-
-        if let Some(ref token) = dev_token {
-            let masked = &token[..("scp_local_token_".len() + 8)];
-            tracing::info!(
-                token_prefix = %masked,
-                dev_bind_addr = ?self.local_api_addr,
-                "dev API token generated (use node.dev_token() for full value)"
-            );
-        }
+        let dev_token = self.local_api_addr.map(generate_dev_token);
 
         // 5-8. Delegate to shared no-domain logic.
         let strategy: Arc<dyn NatStrategy> = self.nat_strategy.unwrap_or_else(|| {

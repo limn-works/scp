@@ -93,6 +93,32 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     pub(crate) start_time: Instant,
 }
 
+impl<B: BlobStorage> NodeState<B> {
+    /// Construct a new `NodeState` with fresh broadcast/projection registries.
+    pub(crate) fn new(
+        did: String,
+        relay_url: String,
+        relay_addr: SocketAddr,
+        bridge_secret: [u8; 32],
+        dev_token: Option<String>,
+        dev_bind_addr: Option<SocketAddr>,
+        blob_storage: Arc<B>,
+    ) -> Self {
+        Self {
+            did,
+            relay_url,
+            broadcast_contexts: RwLock::new(Vec::new()),
+            relay_addr,
+            bridge_secret,
+            dev_token,
+            dev_bind_addr,
+            projected_contexts: RwLock::new(HashMap::new()),
+            blob_storage,
+            start_time: Instant::now(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Router constructors
 // ---------------------------------------------------------------------------
