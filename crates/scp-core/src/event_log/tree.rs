@@ -95,16 +95,63 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     Ok(leaf_index)
 }
 
-/// Appends an event to the event log **without** signature verification.
+/// Appends an event to the event log **without** Ed25519 signature verification.
 ///
-/// Performs the same sequence and `prev_hash` checks as [`append`], but skips
-/// the Ed25519 signature verification step. Intended for trusted in-process
-/// callers (FFI bridge layers, testing) where the event source is the process
-/// itself and signing key material may not be available in the sync context.
+/// # Why this exists
 ///
-/// The event is still serialized and hashed with the RFC 6962 leaf domain
-/// prefix, so it produces the same leaf hash as a signed event with identical
-/// content would.
+/// The MCP FFI bridge (`crates/scp-ffi/src/mcp.rs`) calls
+/// `ContextProvider::invoke_tool` synchronously from within the tokio runtime.
+/// The `KeyCustody` signing trait is async, and calling `block_on` from inside
+/// the tokio runtime panics ("Cannot block the current thread from within a
+/// runtime"). Because signing key material cannot be accessed synchronously,
+/// events emitted from this path carry an empty signature (`Vec::new()`).
+///
+/// # What it still guarantees
+///
+/// - **Sequence ordering**: the event's `sequence` must match the expected next
+///   index, preventing out-of-order insertion.
+/// - **Hash chain integrity**: `prev_hash` must match the last leaf hash (or
+///   the genesis sentinel for the first event), preserving append-only ordering.
+/// - **Merkle commitment**: the event is serialized and hashed with the RFC 6962
+///   `0x00` leaf domain prefix, producing the same leaf hash as a signed event
+///   with identical content would. The event is committed to the Merkle tree.
+///
+/// # Security limitation
+///
+/// **Events appended through this function are NOT cryptographically signed.**
+/// The `signature` field is empty. This means:
+///
+/// - A compromised in-process attacker with write access to the `EventLog`
+///   could inject fabricated events (e.g., fake `ToolInvokedEvent` entries)
+///   that pass sequence and hash-chain validation but carry no proof of origin.
+/// - External verifiers cannot distinguish between legitimate unsigned events
+///   and injected ones — both have empty signatures.
+/// - The threat is limited to in-process attackers because the `EventLog` is
+///   not network-accessible and the calling code controls the event content.
+///
+/// # Threat model
+///
+/// Only **trusted in-process callers** should use this function. The caller
+/// must control the event content and the `EventLog` reference. Current
+/// legitimate callers:
+///
+/// - `FfiBridgeProvider::invoke_tool` in `crates/scp-ffi/src/mcp.rs`
+///   (emits `ToolInvokedEvent` per ADR-010 criterion 3)
+/// - Test code
+///
+/// # Migration plan
+///
+/// When async FFI is available (SCP-214 wires `KeyCustodyProvider` into all
+/// bridges), this function should be replaced by calls to [`append`] with
+/// properly signed events. The migration path:
+///
+/// 1. Make `ContextProvider::invoke_tool` async (or use a signing channel).
+/// 2. Obtain the actor's `KeyCustody` handle in the FFI bridge.
+/// 3. Sign the event via `KeyCustody::sign()` before appending.
+/// 4. Replace all `append_unsigned_event` call sites with [`append`].
+/// 5. Remove this function and its tests.
+///
+/// See `.docs/lessons/unsigned-event-mcp-bridge.md` for the full writeup.
 ///
 /// # Errors
 ///

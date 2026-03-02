@@ -777,11 +777,16 @@ impl ContextProvider for FfiBridgeProvider {
         };
 
         // Phase 3: Append ToolInvokedEvent to the event log (ADR-010
-        // criterion 3). Uses append_unsigned_event because signing key
-        // material is not available in this sync context
-        // (ContextProvider::invoke_tool is called from within the tokio
-        // runtime, preventing block_on for async custody signing). The event
-        // is still recorded in the Merkle tree with full provenance metadata.
+        // criterion 3).
+        //
+        // SECURITY: unsigned event — uses `append_unsigned_event` because
+        // `KeyCustody::sign()` is async and we are inside the tokio runtime
+        // (block_on would panic). The event is chain-validated and Merkle-
+        // committed but carries an empty signature. A compromised in-process
+        // caller could inject fake ToolInvokedEvent entries. Migrate to signed
+        // events via `append` once async FFI signing lands (SCP-214).
+        // See: crates/scp-core/src/event_log/tree.rs::append_unsigned_event
+        // See: .docs/lessons/unsigned-event-mcp-bridge.md
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = {
             let millis = start.elapsed().as_millis();
