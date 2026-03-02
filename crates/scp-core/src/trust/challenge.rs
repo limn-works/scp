@@ -24,9 +24,9 @@
 
 use std::time::Duration;
 
-use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::event_log::Ed25519Signature;
 use crate::identity::DID;
 use crate::identity::cache::Clock;
@@ -390,44 +390,13 @@ pub fn verify_challenge_response(
 
     // 4. Verify Ed25519 signature against responder's public key.
     let public_key_bytes = resolver.resolve_public_key(&response.responder_did)?;
-
-    let pubkey_array: [u8; 32] = public_key_bytes.as_slice().try_into().map_err(|_| {
-        TrustError::ChallengeSignatureInvalid {
-            challenge_id: request.challenge_id.clone(),
-            reason: format!(
-                "responder public key must be 32 bytes, got {}",
-                public_key_bytes.len()
-            ),
-        }
-    })?;
-
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array).map_err(|e| {
-        TrustError::ChallengeSignatureInvalid {
-            challenge_id: request.challenge_id.clone(),
-            reason: format!("invalid Ed25519 public key: {e}"),
-        }
-    })?;
-
-    let sig_bytes: [u8; 64] = response.signature.as_slice().try_into().map_err(|_| {
-        TrustError::ChallengeSignatureInvalid {
-            challenge_id: request.challenge_id.clone(),
-            reason: format!(
-                "signature must be 64 bytes, got {}",
-                response.signature.len()
-            ),
-        }
-    })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
     let canonical = canonical_challenge_response_bytes(response);
-
-    verifying_key.verify(&canonical, &signature).map_err(|_| {
-        TrustError::ChallengeSignatureInvalid {
+    verify_ed25519_signature(&public_key_bytes, &canonical, &response.signature).map_err(
+        |reason| TrustError::ChallengeSignatureInvalid {
             challenge_id: request.challenge_id.clone(),
-            reason: "Ed25519 signature verification failed".to_owned(),
-        }
-    })?;
+            reason,
+        },
+    )?;
 
     // Verification succeeded -- this is challenge-verified, not self-attested.
     Ok(ChallengeVerification {

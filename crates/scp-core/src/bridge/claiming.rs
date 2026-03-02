@@ -33,11 +33,11 @@
 //!
 //! See ADR-023 acceptance criteria 7-8 in `.docs/adrs/phase-5.md`.
 
-use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{ContextId, DID, ShadowProvenanceStatus};
+use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::event_log::Ed25519Signature;
 use crate::trust::AttestationType;
 use crate::trust::attestation::{Attestation, RevocationStatus};
@@ -268,35 +268,9 @@ fn compute_claim_canonical_hash(request: &ClaimRequest) -> Vec<u8> {
 fn verify_claim_signature(request: &ClaimRequest) -> Result<(), ClaimError> {
     let public_key_bytes = extract_public_key_from_did(&request.claimant_did)
         .map_err(|reason| ClaimError::InvalidClaimSignature { reason })?;
-
-    let verifying_key =
-        ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-            ClaimError::InvalidClaimSignature {
-                reason: format!("invalid public key: {e}"),
-            }
-        })?;
-
-    let sig_bytes: [u8; 64] =
-        request
-            .signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| ClaimError::InvalidClaimSignature {
-                reason: format!(
-                    "signature must be 64 bytes, got {}",
-                    request.signature.len()
-                ),
-            })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
     let canonical_hash = compute_claim_canonical_hash(request);
-
-    verifying_key
-        .verify(&canonical_hash, &signature)
-        .map_err(|e| ClaimError::InvalidClaimSignature {
-            reason: format!("signature verification failed: {e}"),
-        })
+    verify_ed25519_signature(&public_key_bytes, &canonical_hash, &request.signature)
+        .map_err(|reason| ClaimError::InvalidClaimSignature { reason })
 }
 
 /// Verifies the Ed25519 signature on an [`Attestation`].
@@ -307,32 +281,9 @@ fn verify_claim_signature(request: &ClaimRequest) -> Result<(), ClaimError> {
 fn verify_attestation_signature(attestation: &Attestation) -> Result<(), ClaimError> {
     let public_key_bytes = extract_public_key_from_did(&attestation.issuer)
         .map_err(|reason| ClaimError::InvalidAttestationSignature { reason })?;
-
-    let verifying_key =
-        ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-            ClaimError::InvalidAttestationSignature {
-                reason: format!("invalid public key: {e}"),
-            }
-        })?;
-
-    let sig_bytes: [u8; 64] = attestation.signature.as_slice().try_into().map_err(|_| {
-        ClaimError::InvalidAttestationSignature {
-            reason: format!(
-                "signature must be 64 bytes, got {}",
-                attestation.signature.len()
-            ),
-        }
-    })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
     let canonical_bytes = crate::trust::attestation::canonical_attestation_bytes(attestation);
-
-    verifying_key
-        .verify(&canonical_bytes, &signature)
-        .map_err(|e| ClaimError::InvalidAttestationSignature {
-            reason: format!("signature verification failed: {e}"),
-        })
+    verify_ed25519_signature(&public_key_bytes, &canonical_bytes, &attestation.signature)
+        .map_err(|reason| ClaimError::InvalidAttestationSignature { reason })
 }
 
 // ---------------------------------------------------------------------------

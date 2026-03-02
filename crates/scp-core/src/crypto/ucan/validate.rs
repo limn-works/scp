@@ -556,9 +556,6 @@ where
 fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Result<(), UcanError> {
     let pk_bytes = did_resolver.resolve_public_key(&token.payload.iss)?;
 
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
-        .map_err(|e| UcanError::MalformedToken(format!("invalid public key: {e}")))?;
-
     // Extract signing input from encoded token: everything before the last '.'
     let signing_input = token
         .encoded
@@ -566,18 +563,12 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
         .map(|pos| &token.encoded[..pos])
         .ok_or_else(|| UcanError::MalformedToken("missing signature segment".to_owned()))?;
 
-    let sig_bytes: [u8; 64] = token.signature.as_slice().try_into().map_err(|_| {
-        UcanError::MalformedToken(format!(
-            "signature must be 64 bytes, got {}",
-            token.signature.len()
-        ))
-    })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    verifying_key
-        .verify_strict(signing_input.as_bytes(), &signature)
-        .map_err(|_| UcanError::SignatureInvalid)
+    crate::crypto::ed25519::verify_ed25519_signature_strict(
+        &pk_bytes,
+        signing_input.as_bytes(),
+        &token.signature,
+    )
+    .map_err(|_| UcanError::SignatureInvalid)
 }
 
 /// Step 3: Verify delegation chain integrity.

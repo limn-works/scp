@@ -27,9 +27,9 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::event_log::Ed25519Signature;
 use crate::identity::DID;
 use crate::identity::cache::Clock;
@@ -260,45 +260,13 @@ pub fn verify_attestation(
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.
     let public_key_bytes = resolver.resolve_public_key(&attestation.issuer)?;
-
-    let pubkey_array: [u8; 32] = public_key_bytes.as_slice().try_into().map_err(|_| {
-        TrustError::AttestationSignatureInvalid {
-            attestation_id: attestation.id.clone(),
-            reason: format!(
-                "issuer public key must be 32 bytes, got {}",
-                public_key_bytes.len()
-            ),
-        }
-    })?;
-
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array).map_err(|e| {
-        TrustError::AttestationSignatureInvalid {
-            attestation_id: attestation.id.clone(),
-            reason: format!("invalid Ed25519 public key: {e}"),
-        }
-    })?;
-
-    let sig_bytes: [u8; 64] = attestation.signature.as_slice().try_into().map_err(|_| {
-        TrustError::AttestationSignatureInvalid {
-            attestation_id: attestation.id.clone(),
-            reason: format!(
-                "signature must be 64 bytes, got {}",
-                attestation.signature.len()
-            ),
-        }
-    })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    // Sign over the canonical content: id + type + issuer + subject + claim + issued_at.
     let canonical = canonical_attestation_bytes(attestation);
-
-    verifying_key.verify(&canonical, &signature).map_err(|_| {
-        TrustError::AttestationSignatureInvalid {
+    verify_ed25519_signature(&public_key_bytes, &canonical, &attestation.signature).map_err(
+        |reason| TrustError::AttestationSignatureInvalid {
             attestation_id: attestation.id.clone(),
-            reason: "Ed25519 signature verification failed".to_owned(),
-        }
-    })?;
+            reason,
+        },
+    )?;
 
     // 2. Validate evidence per attestation type.
     validate_evidence(attestation)?;

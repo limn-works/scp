@@ -223,27 +223,6 @@ pub fn verify_inner_signature(
     inner: &InnerEnvelope,
     sender_public_key: &[u8],
 ) -> Result<bool, EnvelopeError> {
-    // Parse the public key.
-    let pubkey_bytes: [u8; 32] = sender_public_key.try_into().map_err(|_| {
-        EnvelopeError::VerificationFailed(format!(
-            "public key must be 32 bytes, got {}",
-            sender_public_key.len()
-        ))
-    })?;
-
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes)
-        .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
-
-    // Parse the signature.
-    let sig_bytes: [u8; 64] = inner.signature.as_slice().try_into().map_err(|_| {
-        EnvelopeError::VerificationFailed(format!(
-            "signature must be 64 bytes, got {}",
-            inner.signature.len()
-        ))
-    })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
     // Recompute the provenance hash from the stored provenance.
     let provenance_hash = compute_provenance_hash(inner.provenance.as_ref())
         .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
@@ -263,10 +242,24 @@ pub fn verify_inner_signature(
     // Recompute the canonical hash.
     let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
 
-    // Verify.
-    match verifying_key.verify_strict(&canonical_hash, &signature) {
+    // Verify using strict mode (rejects small-order points).
+    match crate::crypto::ed25519::verify_ed25519_signature_strict(
+        sender_public_key,
+        &canonical_hash,
+        &inner.signature,
+    ) {
         Ok(()) => Ok(true),
-        Err(_) => Ok(false),
+        Err(reason) => {
+            // Distinguish malformed inputs from valid-but-non-matching signatures.
+            if reason.contains("must be 32 bytes")
+                || reason.contains("must be 64 bytes")
+                || reason.contains("invalid public key")
+            {
+                Err(EnvelopeError::VerificationFailed(reason))
+            } else {
+                Ok(false)
+            }
+        }
     }
 }
 
