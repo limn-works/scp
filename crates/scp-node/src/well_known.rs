@@ -16,7 +16,13 @@ use axum::response::IntoResponse;
 use scp_core::well_known::{WellKnownContext, WellKnownScp};
 use scp_transport::native::storage::BlobStorage;
 
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+
+/// Characters that must be percent-encoded when embedded as a query parameter
+/// value.  Preserves URL-safe characters (`:`, `/`, `.`, `?`, `@`) so relay
+/// URLs remain human-readable, while encoding delimiters that would break
+/// query-string parsing.
+const QUERY_VALUE: &AsciiSet = &CONTROLS.add(b'&').add(b'=').add(b'#').add(b'+').add(b' ');
 
 use crate::http::NodeState;
 
@@ -40,12 +46,12 @@ pub async fn well_known_handler<B: BlobStorage>(
                 guard
                     .iter()
                     .map(|ctx| {
-                        let encoded_relay = utf8_percent_encode(&state.relay_url, NON_ALPHANUMERIC);
+                        let encoded_relay = utf8_percent_encode(&state.relay_url, QUERY_VALUE);
                         let name_param = ctx
                             .name
                             .as_ref()
                             .map(|n| {
-                                let encoded = utf8_percent_encode(n, NON_ALPHANUMERIC);
+                                let encoded = utf8_percent_encode(n, QUERY_VALUE);
                                 format!("&name={encoded}")
                             })
                             .unwrap_or_default();
