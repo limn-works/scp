@@ -83,7 +83,7 @@ jobs:
       - name: Run tests (native targets only)
         if: >-
           matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --release --target ${{ matrix.target }} --features scp-core/testing
 
       - name: Upload Rust artifacts
         uses: actions/upload-artifact@v4
