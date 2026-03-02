@@ -272,6 +272,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
         &alice_id.did,
         1,
         &block_list,
+        None,
     )
     .await
     .unwrap()
