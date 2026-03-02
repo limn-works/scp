@@ -459,6 +459,9 @@ async fn build_test_node_with_dev_api() -> (
     let node = ApplicationNodeBuilder::new()
         .storage(Arc::new(InMemoryStorage::new()))
         .domain("test.example.com")
+        .tls_provider(Arc::new(SucceedingTlsProvider {
+            domain: "test.example.com".to_owned(),
+        }))
         .generate_identity_with(custody, Arc::new(did_dht))
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
         .local_api(SocketAddr::from(([127, 0, 0, 1], 0)))
