@@ -1024,10 +1024,7 @@ mod tests {
     #[tokio::test]
     async fn auth_missing_bearer_sse_rejected() {
         let router = auth_router();
-        let req = Request::builder()
-            .uri("/sse")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/sse").body(Body::empty()).unwrap();
 
         let status = request_status(router, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1134,10 +1131,7 @@ mod tests {
     async fn noauth_allows_requests_without_header() {
         let router = noauth_router();
         // SSE endpoint should work without any auth header when auth is disabled
-        let req = Request::builder()
-            .uri("/sse")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/sse").body(Body::empty()).unwrap();
 
         let status = request_status(router, req).await;
         assert_eq!(status, StatusCode::OK);
