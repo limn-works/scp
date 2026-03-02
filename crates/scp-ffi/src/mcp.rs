@@ -2689,22 +2689,19 @@ mod tests {
             },
         );
 
-        let stats_before = mcp_registry_stats();
+        // Verify our entry is present before cleanup.
         assert!(
-            stats_before.stopped_servers >= 1,
-            "should have at least 1 stopped server"
+            server_registry().contains_key(&handle),
+            "stopped server handle should be present before cleanup"
         );
 
-        let removed = cleanup_stopped_servers();
-        assert!(
-            removed >= 1,
-            "should have removed at least 1 stopped server"
-        );
+        cleanup_stopped_servers();
 
-        // The specific handle should be gone.
+        // The specific handle should be gone. We check by key rather than
+        // by count because parallel tests may insert/remove other entries.
         assert!(
             !server_registry().contains_key(&handle),
-            "stopped server handle should be removed"
+            "stopped server handle should be removed after cleanup"
         );
 
         crate::runtime::remove_context(&ctx_id);

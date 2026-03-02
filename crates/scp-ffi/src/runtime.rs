@@ -798,22 +798,34 @@ mod tests {
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
 
-        let before = registry_stats().unwrap();
         register_context(&ctx_id, creator).unwrap();
-        let after = registry_stats().unwrap();
+        let stats = registry_stats().unwrap();
 
-        assert_eq!(after.contexts, before.contexts + 1);
+        // Verify that stats reports at least 1 context (our registered one).
+        // Cannot assert exact counts due to parallel test interference.
+        assert!(
+            stats.contexts >= 1,
+            "should have at least 1 context after registration (got {})",
+            stats.contexts,
+        );
+
+        // Verify the specific entry exists via direct registry access.
+        assert!(
+            registry().contains_key(&ctx_id),
+            "registered context should be in registry"
+        );
 
         remove_context(&ctx_id);
-        let final_stats = registry_stats().unwrap();
-        assert_eq!(final_stats.contexts, before.contexts);
+        assert!(
+            !registry().contains_key(&ctx_id),
+            "removed context should not be in registry"
+        );
     }
 
     #[test]
     fn registry_stats_reflects_identity_registration() {
-        let did = "did:dht:z6MkStatsIdentity";
+        let did = "did:dht:z6MkStatsIdentityUnique9988";
 
-        let before = registry_stats().unwrap();
         let entry = IdentityEntry {
             identity: ScpIdentity {
                 did: did.to_owned(),
@@ -825,13 +837,23 @@ mod tests {
             document: test_did_document(did),
         };
         register_identity(did, entry);
-        let after = registry_stats().unwrap();
+        let stats = registry_stats().unwrap();
 
-        assert_eq!(after.identities, before.identities + 1);
+        assert!(
+            stats.identities >= 1,
+            "should have at least 1 identity after registration (got {})",
+            stats.identities,
+        );
+        assert!(
+            identity_registry().contains_key(did),
+            "registered identity should be in registry"
+        );
 
         remove_identity(did);
-        let final_stats = registry_stats().unwrap();
-        assert_eq!(final_stats.identities, before.identities);
+        assert!(
+            !identity_registry().contains_key(did),
+            "removed identity should not be in registry"
+        );
     }
 
     #[test]
@@ -844,16 +866,25 @@ mod tests {
             last_seen: 0,
         };
 
-        let before = registry_stats().unwrap();
         register_known_context(&ctx_id, known);
-        let after = registry_stats().unwrap();
+        let stats = registry_stats().unwrap();
 
-        assert_eq!(after.known_contexts, before.known_contexts + 1);
+        assert!(
+            stats.known_contexts >= 1,
+            "should have at least 1 known context after registration (got {})",
+            stats.known_contexts,
+        );
+        assert!(
+            known_contexts_registry().contains_key(&ctx_id),
+            "registered known context should be in registry"
+        );
 
         // remove_context clears both registries.
         remove_context(&ctx_id);
-        let final_stats = registry_stats().unwrap();
-        assert_eq!(final_stats.known_contexts, before.known_contexts);
+        assert!(
+            !known_contexts_registry().contains_key(&ctx_id),
+            "removed known context should not be in registry"
+        );
     }
 
     #[test]

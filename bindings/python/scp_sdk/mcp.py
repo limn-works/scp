@@ -222,12 +222,21 @@ class McpServer:
         """Stop the server if not already stopped.
 
         Called by the garbage collector. Errors are silently suppressed.
+
+        During interpreter shutdown, module globals (including ``_bridge``)
+        may already be ``None``, so we import ``_scp_core`` directly to
+        avoid relying on module-level names that could be torn down.
         """
-        if self._stopped:
+        try:
+            if self._stopped:
+                return
+        except Exception:
+            # _stopped may not exist if __init__ was never completed.
             return
         try:
-            bridge = _bridge()
-            bridge.py_mcp_server_stop(self._handle)
+            import _scp_core
+
+            _scp_core.py_mcp_server_stop(self._handle)
             self._stopped = True
         except Exception:
             pass
@@ -771,12 +780,21 @@ class McpClient:
         """Disconnect the client if not already disconnected.
 
         Called by the garbage collector. Errors are silently suppressed.
+
+        During interpreter shutdown, module globals (including ``_bridge``)
+        may already be ``None``, so we import ``_scp_core`` directly to
+        avoid relying on module-level names that could be torn down.
         """
-        if self._disconnected:
+        try:
+            if self._disconnected:
+                return
+        except Exception:
+            # _disconnected may not exist if __init__ was never completed.
             return
         try:
-            bridge = _bridge()
-            bridge.py_mcp_client_disconnect(self._handle)
+            import _scp_core
+
+            _scp_core.py_mcp_client_disconnect(self._handle)
             self._disconnected = True
         except Exception:
             pass

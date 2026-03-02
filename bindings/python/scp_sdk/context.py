@@ -564,15 +564,32 @@ class Context:
         Errors are silently suppressed -- ``__del__`` must never raise.
         """
         try:
-            import _scp_core
+            # Capture handle in a local variable to avoid TOCTOU race:
+            # _handle could become None between the check and the use.
+            handle = getattr(self, "_handle", None)
+            if handle is None:
+                return
 
-            if hasattr(self, "_handle") and self._handle is not None:
-                if self.state == "active":
-                    try:
-                        _scp_core.py_context_close(self._handle, self._creator_did)
-                    except Exception:
-                        # Best-effort: context may already be closed.
-                        pass
+            creator_did = getattr(self, "_creator_did", None)
+            if creator_did is None:
+                return
+
+            # Check state via the handle directly (not self.state which
+            # re-reads self._handle, re-introducing the race).
+            try:
+                state = handle.state
+            except Exception:
+                return
+
+            if state == "active":
+                try:
+                    import _scp_core
+
+                    _scp_core.py_context_close(handle, creator_did)
+                except Exception:
+                    # Best-effort: context may already be closed, or
+                    # interpreter may be shutting down.
+                    pass
         except Exception:
             pass
 
