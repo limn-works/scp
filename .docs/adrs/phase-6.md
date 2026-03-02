@@ -140,7 +140,9 @@ class AndroidKeyCustody : KeyCustodyProvider {
             val entry = KeyStore.getInstance("AndroidKeyStore")
                 .apply { load(null) }
                 .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry
-            entry.certificate.publicKey.encoded.takeLast(32).toByteArray()  // raw 32-byte Ed25519 pubkey
+            val encoded = entry.certificate.publicKey.encoded
+            check(encoded.size == 44) { "Expected 44-byte X.509 Ed25519 SPKI, got ${encoded.size}" }
+            encoded.takeLast(32).toByteArray()  // raw 32-byte Ed25519 pubkey
         } else {
             val keyPair = softwareKeys[keyHandle.id]
                 ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")

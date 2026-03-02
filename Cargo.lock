@@ -3625,6 +3625,7 @@ dependencies = [
  "scp-core",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3670,6 +3671,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x509-parser 0.16.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3703,6 +3705,7 @@ name = "scp-testing"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hex",
  "openmls",
  "rmp-serde",
  "scp-core",
@@ -3717,6 +3720,7 @@ name = "scp-transport"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hex",
  "lru",
  "rand 0.8.5",
  "rmp-serde",

@@ -34,7 +34,9 @@ use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 
 use scp_core::crypto::ucan::capability::CapabilityUri;
-use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
+use scp_core::crypto::ucan::validate::{
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+};
 
 use scp_ffi_common::{
     BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
@@ -243,6 +245,7 @@ pub async fn ucan_validate(
         ceiling: &ceiling,
         context_creator_did: &creator_did,
         presenting_agent_did: agent_did,
+        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
     };
 
     // Execute the full 11-step validation pipeline.

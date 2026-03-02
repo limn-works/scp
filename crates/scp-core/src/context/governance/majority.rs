@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    VoteType, compute_proposal_id, hex_encode, sign_vote,
+    VoteType, compute_proposal_id, sign_vote,
 };
 use crate::identity::DID;
 
@@ -145,7 +145,7 @@ impl MajorityVoteEngine {
 
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
-                id: hex_encode(proposal_id),
+                id: hex::encode(proposal_id),
             }
         })?;
 
@@ -208,7 +208,7 @@ impl MajorityVoteEngine {
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
-                id: hex_encode(proposal_id),
+                id: hex::encode(proposal_id),
             }
         })?;
 
@@ -332,7 +332,7 @@ impl GovernanceEngine for MajorityVoteEngine {
 
         // Reject duplicate proposals.
         if self.proposals.contains_key(&proposal_id) {
-            return Err(GovernanceError::DuplicateProposal(hex_encode(&proposal_id)));
+            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
         }
 
         let voting_deadline = context.now + self.voting_window_secs;
@@ -382,7 +382,7 @@ impl GovernanceEngine for MajorityVoteEngine {
         let past_deadline = {
             let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
                 GovernanceError::ProposalNotFound {
-                    id: hex_encode(proposal_id),
+                    id: hex::encode(proposal_id),
                 }
             })?;
 
@@ -415,7 +415,7 @@ impl GovernanceEngine for MajorityVoteEngine {
 
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
-                id: hex_encode(proposal_id),
+                id: hex::encode(proposal_id),
             }
         })?;
 
@@ -462,7 +462,7 @@ impl GovernanceEngine for MajorityVoteEngine {
         let past_deadline = {
             let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
                 GovernanceError::ProposalNotFound {
-                    id: hex_encode(proposal_id),
+                    id: hex::encode(proposal_id),
                 }
             })?;
 
@@ -495,7 +495,7 @@ impl GovernanceEngine for MajorityVoteEngine {
 
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
-                id: hex_encode(proposal_id),
+                id: hex::encode(proposal_id),
             }
         })?;
 

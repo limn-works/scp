@@ -329,7 +329,7 @@ pub trait KeyCustody: Send + Sync {
         peer_public: &[u8; 32],
     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send;
 
-    /// Derive a deterministic, context-scoped pseudonym keypair.
+    /// Derive a deterministic, context-scoped pseudonym keypair (v1, non-rotatable).
     ///
     /// Algorithm (all implementations MUST produce identical output):
     ///   1. `seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`
@@ -342,6 +342,9 @@ pub trait KeyCustody: Send + Sync {
     /// The returned [`PseudonymKeypair`] is always software-managed (derived
     /// output).
     ///
+    /// For contexts that support pseudonym rotation (BLACK-001 mitigation),
+    /// use [`derive_rotatable_pseudonym`](KeyCustody::derive_rotatable_pseudonym) instead.
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
@@ -351,6 +354,35 @@ pub trait KeyCustody: Send + Sync {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
+    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send;
+
+    /// Derive a rotatable, epoch-scoped pseudonym keypair (v2).
+    ///
+    /// Mitigates relay-side pseudonym correlation (BLACK-001) by including a
+    /// rotation epoch in the HMAC derivation, producing a different pseudonym
+    /// for each epoch within the same context.
+    ///
+    /// Algorithm (all implementations MUST produce identical output):
+    ///   1. `seed = HMAC-SHA256(identity_key_material, context_id || epoch_BE || "scp-pseudonym-v2")`
+    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+    ///
+    /// where `epoch_BE` is the `pseudonym_epoch` as an 8-byte big-endian u64.
+    ///
+    /// The domain separator `"scp-pseudonym-v2"` is intentionally different from
+    /// the v1 separator `"scp-pseudonym"` so that epoch 0 in v2 produces a
+    /// different pseudonym than the v1 derivation. This prevents accidental
+    /// domain confusion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
+    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
+    /// X25519 key.
+    fn derive_rotatable_pseudonym(
+        &self,
+        key: &KeyHandle,
+        context_id: &[u8],
+        pseudonym_epoch: u64,
     ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send;
 
     /// Returns the custody type for a given key handle.

@@ -112,10 +112,7 @@ pub struct ClaimRequest {
     pub signature: Ed25519Signature,
 }
 
-pub enum ClaimResult {
-    Success { shadow_id: String, claimant_did: DID },
-    Failed { reason: ClaimError },
-}
+// claim_shadow returns Result<ShadowClaimEvent, ClaimError>
 
 pub enum ClaimError {
     HandleMismatch,
@@ -183,7 +180,7 @@ pub enum ClaimError {
 | `mod.rs` | Module root, `BridgeConnector`, `BridgeMode`, `ShadowIdentity`, re-exports |
 | `registration.rs` | Bridge registration, governance approval, context metadata integration |
 | `shadow.rs` | Shadow identity creation, role management, provenance status |
-| `claiming.rs` | `ClaimRequest`, `ClaimResult`, attestation verification, retroattribution |
+| `claiming.rs` | `ClaimRequest`, `ClaimError`, attestation verification, retroattribution |
 | `provenance.rs` | `BridgeProvenance`, provenance marking for bridged content |
 
 Per-platform implementations (`scp-bridge/x/`, `scp-bridge/bluesky/`) are separate crates built on these primitives.

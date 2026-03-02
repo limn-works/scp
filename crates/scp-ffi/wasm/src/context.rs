@@ -403,8 +403,8 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
         let context_id = format!("ctx-{}", uuid::Uuid::new_v4().as_hyphenated());
 
         let handle = WasmContextHandle::new_active(
-            context_id,
-            identity_did,
+            context_id.clone(),
+            identity_did.clone(),
             mode,
             ceiling,
             ceiling_policy,
@@ -413,6 +413,13 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
             governance,
             economic_policy,
         );
+
+        // Register the context in the runtime registry so that
+        // `with_context(context_id, ...)` lookups succeed for subsequent
+        // context-dependent operations (tool registration, event logging,
+        // UCAN revocation, etc.). See issue #137.
+        crate::runtime::register_context(&context_id, &identity_did)
+            .map_err(ScpWasmError::into_js)?;
 
         Ok(JsValue::from(handle))
     })
@@ -553,6 +560,12 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
 
     // Transition to closed state.
     "closed".clone_into(&mut handle.state.borrow_mut());
+
+    // Remove the context from the runtime registry so that
+    // `with_context(context_id, ...)` lookups fail for this closed context.
+    // See issue #137.
+    let context_id = handle.context_id.clone();
+    crate::runtime::remove_context(&context_id);
 
     future_to_promise(async move { Ok(JsValue::UNDEFINED) })
 }

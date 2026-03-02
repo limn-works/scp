@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{ContextId, Ed25519Signature, MAX_SEQUENTIAL_COMMITS, SyncError, SyncOutcome};
+use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome, SyncPolicy};
 use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -47,8 +47,10 @@ use crate::identity::DID;
 ///
 /// If the MLS epoch gap exceeds this limit, the SDK switches to Welcome-based
 /// fast-forward instead of processing Commits sequentially. Value matches
-/// [`MAX_SEQUENTIAL_COMMITS`] from the parent module (ADR-029 section 3).
-pub const MAX_EPOCH_GAP_FOR_SEQUENTIAL: u64 = MAX_SEQUENTIAL_COMMITS;
+/// [`super::MAX_SEQUENTIAL_COMMITS`] from the parent module (ADR-029 section 3).
+///
+/// For policy-aware code, use [`SyncPolicy::max_sequential_commits`] instead.
+pub const MAX_EPOCH_GAP_FOR_SEQUENTIAL: u64 = super::MAX_SEQUENTIAL_COMMITS;
 
 /// Default snapshot interval in seconds (4 hours).
 ///
@@ -630,22 +632,26 @@ pub fn apply_delta(
 // determine_mls_recovery
 // ---------------------------------------------------------------------------
 
-/// Determines the appropriate MLS recovery action based on the epoch gap.
+/// Determines the appropriate MLS recovery action based on the epoch gap
+/// and the given [`SyncPolicy`].
 ///
 /// The decision follows ADR-029 section 3:
-/// - Epoch gap <= [`MAX_EPOCH_GAP_FOR_SEQUENTIAL`] (100): sequential Commit
-///   processing.
-/// - Epoch gap > 100: Welcome-based fast-forward.
+/// - Epoch gap <= [`SyncPolicy::max_sequential_commits`] (default 100):
+///   sequential Commit processing.
+/// - Epoch gap > limit: Welcome-based fast-forward.
 /// - Broadcast contexts (no MLS epoch): no action.
 ///
 /// See ADR-029 section 3 (MLS Epoch Catch-Up).
 #[must_use]
-pub const fn determine_mls_recovery(delta: &SnapshotDelta) -> MlsRecoveryAction {
+pub const fn determine_mls_recovery(
+    delta: &SnapshotDelta,
+    policy: &SyncPolicy,
+) -> MlsRecoveryAction {
     match (delta.from_epoch, delta.to_epoch) {
         (Some(from), Some(to)) if from == to => MlsRecoveryAction::NoAction,
         (Some(from), Some(to)) => {
             let gap = to.saturating_sub(from);
-            if gap <= MAX_EPOCH_GAP_FOR_SEQUENTIAL {
+            if gap <= policy.max_sequential_commits {
                 MlsRecoveryAction::SequentialCatchUp {
                     from_epoch: from,
                     to_epoch: to,
@@ -1158,7 +1164,10 @@ mod tests {
             new_merkle_root: [0u8; 32],
         };
 
-        assert_eq!(determine_mls_recovery(&delta), MlsRecoveryAction::NoAction);
+        assert_eq!(
+            determine_mls_recovery(&delta, &SyncPolicy::default()),
+            MlsRecoveryAction::NoAction
+        );
     }
 
     #[test]
@@ -1180,7 +1189,10 @@ mod tests {
             new_merkle_root: [0u8; 32],
         };
 
-        assert_eq!(determine_mls_recovery(&delta), MlsRecoveryAction::NoAction);
+        assert_eq!(
+            determine_mls_recovery(&delta, &SyncPolicy::default()),
+            MlsRecoveryAction::NoAction
+        );
     }
 
     #[test]
@@ -1203,7 +1215,7 @@ mod tests {
         };
 
         assert_eq!(
-            determine_mls_recovery(&delta),
+            determine_mls_recovery(&delta, &SyncPolicy::default()),
             MlsRecoveryAction::SequentialCatchUp {
                 from_epoch: 10,
                 to_epoch: 60,
@@ -1231,7 +1243,7 @@ mod tests {
         };
 
         assert_eq!(
-            determine_mls_recovery(&delta),
+            determine_mls_recovery(&delta, &SyncPolicy::default()),
             MlsRecoveryAction::SequentialCatchUp {
                 from_epoch: 10,
                 to_epoch: 110,
@@ -1259,7 +1271,7 @@ mod tests {
         };
 
         assert_eq!(
-            determine_mls_recovery(&delta),
+            determine_mls_recovery(&delta, &SyncPolicy::default()),
             MlsRecoveryAction::WelcomeFastForward {
                 stale_epoch: 10,
                 current_epoch: 200,
@@ -1476,7 +1488,7 @@ mod tests {
         assert_eq!(delta.events_added, 4000);
 
         // MLS recovery should be fast-forward (210 - 10 = 200 > 100)
-        let recovery = determine_mls_recovery(&delta);
+        let recovery = determine_mls_recovery(&delta, &SyncPolicy::default());
         assert_eq!(
             recovery,
             MlsRecoveryAction::WelcomeFastForward {
@@ -1583,7 +1595,7 @@ mod tests {
         assert!(delta.role_definition_changes.contains_key("reviewer"));
 
         // MLS: gap = 300 > 100 -> fast-forward
-        let recovery = determine_mls_recovery(&delta);
+        let recovery = determine_mls_recovery(&delta, &SyncPolicy::default());
         assert_eq!(
             recovery,
             MlsRecoveryAction::WelcomeFastForward {

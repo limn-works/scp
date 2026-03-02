@@ -36,10 +36,10 @@ pub use broadcast::{
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
     BlockNotification, NonceDedup, RotateForBlockResult, SenderKeyEpochAdvance, SenderKeyRequest,
-    SenderKeyRequestResult, SenderKeyResponse, handle_sender_key_request, open_sender_key_response,
-    publish_sender_key_epoch_advance, request_sender_key, rotate_sender_key_for_block,
-    send_block_notification, validate_block_notification_freshness, verify_block_notification,
-    verify_epoch_advance, verify_sender_key_request,
+    SenderKeyRequestResult, SenderKeyResponse, expand_block_list, handle_sender_key_request,
+    open_sender_key_response, publish_sender_key_epoch_advance, request_sender_key,
+    rotate_sender_key_for_block, send_block_notification, validate_block_notification_freshness,
+    verify_block_notification, verify_epoch_advance, verify_sender_key_request,
 };
 
 // ---------------------------------------------------------------------------
@@ -180,6 +180,20 @@ pub enum SenderKeyError {
     /// The system clock is unavailable or before the Unix epoch.
     #[error("clock error: {0}")]
     ClockError(#[from] crate::time::ClockError),
+
+    /// The requester is not a member of the context.
+    ///
+    /// Returned by [`key_protocol::handle_sender_key_request`] when
+    /// `context_members` is provided and the requester's DID is not in
+    /// the membership set. This is the primary defense against Sybil
+    /// block bypass (BLACK-006, §9.16.6): a Sybil DID that has not been
+    /// admitted to the context cannot obtain sender keys regardless of
+    /// whether it appears on the block list.
+    #[error("requester is not a context member: {did}")]
+    NotContextMember {
+        /// The DID that was rejected.
+        did: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

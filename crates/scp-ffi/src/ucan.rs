@@ -41,7 +41,9 @@ use scp_core::crypto::ucan::UcanError as CoreUcanError;
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::mint::{DelegateParams, MintParams, delegate_ucan, mint_ucan};
 use scp_core::crypto::ucan::revoke::compute_revocation_cid;
-use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
+use scp_core::crypto::ucan::validate::{
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+};
 
 use crate::bridge_adapters::{
     BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
@@ -185,6 +187,7 @@ pub fn py_ucan_validate(
             ceiling: &rt.ceiling_strings,
             context_creator_did: &rt.creator_did,
             presenting_agent_did: agent_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)

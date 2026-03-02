@@ -388,7 +388,11 @@ class AndroidKeyCustody : KeyCustodyProvider {
                 "SCP-CRYPTO-4001",
             )
         val encoded = entry.certificate.publicKey.encoded
-        // X.509 SubjectPublicKeyInfo for Ed25519 is 44 bytes: 12-byte header + 32-byte key
+        // X.509 SubjectPublicKeyInfo for Ed25519 is 44 bytes: 12-byte header + 32-byte key (RFC 8410 §3)
+        check(encoded.size == X509_ED25519_SPKI_SIZE) {
+            "Expected $X509_ED25519_SPKI_SIZE-byte X.509 Ed25519 SubjectPublicKeyInfo encoding, " +
+                "got ${encoded.size} bytes — key alias may hold a non-Ed25519 key"
+        }
         return encoded.takeLast(RAW_ED25519_KEY_SIZE).toByteArray()
     }
 
@@ -547,5 +551,8 @@ class AndroidKeyCustody : KeyCustodyProvider {
     companion object {
         /** Raw Ed25519 public key size in bytes. */
         private const val RAW_ED25519_KEY_SIZE = 32
+
+        /** X.509 SubjectPublicKeyInfo encoding size for Ed25519 (RFC 8410 §3): 12-byte ASN.1 header + 32-byte key. */
+        private const val X509_ED25519_SPKI_SIZE = 44
     }
 }

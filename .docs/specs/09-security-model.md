@@ -502,6 +502,7 @@ The protocol provides layered metadata privacy protections. Each layer addresses
 - **Push layer:** Fully opaque push notifications (§10.7)
 - **Blocking layer:** AES-256 sender-side keys enable cryptographic blocking without MLS group changes (§9.16)
 - **Cross-context key isolation:** Independent MLS key material per context (§9.10.9)
+- **Delivery layer:** Relay-side delivery jitter breaks timing correlation between PUBLISH and delivery (§9.10.11)
 
 This section specifies what the protocol protects, how it protects it, and what residual risks remain.
 
@@ -555,6 +556,23 @@ context_pseudonym = context_keypair.public_key
 - **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses the raw Ed25519 public key bytes (ADR-027 amendment: public key bytes ensure cross-platform determinism with hardware TEE keys that cannot export private bytes). All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
 - **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a publicly derivable identifier: `metadata_routing_id = SHA-256(context_id || "scp-metadata")`. This identifier is distinct from the per-member pseudonyms used for message routing and does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the `metadata_routing_id` on the context's relays.
 
+#### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)
+
+To mitigate long-term pseudonym-level traffic analysis by a compromised relay (BLACK-001), pseudonyms support epoch-based rotation. The v2 derivation includes a rotation epoch:
+
+```
+context_seed_v2 = HMAC-SHA256(identity_key_material, context_id || epoch_BE || "scp-pseudonym-v2")
+context_keypair_v2 = Ed25519_keygen(context_seed_v2[0..32])
+```
+
+where `epoch_BE` is a 64-bit big-endian pseudonym rotation epoch (distinct from MLS epochs).
+
+- **Domain separation:** The v2 domain separator `"scp-pseudonym-v2"` differs from v1's `"scp-pseudonym"`, so v2 epoch 0 produces a different pseudonym than v1. This prevents accidental domain confusion.
+- **Rotation trigger:** Context governance policy determines rotation frequency (e.g., daily, weekly, on membership change). The SDK manages rotation timing.
+- **Transition protocol:** During rotation, the client subscribes to BOTH the old and new `routing_id` for a grace period (recommended: 2x the context's blob TTL) to avoid missing messages from peers who have not yet learned the new pseudonym. The sender announces the new `routing_id` to group members via an MLS application message containing `{ pseudonym_epoch: N, routing_id: <new_routing_id> }`.
+- **Backward compatibility:** Contexts that do not opt into rotation continue using v1 derivation with static pseudonyms. The existing mitigations (cover traffic, padding, relay partitioning) provide substantial protection for these contexts.
+- **HSM compatibility:** Same as v1 — `KeyCustody::derive_rotatable_pseudonym(identity_key_handle, context_id, pseudonym_epoch)` delegates the HMAC to the custody boundary.
+
 ### 9.10.5 Connection Privacy
 
 1. **Persistent connections mandatory on desktop/workstation/server.** Constant connection to each relay regardless of activity. Prevents connection-timing correlation.
@@ -566,7 +584,7 @@ context_pseudonym = context_keypair.public_key
 
 Cover traffic is **enabled by default and configurable per-client.** The SDK ships with cover traffic on. Clients or operators may disable it via SDK configuration. Disabling degrades traffic analysis resistance but has no functional impact on message delivery or protocol correctness.
 
-1. **Persistent connections: constant-rate, default on.** One padded dummy message per relay connection per 30 seconds. Dummy messages are always sent at each interval. Real messages are sent as additional traffic. This prevents timing oracles where observers infer real traffic from missing dummies. ~15MB/day for 5 relay connections at 1KB padding.
+1. **Persistent connections: constant-rate, default on.** One padded dummy message per relay connection per 30 seconds. Dummy messages are always sent at each interval. Real messages are sent as additional traffic. This prevents timing oracles where observers infer real traffic from missing dummies. Dummy traffic baseline: ~15MB/day for 5 relay connections at 1KB padding. Real messages add variable bandwidth on top — typically <5% increase at moderate usage, making total bandwidth slightly above the baseline under normal conditions.
 2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
 3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
@@ -592,12 +610,20 @@ Cover traffic is **enabled by default and configurable per-client.** The SDK shi
 
 Each SCP context is a separate MLS group with independent key material. Compromising one context's keys reveals nothing about any other context's keys. The identity key (Ed25519) is shared across contexts but signs actions — it never directly encrypts group content. MLS handles group encryption with ephemeral key material derived independently per group. Per-context pseudonyms (§9.10.4) prevent the identity key from being visible outside encrypted payloads.
 
-### 9.10.10 Residual Risks
+### 9.10.11 Relay Delivery Jitter (BLACK-001 Mitigation)
+
+Relays add a uniformly random delay in `[0, delivery_jitter_ms)` (default: 50ms) before forwarding each stored blob to its subscribers. This breaks the timing correlation between PUBLISH arrival and subscriber delivery, making it harder for a compromised relay to infer communication patterns between specific pseudonyms.
+
+1. **Per-subscriber jitter.** The delay is applied independently for each subscriber of a `routing_id`, so even subscribers on the same routing ID receive blobs at slightly different times. This prevents a relay from using delivery ordering as a correlation signal.
+2. **Configurable.** Relay operators can tune the jitter range via `RelayConfig::delivery_jitter_ms`. Higher values provide stronger timing decorrelation at the cost of delivery latency. Set to 0 to disable (useful for low-latency deployments that accept the residual risk).
+3. **Complements cover traffic.** Delivery jitter addresses the relay-to-subscriber path. Cover traffic (§9.10.6) addresses the client-to-relay path. Together they reduce timing correlation on both legs of the relay.
+
+### 9.10.12 Residual Risks
 
 Even with all protections in this section, the following metadata leaks remain:
 
 - **IP visibility:** Relay operators see the client's IP address (same as any web service). Per-context pseudonyms prevent linking IPs to identities, but a relay operator with access to IP logs could correlate connection patterns. Clients requiring IP anonymity can use a VPN or Tor at the transport layer.
-- **Cover traffic timing analysis:** Sophisticated statistical analysis may distinguish real message patterns within constant-rate cover traffic. The constant rate makes this significantly harder but not provably impossible.
+- **Cover traffic volume analysis:** The additive model eliminates timing oracles (missing dummies never reveal real traffic) but introduces a volume oracle: burst activity above the dummy baseline is visible as elevated traffic to a network observer. At moderate usage the increase is <5% above baseline, but sustained high-volume periods are distinguishable from idle. Sophisticated statistical analysis may further distinguish real message patterns within the traffic stream.
 - **Push notification timing:** Apple/Google learn that a device received a notification at a specific time. Content and source remain opaque (§10.7).
 - **DHT participation patterns:** On desktop, DHT routing traffic is mixed with resolution queries, but a network observer can see DHT participation.
 - **Relay trust:** Relays see blob sizes (bucketed), TTLs, and pseudonyms. A relay colluding with a context member could correlate pseudonyms to identities for that context only.
@@ -781,3 +807,21 @@ Sender keys rotate ONLY on block events, not on MLS epoch advances. This is a de
 - Old sender keys are retained for historical message decryption. A member who joins and receives the current sender keys can decrypt all messages encrypted with those keys (forward and backward within the sender key's lifetime). Historical access boundaries are defined by block events and member joins, not by time.
 
 **Sender key epoch counter.** Each sender maintains a monotonic `sender_key_epoch` counter (starting at 0 on key generation, incremented on each rotation). The epoch counter is included in `SenderKeyEpochAdvance` notifications and `SenderKeyRequest`/`SenderKeyResponse` messages. This enables members to detect missed rotations (gap in observed epochs), detect stale keys (epoch lower than expected), and correctly associate cached keys with the epoch they belong to. The `KeyEpochAdvance` event type (ADR-011) records epoch advances in the context event log for auditability.
+
+### 9.16.6 Sybil Resistance at the Blocking Layer
+
+The block list (§9.16.3) is per-DID. A Sybil attacker — one human controlling multiple DIDs — can create a fresh DID not on the block list and use it to request the new sender key after a block event. The block protocol tenet "every agent traces to a human DID through attestation chains" is not mechanically enforced by the block list alone. This section specifies the mitigations.
+
+**Mitigation 1: Membership gate.** `handle_sender_key_request` MUST verify that the requester's DID is a current member of the context before distributing sender keys. In Encrypted contexts, MLS group membership already gates who can observe application messages (including `SenderKeyRequest`), so this is defense-in-depth redundancy. In Broadcast contexts, where key requests travel as relay messages outside MLS, the membership gate is the primary defense: a Sybil DID that has not been admitted through normal subscription controls (DID-authentication for open contexts, UCAN validation for gated contexts) cannot request keys. The Sybil attacker must first pass the context's admission controls — earned capacity thresholds, UCAN gating, device attestation requirements, or whatever the context mandates — before they can even attempt a key request. This raises the cost of Sybil bypass from "create a DID" to "create a DID AND satisfy context admission requirements."
+
+**Mitigation 2: Identity-linked block expansion.** When blocking a DID, the blocker's SDK SHOULD expand the block list to include all DIDs known to be linked to the same identity. Identity linkage sources include:
+
+- **Attestation chains** (§3.5, §7.4): DIDs with shared social attestations, mutual endorsements, or attestations from the same issuer linking to the same external identity.
+- **Governance records**: DIDs flagged as Sybil aliases by context governance (e.g., admin-initiated Sybil reports).
+- **Behavioral correlation**: DIDs exhibiting correlated activity patterns (same message timing, same relay, same device attestation) that context-level detection flags.
+
+The expansion mechanism is provided by `expand_block_list`, which accepts a block list and a caller-provided identity resolver callback. The sender key layer does not prescribe the linking strategy — it provides the expansion mechanism. Contexts with higher trust requirements (§9.3) will use more aggressive identity resolution; casual contexts may use none.
+
+**Mitigation 3: Group blocking.** When a Sybil cluster is identified, all linked DIDs SHOULD be blocked atomically in a single key rotation (one epoch advance) rather than N separate rotations. This prevents the Sybil attacker from observing individual blocks and rotating identities between rotations.
+
+**Residual risk.** These mitigations raise the cost and complexity of Sybil block bypass but do not eliminate it. A sufficiently motivated attacker who can satisfy context admission requirements with a fresh DID — one with no attestation linkage to the blocked identity — can still obtain sender keys. This is consistent with the protocol's Sybil resistance philosophy (§9.3): make attacks expensive to sustain, not impossible to attempt. The defense layers compose: membership gates make Sybil identities useless without admission, identity-linked expansion blocks known aliases, and context-level thresholds raise the cost of creating useful new identities.

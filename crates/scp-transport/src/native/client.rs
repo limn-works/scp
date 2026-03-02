@@ -313,8 +313,8 @@ impl NativeRelayClient {
                 // Verify blob integrity: SHA-256(blob) must match relay-provided blob_id.
                 let computed_hash: [u8; 32] = Sha256::digest(blob).into();
                 if computed_hash != *blob_id {
-                    let expected = hex_encode(blob_id);
-                    let actual = hex_encode(&computed_hash);
+                    let expected = hex::encode(blob_id);
+                    let actual = hex::encode(computed_hash);
                     tracing::warn!(
                         expected = %expected,
                         actual = %actual,
@@ -830,17 +830,6 @@ impl NativeRelayClient {
     }
 }
 
-/// Hex-encodes a byte slice into a lowercase hex string.
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
-}
-
 /// Assigns a `ref_id` to a [`ClientMessage`] for request-response correlation.
 fn assign_ref_id(msg: &mut ClientMessage, ref_id: &str) {
     match msg {
@@ -1064,17 +1053,6 @@ mod tests {
         assert!(inner.read().await.seen_blob_ids.contains(&correct_blob_id));
     }
 
-    #[test]
-    fn hex_encode_produces_lowercase_hex() {
-        let bytes = [0xAB, 0xCD, 0xEF, 0x01];
-        assert_eq!(hex_encode(&bytes), "abcdef01");
-    }
-
-    #[test]
-    fn hex_encode_empty_is_empty() {
-        assert_eq!(hex_encode(&[]), "");
-    }
-
     // -----------------------------------------------------------------------
     // Pending request timeout cleanup tests (SCP-196)
     // -----------------------------------------------------------------------
@@ -1193,6 +1171,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
