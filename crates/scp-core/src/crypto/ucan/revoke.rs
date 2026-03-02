@@ -1543,6 +1543,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // compute_revocation_cid -- golden value for cross-bridge consistency
+    // -----------------------------------------------------------------------
+
+    /// Golden test: verifies that `compute_revocation_cid` produces a known,
+    /// stable CID for a fixed payload. This value serves as the canonical
+    /// reference for cross-bridge consistency tests.
+    ///
+    /// All bridge implementations (`PyO3`, NAPI, WASM) must produce this exact
+    /// CID when computing the revocation CID for the same payload. The WASM
+    /// bridge re-implements this function locally (cannot depend on scp-core
+    /// due to tokio incompatibility), so the golden value guards against
+    /// silent divergence.
+    ///
+    /// **If this test fails**, the CID computation algorithm has changed.
+    /// Update the golden value here AND in the WASM conformance test
+    /// (`wasm_conformance::wasm_and_core_revocation_cid_match_golden_value`),
+    /// then verify all bridge-specific tests still pass.
+    ///
+    /// The golden payload uses deterministic, hardcoded values with no
+    /// optional fields (nbf=None, fct=None) to ensure serde's
+    /// `skip_serializing_if` behavior is exercised.
+    #[test]
+    fn revocation_cid_golden_value() {
+        use super::super::Attenuation;
+
+        // Golden CID: SHA-256 hex of the JSON-serialized payload.
+        //
+        // To recompute: serialize the payload with serde_json::to_vec (compact,
+        // no whitespace, struct field order), then SHA-256, then lowercase hex.
+        //
+        // This value MUST match:
+        //   - wasm_conformance::wasm_and_core_revocation_cid_match_golden_value
+        //   - Any future bridge-specific revocation CID tests
+        const GOLDEN_CID: &str = "570e8e588aef5a19ea59cf74f9fd0fec33c1aa32819aa6b48f76e4a21b3132ae";
+
+        // Golden payload: fixed values, no optional fields.
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkGoldenTest".to_owned(),
+            aud: "did:dht:z6MkGoldenAudience".to_owned(),
+            exp: 1_700_000_000,
+            nbf: None,
+            nnc: "1699999000000-deadbeef0123456789abcdef01234567".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:golden-ctx/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let cid = compute_revocation_cid(&payload);
+
+        assert_eq!(
+            cid, GOLDEN_CID,
+            "revocation CID does not match golden value — if the algorithm \
+             changed intentionally, update GOLDEN_CID here and in \
+             wasm_conformance.rs"
+        );
+    }
+
+    /// Golden test with optional fields populated (nbf + fct).
+    ///
+    /// Exercises `skip_serializing_if` behavior: when nbf and fct are `Some`,
+    /// they appear in the JSON and change the CID. This guards against
+    /// bridges that might always include or always omit optional fields.
+    #[test]
+    fn revocation_cid_golden_value_with_optional_fields() {
+        use super::super::Attenuation;
+
+        // With optional fields present, the CID must differ from the
+        // no-optionals golden value and must be stable.
+        const GOLDEN_CID_WITH_OPTIONALS: &str =
+            "b5e50448d6d2e9331158cbeb1269a33f5dc1dfa561105584ab2332f0a53fe330";
+
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkGoldenTest".to_owned(),
+            aud: "did:dht:z6MkGoldenAudience".to_owned(),
+            exp: 1_700_000_000,
+            nbf: Some(1_699_999_000),
+            nnc: "1699999000000-deadbeef0123456789abcdef01234567".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:golden-ctx/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec!["bafyrei-parent-proof-cid".to_owned()],
+            fct: Some(serde_json::json!({"delegation_purpose": "test"})),
+        };
+
+        let cid = compute_revocation_cid(&payload);
+
+        // First: verify it differs from the no-optionals golden value.
+        assert_ne!(
+            cid, "570e8e588aef5a19ea59cf74f9fd0fec33c1aa32819aa6b48f76e4a21b3132ae",
+            "CID with optional fields must differ from CID without"
+        );
+
+        // Second: verify the golden value is stable.
+        assert_eq!(
+            cid, GOLDEN_CID_WITH_OPTIONALS,
+            "revocation CID with optional fields does not match golden value"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // revoke_ucan -- content-hash CID is found on subsequent lookup
     // -----------------------------------------------------------------------
 
