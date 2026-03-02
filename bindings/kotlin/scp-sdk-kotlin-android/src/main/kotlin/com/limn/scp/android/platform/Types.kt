@@ -117,7 +117,8 @@ enum class DestructionMethod {
 open class ScpException(
     message: String,
     val code: String,
-) : Exception(message)
+    cause: Throwable? = null,
+) : Exception(message, cause)
 
 /**
  * A wake signal produced by push notification handling.

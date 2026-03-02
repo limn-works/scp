@@ -21,6 +21,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import net.zetetic.database.sqlcipher.SQLiteDatabase
 import net.zetetic.database.sqlcipher.SQLiteOpenHelper
+import java.security.GeneralSecurityException
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -133,12 +134,10 @@ class AndroidStorage(private val context: Context) : StorageProvider {
             val ciphertext = cipher.doFinal(DERIVATION_LABEL.toByteArray(Charsets.UTF_8))
             // Take first 32 bytes of the ciphertext (which includes ciphertext + GCM tag)
             return ciphertext.take(PASSPHRASE_LENGTH).toByteArray()
-        } catch (e: Exception) {
-            if (e is ScpException) throw e
-            throw ScpException(
-                "Storage encryption key derivation failed",
-                ERROR_KEY_DERIVATION_FAILED
-            )
+        } catch (e: ScpException) {
+            throw e
+        } catch (e: GeneralSecurityException) {
+            throw ScpException("Storage encryption key derivation failed", ERROR_KEY_DERIVATION_FAILED, e)
         }
     }
 
@@ -148,12 +147,12 @@ class AndroidStorage(private val context: Context) : StorageProvider {
                 "INSERT OR REPLACE INTO $TABLE_NAME ($COLUMN_KEY, $COLUMN_VALUE) VALUES (?, ?)",
                 arrayOf(key, data)
             )
-        } catch (e: Exception) {
-            if (e is ScpException) throw e
-            throw ScpException(
-                "Storage set operation failed",
-                ERROR_STORAGE_OPERATION_FAILED
-            )
+        } catch (e: ScpException) {
+            throw e
+        } catch (e: android.database.SQLException) {
+            throw ScpException("Storage set operation failed", ERROR_STORAGE_OPERATION_FAILED, e)
+        } catch (e: IllegalStateException) {
+            throw ScpException("Storage set operation failed", ERROR_STORAGE_OPERATION_FAILED, e)
         }
     }
 
@@ -166,12 +165,12 @@ class AndroidStorage(private val context: Context) : StorageProvider {
             return cursor.use {
                 if (it.moveToFirst()) it.getBlob(0) else null
             }
-        } catch (e: Exception) {
-            if (e is ScpException) throw e
-            throw ScpException(
-                "Storage get operation failed",
-                ERROR_STORAGE_OPERATION_FAILED
-            )
+        } catch (e: ScpException) {
+            throw e
+        } catch (e: android.database.SQLException) {
+            throw ScpException("Storage get operation failed", ERROR_STORAGE_OPERATION_FAILED, e)
+        } catch (e: IllegalStateException) {
+            throw ScpException("Storage get operation failed", ERROR_STORAGE_OPERATION_FAILED, e)
         }
     }
 
@@ -181,12 +180,12 @@ class AndroidStorage(private val context: Context) : StorageProvider {
                 "DELETE FROM $TABLE_NAME WHERE $COLUMN_KEY = ?",
                 arrayOf<Any>(key)
             )
-        } catch (e: Exception) {
-            if (e is ScpException) throw e
-            throw ScpException(
-                "Storage delete operation failed",
-                ERROR_STORAGE_OPERATION_FAILED
-            )
+        } catch (e: ScpException) {
+            throw e
+        } catch (e: android.database.SQLException) {
+            throw ScpException("Storage delete operation failed", ERROR_STORAGE_OPERATION_FAILED, e)
+        } catch (e: IllegalStateException) {
+            throw ScpException("Storage delete operation failed", ERROR_STORAGE_OPERATION_FAILED, e)
         }
     }
 
@@ -204,39 +203,49 @@ class AndroidStorage(private val context: Context) : StorageProvider {
                     }
                 }
             }
-        } catch (e: Exception) {
-            if (e is ScpException) throw e
-            throw ScpException(
-                "Storage listKeys failed",
-                ERROR_STORAGE_OPERATION_FAILED
-            )
+        } catch (e: ScpException) {
+            throw e
+        } catch (e: android.database.SQLException) {
+            throw ScpException("Storage listKeys failed", ERROR_STORAGE_OPERATION_FAILED, e)
+        } catch (e: IllegalStateException) {
+            throw ScpException("Storage listKeys failed", ERROR_STORAGE_OPERATION_FAILED, e)
         }
     }
 
     override fun deletePrefix(prefix: String): Long {
         try {
             val escaped = escapeLikePrefix(prefix)
-            db.beginTransaction()
-            try {
-                db.execSQL(
-                    "DELETE FROM $TABLE_NAME WHERE $COLUMN_KEY LIKE ? ESCAPE '\\'",
-                    arrayOf<Any>("$escaped%")
-                )
-                val cursor = db.rawQuery("SELECT changes()", emptyArray())
-                val count = cursor.use {
-                    if (it.moveToFirst()) it.getLong(0) else 0L
-                }
-                db.setTransactionSuccessful()
-                return count
-            } finally {
-                db.endTransaction()
-            }
-        } catch (e: Exception) {
-            if (e is ScpException) throw e
-            throw ScpException(
-                "Storage deletePrefix failed",
-                ERROR_STORAGE_OPERATION_FAILED
+            return executeDeletePrefixTransaction(escaped)
+        } catch (e: ScpException) {
+            throw e
+        } catch (e: android.database.SQLException) {
+            throw ScpException("Storage deletePrefix failed", ERROR_STORAGE_OPERATION_FAILED, e)
+        } catch (e: IllegalStateException) {
+            throw ScpException("Storage deletePrefix failed", ERROR_STORAGE_OPERATION_FAILED, e)
+        }
+    }
+
+    /**
+     * Executes the delete-prefix operation within a database transaction.
+     *
+     * Extracted from [deletePrefix] to reduce nesting depth. Performs the DELETE
+     * and queries `changes()` to return the number of affected rows.
+     */
+    private fun executeDeletePrefixTransaction(escapedPrefix: String): Long {
+        db.beginTransaction()
+        try {
+            db.execSQL(
+                "DELETE FROM $TABLE_NAME WHERE $COLUMN_KEY LIKE ? ESCAPE '\\'",
+                arrayOf<Any>("$escapedPrefix%")
             )
+            val cursor = db.rawQuery("SELECT changes()", emptyArray())
+            val count = cursor.use {
+                if (it.moveToFirst()) it.getLong(0) else 0L
+            }
+            db.setTransactionSuccessful()
+            return count
+        } finally {
+            db.endTransaction()
         }
     }
 
@@ -247,12 +256,12 @@ class AndroidStorage(private val context: Context) : StorageProvider {
                 arrayOf(key)
             )
             return cursor.use { it.moveToFirst() }
-        } catch (e: Exception) {
-            if (e is ScpException) throw e
-            throw ScpException(
-                "Storage exists check failed",
-                ERROR_STORAGE_OPERATION_FAILED
-            )
+        } catch (e: ScpException) {
+            throw e
+        } catch (e: android.database.SQLException) {
+            throw ScpException("Storage exists check failed", ERROR_STORAGE_OPERATION_FAILED, e)
+        } catch (e: IllegalStateException) {
+            throw ScpException("Storage exists check failed", ERROR_STORAGE_OPERATION_FAILED, e)
         }
     }
 

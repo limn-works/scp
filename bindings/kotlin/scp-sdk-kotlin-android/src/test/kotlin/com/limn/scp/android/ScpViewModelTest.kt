@@ -154,7 +154,7 @@ private class TestNativeBindings : NativeBindings {
     override fun contextLeave(contextHandle: Long) {
         leaveCalledHandles.add(contextHandle)
         if (contextHandle == leaveThrowsForHandle) {
-            throw RuntimeException("leave failed for handle $contextHandle")
+            throw ScpLeaveException("leave failed for handle $contextHandle")
         }
     }
 
@@ -163,18 +163,23 @@ private class TestNativeBindings : NativeBindings {
     override fun identityResolve(did: String): String = ""
     override fun contextCreate(identityHandle: Long, paramsJson: String): Long = 0L
     override fun contextJoin(identityHandle: Long, contextId: String): Long = 0L
-    override fun contextClose(contextHandle: Long) {}
-    override fun contextSend(contextHandle: Long, payload: ByteArray) {}
+    override fun contextClose(contextHandle: Long) { /* no-op */ }
+    override fun contextSend(contextHandle: Long, payload: ByteArray) { /* no-op */ }
     override fun contextSubscribe(contextHandle: Long, callback: MessageCallback): Long = 0L
-    override fun contextUnsubscribe(subscriptionHandle: Long) {}
+    override fun contextUnsubscribe(subscriptionHandle: Long) { /* no-op */ }
     override fun toolRegister(contextHandle: Long, definitionJson: String): String = ""
     override fun toolInvoke(contextHandle: Long, toolId: String, inputJson: String): String = ""
     override fun toolVerify(toolId: String, inputJson: String, outputJson: String): Boolean = false
-    override fun ucanValidate(token: String, capability: String, contextId: String) {}
+    override fun ucanValidate(token: String, capability: String, contextId: String) { /* no-op */ }
     override fun ucanMint(identityHandle: Long, memberDid: String, capabilitiesJson: String): String = ""
-    override fun ucanRevoke(identityHandle: Long, token: String) {}
+    override fun ucanRevoke(identityHandle: Long, token: String) { /* no-op */ }
     override fun eventLogQuery(contextId: String, filterJson: String): String = ""
     override fun eventLogVerify(contextId: String, proofJson: String): Boolean = false
     override fun transportConnect(configJson: String, cancellationHandle: CancellationHandle?): Long = 0L
     override fun transportStatus(transportHandle: Long): String = ""
 }
+
+/**
+ * Test-specific exception for simulating leave failures in [TestNativeBindings].
+ */
+private class ScpLeaveException(message: String) : IllegalStateException(message)
