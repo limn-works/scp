@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -19,9 +23,38 @@ jobs:
     steps:
       - run: echo "Not a draft PR, proceeding"
 
+  # Detect which language areas changed. Jobs skip when their paths
+  # haven't been touched, but still report "success" to branch protection.
+  changes:
+    needs: check-draft
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+      typescript: ${{ steps.filter.outputs.typescript }}
+      kotlin: ${{ steps.filter.outputs.kotlin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+            python:
+              - 'bindings/python/**'
+            typescript:
+              - 'bindings/typescript/**'
+            kotlin:
+              - 'bindings/kotlin/**'
+
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     name: Rust / fmt
     runs-on: ubuntu-latest
     steps:
@@ -32,7 +65,8 @@ jobs:
       - run: cargo fmt --all -- --check
 
   rust-clippy:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     name: Rust / clippy
     runs-on: ubuntu-latest
     steps:
@@ -53,8 +87,10 @@ jobs:
           # feature. See GitHub issue #88.
           cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-core/testing -- -D warnings
 
+  # Matrix jobs must always expand so each OS variant reports a status
+  # to branch protection. Step-level `if` skips the heavy work instead.
   rust-test:
-    needs: check-draft
+    needs: changes
     name: Rust / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -63,13 +99,19 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.rust == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.rust == 'true'
       - uses: actions/setup-python@v5
+        if: needs.changes.outputs.rust == 'true'
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.rust == 'true'
       - uses: taiki-e/install-action@nextest
+        if: needs.changes.outputs.rust == 'true'
       - name: Run tests
+        if: needs.changes.outputs.rust == 'true'
         run: |
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -84,7 +126,8 @@ jobs:
           cargo nextest run --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-core/testing
 
   rust-doc:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     name: Rust / doc
     runs-on: ubuntu-latest
     steps:
@@ -101,7 +144,8 @@ jobs:
           cargo doc --workspace --no-deps --features scp-ffi-uniffi/allow_in_memory_custody,scp-core/testing
 
   rust-deny:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     name: Rust / deny
     runs-on: ubuntu-latest
     steps:
@@ -110,7 +154,8 @@ jobs:
 
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     name: Python / lint
     runs-on: ubuntu-latest
     defaults:
@@ -126,7 +171,8 @@ jobs:
       - run: ruff check .
 
   python-test:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     name: Python / test
     runs-on: ubuntu-latest
     defaults:
@@ -142,7 +188,8 @@ jobs:
 
   # ── TypeScript ──────────────────────────────────────────────────────
   typescript-check:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
     name: TypeScript / check + lint + test
     runs-on: ubuntu-latest
     defaults:
@@ -158,7 +205,8 @@ jobs:
 
   # ── Kotlin ──────────────────────────────────────────────────────────
   kotlin-test:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.kotlin == 'true'
     name: Kotlin / test
     runs-on: ubuntu-latest
     defaults:

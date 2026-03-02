@@ -1,7 +1,11 @@
 # SDK API Reference Documentation
 #
 # Generates and publishes API reference docs for all language SDKs
-# on every release tag. Also runs on PRs touching bindings/ for validation.
+# on every release tag. Also runs on PRs for validation.
+#
+# When a PR doesn't touch doc-relevant paths (bindings/, crates/scp-core/src/,
+# crates/scp-ffi/), all doc jobs skip via `if` condition. GitHub reports
+# skipped jobs as passing for required status checks.
 #
 # Source: .docs/scaffold/shared.md section "SDK Documentation Requirements"
 # Story: SCP-139
@@ -23,13 +27,11 @@ on:
     tags:
       - "scp-core@*"
   pull_request:
-    paths:
-      - "bindings/**"
-      - "crates/scp-core/src/**"
-      - "crates/scp-ffi/**"
+    branches: [main]
 
 permissions:
   contents: read
+  pull-requests: read
   pages: write
   id-token: write
 
@@ -46,9 +48,28 @@ jobs:
     steps:
       - run: echo "Not a draft PR, proceeding"
 
+  # Detect whether doc-relevant files changed. When they haven't, all doc
+  # jobs skip but still report a "success" status to branch protection.
+  changes:
+    needs: check-draft
+    runs-on: ubuntu-latest
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docs:
+              - 'bindings/**'
+              - 'crates/scp-core/src/**'
+              - 'crates/scp-ffi/**'
+
   # ---- Rust (rustdoc) ----
   rust-docs:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     name: "Rust API docs (rustdoc)"
     runs-on: ubuntu-latest
     steps:
@@ -64,7 +85,8 @@ jobs:
 
   # ---- Python (sphinx) ----
   python-docs:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     name: "Python API docs (sphinx)"
     runs-on: ubuntu-latest
     steps:
@@ -91,7 +113,8 @@ jobs:
 
   # ---- TypeScript (typedoc) ----
   typescript-docs:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     name: "TypeScript API docs (typedoc)"
     runs-on: ubuntu-latest
     steps:
@@ -115,7 +138,8 @@ jobs:
 
   # ---- Kotlin (Dokka) ----
   kotlin-docs:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     name: "Kotlin API docs (Dokka)"
     runs-on: ubuntu-latest
     steps:
@@ -141,7 +165,8 @@ jobs:
 
   # ---- Go (pkgsite) ----
   go-docs:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     name: "Go API docs (godoc)"
     runs-on: ubuntu-latest
     steps:
@@ -160,7 +185,8 @@ jobs:
 
   # ---- C# (xmldoc) ----
   csharp-docs:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     name: "C# API docs (xmldoc)"
     runs-on: ubuntu-latest
     steps:
@@ -180,7 +206,8 @@ jobs:
 
   # ---- Java (javadoc) ----
   java-docs:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     name: "Java API docs (javadoc)"
     runs-on: ubuntu-latest
     steps:

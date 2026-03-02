@@ -1,0 +1,1719 @@
+{
+  "project": "scp",
+  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolStore modules (event_log, nonce refactor, transport, sender keys, DID cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStore adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, WASM, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
+  "gates": [
+    {
+      "id": "gate-persist-0",
+      "name": "Serialization Prerequisites",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-PERSIST-001"
+      ]
+    },
+    {
+      "id": "gate-persist-1",
+      "name": "Missing ProtocolStore Modules",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-PERSIST-010",
+        "SCP-PERSIST-011",
+        "SCP-PERSIST-012",
+        "SCP-PERSIST-013",
+        "SCP-PERSIST-014",
+        "SCP-PERSIST-015",
+        "SCP-PERSIST-016",
+        "SCP-PERSIST-017",
+        "SCP-PERSIST-018",
+        "SCP-PERSIST-019"
+      ]
+    },
+    {
+      "id": "gate-persist-2",
+      "name": "ContextPersistence Trait and Manager Wiring",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-PERSIST-020",
+        "SCP-PERSIST-021",
+        "SCP-PERSIST-022",
+        "SCP-PERSIST-023",
+        "SCP-PERSIST-024",
+        "SCP-PERSIST-025"
+      ]
+    },
+    {
+      "id": "gate-persist-3",
+      "name": "Storage Conformance and Production Adapters",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-PERSIST-030",
+        "SCP-PERSIST-031",
+        "SCP-PERSIST-032"
+      ]
+    },
+    {
+      "id": "gate-persist-4",
+      "name": "BlobStore Adapters",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-PERSIST-040",
+        "SCP-PERSIST-041",
+        "SCP-PERSIST-042"
+      ]
+    },
+    {
+      "id": "gate-persist-5",
+      "name": "MLS StorageProvider Bridge",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-PERSIST-050"
+      ]
+    },
+    {
+      "id": "gate-persist-6",
+      "name": "Additional Adapters and Platform Storage",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-PERSIST-060",
+        "SCP-PERSIST-061",
+        "SCP-PERSIST-062",
+        "SCP-PERSIST-063",
+        "SCP-PERSIST-064",
+        "SCP-PERSIST-065",
+        "SCP-PERSIST-066",
+        "SCP-PERSIST-067",
+        "SCP-PERSIST-068"
+      ]
+    },
+    {
+      "id": "gate-persist-7",
+      "name": "End-to-End Integration",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-PERSIST-070",
+        "SCP-PERSIST-071",
+        "SCP-PERSIST-072"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-PERSIST-001",
+      "title": "Add Serialize/Deserialize to state types for persistence",
+      "gate": "gate-persist-0",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/roles.rs",
+        "crates/scp-core/src/context/membership.rs"
+      ],
+      "description": "Add `Serialize, Deserialize` derives to `ContextRoleState` (roles.rs line ~570) and `MembershipState` (membership.rs line ~86). These types need serde derives for `ContextSnapshot` serialization in Gate 2. Verify `ContextState` already has them. Add MessagePack roundtrip unit tests for both types per section 17.5.",
+      "acceptanceCriteria": [
+        "`ContextRoleState` and all nested types (CapabilityCeiling, RoleDefinition, RoleAssignment, Capability) derive `Serialize, Deserialize`",
+        "`MembershipState` and all nested types (MemberInfo, DID) derive `Serialize, Deserialize`",
+        "`ContextState` enum derives `Serialize, Deserialize` (verify existing)",
+        "Roundtrip test: serialize `ContextRoleState` via `rmp_serde`, deserialize, assert equality",
+        "Roundtrip test: serialize `MembershipState` via `rmp_serde`, deserialize, assert equality",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Add `Serialize, Deserialize` derives to `ContextRoleState` and all nested types in roles.rs",
+        "Add `Serialize, Deserialize` derives to `MembershipState` and all nested types in membership.rs",
+        "Verify `ContextState` already has serde derives; add if missing",
+        "Write MessagePack roundtrip unit tests for `ContextRoleState` and `MembershipState`"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.5 Serialization"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-010",
+      "title": "Implement event log store module (event_log.rs) \u2014 core methods",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/event_log.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Implement the first 4 event log methods specified in section 17.4 as a new `store/event_log.rs` module. Register in `store/mod.rs`. Keys follow section 17.3: `context/{id}/event/{seq:020d}`, `context/{id}/event_meta/count`. Methods: `append_event`, `load_event`, `load_event_range`, `event_count`. Range query uses `list_keys` with prefix + filter by sequence bounds. Sequence keys use 20-digit zero-padding per section 17.3.",
+      "acceptanceCriteria": [
+        "`store/event_log.rs` exists and is registered in `store/mod.rs`",
+        "`append_event(context_id, seq, event_hash: &[u8; 32])` stores the 32-byte hash under `context/{id}/event/{seq:020d}` (20-digit zero-padded) and updates `event_meta/count`",
+        "`load_event(context_id, seq)` retrieves the stored hash bytes or None; `load_event_range(context_id, start, end)` returns hashes in sequence order via list_keys prefix filtering",
+        "`event_count(context_id)` returns the count from `context/{id}/event_meta/count`",
+        "Unit tests: append+load roundtrip, range query returns correct ordered subset, missing sequence returns None, zero-padding verified (seq 42 -> key ending `00000000000000000042`)",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Create `crates/scp-core/src/store/event_log.rs` with key construction helpers using 20-digit zero-padding",
+        "Implement `append_event`, `load_event`, `load_event_range`, and `event_count`",
+        "Register the module in `store/mod.rs` and expose through ProtocolStore",
+        "Write unit tests for all 4 methods"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-011: Verifiable Event Log (Merkle Tree)"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-011",
+      "title": "Refactor nonce methods from ucan.rs into nonce.rs module",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/nonce.rs",
+        "crates/scp-core/src/store/ucan.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Relocate `check_and_record_nonce` (ucan.rs lines 232-268) and `prune_expired_nonces` (ucan.rs lines 277-294) from `store/ucan.rs` to a new `store/nonce.rs` module. The spec section 17.4 Module Structure specifies these belong in `nonce.rs`. This is a refactor \u2014 move existing implementations, update all imports and callers, do NOT reimplement. The existing tests in ucan.rs that test nonce methods should also move to nonce.rs.",
+      "acceptanceCriteria": [
+        "`store/nonce.rs` exists and is registered in `store/mod.rs`",
+        "`check_and_record_nonce` and `prune_expired_nonces` moved from ucan.rs to nonce.rs with identical behavior",
+        "All imports and callers updated to use the new module path",
+        "Existing nonce tests from ucan.rs moved to nonce.rs and still pass",
+        "No duplicate nonce code remains in ucan.rs",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Create `crates/scp-core/src/store/nonce.rs` and register in `store/mod.rs`",
+        "Move `check_and_record_nonce` and `prune_expired_nonces` implementations from ucan.rs to nonce.rs",
+        "Move all nonce-related tests from ucan.rs to nonce.rs",
+        "Update all imports and callers to reference the new module path",
+        "Verify no nonce code remains in ucan.rs"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Module Structure"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core",
+        "note": "Refactoring story \u2014 existing implementation in ucan.rs lines 232-294 is relocated, not reimplemented"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-012",
+      "title": "Implement transport store module (transport.rs)",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/transport.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Implement 6 transport methods specified in section 17.4 in a new `store/transport.rs` module. Keys: `relay_score/{url_hash}`, `key_package/{url_hash}/{index:010d}`. URLs contain `/` which fails `sanitize_key_component` \u2014 hash URL with SHA-256 hex as key component. Methods: `store_relay_score`, `load_relay_score`, `list_relay_scores`, `store_key_package`, `load_key_packages`, `delete_key_package`.",
+      "acceptanceCriteria": [
+        "`store/transport.rs` exists and is registered in `store/mod.rs`",
+        "`store_relay_score`, `load_relay_score`, `list_relay_scores` use keys `relay_score/{sha256_hex(url)}` (URLs hashed because `/` fails sanitize_key_component; spec key convention adapted)",
+        "`store_key_package`, `load_key_packages`, `delete_key_package` use keys `key_package/{sha256_hex(url)}/{index:010d}`; `load_key_packages` returns all packages in index order",
+        "URL hashing uses SHA-256 hex; index keys use 10-digit zero-padding",
+        "Unit tests: roundtrip for each method, list returns all entries, load_key_packages returns index-ordered results, delete removes correct entry only",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Create `crates/scp-core/src/store/transport.rs` with URL hashing helper using SHA-256 hex",
+        "Implement `store_relay_score`, `load_relay_score`, `list_relay_scores`",
+        "Implement `store_key_package`, `load_key_packages`, `delete_key_package` with 10-digit zero-padded index",
+        "Register the module in `store/mod.rs` and expose through ProtocolStore",
+        "Write unit tests for all 6 methods"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Module Structure"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-013",
+      "title": "Add sender key store methods to context module",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/context.rs"
+      ],
+      "description": "Add the 4 sender key methods specified in section 17.4 to the existing context.rs store module. Keys: `context/{context_id}/sender_key/{did}`. Methods: `store_sender_key`, `load_sender_key`, `list_sender_keys`, `remove_sender_key`. Per the module structure in section 17.4, sender keys belong in context.rs alongside context state and membership.",
+      "acceptanceCriteria": [
+        "`store_sender_key(context_id, did, key)` stores under `context/{context_id}/sender_key/{did}`",
+        "`load_sender_key(context_id, did)` retrieves sender key bytes",
+        "`list_sender_keys(context_id)` returns all `(DID, sender_key_bytes)` pairs",
+        "`remove_sender_key(context_id, did)` deletes the sender key entry",
+        "Unit tests: store/load roundtrip, list returns all pairs, remove deletes entry, missing returns None",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Add sender key method signatures to the existing context.rs store module",
+        "Implement `store_sender_key` and `load_sender_key` with key path `context/{context_id}/sender_key/{did}`",
+        "Implement `list_sender_keys` using `list_keys` with sender_key prefix and parsing DID from key suffix",
+        "Implement `remove_sender_key` using `delete` with the constructed key path",
+        "Write unit tests for all 4 methods"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Module Structure"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-014",
+      "title": "Add DID cache and TOFU record methods to identity module",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/identity.rs"
+      ],
+      "description": "Add 4 missing methods to the existing `store/identity.rs` module per section 17.4: `cache_did_document`, `load_cached_did_document` (keys: `did_cache/{did}`), `store_tofu_record`, `load_tofu_record` (keys: `tofu/{did}`). DID cache stores documents with an `expires_at` timestamp. TOFU records store first-seen trust-on-first-use binding data.",
+      "acceptanceCriteria": [
+        "`cache_did_document(did, doc, expires_at)` stores document bytes and expiry timestamp under `did_cache/{did}`",
+        "`load_cached_did_document(did, now: u64)` returns document bytes if `now < expires_at`, returns None if expired or missing (caller provides current time for testability)",
+        "`store_tofu_record(did, record)` stores under `tofu/{did}`; `load_tofu_record(did)` retrieves bytes or None",
+        "Unit tests: cache roundtrip, cache expiry returns None (with controlled `now` value), TOFU roundtrip, missing returns None",
+        "Overwrite: storing a cached document again with a later expiry replaces the previous entry",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Add `cache_did_document` and `load_cached_did_document` to identity.rs using `did_cache/{did}` key prefix",
+        "Add `store_tofu_record` and `load_tofu_record` to identity.rs using `tofu/{did}` key prefix",
+        "Implement cache expiry check in `load_cached_did_document` (compare stored expires_at against current time)",
+        "Write unit tests for all 4 methods including expiry behavior"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-015",
+      "title": "Add economic governance methods to economy module \u2014 policy and receipts",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/economy.rs"
+      ],
+      "description": "Add 5 of the 8 missing economic governance methods to the existing `store/economy.rs` module per section 17.4: `store_economic_policy`, `load_economic_policy` (key: `context/{id}/economic_policy`), `store_payment_receipt`, `load_payment_receipt`, `list_payment_receipts` (key: `context/{id}/payment_receipt/{receipt_id}`). The economy module currently only has the 4 adapter credential methods.",
+      "acceptanceCriteria": [
+        "`store_economic_policy(context_id, policy)` stores under `context/{id}/economic_policy`",
+        "`load_economic_policy(context_id)` retrieves policy bytes or None",
+        "`store_payment_receipt(context_id, receipt_id, receipt)` stores under `context/{id}/payment_receipt/{receipt_id_hex}`",
+        "`load_payment_receipt(context_id, receipt_id)` retrieves receipt bytes or None",
+        "`list_payment_receipts(context_id)` returns all receipt IDs for the context",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Add `store_economic_policy` and `load_economic_policy` to economy.rs",
+        "Add `store_payment_receipt`, `load_payment_receipt`, `list_payment_receipts` to economy.rs",
+        "Write unit tests for all 5 methods"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-016",
+      "title": "Add spending UCAN methods to economy module",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/economy.rs"
+      ],
+      "description": "Add the remaining 3 economic governance methods to `store/economy.rs` per section 17.4: `store_spending_ucan`, `load_spending_ucan`, `list_spending_ucans` (key: `context/{id}/spending_ucan/{token_id}`). Split from SCP-PERSIST-015 to stay within the 6 acceptance criteria limit.",
+      "acceptanceCriteria": [
+        "`store_spending_ucan(context_id, token_id, ucan)` stores under `context/{id}/spending_ucan/{token_id}`",
+        "`load_spending_ucan(context_id, token_id)` retrieves UCAN bytes or None",
+        "`list_spending_ucans(context_id)` returns all token IDs for the context",
+        "Unit tests: UCAN roundtrip, list UCANs, missing returns None",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Add `store_spending_ucan`, `load_spending_ucan`, `list_spending_ucans` to economy.rs",
+        "Write unit tests for all 3 methods"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-015"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-017",
+      "title": "Implement event log Merkle tree methods (event_log.rs)",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/event_log.rs"
+      ],
+      "description": "Add the remaining 4 event log methods to `store/event_log.rs` per section 17.4: `store_event_root`, `load_event_root` (key: `context/{id}/event_meta/root`), `store_event_tree_node`, `load_event_tree_node` (key: `context/{id}/event_tree/{level}/{index}`). These support the verifiable Merkle tree structure defined in ADR-011. Split from SCP-PERSIST-010 to stay within the 6 acceptance criteria limit.",
+      "acceptanceCriteria": [
+        "`store_event_root(context_id, root)` stores Merkle root at `context/{id}/event_meta/root`",
+        "`load_event_root(context_id)` retrieves stored Merkle root or None",
+        "`store_event_tree_node(context_id, level, index, hash)` stores tree node at `context/{id}/event_tree/{level}/{index}`",
+        "`load_event_tree_node(context_id, level, index)` retrieves tree node or None",
+        "Unit tests: root roundtrip, tree node roundtrip, missing returns None",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Add `store_event_root`, `load_event_root`, `store_event_tree_node`, `load_event_tree_node` to event_log.rs",
+        "Use key paths `context/{id}/event_meta/root` and `context/{id}/event_tree/{level}/{index}`",
+        "Write unit tests for all 4 methods"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-010"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-011: Verifiable Event Log (Merkle Tree)"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-018",
+      "title": "Implement Migratable trait and StoredValue version envelope",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Implement the `Migratable` trait and version-aware read per section 17.10. The `Migratable` trait defines `CURRENT_VERSION: u16` and `fn migrate(old_version: u16, data: &[u8]) -> Option<Self>`. Migration functions are pure \u2014 no I/O, no side effects. Each step transforms bytes from version N to N+1. The chain is applied iteratively until reaching CURRENT_VERSION. After migration, the upgraded value is written back to storage so future reads do not re-migrate. If version > current, return StoreError::IncompatibleVersion.",
+      "acceptanceCriteria": [
+        "`Migratable` trait defined with `CURRENT_VERSION: u16` const and `fn migrate(old_version, data) -> Option<Self>`",
+        "Version-aware read: deserialize `StoredValue`, if version < current apply migration chain iteratively (v1->v2->v3), write back upgraded value to storage",
+        "If version > current, return `StoreError::IncompatibleVersion`; if version == current, deserialize directly",
+        "Unit test: current version roundtrip (no migration triggered)",
+        "Unit test: multi-step chain migration (v1 data -> v2 -> v3 via two registered migrations, written back to storage)",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Define `StoredValue<T>` with version and data fields in store/mod.rs",
+        "Define `Migratable` trait with CURRENT_VERSION and migrate method",
+        "Add `StoreError::IncompatibleVersion` variant",
+        "Implement version-aware read/write helpers on ProtocolStore",
+        "Write unit tests for version roundtrip, migration, and rejection"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.10 Migration Strategy"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.5 Serialization"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-019",
+      "title": "Implement schema version startup check",
+      "gate": "gate-persist-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Implement the `_meta/schema_version` key-space versioning and startup check per section 17.10. On startup, `ProtocolStore` reads `_meta/schema_version`. If missing, writes current version. If behind, runs one-time key-space migration. If ahead, returns error. Key-space migrations are the only blocking startup operation. No downgrade support.",
+      "acceptanceCriteria": [
+        "`ProtocolStore::initialize()` (or equivalent startup method) reads `_meta/schema_version`",
+        "If key missing, writes current schema version and proceeds normally",
+        "If schema version matches current, proceeds normally",
+        "If schema version is behind current, executes registered key-space migrations in order (currently none registered; migration hook is functional, not a stub)",
+        "If schema version is ahead of current, returns `StoreError::IncompatibleVersion`",
+        "Unit tests: fresh store writes version, matching version proceeds, future version errors, behind version triggers migration hook"
+      ],
+      "actionItems": [
+        "Add `_meta/schema_version` read to ProtocolStore startup/initialization path",
+        "Implement version comparison logic: missing (write current), equal (proceed), behind (migration hook), ahead (error)",
+        "Add key-space migration hook that can be extended in future versions",
+        "Write unit tests for all startup scenarios"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-018"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.10 Migration Strategy"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-020",
+      "title": "Define ContextSnapshot and ContextPersistence trait",
+      "gate": "gate-persist-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Define the `ContextSnapshot` struct (serializable) containing: context_id, state (ContextState), context_params (ContextParams), membership (MembershipState), role_state (ContextRoleState), executed_proposals (HashSet<ProposalId>), ttl_remaining_secs (Option<u64>). Define the `ContextPersistence` trait (dyn-compatible, Send + Sync) with methods: persist_context, load_context, persist_broadcast, load_broadcast, delete_context, list_persisted_contexts. This trait replaces `BroadcastPersistence` entirely \u2014 one trait, one provider. All methods return `Result<_, Box<dyn Error + Send + Sync>>` for best-effort semantics.",
+      "acceptanceCriteria": [
+        "`ContextSnapshot` struct with 7 fields: context_id, state, context_params, membership, role_state, executed_proposals, ttl_remaining_secs; derives Serialize, Deserialize, Debug, Clone",
+        "`ContextPersistence` trait with 6 dyn-compatible methods: persist_context, load_context, persist_broadcast, load_broadcast, delete_context, list_persisted_contexts",
+        "`persist_context(id, &ContextSnapshot)` and `load_context(id) -> Option<ContextSnapshot>`; `persist_broadcast(id, &BroadcastContextSnapshot)` and `load_broadcast(id) -> Option<BroadcastContextSnapshot>`",
+        "`delete_context(id)` removes all persisted state; `list_persisted_contexts() -> Vec<String>`",
+        "Compile-time test verifying `dyn ContextPersistence` is object-safe; trait requires `Send + Sync`",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Define `ContextSnapshot` struct with all 7 fields including context_params and serde derives",
+        "Define `ContextPersistence` trait with 6 async methods returning `Result<_, Box<dyn Error + Send + Sync>>`",
+        "Ensure dyn-compatibility: no generics, no RPITIT, all methods take `&self` and return boxed futures",
+        "Write compile-time test verifying `dyn ContextPersistence` is object-safe"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-008: Context Lifecycle State Machine"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-021",
+      "title": "Implement ProtocolStorePersistence canonical bridge",
+      "gate": "gate-persist-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Implement `ProtocolStorePersistence<S: Storage>` that wraps `Arc<ProtocolStore<S>>` and implements `ContextPersistence`. `persist_context` stores the full `ContextSnapshot` under `context/{id}/full_snapshot` as a single atomic blob. `persist_broadcast` delegates to `ProtocolStore::store_broadcast_state`. Buffer zeroization for key material (defense-in-depth). This is the canonical bridge between the dyn-compatible trait and the generic ProtocolStore.",
+      "acceptanceCriteria": [
+        "`ProtocolStorePersistence<S>` struct wraps `Arc<ProtocolStore<S>>` and implements `ContextPersistence`",
+        "`persist_context` serializes full ContextSnapshot to single key, `load_context` deserializes from same key",
+        "`persist_broadcast` and `load_broadcast` delegate to existing ProtocolStore broadcast methods",
+        "`delete_context` calls `ProtocolStore::delete_context`, `list_persisted_contexts` calls `list_active_contexts`",
+        "Serialized bytes zeroized after write (defense-in-depth for key material)",
+        "Unit tests: persist/load roundtrip for both ContextSnapshot and BroadcastContextSnapshot"
+      ],
+      "actionItems": [
+        "Define `ProtocolStorePersistence<S: Storage>` struct wrapping `Arc<ProtocolStore<S>>`",
+        "Implement all 6 `ContextPersistence` trait methods with delegation to ProtocolStore",
+        "Add zeroize-on-drop for serialized byte buffers containing key material",
+        "Write roundtrip unit tests for ContextSnapshot and BroadcastContextSnapshot"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-020"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.5 Serialization"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-022",
+      "title": "Wire ContextPersistence into ContextManager \u2014 replace BroadcastPersistence",
+      "gate": "gate-persist-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Replace `broadcast_persistence: Option<Arc<dyn BroadcastPersistence>>` with `persistence: Option<Arc<dyn ContextPersistence>>` in ContextManager. Remove `BroadcastPersistence` trait entirely \u2014 all its call sites are updated to use `ContextPersistence`. Update constructor. Add persist calls after 7 of the 13 mutation points: create_context, join_context, leave_context, send_message, close_context, finalize_close (calls delete_context), handle_ttl_expiry. Each persist call: snapshot under lock, persist after lock drop, log errors but do not abort (best-effort).",
+      "acceptanceCriteria": [
+        "`ContextManager` field changed from `broadcast_persistence` to `persistence: Option<Arc<dyn ContextPersistence>>`; `BroadcastPersistence` trait and all its impls removed",
+        "Constructor updated to accept `Option<Arc<dyn ContextPersistence>>`",
+        "`create_context` persists context + broadcast (if applicable) after creation",
+        "`join_context`, `leave_context`, `send_message`, `close_context`, `handle_ttl_expiry` each persist after mutation",
+        "`finalize_close` calls `delete_context` on persistence",
+        "All existing ContextManager tests pass with `persistence: None`; mutations succeed even when persistence returns Err (best-effort, non-aborting)"
+      ],
+      "actionItems": [
+        "Replace `broadcast_persistence` field with `persistence: Option<Arc<dyn ContextPersistence>>` and remove BroadcastPersistence trait",
+        "Update ContextManager constructor and add helper method for best-effort persist with error logging",
+        "Wire persist calls into create_context, join_context, leave_context, send_message, close_context, finalize_close, handle_ttl_expiry",
+        "Update all existing test construction sites to pass `persistence: None` and verify all tests pass"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-021"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-008: Context Lifecycle State Machine"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Phase 2"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-023",
+      "title": "Wire remaining mutation persist points into ContextManager",
+      "gate": "gate-persist-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Wire persist calls into the remaining 6 mutation points not covered by SCP-PERSIST-022: propose_ttl_extension, reset_ttl_timer, subscribe_broadcast, unsubscribe_broadcast, block_broadcast_subscriber (the public method name at manager.rs line 1065), execute_governance_action (manager.rs line 1130). Each persist call uses the same best-effort pattern: snapshot under lock, persist after lock drop, log errors. Split from SCP-PERSIST-022 to stay within the 6 acceptance criteria limit.",
+      "acceptanceCriteria": [
+        "`propose_ttl_extension` and `reset_ttl_timer` persist context after mutation",
+        "`subscribe_broadcast` and `unsubscribe_broadcast` persist context + broadcast state",
+        "`block_broadcast_subscriber` persists broadcast state after blocking",
+        "`execute_governance_action` persists context + broadcast state after governance execution",
+        "All persist calls use the same best-effort error-logging pattern from SCP-PERSIST-022",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Wire persist calls into propose_ttl_extension and reset_ttl_timer",
+        "Wire persist calls into subscribe_broadcast and unsubscribe_broadcast (both context + broadcast)",
+        "Wire persist call into block_broadcast_subscriber (broadcast state)",
+        "Wire persist call into execute_governance_action (context + broadcast state)",
+        "Verify all existing tests still pass"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-022"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-008: Context Lifecycle State Machine"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-024",
+      "title": "Implement context restore path \u2014 load and reconstruct",
+      "gate": "gate-persist-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Implement `load_persisted_context_state(context_id)` and `restore_context(context_id, handle)` on ContextManager. `load_persisted_context_state` loads ContextSnapshot + BroadcastContextSnapshot from persistence, reconstructs `PerContextState` including MembershipState, ContextRoleState, executed_proposals HashSet, and re-spawns TTL timer if ttl_remaining_secs is Some. `restore_context` inserts the reconstructed state into the contexts map. This replaces the existing `restore_broadcast_context` method.",
+      "acceptanceCriteria": [
+        "`load_persisted_context_state(context_id)` loads ContextSnapshot from persistence and reconstructs PerContextState with membership, role_state, and executed_proposals",
+        "Re-spawns TTL timer if `ttl_remaining_secs` is Some in the snapshot",
+        "`restore_context(context_id, handle: &ContextHandle)` uses the provided ContextHandle for re-registration and inserts restored state into the contexts map",
+        "Restores broadcast context from persistence if BroadcastContextSnapshot exists for the context",
+        "Existing `restore_broadcast_context` method removed (subsumed by new restore path)",
+        "Test: create context -> persist -> drop -> restore -> verify all state fields match original"
+      ],
+      "actionItems": [
+        "Implement `load_persisted_context_state` with full PerContextState reconstruction",
+        "Implement `restore_context` that inserts into contexts map and optionally restores broadcast",
+        "Remove `restore_broadcast_context` and update all call sites",
+        "Write test: persist-drop-restore roundtrip verifying state matches"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-023"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-008: Context Lifecycle State Machine"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Phase 2"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-025",
+      "title": "Implement restore_all_contexts and restore edge case tests",
+      "gate": "gate-persist-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Implement `restore_all_contexts()` on ContextManager that calls `list_persisted_contexts`, then restores each context using `restore_context`. Returns list of restored context IDs. Also add edge case tests: executed_proposals preservation across restart, TTL timer re-spawn verification, and restore with broadcast state.",
+      "acceptanceCriteria": [
+        "`restore_all_contexts()` lists all persisted context IDs and restores each via `restore_context`",
+        "Returns `Vec<String>` of successfully restored context IDs",
+        "Errors on individual context restore are logged but do not abort other restores",
+        "Test: restore preserves executed_proposals across restart (replay protection)",
+        "Test: restore re-spawns TTL timer for contexts with remaining TTL",
+        "`cargo test -p scp-core` and `cargo clippy -p scp-core` pass"
+      ],
+      "actionItems": [
+        "Implement `restore_all_contexts` that iterates over persisted contexts and restores each",
+        "Handle individual restore errors gracefully (log and continue)",
+        "Write test: executed_proposals preserved across persist-drop-restore cycle",
+        "Write test: TTL timer re-spawned after restore with remaining TTL"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-024"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-008: Context Lifecycle State Machine"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-030",
+      "title": "Implement storage_conformance!() macro with 13 tests",
+      "gate": "gate-persist-3",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/src/conformance/storage.rs",
+        "crates/scp-testing/src/conformance/mod.rs"
+      ],
+      "description": "Create the `storage_conformance!()` macro specified in sections 17.11 and 17.13 at `crates/scp-testing/src/conformance/storage.rs`. The macro takes a factory closure that creates a Storage implementation and generates 13 tests: (1) store/retrieve roundtrip, (2) missing key returns None, (3) delete removes value, (4) list_keys returns sorted results, (5) list_keys with prefix returns sorted subset, (6) delete_prefix removes matching keys and returns count, (7) delete_prefix returns 0 for no match, (8) exists returns true for stored key, (9) exists returns false for missing key, (10) exists returns false after delete, (11) overwrite replaces value, (12) concurrent store + retrieve is safe, (13) store empty value. Apply to `InMemoryStorage` first.",
+      "acceptanceCriteria": [
+        "`storage_conformance!()` macro defined in `scp-testing/src/conformance/storage.rs` and registered in `conformance/mod.rs`",
+        "Generates 13 test functions: roundtrip, missing_returns_none, delete_removes, list_keys_sorted, list_keys_prefix_sorted, delete_prefix_removes, delete_prefix_zero, exists_true, exists_false, exists_after_delete, overwrite, concurrent_access, store_empty_value",
+        "`InMemoryStorage` passes all 13 conformance tests",
+        "Macro exported as `#[macro_export]` for downstream crate usage",
+        "`cargo test -p scp-testing` passes",
+        "`cargo clippy -p scp-testing` clean"
+      ],
+      "actionItems": [
+        "Create `crates/scp-testing/src/conformance/storage.rs` with the `storage_conformance!()` macro",
+        "Implement all 13 generated test functions inside the macro",
+        "Register the module in `conformance/mod.rs`",
+        "Apply the macro to `InMemoryStorage` and verify all 13 tests pass",
+        "Export the macro for downstream crate usage"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Storage Conformance Extensions"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Custom Storage Adapters"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-006: In-Memory Platform Adapter (Testing)"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-testing"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-031",
+      "title": "Implement SqliteStorage adapter",
+      "gate": "gate-persist-3",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/sqlite/mod.rs",
+        "crates/scp-platform/Cargo.toml",
+        "crates/scp-platform/src/lib.rs"
+      ],
+      "description": "Implement `SqliteStorage` as the production default storage adapter per section 17.6. Uses `rusqlite` with `bundled-sqlcipher` feature, WAL mode. Schema: `CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;`. SQLCipher pragmas for encryption per section 17.5. Prefix queries use B-tree range scan (`key >= prefix AND key < prefix_successor`), not LIKE. Behind `sqlite` feature flag.",
+      "acceptanceCriteria": [
+        "`SqliteStorage` struct at `scp-platform/src/sqlite/mod.rs` behind `sqlite` feature flag; `new(dir: &Path, key: &[u8])` creates `scp.db` inside directory",
+        "Schema: `CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID`; WAL mode enabled",
+        "SQLCipher pragmas applied: `cipher_page_size=4096`, `kdf_iter=256000`, `cipher_hmac_algorithm=HMAC_SHA512`, `cipher_kdf_algorithm=PBKDF2_HMAC_SHA512`",
+        "All 6 Storage trait methods implemented: store (INSERT OR REPLACE), retrieve, delete, list_keys (B-tree range scan `key >= prefix AND key < successor`), delete_prefix (range DELETE), exists (COUNT)",
+        "Passes all 13 `storage_conformance!()` tests",
+        "`cargo test -p scp-platform --features sqlite` and `cargo clippy -p scp-platform --features sqlite` pass"
+      ],
+      "actionItems": [
+        "Add `rusqlite` with `bundled-sqlcipher` feature to `scp-platform/Cargo.toml` under `sqlite` feature flag",
+        "Create `crates/scp-platform/src/sqlite/mod.rs` with constructor, WAL mode, and SQLCipher pragmas",
+        "Implement all 6 Storage trait methods using B-tree range scans for prefix operations",
+        "Register module in `lib.rs` behind `#[cfg(feature = \"sqlite\")]`",
+        "Apply `storage_conformance!()` macro and verify all 13 tests pass"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-030"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### SQLite Is the Universal Default"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-platform"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-032",
+      "title": "Implement FilesystemStorage adapter",
+      "gate": "gate-persist-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/filesystem/mod.rs",
+        "crates/scp-platform/Cargo.toml",
+        "crates/scp-platform/src/lib.rs"
+      ],
+      "description": "Implement `FilesystemStorage` per section 17.6. Maps keys to file paths: `{base_dir}/{key}` where `/` in keys maps to directory separators. Atomic writes (temp file + rename). Behind `filesystem` feature flag.",
+      "acceptanceCriteria": [
+        "`FilesystemStorage` struct at `scp-platform/src/filesystem/mod.rs` behind `filesystem` feature flag",
+        "`store` writes atomically (temp + rename); `retrieve` returns None for missing file",
+        "`list_keys` walks directory recursively and returns sorted results; key `/` maps to OS directory separator",
+        "`delete_prefix` removes matching directory subtree; `exists` checks file existence",
+        "Passes all 13 `storage_conformance!()` tests",
+        "`cargo test -p scp-platform --features filesystem` and `cargo clippy` pass"
+      ],
+      "actionItems": [
+        "Add `filesystem` feature flag to `scp-platform/Cargo.toml`",
+        "Create `crates/scp-platform/src/filesystem/mod.rs` with atomic write implementation",
+        "Implement all 6 Storage trait methods with key-to-path and path-to-key conversion",
+        "Register module in `lib.rs` behind `#[cfg(feature = \"filesystem\")]`",
+        "Apply `storage_conformance!()` macro and verify all 13 tests pass"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-030"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### FilesystemStorage"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-platform"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-040",
+      "title": "Implement blob_store_conformance!() macro with 11 tests",
+      "gate": "gate-persist-4",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/src/conformance/blob_store.rs",
+        "crates/scp-testing/src/conformance/mod.rs"
+      ],
+      "description": "Create the `blob_store_conformance!()` macro specified in sections 17.11 and 17.13. The macro takes a factory closure and generates 11 tests per the BlobStore conformance suite: (1) store/get roundtrip, (2) missing blob returns None, (3) TTL expiry (expired blob not returned), (4) query by routing_id returns results in stored_at order, (5) query with since filter, (6) query with limit, (7) delete removes blob, (8) store returns correct SHA-256 blob_id, (9) concurrent store + purge is safe, (10) purge_expired removes only expired blobs, (11) query empty routing_id returns empty Vec. Apply to `InMemoryBlobStorage` first.",
+      "acceptanceCriteria": [
+        "`blob_store_conformance!()` macro defined in `scp-testing/src/conformance/blob_store.rs` and registered in `conformance/mod.rs`",
+        "Macro factory closure receives a controllable clock (or equivalent) for deterministic TTL and purge_expired testing",
+        "Generates 11 test functions: roundtrip, missing_returns_none, ttl_expiry, query_routing_order, query_since, query_limit, delete, store_returns_blob_id, concurrent_store_purge, purge_expired_only, query_empty_returns_empty",
+        "`InMemoryBlobStorage` passes all 11 conformance tests",
+        "Macro exported as `#[macro_export]` for downstream crate usage",
+        "`cargo test -p scp-testing` and `cargo clippy -p scp-testing` pass"
+      ],
+      "actionItems": [
+        "Create `crates/scp-testing/src/conformance/blob_store.rs` with the `blob_store_conformance!()` macro",
+        "Implement all 11 generated test functions inside the macro",
+        "Register the module in `conformance/mod.rs`",
+        "Apply the macro to `InMemoryBlobStorage` and verify all 11 tests pass",
+        "Export the macro for downstream crate usage"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Custom BlobStore Adapters"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.13 Conformance Testing"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-testing"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-041",
+      "title": "Implement SqliteBlobStore adapter",
+      "gate": "gate-persist-4",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/sqlite_blob.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/mod.rs"
+      ],
+      "description": "Implement `SqliteBlobStore` per section 17.7. Schema: blobs table with blob_id, routing_id, recipient_hint, blob_ttl, stored_at, expires_at, blob columns. WITHOUT ROWID. Routing index and expiry index. WAL mode. Behind `sqlite-blob` feature flag.",
+      "acceptanceCriteria": [
+        "`SqliteBlobStore` struct behind `sqlite-blob` feature flag with schema matching section 17.7 (blobs table WITHOUT ROWID + routing index + expiry index)",
+        "All 5 BlobStorage trait methods implemented: store, get, query (routing index, stored_at order), delete, purge_expired (expiry index)",
+        "WAL mode enabled",
+        "Passes all 11 `blob_store_conformance!()` tests",
+        "`cargo test -p scp-transport --features sqlite-blob` passes",
+        "`cargo clippy -p scp-transport --features sqlite-blob` clean"
+      ],
+      "actionItems": [
+        "Add `rusqlite` with `bundled-sqlcipher` to `scp-transport/Cargo.toml` under `sqlite-blob` feature flag",
+        "Create `crates/scp-transport/src/native/sqlite_blob.rs` with schema, WAL mode, and indexes",
+        "Implement all 5 BlobStorage trait methods",
+        "Register module behind feature flag and apply `blob_store_conformance!()` macro"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-040"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### SqliteBlobStore Schema"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-042",
+      "title": "Implement RedbBlobStore adapter",
+      "gate": "gate-persist-4",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/redb_blob.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/mod.rs"
+      ],
+      "description": "Implement `RedbBlobStore` per section 17.7. Two redb tables: `blobs` (blob_id -> serialized StoredBlob) + `routing` (routing_id -> blob_id multimap). TTL enforcement via periodic scan. Behind `redb-blob` feature flag.",
+      "acceptanceCriteria": [
+        "`RedbBlobStore` struct behind `redb-blob` feature flag with two tables: blobs Table and routing MultimapTable",
+        "All 5 BlobStorage trait methods implemented: store (write transaction), get, query (routing multimap, stored_at order), delete, purge_expired (scan blobs table)",
+        "Passes all 11 `blob_store_conformance!()` tests",
+        "Database file contained within configured directory",
+        "`cargo test -p scp-transport --features redb-blob` passes",
+        "`cargo clippy -p scp-transport --features redb-blob` clean"
+      ],
+      "actionItems": [
+        "Add `redb` dependency to `scp-transport/Cargo.toml` under `redb-blob` feature flag",
+        "Create `crates/scp-transport/src/native/redb_blob.rs` with table definitions",
+        "Implement all 5 BlobStorage trait methods using redb transactions",
+        "Register module behind feature flag and apply `blob_store_conformance!()` macro"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-040"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### RedbBlobStore"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-050",
+      "title": "Implement MlsStorageBridge and ScpMlsProvider",
+      "gate": "gate-persist-5",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/storage.rs",
+        "crates/scp-core/src/crypto/mls/mod.rs"
+      ],
+      "description": "Implement the MLS StorageProvider bridge per section 17.9. `MlsStorageBridge<S: Storage>` wraps `Arc<ProtocolStore<S>>` and implements OpenMLS `StorageProvider`. Key prefix: `mls/{context_id}/group_state`, `mls/{context_id}/tree/{leaf_index}`, etc. `ScpMlsProvider<S>` combines RustCrypto + MlsStorageBridge for a complete OpenMLS provider.",
+      "acceptanceCriteria": [
+        "`MlsStorageBridge<S>` wraps `Arc<ProtocolStore<S>>` + context_id and implements `openmls_traits::storage::StorageProvider`",
+        "Key sub-prefixes per section 17.9: `mls/{id}/group_state`, `mls/{id}/tree/{leaf}`, `mls/{id}/key_schedule/{epoch}`, `mls/{id}/proposal/{hash}`, `mls/{id}/key_package/{hash}`, `mls/{id}/encryption_key/{epoch}/{gen}`",
+        "All OpenMLS key types serialized via MessagePack before storage; `ScpMlsProvider<S>` combines crypto + storage",
+        "Test: group state store/load roundtrip via the bridge",
+        "Test: context isolation \u2014 two bridges with different context_ids sharing one ProtocolStore do not leak state",
+        "Test: state survives simulated restart (drop bridge, recreate with same ProtocolStore, verify persisted)"
+      ],
+      "actionItems": [
+        "Create `crates/scp-core/src/crypto/mls/storage.rs` with `MlsStorageBridge<S>`",
+        "Implement all `StorageProvider` methods with key prefix mapping per section 17.9",
+        "Define `ScpMlsProvider<S>` combining RustCrypto backend with MlsStorageBridge",
+        "Register module in `crypto/mls/mod.rs` and write tests for roundtrip, isolation, and restart"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-010"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.9 OpenMLS StorageProvider Bridge"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.4 ProtocolStore"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-060",
+      "title": "Android Storage adapter (Kotlin via UniFFI)",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/android/storage.rs",
+        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/works/limn/scp/android/AndroidStorage.kt"
+      ],
+      "description": "Implement Android storage adapter per sections 17.6 and 17.8. Rust side wraps trait; Kotlin side uses `net.zetetic:sqlcipher-android`. Encryption key derived from Android Keystore TEE-backed AES-256 key. Schema matches SqliteStorage. Database in app's `getNoBackupFilesDir()`.",
+      "acceptanceCriteria": [
+        "`AndroidStorage` Kotlin class implements Storage interface via UniFFI callback using `net.zetetic:sqlcipher-android`",
+        "Encryption key derived from Android Keystore TEE-backed AES-256 key",
+        "Schema matches SqliteStorage: `CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID`",
+        "Database stored in `getNoBackupFilesDir()`; all 6 Storage methods implemented",
+        "Passes storage conformance tests (Kotlin JUnit port)",
+        "`./gradlew test` passes"
+      ],
+      "actionItems": [
+        "Create Rust-side UniFFI callback interface for Storage trait",
+        "Create `AndroidStorage.kt` using `net.zetetic:sqlcipher-android`",
+        "Implement Android Keystore key derivation for SQLCipher encryption key",
+        "Wire database creation with correct schema and directory",
+        "Port storage conformance tests to Kotlin JUnit"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-030"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.8 Platform-Specific Key Custody"
+        }
+      ],
+      "details": {
+        "phase": 5,
+        "crate": "scp-platform"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-061",
+      "title": "iOS/Apple Storage adapter (Rust + Swift)",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/apple/mod.rs",
+        "crates/scp-platform/src/apple/storage.rs",
+        "bindings/swift/Sources/SCPSwift/Storage/AppleStorage.swift"
+      ],
+      "description": "Implement Apple storage adapter per sections 17.6 and 17.8. Rust module uses `rusqlite` with `bundled-sqlcipher`. Encryption key stored in Apple Keychain (kSecClassGenericPassword). `NSFileProtectionCompleteUntilFirstUserAuthentication` on database file. Swift binding is thin UniFFI wrapper.",
+      "acceptanceCriteria": [
+        "`AppleStorage` Rust struct using `rusqlite` with `bundled-sqlcipher`; encryption key from Apple Keychain via `kSecClassGenericPassword` item",
+        "`NSFileProtectionCompleteUntilFirstUserAuthentication` applied to database file; first-run generates Keychain key if absent",
+        "Swift UniFFI wrapper at `bindings/swift/Sources/SCPSwift/Storage/AppleStorage.swift`",
+        "All 6 Storage methods implemented; database in app's `Library/Application Support/` directory",
+        "Passes storage conformance tests (Swift XCTest port)",
+        "`cargo test -p scp-platform --features apple` and Swift XCTest tests pass"
+      ],
+      "actionItems": [
+        "Create `crates/scp-platform/src/apple/storage.rs` with rusqlite + bundled-sqlcipher",
+        "Implement Apple Keychain key custody for encryption key storage/retrieval",
+        "Apply NSFileProtection attribute to database file",
+        "Create Swift UniFFI wrapper",
+        "Port storage conformance tests to Swift XCTest"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-030"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.8 Platform-Specific Key Custody"
+        }
+      ],
+      "details": {
+        "phase": 5,
+        "crate": "scp-platform"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-062",
+      "title": "WasmSqliteStorage browser adapter (TypeScript)",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/typescript/src/storage/wasm-sqlite.ts",
+        "bindings/typescript/package.json"
+      ],
+      "description": "Implement browser storage adapter per section 17.6. Uses wa-sqlite with OPFSCoopSyncVFS (primary) and IDBBatchAtomicVFS (Safari incognito fallback). Per section 17.5, SQLCipher is unavailable in WASM \u2014 each value is encrypted with AES-GCM using a key derived from the identity's WebCrypto key before writing. TypeScript implementation of Storage interface, communicates with Rust WASM core via binding layer.",
+      "acceptanceCriteria": [
+        "`WasmSqliteStorage` TypeScript class using wa-sqlite with OPFSCoopSyncVFS (IDBBatchAtomicVFS fallback for Safari incognito)",
+        "Each value encrypted with AES-GCM using key derived from identity WebCrypto key before writing to wa-sqlite per section 17.5",
+        "Implements all 6 Storage interface methods; all data scoped to OPFS origin",
+        "Test: when OPFS is unavailable, falls back to IDBBatchAtomicVFS without data loss",
+        "Passes storage conformance tests (TypeScript port)",
+        "`bun test` and `bun run check` pass"
+      ],
+      "actionItems": [
+        "Add `wa-sqlite` dependency to `bindings/typescript/package.json`",
+        "Create `WasmSqliteStorage` class with VFS detection and fallback",
+        "Implement all 6 Storage methods matching Rust SqliteStorage patterns",
+        "Port storage conformance tests to TypeScript"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-030"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Browser: The One Exception"
+        }
+      ],
+      "details": {
+        "phase": 4,
+        "crate": "bindings/typescript"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-063",
+      "title": "CombinedNodeStorage (client + relay in one database)",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/combined/mod.rs",
+        "crates/scp-platform/Cargo.toml"
+      ],
+      "description": "Implement `CombinedNodeStorage` for personal node pattern per section 17.1 deployment patterns. Single SQLite database containing both `kv` table (client ProtocolStore) and `blobs` table (relay BlobStore). Implements BOTH `Storage` and `BlobStorage` traits on one struct. Behind `combined` feature flag. This is a PRD-originated design implementing the deployment pattern described in section 17.1, not a directly specified component.",
+      "acceptanceCriteria": [
+        "`CombinedNodeStorage` struct behind `combined` feature flag with single SQLite database containing both `kv` and `blobs` tables",
+        "Implements `Storage` trait (delegates to kv table) and `BlobStorage` trait (delegates to blobs table)",
+        "Passes `storage_conformance!()` for Storage and `blob_store_conformance!()` for BlobStorage",
+        "One directory = complete node state",
+        "`cargo test -p scp-platform --features combined` passes",
+        "`cargo clippy -p scp-platform --features combined` clean"
+      ],
+      "actionItems": [
+        "Add `combined` feature flag depending on `sqlite` and `sqlite-blob` features",
+        "Create `CombinedNodeStorage` with single database holding both tables",
+        "Implement both `Storage` and `BlobStorage` traits",
+        "Apply both conformance macros in tests"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-031",
+        "SCP-PERSIST-041"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.1 Storage Architecture Overview"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-platform",
+        "note": "PRD-originated design implementing deployment patterns from section 17.1"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-064",
+      "title": "SyncableStorage (P2P state replication)",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/syncable/mod.rs",
+        "crates/scp-platform/Cargo.toml"
+      ],
+      "description": "Implement `SyncableStorage` wrapper for P2P state replication. Wraps any `Storage` impl, logs mutations to a write-ahead changelog. `Changeset` type: ordered list of `(key, Option<Vec<u8>>)`. `export_changeset(since)` and `apply_changeset(changeset)` methods. Last-write-wins conflict resolution per StoredValue version. Behind `sync` feature flag. This is a PRD-originated design implementing the deployment patterns described in section 17.1, not a directly specified component.",
+      "acceptanceCriteria": [
+        "`SyncableStorage<S: Storage>` struct behind `sync` feature flag wrapping inner storage with monotonic sequence-numbered mutation changelog",
+        "`export_changeset(since: u64)` returns all mutations since sequence number; `apply_changeset(changeset)` applies with LWW using StoredValue version field as ordering key",
+        "`Changeset` type: ordered list of `(key, Option<Vec<u8>>)` operations, serializable via MessagePack; changelog stored in inner storage under `_sync/` key prefix",
+        "Passes `storage_conformance!()` (transparent wrapper \u2014 all Storage methods delegate to inner, store/delete also append to changelog)",
+        "Tests: export -> apply roundtrip preserves state, LWW resolves conflicts by higher StoredValue version, partial apply rolls back on error",
+        "`cargo test -p scp-platform --features sync` and `cargo clippy -p scp-platform --features sync` pass"
+      ],
+      "actionItems": [
+        "Add `sync` feature flag to Cargo.toml",
+        "Create `SyncableStorage<S>` wrapping inner storage with changelog",
+        "Implement `export_changeset` and `apply_changeset` with LWW",
+        "Implement Storage trait delegation (all methods pass through, store/delete append to changelog)",
+        "Write tests for roundtrip, LWW, partial apply"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-031"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.1 Storage Architecture Overview"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.14 Phase Integration"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-platform",
+        "note": "PRD-originated design implementing deployment patterns from section 17.1"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-065",
+      "title": "LocalBlobCache for P2P clients",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/local_cache.rs",
+        "crates/scp-transport/Cargo.toml"
+      ],
+      "description": "Implement `LocalBlobCache` wrapping any `BlobStorage` as a local message cache for clients without a relay. Configurable max cache size and TTL eviction policy. Behind `local-cache` feature flag. This is a PRD-originated design implementing the deployment patterns described in section 17.1, not a directly specified component.",
+      "acceptanceCriteria": [
+        "`LocalBlobCache` struct behind `local-cache` feature flag wrapping any BlobStorage implementation",
+        "Configurable max cache size with TTL-based eviction (evict oldest when full)",
+        "Passes `blob_store_conformance!()` macro",
+        "All 5 BlobStorage methods implemented",
+        "`cargo test -p scp-transport --features local-cache` passes",
+        "`cargo clippy -p scp-transport --features local-cache` clean"
+      ],
+      "actionItems": [
+        "Add `local-cache` feature flag to Cargo.toml",
+        "Create `LocalBlobCache` wrapping inner BlobStorage with size-limited eviction",
+        "Implement all BlobStorage trait methods with eviction check on store()",
+        "Apply `blob_store_conformance!()` macro in tests"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-041"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.1 Storage Architecture Overview"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-transport",
+        "note": "PRD-originated design implementing deployment patterns from section 17.1"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-066",
+      "title": "Relay operational state persistence",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "Add relay operational state persistence. Relay server takes an optional `Storage` adapter for operational state. Persist subscriptions under `relay/subscription/{routing_id_hex}/{subscriber_id}`. Persist rate limit state under `relay/rate_limit/{client_id}`. On startup: restore active subscriptions from storage.",
+      "acceptanceCriteria": [
+        "`RelayServer` accepts optional Storage adapter for operational state persistence",
+        "Subscriptions persisted under `relay/subscription/` prefix; rate limit counters under `relay/rate_limit/`",
+        "On startup, subscriptions restored from storage (clients receive blobs without re-subscribing)",
+        "Test: subscription survives simulated relay restart",
+        "Test: rate limit state survives restart",
+        "`cargo test -p scp-transport` and `cargo clippy -p scp-transport` pass"
+      ],
+      "actionItems": [
+        "Add optional Storage adapter field to RelayServer and update constructor",
+        "Implement subscription persistence (store on subscribe, delete on unsubscribe)",
+        "Implement rate limit persistence",
+        "Implement startup restore from stored subscriptions",
+        "Write restart survival tests for subscriptions and rate limits"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-030"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.1 Storage Architecture Overview"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Phase 2"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-067",
+      "title": "Implement PostgresBlobStore adapter",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/postgres_blob.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/mod.rs"
+      ],
+      "description": "Implement `PostgresBlobStore` per section 17.7 for production/enterprise relay deployments. Uses `sqlx` with PostgreSQL. Schema mirrors SqliteBlobStore (blobs table with blob_id, routing_id, recipient_hint, blob_ttl, stored_at, expires_at, blob columns + routing index + expiry index). Behind `postgres-blob` feature flag. Phase 5 adapter.",
+      "acceptanceCriteria": [
+        "`PostgresBlobStore` struct behind `postgres-blob` feature flag using `sqlx` with PostgreSQL",
+        "Schema mirrors SqliteBlobStore with PostgreSQL-native types and indexes",
+        "All 5 BlobStorage trait methods implemented",
+        "Passes all 11 `blob_store_conformance!()` tests (requires running PostgreSQL instance for tests)",
+        "`cargo test -p scp-transport --features postgres-blob` passes",
+        "`cargo clippy -p scp-transport --features postgres-blob` clean"
+      ],
+      "actionItems": [
+        "Add `sqlx` with PostgreSQL feature to Cargo.toml under `postgres-blob` flag",
+        "Create `postgres_blob.rs` with schema creation and connection pool",
+        "Implement all 5 BlobStorage trait methods using PostgreSQL queries",
+        "Register module behind feature flag and apply conformance tests"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-040"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Phase 5"
+        }
+      ],
+      "details": {
+        "phase": 5,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-068",
+      "title": "Implement S3BlobStore adapter",
+      "gate": "gate-persist-6",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/s3_blob.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/mod.rs"
+      ],
+      "description": "Implement `S3BlobStore` per section 17.7 for large-scale relay deployments. Uses `aws-sdk-s3` (Apache-2.0 license). S3 key layout: `{bucket}/blobs/{blob_id_hex}` for content, `{bucket}/routing/{routing_id_hex}/{blob_id_hex}` for routing index (empty objects with metadata), `{bucket}/expiry/{expires_at}/{blob_id_hex}` for TTL enforcement via prefix listing. Documented as S3-compatible (covers AWS S3, MinIO, Ceph, R2, B2, etc). Behind `s3-blob` feature flag. Phase 5 adapter.",
+      "acceptanceCriteria": [
+        "`S3BlobStore` struct behind `s3-blob` feature flag using `aws-sdk-s3`",
+        "S3 key layout per section 17.7: blobs/, routing/, expiry/ prefixes",
+        "All 5 BlobStorage trait methods implemented using S3 API calls",
+        "Passes all 11 `blob_store_conformance!()` tests (requires S3-compatible endpoint for tests)",
+        "`cargo test -p scp-transport --features s3-blob` passes",
+        "`cargo clippy -p scp-transport --features s3-blob` clean"
+      ],
+      "actionItems": [
+        "Add `aws-sdk-s3` to Cargo.toml under `s3-blob` flag",
+        "Create `s3_blob.rs` with S3 key layout and client configuration",
+        "Implement all 5 BlobStorage methods: store (put blob + routing + expiry objects), get, query (list routing prefix), delete, purge_expired (list expiry prefix)",
+        "Register module behind feature flag and apply conformance tests"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-040"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Why S3-Compatible"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Phase 5"
+        }
+      ],
+      "details": {
+        "phase": 5,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-070",
+      "title": "End-to-end integration tests \u2014 context lifecycle and cross-adapter",
+      "gate": "gate-persist-7",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/tests/integration/persistence.rs"
+      ],
+      "description": "Integration tests verifying persistence across adapters. Tests run against InMemory, SqliteStorage, and FilesystemStorage. Covers: full restart (create -> persist -> drop -> restore -> verify -> continue ops), close cleanup (delete_context removes all state), TTL expiry (expired state persists and refuses operations after restore), cross-adapter behavior equivalence, sequence number monotonicity across restart, role assignment survival.",
+      "acceptanceCriteria": [
+        "Full restart test: create manager -> contexts + members + messages + roles -> drop -> restore -> verify state + continue operations",
+        "Close cleanup: `delete_context` removes all persisted state (verified via `list_keys` returning empty for context prefix)",
+        "TTL expiry: expired state persists, refuses operations after restore",
+        "Cross-adapter: all tests produce identical results across InMemory, SqliteStorage, FilesystemStorage",
+        "Sequence numbers survive restart and remain monotonic; role assignments survive restart",
+        "`cargo test -p scp-testing` and `cargo clippy --workspace` pass"
+      ],
+      "actionItems": [
+        "Create test module with adapter factory helpers for InMemory, SqliteStorage, FilesystemStorage",
+        "Implement full restart test with state verification and continued operation",
+        "Implement close cleanup, TTL expiry, and cross-adapter smoke tests",
+        "Implement sequence number monotonicity and role survival tests"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-025",
+        "SCP-PERSIST-031",
+        "SCP-PERSIST-032",
+        "SCP-PERSIST-050",
+        "SCP-PERSIST-014"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### ProtocolStore Integration Tests"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Phase 2"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-testing"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-071",
+      "title": "End-to-end integration tests \u2014 sync, relay, and combined node",
+      "gate": "gate-persist-7",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/tests/integration/persistence.rs"
+      ],
+      "description": "Additional integration tests for advanced persistence scenarios. Covers: sync roundtrip (two SyncableStorage instances, mutate A, export, apply to B, verify equivalence), relay restart (subscriptions restored, blobs delivered without re-subscribe), combined node restart (client contexts + relay blobs survive from one directory), executed_proposals replay protection across restart. Split from SCP-PERSIST-070 to stay within 6 acceptance criteria.",
+      "acceptanceCriteria": [
+        "Sync roundtrip: two SyncableStorage instances, mutations on A, export changeset, apply to B, verify B matches A",
+        "Relay restart: subscriptions restored, blobs delivered without re-subscribing",
+        "Combined node: client contexts + relay blobs survive restart from one directory",
+        "executed_proposals survives restart (replay protection verified)",
+        "`cargo test -p scp-testing` passes",
+        "`cargo clippy --workspace` clean"
+      ],
+      "actionItems": [
+        "Implement sync roundtrip test with two SyncableStorage instances",
+        "Implement relay restart test with subscription survival verification",
+        "Implement combined node restart test with CombinedNodeStorage",
+        "Implement executed_proposals replay protection test across restart"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-070",
+        "SCP-PERSIST-063",
+        "SCP-PERSIST-064",
+        "SCP-PERSIST-066"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### ProtocolStore Integration Tests"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### Phase 2"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-testing"
+      }
+    },
+    {
+      "id": "SCP-PERSIST-072",
+      "title": "ProtocolStore module integration tests per section 17.13",
+      "gate": "gate-persist-7",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/tests/integration/persistence.rs"
+      ],
+      "description": "Integration tests for individual ProtocolStore modules per section 17.13 ProtocolStore Integration Tests table. Each test exercises a ProtocolStore module's methods end-to-end through a real Storage backend. These complement the lifecycle tests in SCP-PERSIST-070 by verifying module-level correctness.",
+      "acceptanceCriteria": [
+        "Test: event_log range query returns correct ordered subset across append/load_range",
+        "Test: nonce replay rejected after check_and_record_nonce; prune removes only expired nonces",
+        "Test: membership store/load/list/remove roundtrip; sender_key store/load/list/remove roundtrip",
+        "Test: DID cache returns None after expiry; TOFU record roundtrip",
+        "Test: relay_score list returns all stored scores; MLS group state roundtrip and context isolation",
+        "`cargo test -p scp-testing` passes"
+      ],
+      "actionItems": [
+        "Create parameterized test helpers that run each module test against InMemory and SqliteStorage",
+        "Implement event_log, nonce, membership, sender_key, DID cache, TOFU, relay_score, and MLS integration tests",
+        "Verify each test exercises the full ProtocolStore -> Storage -> Backend path"
+      ],
+      "blockedBy": [
+        "SCP-PERSIST-010",
+        "SCP-PERSIST-011",
+        "SCP-PERSIST-012",
+        "SCP-PERSIST-013",
+        "SCP-PERSIST-014",
+        "SCP-PERSIST-050"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### ProtocolStore Integration Tests"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.13 Conformance Testing"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-testing"
+      }
+    }
+  ]
+}
