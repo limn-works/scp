@@ -86,6 +86,15 @@ fn roles_prefix(context_id: &str) -> Result<String, super::StoreError> {
     Ok(format!("context/{ctx}/role/"))
 }
 
+/// Builds the storage key for broadcast context state.
+///
+/// Format: `context/{context_id}/broadcast_state`
+/// See spec section 5.14.
+fn broadcast_state_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/broadcast_state"))
+}
+
 /// Builds the storage key for an author's broadcast block list.
 ///
 /// Format: `context/{context_id}/broadcast_block/{author_did}`
@@ -344,6 +353,53 @@ impl<S: Storage> ProtocolStore<S> {
             .filter_map(|key| key.strip_prefix(&prefix).map(String::from))
             .collect();
         Ok(role_names)
+    }
+
+    /// Stores the full broadcast context state for persistence across restarts.
+    ///
+    /// Serializes the [`BroadcastContextSnapshot`] under
+    /// `context/{context_id}/broadcast_state`. The snapshot contains the
+    /// admission policy, subscriber roster, and per-author key state
+    /// (including key material, epochs, and block lists).
+    ///
+    /// Called after each broadcast mutation (subscribe, unsubscribe, block,
+    /// create) to ensure broadcast state survives process restarts.
+    ///
+    /// See spec section 5.14 and §17.3.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_broadcast_state(
+        &self,
+        context_id: &str,
+        snapshot: &crate::context::broadcast::BroadcastContextSnapshot,
+    ) -> Result<(), StoreError> {
+        let key = broadcast_state_key(context_id)?;
+        self.store_value(&key, snapshot).await
+    }
+
+    /// Loads the broadcast context state from persistence.
+    ///
+    /// Returns `None` if no broadcast state has been persisted for the given
+    /// context (either the context is not broadcast, or it has not been
+    /// persisted yet). The caller should reconstruct a `BroadcastContext`
+    /// from the returned snapshot using
+    /// [`BroadcastContext::from_snapshot`].
+    ///
+    /// See spec section 5.14 and §17.3.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_broadcast_state(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<crate::context::broadcast::BroadcastContextSnapshot>, StoreError> {
+        let key = broadcast_state_key(context_id)?;
+        self.load_value(&key).await
     }
 
     /// Stores a broadcast block list for an author within a context.
@@ -742,5 +798,152 @@ mod tests {
             .await
             .unwrap();
         assert!(loaded.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Broadcast state persistence
+    // -------------------------------------------------------------------
+
+    fn make_broadcast_snapshot() -> crate::context::broadcast::BroadcastContextSnapshot {
+        use crate::context::broadcast::{
+            AuthorStateSnapshot, BroadcastAdmission, BroadcastContextSnapshot, SubscriberRecord,
+        };
+        use crate::crypto::sender_keys::generate_sender_key;
+
+        let mut subscribers = std::collections::HashMap::new();
+        subscribers.insert(
+            "did:dht:z6MkSub1".to_owned(),
+            SubscriberRecord {
+                subscriber_did: "did:dht:z6MkSub1".to_owned(),
+                registered_at: 1_700_000_000,
+                has_ucan: false,
+            },
+        );
+        subscribers.insert(
+            "did:dht:z6MkSub2".to_owned(),
+            SubscriberRecord {
+                subscriber_did: "did:dht:z6MkSub2".to_owned(),
+                registered_at: 1_700_000_100,
+                has_ucan: true,
+            },
+        );
+
+        let mut block_list = HashSet::new();
+        block_list.insert("did:dht:z6MkBlocked".to_owned());
+
+        let mut authors = std::collections::HashMap::new();
+        authors.insert(
+            "did:dht:z6MkAuthor1".to_owned(),
+            AuthorStateSnapshot {
+                author_did: "did:dht:z6MkAuthor1".to_owned(),
+                broadcast_key: generate_sender_key(),
+                epoch: 3,
+                block_list,
+            },
+        );
+
+        BroadcastContextSnapshot {
+            context_id: "ctx-broadcast-1".to_owned(),
+            admission: BroadcastAdmission::Open,
+            subscribers,
+            authors,
+        }
+    }
+
+    #[tokio::test]
+    async fn store_and_load_broadcast_state_roundtrip() {
+        let store = make_store();
+        let snapshot = make_broadcast_snapshot();
+
+        store
+            .store_broadcast_state("ctx-broadcast-1", &snapshot)
+            .await
+            .unwrap();
+
+        let loaded = store.load_broadcast_state("ctx-broadcast-1").await.unwrap();
+
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.context_id, "ctx-broadcast-1");
+        assert_eq!(
+            loaded.admission,
+            crate::context::broadcast::BroadcastAdmission::Open
+        );
+        assert_eq!(loaded.subscribers.len(), 2);
+        assert!(loaded.subscribers.contains_key("did:dht:z6MkSub1"));
+        assert!(loaded.subscribers.contains_key("did:dht:z6MkSub2"));
+        assert_eq!(loaded.authors.len(), 1);
+        let author = loaded.authors.get("did:dht:z6MkAuthor1").unwrap();
+        assert_eq!(author.epoch, 3);
+        assert!(author.block_list.contains("did:dht:z6MkBlocked"));
+    }
+
+    #[tokio::test]
+    async fn load_broadcast_state_returns_none_for_missing() {
+        let store = make_store();
+        let loaded = store.load_broadcast_state("nonexistent").await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_broadcast_state_overwrites_previous() {
+        use crate::context::broadcast::BroadcastAdmission;
+
+        let store = make_store();
+        let snapshot1 = make_broadcast_snapshot();
+
+        store
+            .store_broadcast_state("ctx-broadcast-1", &snapshot1)
+            .await
+            .unwrap();
+
+        // Modify snapshot: change admission and add subscriber.
+        let mut snapshot2 = make_broadcast_snapshot();
+        snapshot2.admission = BroadcastAdmission::Gated;
+        snapshot2.subscribers.insert(
+            "did:dht:z6MkSub3".to_owned(),
+            crate::context::broadcast::SubscriberRecord {
+                subscriber_did: "did:dht:z6MkSub3".to_owned(),
+                registered_at: 1_700_000_200,
+                has_ucan: true,
+            },
+        );
+
+        store
+            .store_broadcast_state("ctx-broadcast-1", &snapshot2)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_broadcast_state("ctx-broadcast-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.admission, BroadcastAdmission::Gated);
+        assert_eq!(loaded.subscribers.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn delete_context_removes_broadcast_state() {
+        let store = make_store();
+        let snapshot = make_broadcast_snapshot();
+
+        store
+            .store_broadcast_state("ctx-broadcast-1", &snapshot)
+            .await
+            .unwrap();
+
+        store.delete_context("ctx-broadcast-1").await.unwrap();
+
+        let loaded = store.load_broadcast_state("ctx-broadcast-1").await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn broadcast_state_key_follows_convention() {
+        assert_eq!(
+            broadcast_state_key("ctx-123").unwrap(),
+            "context/ctx-123/broadcast_state"
+        );
     }
 }

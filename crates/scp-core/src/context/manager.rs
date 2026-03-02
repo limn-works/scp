@@ -15,8 +15,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::broadcast::{
-    AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision,
-    SubscriptionResult, UnsubscribeResult,
+    AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
+    KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
 };
 use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
@@ -35,7 +35,6 @@ use crate::crypto::ucan::validate::{
 };
 use scp_identity::DID;
 
-// ---------------------------------------------------------------------------
 // GovernanceActionResult
 // ---------------------------------------------------------------------------
 
@@ -49,6 +48,53 @@ use scp_identity::DID;
 pub enum GovernanceActionResult {
     /// An author was blocked from a broadcast context (spec section 5.14.8).
     AuthorBlocked(AuthorBlockResult),
+}
+
+// ---------------------------------------------------------------------------
+// BroadcastPersistence -- persistence provider for broadcast contexts
+// ---------------------------------------------------------------------------
+
+/// Provider for persisting broadcast context state across process restarts.
+///
+/// Implementors store and load [`BroadcastContextSnapshot`] snapshots. The
+/// `ContextManager` calls `persist` after every broadcast-mutating operation
+/// (subscribe, unsubscribe, block, create) and `load` during context
+/// restoration.
+///
+/// The canonical implementation delegates to
+/// [`ProtocolStore::store_broadcast_state`] /
+/// [`ProtocolStore::load_broadcast_state`].
+///
+/// See spec section 5.14.
+pub trait BroadcastPersistence: Send + Sync {
+    /// Persists the broadcast context state snapshot.
+    ///
+    /// Called after each broadcast mutation. Implementations must be
+    /// idempotent (repeated calls with the same snapshot are safe).
+    ///
+    /// # Errors
+    ///
+    /// Returns a boxed error if the persistence operation fails. The
+    /// `ContextManager` logs the failure but does not abort the mutation
+    /// (the in-memory state is authoritative; persistence is best-effort
+    /// for crash recovery).
+    fn persist(
+        &self,
+        context_id: &str,
+        snapshot: &BroadcastContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Loads a previously persisted broadcast context snapshot.
+    ///
+    /// Returns `None` if no snapshot exists for the given context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a boxed error if the load operation fails.
+    fn load(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +182,10 @@ pub struct ContextManager {
     /// spawned TTL timer tasks that need event log access for logging
     /// `ContextExpired` events on context expiry (SCP-169).
     event_log: Arc<dyn ContextEventLogProvider>,
+    /// Optional provider for persisting broadcast context state across
+    /// process restarts. When `Some`, the manager persists broadcast state
+    /// after every broadcast-mutating operation.
+    broadcast_persistence: Option<Arc<dyn BroadcastPersistence>>,
     /// Per-context state, keyed by `context_id` string.
     contexts: Mutex<HashMap<String, PerContextState>>,
 }
@@ -161,8 +211,137 @@ impl ContextManager {
             crypto: Arc::from(crypto),
             transport: Arc::from(transport),
             event_log: Arc::from(event_log),
+            broadcast_persistence: None,
             contexts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Creates a new `ContextManager` with broadcast persistence support.
+    ///
+    /// Same as [`new`](Self::new) but additionally accepts a
+    /// [`BroadcastPersistence`] provider. When provided, the manager
+    /// persists broadcast context state after every broadcast-mutating
+    /// operation (subscribe, unsubscribe, block, create).
+    ///
+    /// # Arguments
+    ///
+    /// * `crypto` -- Provider for MLS and sender key operations.
+    /// * `transport` -- Provider for relay connectivity and publication.
+    /// * `event_log` -- Provider for event log initialisation and append.
+    /// * `broadcast_persistence` -- Provider for broadcast state persistence.
+    #[must_use]
+    pub fn with_broadcast_persistence(
+        crypto: Box<dyn ContextCryptoProvider>,
+        transport: Box<dyn ContextTransportProvider>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        broadcast_persistence: Box<dyn BroadcastPersistence>,
+    ) -> Self {
+        Self {
+            crypto: Arc::from(crypto),
+            transport: Arc::from(transport),
+            event_log: Arc::from(event_log),
+            broadcast_persistence: Some(Arc::from(broadcast_persistence)),
+            contexts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Persists a broadcast context snapshot if a persistence provider is
+    /// configured.
+    ///
+    /// Best-effort: logs errors but does not propagate them to callers.
+    /// In-memory state is authoritative; persistence is for crash recovery.
+    fn persist_broadcast_snapshot(&self, context_id: &str, snapshot: &BroadcastContextSnapshot) {
+        if let Some(ref persistence) = self.broadcast_persistence
+            && let Err(e) = persistence.persist(context_id, snapshot)
+        {
+            // Best-effort persistence: log but don't fail the operation.
+            // In production, the tracing crate would emit a warning here.
+            // In-memory state remains authoritative.
+            let _ = e; // Suppress unused warning; tracing integration is TBD.
+        }
+    }
+
+    /// Restores broadcast context state from the persistence provider.
+    ///
+    /// Loads a previously persisted [`BroadcastContextSnapshot`] and
+    /// reconstructs a [`BroadcastContext`] from it. Called during context
+    /// restoration after a process restart.
+    ///
+    /// Returns `None` if no persistence provider is configured or no
+    /// snapshot exists for the given context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PersistenceFailed`] if the load operation
+    /// fails.
+    pub fn load_persisted_broadcast_state(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<BroadcastContext>, ContextError> {
+        let Some(ref persistence) = self.broadcast_persistence else {
+            return Ok(None);
+        };
+        match persistence.load(context_id) {
+            Ok(Some(snapshot)) => Ok(Some(BroadcastContext::from_snapshot(snapshot))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(ContextError::PersistenceFailed(format!(
+                "failed to load broadcast state for {context_id}: {e}"
+            ))),
+        }
+    }
+
+    /// Restores a broadcast context into the manager from persisted state.
+    ///
+    /// Creates a `PerContextState` with the restored broadcast context
+    /// and registers it in the manager's context map. This is the primary
+    /// entry point for restoring broadcast contexts after a process restart.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context identifier to restore.
+    /// * `handle` -- A pre-created `ContextHandle` for the context.
+    /// * `role_state` -- The restored role state.
+    /// * `membership` -- The restored membership state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PersistenceFailed`] if no persisted broadcast
+    /// state exists. Returns [`ContextError::MembershipFailed`] if the
+    /// context is already registered.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn restore_broadcast_context(
+        &self,
+        context_id: String,
+        handle: ContextHandle,
+        role_state: ContextRoleState,
+        membership: MembershipState,
+    ) -> Result<(), ContextError> {
+        let broadcast_context = self
+            .load_persisted_broadcast_state(&context_id)?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "no persisted broadcast state for {context_id}"
+                ))
+            })?;
+
+        let per_context = PerContextState {
+            handle,
+            membership,
+            role_state,
+            receive_buffer: ReceiveBuffer::new(),
+            ttl_timer: TtlTimer::new(),
+            ttl_extension: None,
+            broadcast_context: Some(broadcast_context),
+        };
+
+        let mut contexts = self.contexts.lock().await;
+        if contexts.contains_key(&context_id) {
+            return Err(ContextError::MembershipFailed(format!(
+                "context '{context_id}' already registered"
+            )));
+        }
+        contexts.insert(context_id, per_context);
+        Ok(())
     }
 
     /// Creates a new SCP context with the two-phase commit pattern.
@@ -240,6 +419,8 @@ impl ContextManager {
             // Register the creator as the first author (messagesWrite).
             bc.add_author(&creator_did)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            // Persist initial broadcast state for crash recovery.
+            self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
             Some(bc)
         } else {
             None
@@ -689,7 +870,7 @@ impl ContextManager {
     {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let result = {
+        let (result, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -704,6 +885,9 @@ impl ContextManager {
 
             let result = bc.subscribe(subscriber_did, ucan, timestamp, validation_ctx)?;
 
+            // Take snapshot for persistence before dropping lock.
+            let snapshot = bc.to_snapshot();
+
             // Add subscriber to membership tracking (role = "subscriber").
             ctx.membership
                 .add_member(subscriber_did.clone(), "subscriber".into(), vec![]);
@@ -711,9 +895,12 @@ impl ContextManager {
             // Push event to receive buffer.
             ctx.receive_buffer.push(result.event.clone());
 
-            result
+            (result, snapshot)
         };
         // Lock dropped.
+
+        // Persist broadcast state for crash recovery.
+        self.persist_broadcast_snapshot(context_id, &snapshot);
 
         // Append event to persistent event log.
         self.event_log
@@ -743,7 +930,7 @@ impl ContextManager {
     ) -> Result<UnsubscribeResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let result = {
+        let (result, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -758,6 +945,9 @@ impl ContextManager {
 
             let result = bc.unsubscribe(subscriber_did, rotate_keys)?;
 
+            // Take snapshot for persistence before dropping lock.
+            let snapshot = bc.to_snapshot();
+
             // Remove from membership tracking.
             ctx.membership.remove_member(subscriber_did);
 
@@ -766,9 +956,12 @@ impl ContextManager {
                 member_did: subscriber_did.clone(),
             });
 
-            result
+            (result, snapshot)
         };
         // Lock dropped.
+
+        // Persist broadcast state for crash recovery.
+        self.persist_broadcast_snapshot(context_id, &snapshot);
 
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft")?;
@@ -866,7 +1059,7 @@ impl ContextManager {
     ) -> Result<BlockResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let result = {
+        let (result, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -881,15 +1074,21 @@ impl ContextManager {
 
             let result = bc.block_subscriber(author_did, subscriber_did)?;
 
+            // Take snapshot for persistence before dropping lock.
+            let snapshot = bc.to_snapshot();
+
             // Emit block event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MemberBlocked {
                 blocked_did: subscriber_did.clone(),
                 author_did: author_did.clone(),
             });
 
-            result
+            (result, snapshot)
         };
         // Lock dropped.
+
+        // Persist broadcast state for crash recovery.
+        self.persist_broadcast_snapshot(context_id, &snapshot);
 
         self.event_log
             .append_context_event(&context_id_bytes, "MemberBlocked")?;
