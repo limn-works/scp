@@ -104,7 +104,8 @@ pub struct WasmContextHandle {
     /// Unique identifier for this context.
     context_id: String,
     /// Current lifecycle state: "creating", "active", "closing", "closed", "expired".
-    state: String,
+    /// Uses `RefCell` for interior mutability so `context_close` can transition state.
+    state: std::cell::RefCell<String>,
     /// DID of the context creator.
     creator_did: String,
     /// Context mode: "Encrypted" (MLS group) or "Broadcast" (per-author keys).
@@ -146,7 +147,7 @@ impl WasmContextHandle {
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn state(&self) -> String {
-        self.state.clone()
+        self.state.borrow().clone()
     }
 
     /// Returns the DID of the context creator.
@@ -250,7 +251,7 @@ impl WasmContextHandle {
     ) -> Self {
         Self {
             context_id,
-            state: "active".to_owned(),
+            state: std::cell::RefCell::new("active".to_owned()),
             creator_did,
             mode,
             ceiling,
@@ -435,7 +436,7 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
 pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise {
-    let state = handle.state.clone();
+    let state = handle.state.borrow().clone();
     let _ = identity_did; // Used when full runtime is wired.
 
     future_to_promise(async move {
@@ -472,7 +473,7 @@ pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
 pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promise {
-    let state = handle.state.clone();
+    let state = handle.state.borrow().clone();
     let _ = identity_did; // Used when full runtime is wired.
 
     future_to_promise(async move {
@@ -523,36 +524,37 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
 pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promise {
-    let state = handle.state.clone();
     let creator_did = handle.creator_did.clone();
 
-    future_to_promise(async move {
-        // Authorization: only the context creator can close the context.
-        if identity_did != creator_did {
-            return Err(ScpWasmError::Permission {
-                message: format!(
-                    "identity '{identity_did}' is not authorized to close this context \
-                     — only the context creator ('{creator_did}') can close it"
-                ),
-                code: "SCP-PERM-3000".to_owned(),
-            }
-            .into_js()
-            .into());
-        }
+    // Authorization: only the context creator can close the context.
+    if identity_did != creator_did {
+        let err = ScpWasmError::Permission {
+            message: format!(
+                "identity '{identity_did}' is not authorized to close this context \
+                 — only the context creator ('{creator_did}') can close it"
+            ),
+            code: "SCP-PERM-3000".to_owned(),
+        };
+        return future_to_promise(async move { Err(err.into_js().into()) });
+    }
 
-        if state != "active" {
-            return Err(ScpWasmError::Context {
+    {
+        let state = handle.state.borrow();
+        if *state != "active" {
+            let err = ScpWasmError::Context {
                 message: format!(
                     "cannot close context in '{state}' state — context must be 'active'"
                 ),
                 code: "SCP-CTX-2017".to_owned(),
-            }
-            .into_js()
-            .into());
+            };
+            return future_to_promise(async move { Err(err.into_js().into()) });
         }
+    }
 
-        Ok(JsValue::UNDEFINED)
-    })
+    // Transition to closed state.
+    *handle.state.borrow_mut() = "closed".to_owned();
+
+    future_to_promise(async move { Ok(JsValue::UNDEFINED) })
 }
 
 /// Sends a message to an SCP context.
@@ -580,7 +582,7 @@ pub fn context_send(
     identity_did: String,
     payload_base64: String,
 ) -> Promise {
-    let state = handle.state.clone();
+    let state = handle.state.borrow().clone();
     let _ = identity_did; // Used when full runtime is wired.
 
     future_to_promise(async move {
@@ -640,11 +642,11 @@ pub fn context_subscribe(
     handle: &WasmContextHandle,
     callback: JsMessageCallback,
 ) -> Result<(), JsError> {
-    if handle.state != "active" {
+    if *handle.state.borrow() != "active" {
         return Err(ScpWasmError::Context {
             message: format!(
                 "cannot subscribe to context in '{}' state — context must be 'active'",
-                handle.state
+                handle.state.borrow()
             ),
             code: "SCP-CTX-2021".to_owned(),
         }
