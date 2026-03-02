@@ -116,11 +116,16 @@ impl ProjectedContext {
         &self.keys
     }
 
-    /// Inserts or replaces a broadcast key at the key's epoch.
+    /// Inserts a broadcast key for the given epoch.
     ///
-    /// Previous epochs are retained (not pruned on epoch advance) so
-    /// messages encrypted under older keys remain decryptable within the
-    /// blob TTL window.
+    /// Keys are retained indefinitely rather than pruned after the blob TTL
+    /// window (spec §18.11.5). This is acceptable because:
+    /// - Key rotations only occur on subscriber blocks (uncommon)
+    /// - Each key is ~40 bytes (32-byte secret + epoch + author DID ref)
+    /// - Even hundreds of epochs per context is negligible memory
+    ///
+    /// If pruning becomes necessary, add a `prune_before(epoch)` method
+    /// keyed to the relay's `max_blob_ttl`.
     pub fn insert_key(&mut self, broadcast_key: BroadcastKey) {
         let epoch = broadcast_key.epoch();
         self.keys.insert(epoch, broadcast_key);
@@ -581,17 +586,6 @@ pub async fn message_handler<B: BlobStorage>(
             .into_response();
     };
 
-    // Conditional GET: check If-None-Match header (after routing_id
-    // validation so unknown routing IDs always get 404, not 304).
-    if let Some(inm) = headers.get(header::IF_NONE_MATCH)
-        && let Ok(inm_str) = inm.to_str()
-    {
-        let expected_etag = format!("\"{blob_id_hex}\"");
-        if inm_str == expected_etag {
-            return StatusCode::NOT_MODIFIED.into_response();
-        }
-    }
-
     // Snapshot keys before dropping the read lock.
     let keys: HashMap<u64, BroadcastKey> = projected.keys.clone();
     drop(projected_contexts);
@@ -626,7 +620,11 @@ pub async fn message_handler<B: BlobStorage>(
         }
     };
 
-    // Verify the blob belongs to this routing_id.
+    // Verify the blob belongs to this routing_id. This MUST happen before
+    // the conditional GET check to prevent a cross-context blob existence
+    // oracle (BLACK-HTTP-005): without this ordering, an attacker could
+    // send If-None-Match with a blob_id from routing_A to routing_B and
+    // receive 304 (confirming blob existence) instead of 404.
     if stored.routing_id != routing_id {
         return (
             StatusCode::NOT_FOUND,
@@ -636,6 +634,18 @@ pub async fn message_handler<B: BlobStorage>(
             }),
         )
             .into_response();
+    }
+
+    // Conditional GET: check If-None-Match header. Placed after both
+    // routing_id validation and blob ownership verification so that
+    // unknown routing IDs and cross-context probes always get 404.
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH)
+        && let Ok(inm_str) = inm.to_str()
+    {
+        let expected_etag = format!("\"{blob_id_hex}\"");
+        if inm_str == expected_etag {
+            return StatusCode::NOT_MODIFIED.into_response();
+        }
     }
 
     // Deserialize BroadcastEnvelope from MessagePack.
@@ -1498,5 +1508,421 @@ mod tests {
 
         assert_eq!(ctx.keys().len(), 1);
         assert!(ctx.key_for_epoch(0).is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Test A: Cross-context routing_id mismatch (BLACK-HTTP-005 defense)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    #[allow(clippy::similar_names)]
+    async fn message_cross_context_routing_id_mismatch_returns_404() {
+        // Create two projected contexts with different routing IDs.
+        let key_a = generate_broadcast_key("did:dht:alice");
+        let key_b = generate_broadcast_key("did:dht:bob");
+        let ctx_a = ProjectedContext::new("context_a", key_a.clone());
+        let ctx_b = ProjectedContext::new("context_b", key_b);
+        let routing_id_a = ctx_a.routing_id;
+        let routing_id_b = ctx_b.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id_a, ctx_a);
+        projected_map.insert(routing_id_b, ctx_b);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Seal and store a blob under routing_A.
+        let envelope = seal_broadcast(&key_a, b"belongs to context_a").unwrap();
+        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id_a, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+
+        // Request the blob via routing_B (wrong context) → must be 404.
+        let router_b = broadcast_projection_router(Arc::clone(&state));
+        let routing_b_hex = hex_encode(&routing_id_b);
+        let blob_hex = hex_encode(&blob_id);
+        let req = Request::builder()
+            .uri(format!(
+                "/scp/broadcast/{routing_b_hex}/messages/{blob_hex}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router_b.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::NOT_FOUND,
+            "cross-context request must return 404, not leak blob existence"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"], "unknown blob_id",
+            "error message must be indistinguishable from genuinely missing blob"
+        );
+
+        // Verify the same blob is accessible via routing_A (correct context) → 200.
+        let router_a = broadcast_projection_router(state);
+        let routing_a_hex = hex_encode(&routing_id_a);
+        let req = Request::builder()
+            .uri(format!(
+                "/scp/broadcast/{routing_a_hex}/messages/{blob_hex}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router_a.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::OK,
+            "correct context should return 200"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Test B: Feed with `since` parameter
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn feed_since_parameter_filters_messages() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "since_ctx";
+        let projected = ProjectedContext::new(context_id, key.clone());
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Store 3 blobs. Because InMemoryBlobStorage uses real timestamps,
+        // all blobs may get the same stored_at. We rely on the since
+        // parameter resolving via blob lookup → stored_at filtering.
+        let mut blob_ids = Vec::new();
+        for i in 0u8..3 {
+            let envelope = seal_broadcast(&key, &[i; 16]).unwrap();
+            let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+            let blob_id = {
+                let mut h = Sha256::new();
+                h.update(&blob_bytes);
+                let r: [u8; 32] = h.finalize().into();
+                r
+            };
+            storage
+                .store(routing_id, blob_id, None, 3600, blob_bytes)
+                .await
+                .unwrap();
+            blob_ids.push(blob_id);
+        }
+
+        let state = test_state_with(projected_map, storage);
+        let routing_hex = hex_encode(&routing_id);
+
+        // Test 1: since=blob_1 — all blobs have the same stored_at (within
+        // the same second), so since filtering returns blobs with
+        // stored_at > since_blob.stored_at. Since they're all equal, this
+        // returns 0. This validates the since lookup path works without error.
+        let router = broadcast_projection_router(Arc::clone(&state));
+        let since_hex = hex_encode(&blob_ids[0]);
+        let req = Request::builder()
+            .uri(format!(
+                "/scp/broadcast/{routing_hex}/feed?since={since_hex}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        // Test 2: since=nonexistent_id — should return all blobs (fallback).
+        let router = broadcast_projection_router(Arc::clone(&state));
+        let nonexistent = hex_encode(&[0xFF; 32]);
+        let req = Request::builder()
+            .uri(format!(
+                "/scp/broadcast/{routing_hex}/feed?since={nonexistent}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "nonexistent since blob_id should fall back to returning all"
+        );
+
+        // Test 3: since=invalid_hex — should return 400.
+        let router = broadcast_projection_router(state);
+        let req = Request::builder()
+            .uri(format!(
+                "/scp/broadcast/{routing_hex}/feed?since=not_valid_hex"
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "BAD_REQUEST");
+    }
+
+    // -------------------------------------------------------------------
+    // Test C: Multi-epoch feed decryption
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn feed_multi_epoch_decryption() {
+        let key0 = generate_broadcast_key("did:dht:alice");
+        let (key1, _advance) = rotate_broadcast_key(&key0, 1000).unwrap();
+
+        let context_id = "multi_epoch_feed_ctx";
+        let mut projected = ProjectedContext::new(context_id, key0.clone());
+        projected.insert_key(key1.clone());
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Seal message_1 with epoch 0 key.
+        let envelope_0 = seal_broadcast(&key0, b"epoch zero message").unwrap();
+        let blob_bytes_0 = rmp_serde::to_vec(&envelope_0).unwrap();
+        let blob_id_0 = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes_0);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id_0, None, 3600, blob_bytes_0)
+            .await
+            .unwrap();
+
+        // Seal message_2 with epoch 1 key.
+        let envelope_1 = seal_broadcast(&key1, b"epoch one message").unwrap();
+        let blob_bytes_1 = rmp_serde::to_vec(&envelope_1).unwrap();
+        let blob_id_1 = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes_1);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id_1, None, 3600, blob_bytes_1)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            2,
+            "both epoch-0 and epoch-1 messages returned"
+        );
+
+        // Verify both messages decrypted correctly by checking their content.
+        let contents: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                let b64 = m["content"].as_str().unwrap();
+                String::from_utf8(BASE64.decode(b64).unwrap()).unwrap()
+            })
+            .collect();
+        assert!(contents.contains(&"epoch zero message".to_owned()));
+        assert!(contents.contains(&"epoch one message".to_owned()));
+
+        // Verify epoch values are correct.
+        let epochs: Vec<u64> = messages
+            .iter()
+            .map(|m| m["key_epoch"].as_u64().unwrap())
+            .collect();
+        assert!(epochs.contains(&0));
+        assert!(epochs.contains(&1));
+    }
+
+    // -------------------------------------------------------------------
+    // Test D: Tampered ciphertext (AEAD authentication failure)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn message_tampered_ciphertext_returns_500() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "tamper_ctx";
+        let projected = ProjectedContext::new(context_id, key.clone());
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Seal a message, then tamper with the ciphertext.
+        let mut envelope = seal_broadcast(&key, b"tamper target").unwrap();
+        // Flip a byte in the ciphertext (after the 12-byte nonce).
+        if envelope.encrypted_content.len() > 13 {
+            envelope.encrypted_content[13] ^= 0xFF;
+        }
+        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+
+        // Also store a valid message.
+        let valid_envelope = seal_broadcast(&key, b"valid message").unwrap();
+        let valid_blob_bytes = rmp_serde::to_vec(&valid_envelope).unwrap();
+        let valid_blob_id = {
+            let mut h = Sha256::new();
+            h.update(&valid_blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, valid_blob_id, None, 3600, valid_blob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+
+        // Per-message endpoint for tampered blob → 500 "decryption failure".
+        let router = broadcast_projection_router(Arc::clone(&state));
+        let routing_hex = hex_encode(&routing_id);
+        let blob_hex = hex_encode(&blob_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/messages/{blob_hex}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "decryption failure");
+
+        // Feed endpoint → tampered message should be silently skipped,
+        // valid message still returned.
+        let router = broadcast_projection_router(state);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "tampered message should be skipped, valid message returned"
+        );
+
+        let content_b64 = messages[0]["content"].as_str().unwrap();
+        let decoded = BASE64.decode(content_b64).unwrap();
+        assert_eq!(decoded, b"valid message");
+    }
+
+    // -------------------------------------------------------------------
+    // Test E: Conditional GET after routing_id fix (BLACK-HTTP-005)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn message_conditional_get_cross_context_returns_404_not_304() {
+        // This test verifies that the conditional GET (If-None-Match) does
+        // NOT short-circuit before the routing_id ownership check. An
+        // attacker sending If-None-Match for a blob from routing_A to
+        // routing_B must get 404, not 304.
+        let key_a = generate_broadcast_key("did:dht:alice");
+        let key_b = generate_broadcast_key("did:dht:bob");
+        let ctx_a = ProjectedContext::new("ctx_a_304", key_a.clone());
+        let ctx_b = ProjectedContext::new("ctx_b_304", key_b);
+        let routing_id_a = ctx_a.routing_id;
+        let routing_id_b = ctx_b.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id_a, ctx_a);
+        projected_map.insert(routing_id_b, ctx_b);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Store blob under routing_A.
+        let envelope = seal_broadcast(&key_a, b"secret of A").unwrap();
+        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id_a, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        // Request via routing_B with If-None-Match matching the blob_id.
+        let routing_b_hex = hex_encode(&routing_id_b);
+        let blob_hex = hex_encode(&blob_id);
+        let etag_value = format!("\"{blob_hex}\"");
+        let req = Request::builder()
+            .uri(format!(
+                "/scp/broadcast/{routing_b_hex}/messages/{blob_hex}"
+            ))
+            .header("If-None-Match", &etag_value)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::NOT_FOUND,
+            "cross-context conditional GET must return 404, not 304"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "unknown blob_id");
     }
 }

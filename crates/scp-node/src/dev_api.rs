@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
@@ -128,8 +129,9 @@ pub async fn bearer_auth_middleware(
         .and_then(|v| v.to_str().ok());
 
     match auth_header {
-        Some(value) if value.starts_with("Bearer ") => {
-            let provided = &value["Bearer ".len()..];
+        // RFC 7235 §2.1: auth-scheme tokens are case-insensitive.
+        Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => {
+            let provided = &value[7..];
             if bool::from(provided.as_bytes().ct_eq(expected_token.as_bytes())) {
                 next.run(req).await.into_response()
             } else {
@@ -348,6 +350,7 @@ pub async fn get_context_handler<B: BlobStorage>(
     State(state): State<Arc<NodeState<B>>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let id = id.to_ascii_lowercase();
     let contexts = state.broadcast_contexts.read().await;
     contexts.iter().find(|ctx| ctx.id == id).map_or_else(
         || DevApiError::not_found(format!("context {id} not found")).into_response(),
@@ -356,7 +359,7 @@ pub async fn get_context_handler<B: BlobStorage>(
 }
 
 /// Maximum allowed length for a context ID (hex-encoded, so 64 chars for 32 bytes).
-const MAX_CONTEXT_ID_LEN: usize = 128;
+const MAX_CONTEXT_ID_LEN: usize = 64;
 /// Maximum allowed length for a context name.
 const MAX_CONTEXT_NAME_LEN: usize = 256;
 
@@ -374,8 +377,14 @@ const MAX_CONTEXT_NAME_LEN: usize = 256;
 /// See spec section 18.10.3.
 pub async fn create_context_handler<B: BlobStorage>(
     State(state): State<Arc<NodeState<B>>>,
-    Json(body): Json<CreateContextRequest>,
+    body: Result<Json<CreateContextRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    // Unwrap JSON body, mapping extraction failures to DevApiError (spec §18.10.4).
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(e) => return DevApiError::bad_request(e.body_text()).into_response(),
+    };
+
     // Validate context ID: non-empty, hex-only, bounded length.
     if body.id.is_empty() || body.id.len() > MAX_CONTEXT_ID_LEN {
         return DevApiError::bad_request(format!(
@@ -387,6 +396,9 @@ pub async fn create_context_handler<B: BlobStorage>(
         return DevApiError::bad_request("context id must contain only hex characters")
             .into_response();
     }
+
+    // Normalize to lowercase so mixed-case hex values are not treated as distinct.
+    let id = body.id.to_ascii_lowercase();
 
     // Validate context name if present: bounded length, no control chars.
     if let Some(ref name) = body.name {
@@ -404,14 +416,13 @@ pub async fn create_context_handler<B: BlobStorage>(
 
     let mut contexts = state.broadcast_contexts.write().await;
 
-    // Reject duplicate context IDs.
-    if contexts.iter().any(|ctx| ctx.id == body.id) {
-        return DevApiError::conflict(format!("context {} already exists", body.id))
-            .into_response();
+    // Reject duplicate context IDs (compared against normalized lowercase).
+    if contexts.iter().any(|ctx| ctx.id == id) {
+        return DevApiError::conflict(format!("context {id} already exists")).into_response();
     }
 
     let ctx = crate::http::BroadcastContext {
-        id: body.id,
+        id,
         name: body.name,
     };
     let response = ContextResponse::from(&ctx);
@@ -432,6 +443,7 @@ pub async fn delete_context_handler<B: BlobStorage>(
     State(state): State<Arc<NodeState<B>>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let id = id.to_ascii_lowercase();
     let mut contexts = state.broadcast_contexts.write().await;
     let len_before = contexts.len();
     contexts.retain(|ctx| ctx.id != id);
@@ -987,5 +999,553 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["code"], "CONFLICT");
+    }
+
+    // -- Tests A-I: additional coverage for confirmed findings --
+
+    /// Test A: Wrong bearer token returns 401 with correct error shape.
+    #[tokio::test]
+    async fn wrong_bearer_token_returns_401_with_error_shape() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .header(header::AUTHORIZATION, "Bearer wrong_token_here")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("missing Content-Type on 401")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("application/json"),
+            "401 response should be JSON, got: {content_type}"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(json["code"], "UNAUTHORIZED");
+    }
+
+    /// Test B: Case-insensitive bearer scheme (RFC 7235 §2.1).
+    #[tokio::test]
+    async fn bearer_scheme_case_insensitive() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+
+        // lowercase "bearer"
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .header(header::AUTHORIZATION, format!("bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "lowercase 'bearer' should pass"
+        );
+
+        // uppercase "BEARER"
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .header(header::AUTHORIZATION, format!("BEARER {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "uppercase 'BEARER' should pass"
+        );
+
+        // mixed case "BeArEr"
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .header(header::AUTHORIZATION, format!("BeArEr {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "mixed case 'BeArEr' should pass"
+        );
+    }
+
+    /// Test C: Non-bearer auth scheme returns 401.
+    #[tokio::test]
+    async fn non_bearer_auth_scheme_returns_401() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "UNAUTHORIZED");
+    }
+
+    /// Test D: Context ID exceeding `MAX_CONTEXT_ID_LEN` returns 400.
+    #[tokio::test]
+    async fn create_context_rejects_oversized_id() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        let oversized_id = "a".repeat(MAX_CONTEXT_ID_LEN + 1);
+        let body_json = serde_json::json!({ "id": oversized_id });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/scp/dev/v1/contexts")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&body_json).unwrap()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "BAD_REQUEST");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains(&MAX_CONTEXT_ID_LEN.to_string()),
+            "error message should mention the max length"
+        );
+    }
+
+    /// Test E: Context name exceeding `MAX_CONTEXT_NAME_LEN` returns 400.
+    #[tokio::test]
+    async fn create_context_rejects_oversized_name() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        let oversized_name = "a".repeat(MAX_CONTEXT_NAME_LEN + 1);
+        let body_json = serde_json::json!({ "id": "aabb", "name": oversized_name });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/scp/dev/v1/contexts")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&body_json).unwrap()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "BAD_REQUEST");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains(&MAX_CONTEXT_NAME_LEN.to_string()),
+            "error message should mention the max length"
+        );
+    }
+
+    /// Test F: Context name with control characters returns 400.
+    #[tokio::test]
+    async fn create_context_rejects_control_chars_in_name() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+
+        let names_with_control = [
+            "name\x00with_null",
+            "name\x1fwith_unit_sep",
+            "\ttabbed",
+            "new\nline",
+        ];
+
+        for bad_name in names_with_control {
+            let router = dev_router(Arc::clone(&state), token.to_owned());
+            let body_json = serde_json::json!({ "id": "aabb", "name": bad_name });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/scp/dev/v1/contexts")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&body_json).unwrap()))
+                .unwrap();
+
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "name with control char should be rejected: {bad_name:?}"
+            );
+
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], "BAD_REQUEST");
+        }
+    }
+
+    /// Test G: Malformed JSON body returns 400 with JSON error (not plain text).
+    #[tokio::test]
+    async fn malformed_json_returns_400_with_json_body() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        // Send {"id": 42} -- number instead of string
+        let req = Request::builder()
+            .method("POST")
+            .uri("/scp/dev/v1/contexts")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"id": 42}"#))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("missing Content-Type on malformed JSON 400")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("application/json"),
+            "malformed JSON error should be JSON, got: {content_type}"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "BAD_REQUEST");
+        assert!(
+            json.get("error").is_some(),
+            "error response must include 'error' field"
+        );
+    }
+
+    /// Test G (cont.): Completely invalid JSON returns 400 with JSON body.
+    #[tokio::test]
+    async fn invalid_json_syntax_returns_400_with_json_body() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/scp/dev/v1/contexts")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("not json at all"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("missing Content-Type")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("application/json"),
+            "invalid JSON syntax error should be JSON, got: {content_type}"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "BAD_REQUEST");
+    }
+
+    /// Test H: Mixed-case hex context IDs are normalized to lowercase.
+    #[tokio::test]
+    async fn context_id_normalized_to_lowercase() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+
+        // Create context with uppercase ID.
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/scp/dev/v1/contexts")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"id":"AABB","name":"Upper"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Response should contain normalized lowercase ID.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["id"], "aabb",
+            "created ID should be normalized to lowercase"
+        );
+
+        // GET /contexts/aabb should find it.
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .uri("/scp/dev/v1/contexts/aabb")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "lowercase lookup should find it"
+        );
+
+        // GET /contexts/AABB should also find it (lookup is normalized).
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .uri("/scp/dev/v1/contexts/AABB")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "uppercase lookup should also find it (normalized)"
+        );
+
+        // Creating with "aabb" should be rejected as duplicate.
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/scp/dev/v1/contexts")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"id":"aabb"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "lowercase duplicate of uppercase should conflict"
+        );
+
+        // DELETE /contexts/AaBb should work (normalized).
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/scp/dev/v1/contexts/AaBb")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "mixed-case delete should find the normalized ID"
+        );
+    }
+
+    /// Sends a request and asserts the response has the expected status and
+    /// `application/json` Content-Type (skipped for 204 No Content).
+    async fn assert_json_content_type(
+        state: &Arc<NodeState<InMemoryBlobStorage>>,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        expected_status: StatusCode,
+        desc: &str,
+    ) {
+        let router = dev_router(Arc::clone(state), token.to_owned());
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if body.is_some() {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        let req = builder
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), expected_status, "{desc}: wrong status");
+
+        if expected_status != StatusCode::NO_CONTENT {
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap_or_else(|| panic!("{desc}: missing Content-Type header"))
+                .to_str()
+                .unwrap();
+            assert!(
+                content_type.contains("application/json"),
+                "{desc}: Content-Type should be JSON, got: {content_type}"
+            );
+        }
+    }
+
+    /// Test I (part 1): Success and error endpoints return JSON Content-Type.
+    #[tokio::test]
+    async fn success_endpoints_return_json_content_type() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+        state
+            .broadcast_contexts
+            .write()
+            .await
+            .push(crate::http::BroadcastContext {
+                id: "deadbeef".to_owned(),
+                name: Some("Test".to_owned()),
+            });
+
+        let cases: &[(&str, &str, Option<&str>, StatusCode, &str)] = &[
+            (
+                "GET",
+                "/scp/dev/v1/health",
+                None,
+                StatusCode::OK,
+                "health 200",
+            ),
+            (
+                "GET",
+                "/scp/dev/v1/identity",
+                None,
+                StatusCode::OK,
+                "identity 200",
+            ),
+            (
+                "GET",
+                "/scp/dev/v1/relay/status",
+                None,
+                StatusCode::OK,
+                "relay status 200",
+            ),
+            (
+                "GET",
+                "/scp/dev/v1/contexts",
+                None,
+                StatusCode::OK,
+                "list contexts 200",
+            ),
+            (
+                "GET",
+                "/scp/dev/v1/contexts/deadbeef",
+                None,
+                StatusCode::OK,
+                "get context 200",
+            ),
+        ];
+
+        for &(method, path, body, expected_status, desc) in cases {
+            assert_json_content_type(&state, token, method, path, body, expected_status, desc)
+                .await;
+        }
+    }
+
+    /// Test I (part 2): Error responses and create/auth return JSON Content-Type.
+    #[tokio::test]
+    async fn error_and_create_endpoints_return_json_content_type() {
+        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let state = test_state(token);
+        state
+            .broadcast_contexts
+            .write()
+            .await
+            .push(crate::http::BroadcastContext {
+                id: "deadbeef".to_owned(),
+                name: Some("Test".to_owned()),
+            });
+
+        let error_cases: &[(&str, &str, Option<&str>, StatusCode, &str)] = &[
+            (
+                "GET",
+                "/scp/dev/v1/contexts/nonexistent",
+                None,
+                StatusCode::NOT_FOUND,
+                "get 404",
+            ),
+            (
+                "DELETE",
+                "/scp/dev/v1/contexts/nonexistent",
+                None,
+                StatusCode::NOT_FOUND,
+                "del 404",
+            ),
+            (
+                "POST",
+                "/scp/dev/v1/contexts",
+                Some(r#"{"id":""}"#),
+                StatusCode::BAD_REQUEST,
+                "empty 400",
+            ),
+            (
+                "POST",
+                "/scp/dev/v1/contexts",
+                Some(r#"{"id":"deadbeef"}"#),
+                StatusCode::CONFLICT,
+                "dup 409",
+            ),
+        ];
+
+        for &(method, path, body, expected_status, desc) in error_cases {
+            assert_json_content_type(&state, token, method, path, body, expected_status, desc)
+                .await;
+        }
+
+        // POST 201 (create) -- separate because it changes state.
+        assert_json_content_type(
+            &state,
+            token,
+            "POST",
+            "/scp/dev/v1/contexts",
+            Some(r#"{"id":"cafe0001","name":"Test I"}"#),
+            StatusCode::CREATED,
+            "create 201",
+        )
+        .await;
+
+        // Unauthenticated 401.
+        let router = dev_router(Arc::clone(&state), token.to_owned());
+        let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "unauth 401");
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("unauth 401: missing Content-Type")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("application/json"),
+            "unauth 401: Content-Type should be JSON, got: {content_type}"
+        );
     }
 }

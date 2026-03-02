@@ -1291,12 +1291,7 @@ impl<
         let dev_token = self.local_api_addr.map(generate_dev_token);
 
         // 5-8. Delegate to shared no-domain logic.
-        let strategy: Arc<dyn NatStrategy> = self.nat_strategy.unwrap_or_else(|| {
-            Arc::new(DefaultNatStrategy::new(
-                self.stun_server.clone(),
-                self.bridge_relay.clone(),
-            ))
-        });
+        let strategy = resolve_nat(self.nat_strategy, self.stun_server, self.bridge_relay);
 
         build_no_domain_inner(
             identity,

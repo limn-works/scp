@@ -22,7 +22,13 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 /// value.  Preserves URL-safe characters (`:`, `/`, `.`, `?`, `@`) so relay
 /// URLs remain human-readable, while encoding delimiters that would break
 /// query-string parsing.
-const QUERY_VALUE: &AsciiSet = &CONTROLS.add(b'&').add(b'=').add(b'#').add(b'+').add(b' ');
+const QUERY_VALUE: &AsciiSet = &CONTROLS
+    .add(b'%')
+    .add(b'&')
+    .add(b'=')
+    .add(b'#')
+    .add(b'+')
+    .add(b' ');
 
 use crate::http::NodeState;
 
@@ -75,8 +81,12 @@ pub async fn well_known_handler<B: BlobStorage>(
     let relay_config = RelayConfig {
         max_blob_size: Some(rc.max_blob_size as u64),
         max_blob_ttl: Some(u64::from(rc.max_blob_ttl)),
-        rate_limit_publish: Some(rc.rate_limit_publishes_per_second),
-        rate_limit_subscribe: Some(rc.rate_limit_subscribes_per_minute),
+        // Spec §18.3.3: unit is "per minute"; transport field is per-second.
+        rate_limit_publish: Some(rc.rate_limit_publishes_per_second.saturating_mul(60)),
+        // Spec §18.3.3: "Maximum concurrent subscriptions per connection."
+        rate_limit_subscribe: Some(
+            u32::try_from(rc.max_subscriptions_per_connection).unwrap_or(u32::MAX),
+        ),
         economic: None,
     };
 

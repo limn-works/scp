@@ -546,8 +546,21 @@ async fn scenario6_dev_api_reachable_alongside_public_server() {
         axum::serve(public_listener, public_router).await.ok();
     });
 
-    // Give the spawned servers a moment to start accepting connections.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait for the spawned servers to start accepting connections.
+    // A fixed sleep is flaky under CI load; instead, retry with backoff.
+    for addr in [dev_addr, public_addr] {
+        let mut retries = 0u64;
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(_) => break,
+                Err(_) if retries < 10 => {
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * retries)).await;
+                }
+                Err(e) => panic!("server at {addr} failed to start: {e}"),
+            }
+        }
+    }
 
     // --- Make authenticated HTTP request to the dev API health endpoint ---
     let response = raw_http_request(
