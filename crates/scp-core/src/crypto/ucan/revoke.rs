@@ -1543,6 +1543,60 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // compute_revocation_cid -- golden cross-bridge consistency
+    // -----------------------------------------------------------------------
+
+    /// Golden test: asserts the CID for a fixed payload matches a known value.
+    ///
+    /// This value is the canonical reference for bridge-specific tests in
+    /// `PyO3`, NAPI, `UniFFI`, and WASM. If this test fails, the CID algorithm
+    /// has changed and ALL bridges must be updated to match.
+    ///
+    /// Algorithm: SHA-256(serde_json::to_vec(payload)) rendered as lowercase
+    /// hex (64 chars). Fields with `skip_serializing_if = "Option::is_none"`
+    /// are omitted when `None`.
+    ///
+    /// Canonical JSON (compact, no whitespace):
+    /// ```text
+    /// {"iss":"did:dht:z6MkIssuer","aud":"did:dht:z6MkMember","exp":1700000000,
+    ///  "nnc":"1699999000000-aabbccdd11223344aabbccdd11223344",
+    ///  "att":[{"with":"scp:ctx:ctx-1/messages:write","can":"write"}],"prf":[]}
+    /// ```
+    #[test]
+    fn compute_revocation_cid_golden_value() {
+        use super::super::Attenuation;
+
+        // Fixed payload — every field is an explicit literal so changes are
+        // immediately visible in diffs. Does NOT use test_payload() because
+        // golden tests must be self-contained.
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkIssuer".to_owned(),
+            aud: "did:dht:z6MkMember".to_owned(),
+            exp: 1_700_000_000,
+            nbf: None,
+            nnc: "1699999000000-aabbccdd11223344aabbccdd11223344".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:ctx-1/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let cid = compute_revocation_cid(&payload);
+
+        // Golden value — SHA-256 of the canonical JSON above.
+        // Bridge tests (PyO3, NAPI, UniFFI, WASM) must assert this same value
+        // for the same input to guarantee cross-bridge consistency.
+        assert_eq!(
+            cid,
+            "18540c30bb67a573c397dad8c679a38df7450fcf284a0b5bf52942a11d6545ac",
+            "revocation CID golden value mismatch — if the algorithm changed, \
+             update this value AND all bridge-specific tests"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // revoke_ucan -- content-hash CID is found on subsequent lookup
     // -----------------------------------------------------------------------
 
