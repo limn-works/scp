@@ -467,6 +467,10 @@ const DEFAULT_CACHE_CAPACITY: usize = 10_000;
 
 impl ResolutionCache {
     /// Creates a new empty resolution cache with default capacity (10,000).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `DEFAULT_CACHE_CAPACITY` is zero (compile-time constant, always non-zero).
     #[must_use]
     #[allow(clippy::expect_used)]
     pub fn new() -> Self {

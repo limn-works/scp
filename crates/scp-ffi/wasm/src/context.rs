@@ -552,7 +552,7 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
     }
 
     // Transition to closed state.
-    *handle.state.borrow_mut() = "closed".to_owned();
+    "closed".clone_into(&mut handle.state.borrow_mut());
 
     future_to_promise(async move { Ok(JsValue::UNDEFINED) })
 }

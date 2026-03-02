@@ -36,6 +36,11 @@ use scp_platform::traits::Storage;
 ///
 /// Rejects strings containing `/`, `\`, `..`, or null bytes to prevent
 /// storage path traversal attacks.
+///
+/// # Errors
+///
+/// Returns [`StoreError::SerializationFailed`] if the input contains
+/// forbidden characters (`/`, `\`, `..`, or null bytes).
 pub fn sanitize_key_component(s: &str) -> Result<&str, StoreError> {
     if s.contains('/') || s.contains('\\') || s.contains("..") || s.contains('\0') {
         return Err(StoreError::SerializationFailed(format!(
