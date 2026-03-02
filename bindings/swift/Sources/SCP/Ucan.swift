@@ -66,7 +66,9 @@ internal enum UcanBridge {
     internal typealias ValidateFn = @Sendable (
         _ handle: ContextHandle,
         _ token: String,
-        _ capability: String
+        _ capability: String,
+        _ presentingAgentDid: String?,
+        _ proofTokens: [String]?
     ) async throws -> Void
 
     /// Mint a UCAN token. Maps to ``ucanMint`` in ScpBindings.
@@ -83,8 +85,8 @@ internal enum UcanBridge {
     ) async throws -> Void
 
     /// Default validate function that delegates to the UniFFI-generated binding.
-    internal static let defaultValidate: ValidateFn = { handle, token, capability in
-        try await ucanValidate(handle: handle, token: token, capability: capability)
+    internal static let defaultValidate: ValidateFn = { handle, token, capability, presentingAgentDid, proofTokens in
+        try await ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
     /// Default mint function that delegates to the UniFFI-generated binding.
@@ -94,7 +96,7 @@ internal enum UcanBridge {
 
     /// Default revoke function that delegates to the UniFFI-generated binding.
     internal static let defaultRevoke: RevokeFn = { handle, token in
-        try await ucanRevoke(handle: handle, tokenId: token)
+        try await ucanRevoke(handle: handle, token: token)
     }
 }
 
@@ -109,6 +111,8 @@ internal enum UcanBridge {
 ///   - handle: The ``ContextHandle`` for the context.
 ///   - token: The encoded UCAN token string.
 ///   - capability: The required capability string to validate against.
+///   - presentingAgentDid: Optional DID of the agent presenting the token.
+///   - proofTokens: Optional proof delegation chain tokens.
 ///   - validateFn: Bridge function override for testing.
 /// - Throws: ``ScpError/Permission(message:code:)`` if validation fails.
 ///
@@ -121,9 +125,11 @@ public func validateUcanToken(
     handle: ContextHandle,
     token: String,
     capability: String,
+    presentingAgentDid: String? = nil,
+    proofTokens: [String]? = nil,
     validateFn: UcanBridge.ValidateFn = UcanBridge.defaultValidate
 ) async throws {
-    try await validateFn(handle, token, capability)
+    try await validateFn(handle, token, capability, presentingAgentDid, proofTokens)
 }
 
 /// Mints a new UCAN token with the specified capabilities.
@@ -196,7 +202,7 @@ public func validate(
 ) async throws -> UcanValidationResult {
     let handle = ContextHandle(noPointer: .init())
     do {
-        try await validateFn(handle, encoded, presenterDid)
+        try await validateFn(handle, encoded, presenterDid, nil, nil)
         return UcanValidationResult(isValid: true, token: nil, failureReason: nil)
     } catch {
         return UcanValidationResult(isValid: false, token: nil, failureReason: "\(error)")

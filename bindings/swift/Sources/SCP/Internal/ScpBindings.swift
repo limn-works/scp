@@ -540,9 +540,8 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 /**
  * Opaque handle to an SCP context.
  *
- * Stores context metadata (ID, state, creator DID). The actual context
- * runtime (MLS group, transport connections) lives in scp-core and will be
- * wired in full integration stories.
+ * Stores context metadata (ID, state, creator DID) and, for in-memory
+ * custody, the key custody and signing key needed for UCAN minting.
  *
  * Generated as `class ContextHandle` in both Swift and Kotlin.
  *
@@ -575,9 +574,8 @@ public protocol ContextHandleProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to an SCP context.
  *
- * Stores context metadata (ID, state, creator DID). The actual context
- * runtime (MLS group, transport connections) lives in scp-core and will be
- * wired in full integration stories.
+ * Stores context metadata (ID, state, creator DID) and, for in-memory
+ * custody, the key custody and signing key needed for UCAN minting.
  *
  * Generated as `class ContextHandle` in both Swift and Kotlin.
  *
@@ -3106,7 +3104,7 @@ extension MemoryScope: Equatable, Hashable {}
 
 
 /**
- * Unified error type for the UniFFI bridge.
+ * Unified error type for the `UniFFI` bridge.
  *
  * Maps to Swift `ScpError` (an `enum` conforming to `Error`) and Kotlin
  * `ScpException` (a sealed exception hierarchy). Every function that can
@@ -3290,14 +3288,14 @@ extension ScpError: Foundation.LocalizedError {
 /**
  * Callback for platform device attestation.
  *
- * Swift SDK: DCAppAttestService (App Attest on iOS 14+ / macOS 11+).
+ * Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
  * Kotlin SDK: Play Integrity API on Android.
  *
  * Implemented by Swift/Kotlin code and injected into the Rust engine.
  *
  * # SAFETY: Thread execution context
  *
- * UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+ * `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
  * thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
  * NOT assume main-thread execution.
  *
@@ -3515,7 +3513,7 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
  *
  * # SAFETY: Thread execution context
  *
- * UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+ * `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
  * thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
  * NOT assume main-thread execution. Keychain / Secure Enclave operations are
  * generally thread-safe; UI updates triggered from within implementations
@@ -3550,6 +3548,32 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * Returns an opaque key identifier string.
      */
     func generateKeypair(keyType: String) async throws  -> String
+    
+    /**
+     * Perform X25519 Diffie-Hellman key agreement.
+     *
+     * `key_id` — the X25519 key handle.
+     * `peer_public` — 32-byte peer X25519 public key.
+     *
+     * Returns the 32-byte shared secret. The private key never leaves the
+     * custody boundary.
+     */
+    func dhAgree(keyId: String, peerPublic: Data) async throws  -> Data
+    
+    /**
+     * Derive a deterministic, context-scoped Ed25519 pseudonym keypair.
+     *
+     * Algorithm (all implementations MUST produce identical output):
+     * 1. `seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")`
+     * 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+     *
+     * ADR-027 amendment: use public key bytes as HMAC key for cross-platform
+     * determinism with hardware TEE keys.
+     *
+     * Returns a two-element list: `[public_key_bytes (32), key_id (string as UTF-8)]`.
+     * The bridge unpacks this into a `PseudonymKeypair`.
+     */
+    func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
     
     /**
      * Return the custody type for `key_id`: `"hardware"`, `"software"`, or
@@ -3741,6 +3765,96 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             )
             uniffiOutReturn.pointee = uniffiForeignFuture
         },
+        dhAgree: { (
+            uniffiHandle: UInt64,
+            keyId: RustBuffer,
+            peerPublic: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> Data in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.dhAgree(
+                     keyId: try FfiConverterString.lift(keyId),
+                     peerPublic: try FfiConverterData.lift(peerPublic)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Data) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterData.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
+        derivePseudonym: { (
+            uniffiHandle: UInt64,
+            keyId: RustBuffer,
+            contextId: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> Data in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.derivePseudonym(
+                     keyId: try FfiConverterString.lift(keyId),
+                     contextId: try FfiConverterData.lift(contextId)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Data) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterData.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
         custodyType: { (
             uniffiHandle: UInt64,
             keyId: RustBuffer,
@@ -3851,7 +3965,7 @@ public func FfiConverterCallbackInterfaceKeyCustodyProvider_lower(_ v: KeyCustod
  *
  * # SAFETY: Thread execution context
  *
- * UniFFI callbacks execute on whatever Rust tokio thread is currently
+ * `UniFFI` callbacks execute on whatever Rust tokio thread is currently
  * running — NOT on the Swift/Kotlin main thread. Implementations MUST be
  * thread-safe (`Send + Sync`) and MUST NOT assume main-thread execution.
  * Any UI or main-thread-only operations MUST be dispatched explicitly:
@@ -4046,7 +4160,7 @@ public func FfiConverterCallbackInterfaceMessageListener_lower(_ v: MessageListe
  *
  * # SAFETY: Thread execution context
  *
- * UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+ * `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
  * thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
  * NOT assume main-thread execution. APNs and FCM APIs are thread-safe;
  * any UI notification work triggered within an implementation MUST be
@@ -4252,11 +4366,11 @@ public func FfiConverterCallbackInterfacePushProvider_lower(_ v: PushProvider) -
  * Callback for platform persistent key-value storage.
  *
  * Swift SDK: Core Data / Keychain / file-based storage.
- * Kotlin SDK: Room / SharedPreferences.
+ * Kotlin SDK: Room / `SharedPreferences`.
  *
  * # SAFETY: Thread execution context
  *
- * UniFFI callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+ * `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
  * thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
  * NOT assume main-thread execution. Storage operations are generally
  * thread-safe (Core Data with proper context management, Room with DAOs).
@@ -4763,6 +4877,30 @@ fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -4942,7 +5080,7 @@ public func uniffiForeignFutureHandleCountScp() -> Int {
  * Closes an SCP context.
  *
  * Initiates the cooperative closing window: notifies members, generates
- * summaries (if memory_scope == Summary), and destroys keys per memory scope.
+ * summaries (if `memory_scope` == Summary), and destroys keys per memory scope.
  *
  * # Arguments
  *
@@ -5096,7 +5234,7 @@ public func contextSend(handle: ContextHandle, identity: Identity, payload: Data
  *
  * * `handle` — The context to subscribe to.
  * * `listener` — A `MessageListener` callback implementation (passed as Box
- * per UniFFI callback interface convention).
+ * per `UniFFI` callback interface convention).
  *
  * # Errors
  *
@@ -5190,7 +5328,15 @@ public func eventLogVerify(handle: ContextHandle, claimJson: String)async throws
  *
  * # Arguments
  *
- * * `custody` — The custody type string: `"in_memory"` or `"platform"`.
+ * * `custody` — The custody type string. Accepted values depend on the build
+ * configuration:
+ * - `"platform"` — always accepted; requires a wired `KeyCustodyProvider`.
+ * - `"software"` — always accepted; requires a wired `KeyCustodyProvider`.
+ * - `"in_memory"` — **only** accepted when the `allow_in_memory_custody`
+ * feature is enabled at compile time. Returns `ScpError::Identity` with
+ * code `SCP-IDN-1008` otherwise. Stores key material in unprotected heap
+ * memory; suitable for testing and development but NOT for production use
+ * on mobile devices.
  *
  * # Returns
  *
@@ -5199,19 +5345,21 @@ public func eventLogVerify(handle: ContextHandle, claimJson: String)async throws
  * # Errors
  *
  * Returns `ScpError::Identity` if key generation or DID creation fails.
+ * Returns `ScpError::Identity` with code `SCP-IDN-1008` if `"in_memory"` is
+ * requested but the `allow_in_memory_custody` feature is not enabled.
  * Returns `ScpError::Validation` if the custody string is not recognized.
  *
- * # In-memory custody
+ * # In-memory custody (feature-gated)
  *
- * When `custody` is `"in_memory"`, this function creates a real
- * `did:dht` identity using [`scp_core::identity::DidDht`] backed by
- * [`scp_platform::testing::InMemoryKeyCustody`]. The returned DID is
- * self-certifying and has the `did:dht:z` prefix.
+ * When `custody` is `"in_memory"` and the `allow_in_memory_custody` feature
+ * is enabled, this function creates a real `did:dht` identity using
+ * [`scp_core::identity::DidDht`] backed by `InMemoryKeyCustody`. The
+ * returned DID is self-certifying and has the `did:dht:z` prefix.
  *
  * `"in_memory"` custody stores key material in unprotected heap memory.
  * It is suitable for testing and development but NOT for production use
  * on mobile devices — use `"platform"` (Secure Enclave / Android Keystore)
- * in production.
+ * in production. See GitHub issue #88 and ADR-006.
  */
 public func identityCreate(custody: String)async throws  -> Identity  {
     return
@@ -5467,22 +5615,38 @@ public func transportStatus(manager: TransportManager)async throws  -> Transport
         )
 }
 /**
- * Mints a new UCAN token for a context member.
+ * Mints a new UCAN token for a context member with real Ed25519 signing.
+ *
+ * Uses the context creator's key custody and active signing key
+ * (retained on the context handle during `context_create`) to produce a
+ * properly signed UCAN token via `scp_core::crypto::ucan::mint::mint_ucan`.
+ *
+ * When the `allow_in_memory_custody` feature is enabled, uses the
+ * `InMemoryKeyCustody` retained on the context handle. When disabled,
+ * UCAN minting requires a wired `KeyCustodyProvider` (not yet
+ * implemented — returns an error).
  *
  * # Arguments
  *
- * * `handle` — The context to mint the token for.
+ * * `handle` — The context to mint the token for (must have key custody
+ * from `context_create` with an `in_memory` identity, or a wired
+ * `KeyCustodyProvider`).
  * * `member_did` — The DID of the member receiving the token.
- * * `capabilities` — List of capability URIs to grant.
+ * * `capabilities` — List of capability strings to grant (e.g.,
+ * `"messages:write"`). Scoped to the context automatically.
  *
  * # Returns
  *
- * A `UcanToken` handle with the minted token's metadata.
+ * A `UcanToken` handle with the minted token's metadata and a real
+ * Ed25519 signature.
  *
  * # Errors
  *
- * Returns `ScpError::Permission` if minting fails (capabilities outside
- * the context ceiling, issuer not authorized, etc.).
+ * Returns `ScpError::Permission` if the context does not have key custody
+ * (created from an `identity_load` handle without key material) or if
+ * signing fails.
+ *
+ * See RED-102 for the `KeyCustody` wiring story.
  */
 public func ucanMint(handle: ContextHandle, memberDid: String, capabilities: [String])async throws  -> UcanToken  {
     return
@@ -5508,18 +5672,18 @@ public func ucanMint(handle: ContextHandle, memberDid: String, capabilities: [St
  * # Arguments
  *
  * * `handle` — The context the token belongs to.
- * * `token_id` — The unique ID of the token to revoke.
+ * * `token` — The full encoded JWT string of the token to revoke.
  *
  * # Errors
  *
  * Returns `ScpError::Permission` if revocation fails (token not found,
  * revoker not authorized — must be the token's issuer or context creator).
  */
-public func ucanRevoke(handle: ContextHandle, tokenId: String)async throws   {
+public func ucanRevoke(handle: ContextHandle, token: String)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_ucan_revoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(tokenId)
+                uniffi_scp_ffi_uniffi_fn_func_ucan_revoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -5542,6 +5706,11 @@ public func ucanRevoke(handle: ContextHandle, tokenId: String)async throws   {
  * * `token` — The encoded UCAN token string (JWT format).
  * * `capability` — The required capability URI (e.g.,
  * `"scp:ctx:abc123/messages:write"`).
+ * * `presenting_agent_did` — Optional DID of the agent presenting the
+ * token. Falls back to the token's audience field if `None`. Required
+ * for ADR-016 step 5 (audience verification).
+ * * `proof_tokens` — Optional list of encoded UCAN proof tokens for
+ * delegation chain traversal (ADR-016 step 3).
  *
  * # Errors
  *
@@ -5549,11 +5718,11 @@ public func ucanRevoke(handle: ContextHandle, tokenId: String)async throws   {
  * invalid signature, expired, insufficient capabilities, revoked,
  * broken delegation chain).
  */
-public func ucanValidate(handle: ContextHandle, token: String, capability: String)async throws   {
+public func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_ucan_validate(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(capability)
+                uniffi_scp_ffi_uniffi_fn_func_ucan_validate(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(capability),FfiConverterOptionString.lower(presentingAgentDid),FfiConverterOptionSequenceString.lower(proofTokens)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -5579,10 +5748,10 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_close() != 58822) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_close() != 27411) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_create() != 54538) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_create() != 28748) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_join() != 63640) {
@@ -5594,7 +5763,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_send() != 19747) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_subscribe() != 42711) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_subscribe() != 40434) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_event_log_query() != 3128) {
@@ -5603,7 +5772,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_event_log_verify() != 52809) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 57708) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 20789) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_load() != 36247) {
@@ -5630,13 +5799,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 40821) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_mint() != 42553) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_mint() != 26230) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_revoke() != 21995) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_revoke() != 3772) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_validate() != 46998) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_validate() != 61065) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_context_id() != 2375) {
@@ -5699,7 +5868,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 22511) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 7348) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 52565) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 45052) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 57759) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_messagelistener_on_message() != 11557) {
