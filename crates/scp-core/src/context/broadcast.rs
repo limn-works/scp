@@ -100,7 +100,7 @@ impl AuthorState {
 // SubscriptionResult
 // ---------------------------------------------------------------------------
 
-/// Result returned by [`BroadcastContext::subscribe`].
+///// Result returned by [`BroadcastContext::subscribe`].
 ///
 /// Contains the current author key epochs so the new subscriber knows which
 /// epochs to request keys for, and the `MemberJoined` event that the caller
