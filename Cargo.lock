@@ -3622,7 +3622,6 @@ name = "scp-mcp"
 version = "0.1.0"
 dependencies = [
  "axum",
- "http-body-util",
  "scp-core",
  "serde",
  "serde_json",
