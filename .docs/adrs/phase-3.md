@@ -682,7 +682,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 ### Implementation
 
 - **Language:** Rust
-- **Library:** `rs-ucan` crate (or `ucan` crate — must support UCAN 0.10+ with mandatory nonce field). If no crate supports mandatory nonces, implement UCAN parsing and validation directly using `serde_json`, `ed25519-dalek`, and `base64`.
+- **Library:** `rs-ucan` crate (or `ucan` crate — must support UCAN 0.10+ with mandatory nonce field). If no crate supports mandatory nonces, implement UCAN parsing and validation directly using `serde_json`, `ed25519-dalek`, and `base64`. [Note: replaced by native impl in scp-core/src/crypto/ucan/]
 - **Crate:** `scp-core`
 - **Module:** `scp-core/crypto/ucan/` (extends the ADR-009 structure)
 - **Nonce storage:** In-memory `HashSet<String>` per context with 24-hour pruning, backed by `scp-platform` Storage trait for persistence across restarts.

@@ -315,7 +315,7 @@ Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core
 ### Implementation
 
 - **Language:** Rust
-- **Library:** `rs-ucan` crate (or `ucan` crate — evaluate for UCAN 0.10+ spec compliance)
+- **Library:** `rs-ucan` crate (or `ucan` crate — evaluate for UCAN 0.10+ spec compliance) [Note: replaced by native impl in scp-core/src/crypto/ucan/]
 - **Crate:** `scp-core`
 - **Modules:** `scp-core/context/roles.rs` (role definitions, assignment), `scp-core/crypto/ucan/` (UCAN wrapper, validation, revocation)
 - **Nonce tracking:** In-memory set of seen nonces per context, persisted to storage.
@@ -325,7 +325,7 @@ Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core
 
 - **ADR-008 (Context):** Roles exist within contexts. Role assignment happens on member join. The capability ceiling is a context parameter.
 - **ADR-003 (DID):** UCAN tokens are signed by DIDs. Delegation chains reference DIDs. Validation requires DID resolution for public key lookup.
-- **rs-ucan library:** Third-party UCAN implementation. Must support UCAN 0.10+ spec with mandatory nonce field.
+- **rs-ucan library:** Third-party UCAN implementation. Must support UCAN 0.10+ spec with mandatory nonce field. [Note: replaced by native impl in scp-core/src/crypto/ucan/]
 
 ### Acceptance Criteria
 
