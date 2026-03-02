@@ -195,76 +195,29 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 
     /// Constructs the BEP44 signable payload for a value and sequence number.
     ///
-    /// BEP44 signing payload format:
-    /// `"4:salt" + salt_len + ":" + salt + "3:seqi" + seq + "e1:v" + val_len + ":" + val`
-    ///
-    /// For did:dht, salt is not used, so the payload is:
-    /// `"3:seqi" + seq + "e1:v" + val_len + ":" + val`
+    /// Delegates to the standalone [`bep44_signable`] function.
     #[must_use]
     pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-        // BEP44 mutable item signable: "3:seqi<seq>e1:v<len>:<val>"
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"3:seqi");
-        payload.extend_from_slice(seq.to_string().as_bytes());
-        payload.extend_from_slice(b"e1:v");
-        payload.extend_from_slice(value.len().to_string().as_bytes());
-        payload.extend_from_slice(b":");
-        payload.extend_from_slice(value);
-        payload
+        bep44_signable(value, seq)
     }
 
     /// Verifies a BEP44 Ed25519 signature over the given value and sequence.
     ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Bep44SignatureInvalid`] if the signature does
-    /// not verify.
+    /// Delegates to the standalone [`verify_bep44_signature`] function.
     fn verify_bep44_signature(
         public_key: &[u8; 32],
         signature: &[u8; 64],
         value: &[u8],
         seq: u64,
     ) -> Result<(), IdentityError> {
-        let verifying_key = VerifyingKey::from_bytes(public_key).map_err(|e| {
-            IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}"))
-        })?;
-
-        let sig = ed25519_dalek::Signature::from_bytes(signature);
-        let payload = Self::bep44_signable(value, seq);
-
-        verifying_key.verify_strict(&payload, &sig).map_err(|e| {
-            IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
-        })
+        verify_bep44_signature(public_key, signature, value, seq)
     }
 
     /// Extracts the 32-byte public key from a `did:dht:z...` string.
     ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::InvalidDidFormat`] if the DID format is wrong
-    /// or z-base-32 decoding fails.
+    /// Delegates to the standalone [`extract_public_key`] function.
     fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
-        let encoded = did_string
-            .strip_prefix(DID_DHT_PREFIX)
-            .and_then(|s| s.strip_prefix('z'))
-            .ok_or_else(|| {
-                IdentityError::InvalidDidFormat(format!(
-                    "expected 'did:dht:z...' prefix, got: {did_string}"
-                ))
-            })?;
-
-        let decoded = zbase32::decode(encoded).map_err(|e| {
-            IdentityError::ZBase32DecodeError(format!("z-base-32 decode failed: {e}"))
-        })?;
-
-        let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-            IdentityError::InvalidDidFormat(format!(
-                "expected 32-byte public key, got {} bytes",
-                v.len()
-            ))
-        })?;
-
-        Ok(key_bytes)
+        extract_public_key(did_string)
     }
 
     /// Publishes a DID document to the DHT with the given signing function.
@@ -421,7 +374,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // Step 5: Verify self-certification.
         // The identity key (#0) in the document must match the public key
         // derived from the DID string.
-        Self::verify_self_certification(did_string, &document)?;
+        verify_self_certification(did_string, &document)?;
 
         // Step 6: Update cache.
         self.cache
@@ -727,35 +680,46 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             revealed_key: new_identity_bytes,
         }))
     }
+}
 
-    /// Verifies that the identity key in the document matches the DID's
-    /// z-base-32 encoded public key.
-    fn verify_self_certification(
-        did_string: &str,
-        document: &DidDocument,
-    ) -> Result<(), IdentityError> {
-        let public_key = Self::extract_public_key(did_string)?;
+/// Verifies that the identity key in a DID document matches the DID string's
+/// z-base-32 encoded public key (self-certification check).
+///
+/// This is the single, consolidated implementation used by:
+/// - `DidDht::resolve_did` (DHT resolution path)
+/// - `verify_and_deserialize` in `resolver.rs` (dual-layer resolution path)
+/// - `relay_resolve` in `resolution.rs` (relay resolution path)
+///
+/// # Errors
+///
+/// Returns [`IdentityError::SelfCertificationFailed`] if the document's identity
+/// key (`#0` verification method) does not match the public key encoded in the
+/// DID string.
+pub fn verify_self_certification(
+    did_string: &str,
+    document: &DidDocument,
+) -> Result<(), IdentityError> {
+    let public_key = extract_public_key(did_string)?;
 
-        // Find the #0 verification method (identity key).
-        let vm0 = document
-            .verification_method_by_fragment("0")
-            .ok_or_else(|| {
-                IdentityError::SelfCertificationFailed(
-                    "no #0 verification method in document".to_owned(),
-                )
-            })?;
+    // Find the #0 verification method (identity key).
+    let vm0 = document
+        .verification_method_by_fragment("0")
+        .ok_or_else(|| {
+            IdentityError::SelfCertificationFailed(
+                "no #0 verification method in document".to_owned(),
+            )
+        })?;
 
-        // Decode the multibase public key from the document.
-        let doc_key_bytes = decode_multibase_key(&vm0.public_key_multibase)?;
+    // Decode the multibase public key from the document.
+    let doc_key_bytes = decode_multibase_key(&vm0.public_key_multibase)?;
 
-        if doc_key_bytes != public_key {
-            return Err(IdentityError::SelfCertificationFailed(format!(
-                "identity key in document does not match DID suffix for {did_string}"
-            )));
-        }
-
-        Ok(())
+    if doc_key_bytes != public_key {
+        return Err(IdentityError::SelfCertificationFailed(format!(
+            "identity key in document does not match DID suffix for {did_string}"
+        )));
     }
+
+    Ok(())
 }
 
 /// Decodes a multibase-encoded public key (z-prefix = base58btc).
@@ -764,7 +728,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 ///
 /// Returns [`IdentityError::InvalidDidFormat`] if the key is not properly
 /// base58btc encoded.
-fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
+pub(crate) fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
     let b58_str = encoded.strip_prefix('z').ok_or_else(|| {
         IdentityError::InvalidDidFormat("multibase key must start with 'z' (base58btc)".to_owned())
     })?;
@@ -1025,6 +989,89 @@ pub fn verify_migration(
     }
 
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// BEP44 utility functions — public for use by relay-based resolution (§3.10.2)
+// ---------------------------------------------------------------------------
+
+/// Constructs the BEP44 signable payload for a value and sequence number.
+///
+/// BEP44 signing payload format (without salt):
+/// `"3:seqi" + seq + "e1:v" + val_len + ":" + val`
+///
+/// This is a standalone function usable from both [`DidDht`] and relay-based
+/// resolution (§3.10.2).
+#[must_use]
+pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"3:seqi");
+    payload.extend_from_slice(seq.to_string().as_bytes());
+    payload.extend_from_slice(b"e1:v");
+    payload.extend_from_slice(value.len().to_string().as_bytes());
+    payload.extend_from_slice(b":");
+    payload.extend_from_slice(value);
+    payload
+}
+
+/// Verifies a BEP44 Ed25519 signature over the given value and sequence.
+///
+/// Constructs the BEP44 signable payload, then verifies the Ed25519 signature
+/// against `public_key`. Used by both DHT resolution and relay-based resolution
+/// (§3.10.2).
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Bep44SignatureInvalid`] if the signature does
+/// not verify or the public key is invalid.
+pub fn verify_bep44_signature(
+    public_key: &[u8; 32],
+    signature: &[u8; 64],
+    value: &[u8],
+    seq: u64,
+) -> Result<(), IdentityError> {
+    let verifying_key = VerifyingKey::from_bytes(public_key)
+        .map_err(|e| IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}")))?;
+
+    let sig = ed25519_dalek::Signature::from_bytes(signature);
+    let payload = bep44_signable(value, seq);
+
+    verifying_key.verify_strict(&payload, &sig).map_err(|e| {
+        IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
+    })
+}
+
+/// Extracts the 32-byte Ed25519 public key from a `did:dht:z...` string.
+///
+/// Strips the `did:dht:z` prefix and z-base-32 decodes the remainder to recover
+/// the 32-byte Identity Key public key. Used by both DHT resolution and
+/// relay-based resolution (§3.10.2).
+///
+/// # Errors
+///
+/// Returns [`IdentityError::InvalidDidFormat`] if the DID format is wrong
+/// or z-base-32 decoding fails, or if the decoded bytes are not 32 bytes.
+pub fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
+    let encoded = did_string
+        .strip_prefix(DID_DHT_PREFIX)
+        .and_then(|s| s.strip_prefix('z'))
+        .ok_or_else(|| {
+            IdentityError::InvalidDidFormat(format!(
+                "expected 'did:dht:z...' prefix, got: {did_string}"
+            ))
+        })?;
+
+    let decoded = zbase32::decode(encoded)
+        .map_err(|e| IdentityError::ZBase32DecodeError(format!("z-base-32 decode failed: {e}")))?;
+
+    let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+        IdentityError::InvalidDidFormat(format!(
+            "expected 32-byte public key, got {} bytes",
+            v.len()
+        ))
+    })?;
+
+    Ok(key_bytes)
 }
 
 #[cfg(test)]

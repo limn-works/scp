@@ -18,10 +18,12 @@ serde_json = { workspace = true }
 serde_bytes = { workspace = true }
 bs58 = { workspace = true }
 hex = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+ed25519-dalek = { workspace = true }
 
 [lints]
 workspace = true

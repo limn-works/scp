@@ -254,11 +254,18 @@ impl<C: Clock> DidCache<C> {
         let mut entries = self.entries.lock().await;
         let now = self.clock.now();
 
-        // If entry exists, only update if new sequence is strictly greater.
-        if let Some(existing) = entries.get(did)
-            && sequence <= existing.sequence
-        {
-            return;
+        // If entry exists with a higher sequence, reject the update. If the
+        // sequence matches, refresh `last_verified` (the document was just
+        // re-verified) but keep the existing document to avoid a permanent
+        // re-resolution loop for stable identities.
+        if let Some(existing) = entries.get_mut(did) {
+            if sequence < existing.sequence {
+                return;
+            }
+            if sequence == existing.sequence {
+                existing.last_verified = now;
+                return;
+            }
         }
 
         let active = entries.get(did).is_some_and(|e| e.active);
@@ -316,6 +323,19 @@ impl<C: Clock> DidCache<C> {
     pub async fn cached_sequence(&self, did: &str) -> Option<u64> {
         let entries = self.entries.lock().await;
         entries.get(did).map(|e| e.sequence)
+    }
+
+    /// Returns the relay service URLs from a cached entry, ignoring TTL expiry.
+    ///
+    /// Unlike [`get()`](DidCache::get), this method returns URLs even from expired
+    /// entries. Used by [`super::resolver::DualLayerResolver`] to prefer an
+    /// identity's known relays over bootstrap relays even when the cache entry
+    /// has expired.
+    pub async fn cached_relay_urls(&self, did: &str) -> Option<Vec<String>> {
+        let entries = self.entries.lock().await;
+        let urls = entries.get(did)?.document.relay_service_urls();
+        drop(entries);
+        if urls.is_empty() { None } else { Some(urls) }
     }
 
     /// Removes a DID from the cache.
@@ -442,19 +462,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_with_same_sequence_is_rejected() {
+    async fn insert_with_same_sequence_keeps_document_refreshes_timestamp() {
         let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
+        let cache = DidCache::with_clock(Arc::clone(&clock));
         let did = "did:dht:zTest123";
         let doc1 = make_document(did);
         let doc2 = DidDocument::new(did, &[10u8; 32], &[20u8; 32], &[30u8; 32]);
 
         cache.insert(did, doc1.clone(), 5).await;
+
+        // Advance time so we can verify last_verified is refreshed.
+        clock.advance(STALENESS_THRESHOLD_SECS + 1);
+
+        // Before re-insert, entry should be stale.
+        let result_before = cache.get(did).await.unwrap();
+        assert!(matches!(result_before.staleness, Staleness::Stale { .. }));
+
+        // Re-insert with same seq refreshes last_verified.
         cache.insert(did, doc2, 5).await;
 
-        let result = cache.get(did).await.unwrap();
-        assert_eq!(result.document, doc1);
-        assert_eq!(result.sequence, 5);
+        // After re-insert, entry should be fresh again (last_verified updated).
+        let result_after = cache.get(did).await.unwrap();
+        assert_eq!(result_after.document, doc1); // Original document preserved
+        assert_eq!(result_after.sequence, 5);
+        assert_eq!(result_after.staleness, Staleness::Fresh); // Timestamp refreshed
     }
 
     #[tokio::test]
@@ -534,5 +565,57 @@ mod tests {
 
         let result = cache.get(did).await.unwrap();
         assert_eq!(result.staleness, Staleness::Fresh);
+    }
+
+    #[tokio::test]
+    async fn cached_relay_urls_returns_urls_from_expired_entry() {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = DidCache::with_clock(Arc::clone(&clock));
+        let did = "did:dht:zRelayCache";
+
+        // Create a document with relay service entries.
+        let mut doc = make_document(did);
+        doc.add_relay_service("wss://relay1.example.com/scp/v1")
+            .unwrap();
+        doc.add_relay_service("wss://relay2.example.com/scp/v1")
+            .unwrap();
+
+        cache.insert(did, doc, 1).await;
+
+        // Advance past the inactive TTL (7 days) so cache.get() returns None.
+        clock.advance(INACTIVE_REFRESH_SECS + 1);
+        assert!(cache.get(did).await.is_none(), "entry should be expired");
+
+        // cached_relay_urls should still return the relay URLs from the expired entry.
+        let urls = cache.cached_relay_urls(did).await;
+        assert!(urls.is_some(), "should return URLs from expired entry");
+        let urls = urls.unwrap();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "wss://relay1.example.com/scp/v1");
+        assert_eq!(urls[1], "wss://relay2.example.com/scp/v1");
+    }
+
+    #[tokio::test]
+    async fn cached_relay_urls_returns_none_for_missing_did() {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = DidCache::with_clock(clock);
+
+        assert!(cache.cached_relay_urls("did:dht:zMissing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_relay_urls_returns_none_when_no_relays() {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = DidCache::with_clock(clock);
+        let did = "did:dht:zNoRelays";
+
+        // Document without any relay services.
+        let doc = make_document(did);
+        cache.insert(did, doc, 1).await;
+
+        assert!(
+            cache.cached_relay_urls(did).await.is_none(),
+            "should return None when document has no relay services"
+        );
     }
 }

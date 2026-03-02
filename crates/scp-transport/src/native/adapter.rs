@@ -28,6 +28,7 @@ use scp_core::envelope::OuterEnvelope;
 use super::client::{NativeRelayClient, SubscriptionMessage};
 use super::protocol::{ClientMessage, RelayMessage};
 use crate::error::TransportError;
+use crate::relay::connection::{SourcedRelayUrl, validate_relay_url};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
@@ -42,14 +43,25 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///
 /// # Construction
 ///
-/// Use [`NativeRelayAdapter::connect`] to create an adapter connected to a
-/// relay at the given URL.
+/// Use [`NativeRelayAdapter::connect_sourced`] for production connections
+/// with provenance-based transport security validation (§10.12.6), or
+/// [`NativeRelayAdapter::connect`] for internal/test usage without
+/// provenance tracking.
 ///
 /// # Examples
 ///
 /// ```rust,ignore
 /// use scp_transport::native::adapter::NativeRelayAdapter;
+/// use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 ///
+/// // Production: validate ws:// vs wss:// based on discovery source.
+/// let sourced = SourcedRelayUrl {
+///     url: "wss://relay.example.com/scp/v1".to_owned(),
+///     source: RelayUrlSource::WellKnown,
+/// };
+/// let adapter = NativeRelayAdapter::connect_sourced(&sourced).await?;
+///
+/// // Test/internal: no provenance validation.
 /// let adapter = NativeRelayAdapter::connect("ws://127.0.0.1:9000/scp/v1").await?;
 /// ```
 pub struct NativeRelayAdapter {
@@ -57,18 +69,67 @@ pub struct NativeRelayAdapter {
     client: NativeRelayClient,
 }
 
+impl std::fmt::Debug for NativeRelayAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeRelayAdapter").finish_non_exhaustive()
+    }
+}
+
 impl NativeRelayAdapter {
-    /// Creates a new adapter connected to the given relay URL.
+    /// Creates a new adapter connected to the given relay URL **without**
+    /// provenance-based transport security validation.
     ///
     /// The URL should be of the form `ws://host:port/scp/v1` or
     /// `wss://host:port/scp/v1`.
+    ///
+    /// **Important:** This method does not enforce the `ws://` vs `wss://`
+    /// rules from spec section 10.12.6. Use [`connect_sourced`] when the
+    /// relay URL has known provenance (e.g., DHT-resolved, `.well-known`,
+    /// explicit config). This method exists for backwards compatibility and
+    /// internal/test usage where provenance is not tracked.
+    ///
+    /// [`connect_sourced`]: Self::connect_sourced
     ///
     /// # Errors
     ///
     /// Returns [`TransportError::ConnectionFailed`] if the initial connection
     /// cannot be established.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use connect_sourced() for provenance-based transport security validation (section 10.12.6)"
+    )]
     pub async fn connect(url: &str) -> Result<Self, TransportError> {
         let client = NativeRelayClient::connect(url).await?;
+        Ok(Self { client })
+    }
+
+    /// Creates a new adapter connected to a relay URL with provenance-based
+    /// transport security validation (§10.12.6).
+    ///
+    /// Validates the URL scheme against the discovery source before connecting:
+    ///
+    /// - `wss://` is always permitted regardless of source.
+    /// - `ws://` is permitted **only** for [`RelayUrlSource::DhtResolved`] URLs
+    ///   (self-hosted relays behind NAT with BEP44-signed DID documents).
+    /// - `ws://` from any other source (`.well-known`, explicit config, peer
+    ///   discovery) is rejected to prevent downgrade attacks.
+    ///
+    /// This is the recommended connection method for production use. All relay
+    /// URLs with known provenance should go through this path.
+    ///
+    /// [`RelayUrlSource::DhtResolved`]: crate::relay::connection::RelayUrlSource::DhtResolved
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] if the URL scheme is not
+    /// permitted for the given source (e.g., `ws://` from a `.well-known`
+    /// endpoint).
+    ///
+    /// Returns [`TransportError::ConnectionFailed`] if the URL passes
+    /// validation but the WebSocket connection cannot be established.
+    pub async fn connect_sourced(sourced: &SourcedRelayUrl) -> Result<Self, TransportError> {
+        validate_relay_url(&sourced.url, &sourced.source)?;
+        let client = NativeRelayClient::connect(&sourced.url).await?;
         Ok(Self { client })
     }
 }
@@ -274,8 +335,11 @@ fn relay_message_to_event(msg: RelayMessage) -> Option<TransportEvent> {
                 )))
             }
         }
-        // OK and PONG don't map to transport events.
-        RelayMessage::Ok { .. } | RelayMessage::Pong { .. } => None,
+        // OK, PONG, and BRIDGE_DATA don't map to transport events.
+        // Bridge data is handled by the bridge service layer.
+        RelayMessage::Ok { .. } | RelayMessage::Pong { .. } | RelayMessage::BridgeData { .. } => {
+            None
+        }
     }
 }
 
@@ -442,5 +506,76 @@ mod tests {
             }
             other => panic!("expected BlobIntegrityError event, got {other:?}"),
         }
+    }
+
+    // --- connect_sourced validation tests ---
+
+    /// Verifies that `connect_sourced` rejects ws:// URLs from non-DHT sources
+    /// before attempting a connection (§10.12.6).
+    #[tokio::test]
+    async fn connect_sourced_rejects_ws_from_well_known() {
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        let sourced = SourcedRelayUrl {
+            url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
+            source: RelayUrlSource::WellKnown,
+        };
+        let err = NativeRelayAdapter::connect_sourced(&sourced)
+            .await
+            .expect_err("ws:// from WellKnown must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ws://"),
+            "error should mention ws://, got: {msg}"
+        );
+        assert!(
+            msg.contains("WellKnown"),
+            "error should mention source, got: {msg}"
+        );
+    }
+
+    /// Verifies that `connect_sourced` rejects ws:// URLs from explicit config.
+    #[tokio::test]
+    async fn connect_sourced_rejects_ws_from_explicit() {
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        let sourced = SourcedRelayUrl {
+            url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
+            source: RelayUrlSource::Explicit,
+        };
+        let err = NativeRelayAdapter::connect_sourced(&sourced)
+            .await
+            .expect_err("ws:// from Explicit must be rejected");
+        assert!(err.to_string().contains("Explicit"));
+    }
+
+    /// Verifies that `connect_sourced` rejects ws:// URLs from peer discovery.
+    #[tokio::test]
+    async fn connect_sourced_rejects_ws_from_peer_discovered() {
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        let sourced = SourcedRelayUrl {
+            url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
+            source: RelayUrlSource::PeerDiscovered,
+        };
+        let err = NativeRelayAdapter::connect_sourced(&sourced)
+            .await
+            .expect_err("ws:// from PeerDiscovered must be rejected");
+        assert!(err.to_string().contains("PeerDiscovered"));
+    }
+
+    /// Verifies that `connect_sourced` rejects invalid schemes (e.g., http://).
+    #[tokio::test]
+    async fn connect_sourced_rejects_invalid_scheme() {
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        let sourced = SourcedRelayUrl {
+            url: "http://relay.example.com/scp/v1".to_owned(),
+            source: RelayUrlSource::DhtResolved,
+        };
+        let err = NativeRelayAdapter::connect_sourced(&sourced)
+            .await
+            .expect_err("http:// scheme must be rejected");
+        assert!(err.to_string().contains("ws:// or wss://"));
     }
 }

@@ -33,6 +33,7 @@ pub mod cover_traffic;
 pub mod error;
 pub mod heartbeat;
 pub mod manager;
+pub mod nat;
 pub mod native;
 pub mod relay;
 pub mod scoring;
@@ -48,5 +49,9 @@ pub use heartbeat::{
     HeartbeatConfig, HeartbeatConfigError, HeartbeatMonitor, SuppressionSuspected,
 };
 pub use manager::TransportManager;
+pub use nat::{
+    MappingProtocol, NatKeepalive, NatProbeResult, NatProber, NatTierChange, NatType, PortMapper,
+    PortMappingError, PortMappingManager, PortMappingResult, StunEndpoint,
+};
 pub use scoring::SuppressionWarning;
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
