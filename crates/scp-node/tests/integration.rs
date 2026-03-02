@@ -24,9 +24,32 @@ use scp_core::identity::dht_client::InMemoryDhtClient;
 use scp_core::identity::{DidCache, DidMethod};
 use scp_core::uri::ScpUri;
 use scp_core::well_known::WellKnownScp;
-use scp_node::ApplicationNodeBuilder;
+use scp_node::{ApplicationNodeBuilder, TlsProvider};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::protocol::{ClientMessage, RelayMessage};
+
+/// Mock TLS provider that succeeds with a self-signed certificate.
+///
+/// Used in integration tests to avoid contacting a real ACME server.
+struct SucceedingTlsProvider {
+    domain: String,
+}
+
+impl TlsProvider for SucceedingTlsProvider {
+    fn provision(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<scp_node::tls::CertificateData, scp_node::tls::TlsError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let domain = self.domain.clone();
+        Box::pin(async move { scp_node::tls::generate_self_signed(&domain) })
+    }
+}
 
 /// Concrete `DidDht` type used in tests (in-memory DHT and system clock).
 type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
@@ -55,6 +78,9 @@ async fn build_test_node() -> (
     let node = ApplicationNodeBuilder::new()
         .storage(Arc::new(InMemoryStorage::new()))
         .domain("test.example.com")
+        .tls_provider(Arc::new(SucceedingTlsProvider {
+            domain: "test.example.com".to_owned(),
+        }))
         .generate_identity_with(custody, Arc::new(did_dht))
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
         .build()

@@ -61,6 +61,10 @@ pub enum NodeError {
     /// NAT traversal failed during zero-config deployment.
     #[error("NAT traversal error: {0}")]
     Nat(String),
+
+    /// TLS provisioning failed.
+    #[error("TLS error: {0}")]
+    Tls(#[from] tls::TlsError),
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +455,38 @@ impl NatStrategy for DefaultNatStrategy {
 }
 
 // ---------------------------------------------------------------------------
+// TLS provider (mockable ACME provisioning for testability)
+// ---------------------------------------------------------------------------
+
+/// Strategy for TLS certificate provisioning (spec section 18.6.3).
+///
+/// Abstracted as a trait to enable mock implementations in tests.
+/// Production code uses [`AcmeProvider`](tls::AcmeProvider); tests can inject
+/// providers that succeed or fail deterministically.
+pub trait TlsProvider: Send + Sync {
+    /// Attempt to provision or load a TLS certificate for the domain.
+    ///
+    /// On success, returns [`CertificateData`](tls::CertificateData) for
+    /// configuring the TLS acceptor.
+    fn provision(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>> + Send + '_>,
+    >;
+}
+
+/// Blanket [`TlsProvider`] for [`AcmeProvider`](tls::AcmeProvider).
+impl<S: Storage + 'static> TlsProvider for tls::AcmeProvider<S> {
+    fn provision(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>> + Send + '_>,
+    > {
+        Box::pin(self.load_or_provision())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ApplicationNodeBuilder
 // ---------------------------------------------------------------------------
 
@@ -486,10 +522,6 @@ pub struct ApplicationNodeBuilder<
     storage: Option<Arc<S>>,
     blob_storage: Option<B>,
     bind_addr: Option<SocketAddr>,
-    // Intentional dead code: TLS provisioning is not yet implemented (ADR-032 AC 7).
-    // This field is part of the builder API surface per SCP-145. It will be consumed
-    // when TLS certificate provisioning is added.
-    #[allow(dead_code)]
     acme_email: Option<String>,
     /// Override the STUN endpoint for NAT type probing (§10.12.8).
     stun_server: Option<String>,
@@ -497,6 +529,8 @@ pub struct ApplicationNodeBuilder<
     bridge_relay: Option<String>,
     /// Pluggable NAT strategy for testability.
     nat_strategy: Option<Arc<dyn NatStrategy>>,
+    /// Pluggable TLS provider for testability (domain mode only).
+    tls_provider: Option<Arc<dyn TlsProvider>>,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -518,6 +552,7 @@ impl ApplicationNodeBuilder {
             stun_server: None,
             bridge_relay: None,
             nat_strategy: None,
+            tls_provider: None,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -564,6 +599,7 @@ impl<
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            tls_provider: self.tls_provider,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -590,6 +626,7 @@ impl<
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            tls_provider: self.tls_provider,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -654,6 +691,17 @@ impl<
         self.nat_strategy = Some(strategy);
         self
     }
+
+    /// Sets a custom TLS provider for testability.
+    ///
+    /// Production code uses [`AcmeProvider`](tls::AcmeProvider) (created
+    /// automatically during domain `build()`). Tests can inject mock
+    /// providers that succeed or fail deterministically.
+    #[must_use]
+    pub fn tls_provider(mut self, provider: Arc<dyn TlsProvider>) -> Self {
+        self.tls_provider = Some(provider);
+        self
+    }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, Dom, Id>
@@ -676,6 +724,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, 
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            tls_provider: self.tls_provider,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -703,6 +752,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            tls_provider: self.tls_provider,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -736,6 +786,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            tls_provider: self.tls_provider,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -762,6 +813,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            tls_provider: self.tls_provider,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -812,9 +864,7 @@ impl<
         let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
 
         // 3. Obtain identity.
-        let relay_url = format!("wss://{domain}/scp/v1");
-
-        let (identity, mut document, did_method) = match identity_source {
+        let (identity, document, did_method) = match identity_source {
             IdentitySource::Generate {
                 key_custody,
                 did_method,
@@ -827,10 +877,7 @@ impl<
             }
         };
 
-        // 4. Add SCPRelay service entry to the DID document (local-only, no network).
-        document.add_relay_service(&relay_url)?;
-
-        // 5. Generate a shared secret for the internal WebSocket bridge.
+        // 4. Generate a shared secret for the internal WebSocket bridge.
         //    The axum handler includes this token when connecting to the relay;
         //    the relay rejects connections without it (defense-in-depth, #85).
         let bridge_secret: [u8; 32] = rand::random();
@@ -853,42 +900,155 @@ impl<
         let relay_server = RelayServer::new(relay_config, blob_storage);
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
-        // 7. Publish DID document now that the relay is confirmed listening.
+        // 7. Attempt TLS provisioning (§10.12.8 step 4).
         //
-        // §10.12.8: If domain-based deployment fails (DNS misconfigured, ACME
-        // challenge fails), log the failure and fall through to no_domain behavior.
-        // ACME provisioning is not yet wired into this build path — see SCP-246.
-        // When wired, wrap this block in a match and fall through to
-        // `build_no_domain_inner` on ACME failure.
-        did_method.publish(&identity, &document).await?;
+        //    If TLS provisioning succeeds, proceed with domain-based deployment
+        //    (wss://, .well-known/scp). If it fails (DNS misconfigured, ACME
+        //    challenge fails, port 80/443 unreachable), log the failure and fall
+        //    through to no_domain behavior (NAT probing, Tiers 1-3).
+        let tls_provider: Arc<dyn TlsProvider> =
+            self.tls_provider.unwrap_or_else(|| {
+                let mut provider = tls::AcmeProvider::new(&domain, Arc::clone(&storage));
+                if let Some(ref email) = self.acme_email {
+                    provider = provider.with_email(email);
+                }
+                Arc::new(provider)
+            });
 
-        tracing::info!(
-            domain = %domain,
-            relay_url = %relay_url,
-            bound_addr = %bound_addr,
-            did = %identity.did,
-            "application node started (domain mode)"
-        );
+        match tls_provider.provision().await {
+            Ok(_cert_data) => {
+                // TLS provisioned successfully — proceed with domain deployment.
+                let relay_url = format!("wss://{domain}/scp/v1");
 
-        let state = Arc::new(http::NodeState {
-            did: identity.did.clone(),
-            relay_url: relay_url.clone(),
-            broadcast_contexts: RwLock::new(Vec::new()),
-            relay_addr: bound_addr,
-            bridge_secret,
+                let mut document = document;
+                document.add_relay_service(&relay_url)?;
+
+                did_method.publish(&identity, &document).await?;
+
+                tracing::info!(
+                    domain = %domain,
+                    relay_url = %relay_url,
+                    bound_addr = %bound_addr,
+                    did = %identity.did,
+                    "application node started (domain mode)"
+                );
+
+                let state = Arc::new(http::NodeState {
+                    did: identity.did.clone(),
+                    relay_url: relay_url.clone(),
+                    broadcast_contexts: RwLock::new(Vec::new()),
+                    relay_addr: bound_addr,
+                    bridge_secret,
+                });
+
+                Ok(ApplicationNode {
+                    domain: Some(domain),
+                    relay: RelayHandle {
+                        bound_addr,
+                        shutdown_handle,
+                    },
+                    identity: IdentityHandle { identity, document },
+                    storage,
+                    state,
+                })
+            }
+            Err(tls_err) => {
+                tracing::warn!(
+                    domain = %domain,
+                    error = %tls_err,
+                    "domain-based TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
+                );
+
+                let strategy: Arc<dyn NatStrategy> =
+                    self.nat_strategy.unwrap_or_else(|| {
+                        Arc::new(DefaultNatStrategy::new(
+                            self.stun_server.clone(),
+                            self.bridge_relay.clone(),
+                        ))
+                    });
+
+                build_no_domain_inner(
+                    identity,
+                    document,
+                    did_method,
+                    storage,
+                    shutdown_handle,
+                    bound_addr,
+                    strategy,
+                )
+                .await
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared no-domain build logic (used by HasNoDomain::build and domain fallthrough)
+// ---------------------------------------------------------------------------
+
+async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
+    identity: ScpIdentity,
+    mut document: DidDocument,
+    did_method: Arc<D>,
+    storage: Arc<S>,
+    shutdown_handle: ShutdownHandle,
+    bound_addr: SocketAddr,
+    nat_strategy: Arc<dyn NatStrategy>,
+) -> Result<ApplicationNode<S>, NodeError> {
+    let tier = nat_strategy.select_tier(bound_addr.port()).await?;
+
+    let relay_url = match &tier {
+        ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
+            format!("ws://{external_addr}/scp/v1")
+        }
+        ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
+    };
+
+    let relay_count = document
+        .service
+        .iter()
+        .filter(|s| s.service_type == "SCPRelay")
+        .count();
+
+    document
+        .service
+        .push(scp_core::identity::document::Service {
+            id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
+            service_type: "SCPRelay".to_owned(),
+            service_endpoint: relay_url.clone(),
         });
 
-        Ok(ApplicationNode {
-            domain: Some(domain),
-            relay: RelayHandle {
-                bound_addr,
-                shutdown_handle,
-            },
-            identity: IdentityHandle { identity, document },
-            storage,
-            state,
-        })
-    }
+    // 4. Publish DID document.
+    did_method.publish(&identity, &document).await?;
+
+    tracing::info!(
+        tier = ?tier,
+        relay_url = %relay_url,
+        bound_addr = %bound_addr,
+        did = %identity.did,
+        "application node started (no-domain mode, §10.12.8)"
+    );
+
+    let bridge_secret: [u8; 32] = rand::random();
+    let state = Arc::new(http::NodeState {
+        did: identity.did.clone(),
+        relay_url,
+        broadcast_contexts: RwLock::new(Vec::new()),
+        relay_addr: bound_addr,
+        bridge_secret,
+    });
+
+    // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
+    Ok(ApplicationNode {
+        domain: None,
+        relay: RelayHandle {
+            bound_addr,
+            shutdown_handle,
+        },
+        identity: IdentityHandle { identity, document },
+        storage,
+        state,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -933,7 +1093,7 @@ impl<
         let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
 
         // 2. Obtain identity.
-        let (identity, mut document, did_method) = match identity_source {
+        let (identity, document, did_method) = match identity_source {
             IdentitySource::Generate {
                 key_custody,
                 did_method,
@@ -962,7 +1122,7 @@ impl<
         let relay_server = RelayServer::new(relay_config, blob_storage);
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
-        // 4. Probe NAT type and select reachability tier (§10.12.8).
+        // 4-8. Delegate to shared no-domain logic.
         let strategy: Arc<dyn NatStrategy> = self.nat_strategy.unwrap_or_else(|| {
             Arc::new(DefaultNatStrategy::new(
                 self.stun_server.clone(),
@@ -970,62 +1130,16 @@ impl<
             ))
         });
 
-        let tier = strategy.select_tier(bound_addr.port()).await?;
-
-        // 5. Construct relay URL based on tier (§10.12.7).
-        let relay_url = match &tier {
-            ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
-                format!("ws://{external_addr}/scp/v1")
-            }
-            ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
-        };
-
-        // 6. Add SCPRelay service entry to the DID document.
-        //    `add_relay_service` requires wss://, but Tiers 1-2 use ws://.
-        //    Construct the service entry directly per §10.12.7.
-        let relay_count = document
-            .service
-            .iter()
-            .filter(|s| s.service_type == "SCPRelay")
-            .count();
-
-        document
-            .service
-            .push(scp_core::identity::document::Service {
-                id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
-                service_type: "SCPRelay".to_owned(),
-                service_endpoint: relay_url.clone(),
-            });
-
-        // 7. Publish DID document.
-        did_method.publish(&identity, &document).await?;
-
-        tracing::info!(
-            tier = ?tier,
-            relay_url = %relay_url,
-            bound_addr = %bound_addr,
-            did = %identity.did,
-            "application node started (no-domain mode, §10.12.8)"
-        );
-
-        let state = Arc::new(http::NodeState {
-            did: identity.did.clone(),
-            relay_url,
-            broadcast_contexts: RwLock::new(Vec::new()),
-            relay_addr: bound_addr,
-        });
-
-        // 8. Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
-        Ok(ApplicationNode {
-            domain: None,
-            relay: RelayHandle {
-                bound_addr,
-                shutdown_handle,
-            },
-            identity: IdentityHandle { identity, document },
+        build_no_domain_inner(
+            identity,
+            document,
+            did_method,
             storage,
-            state,
-        })
+            shutdown_handle,
+            bound_addr,
+            strategy,
+        )
+        .await
     }
 }
 
@@ -1258,7 +1372,51 @@ mod tests {
         DidDht::with_client_and_signer(dht_client, cache, sign_fn)
     }
 
+    /// Mock TLS provider that succeeds with a self-signed certificate.
+    struct SucceedingTlsProvider {
+        domain: String,
+    }
+
+    impl TlsProvider for SucceedingTlsProvider {
+        fn provision(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let domain = self.domain.clone();
+            Box::pin(async move { tls::generate_self_signed(&domain) })
+        }
+    }
+
+    /// Mock TLS provider that always fails (simulates ACME failure).
+    struct FailingTlsProvider;
+
+    impl TlsProvider for FailingTlsProvider {
+        fn provision(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Err(tls::TlsError::Acme(
+                    "ACME challenge failed (mock)".to_owned(),
+                ))
+            })
+        }
+    }
+
     /// Helper: creates a builder with domain and `generate_identity` configured.
+    ///
+    /// Uses a [`SucceedingTlsProvider`] so domain-mode tests proceed without
+    /// contacting a real ACME server.
     fn test_builder() -> ApplicationNodeBuilder<
         InMemoryKeyCustody,
         TestDidDht,
@@ -1272,6 +1430,9 @@ mod tests {
         ApplicationNodeBuilder::new()
             .storage(Arc::new(InMemoryStorage::new()))
             .domain("test.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "test.example.com".to_owned(),
+            }))
             .generate_identity_with(custody, did_method)
     }
 
@@ -1369,6 +1530,9 @@ mod tests {
 
         let node = ApplicationNodeBuilder::new()
             .domain("explicit.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "explicit.example.com".to_owned(),
+            }))
             .identity(identity, document, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
             .build()
@@ -1447,6 +1611,9 @@ mod tests {
 
         let _node = ApplicationNodeBuilder::new()
             .domain("counting.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "counting.example.com".to_owned(),
+            }))
             .generate_identity_with(custody, counting_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
             .build()
@@ -1585,6 +1752,9 @@ mod tests {
 
         let _node = ApplicationNodeBuilder::new()
             .domain("relay-order.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "relay-order.example.com".to_owned(),
+            }))
             .generate_identity_with(custody, check_method)
             .bind_addr(bind_addr)
             .build()
@@ -1617,6 +1787,9 @@ mod tests {
         let node = ApplicationNodeBuilder::new()
             .storage(custom_storage)
             .domain("storage.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "storage.example.com".to_owned(),
+            }))
             .generate_identity_with(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
             .build()
@@ -1858,6 +2031,90 @@ mod tests {
         );
         assert_eq!(node.relay_url(), "wss://test.example.com/scp/v1");
         assert_eq!(node.domain(), Some("test.example.com"));
+    }
+
+    #[tokio::test]
+    async fn domain_fallthrough_on_acme_failure_probes_nat() {
+        // AC9: When .domain() is set and TLS provisioning fails (ACME),
+        // automatic fallthrough to Tiers 1-3 (§10.12.8 step 4).
+        // AC11: Verify that NAT is probed on fallthrough.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Mock NAT strategy that records whether it was called.
+        struct RecordingNatStrategy {
+            called: Arc<AtomicBool>,
+            tier: ReachabilityTier,
+        }
+
+        impl NatStrategy for RecordingNatStrategy {
+            fn select_tier(
+                &self,
+                _relay_port: u16,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                self.called.store(true, Ordering::SeqCst);
+                let tier = self.tier.clone();
+                Box::pin(async move { Ok(tier) })
+            }
+        }
+
+        let nat_called = Arc::new(AtomicBool::new(false));
+        let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let node = ApplicationNodeBuilder::new()
+            .storage(Arc::new(InMemoryStorage::new()))
+            .domain("fail.example.com")
+            .tls_provider(Arc::new(FailingTlsProvider))
+            .nat_strategy(Arc::new(RecordingNatStrategy {
+                called: Arc::clone(&nat_called),
+                tier: ReachabilityTier::Stun { external_addr },
+            }))
+            .generate_identity_with(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        // Verify fallthrough happened: domain should be None.
+        assert!(
+            node.domain().is_none(),
+            "domain should be None after TLS fallthrough"
+        );
+
+        // Verify NAT was probed (AC11).
+        assert!(
+            nat_called.load(Ordering::SeqCst),
+            "NAT strategy should have been called on ACME failure fallthrough"
+        );
+
+        // Verify the relay URL uses ws:// (not wss://).
+        assert!(
+            node.relay_url().starts_with("ws://"),
+            "fallthrough should use ws:// URL, got: {}",
+            node.relay_url()
+        );
+        assert_eq!(node.relay_url(), "ws://198.51.100.7:32891/scp/v1");
+
+        // Verify the relay is bound and functioning.
+        assert_ne!(
+            node.relay().bound_addr().port(),
+            0,
+            "relay should be bound to a real port after fallthrough"
+        );
+
+        // Verify identity was created.
+        assert!(
+            node.identity().did().starts_with("did:dht:"),
+            "DID should start with did:dht:"
+        );
     }
 
     #[tokio::test]
