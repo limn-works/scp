@@ -1088,3 +1088,102 @@ Implement a complete addressability and deployment layer as specified in §18:
 | `Cargo.toml` | Add scp-node workspace member |
 
 **Estimated functions:** ~30-35 public functions, ~20-25 internal helpers across all files.
+
+---
+
+## ADR-035: Local HTTP Control API and Broadcast Projection
+
+> **Note:** ADR-035 is numbered non-sequentially (same pattern as ADR-032). Both features are `ApplicationNode`-scope extensions that depend on Phase 2 ADRs and live in the `scp-node` crate. They are application-layer conveniences, not protocol changes.
+
+**Status:** Decided
+
+### Context
+
+SCP's core transport is MessagePack-over-WebSocket with encrypted blobs — deliberately opaque to intermediaries (§9.9.1). This is architecturally correct (relays are dumb pipes), but it means:
+
+1. **No dev tooling interop.** Standard HTTP tools (curl, Postman, OpenAPI) cannot inspect node state or relay status. Operators debugging a deployment must write Rust code or use the SDK CLI.
+2. **No HTTP distribution for broadcast content.** Broadcast contexts (§5.14) produce content intended for broad audiences, but that content is only accessible to SCP clients with broadcast keys. CDNs, web browsers, RSS readers, and search crawlers are excluded.
+
+Both gaps are recoverable at the application layer without compromising the wire protocol.
+
+### Decision
+
+Implement two `ApplicationNode` features in the `scp-node` crate:
+
+#### 1. Local HTTP Control API (§18.10)
+
+- **Separate port.** Dev API listens on `127.0.0.1:<port>`, distinct from the public HTTPS listener. Prevents accidental exposure through reverse proxy misconfiguration.
+- **Bearer token authentication.** Token format: `scp_local_token_<32 random hex>`. Generated at startup, logged at INFO. All `/scp/dev/v1/*` requests require `Authorization: Bearer <token>`. 401 on missing/wrong token.
+- **Seven endpoints.** Health, identity, relay status, context list/get/create/delete. All JSON. Read-only for node state; context management via POST/DELETE.
+- **Opt-in.** Enabled via `.local_api(addr)` on the builder. Production default: disabled (zero additional attack surface).
+
+#### 2. HTTP Broadcast Projection (§18.11)
+
+- **Public HTTPS port.** Projection endpoints serve on the same listener as `.well-known/scp` and `/scp/v1`. Content is public by design (§5.14).
+- **Author-side only.** The relay cannot decrypt (§9.9.1). The author's `ApplicationNode` holds the broadcast keys and decrypts its own content for HTTP serving. Subscriber-side projection is deliberately unsupported.
+- **Feed endpoint.** `GET /scp/broadcast/<routing_id>/feed` — paginated JSON with 30s cache TTL and ETag.
+- **Per-message endpoint.** `GET /scp/broadcast/<routing_id>/messages/<blob_id>` — immutable individual messages with 1-year cache TTL and conditional GET (304).
+- **Opt-in per context.** `enable_broadcast_projection(context_id, broadcast_key)` activates projection. `disable_broadcast_projection(context_id)` deactivates.
+
+#### 3. Shared BlobStorage via Arc
+
+`RelayServer::new` currently takes an owned `B: BlobStorage`, wrapping it in `Arc<B>` internally. Broadcast projection needs to query the same `BlobStorage` instance that the relay writes to. The change: the `ApplicationNode` builder creates `Arc<B>`, passing `Arc::clone` to both `RelayServer` and `NodeState`. This requires `RelayServer::new` to accept `Arc<B>` instead of owned `B`.
+
+### Rationale
+
+- **Separate port for dev API:** A reverse proxy forwarding `*` to the public HTTPS port is a common deployment pattern. If the dev API shared the public port, every such proxy would expose it. Separate port requires explicit, intentional proxy configuration. The trade-off (two listeners) is negligible.
+- **Projection is public because broadcast content is public:** §5.14 defines broadcast contexts as unlimited-audience, per-author keyed content. Making this content accessible via HTTP is consistent with its design intent. Adding authentication would be contradictory — the content is already available to anyone with the broadcast key, and broadcast keys are distributed freely.
+- **Author-side only:** Subscriber-side projection would let any subscriber redistribute content via HTTP without the author's control or knowledge. Author-side projection means the author explicitly opts in.
+- **`routing_id` in URLs is not new disclosure:** `routing_id = SHA-256(context_id)` is already visible to every relay handling the broadcast context (§5.14.6). Using it in HTTP URLs reveals nothing beyond what relays already observe.
+- **`Arc<dyn BlobStorage>` sharing over IPC:** A separate `scp-broadcast-proxy` process would require IPC (Unix socket, shared memory) to access blobs. The keys and blobs are already in-process in the `ApplicationNode`. `Arc` sharing is zero-copy, zero-overhead.
+
+### Rejected Alternatives
+
+1. **Relay-side projection.** Relays cannot decrypt broadcast content (§9.9.1). Giving relays broadcast keys would violate the untrusted-relay invariant and expand the trust boundary.
+2. **Separate `scp-broadcast-proxy` process.** Adds IPC complexity for zero benefit — keys and blobs are already in the `ApplicationNode` process. If operators want a separate process, they can run a second `ApplicationNode` with projection enabled.
+3. **UNIX socket for dev API.** Not portable across deployment modes (containers, Windows). TCP on localhost is universally supported.
+4. **Dev API on the public port with path-based routing.** Accidental exposure risk through reverse proxy misconfiguration outweighs the convenience of a single port.
+
+### Dependencies
+
+- **ADR-032 (Addressability and Deployment):** `ApplicationNode` builder, `NodeState`, `serve()`, axum Router composition.
+- **ADR-007 (BroadcastKey):** `BroadcastKey` type, `BroadcastEnvelope` seal/open operations. Key epoch management.
+- **ADR-004 (Native Relay):** `RelayServer`, `BlobStorage` trait, `query(routing_id, since, limit)` interface. `Arc<B>` change to `RelayServer::new`.
+
+### Acceptance Criteria
+
+1. **Dev API bearer token** generated at startup, logged at INFO, available via `node.dev_token()`.
+2. **Dev API bound to localhost** on a separate port from the public HTTPS listener.
+3. **`GET /scp/dev/v1/health`** returns uptime, relay connection count, and storage status.
+4. **`GET /scp/dev/v1/identity`** returns DID string and DID document.
+5. **`GET /scp/dev/v1/relay/status`** returns bound address, active connections, and blob count.
+6. **`GET /scp/dev/v1/contexts`** returns list of registered broadcast contexts.
+7. **`GET /scp/dev/v1/contexts/:id`** returns single context details. 404 for unknown ID.
+8. **`POST /scp/dev/v1/contexts`** registers a broadcast context. 201 on success.
+9. **`DELETE /scp/dev/v1/contexts/:id`** deregisters a context. 204 on success. 404 for unknown ID.
+10. **Bearer token middleware** returns 401 for missing or invalid token on all dev API endpoints.
+11. **`enable_broadcast_projection`** activates HTTP projection for a broadcast context.
+12. **Feed endpoint** returns paginated JSON with `Cache-Control: public, max-age=30, stale-while-revalidate=300` and `ETag`.
+13. **Per-message endpoint** returns single message JSON with `Cache-Control: public, immutable, max-age=31536000` and `ETag`.
+14. **Conditional GET** on per-message endpoint: `If-None-Match` with matching ETag returns 304.
+15. **`ProjectedContext` registry** maps `routing_id → BroadcastKey` per epoch. Decryption uses epoch-matched key.
+16. **`RelayServer::new` accepts `Arc<B>`** so the same `BlobStorage` instance is shared between relay and projection handlers.
+
+### Scope
+
+**New files:**
+
+| File | Purpose |
+|------|---------|
+| `crates/scp-node/src/dev_api.rs` | Dev API handlers + bearer auth middleware |
+| `crates/scp-node/src/projection.rs` | `ProjectedContext` type + broadcast projection handlers |
+
+**Modified files:**
+
+| File | Change |
+|------|--------|
+| `crates/scp-node/src/lib.rs` | `NodeState` extensions (dev token, dev bind addr, projected contexts, `Arc<dyn BlobStorage>`), new builder methods, new `ApplicationNode` methods |
+| `crates/scp-node/src/http.rs` | Wire `dev_router()` and `broadcast_projection_router()` into `serve()`, add dev API listener |
+| `crates/scp-transport/src/native/server.rs` | `RelayServer::new` accepts `Arc<B>` instead of owned `B` |
+
+**Estimated functions:** ~15-20 public functions, ~10-15 internal helpers across new and modified files.

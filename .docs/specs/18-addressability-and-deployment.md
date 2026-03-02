@@ -451,3 +451,203 @@ End-to-end deployment of an SCP-enabled agent on a dedicated machine:
 | HTTP server (`.well-known` + relay upgrade) | Phase 2 | Required for web discovery and WebSocket relay. |
 
 The `scp-node` crate is added to the workspace as a new top-level crate at `crates/scp-node/`, depending on `scp-core`, `scp-transport`, and `scp-platform`.
+
+## 18.10 Local HTTP Control API
+
+SCP's core transport is MessagePack-over-WebSocket with encrypted blobs — deliberately opaque to intermediaries (§9.9.1). Standard HTTP dev tooling (curl, Postman, OpenAPI) cannot interact with this wire protocol. The local HTTP control API recovers HTTP-ecosystem usefulness for debugging and local integration without exposing any protocol endpoints.
+
+### 18.10.1 Design Rationale
+
+The dev API is **not a protocol endpoint**. It is a local control plane bound to the operator's machine. No SCP peer ever interacts with it — it exists solely for:
+
+- **Debugging:** Inspecting node state, relay status, and registered contexts via curl or browser.
+- **Local integration:** Non-Rust applications on the same machine can query node state over HTTP.
+- **Tooling:** OpenAPI-compatible surface for Postman collections, monitoring dashboards, and health checks.
+
+The dev API is a convenience projection of the SDK surface — all operations are also available directly via `ApplicationNode` methods in Rust. No functionality is exclusive to the HTTP API. It exists for tooling and non-Rust local integrations that cannot call Rust methods directly.
+
+### 18.10.2 Binding and Authentication
+
+The dev API listens on a **separate port** from the public HTTPS listener, bound to `127.0.0.1:<port>` by default. This separation prevents accidental exposure through reverse proxy misconfiguration — a reverse proxy forwarding to the public HTTPS port never sees the dev API.
+
+Authentication uses a bearer token generated at startup:
+
+- Token format: `scp_local_token_<32 random hex characters>` (e.g., `scp_local_token_a1b2c3...`).
+- The token is logged at `INFO` level on startup and available via `node.dev_token()`.
+- All requests to `/scp/dev/v1/*` require `Authorization: Bearer <token>`.
+- Missing or invalid token returns `401 Unauthorized` with `{ "error": "unauthorized", "code": "UNAUTHORIZED" }`.
+
+### 18.10.3 Endpoint Catalog
+
+All endpoints are prefixed with `/scp/dev/v1/`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/scp/dev/v1/health` | Uptime, relay connection count, storage status |
+| `GET` | `/scp/dev/v1/identity` | DID string and DID document |
+| `GET` | `/scp/dev/v1/relay/status` | Bound address, active connections, blob count |
+| `GET` | `/scp/dev/v1/contexts` | List registered broadcast contexts |
+| `GET` | `/scp/dev/v1/contexts/:id` | Single context (id, name, mode, subscriber count) |
+| `POST` | `/scp/dev/v1/contexts` | Register a broadcast context |
+| `DELETE` | `/scp/dev/v1/contexts/:id` | Deregister a broadcast context |
+
+### 18.10.4 Response Format
+
+All responses are JSON (`Content-Type: application/json`).
+
+Success responses return the resource directly. Error responses use:
+
+```json
+{
+  "error": "human-readable message",
+  "code": "MACHINE_READABLE_CODE"
+}
+```
+
+Standard HTTP status codes: `200` (success), `201` (created), `204` (deleted), `400` (bad request), `401` (unauthorized), `404` (not found), `500` (internal error).
+
+### 18.10.5 SDK Surface
+
+- `ApplicationNodeBuilder::local_api(addr: SocketAddr)` — enables the dev API on the specified address. Not called = dev API disabled (production default).
+- `ApplicationNode::dev_router() -> axum::Router` — returns the dev API router for composition. Only available when `local_api()` was called on the builder.
+- `ApplicationNode::dev_token() -> Option<&str>` — returns the bearer token if the dev API is enabled. `None` if disabled.
+
+### 18.10.6 Security Properties
+
+- **Localhost binding** prevents remote access. Combined with bearer token authentication, this provides defense-in-depth against SSRF attacks (a compromised service on the same machine still needs the token).
+- **No private key material** is exposed through any endpoint. The identity endpoint returns the DID string and DID document (public information).
+- **No message content** is exposed. The relay status endpoint shows connection and blob counts, not blob contents.
+- **Production default: disabled.** The dev API is opt-in via `local_api()`. Deployments that do not call this method have zero additional attack surface.
+- **Separate port** from the public HTTPS listener. Reverse proxy configurations that forward to the public port never accidentally expose the dev API.
+
+## 18.11 HTTP Broadcast Projection
+
+Broadcast contexts (§5.14) distribute content to unlimited audiences using per-author AES-256 keys instead of MLS group encryption. The content is encrypted on the wire but intended for broad consumption — subscribers decrypt using the author's broadcast key. HTTP broadcast projection decrypts and re-serves this content over standard HTTP, enabling CDN distribution, web readers, RSS aggregation, search engine crawling, and monitoring dashboards.
+
+### 18.11.1 Design Rationale
+
+Projection is **author-side only**. The relay cannot decrypt broadcast content (§9.9.1 — relays are untrusted dumb pipes that see only encrypted blobs). The author's `ApplicationNode` holds the broadcast keys and is the only entity that can decrypt its own broadcast content for HTTP serving.
+
+Use cases:
+
+- **Web readers:** Standard browsers render broadcast content without SCP client software.
+- **CDN distribution:** Immutable per-message endpoints are CDN-friendly (infinite cache TTL).
+- **RSS/Atom feeds:** Feed readers poll the feed endpoint.
+- **Search engine crawling:** Crawlers index projected content.
+- **Monitoring:** HTTP health checks and content verification dashboards.
+
+Subscriber-side projection is deliberately not supported — it would allow subscribers to redistribute content via HTTP without the author's control or knowledge.
+
+### 18.11.2 Activation
+
+Projection is opt-in per context:
+
+```rust
+node.enable_broadcast_projection(context_id, broadcast_key).await;
+```
+
+Projected content is served at:
+
+- **Feed:** `GET /scp/broadcast/<routing_id_hex>/feed`
+- **Per-message:** `GET /scp/broadcast/<routing_id_hex>/messages/<blob_id_hex>`
+
+Where `routing_id = SHA-256(context_id)` — this value is already public per §5.14.6 (used as the relay routing key for broadcast contexts). Exposing it in the URL path discloses no new information.
+
+Projection is disabled per context via:
+
+```rust
+node.disable_broadcast_projection(context_id).await;
+```
+
+### 18.11.3 Feed Endpoint
+
+`GET /scp/broadcast/<routing_id>/feed`
+
+Returns the most recent messages in the broadcast context, decrypted and serialized as JSON:
+
+```json
+{
+  "context_id": "<hex>",
+  "author_did": "did:dht:...",
+  "messages": [
+    {
+      "id": "<blob_id_hex>",
+      "author_did": "did:dht:...",
+      "key_epoch": 42,
+      "published_at": "2025-01-15T10:30:00Z",
+      "content": "<base64-encoded decrypted content>"
+    }
+  ]
+}
+```
+
+Query parameters:
+
+- `?since=<blob_id>` — return messages after the specified blob ID (exclusive).
+- `?limit=N` — maximum number of messages to return. Default: 20, maximum: 100.
+
+Caching headers:
+
+- `Cache-Control: public, max-age=30, stale-while-revalidate=300` — content is public and changes as new messages arrive. 30-second freshness with 5-minute stale-while-revalidate gives CDNs useful cacheability without excessive staleness.
+- `ETag: "<latest_blob_id>"` — the ETag is the most recent blob ID in the response.
+
+### 18.11.4 Per-Message Endpoint
+
+`GET /scp/broadcast/<routing_id>/messages/<blob_id>`
+
+Returns a single decrypted message:
+
+```json
+{
+  "id": "<blob_id_hex>",
+  "author_did": "did:dht:...",
+  "key_epoch": 42,
+  "published_at": "2025-01-15T10:30:00Z",
+  "content": "<base64-encoded decrypted content>"
+}
+```
+
+Caching headers:
+
+- `Cache-Control: public, immutable, max-age=31536000` — individual messages are immutable once published. Aggressive CDN caching with 1-year TTL.
+- `ETag: "<blob_id>"` — the blob ID itself serves as a stable ETag.
+
+Conditional GET: if the client sends `If-None-Match: "<blob_id>"`, the server returns `304 Not Modified` with no body.
+
+### 18.11.5 Decryption Architecture
+
+A `ProjectedContext` registry maps `routing_id → BroadcastKey` (per epoch):
+
+1. On request: look up `routing_id` in the registry.
+2. Query `BlobStorage` for the requested blob(s) using the existing `query(routing_id, since, limit)` interface.
+3. Deserialize each blob as a `BroadcastEnvelope` (§5.14).
+4. Open with the epoch-matched `BroadcastKey` from the registry.
+5. Return decrypted content in the JSON response.
+
+The `BlobStorage` instance is shared between the relay server and the projection handlers via `Arc<dyn BlobStorage>`. This requires `RelayServer::new` to accept `Arc<B>` so the same storage instance can be passed to both the relay and the `NodeState` (see ADR-035 for the architectural change).
+
+Keys are retained per epoch for the blob TTL window. When a key epoch advances, the previous epoch's key remains available to decrypt blobs published under the old epoch until those blobs expire.
+
+### 18.11.6 Security Properties
+
+- **Author's own keys only.** The node holds the broadcast keys it created. It cannot project contexts it merely subscribes to.
+- **Read-only.** Projection endpoints serve content; they do not accept writes. The write path remains the SCP protocol (MLS or broadcast envelope).
+- **Public endpoint.** Broadcast content was intended for broad distribution (§5.14 design). The projection makes already-public content accessible via HTTP without requiring SCP client software.
+- **No authentication on projection endpoints.** The content is public by design. Operators wanting access control can place a reverse proxy with authentication in front of the projection endpoints.
+- **`routing_id` is not new disclosure.** The `routing_id = SHA-256(context_id)` is already visible to relays (§5.14.6). Using it in URL paths reveals nothing beyond what relays already observe.
+
+### 18.11.7 `scp://` URI Integration
+
+When broadcast projection is enabled for a context, the `scp://` URI (§18.4) gains an optional `projection` query parameter pointing to the HTTP feed URL:
+
+```
+scp://context/<context_id_hex>?relay=wss://example.com/scp/v1&projection=https://example.com/scp/broadcast/<routing_id_hex>/feed
+```
+
+This allows URI consumers to choose between the native SCP path (relay + broadcast key) and the HTTP projection path (standard GET request). The `projection` parameter is advisory — clients that support native SCP ignore it.
+
+### 18.11.8 SDK Surface
+
+- `ApplicationNode::enable_broadcast_projection(context_id, broadcast_key)` — activates HTTP projection for the specified broadcast context. Registers the context and key in the `ProjectedContext` registry.
+- `ApplicationNode::disable_broadcast_projection(context_id)` — deactivates HTTP projection for the specified context. Removes it from the registry. Existing CDN caches may continue serving stale content per their cache headers.
+- `ApplicationNode::broadcast_projection_router() -> axum::Router` — returns the projection router for composition. Served on the public HTTPS port alongside `.well-known/scp` and `/scp/v1`.
