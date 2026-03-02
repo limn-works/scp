@@ -172,7 +172,7 @@ private class TestNativeBindings : NativeBindings {
     override fun toolVerify(toolId: String, inputJson: String, outputJson: String): Boolean = false
     override fun ucanValidate(token: String, capability: String, contextId: String) {}
     override fun ucanMint(identityHandle: Long, memberDid: String, capabilitiesJson: String): String = ""
-    override fun ucanRevoke(identityHandle: Long, tokenId: String) {}
+    override fun ucanRevoke(identityHandle: Long, token: String) {}
     override fun eventLogQuery(contextId: String, filterJson: String): String = ""
     override fun eventLogVerify(contextId: String, proofJson: String): Boolean = false
     override fun transportConnect(configJson: String, cancellationHandle: CancellationHandle?): Long = 0L

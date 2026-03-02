@@ -190,7 +190,7 @@ async def revoke(context: str, token: str) -> None:
 
     Args:
         context: The context ID the token belongs to.
-        token: The unique token ID (or CID) to revoke.
+        token: The full encoded JWT string of the token to revoke.
 
     Raises:
         UcanPermissionError: If revocation fails (token not found, revoker

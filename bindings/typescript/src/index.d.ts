@@ -203,7 +203,7 @@ export declare function validate(
   capability: string,
 ): Promise<void>;
 
-export declare function revoke(contextId: string, tokenId: string): Promise<void>;
+export declare function revoke(contextId: string, token: string): Promise<void>;
 
 export declare function delegate(options: {
   issuer: Identity;

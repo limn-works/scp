@@ -98,7 +98,7 @@ export interface Bridge {
     memberDid: string,
     capabilities: readonly string[],
   ): Promise<UcanToken>;
-  ucanRevoke(handle: BridgeContextHandle, tokenId: string): Promise<void>;
+  ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void>;
 
   // Event Log
   eventLogQuery(

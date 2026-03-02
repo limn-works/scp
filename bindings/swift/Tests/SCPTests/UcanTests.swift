@@ -220,19 +220,19 @@ struct UcanTests {
     @Test("revokeUcanToken calls bridge successfully")
     func revokeRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        var revokedTokenId: String?
+        var revokedToken: String?
 
-        let mockRevoke: UcanBridge.RevokeFn = { _, tokenId in
-            revokedTokenId = tokenId
+        let mockRevoke: UcanBridge.RevokeFn = { _, token in
+            revokedToken = token
         }
 
         try await revokeUcanToken(
             handle: handle,
-            tokenId: "token-to-revoke",
+            token: "header.payload.signature",
             revokeFn: mockRevoke
         )
 
-        #expect(revokedTokenId == "token-to-revoke")
+        #expect(revokedToken == "header.payload.signature")
     }
 
     // MARK: - Legacy API

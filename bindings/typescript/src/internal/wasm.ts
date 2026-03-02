@@ -337,7 +337,7 @@ export function createWasmBridge(): Bridge {
       );
     },
 
-    async ucanRevoke(_handle: BridgeContextHandle, _tokenId: string): Promise<void> {
+    async ucanRevoke(_handle: BridgeContextHandle, _token: string): Promise<void> {
       throw new TransportError(
         "UCAN revocation in the WASM bridge requires runtime wiring",
         "SCP-PERM-3003",
