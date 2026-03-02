@@ -27,7 +27,7 @@ use std::time::Duration;
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
-use scp_core::bridge::claiming::{ClaimRequest, ClaimResult, ShadowClaimEvent, claim_shadow};
+use scp_core::bridge::claiming::{ClaimRequest, claim_shadow};
 use scp_core::bridge::provenance::{
     BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
 };
@@ -91,11 +91,17 @@ fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
 /// Computes the canonical hash for signing an event (matches `tree.rs` internals).
 fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
     let mut hasher = Sha256::new();
+    hasher.update(b"SCP-EVENT-V1:");
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
     hasher.update(event_type_tag(&event.event_type).to_be_bytes());
-    hasher.update(event.actor_did.as_bytes());
+    length_prefix(&mut hasher, event.actor_did.as_bytes());
     hasher.update(event.timestamp.to_be_bytes());
     hasher.update(event.sequence.to_be_bytes());
-    hasher.update(&event.payload.data);
+    length_prefix(&mut hasher, &event.payload.data);
     hasher.update(event.prev_hash);
     hasher.finalize().to_vec()
 }
@@ -170,6 +176,7 @@ fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
 /// (matching the internal `compute_claim_canonical_hash` in claiming.rs).
 fn compute_claim_hash(request: &ClaimRequest) -> Vec<u8> {
     let mut hasher = Sha256::new();
+    hasher.update(b"SCP-CLAIM-V1:");
     #[allow(clippy::cast_possible_truncation)]
     let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
         hasher.update((bytes.len() as u32).to_be_bytes());
@@ -187,12 +194,21 @@ fn compute_claim_hash(request: &ClaimRequest) -> Vec<u8> {
 /// `pub(crate) canonical_attestation_bytes` in `trust/attestation.rs`).
 fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(attestation.id.as_bytes());
-    bytes.extend_from_slice(format!("{:?}", attestation.attestation_type).as_bytes());
-    bytes.extend_from_slice(attestation.issuer.as_bytes());
-    bytes.extend_from_slice(attestation.subject.as_bytes());
-    bytes.extend_from_slice(attestation.claim.to_string().as_bytes());
-    bytes.extend_from_slice(&attestation.issued_at.to_le_bytes());
+    bytes.extend_from_slice(b"SCP-ATTESTATION-V1:");
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |bytes: &mut Vec<u8>, data: &[u8]| {
+        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(data);
+    };
+    length_prefix(&mut bytes, attestation.id.as_bytes());
+    length_prefix(
+        &mut bytes,
+        format!("{:?}", attestation.attestation_type).as_bytes(),
+    );
+    length_prefix(&mut bytes, attestation.issuer.as_bytes());
+    length_prefix(&mut bytes, attestation.subject.as_bytes());
+    length_prefix(&mut bytes, attestation.claim.to_string().as_bytes());
+    bytes.extend_from_slice(&attestation.issued_at.to_be_bytes());
     bytes
 }
 
@@ -377,22 +393,10 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
         &claimant_sk,
     );
 
-    let (result, claim_event) = claim_shadow(&mut shadow_registry, &claim_request);
+    let claim_event =
+        claim_shadow(&mut shadow_registry, &claim_request).expect("claim should succeed");
 
-    // Verify claiming succeeded.
-    match &result {
-        ClaimResult::Success {
-            shadow_id: sid,
-            claimant_did: cdid,
-        } => {
-            assert_eq!(sid, shadow_id);
-            assert_eq!(*cdid, claimant_did);
-        }
-        ClaimResult::Failed { reason } => panic!("claim should succeed, got: {reason}"),
-    }
-
-    // Verify claim event was produced (retroattribution event).
-    let claim_event: ShadowClaimEvent = claim_event.expect("claim event must be produced");
+    // Verify claim event fields.
     assert_eq!(claim_event.shadow_id, shadow_id);
     assert_eq!(claim_event.claimant_did, claimant_did);
     assert_eq!(claim_event.platform_handle, platform_handle);

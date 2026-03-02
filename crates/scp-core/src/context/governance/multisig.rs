@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    VoteType, compute_proposal_id, hex_encode, sign_vote,
+    VoteType, compute_proposal_id, sign_vote,
 };
 use crate::identity::DID;
 
@@ -172,7 +172,7 @@ impl ThresholdEngine {
             self.proposals
                 .get(proposal_id)
                 .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex_encode(proposal_id),
+                    id: hex::encode(proposal_id),
                 })?;
 
         // Already terminal -- nothing to do.
@@ -228,7 +228,7 @@ impl GovernanceEngine for ThresholdEngine {
 
         // Reject duplicate proposals.
         if self.proposals.contains_key(&proposal_id) {
-            return Err(GovernanceError::DuplicateProposal(hex_encode(&proposal_id)));
+            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
         }
 
         let voting_deadline = context.now + self.voting_window_secs;
@@ -279,7 +279,7 @@ impl GovernanceEngine for ThresholdEngine {
         // present because we inserted it above and hold `&mut self`.
         let Some(proposal) = self.proposals.get(&proposal_id).cloned() else {
             return Err(GovernanceError::ProposalNotFound {
-                id: hex_encode(&proposal_id),
+                id: hex::encode(proposal_id),
             });
         };
 
@@ -310,7 +310,7 @@ impl GovernanceEngine for ThresholdEngine {
             self.proposals
                 .get(proposal_id)
                 .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex_encode(proposal_id),
+                    id: hex::encode(proposal_id),
                 })?;
 
         // Must be pending.
@@ -323,7 +323,7 @@ impl GovernanceEngine for ThresholdEngine {
         // Bug 1 fix: deadline guard -- reject votes after the voting window.
         if context.now >= proposal.voting_deadline {
             return Err(GovernanceError::VotingWindowExpired {
-                id: hex_encode(proposal_id),
+                id: hex::encode(proposal_id),
             });
         }
 
@@ -377,7 +377,7 @@ impl GovernanceEngine for ThresholdEngine {
             self.proposals
                 .get(proposal_id)
                 .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex_encode(proposal_id),
+                    id: hex::encode(proposal_id),
                 })?;
 
         // Must be pending.
@@ -390,7 +390,7 @@ impl GovernanceEngine for ThresholdEngine {
         // Bug 1 fix: deadline guard -- reject votes after the voting window.
         if context.now >= proposal.voting_deadline {
             return Err(GovernanceError::VotingWindowExpired {
-                id: hex_encode(proposal_id),
+                id: hex::encode(proposal_id),
             });
         }
 
@@ -443,7 +443,7 @@ impl GovernanceEngine for ThresholdEngine {
             self.proposals
                 .get(proposal_id)
                 .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex_encode(proposal_id),
+                    id: hex::encode(proposal_id),
                 })?;
 
         // Must be pending.
@@ -456,7 +456,7 @@ impl GovernanceEngine for ThresholdEngine {
         // Deadline guard: cannot withdraw after voting window.
         if context.now >= proposal.voting_deadline {
             return Err(GovernanceError::VotingWindowExpired {
-                id: hex_encode(proposal_id),
+                id: hex::encode(proposal_id),
             });
         }
 

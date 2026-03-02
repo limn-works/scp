@@ -691,6 +691,19 @@ impl KeyCustody for NoOpCustody {
         )))
     }
 
+    fn derive_rotatable_pseudonym(
+        &self,
+        _handle: &scp_platform::KeyHandle,
+        _context_id: &[u8],
+        _pseudonym_epoch: u64,
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::PseudonymKeypair, scp_platform::PlatformError>,
+    > + Send {
+        std::future::ready(Err(scp_platform::PlatformError::StorageError(
+            "NoOpCustody: not configured".to_owned(),
+        )))
+    }
+
     fn custody_type(&self, _handle: &scp_platform::KeyHandle) -> scp_platform::CustodyType {
         scp_platform::CustodyType::InMemory
     }

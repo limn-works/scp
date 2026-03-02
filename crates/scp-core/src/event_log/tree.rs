@@ -15,10 +15,10 @@
 //!
 //! See ADR-011 in `.docs/adrs/phase-2.md`.
 
-use ed25519_dalek::Verifier;
 use sha2::{Digest, Sha256};
 
 use super::{Event, EventLog, EventLogError, EventType};
+use crate::crypto::ed25519::verify_ed25519_signature;
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
 ///
@@ -167,64 +167,51 @@ fn serialize_event_for_hashing(event: &Event) -> Result<Vec<u8>, EventLogError> 
 /// The signature covers a canonical hash of all event fields except the
 /// signature itself.
 fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
-    // Extract the public key from the DID.
     let public_key_bytes = extract_public_key_from_did(&event.actor_did).map_err(|reason| {
         EventLogError::InvalidSignature {
             sequence: event.sequence,
             reason,
         }
     })?;
-
-    // Parse the verifying key.
-    let verifying_key =
-        ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-            EventLogError::InvalidSignature {
-                sequence: event.sequence,
-                reason: format!("invalid public key: {e}"),
-            }
-        })?;
-
-    // Parse the signature.
-    let sig_bytes: [u8; 64] =
-        event
-            .signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| EventLogError::InvalidSignature {
-                sequence: event.sequence,
-                reason: format!("signature must be 64 bytes, got {}", event.signature.len()),
-            })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    // Compute the canonical hash of the event content (excluding signature).
     let canonical_hash = compute_event_canonical_hash(event);
-
-    // Verify.
-    verifying_key
-        .verify(&canonical_hash, &signature)
-        .map_err(|e| EventLogError::InvalidSignature {
+    verify_ed25519_signature(&public_key_bytes, &canonical_hash, &event.signature).map_err(
+        |reason| EventLogError::InvalidSignature {
             sequence: event.sequence,
-            reason: format!("signature verification failed: {e}"),
-        })
+            reason,
+        },
+    )
 }
 
 /// Computes the canonical hash of an event for signature purposes.
 ///
 /// ```text
-/// SHA-256(event_type_tag || actor_did || timestamp_BE || sequence_BE
-///         || payload || prev_hash)
+/// SHA-256("SCP-EVENT-V1:" || event_type_tag || len(actor_did) || actor_did
+///         || timestamp_BE || sequence_BE || len(payload) || payload
+///         || prev_hash)
 /// ```
+///
+/// Variable-length fields (`actor_did`, `payload.data`) are prefixed with
+/// their length as a 4-byte big-endian u32 to prevent field-boundary
+/// ambiguity. The `SCP-EVENT-V1:` domain separator prevents cross-protocol
+/// hash confusion.
 fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
     let mut hasher = Sha256::new();
+    hasher.update(b"SCP-EVENT-V1:");
 
-    // Event type as a tag byte.
+    // Length-prefix closure for variable-length fields.
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+
+    // Event type as a tag byte (fixed-width u16).
     hasher.update(event_type_tag(&event.event_type).to_be_bytes());
-    hasher.update(event.actor_did.as_bytes());
+    length_prefix(&mut hasher, event.actor_did.as_bytes());
     hasher.update(event.timestamp.to_be_bytes());
     hasher.update(event.sequence.to_be_bytes());
-    hasher.update(&event.payload.data);
-    hasher.update(event.prev_hash);
+    length_prefix(&mut hasher, &event.payload.data);
+    hasher.update(event.prev_hash); // 32B fixed
 
     hasher.finalize().to_vec()
 }
@@ -281,7 +268,7 @@ fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
 
     // Support did:key:<hex> format for testing.
     if let Some(hex_str) = did.strip_prefix("did:key:") {
-        let decoded = hex_decode(hex_str)?;
+        let decoded = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
         let bytes: [u8; 32] = decoded
             .try_into()
             .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
@@ -289,22 +276,6 @@ fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
     }
 
     Err(format!("unsupported DID format: {did}"))
-}
-
-/// Decodes a hexadecimal string to bytes.
-fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length: {}", hex.len()));
-    }
-
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte_str = &hex[i..i + 2];
-        let byte =
-            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
-        bytes.push(byte);
-    }
-    Ok(bytes)
 }
 
 /// Recomputes the entire interior tree from the leaf layer.
@@ -865,5 +836,46 @@ mod tests {
             current = next;
         }
         current[0]
+    }
+
+    // -----------------------------------------------------------------------
+    // length prefix prevents field boundary ambiguity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn length_prefix_prevents_field_boundary_ambiguity() {
+        // Two events that differ only by shifting bytes between actor_did
+        // and payload. Without length prefixes these would hash identically.
+        let event_a = Event {
+            event_type: EventType::MessageSent,
+            actor_did: "did:key:AB".into(),
+            timestamp: 1000,
+            sequence: 0,
+            payload: EventPayload {
+                data: b"CD".to_vec(),
+            },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        };
+
+        let event_b = Event {
+            event_type: EventType::MessageSent,
+            actor_did: "did:key:ABC".into(),
+            timestamp: 1000,
+            sequence: 0,
+            payload: EventPayload {
+                data: b"D".to_vec(),
+            },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        };
+
+        let hash_a = compute_event_canonical_hash(&event_a);
+        let hash_b = compute_event_canonical_hash(&event_b);
+
+        assert_ne!(
+            hash_a, hash_b,
+            "shifting bytes between actor_did and payload must produce different hashes"
+        );
     }
 }

@@ -27,9 +27,9 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::event_log::Ed25519Signature;
 use crate::identity::DID;
 use crate::identity::cache::Clock;
@@ -260,45 +260,13 @@ pub fn verify_attestation(
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.
     let public_key_bytes = resolver.resolve_public_key(&attestation.issuer)?;
-
-    let pubkey_array: [u8; 32] = public_key_bytes.as_slice().try_into().map_err(|_| {
-        TrustError::AttestationSignatureInvalid {
-            attestation_id: attestation.id.clone(),
-            reason: format!(
-                "issuer public key must be 32 bytes, got {}",
-                public_key_bytes.len()
-            ),
-        }
-    })?;
-
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_array).map_err(|e| {
-        TrustError::AttestationSignatureInvalid {
-            attestation_id: attestation.id.clone(),
-            reason: format!("invalid Ed25519 public key: {e}"),
-        }
-    })?;
-
-    let sig_bytes: [u8; 64] = attestation.signature.as_slice().try_into().map_err(|_| {
-        TrustError::AttestationSignatureInvalid {
-            attestation_id: attestation.id.clone(),
-            reason: format!(
-                "signature must be 64 bytes, got {}",
-                attestation.signature.len()
-            ),
-        }
-    })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    // Sign over the canonical content: id + type + issuer + subject + claim + issued_at.
     let canonical = canonical_attestation_bytes(attestation);
-
-    verifying_key.verify(&canonical, &signature).map_err(|_| {
-        TrustError::AttestationSignatureInvalid {
+    verify_ed25519_signature(&public_key_bytes, &canonical, &attestation.signature).map_err(
+        |reason| TrustError::AttestationSignatureInvalid {
             attestation_id: attestation.id.clone(),
-            reason: "Ed25519 signature verification failed".to_owned(),
-        }
-    })?;
+            reason,
+        },
+    )?;
 
     // 2. Validate evidence per attestation type.
     validate_evidence(attestation)?;
@@ -429,17 +397,36 @@ pub fn check_threshold_attestation(
 
 /// Computes the canonical byte representation of an attestation for signing.
 ///
-/// The canonical form includes: id, `attestation_type` (debug string), issuer,
-/// subject, claim (compact JSON), and `issued_at`. This deterministic
-/// representation is what the issuer signs and what the verifier checks.
+/// ```text
+/// "SCP-ATTESTATION-V1:" || len(id) || id || len(attestation_type) || attestation_type
+///     || len(issuer) || issuer || len(subject) || subject
+///     || len(claim_json) || claim_json || issued_at_BE
+/// ```
+///
+/// Variable-length fields are prefixed with their length as a 4-byte
+/// big-endian u32 to prevent field-boundary ambiguity. The domain separator
+/// prevents cross-protocol hash confusion. `issued_at` uses big-endian
+/// encoding, consistent with all other canonical hash functions.
 pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(attestation.id.as_bytes());
-    bytes.extend_from_slice(format!("{:?}", attestation.attestation_type).as_bytes());
-    bytes.extend_from_slice(attestation.issuer.as_bytes());
-    bytes.extend_from_slice(attestation.subject.as_bytes());
-    bytes.extend_from_slice(attestation.claim.to_string().as_bytes());
-    bytes.extend_from_slice(&attestation.issued_at.to_le_bytes());
+    bytes.extend_from_slice(b"SCP-ATTESTATION-V1:");
+
+    // Length-prefix helper for variable-length fields.
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |bytes: &mut Vec<u8>, data: &[u8]| {
+        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(data);
+    };
+
+    length_prefix(&mut bytes, attestation.id.as_bytes());
+    length_prefix(
+        &mut bytes,
+        format!("{:?}", attestation.attestation_type).as_bytes(),
+    );
+    length_prefix(&mut bytes, attestation.issuer.as_bytes());
+    length_prefix(&mut bytes, attestation.subject.as_bytes());
+    length_prefix(&mut bytes, attestation.claim.to_string().as_bytes());
+    bytes.extend_from_slice(&attestation.issued_at.to_be_bytes()); // fixed-width, no prefix needed
     bytes
 }
 
@@ -1353,6 +1340,50 @@ mod tests {
             (result.independence_score - 0.6).abs() < 0.001,
             "expected ~0.6, got {}",
             result.independence_score
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // length prefix prevents field boundary ambiguity
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn canonical_attestation_boundary_shift_produces_different_bytes() {
+        let att_a = Attestation {
+            id: "att-AB".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:CD".into(),
+            subject: "did:key:subj".into(),
+            claim: serde_json::json!({"x": 1}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        let att_b = Attestation {
+            id: "att-ABC".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:D".into(),
+            subject: "did:key:subj".into(),
+            claim: serde_json::json!({"x": 1}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        let bytes_a = canonical_attestation_bytes(&att_a);
+        let bytes_b = canonical_attestation_bytes(&att_b);
+        assert_ne!(
+            bytes_a, bytes_b,
+            "shifting bytes between id and issuer must produce different canonical bytes"
         );
     }
 }

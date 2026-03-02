@@ -674,12 +674,22 @@ impl ContextProvider for FfiBridgeProvider {
         // invoke_tool in scp-core is for contexts where Rust itself executes
         // tools. See SCP-212, ADR-010, ADR-015.
         //
+        // IMPORTANT: The handler Arc and output schema are extracted inside the
+        // DashMap shard lock (via with_context), then the lock is released
+        // BEFORE calling the handler. This prevents holding the shard lock
+        // during Python GIL acquisition, which would block concurrent
+        // same-context operations for the duration of the handler. See #122.
+        //
         // Handler execution is bounded by `tool_timeout_ms` to prevent a
         // misbehaving handler from blocking the tokio runtime indefinitely.
         // Uses std::thread::spawn + mpsc::recv_timeout (sync timeout) because
         // ContextProvider::invoke_tool is a sync trait method. See issue #123.
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
-        crate::runtime::with_context(context_id, |rt| {
+
+        // Phase 1: Validate input and extract handler + output schema under
+        // the DashMap shard lock. The lock is released when with_context
+        // returns.
+        let dispatch = crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::ContextError(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
@@ -697,9 +707,20 @@ impl ContextProvider for FfiBridgeProvider {
                 ))
             })?;
 
-            // Dispatch to registered handler if available.
-            if let Some(handler) = rt.tool_handlers.get(tool_name) {
-                let handler = handler.clone();
+            // Clone handler Arc and output schema so we can release the lock.
+            Ok(rt
+                .tool_handlers
+                .get(tool_name)
+                .map(|handler| (handler.clone(), registration.schema.output_schema.clone())))
+        })
+        .map_err(|e| format!("{e}"))?;
+
+        // Phase 2: Execute handler OUTSIDE the DashMap shard lock so that
+        // concurrent same-context operations are not blocked during Python
+        // GIL acquisition and handler execution. Handler execution is
+        // bounded by `tool_timeout_ms` (issue #123).
+        match dispatch {
+            Some((handler, output_schema)) => {
                 // Run the handler on a dedicated thread with a timeout to
                 // prevent indefinite blocking. The handler is Send + Sync
                 // (Arc<dyn Fn>), so it is safe to move across threads.
@@ -707,45 +728,40 @@ impl ContextProvider for FfiBridgeProvider {
                 std::thread::spawn(move || {
                     let result = handler(arguments);
                     // If the receiver has been dropped (timeout elapsed), the
-                    // send will fail silently — that is intentional.
+                    // send will fail silently -- that is intentional.
                     let _ = tx.send(result);
                 });
 
                 let handler_result = rx.recv_timeout(timeout).map_err(|_| {
-                    ScpPyError::ContextError(format!(
+                    format!(
                         "tool handler for '{tool_name}' timed out after {}ms",
                         timeout.as_millis()
-                    ))
+                    )
                 })?;
 
-                let output = handler_result.map_err(|e| {
-                    ScpPyError::ContextError(format!("tool handler for '{tool_name}' failed: {e}"))
-                })?;
+                let output = handler_result
+                    .map_err(|e| format!("tool handler for '{tool_name}' failed: {e}"))?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
                 scp_core::context::tools::schema::validate_value_against_schema(
                     &output,
-                    &registration.schema.output_schema,
+                    &output_schema,
                 )
-                .map_err(|msg| {
-                    ScpPyError::ValidationError(format!(
-                        "output validation failed for tool '{tool_name}': {msg}"
-                    ))
-                })?;
+                .map_err(|msg| format!("output validation failed for tool '{tool_name}': {msg}"))?;
 
-                return Ok(output);
+                Ok(output)
             }
-
-            // No handler registered -- fall back to echo mode.
-            Ok(serde_json::json!({
-                "tool": tool_name,
-                "context": context_id,
-                "status": "validated",
-                "input_valid": true,
-                "validated_input": arguments,
-            }))
-        })
-        .map_err(|e| format!("{e}"))
+            None => {
+                // No handler registered -- fall back to echo mode.
+                Ok(serde_json::json!({
+                    "tool": tool_name,
+                    "context": context_id,
+                    "status": "validated",
+                    "input_valid": true,
+                    "validated_input": arguments,
+                }))
+            }
+        }
     }
 
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {

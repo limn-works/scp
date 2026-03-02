@@ -306,21 +306,6 @@ fn generate_standing_channel_id(local_did: &DID, peer_did: &DID) -> String {
     format!("standing-{}", hex::encode(&hash[..8]))
 }
 
-/// Minimal hex encoding for context ID generation.
-mod hex {
-    use std::fmt::Write;
-
-    /// Encodes bytes as a lowercase hex string.
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes
-            .iter()
-            .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-                let _ = write!(s, "{b:02x}");
-                s
-            })
-    }
-}
-
 // Compile-time assertion that `StandingChannelManager` is `Send + Sync`.
 const fn _assert_send_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}

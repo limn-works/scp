@@ -762,7 +762,7 @@ impl GovernanceEngine for SingleAdminEngine {
 
         // Reject duplicate proposals before constructing events.
         if self.proposals.contains_key(&proposal_id) {
-            return Err(GovernanceError::DuplicateProposal(hex_encode(&proposal_id)));
+            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
         }
 
         // Sign the proposer's implicit approval vote.
@@ -822,7 +822,7 @@ impl GovernanceEngine for SingleAdminEngine {
             self.proposals
                 .get(proposal_id)
                 .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex_encode(proposal_id),
+                    id: hex::encode(proposal_id),
                 })?;
 
         // In single-admin mode, only the admin can interact.
@@ -847,7 +847,7 @@ impl GovernanceEngine for SingleAdminEngine {
             self.proposals
                 .get(proposal_id)
                 .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex_encode(proposal_id),
+                    id: hex::encode(proposal_id),
                 })?;
 
         // In single-admin mode, only the admin can interact.
@@ -874,21 +874,6 @@ impl GovernanceEngine for SingleAdminEngine {
     fn get_proposal(&self, proposal_id: &ProposalId) -> Option<&GovernanceProposal> {
         self.proposals.get(proposal_id)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Hex encoding helper
-// ---------------------------------------------------------------------------
-
-/// Encode bytes as lowercase hex string for error messages.
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,17 +1721,6 @@ mod tests {
         assert_eq!(deserialized.created_at, proposal.created_at);
         assert_eq!(deserialized.voting_deadline, proposal.voting_deadline);
         assert_eq!(deserialized.created_at_epoch, proposal.created_at_epoch);
-    }
-
-    // -----------------------------------------------------------------------
-    // hex encoding helper
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn hex_encode_produces_correct_output() {
-        assert_eq!(hex_encode(&[0x00, 0xff, 0x0a]), "00ff0a");
-        assert_eq!(hex_encode(&[]), "");
-        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
     }
 
     // -----------------------------------------------------------------------

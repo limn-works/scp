@@ -16,6 +16,8 @@
 //! All groups use `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` — no
 //! ciphersuite negotiation. See ADR-001 for the rationale.
 
+use std::ops::Deref;
+
 use super::credential::ScpCredential;
 use super::error::MlsError;
 use super::storage::ScpMlsProvider;
@@ -37,6 +39,58 @@ use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTra
 /// and simplifies the implementation. See ADR-001 for the rationale.
 pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
+// ---------------------------------------------------------------------------
+// ZeroizingSigner — defense-in-depth wrapper for upstream SignatureKeyPair
+// ---------------------------------------------------------------------------
+
+/// Wrapper around `openmls_basic_credential::SignatureKeyPair` that documents
+/// the zeroization gap and ensures eager drop semantics.
+///
+/// `SignatureKeyPair` stores its Ed25519 private key in a plain `Vec<u8>` and
+/// does not implement [`Zeroize`] or [`ZeroizeOnDrop`](zeroize::ZeroizeOnDrop).
+/// The `private` field is not publicly accessible (only available behind the
+/// `test-utils` feature), so we cannot zeroize it from outside the crate
+/// without `unsafe` code.
+///
+/// This wrapper provides:
+/// 1. **Documentation of the gap** — future upstream support for `Zeroize` on
+///    `SignatureKeyPair` would close this.
+/// 2. **Eager drop via [`ZeroizingSigner::take`]** — `destroy_group` uses
+///    `take()` to drop the key material as early as possible.
+/// 3. **Centralized ownership** — all `SignatureKeyPair` storage in
+///    `ScpMlsGroup` goes through this type.
+///
+/// **Upstream limitation:** Full zeroization requires `openmls_basic_credential`
+/// to implement `Zeroize` on `SignatureKeyPair`. See issue #82.
+pub(crate) struct ZeroizingSigner(Option<SignatureKeyPair>);
+
+impl ZeroizingSigner {
+    /// Wraps a `SignatureKeyPair` in a zeroizing wrapper.
+    const fn new(inner: SignatureKeyPair) -> Self {
+        Self(Some(inner))
+    }
+
+    /// Returns a reference to the inner `SignatureKeyPair`, or `None` after
+    /// destruction.
+    const fn as_ref(&self) -> Option<&SignatureKeyPair> {
+        self.0.as_ref()
+    }
+
+    /// Takes the inner `SignatureKeyPair` out, leaving `None`. Used by
+    /// `destroy_group` for eager cleanup.
+    const fn take(&mut self) -> Option<SignatureKeyPair> {
+        self.0.take()
+    }
+}
+
+impl Deref for ZeroizingSigner {
+    type Target = Option<SignatureKeyPair>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Wrapper around an `OpenMLS` `MlsGroup` that enforces SCP conventions.
 ///
 /// `ScpMlsGroup` holds the MLS group state, the provider (crypto + storage),
@@ -56,9 +110,11 @@ pub struct ScpMlsGroup {
     pub(crate) group: Option<MlsGroup>,
     /// The MLS provider (crypto + storage) for this group.
     pub(crate) provider: ScpMlsProvider,
-    /// The local member's Ed25519 signing key pair. `None` after
-    /// [`destroy_group`] drops the private key material.
-    pub(crate) signer: Option<SignatureKeyPair>,
+    /// The local member's Ed25519 signing key pair, wrapped in
+    /// [`ZeroizingSigner`] for best-effort zeroization on drop.
+    /// Inner `Option` is `None` after [`destroy_group`] drops the
+    /// private key material.
+    pub(crate) signer: ZeroizingSigner,
     /// Whether the group has been destroyed.
     pub(crate) destroyed: bool,
 }
@@ -221,7 +277,7 @@ pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError>
     Ok(ScpMlsGroup {
         group: Some(group),
         provider,
-        signer: Some(signer),
+        signer: ZeroizingSigner::new(signer),
         destroyed: false,
     })
 }
@@ -512,7 +568,7 @@ pub fn join_group(
     Ok(ScpMlsGroup {
         group: Some(group),
         provider,
-        signer: Some(signer),
+        signer: ZeroizingSigner::new(signer),
         destroyed: false,
     })
 }
