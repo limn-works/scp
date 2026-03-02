@@ -982,38 +982,74 @@ async fn deliver_to_subscribers(
         blob: stored.blob.clone(),
     };
 
-    let mut failed = 0u64;
-    for entry in entries {
-        // Apply per-subscriber delivery jitter (BLACK-001 mitigation).
-        // The delay breaks timing correlation between PUBLISH and delivery.
-        if jitter_ms > 0 {
-            let delay_ms = rand::random::<u64>() % jitter_ms;
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    let total_subscribers = entries.len();
+
+    // When jitter is enabled, spawn parallel tasks so each subscriber's
+    // random delay runs concurrently instead of cascading sequentially.
+    // With N subscribers at J ms max jitter, worst-case drops from ~N*J/2
+    // to ~J ms total wall time.
+    let failed = if jitter_ms > 0 {
+        let mut handles = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let msg = blob_msg.clone();
+            let tx = entry.tx.clone();
+            let connection_id = entry.connection_id;
+            let blob_id = stored.blob_id;
+
+            handles.push(tokio::spawn(async move {
+                // Per-subscriber delivery jitter (BLACK-001 mitigation).
+                let delay_ms = rand::random::<u64>() % jitter_ms;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                if let Err(e) = tx.try_send(msg) {
+                    tracing::warn!(
+                        connection_id,
+                        blob_id = ?blob_id,
+                        error = %e,
+                        total_subscribers,
+                        "failed to deliver blob to subscriber (channel full or closed) — \
+                         possible selective suppression vector"
+                    );
+                    1u64
+                } else {
+                    0u64
+                }
+            }));
         }
 
-        // Send to subscriber; if the channel is full or closed, track the failure.
-        if let Err(e) = entry.tx.try_send(blob_msg.clone()) {
-            failed += 1;
-            tracing::warn!(
-                connection_id = entry.connection_id,
-                blob_id = ?stored.blob_id,
-                error = %e,
-                failed_count = failed,
-                total_subscribers = entries.len(),
-                "failed to deliver blob to subscriber (channel full or closed) — \
-                 possible selective suppression vector"
-            );
+        let mut total_failed = 0u64;
+        for handle in handles {
+            // Unwrap is safe: the spawned tasks do not panic.
+            total_failed += handle.await.unwrap_or(1);
         }
-    }
+        total_failed
+    } else {
+        // Zero-jitter fast path: deliver sequentially without spawn overhead.
+        let mut total_failed = 0u64;
+        for entry in entries {
+            if let Err(e) = entry.tx.try_send(blob_msg.clone()) {
+                total_failed += 1;
+                tracing::warn!(
+                    connection_id = entry.connection_id,
+                    blob_id = ?stored.blob_id,
+                    error = %e,
+                    failed_count = total_failed,
+                    total_subscribers,
+                    "failed to deliver blob to subscriber (channel full or closed) — \
+                     possible selective suppression vector"
+                );
+            }
+        }
+        total_failed
+    };
 
     if failed > 0 {
         tracing::warn!(
             blob_id = ?stored.blob_id,
             routing_id = ?stored.routing_id,
             failed_deliveries = failed,
-            total_subscribers = entries.len(),
-            "blob delivery incomplete: {failed}/{} subscribers received the blob",
-            entries.len()
+            total_subscribers,
+            "blob delivery incomplete: {failed}/{total_subscribers} subscribers received the blob",
         );
     }
 
