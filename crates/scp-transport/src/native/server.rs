@@ -65,6 +65,14 @@ pub struct RelayConfig {
     pub max_total_connections: usize,
     /// Maximum PUBLISH operations per second per IP address (default: 100).
     pub rate_limit_publishes_per_second: u32,
+    /// Maximum random delivery jitter in milliseconds (default: 50ms).
+    ///
+    /// When non-zero, the relay adds a uniformly random delay in
+    /// `[0, delivery_jitter_ms)` before forwarding each stored blob to its
+    /// subscribers. This breaks timing correlation between PUBLISH arrival
+    /// and subscriber delivery, mitigating relay-side traffic analysis
+    /// (BLACK-001). Set to 0 to disable jitter (useful for tests).
+    pub delivery_jitter_ms: u64,
 }
 
 impl Default for RelayConfig {
@@ -79,6 +87,7 @@ impl Default for RelayConfig {
             max_connections_per_ip: 10,
             max_total_connections: 1000,
             rate_limit_publishes_per_second: 100,
+            delivery_jitter_ms: 50,
         }
     }
 }
@@ -742,9 +751,11 @@ async fn handle_publish<S: BlobStorage>(
         }
     };
 
-    // Deliver to active subscribers. The return value tracks failed sends
-    // (logged inside the function) for suppression detection.
-    let _failed_deliveries = deliver_to_subscribers(&stored, subscriptions).await;
+    // Deliver to active subscribers with optional jitter (BLACK-001).
+    // The return value tracks failed sends (logged inside the function)
+    // for suppression detection.
+    let _failed_deliveries =
+        deliver_to_subscribers(&stored, subscriptions, config.delivery_jitter_ms).await;
 
     // Respond with OK + blob_id.
     let ok = RelayMessage::Ok {
@@ -754,13 +765,23 @@ async fn handle_publish<S: BlobStorage>(
     let _ = tx.send(ok).await;
 }
 
-/// Delivers a stored blob to matching subscribers.
+/// Delivers a stored blob to matching subscribers with optional delivery jitter.
+///
+/// When `jitter_ms > 0`, a uniformly random delay in `[0, jitter_ms)` is applied
+/// before delivery to each subscriber. This breaks the timing correlation between
+/// PUBLISH arrival and subscriber delivery, mitigating relay-side traffic analysis
+/// (BLACK-001). The jitter is per-subscriber so that even subscribers on the same
+/// `routing_id` receive blobs at slightly different times.
 ///
 /// Returns the number of delivery failures (subscribers whose channel was
 /// full or closed). A non-zero count indicates potential selective message
 /// suppression if a relay artificially fills a target's buffer.
 #[allow(clippy::significant_drop_tightening)]
-async fn deliver_to_subscribers(stored: &StoredBlob, subscriptions: &SubscriptionRegistry) -> u64 {
+async fn deliver_to_subscribers(
+    stored: &StoredBlob,
+    subscriptions: &SubscriptionRegistry,
+    jitter_ms: u64,
+) -> u64 {
     let registry = subscriptions.read().await;
 
     let Some(entries) = registry.get(&stored.routing_id) else {
@@ -778,6 +799,13 @@ async fn deliver_to_subscribers(stored: &StoredBlob, subscriptions: &Subscriptio
 
     let mut failed = 0u64;
     for entry in entries {
+        // Apply per-subscriber delivery jitter (BLACK-001 mitigation).
+        // The delay breaks timing correlation between PUBLISH and delivery.
+        if jitter_ms > 0 {
+            let delay_ms = rand::random::<u64>() % jitter_ms;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
         // Send to subscriber; if the channel is full or closed, track the failure.
         if let Err(e) = entry.tx.try_send(blob_msg.clone()) {
             failed += 1;
@@ -1012,10 +1040,12 @@ mod tests {
     use tokio_tungstenite::connect_async;
 
     /// Helper: create a test server on a random port and return the address.
+    /// Delivery jitter is disabled (0ms) for deterministic test behavior.
     async fn start_test_server() -> SocketAddr {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1679,6 +1709,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(50),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1729,6 +1760,7 @@ mod tests {
             max_connections_per_ip: 2,
             max_total_connections: 100,
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1759,6 +1791,7 @@ mod tests {
             max_connections_per_ip: 100,
             max_total_connections: 2,
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1787,6 +1820,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             rate_limit_publishes_per_second: 2,
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1836,6 +1870,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         // Storage with capacity of 2.
@@ -1888,6 +1923,7 @@ mod tests {
             max_connections_per_ip: 1,
             max_total_connections: 100,
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1922,6 +1958,7 @@ mod tests {
     async fn shutdown_does_not_panic() {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1936,6 +1973,7 @@ mod tests {
     async fn shutdown_stops_accepting_connections() {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1970,6 +2008,7 @@ mod tests {
     async fn in_flight_connection_survives_shutdown() {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
