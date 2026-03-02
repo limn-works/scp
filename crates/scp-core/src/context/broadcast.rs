@@ -13,6 +13,7 @@ use std::hash::BuildHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::context::ContextError;
+use crate::context::membership::ContextEvent;
 use crate::context::params::ContextMode;
 use crate::crypto::sender_keys::{SenderKey, generate_sender_key};
 use crate::crypto::ucan::UcanToken;
@@ -20,6 +21,7 @@ use crate::crypto::ucan::capability::CapabilityUri;
 use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, validate_ucan,
 };
+use crate::identity::DID;
 
 // ---------------------------------------------------------------------------
 // BroadcastAdmission
@@ -101,11 +103,18 @@ impl AuthorState {
 /// Result returned by [`BroadcastContext::subscribe`].
 ///
 /// Contains the current author key epochs so the new subscriber knows which
-/// epochs to request keys for.
+/// epochs to request keys for, and the `MemberJoined` event that the caller
+/// must append to the context's event log and receive buffer.
 #[derive(Debug, Clone)]
 pub struct SubscriptionResult {
     /// Map of author DID to their current key epoch at time of subscription.
     pub author_epochs: HashMap<String, u64>,
+    /// The `MemberJoined` event for this subscription.
+    ///
+    /// The caller (`ContextManager`) is responsible for appending this event
+    /// to the context's event log and receive buffer. See spec section 5.14.3:
+    /// "Event log records registration via `MemberJoined` with role subscriber."
+    pub event: ContextEvent,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +319,17 @@ impl BroadcastContext {
             .map(|(did, state)| (did.clone(), state.epoch))
             .collect();
 
-        Ok(SubscriptionResult { author_epochs })
+        // Spec section 5.14.3: "Event log records registration via
+        // MemberJoined with role subscriber."
+        let event = ContextEvent::MemberJoined {
+            member_did: DID(subscriber_did.to_owned()),
+            role_name: "subscriber".to_owned(),
+        };
+
+        Ok(SubscriptionResult {
+            author_epochs,
+            event,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1431,6 +1450,91 @@ mod tests {
         assert_eq!(
             result.new_epoch, 1,
             "single group block = single epoch bump"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MemberJoined event emission (issue #143, spec section 5.14.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscribe_emits_member_joined_event_with_subscriber_role() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let result = subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        assert_eq!(
+            result.event,
+            ContextEvent::MemberJoined {
+                member_did: DID("did:example:bob".to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn subscribe_multiple_each_emits_member_joined_event() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let r1 = subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        let r2 = subscribe_open(&mut ctx, "did:example:sub2", None, 1001).unwrap();
+        let r3 = subscribe_open(&mut ctx, "did:example:sub3", None, 1002).unwrap();
+
+        // Each subscription produces its own MemberJoined event with the
+        // correct subscriber DID.
+        assert_eq!(
+            r1.event,
+            ContextEvent::MemberJoined {
+                member_did: DID("did:example:sub1".to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
+        );
+        assert_eq!(
+            r2.event,
+            ContextEvent::MemberJoined {
+                member_did: DID("did:example:sub2".to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
+        );
+        assert_eq!(
+            r3.event,
+            ContextEvent::MemberJoined {
+                member_did: DID("did:example:sub3".to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn subscribe_gated_emits_member_joined_event() {
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        let mut setup = GatedTestSetup::new();
+        let ucan = setup.make_ucan("ctx-gated-1", "did:example:bob");
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx
+            .subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
+            .unwrap();
+
+        assert_eq!(
+            result.event,
+            ContextEvent::MemberJoined {
+                member_did: DID("did:example:bob".to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
         );
     }
 }
