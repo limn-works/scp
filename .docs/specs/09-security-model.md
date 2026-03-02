@@ -566,7 +566,7 @@ context_pseudonym = context_keypair.public_key
 
 Cover traffic is **enabled by default and configurable per-client.** The SDK ships with cover traffic on. Clients or operators may disable it via SDK configuration. Disabling degrades traffic analysis resistance but has no functional impact on message delivery or protocol correctness.
 
-1. **Persistent connections: constant-rate, default on.** One padded dummy message per relay connection per 30 seconds. Dummy messages are always sent at each interval. Real messages are sent as additional traffic. This prevents timing oracles where observers infer real traffic from missing dummies. ~15MB/day for 5 relay connections at 1KB padding.
+1. **Persistent connections: constant-rate, default on.** One padded dummy message per relay connection per 30 seconds. Dummy messages are always sent at each interval. Real messages are sent as additional traffic. This prevents timing oracles where observers infer real traffic from missing dummies. Dummy traffic baseline: ~15MB/day for 5 relay connections at 1KB padding. Real messages add variable bandwidth on top — typically <5% increase at moderate usage, making total bandwidth slightly above the baseline under normal conditions.
 2. **Push-wake connections: no cover traffic.** Connection is transient and brief.
 3. **Dummy message format:** Single-byte flag inside encrypted payload distinguishes real from dummy. Recipients decrypt, check flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
@@ -597,7 +597,7 @@ Each SCP context is a separate MLS group with independent key material. Compromi
 Even with all protections in this section, the following metadata leaks remain:
 
 - **IP visibility:** Relay operators see the client's IP address (same as any web service). Per-context pseudonyms prevent linking IPs to identities, but a relay operator with access to IP logs could correlate connection patterns. Clients requiring IP anonymity can use a VPN or Tor at the transport layer.
-- **Cover traffic timing analysis:** Sophisticated statistical analysis may distinguish real message patterns within constant-rate cover traffic. The constant rate makes this significantly harder but not provably impossible.
+- **Cover traffic volume analysis:** The additive model eliminates timing oracles (missing dummies never reveal real traffic) but introduces a volume oracle: burst activity above the dummy baseline is visible as elevated traffic to a network observer. At moderate usage the increase is <5% above baseline, but sustained high-volume periods are distinguishable from idle. Sophisticated statistical analysis may further distinguish real message patterns within the traffic stream.
 - **Push notification timing:** Apple/Google learn that a device received a notification at a specific time. Content and source remain opaque (§10.7).
 - **DHT participation patterns:** On desktop, DHT routing traffic is mixed with resolution queries, but a network observer can see DHT participation.
 - **Relay trust:** Relays see blob sizes (bucketed), TTLs, and pseudonyms. A relay colluding with a context member could correlate pseudonyms to identities for that context only.
