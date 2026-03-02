@@ -150,17 +150,40 @@ This is analogous to the distinction between a text message and an API call. Bot
 
 The protocol's security model assumes one identity per human. Sybil attacks — one person creating many identities to gain disproportionate influence — undermine every trust mechanism in the spec: behavioral records become meaningless, one-agent-per-context is circumventable, earned capacity is gameable.
 
-Provably guaranteeing one-identity-per-human in a decentralized system without invasive verification (KYC, biometric databases) is an unsolved problem. The protocol's approach is to make sybil attacks **expensive enough to be manageable** through three layered mechanisms:
+Provably guaranteeing one-identity-per-human in a decentralized system without invasive verification (KYC, biometric databases) is an unsolved problem. The protocol's approach: make sybil attacks **expensive to sustain** through composable trust signals where **depth of investment in one identity** is the sybil discriminator.
 
-**Device attestation.** Modern devices provide hardware-backed attestation (Apple App Attest, Google Play Integrity) that can prove: "this is a real, un-jailbroken device and it has not previously created another DID through this protocol." One physical device = one DID creation. This doesn't prove one human (a person with two phones gets two identities), but it makes identity creation cost the price of a physical device. The SDK integrates device attestation as part of DID creation. Device attestation constrains DID **creation** only — a DID created on one device can authenticate on multiple devices freely. Multi-device usage (§10.2) is unaffected; the restriction is on how many identities can be minted, not how many devices can use one.
+A sybil attacker creates many shallow identities. A real human accumulates deep, cross-platform evidence on one identity. The protocol provides signals; contexts set thresholds.
 
-**Earned capacity.** New identities start with limited capabilities — restricted context creation, limited context participation slots, constrained tool invocation rates. Capacity grows through participation history, behavioral records, and time. Sybil accounts are cheap to create (one device per identity) but expensive to make useful — each needs real participation history. This is the Reddit model: new accounts can browse, established accounts can post in restricted communities.
+**Trust signals** (composable, none individually required):
 
-**Context-level social verification.** Contexts set their own admission thresholds — how much behavioral history, how many endorsements, what attestations are required for participation at each role level. A casual group chat might require nothing beyond a valid DID. A high-trust financial context might require 6 months of behavioral history, 3 independent endorsements, and challenge-verified agent capabilities. The protocol provides the verification data (behavioral records, attestations, challenge results); contexts define their own thresholds.
+| Signal | What it proves | Where it lives | Self-asserted? | Platform |
+|--------|---------------|---------------|---------------|----------|
+| Social attestation (§3.5) | Controls real platform accounts | DID document | Yes (cryptographic proof) | All |
+| Device attestation | Real hardware + signed app | DID document | Yes (platform-signed proof) | Mobile only |
+| Participation history | Active for N days across M contexts | Context state (computed) | No | All |
+| Behavioral record | No penalties, positive interactions | Context state (computed) | No | All |
+| Economic activity (§19) | Has spent real money | Context state / payment receipts | No | All |
+| Endorsements | Other established DIDs vouch | DID document or context | No (signed by endorser) | All |
 
-These three layers compose: device attestation makes identity creation expensive → earned capacity makes new identities limited → context-level thresholds make meaningful participation require real history. A sybil attacker needs many devices AND time AND social verification to gain influence. Not impossible, but expensive enough that the attack scales poorly. Crucially, consequences for coordinated attacks render sybil accounts single-use — once detected and penalized, the investment in aging and building history is lost. This makes sustained sybil campaigns economically irrational even when individual identity creation is feasible.
+**Key insight: multiple attestations on one DID is a strength signal.** A DID with App Attest from an iPhone, Play Integrity from a tablet, social attestations from X/GitHub/LinkedIn, 8 months of history, and clean behavioral records is highly trustworthy. This depth cannot be faked cheaply. Sybil accounts are broad (many identities) but shallow (no depth on any single one).
 
-Sybil resistance is a **deterrent**, not an enforcement guarantee. The protocol concedes that a sufficiently determined attacker with many devices can create multiple identities. The defense is structural: making the attack expensive to mount, expensive to sustain, and costly when detected.
+**Storage split:**
+- Self-asserted signals (device attestation, social attestation, endorsements) live in the DID document. The owner publishes them; peers verify the cryptographic proofs.
+- Protocol-derived signals (participation history, behavioral records, economic activity) live in context state. They are computed, not self-asserted. You publish your credentials; the network records your behavior.
+
+**Device attestation repositioned.** Device attestation (Apple App Attest, Google Play Integrity) is an optional SDK-level trust signal, not a protocol-level uniqueness gate. Contexts MAY weight it. Its absence is expected — desktop users, non-native clients, protocol-only implementations — and is not penalizing. Other signals compensate. The protocol cannot distinguish hardware at the network level; a DID is a keypair, and the protocol sees bytes, not devices. Device wipe produces fresh attestation keys with no collision detectable. App Attest is per-bundle-ID, but SCP is a protocol, not an app — different SCP apps on one device get different attestation keys. Play Integrity requires Google's servers, introducing an operator dependency the protocol otherwise avoids.
+
+**Desktop gap acknowledged.** macOS, Linux, and Windows have no App Attest or Play Integrity equivalent. The laptop/workstation deployment tier — a keystone use case (§10.2) — has zero hardware attestation path. Desktop DIDs rely on earned capacity, behavioral records, social verification, and economic cost for sybil resistance. This is acceptable: depth of investment discriminates sybil identities regardless of platform.
+
+Three layers compose:
+
+1. **Earned capacity.** New identities start with limited capabilities — restricted context creation, limited participation slots, constrained tool invocation rates. Capacity grows through participation history, behavioral records, and time. Sybil accounts are cheap to create but expensive to make useful — each needs real participation history.
+2. **Social and economic cost.** Real platform accounts, real money, real endorsements from established identities — each compounds the cost of maintaining sybil identities at scale. A sybil operator must sustain depth across every identity, not just breadth.
+3. **Context-level thresholds.** Contexts set their own admission requirements from available signals. A casual group chat might require nothing beyond a valid DID. A high-trust financial context might require multiple attestation types, months of behavioral history, independent endorsements, and economic activity. The protocol provides the verification data; contexts define their own thresholds.
+
+These layers interact: earned capacity makes new identities limited, social and economic cost makes depth expensive to fake, and context-level thresholds let high-value spaces demand the depth that sybil accounts lack. Consequences for coordinated attacks render sybil accounts single-use — once detected and penalized, the investment in aging and building history is lost. This makes sustained sybil campaigns economically irrational even when individual identity creation is feasible.
+
+Sybil resistance is a **deterrent**, not an enforcement guarantee. The defense is structural: expensive to mount, expensive to sustain, costly when detected.
 
 ## 9.4 Systemic Defense Philosophy
 
@@ -213,6 +236,8 @@ The did:dht method (target DID method for SCP) is **self-certifying**: the DID s
 **Stale document prevention:** BEP44 records include a sequence number. The client MUST reject DID documents with a lower sequence number than previously observed for the same DID. This prevents serving outdated documents.
 
 **The remaining question:** "Is this the right DID?" Self-certification proves the binding between a DID and its key, but cannot prove the binding between a DID and a person. This is an out-of-band verification problem addressed by Key Continuity Verification (§9.11).
+
+**Relay-stored DID documents.** Self-certification applies equally to DID documents stored on SCP relays (§3.10.2). The BEP44 signature is verified against the public key encoded in the DID string regardless of whether the document was retrieved from the Mainline DHT or an SCP relay. The storage backend does not affect the trust model.
 
 ### 9.6.2 did:web Security Properties and Limitations
 
@@ -552,6 +577,7 @@ Cover traffic is **enabled by default and configurable per-client.** The SDK shi
 2. **Mobile: DHT queries via standard HTTPS gateway or lightweight DHT client.** Resolution is infrequent (once per first contact, then cached), so latency is acceptable.
 3. **Aggressive caching:** 24-hour refresh for active contacts, 7-day for inactive. Stale documents detected via BEP44 sequence number comparison. Key change alerts trigger immediate re-resolution.
 4. **No batch/prefetch, no resolution proxy.** Local DHT node on desktop and caching on mobile provide practical privacy without new infrastructure.
+5. **Relay-based resolution adds one observer.** When DID documents are also resolved from SCP relays (§3.10.2), the relay operator learns that a resolver IP queried a specific `routing_id` — and can infer which DID if the relay stores that DID's document (§3.10.9). This is no privacy degradation vs. DHT-only: the relay operator already sees message traffic metadata (§9.9.1). Parallel dual-layer resolution (§3.10.4) means no single backend is the exclusive observer.
 
 ### 9.10.8 Relay Query Privacy
 
@@ -639,6 +665,8 @@ When a key is known or suspected to be compromised, the following ordered steps 
 **Relay authentication:** SCP does not depend on relay authentication — encryption-as-access-control (§10.5) makes it unnecessary for confidentiality. Individual transport adapters may support adapter-specific authentication mechanisms (e.g., NIP-42 for Nostr relays). Relay authentication may be useful for relays that want to limit their user base or implement per-user rate limiting.
 
 **Direct connections:** For the direct WebSocket transport adapter, connections between devices MUST use TLS (wss://) unless both devices are on the same local network AND the user has explicitly accepted the risk.
+
+**Self-hosted relay exception:** `ws://` (plaintext WebSocket) is permitted for self-hosted relays discovered via DHT-resolved DID documents (§10.12.6). These relays have no domain and cannot obtain CA-signed certificates. MLS provides the confidentiality boundary; TLS on a dumb pipe protects already-encrypted traffic. The SDK MUST reject `ws://` relay URLs obtained from `.well-known/scp` or any non-DHT source.
 
 ## 9.14 Clock and Ordering Model
 

@@ -40,7 +40,7 @@ The `SCPRelay` service endpoint type declares transport-layer relay URLs where t
 
 Properties:
 
-- **URL format:** `wss://<host>/scp/v1` — the canonical SCP relay WebSocket endpoint (ADR-004). TLS 1.3 required (§9.13).
+- **URL format:** `wss://<host>/scp/v1` — the canonical SCP relay WebSocket endpoint (ADR-004). TLS 1.3 required (§9.13). **Exception:** Self-hosted relays without a domain MAY use `ws://` with IP literal addresses when discovered via DHT-resolved DID documents (§10.12.7). The SDK MUST reject `ws://` URLs from `.well-known/scp` or any non-DHT source.
 - **Multiple entries allowed.** An identity MAY publish multiple `SCPRelay` entries for suppression resistance (§9.9.2, ADR-012). The recommended minimum is 3 relays.
 - **Self-certified via BEP44.** For did:dht identities, relay URLs in the DID document are signed as part of the BEP44 record (§9.6.3). Substituting a relay URL requires the identity's private key.
 - **Sequence number monotonicity.** Relay list updates follow the BEP44 sequence number rules (§9.6.3). Clients MUST reject DID documents with lower sequence numbers than previously observed.
@@ -251,6 +251,8 @@ When an identity needs to discover relays, the SDK follows this priority chain:
 
 Each priority level is tried in order. The first level that yields at least one reachable relay is used. The SDK MAY combine results from multiple levels (e.g., explicit + DID document) for suppression resistance.
 
+Bootstrap relays SHOULD support STUN service (§10.12.3) — this makes them available as NAT type detection endpoints for self-hosted relays behind residential NAT. Bootstrap relays also serve as DID resolution endpoints: identity owners SHOULD publish DID documents to bootstrap relays via the relay-based resolution layer (§3.10.2), and resolvers SHOULD query bootstrap relays when the identity's own relays are unknown.
+
 ### 18.5.2 Agent Deployment Case
 
 An agent deploying via `ApplicationNode` (§18.6) follows a simplified bootstrap:
@@ -277,6 +279,8 @@ A client that knows only a domain name (e.g., from a website or advertisement):
 `ApplicationNode` is a concrete SDK type in the `scp-node` crate that composes an SCP relay, an identity, and an HTTP server into a single deployable unit. It is the "one box" deployment pattern — relay + participant + HTTP server on one machine.
 
 `ApplicationNode` is NOT an HTTP framework. It exposes components (relay router, `.well-known` router, TLS configuration) that integrate with existing HTTP frameworks (axum, actix-web, etc.). Applications build their HTTP layer on top; `ApplicationNode` provides the SCP-specific pieces.
+
+When `.no_domain()` is set (§10.12.8), `ApplicationNode` skips ACME TLS provisioning, does not serve `.well-known/scp`, and instead probes NAT type via STUN to determine the appropriate reachability tier (UPnP, STUN hole punch, or relay bridge). The DID document is published with a `ws://` relay URL. This is the zero-config deployment path for self-hosted relays behind residential NAT.
 
 ### 18.6.1 Components
 
@@ -358,6 +362,7 @@ impl ApplicationNodeBuilder {
 - **Certificate storage.** Certificates and private keys are stored in `SqliteStorage` (§17.6), encrypted at rest.
 - **Auto-renewal.** The node renews certificates 30 days before expiry. Renewal is background and non-disruptive.
 - **TLS 1.3 required.** Per §9.13, all relay connections use TLS 1.3. The node's TLS configuration enforces this minimum version.
+- **TLS skipped for `.no_domain()` mode.** When `.no_domain()` is set (§10.12.8), ACME provisioning is skipped entirely. The relay listens on `ws://` (plaintext WebSocket). MLS provides the confidentiality boundary; TLS is defense-in-depth that requires a domain to provision. See §10.12.6 for the security rationale.
 
 ### 18.6.4 Properties and Invariants
 
