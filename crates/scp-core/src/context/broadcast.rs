@@ -464,7 +464,8 @@ mod tests {
     use super::*;
     use crate::crypto::sender_keys::{decrypt_sender_layer, encrypt_sender_layer};
     use crate::crypto::ucan::validate::{
-        InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver, InMemoryRevocationChecker,
+        DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
+        InMemoryProofResolver, InMemoryRevocationChecker,
     };
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
     use std::collections::HashMap as StdHashMap;
@@ -739,6 +740,7 @@ mod tests {
             ceiling: &setup.ceiling,
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         let result = ctx
@@ -765,6 +767,7 @@ mod tests {
             ceiling: &setup.ceiling,
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -834,6 +837,7 @@ mod tests {
             ceiling: &setup.ceiling,
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -856,6 +860,7 @@ mod tests {
             ceiling: &setup.ceiling,
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -1049,6 +1054,7 @@ mod tests {
             ceiling: &setup.ceiling,
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:sub1",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
         ctx.subscribe("did:example:sub1", Some(&ucan), 1000, Some(&mut val_ctx))
             .unwrap();
@@ -1149,6 +1155,7 @@ mod tests {
             ceiling: &setup.ceiling,
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         // With full validation, a properly signed wildcard UCAN from the
@@ -1224,6 +1231,7 @@ mod tests {
             ceiling: &setup.ceiling,
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
