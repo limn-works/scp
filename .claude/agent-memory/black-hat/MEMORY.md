@@ -105,6 +105,45 @@ Notes:
 - PyO3 context_close authorization check
 - Merkle checkpoint equivocation detection
 
+## Key Attack Surfaces -- HTTP Features (PR #195)
+
+### CRITICAL: Bridge secret in plaintext over localhost TCP
+- File: `crates/scp-node/src/http.rs` line 144
+- `ws://{relay_addr}/?token={token_hex}` -- co-tenant can sniff
+
+### HIGH: .well-known/scp URI injection via unescaped context name
+- File: `crates/scp-node/src/well_known.rs` lines 42-48
+- Name interpolated into scp:// URI without percent-encoding
+
+### HIGH: Conditional GET bypasses routing_id check (cross-context oracle)
+- File: `crates/scp-node/src/projection.rs` lines 570-578
+- If-None-Match check before routing_id validation = blob existence oracle
+
+### HIGH: Unbounded context/projection registry (no max count, no rate limit)
+- Dev API: `crates/scp-node/src/dev_api.rs` lines 405-421
+- No DefaultBodyLimit, no max context count
+
+### MEDIUM: Dev API loopback check only at builder, not at bind point
+- File: `crates/scp-node/src/http.rs` lines 319-343
+- serve() binds dev_addr without revalidating is_loopback()
+
+### MEDIUM: Routing ID enumeration via timing + 404/200 oracle
+- File: `crates/scp-node/src/projection.rs` feed_handler
+- SHA-256(context_id) is deterministic and publicly computable
+
+### MEDIUM: Broadcast keys cloned without zeroization
+- File: `crates/scp-node/src/projection.rs` lines 414, 594
+
+## Patterns Confirmed Working (HTTP Features)
+- Bearer token uses subtle::ConstantTimeEq (correct)
+- Bridge secret uses ct_eq at relay level (correct)
+- Token entropy: 128 bits from OsRng (sufficient)
+- Token masked in logs (only prefix shown)
+- Context ID hex-only validation prevents injection
+- Blob routing_id cross-check in message_handler
+- Feed limit clamped to 100
+- #![forbid(unsafe_code)] on scp-node
+
 ## Patterns Confirmed Working (prior PRs)
 - Ceiling inheritance in nesting is sound
 - Template spoofing detection works correctly
