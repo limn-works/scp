@@ -145,8 +145,18 @@ class AndroidKeyCustody internal constructor(
      */
     private val softwareKeyTypes = ConcurrentHashMap<String, KeyType>()
 
+    /**
+     * Delegate for Bouncy Castle software key operations.
+     *
+     * Shares the same [softwareKeys] and [softwareKeyTypes] maps so that keys
+     * created via the delegate are visible to [AndroidKeyCustody] methods
+     * (e.g., [dhAgree], [derivePseudonym]) and vice versa. Also holds a
+     * reference to [encryptedPrefs] for persisting Ed25519 key seeds.
+     */
+    private val softwareKeyOps = SoftwareKeyOps(softwareKeys, softwareKeyTypes, encryptedPrefs)
+
     init {
-        restorePersistedEd25519Keys()
+        softwareKeyOps.restorePersistedEd25519Keys()
     }
 
     // -----------------------------------------------------------------------
@@ -172,11 +182,11 @@ class AndroidKeyCustody internal constructor(
                 generateKeystoreEd25519(keyId)
             }
             keyType == KeyType.ED25519 -> {
-                generateSoftwareEd25519(keyId)
+                softwareKeyOps.generateEd25519(keyId)
             }
             else -> {
                 // X25519 wrapping keys are always software-managed
-                generateSoftwareX25519(keyId)
+                softwareKeyOps.generateX25519(keyId)
             }
         }
     }
@@ -201,7 +211,7 @@ class AndroidKeyCustody internal constructor(
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
             signWithKeystore(keyHandle, data)
         } else {
-            signWithSoftware(keyHandle, data)
+            softwareKeyOps.sign(keyHandle, data)
         }
     }
 
@@ -222,7 +232,7 @@ class AndroidKeyCustody internal constructor(
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
             publicKeyFromKeystore(keyHandle)
         } else {
-            publicKeyFromSoftware(keyHandle)
+            softwareKeyOps.publicKey(keyHandle)
         }
     }
 
@@ -246,7 +256,7 @@ class AndroidKeyCustody internal constructor(
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
             destroyKeystoreKey(keyHandle)
         } else {
-            destroySoftwareKey(keyHandle)
+            softwareKeyOps.destroy(keyHandle)
         }
     }
 
@@ -474,10 +484,36 @@ class AndroidKeyCustody internal constructor(
         )
     }
 
-    // -----------------------------------------------------------------------
-    // Private: Software key operations (Bouncy Castle)
-    // -----------------------------------------------------------------------
+    companion object {
+        /** Raw Ed25519 public key size in bytes. */
+        private const val RAW_ED25519_KEY_SIZE = 32
 
+        /** X.509 SubjectPublicKeyInfo encoding size for Ed25519 (RFC 8410 §3): 12-byte ASN.1 header + 32-byte key. */
+        private const val X509_ED25519_SPKI_SIZE = 44
+
+        /** Filename for the EncryptedSharedPreferences storing software Ed25519 keys. */
+        internal const val PREFS_FILENAME = "scp_key_custody"
+    }
+}
+
+/**
+ * Bouncy Castle software key operations for [AndroidKeyCustody].
+ *
+ * Manages Ed25519 and X25519 keys in software for platforms where Android Keystore
+ * does not support these algorithms (Ed25519 on API 26-32, X25519 on all API levels).
+ *
+ * Extracted from [AndroidKeyCustody] to keep the parent class focused on routing
+ * between hardware and software custody while respecting function count limits.
+ *
+ * @param softwareKeys Shared key storage map (same instance as [AndroidKeyCustody.softwareKeys]).
+ * @param softwareKeyTypes Shared key type tracking map.
+ * @param encryptedPrefs Persistent storage for Ed25519 private key seeds (ADR-027, #119).
+ */
+internal class SoftwareKeyOps(
+    private val softwareKeys: ConcurrentHashMap<String, AsymmetricCipherKeyPair>,
+    private val softwareKeyTypes: ConcurrentHashMap<String, KeyType>,
+    private val encryptedPrefs: SharedPreferences,
+) {
     /**
      * Generates a software-backed Ed25519 keypair using Bouncy Castle.
      *
@@ -490,7 +526,7 @@ class AndroidKeyCustody internal constructor(
      * under the key `scp.ed25519.<keyId>`. After writing, the local byte array copy
      * is zeroed to minimize the window of plaintext key material in memory.
      */
-    private fun generateSoftwareEd25519(keyId: String): KeyHandle {
+    fun generateEd25519(keyId: String): KeyHandle {
         val keyPair = Ed25519KeyPairGenerator().apply {
             init(Ed25519KeyGenerationParameters(SecureRandom()))
         }.generateKeyPair()
@@ -509,7 +545,7 @@ class AndroidKeyCustody internal constructor(
      * X25519 wrapping keys are always software-managed because Android Keystore
      * does not support X25519 at any API level.
      */
-    private fun generateSoftwareX25519(keyId: String): KeyHandle {
+    fun generateX25519(keyId: String): KeyHandle {
         val keyPair = X25519KeyPairGenerator().apply {
             init(X25519KeyGenerationParameters(SecureRandom()))
         }.generateKeyPair()
@@ -521,7 +557,7 @@ class AndroidKeyCustody internal constructor(
     /**
      * Signs data using a software-backed Ed25519 key from Bouncy Castle.
      */
-    private fun signWithSoftware(keyHandle: KeyHandle, data: ByteArray): ByteArray {
+    fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "Key not found: ${keyHandle.id}",
@@ -546,7 +582,7 @@ class AndroidKeyCustody internal constructor(
     /**
      * Returns the raw 32-byte public key from a software-backed key.
      */
-    private fun publicKeyFromSoftware(keyHandle: KeyHandle): ByteArray {
+    fun publicKey(keyHandle: KeyHandle): ByteArray {
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "Key not found: ${keyHandle.id}",
@@ -575,7 +611,7 @@ class AndroidKeyCustody internal constructor(
      * in software (Bouncy Castle in-memory + EncryptedSharedPreferences) without
      * hardware protection.
      */
-    private fun destroySoftwareKey(keyHandle: KeyHandle): DestructionAttestation {
+    fun destroy(keyHandle: KeyHandle): DestructionAttestation {
         val removed = softwareKeys.remove(keyHandle.id)
         softwareKeyTypes.remove(keyHandle.id)
 
@@ -629,14 +665,14 @@ class AndroidKeyCustody internal constructor(
     /**
      * Restores all persisted Ed25519 keys from [encryptedPrefs] into [softwareKeys].
      *
-     * Called once during [init]. For each entry matching the [PREFS_KEY_PREFIX], decodes
-     * the Base64-encoded 32-byte seed, reconstructs the Bouncy Castle Ed25519 keypair
+     * Called from [AndroidKeyCustody.init]. For each entry matching the [PREFS_KEY_PREFIX],
+     * decodes the Base64-encoded 32-byte seed, reconstructs the Bouncy Castle Ed25519 keypair
      * using [FixedSecureRandom] for deterministic derivation from the seed, and places
      * the key pair into [softwareKeys] and [softwareKeyTypes].
      *
      * The decoded seed bytes are zeroed after keypair reconstruction.
      */
-    private fun restorePersistedEd25519Keys() {
+    fun restorePersistedEd25519Keys() {
         encryptedPrefs.all
             .filter { (key, value) -> key.startsWith(PREFS_KEY_PREFIX) && value is String }
             .forEach { (prefsKey, value) ->
@@ -655,15 +691,6 @@ class AndroidKeyCustody internal constructor(
     }
 
     companion object {
-        /** Raw Ed25519 public key size in bytes. */
-        private const val RAW_ED25519_KEY_SIZE = 32
-
-        /** X.509 SubjectPublicKeyInfo encoding size for Ed25519 (RFC 8410 §3): 12-byte ASN.1 header + 32-byte key. */
-        private const val X509_ED25519_SPKI_SIZE = 44
-
-        /** Filename for the EncryptedSharedPreferences storing software Ed25519 keys. */
-        private const val PREFS_FILENAME = "scp_key_custody"
-
         /** Key prefix for Ed25519 private key entries in EncryptedSharedPreferences. */
         private const val PREFS_KEY_PREFIX = "scp.ed25519."
     }

@@ -83,18 +83,27 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
         } catch (e: ApiException) {
             // Known Play Integrity API error — status code is a documented public
             // constant (API_NOT_AVAILABLE, INTEGRITY_TOKEN_PROVIDER_INVALID, etc.).
+            // Preserve the original exception as cause for diagnostic context.
             throw ScpException(
                 "Play Integrity token request failed: status ${e.statusCode}",
-                CODE_ATTESTATION_FAILED
+                CODE_ATTESTATION_FAILED,
+                e
             )
-        } catch (e: Exception) {
-            // Unexpected failure — log details internally but surface only a
-            // generic message to avoid leaking Android framework internals
-            // across the FFI boundary.
-            Log.e(TAG, "Unexpected Play Integrity failure", e)
+        } catch (e: SecurityException) {
+            // Permission or security policy violation during Play Integrity call.
+            Log.e(TAG, "Security error during Play Integrity request", e)
             throw ScpException(
                 "Play Integrity token request failed",
-                CODE_ATTESTATION_FAILED
+                CODE_ATTESTATION_FAILED,
+                e
+            )
+        } catch (e: IllegalStateException) {
+            // IntegrityManager used in invalid state (e.g., context destroyed).
+            Log.e(TAG, "Illegal state during Play Integrity request", e)
+            throw ScpException(
+                "Play Integrity token request failed",
+                CODE_ATTESTATION_FAILED,
+                e
             )
         }
 
