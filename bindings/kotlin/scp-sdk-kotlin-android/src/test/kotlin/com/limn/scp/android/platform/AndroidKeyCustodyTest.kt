@@ -213,6 +213,28 @@ class AndroidKeyCustodyTest {
             }
             assertEquals("SCP-CRYPTO-4001", exception.code)
         }
+
+        @Test
+        fun `Ed25519 X509 SubjectPublicKeyInfo encoding is 44 bytes per RFC 8410`() {
+            // Verify the assumption underpinning the check() assertion in publicKeyFromKeystore:
+            // Bouncy Castle's Ed25519 SubjectPublicKeyInfo encoding must be exactly 44 bytes
+            // (12-byte ASN.1 header + 32-byte raw key). This is the fixed encoding from RFC 8410 §3.
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val keyPair = custody.softwareKeys[handle.id]!!
+            val pubKeyParams = keyPair.public as Ed25519PublicKeyParameters
+
+            // Build the X.509 SubjectPublicKeyInfo encoding the same way Android Keystore would
+            val subjectPublicKeyInfo = org.bouncycastle.crypto.util.SubjectPublicKeyInfoFactory
+                .createSubjectPublicKeyInfo(pubKeyParams)
+            val spkiEncoded = subjectPublicKeyInfo.encoded
+
+            assertEquals(44, spkiEncoded.size, "Ed25519 X.509 SPKI must be 44 bytes per RFC 8410")
+
+            // The last 32 bytes must match the raw public key
+            val rawKey = pubKeyParams.encoded
+            assertEquals(32, rawKey.size)
+            assertArrayEquals(rawKey, spkiEncoded.takeLast(32).toByteArray())
+        }
     }
 
     // -------------------------------------------------------------------
