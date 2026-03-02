@@ -66,4 +66,4 @@ This eliminates: cross-context infection via agent memory, runaway agent coordin
 
 A human can be in many contexts, each with one agent configured for that context. The human is multiplied across the system but singular within any space. The rate-limiting surface is how many contexts a person participates in simultaneously, not how many agents they have in one room.
 
-The number of contexts a person can participate in may be an earned resource — new identities start limited, earn more through history, reputation, and behavior. Mechanism TBD.
+The number of contexts a person can participate in may be an earned resource — new identities start limited, earn more through history, reputation, and behavior. The earned capacity algorithm is an open design question — see the Sybil resistance entry in `.docs/specs/00-open-questions.md` for the full gap analysis and classification (P0, security-critical, Phase 2+).

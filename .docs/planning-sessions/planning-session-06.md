@@ -2,7 +2,7 @@
 
 **Date:** February 22, 2026
 **Scope:** Review of PR #1 (architecture branch). Corrections to blocking mechanism, DID method ordering, transport independence, provenance elevation, cross-context tool call governance, ephemeral deletion, metadata privacy, A2A reconsideration, infrastructure independence.
-**Artifacts modified:** `.docs/specs/`, `sketch.md`, `architecture.md` (changes committed to architecture branch). `open-questions.md` (new file).
+**Artifacts modified:** `.docs/specs/`, `sketch.md`, `architecture.md` (changes committed to architecture branch). `.docs/specs/00-open-questions.md` (new file, originally created as root `open-questions.md`, later moved).
 
 ---
 
@@ -134,7 +134,7 @@ The PR introduced propose/accept context creation (§5.12) for agent-to-agent co
 
 **Current leaning:** Remove propose/accept entirely. Rely on cross-context tool calls for all inter-agent interaction. Agents that need to form new relationships require human facilitation through shared contexts. This is simpler, more secure, and the original design was right.
 
-**Status:** Open question #4 in open-questions.md. Requires final decision.
+**Status:** Open question #4 in `.docs/specs/00-open-questions.md`. Requires final decision. *[Subsequently resolved: A2A was removed. See §4.7 and 00-open-questions.md.]*
 
 ---
 
@@ -142,7 +142,7 @@ The PR introduced propose/accept context creation (§5.12) for agent-to-agent co
 
 The PR deferred metadata privacy to "future versions." This was rejected. Everything gets specced and implemented.
 
-10 metadata privacy decisions were identified, analyzed, and given concrete suggestions in open-questions.md:
+10 metadata privacy decisions were identified, analyzed, and given concrete suggestions in `.docs/specs/00-open-questions.md`:
 
 1. **Push notification opacity** — Fully opaque, mandate it
 2. **Envelope format metadata** — Minimal outer envelope (routing pseudonym + blob TTL + encrypted blob)
@@ -155,7 +155,7 @@ The PR deferred metadata privacy to "future versions." This was rejected. Everyt
 9. **DID resolution privacy** — Local DHT node on persistent devices, Tor-routed on mobile
 10. **Relay query privacy** — Pseudonyms + relay set partitioning + subscription mixing
 
-These suggestions form a coherent metadata privacy architecture. See open-questions.md for full analysis of each.
+These suggestions form a coherent metadata privacy architecture. See `.docs/specs/00-open-questions.md` for full analysis of each. *[All 10 decisions were subsequently resolved and written into §9.10.]*
 
 ---
 
@@ -190,18 +190,20 @@ These suggestions form a coherent metadata privacy architecture. See open-questi
 
 ### Files Created:
 
-**open-questions.md:** 10 open questions with detailed analysis, options, tradeoffs, and concrete suggestions. Dependency graph and recommended decision order.
+**`.docs/specs/00-open-questions.md`:** 10 open questions with detailed analysis, options, tradeoffs, and concrete suggestions. Dependency graph and recommended decision order.
 
 ---
 
 ## 5. What This Session Did Not Resolve
 
-- **A2A propose/accept: keep or remove.** Leaning remove. Needs final decision.
-- **All 10 metadata privacy decisions.** Suggestions exist but need confirmation.
-- **Sender-side key layer detailed spec.** Direction agreed, full protocol specification needed.
-- **SCP native relay protocol specification.** Decided it should exist, not yet designed.
-- **Stateful tool session protocol details.** §6.2.1 captures the concept; wire format and session lifecycle need specification.
-- **Specific changes needed if A2A is removed.** §5.12, §6.4, A2A threat analysis in §9, planning-session-03.md content, sketch.md proposal APIs, architecture.md A2A references — all need cleanup.
+*[All items below were subsequently resolved. Annotations added 2026-03-02.]*
+
+- **A2A propose/accept: keep or remove.** Leaning remove. Needs final decision. *[Resolved: removed. See §4.7, 00-open-questions.md.]*
+- **All 10 metadata privacy decisions.** Suggestions exist but need confirmation. *[Resolved: all 10 written into §9.10.]*
+- **Sender-side key layer detailed spec.** Direction agreed, full protocol specification needed. *[Resolved: fully specified in §9.16.]*
+- **SCP native relay protocol specification.** Decided it should exist, not yet designed. *[Resolved: ADR-004 specifies the native relay protocol.]*
+- **Stateful tool session protocol details.** §6.2.1 captures the concept; wire format and session lifecycle need specification. *[Resolved: §6.2.1 fully specified.]*
+- **Specific changes needed if A2A is removed.** §5.12, §6.4, A2A threat analysis in §9, planning-session-03.md content, sketch.md proposal APIs, architecture.md A2A references — all need cleanup. *[Resolved: A2A removed, §6.4 removed, §5.12 is now well-known templates, all cleanup completed.]*
 
 ---
 

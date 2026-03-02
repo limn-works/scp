@@ -50,7 +50,7 @@
 │  │  │       │             │             │              │       │ │  │
 │  │  │  ┌────┴─────────────┴─────────────┴──────────────┴────┐ │ │  │
 │  │  │  │  CRYPTO LAYER                                       │ │ │  │
-│  │  │  │  MLS (OpenMLS) │ UCAN (rs-ucan) │ Merkle trees    │ │ │  │
+│  │  │  │  MLS (OpenMLS) │ UCAN (native)  │ Merkle trees    │ │ │  │
 │  │  │  └────────────────────────┬────────────────────────────┘ │ │  │
 │  │  └──────────────────────────┼──────────────────────────────┘ │  │
 │  │                              │                                │  │
@@ -306,6 +306,12 @@ scp/
 │   │   ├── tls.rs             # ACME TLS provisioning (Let's Encrypt)
 │   │   └── well_known.rs      # .well-known/scp generation from node state
 │   │
+│   ├── scp-relay/             # Standalone SCP native relay server binary
+│   │   └── main.rs
+│   │
+│   ├── scp-media/             # Real-time media transport types (§10.9)
+│   │   └── lib.rs             # WebRTC signaling types, MLS key export for DTLS-SRTP
+│   │
 │   ├── scp-ffi/               # Foreign function interface layer
 │   │   ├── uniffi/            # UniFFI definitions → Swift, Kotlin
 │   │   └── pyo3/              # PyO3 definitions → Python
@@ -518,7 +524,7 @@ State:
 │                                                                  │
 │  ┌──────────────────────┐  ┌──────────────────────┐            │
 │  │ MLS Module            │  │ UCAN Module          │            │
-│  │ (OpenMLS)             │  │ (rs-ucan)            │            │
+│  │ (OpenMLS)             │  │ (native impl)        │            │
 │  │                       │  │                      │            │
 │  │ • create_group        │  │ • create_token       │            │
 │  │ • add_member          │  │   (mandatory nonce)  │            │
@@ -610,6 +616,14 @@ State:
         ├──► scp-core
         ├──► scp-transport
         └──► scp-platform
+
+   scp-relay (standalone binary)
+        │
+        └──► scp-transport
+
+   scp-media (real-time media types, §10.9)
+        │
+        └──► scp-core
 
    scp-testing (dev-dependency, §16)
         │
@@ -933,7 +947,7 @@ These are Phase 5 deliverables (community SDKs). The C ABI is stable and version
 
 ```
 Build:
-  • scp-core/crypto/ — MLS wrapper (OpenMLS), UCAN wrapper (rs-ucan)
+  • scp-core/crypto/ — MLS wrapper (OpenMLS), UCAN (native implementation)
   • scp-core/envelope/ — SCP envelope creation, signing, verification
   • scp-core/identity/ — DID creation (did:dht)
   • scp-core/clock.rs — Clock trait + SystemClock (§16.3)
@@ -1109,7 +1123,8 @@ Build:
   • Event log pruning/checkpointing
   • Performance optimization
   • Security audit
-  • Governance models beyond single-admin
+  • Governance models beyond single-admin — DONE: GovernanceEngine trait with SingleAdmin,
+    Threshold (M-of-N), Majority, and Unanimity models (ADR-031, SCP-129–133)
 
 Test:
   • Load testing: 1000 SimulatedIdentity instances in scp-testing simulator,
@@ -1181,7 +1196,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | DID method (fallback) | did:web | Contingency only if did:dht libraries prove unusable. Not a planned deployment. |
 | Group encryption | MLS (OpenMLS) | O(log n) removal, forward secrecy, clean key destruction. |
 | Transport | SCP native relay (canonical) + adapters | No dependency on any single transport. SCP native relay is simplest reference. Adapters: Nostr, Matrix, Holepunch/Hyperswarm, libp2p, WebSocket, WebRTC, QUIC, BLE, Tor, I2P, SSB, MQTT, NATS, ZeroMQ, Yggdrasil, cjdns. |
-| Capability tokens | UCAN (rs-ucan) | Per-agent, per-context, per-capability, revocable. |
+| Capability tokens | UCAN (native impl) | Per-agent, per-context, per-capability, revocable. Native implementation using ed25519-dalek + serde_json. |
 | Spec status | Ships with SDK, iterates | Don't wait for perfect spec. Working code first. |
 | Infrastructure owned | Almost nothing | did:dht uses Mainline DHT (existing). Everything else is existing or user-owned. |
 | MCP integration | SCP agent as MCP server | Every MCP-compatible model works with SCP. Zero model-side integration. |
