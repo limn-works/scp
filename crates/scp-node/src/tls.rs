@@ -21,6 +21,7 @@ use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use scp_platform::traits::Storage;
 use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -74,12 +75,18 @@ pub enum TlsError {
 ///
 /// This is the interchange format between ACME provisioning, storage, and
 /// TLS configuration. Both fields are PEM strings.
+///
+/// The private key PEM is wrapped in [`Zeroizing`] so that the backing
+/// allocation is zeroed on drop, preventing key material from lingering
+/// in freed memory (defense-in-depth against core dumps, swap recovery,
+/// and cold-boot attacks). See issue #82.
 #[derive(Clone)]
 pub struct CertificateData {
     /// PEM-encoded certificate chain (leaf + intermediates).
     pub certificate_chain_pem: String,
-    /// PEM-encoded private key.
-    pub private_key_pem: String,
+    /// PEM-encoded private key. Wrapped in [`Zeroizing`] so the backing
+    /// buffer is zeroed on drop.
+    pub private_key_pem: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for CertificateData {
@@ -215,8 +222,10 @@ pub async fn load_certificate<S: Storage>(
         (Some(cert), Some(key)) => {
             let certificate_chain_pem = String::from_utf8(cert)
                 .map_err(|e| TlsError::Storage(format!("certificate is not valid UTF-8: {e}")))?;
-            let private_key_pem = String::from_utf8(key)
-                .map_err(|e| TlsError::Storage(format!("private key is not valid UTF-8: {e}")))?;
+            let private_key_pem =
+                Zeroizing::new(String::from_utf8(key).map_err(|e| {
+                    TlsError::Storage(format!("private key is not valid UTF-8: {e}"))
+                })?);
             Ok(Some(CertificateData {
                 certificate_chain_pem,
                 private_key_pem,
@@ -491,10 +500,12 @@ impl<S: Storage + 'static> AcmeProvider<S> {
             .map_err(|e| TlsError::Acme(format!("order failed to become ready: {e}")))?;
 
         // 6. Finalize with CSR (instant-acme generates the CSR via rcgen).
-        let private_key_pem = order
-            .finalize()
-            .await
-            .map_err(|e| TlsError::Acme(format!("failed to finalize order: {e}")))?;
+        let private_key_pem = Zeroizing::new(
+            order
+                .finalize()
+                .await
+                .map_err(|e| TlsError::Acme(format!("failed to finalize order: {e}")))?,
+        );
 
         // 7. Download certificate.
         let certificate_chain_pem = order
@@ -683,7 +694,7 @@ pub fn generate_self_signed(domain: &str) -> Result<CertificateData, TlsError> {
 
     Ok(CertificateData {
         certificate_chain_pem: cert.pem(),
-        private_key_pem: key_pair.serialize_pem(),
+        private_key_pem: Zeroizing::new(key_pair.serialize_pem()),
     })
 }
 
