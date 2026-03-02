@@ -36,7 +36,7 @@ bindings/
 | `scp-transport` | Transport trait + adapters. Native relay server/client. Multi-transport routing | tokio, tokio-tungstenite, futures |
 | `scp-platform` | Platform abstraction traits + in-memory testing adapters | ed25519-dalek, rand |
 | `scp-mcp` | MCP JSON-RPC server/client for tool exposition | serde_json, tokio, axum |
-| `scp-ffi/*` | Language-specific FFI bridges. Thin translation layers only — zero protocol logic | pyo3, uniffi, cbindgen, wasm-bindgen, napi-rs |
+| `crates/scp-ffi/*` | Language-specific FFI bridges. Thin translation layers only — zero protocol logic | pyo3, uniffi, cbindgen, wasm-bindgen, napi-rs |
 
 ## FFI Bridge Strategy
 
@@ -44,11 +44,11 @@ Three bridges serve eight languages:
 
 | Bridge | Crate | Target languages | Mechanism |
 |--------|-------|------------------|-----------|
-| **PyO3** | `scp-ffi/pyo3` | Python | Direct Rust-Python interop via `#[pyfunction]`/`#[pyclass]` |
-| **UniFFI** | `scp-ffi/uniffi` | Swift, Kotlin | Single UDL definition generates Swift + Kotlin bindings |
-| **cbindgen** | `scp-ffi/cbindgen` | Go, C#, Java | C ABI header → cgo, P/Invoke, JNA |
-| **wasm-bindgen** | `scp-ffi/wasm` | TypeScript (browser) | WASM module loaded in browser |
-| **napi-rs** | `scp-ffi/napi` | TypeScript (Bun/Node) | Native addon for server-side JS runtimes |
+| **PyO3** | `crates/scp-ffi/pyo3` | Python | Direct Rust-Python interop via `#[pyfunction]`/`#[pyclass]` |
+| **UniFFI** | `crates/scp-ffi/uniffi` | Swift, Kotlin | Single UDL definition generates Swift + Kotlin bindings |
+| **cbindgen** | `crates/scp-ffi/cbindgen` | Go, C#, Java | C ABI header → cgo, P/Invoke, JNA |
+| **wasm-bindgen** | `crates/scp-ffi/wasm` | TypeScript (browser) | WASM module loaded in browser |
+| **napi-rs** | `crates/scp-ffi/napi` | TypeScript (Bun/Node) | Native addon for server-side JS runtimes |
 
 Every FFI bridge crate:
 - Depends on `scp-core`, `scp-transport`, `scp-platform`

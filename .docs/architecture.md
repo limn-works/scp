@@ -874,7 +874,7 @@ agent.invoke({"input": "Schedule a meeting with Bob"})
 **PyO3 bridge layer:**
 
 ```
-Python (scp_sdk/)              PyO3 (scp-ffi/pyo3/)         Rust (scp-core/)
+Python (scp_sdk/)              PyO3 (crates/scp-ffi/pyo3/)  Rust (scp-core/)
 
 scp.Identity.create()    →    py_identity_create()     →    Identity::create()
 scp.Context.create()     →    py_context_create()      →    ContextManager::create()
@@ -1025,7 +1025,7 @@ Deliverable: Two devices with full context lifecycle over real SCP relays.
 
 ```
 Build:
-  • scp-ffi/pyo3/ — PyO3 bridge layer
+  • crates/scp-ffi/pyo3/ — PyO3 bridge layer
   • bindings/python/ — Pythonic wrappers, async, type hints
   • scp-mcp/server.rs — SCP agent as MCP server
   • scp-mcp/client.rs — SCP agent as MCP client
@@ -1058,7 +1058,7 @@ Build:
   • scp-core/context/ — advanced memory scope policies (basic TTL enforcement is Phase 2)
   • scp-core/discovery/ — tool-interface discovery (§6.2.2)
   • scp-core/provenance/ — data provenance tagging
-  • scp-ffi/uniffi/ — UniFFI definitions (prepares Swift/Kotlin)
+  • crates/scp-ffi/uniffi/ — UniFFI definitions (prepares Swift/Kotlin)
   • bindings/typescript/ — TypeScript SDK (wasm-bindgen for browser, napi-rs for Node)
 
 Test:

@@ -398,13 +398,14 @@ Chain depth is capped at 3 hops (protocol default) to bound amplification. The a
 ### Crate architecture (Rust core)
 
 ```
-scp-core/          — Protocol engine (context, identity, trust, discovery managers)
-  store/           — ProtocolStore layer (thick), Storage trait (thin, 6 methods)
-scp-crypto/        — MLS (OpenMLS), UCAN (native impl), Merkle trees, HPKE, HKDF
-scp-transport/     — Transport adapter trait + SCP native relay adapter
-scp-relay/         — Reference relay implementation
-scp-ffi/           — UniFFI bindings (Swift, Kotlin), PyO3 (Python), wasm-bindgen (TS)
-scp-mcp/           — MCP server adapter (exposes SCP contexts as MCP tool surfaces)
+crates/
+  scp-core/          — Protocol engine (context, identity, trust, discovery managers)
+    store/           — ProtocolStore layer (thick), Storage trait (thin, 6 methods)
+  scp-crypto/        — MLS (OpenMLS), UCAN (native impl), Merkle trees, HPKE, HKDF
+  scp-transport/     — Transport adapter trait + SCP native relay adapter
+  scp-relay/         — Reference relay implementation
+  scp-ffi/           — UniFFI bindings (Swift, Kotlin), PyO3 (Python), wasm-bindgen (TS)
+  scp-mcp/           — MCP server adapter (exposes SCP contexts as MCP tool surfaces)
 ```
 
 **Storage:** MessagePack serialization with version envelopes. SQLite (bundled-sqlcipher) as universal default. BlobStore backends: SQLite, redb, PostgreSQL, S3-compatible.
