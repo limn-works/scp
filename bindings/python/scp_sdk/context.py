@@ -552,6 +552,47 @@ class Context:
                 exc_info=True,
             )
 
+    # -- Finalizer (GC safety for long-running processes) -------------------
+
+    def __del__(self) -> None:
+        """Release registry resources if the context was not properly closed.
+
+        Called by the garbage collector when the ``Context`` object is
+        reclaimed.  This is a last-resort cleanup for processes that do
+        not use ``async with`` or forget to call :meth:`close`.
+
+        Errors are silently suppressed -- ``__del__`` must never raise.
+        """
+        try:
+            # Capture handle in a local variable to avoid TOCTOU race:
+            # _handle could become None between the check and the use.
+            handle = getattr(self, "_handle", None)
+            if handle is None:
+                return
+
+            creator_did = getattr(self, "_creator_did", None)
+            if creator_did is None:
+                return
+
+            # Check state via the handle directly (not self.state which
+            # re-reads self._handle, re-introducing the race).
+            try:
+                state = handle.state
+            except Exception:
+                return
+
+            if state == "active":
+                try:
+                    import _scp_core
+
+                    _scp_core.py_context_close(handle, creator_did)
+                except Exception:
+                    # Best-effort: context may already be closed, or
+                    # interpreter may be shutting down.
+                    pass
+        except Exception:
+            pass
+
     # -- Representation -----------------------------------------------------
 
     def __repr__(self) -> str:

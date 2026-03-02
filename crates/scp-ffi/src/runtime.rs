@@ -709,3 +709,222 @@ pub fn clear_relay_connection() -> Result<(), ScpPyError> {
     })? = None;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Registry statistics and cleanup (issue #108)
+// ---------------------------------------------------------------------------
+
+/// Entry counts for all global FFI registries.
+///
+/// Returned by [`registry_stats`] for monitoring and debugging. Allows
+/// Python callers to observe registry growth in long-running processes
+/// without accessing the registries directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryStats {
+    /// Number of entries in the context runtime registry.
+    pub contexts: usize,
+    /// Number of entries in the known-contexts discovery registry.
+    pub known_contexts: usize,
+    /// Number of entries in the identity registry.
+    pub identities: usize,
+    /// Whether a relay connection is currently active.
+    pub relay_connected: bool,
+}
+
+/// Returns current entry counts for all global registries.
+///
+/// Intended for monitoring and debugging in long-running processes.
+/// All reads are lock-free (`DashMap`) or brief (`RwLock` on relay state).
+///
+/// # Errors
+///
+/// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
+pub fn registry_stats() -> Result<RegistryStats, ScpPyError> {
+    let relay_connected = relay_state()
+        .read()
+        .map_err(|_| {
+            ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+        })?
+        .is_some();
+
+    Ok(RegistryStats {
+        contexts: registry().len(),
+        known_contexts: known_contexts_registry().len(),
+        identities: identity_registry().len(),
+        relay_connected,
+    })
+}
+
+/// Removes an identity from the global registry.
+///
+/// Returns `true` if the identity was present and removed, `false` if not found.
+/// Provided as a cleanup mechanism for long-running processes alongside
+/// [`remove_identity`] which is unconditional.
+#[must_use]
+pub fn remove_identity_if_present(did: &str) -> bool {
+    identity_registry().remove(did).is_some()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Helper to generate unique context IDs for parallel test isolation.
+    fn unique_ctx_id(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{prefix}-cleanup-test-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// Helper to create a minimal `DidDocument` for testing.
+    fn test_did_document(did: &str) -> DidDocument {
+        DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: did.to_owned(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            also_known_as: vec![],
+            service: vec![],
+        }
+    }
+
+    #[test]
+    fn registry_stats_reflects_context_registration() {
+        let ctx_id = unique_ctx_id("stats-ctx");
+        let creator = "did:dht:z6MkStatsTest";
+
+        register_context(&ctx_id, creator).unwrap();
+        let stats = registry_stats().unwrap();
+
+        // Verify that stats reports at least 1 context (our registered one).
+        // Cannot assert exact counts due to parallel test interference.
+        assert!(
+            stats.contexts >= 1,
+            "should have at least 1 context after registration (got {})",
+            stats.contexts,
+        );
+
+        // Verify the specific entry exists via direct registry access.
+        assert!(
+            registry().contains_key(&ctx_id),
+            "registered context should be in registry"
+        );
+
+        remove_context(&ctx_id);
+        assert!(
+            !registry().contains_key(&ctx_id),
+            "removed context should not be in registry"
+        );
+    }
+
+    #[test]
+    fn registry_stats_reflects_identity_registration() {
+        let did = "did:dht:z6MkStatsIdentityUnique9988";
+
+        let entry = IdentityEntry {
+            identity: ScpIdentity {
+                did: did.to_owned(),
+                identity_key: scp_platform::KeyHandle::new(0),
+                active_signing_key: scp_platform::KeyHandle::new(0),
+                pre_rotation_commitment: [0u8; 32],
+            },
+            custody: Arc::new(InMemoryKeyCustody::new()),
+            document: test_did_document(did),
+        };
+        register_identity(did, entry);
+        let stats = registry_stats().unwrap();
+
+        assert!(
+            stats.identities >= 1,
+            "should have at least 1 identity after registration (got {})",
+            stats.identities,
+        );
+        assert!(
+            identity_registry().contains_key(did),
+            "registered identity should be in registry"
+        );
+
+        remove_identity(did);
+        assert!(
+            !identity_registry().contains_key(did),
+            "removed identity should not be in registry"
+        );
+    }
+
+    #[test]
+    fn registry_stats_reflects_known_context_registration() {
+        let ctx_id = unique_ctx_id("stats-known");
+        let known = KnownContext {
+            routing_id: [0xCC; 32],
+            relay_url: None,
+            member_did: "did:dht:z6MkStatsKnown".to_owned(),
+            last_seen: 0,
+        };
+
+        register_known_context(&ctx_id, known);
+        let stats = registry_stats().unwrap();
+
+        assert!(
+            stats.known_contexts >= 1,
+            "should have at least 1 known context after registration (got {})",
+            stats.known_contexts,
+        );
+        assert!(
+            known_contexts_registry().contains_key(&ctx_id),
+            "registered known context should be in registry"
+        );
+
+        // remove_context clears both registries.
+        remove_context(&ctx_id);
+        assert!(
+            !known_contexts_registry().contains_key(&ctx_id),
+            "removed known context should not be in registry"
+        );
+    }
+
+    #[test]
+    fn remove_identity_if_present_returns_true_when_found() {
+        let did = "did:dht:z6MkRemoveIfPresent";
+        let entry = IdentityEntry {
+            identity: ScpIdentity {
+                did: did.to_owned(),
+                identity_key: scp_platform::KeyHandle::new(0),
+                active_signing_key: scp_platform::KeyHandle::new(0),
+                pre_rotation_commitment: [0u8; 32],
+            },
+            custody: Arc::new(InMemoryKeyCustody::new()),
+            document: test_did_document(did),
+        };
+        register_identity(did, entry);
+        assert!(remove_identity_if_present(did));
+    }
+
+    #[test]
+    fn remove_identity_if_present_returns_false_when_not_found() {
+        assert!(!remove_identity_if_present("did:dht:z6MkNotPresent9999"));
+    }
+
+    #[test]
+    fn registry_stats_returns_all_fields() {
+        // Verifies the struct shape and that registry_stats() doesn't panic.
+        let stats = registry_stats().unwrap();
+        // Destructure to catch struct changes at compile time. If a field is
+        // added or removed, this will fail to compile.
+        let RegistryStats {
+            contexts,
+            known_contexts,
+            identities,
+            relay_connected,
+        } = stats;
+        // Ensure all fields are typed correctly.
+        let _: usize = contexts;
+        let _: usize = known_contexts;
+        let _: usize = identities;
+        let _: bool = relay_connected;
+    }
+}

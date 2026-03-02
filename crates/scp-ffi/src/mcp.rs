@@ -1803,6 +1803,117 @@ pub fn py_register_tool_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Registry statistics and cleanup (issue #108)
+// ---------------------------------------------------------------------------
+
+/// MCP-specific registry entry counts.
+///
+/// Returned by [`py_registry_stats`] alongside the core registry stats
+/// for monitoring and debugging in long-running processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpRegistryStats {
+    /// Number of entries in the MCP server registry.
+    servers: usize,
+    /// Number of stopped servers still in the registry.
+    stopped_servers: usize,
+    /// Number of entries in the MCP client registry.
+    clients: usize,
+}
+
+/// Returns MCP registry entry counts.
+fn mcp_registry_stats() -> McpRegistryStats {
+    let servers = server_registry().len();
+    let stopped_servers = server_registry()
+        .iter()
+        .filter(|entry| entry.value().stopped)
+        .count();
+    let clients = client_registry().len();
+    McpRegistryStats {
+        servers,
+        stopped_servers,
+        clients,
+    }
+}
+
+/// Removes stopped MCP server entries from the registry.
+///
+/// Returns the number of entries removed. Stopped servers (where
+/// `py_mcp_server_stop` was called but the entry was not removed) are
+/// cleaned up to prevent indefinite accumulation in long-running
+/// processes.
+fn cleanup_stopped_servers() -> usize {
+    let mut removed = 0;
+    let keys_to_remove: Vec<String> = server_registry()
+        .iter()
+        .filter(|entry| entry.value().stopped)
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    for key in keys_to_remove {
+        if server_registry().remove(&key).is_some() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Returns registry entry counts for all FFI registries.
+///
+/// Exposes the current entry counts for the context registry, identity
+/// registry, known-contexts registry, MCP server registry, and MCP
+/// client registry. Intended for monitoring and debugging in
+/// long-running processes.
+///
+/// # Returns
+///
+/// A Python dict with keys: `contexts`, `known_contexts`, `identities`,
+/// `relay_connected`, `mcp_servers`, `mcp_servers_stopped`, `mcp_clients`.
+///
+/// # Errors
+///
+/// Raises `TransportError` if the relay state lock is poisoned.
+#[pyfunction]
+#[pyo3(name = "py_registry_stats")]
+pub fn py_registry_stats(py: Python<'_>) -> PyResult<PyObject> {
+    let core_stats = crate::runtime::registry_stats()?;
+    let mcp_stats = mcp_registry_stats();
+
+    let dict = PyDict::new(py);
+    dict.set_item("contexts", core_stats.contexts)?;
+    dict.set_item("known_contexts", core_stats.known_contexts)?;
+    dict.set_item("identities", core_stats.identities)?;
+    dict.set_item("relay_connected", core_stats.relay_connected)?;
+    dict.set_item("mcp_servers", mcp_stats.servers)?;
+    dict.set_item("mcp_servers_stopped", mcp_stats.stopped_servers)?;
+    dict.set_item("mcp_clients", mcp_stats.clients)?;
+    Ok(dict.into())
+}
+
+/// Removes stale entries from all FFI registries.
+///
+/// Currently cleans up:
+/// - Stopped MCP server entries (where `py_mcp_server_stop` was called but
+///   the entry was never removed from the registry)
+///
+/// # Returns
+///
+/// A Python dict with keys: `mcp_servers_removed` (number of stopped
+/// server entries cleaned up).
+///
+/// # Errors
+///
+/// Raises `TransportError` on internal errors.
+#[pyfunction]
+#[pyo3(name = "py_registry_cleanup")]
+pub fn py_registry_cleanup(py: Python<'_>) -> PyResult<PyObject> {
+    let servers_removed = cleanup_stopped_servers();
+
+    let dict = PyDict::new(py);
+    dict.set_item("mcp_servers_removed", servers_removed)?;
+    Ok(dict.into())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1830,6 +1941,8 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_mcp_reset_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_get_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_register_tool_handler, m)?)?;
+    m.add_function(wrap_pyfunction!(py_registry_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(py_registry_cleanup, m)?)?;
     Ok(())
 }
 
@@ -2528,5 +2641,120 @@ mod tests {
     fn stdio_client_transport_empty_command() {
         let result = StdioClientTransport::spawn(&[]);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry statistics and cleanup (issue #108)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_registry_stats_returns_consistent_counts() {
+        let stats = mcp_registry_stats();
+        // Cannot assert exact values due to parallel tests, but structural
+        // invariants must hold: stopped_servers can never exceed total servers.
+        assert!(
+            stats.stopped_servers <= stats.servers,
+            "stopped_servers ({}) must be <= servers ({})",
+            stats.stopped_servers,
+            stats.servers
+        );
+        // Verify the struct is constructable and all fields are accessible.
+        let _ = stats.clients;
+    }
+
+    #[test]
+    fn cleanup_stopped_servers_removes_stopped_entries() {
+        let creator = "did:dht:z6MkCreatorCleanup";
+        let ctx_id = setup_test_context(creator, false);
+
+        // Create a minimal server entry directly in the registry.
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        };
+        let server = McpServer::new(provider);
+        let server = Arc::new(Mutex::new(server));
+        let handle = generate_handle_id("mcp-server");
+
+        server_registry().insert(
+            handle.clone(),
+            McpServerState {
+                identity_did: creator.to_owned(),
+                context_ids: vec![ctx_id.clone()],
+                transport: "stdio".to_owned(),
+                stopped: true, // Already stopped.
+                server,
+                shutdown_tx: None,
+                task_handle: None,
+            },
+        );
+
+        // Verify our entry is present before cleanup.
+        assert!(
+            server_registry().contains_key(&handle),
+            "stopped server handle should be present before cleanup"
+        );
+
+        cleanup_stopped_servers();
+
+        // The specific handle should be gone. We check by key rather than
+        // by count because parallel tests may insert/remove other entries.
+        assert!(
+            !server_registry().contains_key(&handle),
+            "stopped server handle should be removed after cleanup"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn cleanup_stopped_servers_leaves_running_entries() {
+        let creator = "did:dht:z6MkCreatorCleanupRunning";
+        let ctx_id = setup_test_context(creator, false);
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        };
+        let server = McpServer::new(provider);
+        let server = Arc::new(Mutex::new(server));
+        let handle = generate_handle_id("mcp-server");
+
+        server_registry().insert(
+            handle.clone(),
+            McpServerState {
+                identity_did: creator.to_owned(),
+                context_ids: vec![ctx_id.clone()],
+                transport: "stdio".to_owned(),
+                stopped: false, // Still running.
+                server,
+                shutdown_tx: None,
+                task_handle: None,
+            },
+        );
+
+        cleanup_stopped_servers();
+
+        // Running server should still be present.
+        assert!(
+            server_registry().contains_key(&handle),
+            "running server handle should NOT be removed"
+        );
+
+        // Cleanup: remove manually.
+        server_registry().remove(&handle);
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn core_registry_stats_includes_all_fields() {
+        let stats = crate::runtime::registry_stats().unwrap();
+        // Just verify the struct has the expected fields and doesn't panic.
+        let _ = stats.contexts;
+        let _ = stats.known_contexts;
+        let _ = stats.identities;
+        let _ = stats.relay_connected;
     }
 }
