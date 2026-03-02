@@ -246,6 +246,11 @@ pub fn py_ucan_mint(
     for cap in &capabilities {
         validate::validate_capability_uri(cap)?;
     }
+    if let Some(ref tokens) = proofs {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
     // Look up the context to get the creator DID (issuer).
     let creator_did = crate::runtime::with_context(context_id, |rt| Ok(rt.creator_did.clone()))?;
 
