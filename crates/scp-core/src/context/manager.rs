@@ -1192,7 +1192,7 @@ impl ContextManager {
     ) -> Result<AuthorBlockResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let result = {
+        let (result, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -1214,6 +1214,9 @@ impl ContextManager {
 
             let result = bc.block_author(author_did)?;
 
+            // Take snapshot for persistence before dropping lock.
+            let snapshot = bc.to_snapshot();
+
             // Emit block event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::AuthorBlocked {
                 author_did: author_did.clone(),
@@ -1222,9 +1225,12 @@ impl ContextManager {
             // Record the proposal as executed (inside lock scope).
             ctx.executed_proposals.insert(proposal_id);
 
-            result
+            (result, snapshot)
         };
         // Lock dropped.
+
+        // Persist broadcast state for crash recovery.
+        self.persist_broadcast_snapshot(context_id, &snapshot);
 
         self.event_log
             .append_context_event(&context_id_bytes, "AuthorBlocked")?;
