@@ -429,9 +429,13 @@ impl ContextManager {
             // For broadcast contexts, unsubscribe from the BroadcastContext.
             // rotate_keys=true for forward secrecy after departure.
             if let Some(ref mut bc) = ctx.broadcast_context {
-                // Ignore MemberNotFound for unsubscribe -- the member may be
-                // an author who was never a subscriber.
-                let _ = bc.unsubscribe(member_did, true);
+                // Ignore MemberNotFound -- the member may be an author who was
+                // never a subscriber. Propagate all other errors (e.g.
+                // CryptoFailed from epoch overflow during key rotation).
+                match bc.unsubscribe(member_did, true) {
+                    Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
             }
 
             if !ctx.membership.remove_member(member_did) {
