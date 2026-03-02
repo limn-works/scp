@@ -2668,7 +2668,7 @@ fn wasm_multi_proof_same_root_triggers_circular_detection() {
 
     // Root -> B.
     let root_to_b_payload = wasm_ucan_mirror::UcanPayload {
-        iss: root_did.clone(),
+        iss: root_did,
         aud: b_did.clone(),
         exp: now + 3600,
         nbf: None,
