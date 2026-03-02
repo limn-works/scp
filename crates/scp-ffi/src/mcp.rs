@@ -660,6 +660,7 @@ impl ContextProvider for FfiBridgeProvider {
         .map_err(|e| format!("{e}"))
     }
 
+    #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
     fn invoke_tool(
         &self,
         context_id: &str,
@@ -669,6 +670,9 @@ impl ContextProvider for FfiBridgeProvider {
         // Validates tool existence and input schema, then dispatches to a
         // registered handler if one exists. If no handler is registered, falls
         // back to echoing the validated input with metadata (schema-only mode).
+        //
+        // After successful invocation, appends a ToolInvokedEvent to the
+        // context's event log per ADR-010 acceptance criterion 3.
         //
         // The handler dispatch is sync because ContextProvider::invoke_tool is
         // sync and Python handlers are GIL-bound (inherently sync). The async
@@ -685,12 +689,15 @@ impl ContextProvider for FfiBridgeProvider {
         // misbehaving handler from blocking the tokio runtime indefinitely.
         // Uses std::thread::spawn + mpsc::recv_timeout (sync timeout) because
         // ContextProvider::invoke_tool is a sync trait method. See issue #123.
+        let start = std::time::Instant::now();
+        let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
 
         // Phase 1: Validate input and extract handler + output schema under
         // the DashMap shard lock. The lock is released when with_context
-        // returns.
-        let dispatch = crate::runtime::with_context(context_id, |rt| {
+        // returns. Also compute input hash before dispatch (arguments may
+        // be consumed by the handler).
+        let (dispatch, input_hash) = crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::ContextError(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
@@ -709,10 +716,15 @@ impl ContextProvider for FfiBridgeProvider {
             })?;
 
             // Clone handler Arc and output schema so we can release the lock.
-            Ok(rt
-                .tool_handlers
-                .get(tool_name)
-                .map(|handler| (handler.clone(), registration.schema.output_schema.clone())))
+            // Compute input hash before dispatch (arguments may be consumed).
+            let input_hash = scp_core::context::tools::sha256_json(&arguments);
+
+            Ok((
+                rt.tool_handlers
+                    .get(tool_name)
+                    .map(|handler| (handler.clone(), registration.schema.output_schema.clone())),
+                input_hash,
+            ))
         })
         .map_err(|e| format!("{e}"))?;
 
@@ -720,7 +732,7 @@ impl ContextProvider for FfiBridgeProvider {
         // concurrent same-context operations are not blocked during Python
         // GIL acquisition and handler execution. Handler execution is
         // bounded by `tool_timeout_ms` (issue #123).
-        match dispatch {
+        let output = match dispatch {
             Some((handler, output_schema)) => {
                 // Run the handler on a dedicated thread with a timeout to
                 // prevent indefinite blocking. The handler is Send + Sync
@@ -750,19 +762,87 @@ impl ContextProvider for FfiBridgeProvider {
                 )
                 .map_err(|msg| format!("output validation failed for tool '{tool_name}': {msg}"))?;
 
-                Ok(output)
+                output
             }
             None => {
                 // No handler registered -- fall back to echo mode.
-                Ok(serde_json::json!({
+                serde_json::json!({
                     "tool": tool_name,
                     "context": context_id,
                     "status": "validated",
                     "input_valid": true,
                     "validated_input": arguments,
-                }))
+                })
             }
+        };
+
+        // Phase 3: Append ToolInvokedEvent to the event log (ADR-010
+        // criterion 3). Uses append_unsigned_event because signing key
+        // material is not available in this sync context
+        // (ContextProvider::invoke_tool is called from within the tokio
+        // runtime, preventing block_on for async custody signing). The event
+        // is still recorded in the Merkle tree with full provenance metadata.
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = {
+            let millis = start.elapsed().as_millis();
+            if millis > u128::from(u64::MAX) {
+                u64::MAX
+            } else {
+                millis as u64
+            }
+        };
+
+        let tool_event = scp_core::context::tools::ToolInvokedEvent {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            tool_id: tool_name.to_owned(),
+            invoker_did: agent_did.clone().into(),
+            status: scp_core::context::tools::ToolStatus::Success,
+            execution_time_ms: elapsed_ms,
+            input_hash,
+            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+        };
+
+        let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        // Re-acquire the DashMap lock briefly to append the event.
+        if let Err(e) = crate::runtime::with_context(context_id, |rt| {
+            let sequence = scp_core::event_log::tree::event_count(&rt.event_log);
+            let prev_hash = if rt.event_log.leaves().is_empty() {
+                scp_core::event_log::tree::GENESIS_PREV_HASH
+            } else {
+                rt.event_log.leaves()[rt.event_log.leaves().len() - 1]
+            };
+
+            let event = scp_core::event_log::Event {
+                event_type: scp_core::event_log::EventType::ToolInvoked,
+                actor_did: agent_did.into(),
+                timestamp,
+                sequence,
+                payload: scp_core::event_log::EventPayload {
+                    data: payload_data.clone(),
+                },
+                prev_hash,
+                signature: Vec::new(),
+            };
+
+            scp_core::event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
+                .map_err(|e| ScpPyError::ContextError(e.to_string()))?;
+            Ok(())
+        }) {
+            tracing::warn!(
+                tool = %tool_name,
+                context = %context_id,
+                error = %e,
+                "failed to append ToolInvokedEvent to event log"
+            );
         }
+
+        Ok(output)
     }
 
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
@@ -2214,6 +2294,135 @@ mod tests {
         assert_eq!(output["context"], ctx_id);
         assert_eq!(output["input_valid"], true);
         assert_eq!(output["validated_input"], input);
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::invoke_tool — appends ToolInvokedEvent to event log
+    // (ADR-010 acceptance criterion 3, issue #120)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invoke_tool_echo_mode_appends_tool_invoked_event() {
+        let creator = "did:dht:z6MkCreatorEventLog";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Verify the event log is initially empty.
+        let initial_count = crate::runtime::with_context(&ctx_id, |rt| {
+            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+        })
+        .unwrap();
+        assert_eq!(initial_count, 0, "event log should start empty");
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        };
+
+        // Invoke in echo mode (no handler registered).
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+
+        // Verify the event log now has one event.
+        let after_count = crate::runtime::with_context(&ctx_id, |rt| {
+            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+        })
+        .unwrap();
+        assert_eq!(
+            after_count, 1,
+            "event log should have 1 event after invocation"
+        );
+
+        // Invoke again to verify sequential appending.
+        let result2 =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
+        assert!(result2.is_ok());
+
+        let final_count = crate::runtime::with_context(&ctx_id, |rt| {
+            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+        })
+        .unwrap();
+        assert_eq!(
+            final_count, 2,
+            "event log should have 2 events after two invocations"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_with_handler_appends_tool_invoked_event() {
+        let creator = "did:dht:z6MkCreatorHandlerEventLog";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a handler.
+        let handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|input: serde_json::Value| {
+                let a = input["a"].as_f64().unwrap_or(0.0);
+                let b = input["b"].as_f64().unwrap_or(0.0);
+                Ok(serde_json::json!({"result": a + b}))
+            });
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 10, "b": 20}));
+        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+        assert_eq!(result.unwrap(), serde_json::json!({"result": 30.0}));
+
+        // Verify event was logged.
+        let count = crate::runtime::with_context(&ctx_id, |rt| {
+            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+        })
+        .unwrap();
+        assert_eq!(count, 1, "handler path should also append to event log");
+
+        // Verify the merkle root is non-zero (tree was actually built).
+        let root = crate::runtime::with_context(&ctx_id, |rt| {
+            Ok(scp_core::event_log::tree::root(&rt.event_log))
+        })
+        .unwrap();
+        assert_ne!(
+            root, [0u8; 32],
+            "merkle root should be non-zero after appending an event"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_error_does_not_append_event() {
+        let creator = "did:dht:z6MkCreatorNoEventOnErr";
+        let ctx_id = setup_test_context(creator, true);
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        };
+
+        // Invoke with invalid input (schema validation fails).
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!("not an object"));
+        assert!(result.is_err(), "invalid input should be rejected");
+
+        // Event log should still be empty (no event appended on error).
+        let count = crate::runtime::with_context(&ctx_id, |rt| {
+            Ok(scp_core::event_log::tree::event_count(&rt.event_log))
+        })
+        .unwrap();
+        assert_eq!(
+            count, 0,
+            "event log should remain empty when invocation fails"
+        );
 
         crate::runtime::remove_context(&ctx_id);
     }
