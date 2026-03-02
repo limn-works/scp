@@ -25,7 +25,21 @@
         "SCP-238",
         "SCP-239",
         "SCP-240",
-        "SCP-241"
+        "SCP-241",
+        "SCP-245"
+      ]
+    },
+    {
+      "id": "gate-reachability-3",
+      "name": "Reachability Hardening",
+      "priority": "P2",
+      "status": "pending",
+      "stories": [
+        "SCP-242",
+        "SCP-243",
+        "SCP-244",
+        "SCP-246",
+        "SCP-247"
       ]
     }
   ],
@@ -493,6 +507,262 @@
         "crate": "scp-core"
       },
       "result": "Implemented DidResolver trait, DualLayerResolver with parallel relay+DHT resolution, ResolvedDidDocument, ResolutionSource. 14 tests. Commit ec59a72."
+    },
+    {
+      "id": "SCP-242",
+      "title": "Implement reachability self-test on startup",
+      "gate": "gate-reachability-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-transport/src/nat/mod.rs"
+      ],
+      "description": "After obtaining an external address via UPnP (Tier 1, §10.12.2 step 4) or STUN (Tier 2, §10.12.3), the SDK must perform a reachability self-test before publishing the address in the DID document. If the self-test fails, the mapping is considered unreliable and the SDK falls through to the next tier. Currently, the tier selection algorithm publishes the address without verification. This story adds the self-test probe.",
+      "acceptanceCriteria": [
+        "After Tier 1 UPnP mapping, a self-test probe verifies external reachability before publishing",
+        "After Tier 2 STUN hole punch, a self-test probe verifies external reachability before publishing",
+        "Self-test failure on Tier 1 triggers fallthrough to Tier 2 (§10.12.2 step 4)",
+        "Self-test failure on Tier 2 triggers fallthrough to Tier 3 (§10.12.3)",
+        "Self-test uses a known relay as intermediary to probe the external address",
+        "Unit test: self-test success proceeds with address publication",
+        "Unit test: self-test failure triggers fallthrough to next tier"
+      ],
+      "actionItems": [
+        "Implement reachability self-test in NatProber or DefaultNatStrategy",
+        "Add self-test after UPnP mapping success in select_tier",
+        "Add self-test after STUN address discovery in select_tier",
+        "Wire fallthrough on self-test failure",
+        "Add tests with mock probe results"
+      ],
+      "blockedBy": [
+        "SCP-232",
+        "SCP-233"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.2 Tier 1: UPnP/NAT-PMP Port Mapping"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.3 Tier 2: STUN Hole Punching"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-243",
+      "title": "Implement periodic 30-minute tier re-evaluation",
+      "gate": "gate-reachability-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-transport/src/nat/mod.rs"
+      ],
+      "description": "The SDK must re-evaluate the reachability tier periodically (recommended: every 30 minutes per §10.12.1) and on network change events. Tier changes trigger DID document updates with the new relay address. Currently the tier is selected once at startup and never re-evaluated. This story adds the periodic re-evaluation loop.",
+      "acceptanceCriteria": [
+        "A background task re-evaluates the reachability tier every 30 minutes",
+        "Tier change triggers DID document update with the new relay address",
+        "Tier change is logged at INFO level (§10.12.1)",
+        "Network change events (IP change, interface up/down) trigger immediate re-evaluation",
+        "Unit test: tier change after 30 minutes triggers DID document republish",
+        "Unit test: network event triggers immediate re-evaluation"
+      ],
+      "actionItems": [
+        "Add periodic tier re-evaluation loop in ApplicationNode",
+        "Implement NatTierChange event emission on tier change",
+        "Wire DID document republish on tier change",
+        "Add network change event detection (platform-specific)",
+        "Add tests for periodic and event-triggered re-evaluation"
+      ],
+      "blockedBy": [
+        "SCP-235"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.1 Reachability Tiers"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-244",
+      "title": "Implement multi-STUN divergence detection for symmetric NAT",
+      "gate": "gate-reachability-3",
+      "priority": "P2",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/nat/stun.rs",
+        "crates/scp-transport/src/nat/types.rs"
+      ],
+      "description": "Symmetric NAT detection requires comparing external addresses from multiple STUN servers (§10.12.9 threat model). If different STUN servers report different external addresses, the NAT is symmetric. Currently NatProber supports multiple endpoints but only uses the first successful response for classification. This story adds divergence detection: query at least 2 STUN servers, compare external addresses, and classify as symmetric if they diverge.",
+      "acceptanceCriteria": [
+        "NatProber queries at least 2 STUN servers when multiple endpoints are configured",
+        "If external addresses from 2+ STUN servers match, NAT is classified as non-symmetric",
+        "If external addresses from 2+ STUN servers diverge, NAT is classified as symmetric",
+        "Single-STUN fallback: if only 1 endpoint responds, classification uses port-mapping heuristics",
+        "Unit test: two STUN servers return same address, classified as non-symmetric",
+        "Unit test: two STUN servers return different addresses, classified as symmetric"
+      ],
+      "actionItems": [
+        "Update NatProber::probe to query all configured STUN endpoints",
+        "Compare external addresses from multiple responses",
+        "Classify as symmetric if addresses diverge",
+        "Add divergence-based tests"
+      ],
+      "blockedBy": [
+        "SCP-232"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.9 Threat Model"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.3 Tier 2: STUN Hole Punching"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-245",
+      "title": "Implement protocol-level healing of stale DID documents across resolution layers",
+      "gate": "gate-reachability-2",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/resolver.rs",
+        "crates/scp-core/src/identity/republish.rs"
+      ],
+      "description": "Per §3.10.7, when both resolution layers return valid documents with different sequence numbers, the resolver SHOULD re-publish the fresher document to the layer that returned the stale one (protocol-level healing). Currently DualLayerResolver picks the highest seq but does not trigger a republish to the stale layer. This story implements the healing mechanism: when the relay returns seq=1 and DHT returns seq=5, the resolver queues a republish of the seq=5 document to the relay layer.",
+      "acceptanceCriteria": [
+        "When relay returns a lower seq than DHT, the DHT document is republished to relay layer",
+        "When DHT returns a lower seq than relay, the relay document is republished to DHT layer",
+        "Healing is asynchronous (does not block the resolve call)",
+        "Healing is best-effort (failure is logged, not propagated)",
+        "Unit test: seq divergence triggers healing republish to stale layer",
+        "Unit test: healing failure is logged and does not affect resolve result"
+      ],
+      "actionItems": [
+        "Add healing trigger in DualLayerResolver when seq numbers diverge",
+        "Implement async republish to the stale layer",
+        "Wire RepublishManager or a dedicated healing publisher",
+        "Add tests for both divergence directions"
+      ],
+      "blockedBy": [
+        "SCP-241"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.7 Version Resolution"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-246",
+      "title": "Wire AcmeProvider into ApplicationNodeBuilder.build()",
+      "gate": "gate-reachability-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-transport/src/tls.rs"
+      ],
+      "description": "The AcmeProvider module exists in scp-transport/src/tls.rs but is never called from the domain build path in ApplicationNodeBuilder.build(). When .domain() is set, the builder should invoke AcmeProvider to provision a TLS certificate via Let's Encrypt before starting the relay listener. Currently the code has a comment noting ACME is not yet integrated (§10.12.8 ADR-032 AC 7). This story wires the existing module into the build path.",
+      "acceptanceCriteria": [
+        "When .domain() is set, AcmeProvider is invoked during build() to provision TLS",
+        "ACME challenge success results in wss:// relay URL in DID document",
+        "ACME challenge failure triggers fallthrough to no_domain behavior (§10.12.8)",
+        "AcmeProvider uses the email from .acme_email() builder method",
+        "Unit test: ACME success produces wss:// relay URL",
+        "Unit test: ACME failure falls through to NAT traversal tiers"
+      ],
+      "actionItems": [
+        "Import AcmeProvider in scp-node/src/lib.rs",
+        "Wire AcmeProvider::provision() in the domain build path",
+        "Handle ACME failure with fallthrough to build_no_domain_inner",
+        "Update the existing ACME comment to reference this story",
+        "Add tests with mock AcmeProvider"
+      ],
+      "blockedBy": [
+        "SCP-235"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.8 ApplicationNode Integration"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-247",
+      "title": "Implement BRIDGE_REGISTER authentication with routing ID ownership proof",
+      "gate": "gate-reachability-3",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/bridge.rs",
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "BRIDGE_REGISTER currently accepts any routing_id without authentication (§10.12.4). An attacker can register arbitrary routing IDs and intercept traffic meant for the legitimate self-hosted relay. This story adds signature-based authentication: the BRIDGE_REGISTER message must include an Ed25519 signature proving the sender owns the DID that maps to the claimed routing_id. The bridge relay verifies the signature before accepting the registration.",
+      "acceptanceCriteria": [
+        "BRIDGE_REGISTER requires an Ed25519 signature proving ownership of routing_id's DID",
+        "Bridge relay rejects BRIDGE_REGISTER with missing or invalid signature",
+        "Bridge relay rejects BRIDGE_REGISTER where signature DID does not map to claimed routing_id",
+        "Signature covers routing_id || timestamp to prevent replay attacks",
+        "Timestamp must be within 60 seconds of server time (replay window)",
+        "Unit test: valid signature accepted, registration succeeds",
+        "Unit test: invalid signature rejected with BRIDGE_AUTH_FAILED error",
+        "Unit test: expired timestamp rejected"
+      ],
+      "actionItems": [
+        "Add signature and timestamp fields to BridgeRegistration struct",
+        "Implement signature verification in BridgeRegistry::register",
+        "Add BRIDGE_AUTH_FAILED error code",
+        "Update wire format to include signature field",
+        "Add tests for valid, invalid, and expired cases"
+      ],
+      "blockedBy": [
+        "SCP-236"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        }
+      ],
+      "details": {
+        "phase": 3,
+        "crate": "scp-transport"
+      }
     }
   ]
 }

@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::cache::DidCache;
-use crate::dht::{extract_public_key, verify_bep44_signature};
+use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
 use crate::document::DidDocument;
 use crate::{IdentityError, cache::Clock};
 
@@ -73,6 +73,10 @@ pub struct RelayQueryRecord {
     /// The 64-byte Ed25519 signature over the BEP44 payload.
     pub signature: [u8; 64],
     /// The BEP44 sequence number.
+    ///
+    /// Deliberately `u64` despite BEP44's signed integer wire format. SCP never
+    /// publishes negative sequence numbers; the bencode encoder/decoder handles
+    /// `u64` ↔ `i64` transparently for values up to `i64::MAX`.
     pub seq: u64,
 }
 
@@ -203,9 +207,19 @@ pub async fn relay_resolve<Q: RelayQuerier, C: Clock>(
             continue;
         };
         let Ok(document) = DidDocument::from_json(&doc_json) else {
-            warn!(relay_url, did = did_string, "relay returned invalid DID document JSON");
+            warn!(
+                relay_url,
+                did = did_string,
+                "relay returned invalid DID document JSON"
+            );
             continue;
         };
+
+        // Step 3c.1: Verify self-certification — identity key must match DID suffix.
+        if let Err(e) = verify_self_certification(did_string, &document) {
+            warn!(relay_url, did = did_string, error = %e, "self-certification failed");
+            continue;
+        }
 
         // Step 3d: Cache the result.
         cache.insert(did_string, document.clone(), record.seq).await;
@@ -650,6 +664,51 @@ mod tests {
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().relay_url, "wss://relay2.example.com/scp/v1");
+    }
+
+    /// Document with mismatched identity key is rejected (self-certification).
+    #[tokio::test]
+    async fn relay_resolve_rejects_wrong_identity_key() {
+        let (verifying_key, signing_key) = make_ed25519_keypair();
+        let did = did_from_public_key(&verifying_key);
+        let routing_id = did_routing_id(&did);
+
+        // Create a document with a WRONG identity key (different from DID suffix).
+        let wrong_identity_key = [0xFFu8; 32];
+        let active_key = [2u8; 32];
+        let pre_rotation_key = [3u8; 32];
+        let doc = DidDocument::new(&did, &wrong_identity_key, &active_key, &pre_rotation_key);
+        let value = serde_json::to_vec(&doc).unwrap();
+
+        // Sign it correctly with the real key (BEP44 sig will verify, but
+        // self-cert will fail because the doc's #0 key doesn't match the DID).
+        let payload = bep44_signable(&value, 1);
+        let signature: ed25519_dalek::Signature =
+            ed25519_dalek::Signer::sign(&signing_key, &payload);
+
+        let blob = RelayQueryRecord {
+            value,
+            signature: signature.to_bytes(),
+            seq: 1,
+        };
+
+        let querier = InMemoryRelayQuerier::new();
+        querier
+            .insert("wss://relay1.example.com/scp/v1", &routing_id, blob)
+            .await;
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = DidCache::with_clock(clock);
+
+        let result = relay_resolve(&did, &["wss://relay1.example.com/scp/v1"], &querier, &cache)
+            .await
+            .unwrap();
+
+        // Self-certification failure: no valid result returned.
+        assert!(result.is_none());
+
+        // Nothing should be cached.
+        assert!(cache.get(&did).await.is_none());
     }
 
     /// Invalid DID format returns an error immediately.

@@ -44,7 +44,7 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"

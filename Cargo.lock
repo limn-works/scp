@@ -3513,6 +3513,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
  "x25519-dalek 2.0.1",
  "z-base-32",
@@ -3632,6 +3633,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "z-base-32",
 ]
 

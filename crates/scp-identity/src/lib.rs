@@ -33,15 +33,22 @@ pub mod dht_client;
 pub mod document;
 pub mod republish;
 pub mod resolution;
+pub mod resolver;
 
 pub use cache::{DidCache, DidResolutionResult, Staleness};
-pub use dht::{DidDht, verify_migration};
+pub use dht::{
+    DidDht, extract_public_key, verify_bep44_signature, verify_migration,
+    verify_self_certification,
+};
 pub use dht_client::{DhtClient, InMemoryDhtClient};
 pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 pub use republish::RepublishManager;
 pub use resolution::{
     InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id,
     relay_resolve,
+};
+pub use resolver::{
+    DidResolver, DualLayerResolver, MultiRelayQuerier, ResolutionSource, ResolvedDidDocument,
 };
 
 use serde::{Deserialize, Serialize};

@@ -14,14 +14,19 @@ pub use scp_identity::dht_client;
 pub use scp_identity::document;
 pub use scp_identity::republish;
 pub use scp_identity::resolution;
+pub use scp_identity::resolver;
 
 // Re-export top-level types so `use scp_core::identity::DID` etc. still work.
 pub use scp_identity::{
     DID, DhtClient, DidCache, DidDht, DidDocument, DidMethod, DidResolutionResult,
     DidRotationEvent, IdentityError, InMemoryDhtClient, MigrationProof, PreRotationProof,
-    RepublishManager, ScpIdentity, Staleness, verify_migration,
+    RepublishManager, ScpIdentity, Staleness, extract_public_key, verify_bep44_signature,
+    verify_migration, verify_self_certification,
 };
 pub use scp_identity::resolution::{
     InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id,
     relay_resolve,
+};
+pub use scp_identity::resolver::{
+    DidResolver, DualLayerResolver, MultiRelayQuerier, ResolutionSource, ResolvedDidDocument,
 };

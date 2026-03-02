@@ -196,7 +196,7 @@ async fn receive_envelope(
 /// envelope (ADR-002), transport trait (ADR-005), native relay (ADR-004),
 /// platform adapters (ADR-006), and sender keys (ADR-007).
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, deprecated)]
 async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 1 & 2: Alice and Bob create did:dht identities (ADR-003, ADR-006)
@@ -455,6 +455,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
 /// Tests that the transport adapter trait (ADR-005) correctly routes
 /// envelopes through the native relay server (ADR-004).
 #[tokio::test]
+#[allow(deprecated)]
 async fn native_relay_adapter_send_receive_roundtrip() {
     let relay_addr = start_relay().await;
     let relay_url = format!("ws://{relay_addr}/scp/v1");

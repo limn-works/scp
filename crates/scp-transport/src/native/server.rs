@@ -860,15 +860,17 @@ async fn handle_client_message<S: BlobStorage>(
             // Bridge registration requires a BridgeRegistry, which is
             // managed separately from the standard relay server.
             if config.supports_bridge {
-                // Bridge registration is handled by the bridge service
-                // layer (relay::bridge::BridgeRegistry) which wraps the
-                // server. Respond with OK as acknowledgement -- actual
-                // registration state is managed externally.
-                let ok_msg = RelayMessage::Ok {
+                // Bridge service layer (relay::bridge::BridgeRegistry) is
+                // not yet wired into the relay server. Return an error so
+                // clients know the feature is not operational yet.
+                let err_msg = RelayMessage::Err {
                     ref_id: ref_id.clone(),
-                    blob_id: None,
+                    code: code::BRIDGE_NOT_INTEGRATED,
+                    msg:
+                        "bridge relay integration pending — handler not yet wired to BridgeRegistry"
+                            .to_string(),
                 };
-                let _ = tx.send(ok_msg).await;
+                let _ = tx.send(err_msg).await;
             } else {
                 let err_msg = RelayMessage::Err {
                     ref_id: ref_id.clone(),
@@ -881,14 +883,17 @@ async fn handle_client_message<S: BlobStorage>(
         ClientMessage::BridgeData { ref_id, .. } => {
             // Bridge data forwarding requires the bridge service layer.
             if config.supports_bridge {
-                // Bridge data forwarding is handled by the bridge service
-                // layer. The server acknowledges receipt; actual forwarding
-                // is done by BridgeRegistry.lookup() + channel send.
-                let ok_msg = RelayMessage::Ok {
+                // Bridge service layer is not yet wired into the relay
+                // server. Return an error so clients know the feature is
+                // not operational yet.
+                let err_msg = RelayMessage::Err {
                     ref_id: ref_id.clone(),
-                    blob_id: None,
+                    code: code::BRIDGE_NOT_INTEGRATED,
+                    msg:
+                        "bridge relay integration pending — handler not yet wired to BridgeRegistry"
+                            .to_string(),
                 };
-                let _ = tx.send(ok_msg).await;
+                let _ = tx.send(err_msg).await;
             } else {
                 let err_msg = RelayMessage::Err {
                     ref_id: ref_id.clone(),

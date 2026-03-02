@@ -374,7 +374,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // Step 5: Verify self-certification.
         // The identity key (#0) in the document must match the public key
         // derived from the DID string.
-        Self::verify_self_certification(did_string, &document)?;
+        verify_self_certification(did_string, &document)?;
 
         // Step 6: Update cache.
         self.cache
@@ -680,35 +680,46 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             revealed_key: new_identity_bytes,
         }))
     }
+}
 
-    /// Verifies that the identity key in the document matches the DID's
-    /// z-base-32 encoded public key.
-    fn verify_self_certification(
-        did_string: &str,
-        document: &DidDocument,
-    ) -> Result<(), IdentityError> {
-        let public_key = Self::extract_public_key(did_string)?;
+/// Verifies that the identity key in a DID document matches the DID string's
+/// z-base-32 encoded public key (self-certification check).
+///
+/// This is the single, consolidated implementation used by:
+/// - `DidDht::resolve_did` (DHT resolution path)
+/// - `verify_and_deserialize` in `resolver.rs` (dual-layer resolution path)
+/// - `relay_resolve` in `resolution.rs` (relay resolution path)
+///
+/// # Errors
+///
+/// Returns [`IdentityError::SelfCertificationFailed`] if the document's identity
+/// key (`#0` verification method) does not match the public key encoded in the
+/// DID string.
+pub fn verify_self_certification(
+    did_string: &str,
+    document: &DidDocument,
+) -> Result<(), IdentityError> {
+    let public_key = extract_public_key(did_string)?;
 
-        // Find the #0 verification method (identity key).
-        let vm0 = document
-            .verification_method_by_fragment("0")
-            .ok_or_else(|| {
-                IdentityError::SelfCertificationFailed(
-                    "no #0 verification method in document".to_owned(),
-                )
-            })?;
+    // Find the #0 verification method (identity key).
+    let vm0 = document
+        .verification_method_by_fragment("0")
+        .ok_or_else(|| {
+            IdentityError::SelfCertificationFailed(
+                "no #0 verification method in document".to_owned(),
+            )
+        })?;
 
-        // Decode the multibase public key from the document.
-        let doc_key_bytes = decode_multibase_key(&vm0.public_key_multibase)?;
+    // Decode the multibase public key from the document.
+    let doc_key_bytes = decode_multibase_key(&vm0.public_key_multibase)?;
 
-        if doc_key_bytes != public_key {
-            return Err(IdentityError::SelfCertificationFailed(format!(
-                "identity key in document does not match DID suffix for {did_string}"
-            )));
-        }
-
-        Ok(())
+    if doc_key_bytes != public_key {
+        return Err(IdentityError::SelfCertificationFailed(format!(
+            "identity key in document does not match DID suffix for {did_string}"
+        )));
     }
+
+    Ok(())
 }
 
 /// Decodes a multibase-encoded public key (z-prefix = base58btc).
@@ -717,7 +728,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 ///
 /// Returns [`IdentityError::InvalidDidFormat`] if the key is not properly
 /// base58btc encoded.
-fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
+pub(crate) fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
     let b58_str = encoded.strip_prefix('z').ok_or_else(|| {
         IdentityError::InvalidDidFormat("multibase key must start with 'z' (base58btc)".to_owned())
     })?;
@@ -978,37 +989,6 @@ pub fn verify_migration(
     }
 
     Ok(true)
-}
-
-/// Decodes a lowercase hexadecimal string to bytes.
-///
-/// # Errors
-///
-/// Returns an error if the string length is odd or contains non-hex characters.
-fn hex_decode(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!("expected 64 hex chars, got {}", hex.len()));
-    }
-
-    let mut result = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0])
-            .ok_or_else(|| format!("invalid hex character: {}", chunk[0] as char))?;
-        let lo = hex_nibble(chunk[1])
-            .ok_or_else(|| format!("invalid hex character: {}", chunk[1] as char))?;
-        result[i] = (hi << 4) | lo;
-    }
-    Ok(result)
-}
-
-/// Converts a single hex ASCII byte to its numeric value (0-15).
-const fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -338,6 +338,17 @@ pub trait NatStrategy: Send + Sync {
     >;
 }
 
+/// Default STUN endpoints with pre-resolved IP addresses.
+///
+/// Two endpoints are required for NAT type classification (the prober
+/// compares external addresses reported by different STUN servers to
+/// detect symmetric NAT). Addresses are numeric `SocketAddr` values
+/// because `str::parse::<SocketAddr>` rejects hostnames.
+const DEFAULT_STUN_ENDPOINTS: &[(&str, &str)] = &[
+    ("74.125.250.129:19302", "stun1.l.google.com"),
+    ("64.233.163.127:19302", "stun2.l.google.com"),
+];
+
 /// Default NAT strategy using real STUN probing, `UPnP`, and bridge relay.
 ///
 /// Uses [`NatProber`](scp_transport::nat::NatProber) for STUN probing and
@@ -370,23 +381,33 @@ impl NatStrategy for DefaultNatStrategy {
         Box::pin(async move {
             use scp_transport::nat::{NatProber, StunEndpoint};
 
-            // Step 1: Resolve STUN endpoint.
-            let stun_url = self
-                .stun_server
-                .as_deref()
-                .unwrap_or("stun.l.google.com:19302");
-
-            // Parse the STUN server address.
-            let stun_addr: SocketAddr = stun_url.parse().map_err(|e| {
-                NodeError::Nat(format!("invalid STUN server address '{stun_url}': {e}"))
-            })?;
-
-            let endpoint = StunEndpoint {
-                addr: stun_addr,
-                label: stun_url.to_owned(),
+            // Step 1: Build STUN endpoint list.
+            let endpoints: Vec<StunEndpoint> = if let Some(ref override_url) = self.stun_server {
+                // User-provided override: single endpoint.
+                let addr: SocketAddr = override_url.parse().map_err(|e| {
+                    NodeError::Nat(format!("invalid STUN server address '{override_url}': {e}"))
+                })?;
+                vec![StunEndpoint {
+                    addr,
+                    label: override_url.clone(),
+                }]
+            } else {
+                // Default: two pre-resolved endpoints for NAT classification.
+                DEFAULT_STUN_ENDPOINTS
+                    .iter()
+                    .map(|(addr_str, label)| {
+                        let addr: SocketAddr = addr_str
+                            .parse()
+                            .expect("DEFAULT_STUN_ENDPOINTS contains valid SocketAddr literals");
+                        StunEndpoint {
+                            addr,
+                            label: (*label).to_owned(),
+                        }
+                    })
+                    .collect()
             };
 
-            let prober = NatProber::new(vec![endpoint], None)
+            let prober = NatProber::new(endpoints, None)
                 .map_err(|e| NodeError::Nat(format!("failed to create NAT prober: {e}")))?;
 
             // Step 2: Probe NAT type.
@@ -836,9 +857,9 @@ impl<
         //
         // §10.12.8: If domain-based deployment fails (DNS misconfigured, ACME
         // challenge fails), log the failure and fall through to no_domain behavior.
-        // Currently ACME provisioning is not yet implemented (ADR-032 AC 7),
-        // so this path always succeeds. When ACME is implemented, wrap this
-        // block in a match and fall through to `build_no_domain_inner` on failure.
+        // ACME provisioning is not yet wired into this build path — see SCP-246.
+        // When wired, wrap this block in a match and fall through to
+        // `build_no_domain_inner` on ACME failure.
         did_method.publish(&identity, &document).await?;
 
         tracing::info!(
@@ -1940,6 +1961,16 @@ mod tests {
             1,
             "DID should be published exactly once on no-domain build"
         );
+    }
+
+    #[test]
+    fn default_stun_endpoints_parseable() {
+        for (addr, _label) in DEFAULT_STUN_ENDPOINTS {
+            let parsed: std::net::SocketAddr = addr
+                .parse()
+                .unwrap_or_else(|e| panic!("STUN endpoint '{addr}' not parseable: {e}"));
+            assert_ne!(parsed.port(), 0);
+        }
     }
 
     // -- HTTP tests (SCP-147) ------------------------------------------------

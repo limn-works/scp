@@ -2,32 +2,35 @@
 //!
 //! Implements the parallel dual-layer resolution protocol defined in §3.10.10
 //! and §3.10.4. Both layers (SCP relay QUERY and Mainline DHT BEP44 lookup)
-//! are queried concurrently; the first valid response wins. "Valid" means the
-//! BEP44 signature verifies against the public key encoded in the DID string
-//! AND the sequence number is greater than or equal to the last known sequence
-//! number for that DID.
+//! are queried in parallel; both layers are queried in parallel, highest seq
+//! wins per section 3.10.7. "Valid" means the BEP44 signature verifies against
+//! the public key encoded in the DID string AND the sequence number is greater
+//! than or equal to the last known sequence number for that DID.
 //!
 //! When both layers return valid documents, the document with the highest
-//! sequence number is accepted. The slower query is cancelled once the first
-//! valid response arrives.
+//! sequence number is accepted. On a tie, the relay result is preferred
+//! (lower latency for subsequent operations).
 //!
 //! # Architecture
 //!
 //! - [`DidResolver`] — Trait for unified DID resolution (§3.10.10).
 //! - [`ResolvedDidDocument`] — Resolution result with provenance metadata.
 //! - [`ResolutionSource`] — Which layer served the document.
-//! - [`RelayQuerier`] — Trait abstracting SCP relay QUERY operations.
+//! - [`MultiRelayQuerier`] — Trait abstracting SCP relay QUERY operations.
 //! - [`DualLayerResolver`] — Composes relay + DHT resolution in parallel.
 //!
 //! See SCP-241 in `.docs/prds/reachability.json`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use super::IdentityError;
-use super::cache::{Clock, DidCache, SystemClock};
-use super::dht::{extract_public_key, verify_bep44_signature};
-use super::dht_client::{DhtClient, DhtRecord};
-use super::document::DidDocument;
+use tracing::{debug, warn};
+
+use crate::IdentityError;
+use crate::cache::{Clock, DidCache, SystemClock};
+use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
+use crate::dht_client::{DhtClient, DhtRecord};
+use crate::document::DidDocument;
 
 // ---------------------------------------------------------------------------
 // Core types (§3.10.10)
@@ -56,7 +59,11 @@ pub trait DidResolver: Send + Sync {
 pub struct ResolvedDidDocument {
     /// The verified DID document.
     pub document: DidDocument,
-    /// BEP44 sequence number. Monotonically increasing.
+    /// The BEP44 sequence number.
+    ///
+    /// Deliberately `u64` despite BEP44's signed integer wire format. SCP never
+    /// publishes negative sequence numbers; the bencode encoder/decoder handles
+    /// `u64` ↔ `i64` transparently for values up to `i64::MAX`.
     pub seq: u64,
     /// Which resolution layer served this document.
     pub source: ResolutionSource,
@@ -89,19 +96,28 @@ pub struct RelayRecord {
     /// The Ed25519 signature over the BEP44 encoded payload.
     pub signature: [u8; 64],
     /// The BEP44 sequence number.
+    ///
+    /// Deliberately `u64` despite BEP44's signed integer wire format. SCP never
+    /// publishes negative sequence numbers; the bencode encoder/decoder handles
+    /// `u64` ↔ `i64` transparently for values up to `i64::MAX`.
     pub seq: u64,
     /// The relay URL that served this record.
     pub relay_url: String,
 }
 
-/// Abstracts SCP relay QUERY operations for DID document resolution.
+/// Abstracts SCP relay QUERY operations for DID document resolution across
+/// multiple relays.
 ///
 /// The relay querier sends a QUERY with `routing_id = did_routing_id(did_string)`
 /// and `limit = 1` to known SCP relays. It returns the first valid BEP44-signed
 /// blob found, or `None` if no relay has the document.
 ///
+/// Named `MultiRelayQuerier` to distinguish from [`super::resolution::RelayQuerier`]
+/// which operates on a single relay URL. This trait takes a slice of relay URLs
+/// and selects the best result.
+///
 /// See §3.10.2 for the relay-based resolution protocol.
-pub trait RelayQuerier: Send + Sync {
+pub trait MultiRelayQuerier: Send + Sync {
     /// Queries SCP relays for a DID document.
     ///
     /// # Arguments
@@ -148,31 +164,7 @@ fn verify_and_deserialize(
         .map_err(|e| IdentityError::DocumentDeserializationError(e.to_string()))?;
 
     // Step 3: Self-certification — identity key (#0) must match DID suffix.
-    let vm0 = document
-        .verification_method_by_fragment("0")
-        .ok_or_else(|| {
-            IdentityError::SelfCertificationFailed(
-                "no #0 verification method in document".to_owned(),
-            )
-        })?;
-
-    let doc_key_str = vm0.public_key_multibase.strip_prefix('z').ok_or_else(|| {
-        IdentityError::InvalidDidFormat("multibase key must start with 'z' (base58btc)".to_owned())
-    })?;
-
-    let doc_key_bytes: [u8; 32] = bs58::decode(doc_key_str)
-        .into_vec()
-        .map_err(|e| IdentityError::InvalidDidFormat(format!("base58btc decode failed: {e}")))?
-        .try_into()
-        .map_err(|v: Vec<u8>| {
-            IdentityError::InvalidDidFormat(format!("expected 32-byte key, got {} bytes", v.len()))
-        })?;
-
-    if doc_key_bytes != *public_key {
-        return Err(IdentityError::SelfCertificationFailed(format!(
-            "identity key in document does not match DID suffix for {did_string}"
-        )));
-    }
+    verify_self_certification(did_string, &document)?;
 
     Ok(document)
 }
@@ -181,18 +173,26 @@ fn verify_and_deserialize(
 // DualLayerResolver
 // ---------------------------------------------------------------------------
 
+/// Per-layer timeout for parallel resolution. Each of the relay and DHT
+/// layers is given this much time to respond before being treated as a
+/// timeout (returning `Ok(None)`).
+const LAYER_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Composes SCP relay QUERY with Mainline DHT resolution in parallel.
 ///
 /// On `resolve()`:
 /// 1. Check cache. If a fresh entry exists, return with `ResolutionSource::Cache`.
 /// 2. Extract the public key from the DID string.
-/// 3. Initiate both relay QUERY and DHT resolve concurrently.
-/// 4. First valid response wins (latency = min(relay, dht)).
-/// 5. When both return valid documents, highest sequence number wins.
-/// 6. Cache the result.
+/// 3. Initiate both relay QUERY and DHT resolve concurrently via `tokio::join!`
+///    with per-layer 10-second timeouts.
+/// 4. Both layers are awaited; the result with the highest sequence number wins.
+/// 5. On a seq tie, the relay result is preferred (lower latency for subsequent ops).
+/// 6. When one layer times out, the other's valid result is used.
+/// 7. When both fail or return nothing, returns `Ok(None)`.
+/// 8. Cache the result.
 ///
-/// See §3.10.4 for the full resolution protocol.
-pub struct DualLayerResolver<R: RelayQuerier, D: DhtClient, C: Clock = SystemClock> {
+/// See §3.10.4 and §3.10.7 for the full resolution protocol.
+pub struct DualLayerResolver<R: MultiRelayQuerier, D: DhtClient, C: Clock = SystemClock> {
     relay_querier: Arc<R>,
     dht_client: Arc<D>,
     cache: Arc<DidCache<C>>,
@@ -200,7 +200,7 @@ pub struct DualLayerResolver<R: RelayQuerier, D: DhtClient, C: Clock = SystemClo
     bootstrap_relays: Vec<String>,
 }
 
-impl<R: RelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
+impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
     /// Creates a new dual-layer resolver.
     #[must_use]
     pub const fn new(
@@ -219,7 +219,7 @@ impl<R: RelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
 }
 
 #[allow(clippy::manual_async_fn)]
-impl<R: RelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static> DidResolver
+impl<R: MultiRelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static> DidResolver
     for DualLayerResolver<R, D, C>
 {
     fn resolve(
@@ -246,46 +246,61 @@ impl<R: RelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static> DidR
             let public_key = extract_public_key(&did)?;
 
             // Step 3: Determine relay URLs.
-            // If the cache has a document with relay service entries, use those;
-            // otherwise fall back to bootstrap relays.
+            // Use cached relay URLs (even from expired entries) to prefer an
+            // identity's known relays over bootstrap relays. Falls back to
+            // bootstrap relays when no cached entry exists at all.
             let relay_urls = cache
-                .get(&did)
+                .cached_relay_urls(&did)
                 .await
-                .map(|cached| cached.document.relay_service_urls())
-                .filter(|urls| !urls.is_empty())
                 .unwrap_or(bootstrap_relays);
 
-            // Step 4: Initiate both layers in parallel using tokio::select!.
-            // The first valid response wins; the slower future is dropped
-            // (cancelled) when select! chooses the other branch.
-            let relay_fut = relay_querier.query(&did, &relay_urls);
-            let dht_fut = dht_client.resolve(&public_key);
-
-            tokio::pin!(relay_fut);
-            tokio::pin!(dht_fut);
-
-            let result = tokio::select! {
-                relay_result = &mut relay_fut => {
-                    if let Ok(Some(resolved)) = validate_relay_result(relay_result, &did, &public_key) {
-                        Ok(Some(resolved))
-                    } else {
-                        // Relay failed or empty. Wait for DHT.
-                        let dht_result = dht_fut.await;
-                        validate_dht_result(dht_result, &did, &public_key)
+            // Step 4: Initiate both layers in parallel using tokio::join!
+            // with per-layer timeouts (LAYER_TIMEOUT). Both layers are
+            // awaited; the result with the highest sequence number wins.
+            let relay_fut = async {
+                match tokio::time::timeout(LAYER_TIMEOUT, relay_querier.query(&did, &relay_urls))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        debug!(did = %did, "relay layer timed out");
+                        Ok(None)
                     }
                 }
-                dht_result = &mut dht_fut => {
-                    if let Ok(Some(resolved)) = validate_dht_result(dht_result, &did, &public_key) {
-                        Ok(Some(resolved))
-                    } else {
-                        // DHT failed or empty. Wait for relay.
-                        let relay_result = relay_fut.await;
-                        validate_relay_result(relay_result, &did, &public_key)
+            };
+            let dht_fut = async {
+                match tokio::time::timeout(LAYER_TIMEOUT, dht_client.resolve(&public_key)).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        debug!(did = %did, "DHT layer timed out");
+                        Ok(None)
                     }
                 }
-            }?;
+            };
 
-            // Step 5: Cache the result.
+            let (relay_result, dht_result) = tokio::join!(relay_fut, dht_fut);
+
+            // Validate both results independently.
+            let relay_doc = validate_relay_result(relay_result, &did, &public_key);
+            let dht_doc = validate_dht_result(dht_result, &did, &public_key);
+
+            // Step 5: Pick the result with the highest sequence number.
+            // On a tie, prefer relay (lower latency for subsequent operations).
+            let result = match (relay_doc, dht_doc) {
+                (Some(relay), Some(dht)) => {
+                    if relay.seq >= dht.seq {
+                        // Relay wins on higher seq or tie (prefer relay on tie).
+                        Some(relay)
+                    } else {
+                        Some(dht)
+                    }
+                }
+                (Some(relay), None) => Some(relay),
+                (None, Some(dht)) => Some(dht),
+                (None, None) => None,
+            };
+
+            // Step 6: Cache the result.
             if let Some(ref resolved) = result {
                 cache
                     .insert(&did, resolved.document.clone(), resolved.seq)
@@ -299,58 +314,86 @@ impl<R: RelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static> DidR
 
 /// Validates a relay resolution result: verifies BEP44 signature, deserializes
 /// document, and wraps in `ResolvedDidDocument`.
+///
+/// Network errors and verification failures are logged (not silently swallowed)
+/// and mapped to `None` so that the other layer can still provide a result.
 fn validate_relay_result(
     result: Result<Option<RelayRecord>, IdentityError>,
     did: &str,
     public_key: &[u8; 32],
-) -> Result<Option<ResolvedDidDocument>, IdentityError> {
-    // Treat relay errors as "not found" — both Ok(None) and Err(_) return None.
-    let Ok(Some(record)) = result else {
-        return Ok(None);
+) -> Option<ResolvedDidDocument> {
+    let record = match result {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            debug!(did, "relay returned no document");
+            return None;
+        }
+        Err(e) => {
+            debug!(did, error = %e, "relay query failed");
+            return None;
+        }
     };
 
-    let document = verify_and_deserialize(
+    match verify_and_deserialize(
         did,
         public_key,
         &record.value,
         &record.signature,
         record.seq,
-    )?;
-
-    Ok(Some(ResolvedDidDocument {
-        document,
-        seq: record.seq,
-        source: ResolutionSource::ScpRelay {
-            relay_url: record.relay_url,
-        },
-    }))
+    ) {
+        Ok(document) => Some(ResolvedDidDocument {
+            document,
+            seq: record.seq,
+            source: ResolutionSource::ScpRelay {
+                relay_url: record.relay_url,
+            },
+        }),
+        Err(e) => {
+            warn!(did, error = %e, "relay record verification failed");
+            None
+        }
+    }
 }
 
 /// Validates a DHT resolution result: verifies BEP44 signature, deserializes
 /// document, and wraps in `ResolvedDidDocument`.
+///
+/// Network errors and verification failures are logged (not silently swallowed)
+/// and mapped to `None` so that the other layer can still provide a result.
 fn validate_dht_result(
     result: Result<Option<DhtRecord>, IdentityError>,
     did: &str,
     public_key: &[u8; 32],
-) -> Result<Option<ResolvedDidDocument>, IdentityError> {
-    // Treat DHT errors as "not found" — both Ok(None) and Err(_) return None.
-    let Ok(Some(record)) = result else {
-        return Ok(None);
+) -> Option<ResolvedDidDocument> {
+    let record = match result {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            debug!(did, "DHT returned no document");
+            return None;
+        }
+        Err(e) => {
+            debug!(did, error = %e, "DHT resolve failed");
+            return None;
+        }
     };
 
-    let document = verify_and_deserialize(
+    match verify_and_deserialize(
         did,
         public_key,
         &record.value,
         &record.signature,
         record.seq,
-    )?;
-
-    Ok(Some(ResolvedDidDocument {
-        document,
-        seq: record.seq,
-        source: ResolutionSource::MainlineDht,
-    }))
+    ) {
+        Ok(document) => Some(ResolvedDidDocument {
+            document,
+            seq: record.seq,
+            source: ResolutionSource::MainlineDht,
+        }),
+        Err(e) => {
+            warn!(did, error = %e, "DHT record verification failed");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,12 +416,12 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use super::*;
+    use crate::*;
     use crate::identity::cache::{DidCache, TestClock};
     use crate::identity::dht::bep44_signable;
     use crate::identity::dht_client::{DhtRecord, InMemoryDhtClient};
-    use crate::identity::resolution::did_routing_id;
     use crate::identity::document::DidDocument;
+    use crate::identity::resolution::did_routing_id;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -429,7 +472,7 @@ mod tests {
         }
     }
 
-    impl RelayQuerier for InMemoryRelayQuerier {
+    impl MultiRelayQuerier for InMemoryRelayQuerier {
         fn query(
             &self,
             did: &str,
@@ -512,7 +555,7 @@ mod tests {
     }
 
     /// Creates a `DualLayerResolver` with the given relay querier and DHT client.
-    fn make_resolver<R: RelayQuerier, D: DhtClient>(
+    fn make_resolver<R: MultiRelayQuerier, D: DhtClient>(
         relay: Arc<R>,
         dht: Arc<D>,
         cache: Arc<DidCache<Arc<TestClock>>>,
@@ -531,8 +574,9 @@ mod tests {
 
     #[tokio::test]
     async fn relay_responds_first_with_valid_doc() {
-        // Relay has 10ms delay, DHT has 5000ms delay.
-        // Relay should win and DHT should be cancelled.
+        // Relay has 10ms delay, DHT has 100ms delay. Both respond, but relay
+        // has a valid doc and DHT also has the same doc. Relay result is used
+        // since both have same seq and relay is preferred on tie.
         let (signing_key, did, doc) = make_test_identity();
         let (value, signature) = sign_document(&signing_key, &doc, 1);
         let public_key = signing_key.verifying_key();
@@ -550,7 +594,7 @@ mod tests {
             )
             .await;
 
-        let dht = Arc::new(DelayedDhtClient::new(Duration::from_secs(5)));
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(100)));
         dht.inner
             .publish(public_key.as_bytes(), &signature, &value, 1)
             .await
@@ -562,11 +606,12 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
             .await
-            .expect("should not timeout — relay should respond quickly")
+            .expect("should not timeout — both layers respond quickly")
             .unwrap();
 
         let resolved = result.expect("should resolve successfully");
         assert_eq!(resolved.seq, 1);
+        // On tie (both seq=1), relay is preferred.
         assert_eq!(
             resolved.source,
             ResolutionSource::ScpRelay {
@@ -577,25 +622,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dht_responds_first_with_valid_doc() {
-        // DHT has 10ms delay, relay has 5000ms delay.
-        // DHT should win and relay should be cancelled.
+    async fn dht_only_responds_with_valid_doc() {
+        // DHT has 10ms delay, relay has no document (empty).
+        // DHT result should be used since relay returns None.
         let (signing_key, did, doc) = make_test_identity();
         let (value, signature) = sign_document(&signing_key, &doc, 1);
         let public_key = signing_key.verifying_key();
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_secs(5)));
-        relay
-            .insert(
-                &did,
-                RelayRecord {
-                    value: value.clone(),
-                    signature,
-                    seq: 1,
-                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
-                },
-            )
-            .await;
+        // Relay has no document stored.
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
 
         let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
         dht.inner
@@ -609,7 +644,7 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
             .await
-            .expect("should not timeout — DHT should respond quickly")
+            .expect("should not timeout — both layers respond quickly")
             .unwrap();
 
         let resolved = result.expect("should resolve successfully");
@@ -621,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn both_respond_higher_seq_wins() {
         // Both layers respond quickly, but with different sequence numbers.
-        // The one with higher seq should win regardless of arrival order.
+        // With join!, both are awaited and the highest seq wins.
         let (signing_key, did, doc_v1) = make_test_identity();
         let public_key = signing_key.verifying_key();
 
@@ -663,16 +698,15 @@ mod tests {
             .unwrap();
 
         let resolved = result.expect("should resolve successfully");
-        // Whichever arrives first wins when selected, but since relay has the
-        // higher seq (5) and both have similar timing, relay's result should
-        // be accepted. The key assertion: a valid result was returned.
-        assert!(resolved.seq >= 1, "should get a valid seq number");
+        // Both layers are awaited via join!. Relay has seq=5, DHT has seq=1.
+        // Highest seq wins, so relay's seq=5 must be the result.
+        assert_eq!(resolved.seq, 5);
     }
 
     #[tokio::test]
     async fn both_respond_dht_has_higher_seq() {
-        // DHT responds first with seq=5, relay responds later with seq=1.
-        // DHT's higher seq should be used since it arrives first.
+        // Relay responds fast with seq=1, DHT responds slow with seq=5.
+        // With join!, both are awaited and the highest seq wins — DHT's seq=5.
         let (signing_key, did, _) = make_test_identity();
         let public_key = signing_key.verifying_key();
 
@@ -683,8 +717,8 @@ mod tests {
         let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
         let (value_v5, sig_v5) = sign_document(&signing_key, &doc_v5, 5);
 
-        // Relay returns seq=1 (lower), slow.
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_secs(5)));
+        // Relay returns seq=1 (lower), fast (10ms).
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
         relay
             .insert(
                 &did,
@@ -697,8 +731,8 @@ mod tests {
             )
             .await;
 
-        // DHT returns seq=5 (higher), fast.
-        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        // DHT returns seq=5 (higher), slow (500ms — but still within timeout).
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(500)));
         dht.inner
             .publish(public_key.as_bytes(), &sig_v5, &value_v5, 5)
             .await
@@ -714,6 +748,7 @@ mod tests {
             .unwrap();
 
         let resolved = result.expect("should resolve successfully");
+        // With join!, both layers are awaited. DHT has higher seq (5), so it wins.
         assert_eq!(resolved.seq, 5);
         assert_eq!(resolved.source, ResolutionSource::MainlineDht);
     }
@@ -946,5 +981,55 @@ mod tests {
         assert_ne!(relay, dht);
         assert_ne!(dht, cache);
         assert_ne!(relay, cache);
+    }
+
+    #[tokio::test]
+    async fn relay_verification_error_logged_dht_still_resolves() {
+        // Relay returns a document with a corrupt signature. DHT returns a valid
+        // document. The resolver should log the relay verification error and
+        // return the DHT result.
+        let (signing_key, did, doc) = make_test_identity();
+        let (value, signature) = sign_document(&signing_key, &doc, 1);
+        let public_key = signing_key.verifying_key();
+
+        // Relay: corrupt the signature so verification fails.
+        let mut corrupt_sig = signature;
+        corrupt_sig[0] ^= 0xFF;
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value: value.clone(),
+                    signature: corrupt_sig,
+                    seq: 1,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        // DHT: valid document.
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &signature, &value, 1)
+            .await
+            .unwrap();
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        let resolver = make_resolver(relay, dht, cache);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        // Relay's corrupt signature should be logged and ignored.
+        // DHT's valid result should be returned.
+        let resolved = result.expect("should resolve from DHT despite relay verification error");
+        assert_eq!(resolved.seq, 1);
+        assert_eq!(resolved.source, ResolutionSource::MainlineDht);
+        assert_eq!(resolved.document, doc);
     }
 }
