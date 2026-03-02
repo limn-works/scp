@@ -1,0 +1,460 @@
+{
+  "project": "scp",
+  "description": "Local HTTP control API for debugging and operator tooling, plus HTTP broadcast projection for CDN distribution, web readers, and search engine crawlability.",
+  "gates": [
+    {
+      "id": "gate-http-1",
+      "name": "Local HTTP Control API",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-242",
+        "SCP-243",
+        "SCP-244",
+        "SCP-245"
+      ]
+    },
+    {
+      "id": "gate-http-2",
+      "name": "HTTP Broadcast Projection",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-246",
+        "SCP-247",
+        "SCP-248",
+        "SCP-249"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-242",
+      "title": "Extend NodeState with dev token, dev bind addr, projected contexts registry, and Arc<dyn BlobStorage>",
+      "gate": "gate-http-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/http.rs",
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "Extend NodeState with fields required by both the dev API and broadcast projection: dev_token (Option<String>), dev_bind_addr (Option<SocketAddr>), projected_contexts (RwLock<HashMap<RoutingId, ProjectedContext>>), and blob_storage (Arc<dyn BlobStorage>). Change RelayServer::new to accept Arc<B> instead of owned B so the same BlobStorage instance can be shared between the relay server and projection handlers. Update ApplicationNodeBuilder with .local_api(addr) method and wire the new fields through build(). Generate the bearer token (scp_local_token_<32 random hex>) at build time when local_api is configured. This is the shared foundation for both gate-http-1 and gate-http-2.",
+      "acceptanceCriteria": [
+        "NodeState has dev_token: Option<String> field",
+        "NodeState has dev_bind_addr: Option<SocketAddr> field",
+        "NodeState has projected_contexts: RwLock<HashMap<[u8; 32], ProjectedContext>> field",
+        "NodeState has blob_storage: Arc<dyn BlobStorage> field",
+        "RelayServer::new accepts Arc<B> where B: BlobStorage instead of owned B",
+        "Existing RelayServer callers updated to pass Arc<B>",
+        "ApplicationNodeBuilder has .local_api(addr: SocketAddr) method",
+        "Bearer token generated as scp_local_token_<32 random hex chars> when local_api is set",
+        "Bearer token logged at INFO level during build()",
+        "node.dev_token() returns Option<&str> (Some when local_api set, None otherwise)",
+        "All existing tests continue to pass after RelayServer::new signature change",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Add dev_token, dev_bind_addr, projected_contexts, and blob_storage fields to NodeState",
+        "Define ProjectedContext struct (routing_id, context_id, keys: HashMap<u64, BroadcastKey>)",
+        "Change RelayServer::new signature from B to Arc<B>",
+        "Update all RelayServer::new call sites to pass Arc::clone",
+        "Add .local_api(addr) to ApplicationNodeBuilder",
+        "Generate bearer token using rand::thread_rng() and hex encoding",
+        "Add dev_token() accessor to ApplicationNode",
+        "Log token at INFO in build() when local_api is configured",
+        "Update existing tests for new RelayServer::new signature"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.2 Binding and Authentication"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.5 SDK Surface"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.5 Decryption Architecture"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-035: Local HTTP Control API and Broadcast Projection"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-243",
+      "title": "Implement dev API handlers (health, identity, relay status) with bearer token middleware",
+      "gate": "gate-http-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/dev_api.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Create dev_api.rs with bearer token authentication middleware and three read-only handlers: GET /scp/dev/v1/health (uptime, relay connection count, storage status), GET /scp/dev/v1/identity (DID string and DID document), GET /scp/dev/v1/relay/status (bound address, active connections, blob count). The middleware extracts the Authorization header, compares against NodeState.dev_token using constant-time comparison, and returns 401 with {\"error\": \"unauthorized\", \"code\": \"UNAUTHORIZED\"} on mismatch. All responses are JSON. Follow the well_known_handler pattern (axum State + Json response).",
+      "acceptanceCriteria": [
+        "Bearer token middleware extracts Authorization header and validates against NodeState.dev_token",
+        "Constant-time comparison used for token validation (no timing side-channel)",
+        "Missing Authorization header returns 401 with {\"error\": \"unauthorized\", \"code\": \"UNAUTHORIZED\"}",
+        "Invalid token returns 401 with {\"error\": \"unauthorized\", \"code\": \"UNAUTHORIZED\"}",
+        "GET /scp/dev/v1/health returns JSON with uptime_seconds, relay_connections, and storage_status fields",
+        "GET /scp/dev/v1/identity returns JSON with did and document fields",
+        "GET /scp/dev/v1/relay/status returns JSON with bound_addr, active_connections, and blob_count fields",
+        "All responses have Content-Type: application/json",
+        "dev_api module declared as pub mod in lib.rs",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Create crates/scp-node/src/dev_api.rs",
+        "Implement bearer_auth_layer as axum middleware (extract Authorization header, constant-time compare)",
+        "Implement health_handler returning uptime, connections, storage status",
+        "Implement identity_handler returning DID string and document",
+        "Implement relay_status_handler returning bound addr, connections, blob count",
+        "Define JSON response structs with serde::Serialize",
+        "Define error response struct with error and code fields",
+        "Add pub mod dev_api to lib.rs",
+        "Add unit tests for middleware (valid token, invalid token, missing header)"
+      ],
+      "blockedBy": [
+        "SCP-242"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.2 Binding and Authentication"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.3 Endpoint Catalog"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.4 Response Format"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-244",
+      "title": "Implement dev API context management endpoints (list, get, register, deregister)",
+      "gate": "gate-http-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/dev_api.rs"
+      ],
+      "description": "Add four context management handlers to dev_api.rs: GET /scp/dev/v1/contexts (list all registered broadcast contexts), GET /scp/dev/v1/contexts/:id (single context details — id, name, mode, subscriber count), POST /scp/dev/v1/contexts (register a broadcast context, returns 201), DELETE /scp/dev/v1/contexts/:id (deregister, returns 204). Unknown context IDs return 404 with {\"error\": \"context not found\", \"code\": \"NOT_FOUND\"}. All endpoints use the bearer token middleware from SCP-243. Context registration modifies NodeState.broadcast_contexts (same list used by .well-known/scp).",
+      "acceptanceCriteria": [
+        "GET /scp/dev/v1/contexts returns JSON array of all registered broadcast contexts",
+        "GET /scp/dev/v1/contexts/:id returns JSON with id, name, mode, and subscriber_count fields",
+        "GET /scp/dev/v1/contexts/:id returns 404 for unknown context ID",
+        "POST /scp/dev/v1/contexts accepts JSON body with id and optional name fields",
+        "POST /scp/dev/v1/contexts returns 201 Created on success",
+        "DELETE /scp/dev/v1/contexts/:id returns 204 No Content on success",
+        "DELETE /scp/dev/v1/contexts/:id returns 404 for unknown context ID",
+        "All endpoints require valid bearer token (401 on missing/invalid)",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Implement list_contexts_handler returning all broadcast contexts",
+        "Implement get_context_handler with :id path parameter",
+        "Implement create_context_handler parsing JSON body",
+        "Implement delete_context_handler with :id path parameter",
+        "Define request/response structs for context CRUD",
+        "Wire handlers into dev API router with appropriate HTTP methods",
+        "Add unit tests for each endpoint (success and error cases)"
+      ],
+      "blockedBy": [
+        "SCP-243"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.3 Endpoint Catalog"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.4 Response Format"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-245",
+      "title": "Wire dev_router() into ApplicationNode and serve() with separate listener",
+      "gate": "gate-http-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/http.rs"
+      ],
+      "description": "Add dev_router() method to ApplicationNode that composes all dev API routes (from SCP-243 and SCP-244) with the bearer token middleware into a single axum::Router. Modify serve() to spawn a separate tokio task binding the dev API router to the configured dev_bind_addr (localhost) when local_api was set on the builder. The dev API listener runs concurrently with the public HTTPS listener. If local_api was not configured, serve() behaves identically to before (no dev listener). Log the dev API address at INFO when it starts.",
+      "acceptanceCriteria": [
+        "ApplicationNode::dev_router() returns axum::Router with all /scp/dev/v1/* routes",
+        "dev_router() includes bearer token middleware on all routes",
+        "serve() spawns separate tokio task for dev API listener when local_api was configured",
+        "Dev API listener binds to the configured SocketAddr (default 127.0.0.1)",
+        "Dev API listener runs concurrently with public HTTPS listener",
+        "serve() behavior unchanged when local_api was not configured (no dev listener spawned)",
+        "Dev API address logged at INFO when listener starts",
+        "Integration test: dev API reachable on localhost while public server runs on separate port",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Add dev_router() method to ApplicationNode returning composed Router",
+        "Modify serve() to optionally spawn dev API listener task",
+        "Bind dev API to NodeState.dev_bind_addr when present",
+        "Log dev API address and token at INFO on startup",
+        "Add integration test starting both listeners and verifying reachability",
+        "Ensure graceful shutdown of dev API listener alongside main server"
+      ],
+      "blockedBy": [
+        "SCP-244"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.5 SDK Surface"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.10.6 Security Properties"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-035: Local HTTP Control API and Broadcast Projection"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-246",
+      "title": "Implement ProjectedContext type with per-epoch BroadcastKey management",
+      "gate": "gate-http-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/projection.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Create projection.rs with the ProjectedContext type that maps routing_id to per-epoch BroadcastKeys for broadcast projection decryption. ProjectedContext stores context_id, routing_id (SHA-256(context_id)), and a HashMap<u64, BroadcastKey> of epoch-keyed broadcast keys. Add enable_broadcast_projection(context_id, broadcast_key) and disable_broadcast_projection(context_id) methods to ApplicationNode. enable_broadcast_projection computes routing_id, inserts into NodeState.projected_contexts. disable_broadcast_projection removes the entry. Keys are retained per epoch for the blob TTL window.",
+      "acceptanceCriteria": [
+        "ProjectedContext struct has context_id, routing_id, and keys (HashMap<u64, BroadcastKey>) fields",
+        "routing_id computed as SHA-256(context_id) matching §5.14.6",
+        "enable_broadcast_projection(context_id, broadcast_key) inserts into projected_contexts registry",
+        "disable_broadcast_projection(context_id) removes from projected_contexts registry",
+        "Multiple epochs supported: different keys for different key_epoch values",
+        "Key epochs retained for blob TTL window (not pruned on epoch advance)",
+        "projection module declared as pub mod in lib.rs",
+        "Unit test: enable then disable roundtrip",
+        "Unit test: multiple epochs stored and retrievable by epoch number",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Create crates/scp-node/src/projection.rs",
+        "Define ProjectedContext struct with context_id, routing_id, and keys fields",
+        "Implement routing_id computation as SHA-256(context_id)",
+        "Add enable_broadcast_projection to ApplicationNode",
+        "Add disable_broadcast_projection to ApplicationNode",
+        "Add pub mod projection to lib.rs",
+        "Add unit tests for enable/disable and multi-epoch key storage"
+      ],
+      "blockedBy": [
+        "SCP-242"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.2 Activation"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.5 Decryption Architecture"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.8 SDK Surface"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-247",
+      "title": "Implement broadcast projection feed endpoint with caching headers",
+      "gate": "gate-http-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/projection.rs"
+      ],
+      "description": "Implement GET /scp/broadcast/<routing_id>/feed handler. On request: look up routing_id in ProjectedContext registry, query BlobStorage for recent blobs using query(routing_id, since, limit), deserialize each as BroadcastEnvelope, open with epoch-matched BroadcastKey, return decrypted content as JSON. Response includes context_id, author_did, and messages array (each with id, author_did, key_epoch, published_at, content as base64). Query params: ?since=<blob_id> (messages after this ID), ?limit=N (default 20, max 100). Headers: Cache-Control: public, max-age=30, stale-while-revalidate=300 and ETag set to latest blob_id.",
+      "acceptanceCriteria": [
+        "GET /scp/broadcast/<routing_id>/feed returns JSON with context_id, author_did, and messages array",
+        "Each message has id, author_did, key_epoch, published_at, and content (base64) fields",
+        "?since=<blob_id> returns only messages after the specified blob ID",
+        "?limit=N limits response to N messages (default 20, max 100)",
+        "Unknown routing_id returns 404",
+        "BroadcastEnvelope deserialized and decrypted with epoch-matched BroadcastKey",
+        "Decryption failure for a blob is logged and that blob is skipped (not a 500)",
+        "Cache-Control header set to public, max-age=30, stale-while-revalidate=300",
+        "ETag header set to latest blob_id in the response",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Implement feed_handler axum handler with routing_id path parameter",
+        "Parse since and limit query parameters with defaults",
+        "Query BlobStorage via Arc<dyn BlobStorage> from NodeState",
+        "Deserialize blobs as BroadcastEnvelope and decrypt with ProjectedContext keys",
+        "Construct JSON response with decrypted content as base64",
+        "Set Cache-Control and ETag response headers",
+        "Handle unknown routing_id with 404",
+        "Handle decryption failures gracefully (skip, log warning)",
+        "Add unit tests with mock BlobStorage"
+      ],
+      "blockedBy": [
+        "SCP-246"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.3 Feed Endpoint"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.5 Decryption Architecture"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-248",
+      "title": "Implement broadcast projection per-message endpoint with conditional GET",
+      "gate": "gate-http-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/projection.rs"
+      ],
+      "description": "Implement GET /scp/broadcast/<routing_id>/messages/<blob_id> handler. Looks up routing_id in ProjectedContext registry, fetches single blob from BlobStorage by blob_id, deserializes as BroadcastEnvelope, decrypts with epoch-matched key, returns single message JSON (id, author_did, key_epoch, published_at, content as base64). Headers: Cache-Control: public, immutable, max-age=31536000 and ETag set to blob_id. Conditional GET: if If-None-Match header matches blob_id, return 304 Not Modified with no body. Unknown routing_id or blob_id returns 404.",
+      "acceptanceCriteria": [
+        "GET /scp/broadcast/<routing_id>/messages/<blob_id> returns single message JSON",
+        "Message has id, author_did, key_epoch, published_at, and content (base64) fields",
+        "Unknown routing_id returns 404",
+        "Unknown blob_id returns 404",
+        "Cache-Control header set to public, immutable, max-age=31536000",
+        "ETag header set to blob_id",
+        "If-None-Match header matching blob_id returns 304 Not Modified with no body",
+        "If-None-Match header not matching returns 200 with full response",
+        "Decryption failure returns 500 with error JSON",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Implement message_handler axum handler with routing_id and blob_id path parameters",
+        "Fetch single blob from BlobStorage by blob_id",
+        "Check If-None-Match header against blob_id for conditional GET",
+        "Deserialize blob as BroadcastEnvelope and decrypt",
+        "Construct single message JSON response",
+        "Set Cache-Control and ETag response headers",
+        "Return 304 for matching If-None-Match",
+        "Handle unknown routing_id and blob_id with 404",
+        "Add unit tests including conditional GET scenarios"
+      ],
+      "blockedBy": [
+        "SCP-247"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.4 Per-Message Endpoint"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.5 Decryption Architecture"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-249",
+      "title": "Wire broadcast_projection_router() into ApplicationNode and serve()",
+      "gate": "gate-http-2",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/http.rs"
+      ],
+      "description": "Add broadcast_projection_router() method to ApplicationNode that composes the feed and per-message handlers from SCP-247 and SCP-248 into a single axum::Router. Modify serve() to merge the projection router into the public HTTPS listener alongside .well-known/scp and /scp/v1. The projection router has no authentication (content is public per §5.14). The router is only included when at least one projected context is registered. Log projection endpoint availability at INFO on startup.",
+      "acceptanceCriteria": [
+        "ApplicationNode::broadcast_projection_router() returns axum::Router with /scp/broadcast/* routes",
+        "Projection router includes feed endpoint at /scp/broadcast/<routing_id>/feed",
+        "Projection router includes message endpoint at /scp/broadcast/<routing_id>/messages/<blob_id>",
+        "Projection router has no authentication middleware (public endpoints)",
+        "serve() merges projection router into public HTTPS listener",
+        "Projection endpoints coexist with .well-known/scp and /scp/v1 on the same listener",
+        "Integration test: projection endpoints reachable alongside .well-known/scp",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Add broadcast_projection_router() method to ApplicationNode",
+        "Compose feed and message handlers into Router with path parameters",
+        "Merge projection router into serve() alongside existing routers",
+        "Log projection availability at INFO on startup",
+        "Add integration test for combined routing",
+        "Verify no route conflicts with existing /scp/* paths"
+      ],
+      "blockedBy": [
+        "SCP-248"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.8 SDK Surface"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-035: Local HTTP Control API and Broadcast Projection"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    }
+  ]
+}
