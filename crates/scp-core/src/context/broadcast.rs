@@ -843,12 +843,6 @@ impl BroadcastContext {
     /// Restores authors (with key material, epochs, and block lists),
     /// subscribers, and admission policy. Called during context restoration
     /// after a process restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::InvalidMemoryScopeForBroadcast`] if the
-    /// snapshot is internally inconsistent (should not happen with valid
-    /// persisted data).
     #[must_use]
     pub fn from_snapshot(snapshot: BroadcastContextSnapshot) -> Self {
         let authors = snapshot

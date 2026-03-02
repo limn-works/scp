@@ -250,6 +250,16 @@ impl ContextManager {
     ///
     /// Best-effort: logs errors but does not propagate them to callers.
     /// In-memory state is authoritative; persistence is for crash recovery.
+    ///
+    /// # Ordering note
+    ///
+    /// The snapshot is captured under the contexts mutex lock, but
+    /// `persist` is called after the lock is released. A concurrent
+    /// mutation could therefore persist a stale snapshot (the second
+    /// mutation's snapshot would overwrite it shortly after). This is
+    /// low probability and acceptable for v1 -- the worst case is a
+    /// single extra key-epoch replay on restart, which the pull-based
+    /// key distribution protocol already handles idempotently.
     fn persist_broadcast_snapshot(&self, context_id: &str, snapshot: &BroadcastContextSnapshot) {
         if let Some(ref persistence) = self.broadcast_persistence
             && let Err(e) = persistence.persist(context_id, snapshot)
@@ -3474,5 +3484,251 @@ mod tests {
             ),
             "should return PermissionDenied for replayed proposal"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Broadcast persistence restore tests
+    // -----------------------------------------------------------------------
+
+    /// Mock `BroadcastPersistence` that stores snapshots in a `HashMap`.
+    #[derive(Default)]
+    struct MockBroadcastPersistence {
+        store: std::sync::Mutex<HashMap<String, BroadcastContextSnapshot>>,
+    }
+
+    impl BroadcastPersistence for MockBroadcastPersistence {
+        fn persist(
+            &self,
+            context_id: &str,
+            snapshot: &BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.store
+                .lock()
+                .unwrap()
+                .insert(context_id.to_owned(), snapshot.clone());
+            Ok(())
+        }
+
+        fn load(
+            &self,
+            context_id: &str,
+        ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(self.store.lock().unwrap().get(context_id).cloned())
+        }
+    }
+
+    /// Helper: build a `BroadcastContextSnapshot` with known state.
+    fn test_broadcast_snapshot(context_id: &str) -> BroadcastContextSnapshot {
+        use std::collections::HashSet;
+
+        use crate::context::broadcast::{
+            AuthorStateSnapshot, BroadcastAdmission, SubscriberRecord,
+        };
+        use crate::crypto::sender_keys::generate_sender_key;
+
+        let mut authors = HashMap::new();
+        authors.insert(
+            "did:key:author1".to_owned(),
+            AuthorStateSnapshot {
+                author_did: "did:key:author1".to_owned(),
+                broadcast_key: generate_sender_key(),
+                epoch: 3,
+                block_list: HashSet::from(["did:key:blocked1".to_owned()]),
+            },
+        );
+
+        let mut subscribers = HashMap::new();
+        subscribers.insert(
+            "did:key:sub1".to_owned(),
+            SubscriberRecord {
+                subscriber_did: "did:key:sub1".to_owned(),
+                registered_at: 1_700_000_000,
+                has_ucan: false,
+            },
+        );
+        subscribers.insert(
+            "did:key:sub2".to_owned(),
+            SubscriberRecord {
+                subscriber_did: "did:key:sub2".to_owned(),
+                registered_at: 1_700_001_000,
+                has_ucan: true,
+            },
+        );
+
+        BroadcastContextSnapshot {
+            context_id: context_id.to_owned(),
+            admission: BroadcastAdmission::Gated,
+            subscribers,
+            authors,
+        }
+    }
+
+    /// `load_persisted_broadcast_state` round-trips: persist a snapshot via the
+    /// mock, then load and verify the restored `BroadcastContext` matches.
+    #[tokio::test]
+    async fn load_persisted_broadcast_state_roundtrip() {
+        let persistence = Arc::new(MockBroadcastPersistence::default());
+
+        // Seed the mock with a known snapshot.
+        let snapshot = test_broadcast_snapshot("bc-persist-1");
+        persistence.persist("bc-persist-1", &snapshot).unwrap();
+
+        let manager = ContextManager::with_broadcast_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockBroadcastPersistence {
+                store: std::sync::Mutex::new(persistence.store.lock().unwrap().clone()),
+            }),
+        );
+
+        // Load persisted state.
+        let loaded = manager
+            .load_persisted_broadcast_state("bc-persist-1")
+            .unwrap();
+        assert!(loaded.is_some(), "snapshot should be found");
+        let bc = loaded.unwrap();
+
+        // Verify authors.
+        assert!(bc.get_author("did:key:author1").is_some());
+        assert_eq!(bc.author_dids().count(), 1);
+
+        // Verify subscribers.
+        assert!(bc.is_subscriber("did:key:sub1"));
+        assert!(bc.is_subscriber("did:key:sub2"));
+        assert_eq!(bc.subscriber_count(), 2);
+
+        // Verify author epoch survived the round-trip.
+        let re_snapshot = bc.to_snapshot();
+        let author_snap = re_snapshot.authors.get("did:key:author1").unwrap();
+        assert_eq!(author_snap.epoch, 3);
+        assert!(author_snap.block_list.contains("did:key:blocked1"));
+
+        // Verify admission policy.
+        assert_eq!(
+            re_snapshot.admission,
+            crate::context::broadcast::BroadcastAdmission::Gated,
+        );
+    }
+
+    /// `load_persisted_broadcast_state` returns `None` when no snapshot exists.
+    #[tokio::test]
+    async fn load_persisted_broadcast_state_returns_none_for_missing() {
+        let manager = ContextManager::with_broadcast_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockBroadcastPersistence::default()),
+        );
+
+        let loaded = manager
+            .load_persisted_broadcast_state("nonexistent")
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    /// `restore_broadcast_context` inserts the context into the manager.
+    #[tokio::test]
+    async fn restore_broadcast_context_registers_context() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+
+        let snapshot = test_broadcast_snapshot("bc-restore-1");
+        let persistence = MockBroadcastPersistence::default();
+        persistence.persist("bc-restore-1", &snapshot).unwrap();
+
+        let manager = ContextManager::with_broadcast_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(persistence),
+        );
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ..ContextParams::default()
+        };
+        let handle = ContextHandle::new("bc-restore-1".to_owned(), params);
+        handle.transition_to(&ContextState::Active).await.unwrap();
+
+        let ceiling = default_ceiling();
+        let role_state =
+            ContextRoleState::new("bc-restore-1", "did:key:author1", ceiling, vec![]).unwrap();
+        let membership = MembershipState::new();
+
+        let result = manager
+            .restore_broadcast_context("bc-restore-1".into(), handle, role_state, membership)
+            .await;
+        assert!(result.is_ok(), "restore should succeed");
+
+        // Verify broadcast context is accessible via the manager.
+        assert!(
+            manager
+                .is_broadcast_subscriber("bc-restore-1", "did:key:sub1")
+                .await
+        );
+        assert!(
+            manager
+                .is_broadcast_subscriber("bc-restore-1", "did:key:sub2")
+                .await
+        );
+    }
+
+    /// `restore_broadcast_context` rejects duplicate context registration.
+    #[tokio::test]
+    async fn restore_broadcast_context_rejects_duplicate() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+
+        let snapshot = test_broadcast_snapshot("bc-dup-1");
+        let persistence = MockBroadcastPersistence::default();
+        persistence.persist("bc-dup-1", &snapshot).unwrap();
+
+        let manager = ContextManager::with_broadcast_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(persistence),
+        );
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ..ContextParams::default()
+        };
+
+        // First restore succeeds.
+        let handle1 = ContextHandle::new("bc-dup-1".to_owned(), params.clone());
+        handle1.transition_to(&ContextState::Active).await.unwrap();
+        let ceiling = default_ceiling();
+        let role_state =
+            ContextRoleState::new("bc-dup-1", "did:key:author1", ceiling.clone(), vec![]).unwrap();
+        manager
+            .restore_broadcast_context(
+                "bc-dup-1".into(),
+                handle1,
+                role_state,
+                MembershipState::new(),
+            )
+            .await
+            .unwrap();
+
+        // Second restore with same context_id fails.
+        let handle2 = ContextHandle::new("bc-dup-1".to_owned(), params);
+        handle2.transition_to(&ContextState::Active).await.unwrap();
+        let role_state2 =
+            ContextRoleState::new("bc-dup-1", "did:key:author1", ceiling, vec![]).unwrap();
+        let result = manager
+            .restore_broadcast_context(
+                "bc-dup-1".into(),
+                handle2,
+                role_state2,
+                MembershipState::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::MembershipFailed(_)
+        ));
     }
 }

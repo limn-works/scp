@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 
 use scp_platform::traits::Storage;
+use zeroize::Zeroize;
 
 use scp_identity::DID;
 
@@ -377,7 +378,15 @@ impl<S: Storage> ProtocolStore<S> {
         snapshot: &crate::context::broadcast::BroadcastContextSnapshot,
     ) -> Result<(), StoreError> {
         let key = broadcast_state_key(context_id)?;
-        self.store_value(&key, snapshot).await
+        let mut bytes = Self::serialize(snapshot)?;
+        let result = self
+            .storage
+            .store(&key, &bytes)
+            .await
+            .map_err(StoreError::Storage);
+        // Defense-in-depth: clear serialized key material from memory.
+        bytes.zeroize();
+        result
     }
 
     /// Loads the broadcast context state from persistence.
