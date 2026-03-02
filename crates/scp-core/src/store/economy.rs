@@ -194,6 +194,7 @@ mod tests {
     use scp_platform::testing::InMemoryStorage;
 
     use super::*;
+    use crate::economy::credentials::EncryptedBlob;
 
     fn test_did() -> DID {
         DID::from("did:dht:z6MkTestHuman")
@@ -287,7 +288,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: did.clone(),
-            encrypted_data: vec![1, 2, 3, 4],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![1, 2, 3, 4]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -311,7 +312,7 @@ mod tests {
             let credential = AdapterCredential {
                 adapter_id: (*adapter_id).to_owned(),
                 identity: did.clone(),
-                encrypted_data: vec![1],
+                encrypted_data: EncryptedBlob::from_encrypted(vec![1]),
                 created_at: 1_700_000_000,
                 rotated_at: 1_700_000_000,
             };
@@ -336,7 +337,7 @@ mod tests {
         let cred_a = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: did_a.clone(),
-            encrypted_data: vec![0xAA],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xAA]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -344,7 +345,7 @@ mod tests {
         let cred_b = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: did_b.clone(),
-            encrypted_data: vec![0xBB],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xBB]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -365,8 +366,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(loaded_a.encrypted_data, vec![0xAA]);
-        assert_eq!(loaded_b.encrypted_data, vec![0xBB]);
+        assert_eq!(loaded_a.encrypted_data.as_bytes(), &[0xAA]);
+        assert_eq!(loaded_b.encrypted_data.as_bytes(), &[0xBB]);
     }
 
     #[tokio::test]
@@ -377,7 +378,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: did.clone(),
-            encrypted_data: vec![1],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![1]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };

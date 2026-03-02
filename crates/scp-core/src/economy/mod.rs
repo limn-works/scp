@@ -39,7 +39,7 @@ pub use adapter::{
 };
 pub use antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
 pub use credentials::{
-    AdapterCredential, AdapterCredentialStore, CredentialError, configure_adapter,
+    AdapterCredential, AdapterCredentialStore, CredentialError, EncryptedBlob, configure_adapter,
     retrieve_adapter_credential, validate_adapter,
 };
 pub use estimate::estimate_cost;
