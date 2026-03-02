@@ -51,6 +51,7 @@ use scp_mcp::server::{ContextProvider, ContextToolInfo, McpServer, MemberInfo};
 
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // Bounded read_line — prevents OOM from unbounded line reads
@@ -565,6 +566,14 @@ impl McpTransport for ClientTransport {
 // FFI bridge context provider
 // ---------------------------------------------------------------------------
 
+/// Default tool handler execution timeout in milliseconds (30 seconds).
+///
+/// Matches [`scp_core::context::tools::DEFAULT_TIMEOUT_MS`]. If a registered
+/// handler does not return within this duration, the invocation is aborted
+/// with a timeout error. Configurable per-provider via
+/// [`FfiBridgeProvider::tool_timeout_ms`].
+const FFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as u64;
+
 /// Implements [`ContextProvider`] by reading from the scp-ffi runtime registry.
 ///
 /// Bridges the MCP server's context/tool queries to the live runtime state
@@ -574,6 +583,12 @@ struct FfiBridgeProvider {
     agent_did: String,
     /// The context IDs this provider serves.
     context_ids: Vec<String>,
+    /// Maximum time (in milliseconds) to wait for a tool handler to complete.
+    ///
+    /// Defaults to [`FFI_TOOL_TIMEOUT_MS`] (30 seconds). If a registered
+    /// handler blocks longer than this, the invocation returns an error
+    /// instead of blocking indefinitely. See issue #123.
+    tool_timeout_ms: u64,
 }
 
 impl ContextProvider for FfiBridgeProvider {
@@ -659,7 +674,23 @@ impl ContextProvider for FfiBridgeProvider {
         // sync and Python handlers are GIL-bound (inherently sync). The async
         // invoke_tool in scp-core is for contexts where Rust itself executes
         // tools. See SCP-212, ADR-010, ADR-015.
-        crate::runtime::with_context(context_id, |rt| {
+        //
+        // IMPORTANT: The handler Arc and output schema are extracted inside the
+        // DashMap shard lock (via with_context), then the lock is released
+        // BEFORE calling the handler. This prevents holding the shard lock
+        // during Python GIL acquisition, which would block concurrent
+        // same-context operations for the duration of the handler. See #122.
+        //
+        // Handler execution is bounded by `tool_timeout_ms` to prevent a
+        // misbehaving handler from blocking the tokio runtime indefinitely.
+        // Uses std::thread::spawn + mpsc::recv_timeout (sync timeout) because
+        // ContextProvider::invoke_tool is a sync trait method. See issue #123.
+        let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
+
+        // Phase 1: Validate input and extract handler + output schema under
+        // the DashMap shard lock. The lock is released when with_context
+        // returns.
+        let dispatch = crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::ContextError(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
@@ -677,39 +708,61 @@ impl ContextProvider for FfiBridgeProvider {
                 ))
             })?;
 
-            // Dispatch to registered handler if available.
-            if let Some(handler) = rt.tool_handlers.get(tool_name) {
-                let handler = handler.clone();
-                // Call the handler with validated input. The handler is a sync
-                // closure wrapping a Python callable (acquired via GIL).
-                let output = handler(arguments).map_err(|e| {
-                    ScpPyError::ContextError(format!("tool handler for '{tool_name}' failed: {e}"))
+            // Clone handler Arc and output schema so we can release the lock.
+            Ok(rt
+                .tool_handlers
+                .get(tool_name)
+                .map(|handler| (handler.clone(), registration.schema.output_schema.clone())))
+        })
+        .map_err(|e| format!("{e}"))?;
+
+        // Phase 2: Execute handler OUTSIDE the DashMap shard lock so that
+        // concurrent same-context operations are not blocked during Python
+        // GIL acquisition and handler execution. Handler execution is
+        // bounded by `tool_timeout_ms` (issue #123).
+        match dispatch {
+            Some((handler, output_schema)) => {
+                // Run the handler on a dedicated thread with a timeout to
+                // prevent indefinite blocking. The handler is Send + Sync
+                // (Arc<dyn Fn>), so it is safe to move across threads.
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = handler(arguments);
+                    // If the receiver has been dropped (timeout elapsed), the
+                    // send will fail silently -- that is intentional.
+                    let _ = tx.send(result);
+                });
+
+                let handler_result = rx.recv_timeout(timeout).map_err(|_| {
+                    format!(
+                        "tool handler for '{tool_name}' timed out after {}ms",
+                        timeout.as_millis()
+                    )
                 })?;
+
+                let output = handler_result
+                    .map_err(|e| format!("tool handler for '{tool_name}' failed: {e}"))?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
                 scp_core::context::tools::schema::validate_value_against_schema(
                     &output,
-                    &registration.schema.output_schema,
+                    &output_schema,
                 )
-                .map_err(|msg| {
-                    ScpPyError::ValidationError(format!(
-                        "output validation failed for tool '{tool_name}': {msg}"
-                    ))
-                })?;
+                .map_err(|msg| format!("output validation failed for tool '{tool_name}': {msg}"))?;
 
-                return Ok(output);
+                Ok(output)
             }
-
-            // No handler registered -- fall back to echo mode.
-            Ok(serde_json::json!({
-                "tool": tool_name,
-                "context": context_id,
-                "status": "validated",
-                "input_valid": true,
-                "validated_input": arguments,
-            }))
-        })
-        .map_err(|e| format!("{e}"))
+            None => {
+                // No handler registered -- fall back to echo mode.
+                Ok(serde_json::json!({
+                    "tool": tool_name,
+                    "context": context_id,
+                    "status": "validated",
+                    "input_valid": true,
+                    "validated_input": arguments,
+                }))
+            }
+        }
     }
 
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
@@ -853,12 +906,10 @@ pub fn py_mcp_serve(
     context_ids: Vec<String>,
     transport: &str,
 ) -> PyResult<String> {
-    // Validate transport mode.
-    if transport != "stdio" && transport != "sse" {
-        return Err(ScpPyError::ValidationError(format!(
-            "transport must be 'stdio' or 'sse', got '{transport}'"
-        ))
-        .into());
+    validate::validate_did(identity_did)?;
+    validate::validate_transport_mode(transport)?;
+    for ctx_id in &context_ids {
+        validate::validate_context_id(ctx_id)?;
     }
 
     // Validate that all context IDs are registered in the runtime.
@@ -872,6 +923,7 @@ pub fn py_mcp_serve(
     let provider = FfiBridgeProvider {
         agent_did: identity_did.to_owned(),
         context_ids: context_ids.clone(),
+        tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
     };
     let server = McpServer::new(provider);
     let server = Arc::new(Mutex::new(server));
@@ -969,6 +1021,7 @@ pub fn py_mcp_serve(
                 let provider = FfiBridgeProvider {
                     agent_did: sse_agent_did,
                     context_ids: sse_context_ids,
+                    tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
                 };
                 let sse_server = McpServer::new(provider);
                 let config =
@@ -1027,6 +1080,7 @@ pub fn py_mcp_serve(
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_stop")]
 pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
+    validate::validate_mcp_handle(handle)?;
     let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
     })?;
@@ -1065,6 +1119,7 @@ pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_wait")]
 pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
+    validate::validate_mcp_handle(handle)?;
     // Extract the task handle if available.
     let task_handle = {
         let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
@@ -1107,6 +1162,7 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_server_info")]
 pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+    validate::validate_mcp_handle(handle)?;
     let entry = server_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
     })?;
@@ -1136,6 +1192,7 @@ pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_info")]
 pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+    validate::validate_mcp_handle(handle)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
@@ -1225,11 +1282,7 @@ pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_connect_sse")]
 pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
-    if url.is_empty() {
-        return Err(
-            ScpPyError::ValidationError("url must be a non-empty string".to_owned()).into(),
-        );
-    }
+    validate::validate_relay_url(url)?;
 
     // Connect to the SSE endpoint.
     let transport = SseClientTransport::connect(url)
@@ -1272,6 +1325,7 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_disconnect")]
 pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
+    validate::validate_mcp_handle(handle)?;
     let (_, state) = client_registry().remove(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
@@ -1306,6 +1360,7 @@ pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "py_mcp_client_list_tools")]
 pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+    validate::validate_mcp_handle(handle)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
@@ -1370,6 +1425,10 @@ pub fn py_mcp_client_invoke(
     context_id: &str,
     identity_did: &str,
 ) -> PyResult<PyObject> {
+    validate::validate_mcp_handle(handle)?;
+    validate::validate_tool_name(tool_name)?;
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(identity_did)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
         ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
     })?;
@@ -1453,6 +1512,7 @@ pub fn py_mcp_load_contexts(
     identity_did: &str,
     _relay_url: &str,
 ) -> PyResult<Vec<PyObject>> {
+    validate::validate_did(identity_did)?;
     // Step 1: Collect contexts from the local runtime registry.
     let local_context_ids = crate::runtime::context_ids_for_member(identity_did);
 
@@ -1707,6 +1767,8 @@ pub fn py_register_tool_handler(
     tool_name: &str,
     handler: PyObject,
 ) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_tool_name(tool_name)?;
     // Verify the handler is callable before storing it.
     if !handler.bind(py).is_callable() {
         return Err(ScpPyError::ValidationError("handler must be callable".to_owned()).into());
@@ -1741,6 +1803,117 @@ pub fn py_register_tool_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Registry statistics and cleanup (issue #108)
+// ---------------------------------------------------------------------------
+
+/// MCP-specific registry entry counts.
+///
+/// Returned by [`py_registry_stats`] alongside the core registry stats
+/// for monitoring and debugging in long-running processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpRegistryStats {
+    /// Number of entries in the MCP server registry.
+    servers: usize,
+    /// Number of stopped servers still in the registry.
+    stopped_servers: usize,
+    /// Number of entries in the MCP client registry.
+    clients: usize,
+}
+
+/// Returns MCP registry entry counts.
+fn mcp_registry_stats() -> McpRegistryStats {
+    let servers = server_registry().len();
+    let stopped_servers = server_registry()
+        .iter()
+        .filter(|entry| entry.value().stopped)
+        .count();
+    let clients = client_registry().len();
+    McpRegistryStats {
+        servers,
+        stopped_servers,
+        clients,
+    }
+}
+
+/// Removes stopped MCP server entries from the registry.
+///
+/// Returns the number of entries removed. Stopped servers (where
+/// `py_mcp_server_stop` was called but the entry was not removed) are
+/// cleaned up to prevent indefinite accumulation in long-running
+/// processes.
+fn cleanup_stopped_servers() -> usize {
+    let mut removed = 0;
+    let keys_to_remove: Vec<String> = server_registry()
+        .iter()
+        .filter(|entry| entry.value().stopped)
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    for key in keys_to_remove {
+        if server_registry().remove(&key).is_some() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Returns registry entry counts for all FFI registries.
+///
+/// Exposes the current entry counts for the context registry, identity
+/// registry, known-contexts registry, MCP server registry, and MCP
+/// client registry. Intended for monitoring and debugging in
+/// long-running processes.
+///
+/// # Returns
+///
+/// A Python dict with keys: `contexts`, `known_contexts`, `identities`,
+/// `relay_connected`, `mcp_servers`, `mcp_servers_stopped`, `mcp_clients`.
+///
+/// # Errors
+///
+/// Raises `TransportError` if the relay state lock is poisoned.
+#[pyfunction]
+#[pyo3(name = "py_registry_stats")]
+pub fn py_registry_stats(py: Python<'_>) -> PyResult<PyObject> {
+    let core_stats = crate::runtime::registry_stats()?;
+    let mcp_stats = mcp_registry_stats();
+
+    let dict = PyDict::new(py);
+    dict.set_item("contexts", core_stats.contexts)?;
+    dict.set_item("known_contexts", core_stats.known_contexts)?;
+    dict.set_item("identities", core_stats.identities)?;
+    dict.set_item("relay_connected", core_stats.relay_connected)?;
+    dict.set_item("mcp_servers", mcp_stats.servers)?;
+    dict.set_item("mcp_servers_stopped", mcp_stats.stopped_servers)?;
+    dict.set_item("mcp_clients", mcp_stats.clients)?;
+    Ok(dict.into())
+}
+
+/// Removes stale entries from all FFI registries.
+///
+/// Currently cleans up:
+/// - Stopped MCP server entries (where `py_mcp_server_stop` was called but
+///   the entry was never removed from the registry)
+///
+/// # Returns
+///
+/// A Python dict with keys: `mcp_servers_removed` (number of stopped
+/// server entries cleaned up).
+///
+/// # Errors
+///
+/// Raises `TransportError` on internal errors.
+#[pyfunction]
+#[pyo3(name = "py_registry_cleanup")]
+pub fn py_registry_cleanup(py: Python<'_>) -> PyResult<PyObject> {
+    let servers_removed = cleanup_stopped_servers();
+
+    let dict = PyDict::new(py);
+    dict.set_item("mcp_servers_removed", servers_removed)?;
+    Ok(dict.into())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1768,6 +1941,8 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_mcp_reset_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_get_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_register_tool_handler, m)?)?;
+    m.add_function(wrap_pyfunction!(py_registry_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(py_registry_cleanup, m)?)?;
     Ok(())
 }
 
@@ -1864,6 +2039,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         assert_eq!(
             provider.active_context_ids(),
@@ -1876,6 +2052,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         assert_eq!(provider.agent_did(), "did:dht:z6MkTest");
     }
@@ -1885,6 +2062,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["nonexistent".to_owned()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         // Unknown context returns empty tool list (no panic).
         let tools = provider.context_tools("nonexistent");
@@ -1956,6 +2134,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         // Creator has ToolInvokeAll, so any tool name should pass.
         assert!(
@@ -1991,6 +2170,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: member.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         let result = provider.validate_capability(&ctx_id, "calculator");
         assert!(
@@ -2018,6 +2198,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2049,6 +2230,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         // Input schema requires an object with "a" and "b" as required fields.
@@ -2089,6 +2271,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
@@ -2203,6 +2386,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
     }
@@ -2235,6 +2419,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2294,6 +2479,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let result =
@@ -2325,6 +2511,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let result =
@@ -2337,6 +2524,98 @@ mod tests {
         );
 
         crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool handler execution timeout (issue #123)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invoke_tool_handler_timeout_produces_clear_error() {
+        let creator = "did:dht:z6MkCreatorTimeout";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a handler that blocks for 5 seconds (will be timed out).
+        let blocking_handler: crate::runtime::ToolHandler = std::sync::Arc::new(|_input| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            Ok(serde_json::json!({"result": 42}))
+        });
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", blocking_handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: 50, // 50ms — will expire before the 5s sleep.
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        assert!(result.is_err(), "blocking handler should be timed out");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "error should mention timeout: {err}"
+        );
+        assert!(
+            err.contains("50ms"),
+            "error should include the timeout duration: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_handler_completes_within_timeout_succeeds() {
+        let creator = "did:dht:z6MkCreatorTimeoutOk";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a fast handler.
+        let fast_handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|input: serde_json::Value| {
+                let a = input
+                    .get("a")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let b = input
+                    .get("b")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                Ok(serde_json::json!({"result": a + b}))
+            });
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", fast_handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: 5_000, // 5 seconds — plenty for an instant handler.
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 3, "b": 4}));
+        assert!(
+            result.is_ok(),
+            "fast handler should complete within timeout: {result:?}"
+        );
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({"result": 7.0}),
+            "handler output should be correct"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_handler_default_timeout_is_30s() {
+        // Verify the default timeout constant matches scp-core.
+        assert_eq!(
+            FFI_TOOL_TIMEOUT_MS,
+            u64::from(scp_core::context::tools::DEFAULT_TIMEOUT_MS),
+            "FFI default timeout should match scp-core default"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2362,5 +2641,120 @@ mod tests {
     fn stdio_client_transport_empty_command() {
         let result = StdioClientTransport::spawn(&[]);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry statistics and cleanup (issue #108)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_registry_stats_returns_consistent_counts() {
+        let stats = mcp_registry_stats();
+        // Cannot assert exact values due to parallel tests, but structural
+        // invariants must hold: stopped_servers can never exceed total servers.
+        assert!(
+            stats.stopped_servers <= stats.servers,
+            "stopped_servers ({}) must be <= servers ({})",
+            stats.stopped_servers,
+            stats.servers
+        );
+        // Verify the struct is constructable and all fields are accessible.
+        let _ = stats.clients;
+    }
+
+    #[test]
+    fn cleanup_stopped_servers_removes_stopped_entries() {
+        let creator = "did:dht:z6MkCreatorCleanup";
+        let ctx_id = setup_test_context(creator, false);
+
+        // Create a minimal server entry directly in the registry.
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        };
+        let server = McpServer::new(provider);
+        let server = Arc::new(Mutex::new(server));
+        let handle = generate_handle_id("mcp-server");
+
+        server_registry().insert(
+            handle.clone(),
+            McpServerState {
+                identity_did: creator.to_owned(),
+                context_ids: vec![ctx_id.clone()],
+                transport: "stdio".to_owned(),
+                stopped: true, // Already stopped.
+                server,
+                shutdown_tx: None,
+                task_handle: None,
+            },
+        );
+
+        // Verify our entry is present before cleanup.
+        assert!(
+            server_registry().contains_key(&handle),
+            "stopped server handle should be present before cleanup"
+        );
+
+        cleanup_stopped_servers();
+
+        // The specific handle should be gone. We check by key rather than
+        // by count because parallel tests may insert/remove other entries.
+        assert!(
+            !server_registry().contains_key(&handle),
+            "stopped server handle should be removed after cleanup"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn cleanup_stopped_servers_leaves_running_entries() {
+        let creator = "did:dht:z6MkCreatorCleanupRunning";
+        let ctx_id = setup_test_context(creator, false);
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        };
+        let server = McpServer::new(provider);
+        let server = Arc::new(Mutex::new(server));
+        let handle = generate_handle_id("mcp-server");
+
+        server_registry().insert(
+            handle.clone(),
+            McpServerState {
+                identity_did: creator.to_owned(),
+                context_ids: vec![ctx_id.clone()],
+                transport: "stdio".to_owned(),
+                stopped: false, // Still running.
+                server,
+                shutdown_tx: None,
+                task_handle: None,
+            },
+        );
+
+        cleanup_stopped_servers();
+
+        // Running server should still be present.
+        assert!(
+            server_registry().contains_key(&handle),
+            "running server handle should NOT be removed"
+        );
+
+        // Cleanup: remove manually.
+        server_registry().remove(&handle);
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn core_registry_stats_includes_all_fields() {
+        let stats = crate::runtime::registry_stats().unwrap();
+        // Just verify the struct has the expected fields and doesn't panic.
+        let _ = stats.contexts;
+        let _ = stats.known_contexts;
+        let _ = stats.identities;
+        let _ = stats.relay_connected;
     }
 }

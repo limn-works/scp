@@ -176,8 +176,8 @@ class ConformanceDispatcher(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
         val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
-        val tokenId = input["token_id"] ?: input["encoded"] ?: ""
-        bridge.ucan.revoke(identityHandle, tokenId)
+        val token = input["token"] ?: input["encoded"] ?: ""
+        bridge.ucan.revoke(identityHandle, token)
         mapOf("status" to "revoked")
     }
 

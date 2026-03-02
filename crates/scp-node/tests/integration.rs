@@ -102,12 +102,13 @@ async fn scenario1_node_build_publishes_did_and_serves_well_known() {
     assert_eq!(well_known.did, did);
     assert_eq!(well_known.relay, "wss://test.example.com/scp/v1");
 
-    // --- Assert: relay accepts WebSocket connections ---
+    // --- Assert: relay accepts WebSocket connections with bridge token ---
     let addr = node.relay().bound_addr();
-    let url = format!("ws://{addr}");
+    let token = node.bridge_token_hex();
+    let url = format!("ws://{addr}/?token={token}");
     let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
         .await
-        .expect("relay should accept WebSocket connections");
+        .expect("relay should accept WebSocket connections with valid token");
     drop(ws_stream);
 }
 
@@ -139,9 +140,11 @@ async fn scenario2_client_discovers_relay_via_well_known_and_subscribes() {
 
     // --- Step 2: Client connects to the relay ---
     // In a real scenario, the client would connect to the wss:// relay URL
-    // from .well-known/scp. In tests, we connect to the local bound address.
+    // from .well-known/scp. In tests, we connect to the local bound address
+    // with the bridge token.
     let relay_addr = node.relay().bound_addr();
-    let url = format!("ws://{relay_addr}");
+    let token = node.bridge_token_hex();
+    let url = format!("ws://{relay_addr}/?token={token}");
     let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("should connect to relay");
@@ -181,10 +184,10 @@ async fn scenario2_client_discovers_relay_via_well_known_and_subscribes() {
     }
 
     // --- Step 5: Publish a message to the same routing_id ---
-    // Use a second WebSocket connection to publish.
+    // Use a second WebSocket connection to publish (reuses the same token URL).
     let (pub_stream, _) = tokio_tungstenite::connect_async(&url)
         .await
-        .expect("publisher should connect");
+        .expect("publisher should connect with valid token");
     let (mut pub_sink, mut pub_source) = pub_stream.split();
 
     let blob_content = b"hello from SCP integration test".to_vec();
@@ -272,9 +275,10 @@ async fn scenario3_client_discovers_relay_via_did_resolution() {
 
     // --- Step 3: Connect to the relay ---
     // In production the client would connect to the wss:// URL from the DID
-    // document. In tests we use the local relay address.
+    // document. In tests we use the local relay address with the bridge token.
     let relay_addr = node.relay().bound_addr();
-    let url = format!("ws://{relay_addr}");
+    let token = node.bridge_token_hex();
+    let url = format!("ws://{relay_addr}/?token={token}");
     let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("should connect to relay discovered via DID resolution");
@@ -368,4 +372,47 @@ async fn scenario4_scp_uri_roundtrip() {
         .parse()
         .expect("URI with special chars should parse");
     assert_eq!(uri_special, parsed);
+}
+
+// =========================================================================
+// Scenario 5: Bridge secret rejects unauthenticated connections (#85)
+// =========================================================================
+
+#[tokio::test]
+async fn scenario5_relay_rejects_connection_without_bridge_token() {
+    let (node, _dht_client) = build_test_node().await;
+    let addr = node.relay().bound_addr();
+
+    // Attempt 1: No token at all — should be rejected.
+    let url_no_token = format!("ws://{addr}");
+    let result = tokio_tungstenite::connect_async(&url_no_token).await;
+    assert!(
+        result.is_err(),
+        "relay should reject connections without a bridge token"
+    );
+
+    // Attempt 2: Wrong token — should be rejected.
+    let wrong_token = "00".repeat(32);
+    let url_wrong_token = format!("ws://{addr}/?token={wrong_token}");
+    let result = tokio_tungstenite::connect_async(&url_wrong_token).await;
+    assert!(
+        result.is_err(),
+        "relay should reject connections with an invalid bridge token"
+    );
+
+    // Attempt 3: Malformed token (too short) — should be rejected.
+    let url_short_token = format!("ws://{addr}/?token=abcd");
+    let result = tokio_tungstenite::connect_async(&url_short_token).await;
+    assert!(
+        result.is_err(),
+        "relay should reject connections with a malformed bridge token"
+    );
+
+    // Attempt 4: Correct token — should succeed.
+    let token = node.bridge_token_hex();
+    let url_valid = format!("ws://{addr}/?token={token}");
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&url_valid)
+        .await
+        .expect("relay should accept connections with valid bridge token");
+    drop(ws_stream);
 }

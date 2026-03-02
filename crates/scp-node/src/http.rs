@@ -52,6 +52,12 @@ pub struct NodeState {
     pub(crate) broadcast_contexts: RwLock<Vec<BroadcastContext>>,
     /// The relay server's bound address for WebSocket bridge connections.
     pub(crate) relay_addr: SocketAddr,
+    /// Shared secret for authenticating internal bridge connections.
+    ///
+    /// Generated at startup and included as a query parameter when the
+    /// axum handler connects to the internal relay. The relay validates
+    /// this token during the WebSocket handshake (defense-in-depth, #85).
+    pub(crate) bridge_secret: [u8; 32],
 }
 
 // ---------------------------------------------------------------------------
@@ -83,21 +89,26 @@ pub fn relay_router(state: Arc<NodeState>) -> Router {
 /// Axum handler for WebSocket upgrade at `/scp/v1`.
 ///
 /// Bridges the incoming WebSocket connection to the node's internal
-/// relay server by connecting to `relay_addr` on localhost.
+/// relay server by connecting to `relay_addr` on localhost, authenticated
+/// with the bridge secret.
 async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<NodeState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| relay_bridge(socket, state.relay_addr))
+    let relay_addr = state.relay_addr;
+    let bridge_secret = state.bridge_secret;
+    ws.on_upgrade(move |socket| relay_bridge(socket, relay_addr, bridge_secret))
 }
 
 /// Bridges an axum WebSocket to the internal relay server.
 ///
-/// Connects to the relay at `relay_addr`, then forwards frames in
-/// both directions until either side closes. Sends explicit WebSocket
-/// close frames on both sides when the bridge terminates.
-async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr) {
-    let url = format!("ws://{relay_addr}");
+/// Connects to the relay at `relay_addr` with the bridge secret included
+/// as a `token` query parameter, then forwards frames in both directions
+/// until either side closes. Sends explicit WebSocket close frames on
+/// both sides when the bridge terminates.
+async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret: [u8; 32]) {
+    let token_hex = scp_transport::native::server::hex_encode_32(&bridge_secret);
+    let url = format!("ws://{relay_addr}/?token={token_hex}");
     let relay_conn = tokio_tungstenite::connect_async(&url).await;
 
     let Ok((relay_ws, _)) = relay_conn else {

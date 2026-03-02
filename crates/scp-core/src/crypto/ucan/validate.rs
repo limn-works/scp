@@ -33,6 +33,13 @@ use super::{UcanError, UcanHeader, UcanPayload, UcanToken};
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
+/// Default clock skew tolerance: 5 minutes in seconds (spec section 9.14).
+///
+/// Applied to `exp` and `nbf` checks in [`verify_expiry`] to accommodate
+/// NTP desynchronization between issuer and validator in distributed
+/// deployments.
+pub const DEFAULT_CLOCK_SKEW_TOLERANCE_SECS: u64 = 5 * 60;
+
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
 #[cfg(test)]
 const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
@@ -340,6 +347,16 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
     pub context_creator_did: &'a str,
     /// Presenting agent's DID (step 5 — audience verification).
     pub presenting_agent_did: &'a str,
+    /// Clock skew tolerance in seconds for `exp`/`nbf` checks (step 11).
+    ///
+    /// Accommodates NTP desynchronization between issuer and validator in
+    /// distributed deployments. Defaults to
+    /// [`DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`] (5 minutes, per spec section
+    /// 9.14).
+    ///
+    /// - `exp` check: token accepted if `exp + tolerance >= now`
+    /// - `nbf` check: token accepted if `nbf - tolerance <= now`
+    pub clock_skew_tolerance_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +424,7 @@ where
         ctx.did_resolver,
         ctx.proof_resolver,
         ctx.revocation_checker,
+        ctx.clock_skew_tolerance_secs,
     )?;
 
     // Step 4: Root issuer — verify root token's iss is context creator.
@@ -463,8 +481,9 @@ where
         return Err(UcanError::TokenRevoked(revocation_cid));
     }
 
-    // Step 11: Expiry — verify exp > now and nbf <= now.
-    verify_expiry(token)?;
+    // Step 11: Expiry — verify exp > now and nbf <= now (with clock skew
+    // tolerance).
+    verify_expiry(token, ctx.clock_skew_tolerance_secs)?;
 
     Ok(())
 }
@@ -536,8 +555,8 @@ where
     // Step 8: Ceiling.
     verify_ceiling_compliance(std::slice::from_ref(required_capability), ceiling)?;
 
-    // Step 11: Expiry.
-    verify_expiry(token)?;
+    // Step 11: Expiry (with default clock skew tolerance).
+    verify_expiry(token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS)?;
 
     Ok(())
 }
@@ -556,9 +575,6 @@ where
 fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Result<(), UcanError> {
     let pk_bytes = did_resolver.resolve_public_key(&token.payload.iss)?;
 
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
-        .map_err(|e| UcanError::MalformedToken(format!("invalid public key: {e}")))?;
-
     // Extract signing input from encoded token: everything before the last '.'
     let signing_input = token
         .encoded
@@ -566,18 +582,12 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
         .map(|pos| &token.encoded[..pos])
         .ok_or_else(|| UcanError::MalformedToken("missing signature segment".to_owned()))?;
 
-    let sig_bytes: [u8; 64] = token.signature.as_slice().try_into().map_err(|_| {
-        UcanError::MalformedToken(format!(
-            "signature must be 64 bytes, got {}",
-            token.signature.len()
-        ))
-    })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    verifying_key
-        .verify_strict(signing_input.as_bytes(), &signature)
-        .map_err(|_| UcanError::SignatureInvalid)
+    crate::crypto::ed25519::verify_ed25519_signature_strict(
+        &pk_bytes,
+        signing_input.as_bytes(),
+        &token.signature,
+    )
+    .map_err(|_| UcanError::SignatureInvalid)
 }
 
 /// Step 3: Verify delegation chain integrity.
@@ -604,6 +614,7 @@ fn verify_delegation_chain(
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
     revocation_checker: &impl RevocationChecker,
+    clock_skew_tolerance_secs: u64,
 ) -> Result<String, UcanError> {
     if token.payload.prf.is_empty() {
         return Ok(token.payload.iss.clone());
@@ -618,6 +629,7 @@ fn verify_delegation_chain(
         revocation_checker,
         0,
         &mut seen_issuers,
+        clock_skew_tolerance_secs,
     )
 }
 
@@ -640,6 +652,7 @@ fn verify_chain_recursive(
     revocation_checker: &impl RevocationChecker,
     depth: usize,
     seen_issuers: &mut HashSet<String>,
+    clock_skew_tolerance_secs: u64,
 ) -> Result<String, UcanError> {
     if depth > MAX_CHAIN_DEPTH {
         return Err(UcanError::DelegationChainBroken(
@@ -679,7 +692,7 @@ fn verify_chain_recursive(
         verify_signature(&parent, did_resolver)?;
 
         // Verify parent token has not expired (spec 7.2).
-        verify_expiry(&parent)?;
+        verify_expiry(&parent, clock_skew_tolerance_secs)?;
 
         // Verify parent token has not been revoked (spec 7.2).
         let parent_revocation_cid = compute_revocation_cid(&parent.payload);
@@ -695,6 +708,7 @@ fn verify_chain_recursive(
             revocation_checker,
             depth + 1,
             seen_issuers,
+            clock_skew_tolerance_secs,
         )?;
 
         // All proof chains must converge to the same root issuer.
@@ -764,23 +778,32 @@ fn verify_attenuation(
     Ok(())
 }
 
-/// Step 11: Verify token expiry.
+/// Step 11: Verify token expiry with clock skew tolerance.
 ///
 /// Checks that:
 /// - `nbf < exp` (if present, the time range is valid)
-/// - `exp > now` (not expired)
-/// - `exp <= now + 24h` (not too far in the future)
-/// - `nbf <= now` (if present, the token is already valid)
+/// - `exp + tolerance > now` (not expired, accounting for clock drift)
+/// - `exp <= now + 24h` (not too far in the future -- tolerance not applied)
+/// - `nbf - tolerance <= now` (if present, the token is already valid,
+///   accounting for clock drift)
+///
+/// The `clock_skew_tolerance_secs` parameter accommodates NTP
+/// desynchronization between issuer and validator in distributed deployments
+/// (spec section 9.14). A tolerance of 0 disables clock drift handling.
+///
+/// Note: The `ExpiryTooFar` check does NOT include tolerance. Tolerance is
+/// only applied to the leniency direction (accepting slightly expired or
+/// slightly future tokens), not to extending the maximum allowed lifetime.
 ///
 /// # Errors
 ///
 /// Returns [`UcanError::InvalidTimeRange`] if `nbf >= exp`.
-/// Returns [`UcanError::TokenExpired`] if the token has expired.
+/// Returns [`UcanError::TokenExpired`] if the token has expired beyond tolerance.
 /// Returns [`UcanError::ExpiryTooFar`] if `exp` exceeds now + 24 hours.
-/// Returns [`UcanError::TokenNotYetValid`] if `nbf > now`.
-fn verify_expiry(token: &UcanToken) -> Result<(), UcanError> {
+/// Returns [`UcanError::TokenNotYetValid`] if `nbf > now + tolerance`.
+fn verify_expiry(token: &UcanToken, clock_skew_tolerance_secs: u64) -> Result<(), UcanError> {
     // Check nbf < exp first — a token with nbf >= exp is inherently invalid
-    // regardless of the current time.
+    // regardless of the current time or tolerance.
     if let Some(nbf) = token.payload.nbf
         && nbf >= token.payload.exp
     {
@@ -792,16 +815,24 @@ fn verify_expiry(token: &UcanToken) -> Result<(), UcanError> {
 
     let now = now_secs()?;
 
-    if token.payload.exp <= now {
+    // exp check with tolerance: allow tokens that expired within the
+    // tolerance window. `exp + tolerance > now` is equivalent to
+    // `exp > now - tolerance` but avoids underflow when now < tolerance.
+    if token.payload.exp + clock_skew_tolerance_secs <= now {
         return Err(UcanError::TokenExpired);
     }
 
+    // ExpiryTooFar check — no tolerance applied. This bounds the maximum
+    // token lifetime; clock drift doesn't justify longer-lived tokens.
     if token.payload.exp > now + MAX_EXPIRY_SECS {
         return Err(UcanError::ExpiryTooFar(token.payload.exp));
     }
 
+    // nbf check with tolerance: allow tokens whose not-before is slightly
+    // in the future (within tolerance). Uses saturating subtraction to avoid
+    // underflow when nbf < tolerance.
     if let Some(nbf) = token.payload.nbf
-        && nbf > now
+        && nbf.saturating_sub(clock_skew_tolerance_secs) > now
     {
         return Err(UcanError::TokenNotYetValid);
     }
@@ -862,6 +893,7 @@ mod tests {
             ceiling,
             context_creator_did,
             presenting_agent_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         }
     }
 
@@ -1872,6 +1904,8 @@ mod tests {
             &issuer_did,
             "did:dht:z6MkMember",
         );
+        // Use zero tolerance so the 2-second expiry is detected.
+        ctx.clock_skew_tolerance_secs = 0;
 
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(
@@ -1899,7 +1933,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token);
+        let result = verify_expiry(&token, 0);
         assert!(
             matches!(result, Err(UcanError::ExpiryTooFar(_))),
             "exp beyond 24h must be rejected: {result:?}"
@@ -1924,7 +1958,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token);
+        let result = verify_expiry(&token, 0);
         assert!(matches!(result, Err(UcanError::TokenExpired)));
     }
 
@@ -1947,7 +1981,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token);
+        let result = verify_expiry(&token, 0);
         assert!(matches!(result, Err(UcanError::TokenNotYetValid)));
     }
 
@@ -1970,7 +2004,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        assert!(verify_expiry(&token).is_ok());
+        assert!(verify_expiry(&token, 0).is_ok());
     }
 
     #[test]
@@ -1992,7 +2026,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token);
+        let result = verify_expiry(&token, 0);
         assert!(
             matches!(result, Err(UcanError::InvalidTimeRange { nbf, exp }) if nbf == now + 7200 && exp == now + 3600),
             "nbf > exp must return InvalidTimeRange: {result:?}"
@@ -2019,7 +2053,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token);
+        let result = verify_expiry(&token, 0);
         assert!(
             matches!(result, Err(UcanError::InvalidTimeRange { .. })),
             "nbf == exp must return InvalidTimeRange: {result:?}"
@@ -2046,7 +2080,7 @@ mod tests {
         };
 
         assert!(
-            verify_expiry(&token).is_ok(),
+            verify_expiry(&token, 0).is_ok(),
             "nbf < exp must pass time range validation"
         );
     }
@@ -2058,10 +2092,7 @@ mod tests {
     #[test]
     fn nonce_tracker_rejects_reused_nonce() {
         let mut tracker = InMemoryNonceTracker::new();
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        let now_millis = crate::time::now_millis().expect("clock unavailable in test");
 
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs().unwrap() + 3600;
@@ -2089,10 +2120,7 @@ mod tests {
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
 
         // Hex suffix too short.
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        let now_millis = crate::time::now_millis().expect("clock unavailable in test");
         let result = tracker.check_and_record(&format!("{now_millis}-aabb"), expiry);
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
     }
@@ -2383,7 +2411,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token);
+        let result = verify_expiry(&token, 0);
         // nbf == exp triggers InvalidTimeRange before TokenExpired.
         assert!(
             matches!(result, Err(UcanError::InvalidTimeRange { nbf: 0, exp: 0 })),
@@ -2414,7 +2442,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token);
+        let result = verify_expiry(&token, 0);
         assert!(
             matches!(result, Err(UcanError::TokenExpired)),
             "near-epoch token (exp=1) must be rejected: {result:?}"
@@ -2539,6 +2567,7 @@ mod tests {
             &resolver,
             &proof_resolver,
             &revocation_checker,
+            DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         );
         assert!(
             matches!(result, Err(UcanError::CircularDelegation(_))),
@@ -2610,6 +2639,7 @@ mod tests {
             &resolver,
             &proof_resolver,
             &revocation_checker,
+            DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         );
         assert!(result.is_ok(), "linear chain A->B->C must pass: {result:?}");
         assert_eq!(result.unwrap(), did_a);
@@ -2671,6 +2701,7 @@ mod tests {
             &resolver,
             &proof_resolver,
             &revocation_checker,
+            DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         );
         assert!(
             matches!(result, Err(UcanError::CircularDelegation(_))),
@@ -2711,6 +2742,7 @@ mod tests {
             &revocation_checker,
             MAX_CHAIN_DEPTH + 1,
             &mut seen,
+            DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         );
 
         assert!(
@@ -2729,5 +2761,240 @@ mod tests {
             err.to_string(),
             "circular delegation detected: issuer 'did:dht:z6MkA' appears multiple times"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Clock drift tolerance tests (issue #107)
+    // -----------------------------------------------------------------------
+
+    /// A token that expired 30 seconds ago should be accepted with the default
+    /// 5-minute tolerance (300 seconds).
+    #[test]
+    fn verify_expiry_tolerates_recently_expired_token() {
+        let now = now_secs().unwrap();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: now - 30, // Expired 30 seconds ago.
+                nbf: None,
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        // With 300s tolerance: exp (now - 30) + 300 = now + 270 > now. Accepted.
+        assert!(
+            verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS).is_ok(),
+            "token expired 30s ago must be accepted with 5-min tolerance"
+        );
+
+        // With 0 tolerance: exp (now - 30) + 0 <= now. Rejected.
+        assert!(
+            matches!(verify_expiry(&token, 0), Err(UcanError::TokenExpired)),
+            "token expired 30s ago must be rejected with 0 tolerance"
+        );
+    }
+
+    /// A token that expired 6 minutes ago should be rejected even with the
+    /// default 5-minute tolerance.
+    #[test]
+    fn verify_expiry_rejects_token_expired_beyond_tolerance() {
+        let now = now_secs().unwrap();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: now - 360, // Expired 6 minutes ago.
+                nbf: None,
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        // exp (now - 360) + 300 = now - 60 <= now. Rejected.
+        assert!(
+            matches!(
+                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS),
+                Err(UcanError::TokenExpired)
+            ),
+            "token expired 6 min ago must be rejected even with 5-min tolerance"
+        );
+    }
+
+    /// A token with nbf 30 seconds in the future should be accepted with the
+    /// default 5-minute tolerance.
+    #[test]
+    fn verify_expiry_tolerates_slightly_future_nbf() {
+        let now = now_secs().unwrap();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: now + 3600,
+                nbf: Some(now + 30), // nbf 30 seconds from now.
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        // With 300s tolerance: nbf (now + 30) - 300 = now - 270 <= now. Accepted.
+        assert!(
+            verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS).is_ok(),
+            "nbf 30s in the future must be accepted with 5-min tolerance"
+        );
+
+        // With 0 tolerance: nbf (now + 30) - 0 = now + 30 > now. Rejected.
+        assert!(
+            matches!(verify_expiry(&token, 0), Err(UcanError::TokenNotYetValid)),
+            "nbf 30s in the future must be rejected with 0 tolerance"
+        );
+    }
+
+    /// A token with nbf 6 minutes in the future should be rejected even with
+    /// the default 5-minute tolerance.
+    #[test]
+    fn verify_expiry_rejects_nbf_beyond_tolerance() {
+        let now = now_secs().unwrap();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: now + 7200,
+                nbf: Some(now + 360), // nbf 6 minutes from now.
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        // nbf (now + 360) - 300 = now + 60 > now. Rejected.
+        assert!(
+            matches!(
+                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS),
+                Err(UcanError::TokenNotYetValid)
+            ),
+            "nbf 6 min in the future must be rejected even with 5-min tolerance"
+        );
+    }
+
+    /// The expiry-too-far check must NOT include tolerance. A token with exp
+    /// exactly at the 24h limit is valid; tolerance doesn't extend this bound.
+    #[test]
+    fn verify_expiry_too_far_ignores_tolerance() {
+        let now = now_secs().unwrap();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: now + MAX_EXPIRY_SECS + 1, // 1 second beyond 24h limit.
+                nbf: None,
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        // Even with large tolerance, ExpiryTooFar is not affected.
+        assert!(
+            matches!(
+                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS),
+                Err(UcanError::ExpiryTooFar(_))
+            ),
+            "exp beyond 24h must be rejected regardless of tolerance"
+        );
+    }
+
+    /// The `InvalidTimeRange` check (nbf >= exp) must be independent of
+    /// tolerance. It is a structural token error, not a clock drift issue.
+    #[test]
+    fn verify_expiry_invalid_time_range_ignores_tolerance() {
+        let now = now_secs().unwrap();
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: now + 3600,
+                nbf: Some(now + 7200), // nbf > exp -- structural error.
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        // Even with large tolerance, InvalidTimeRange fires first.
+        assert!(
+            matches!(
+                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS),
+                Err(UcanError::InvalidTimeRange { .. })
+            ),
+            "nbf > exp must return InvalidTimeRange regardless of tolerance"
+        );
+    }
+
+    /// Verify that a token exactly at the tolerance boundary for expiry is
+    /// rejected. `exp + tolerance == now` means `exp + tolerance <= now`, so
+    /// it's expired.
+    #[test]
+    fn verify_expiry_boundary_expired_at_exact_tolerance() {
+        let now = now_secs().unwrap();
+        let tolerance = 60u64;
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkCreator".into(),
+                aud: "did:dht:z6MkMember".into(),
+                exp: now - tolerance, // exp + tolerance == now.
+                nbf: None,
+                nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+
+        // exp + tolerance == now. Uses `<=` so this is rejected.
+        assert!(
+            matches!(
+                verify_expiry(&token, tolerance),
+                Err(UcanError::TokenExpired)
+            ),
+            "token at exact tolerance boundary must be rejected"
+        );
+    }
+
+    /// Verify that the default constant matches the expected 5-minute value.
+    #[test]
+    fn default_clock_skew_tolerance_is_five_minutes() {
+        assert_eq!(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, 300);
     }
 }

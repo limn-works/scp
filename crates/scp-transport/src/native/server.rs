@@ -29,9 +29,13 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Callback, ErrorResponse, Request, Response,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::error::code;
@@ -72,6 +76,23 @@ pub struct RelayConfig {
     /// subscribe/unsubscribe churn that causes write-lock contention on the
     /// `SubscriptionRegistry`.
     pub rate_limit_subscribes_per_minute: u32,
+    /// Maximum random delivery jitter in milliseconds (default: 50ms).
+    ///
+    /// When non-zero, the relay adds a uniformly random delay in
+    /// `[0, delivery_jitter_ms)` before forwarding each stored blob to its
+    /// subscribers. This breaks timing correlation between PUBLISH arrival
+    /// and subscriber delivery, mitigating relay-side traffic analysis
+    /// (BLACK-001). Set to 0 to disable jitter (useful for tests).
+    pub delivery_jitter_ms: u64,
+    /// Optional shared secret for authenticating internal bridge connections.
+    ///
+    /// When set, the relay rejects any WebSocket upgrade whose URI does not
+    /// include a `token` query parameter matching this value (hex-encoded,
+    /// constant-time comparison). Used by [`ApplicationNode`] to prevent
+    /// unauthorized connections to the internal relay port.
+    ///
+    /// See GitHub issue #85 for the threat model.
+    pub bridge_secret: Option<[u8; 32]>,
 }
 
 impl Default for RelayConfig {
@@ -87,6 +108,8 @@ impl Default for RelayConfig {
             max_total_connections: 1000,
             rate_limit_publishes_per_second: 100,
             rate_limit_subscribes_per_minute: 20,
+            delivery_jitter_ms: 50,
+            bridge_secret: None,
         }
     }
 }
@@ -509,7 +532,104 @@ async fn check_publish_rate_limit(
     allowed
 }
 
+/// Callback for `accept_hdr_async` that validates the bridge secret.
+///
+/// Extracts the `token` query parameter from the WebSocket upgrade URI,
+/// hex-decodes it, and performs a constant-time comparison against the
+/// expected secret. Returns HTTP 403 on mismatch or missing token.
+///
+/// The token is never included in error messages or logs to prevent leakage.
+struct BridgeSecretCallback {
+    expected: [u8; 32],
+}
+
+impl Callback for BridgeSecretCallback {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        use tokio_tungstenite::tungstenite::http::StatusCode;
+
+        let uri = request.uri();
+        let query = uri.query().unwrap_or("");
+
+        // Parse the `token` parameter from the query string.
+        let provided_token = query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            if key == "token" { Some(value) } else { None }
+        });
+
+        let Some(hex_token) = provided_token else {
+            tracing::warn!("bridge connection rejected: missing token");
+            let mut err = ErrorResponse::new(None);
+            *err.status_mut() = StatusCode::FORBIDDEN;
+            return Err(err);
+        };
+
+        // Hex-decode the provided token.
+        let decoded = hex_decode_32(hex_token);
+        let Some(decoded) = decoded else {
+            tracing::warn!("bridge connection rejected: invalid token format");
+            let mut err = ErrorResponse::new(None);
+            *err.status_mut() = StatusCode::FORBIDDEN;
+            return Err(err);
+        };
+
+        // Constant-time comparison to prevent timing side-channels.
+        if decoded.ct_eq(&self.expected).into() {
+            Ok(response)
+        } else {
+            tracing::warn!("bridge connection rejected: invalid token");
+            let mut err = ErrorResponse::new(None);
+            *err.status_mut() = StatusCode::FORBIDDEN;
+            Err(err)
+        }
+    }
+}
+
+/// Decodes a 64-character hex string into a `[u8; 32]`.
+///
+/// Returns `None` on invalid length or non-hex characters.
+fn hex_decode_32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = hex.as_bytes().get(i * 2)?;
+        let lo = hex.as_bytes().get(i * 2 + 1)?;
+        *byte = (hex_nibble(*hi)? << 4) | hex_nibble(*lo)?;
+    }
+    Some(out)
+}
+
+/// Converts an ASCII hex character to its 4-bit value.
+const fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Encodes a `[u8; 32]` as a 64-character lowercase hex string.
+///
+/// Used by [`ApplicationNode`] to format the bridge token for the
+/// WebSocket connection URL.
+#[must_use]
+pub fn hex_encode_32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Handles a single WebSocket connection.
+///
+/// When `config.bridge_secret` is set, the WebSocket upgrade request must
+/// include a `token` query parameter whose hex-decoded value matches the
+/// secret (constant-time comparison). Connections without a valid token are
+/// rejected during the handshake — no protocol messages are exchanged.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection<S: BlobStorage + 'static>(
     stream: TcpStream,
@@ -520,9 +640,21 @@ async fn handle_connection<S: BlobStorage + 'static>(
     config: RelayConfig,
     rate_limiter: PublishRateLimiter,
 ) -> Result<(), ConnectionError> {
-    let ws_stream = tokio_tungstenite::accept_async(stream)
+    let ws_stream = if let Some(expected_secret) = config.bridge_secret {
+        // Validate the bridge token during the WebSocket handshake.
+        tokio_tungstenite::accept_hdr_async(
+            stream,
+            BridgeSecretCallback {
+                expected: expected_secret,
+            },
+        )
         .await
-        .map_err(|e| ConnectionError::WebSocket(e.to_string()))?;
+        .map_err(|e| ConnectionError::WebSocket(e.to_string()))?
+    } else {
+        tokio_tungstenite::accept_async(stream)
+            .await
+            .map_err(|e| ConnectionError::WebSocket(e.to_string()))?
+    };
 
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
@@ -804,9 +936,11 @@ async fn handle_publish<S: BlobStorage>(
         }
     };
 
-    // Deliver to active subscribers. The return value tracks failed sends
-    // (logged inside the function) for suppression detection.
-    let _failed_deliveries = deliver_to_subscribers(&stored, subscriptions).await;
+    // Deliver to active subscribers with optional jitter (BLACK-001).
+    // The return value tracks failed sends (logged inside the function)
+    // for suppression detection.
+    let _failed_deliveries =
+        deliver_to_subscribers(&stored, subscriptions, config.delivery_jitter_ms).await;
 
     // Respond with OK + blob_id.
     let ok = RelayMessage::Ok {
@@ -816,13 +950,23 @@ async fn handle_publish<S: BlobStorage>(
     let _ = tx.send(ok).await;
 }
 
-/// Delivers a stored blob to matching subscribers.
+/// Delivers a stored blob to matching subscribers with optional delivery jitter.
+///
+/// When `jitter_ms > 0`, a uniformly random delay in `[0, jitter_ms)` is applied
+/// before delivery to each subscriber. This breaks the timing correlation between
+/// PUBLISH arrival and subscriber delivery, mitigating relay-side traffic analysis
+/// (BLACK-001). The jitter is per-subscriber so that even subscribers on the same
+/// `routing_id` receive blobs at slightly different times.
 ///
 /// Returns the number of delivery failures (subscribers whose channel was
 /// full or closed). A non-zero count indicates potential selective message
 /// suppression if a relay artificially fills a target's buffer.
 #[allow(clippy::significant_drop_tightening)]
-async fn deliver_to_subscribers(stored: &StoredBlob, subscriptions: &SubscriptionRegistry) -> u64 {
+async fn deliver_to_subscribers(
+    stored: &StoredBlob,
+    subscriptions: &SubscriptionRegistry,
+    jitter_ms: u64,
+) -> u64 {
     let registry = subscriptions.read().await;
 
     let Some(entries) = registry.get(&stored.routing_id) else {
@@ -840,6 +984,13 @@ async fn deliver_to_subscribers(stored: &StoredBlob, subscriptions: &Subscriptio
 
     let mut failed = 0u64;
     for entry in entries {
+        // Apply per-subscriber delivery jitter (BLACK-001 mitigation).
+        // The delay breaks timing correlation between PUBLISH and delivery.
+        if jitter_ms > 0 {
+            let delay_ms = rand::random::<u64>() % jitter_ms;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
         // Send to subscriber; if the channel is full or closed, track the failure.
         if let Err(e) = entry.tx.try_send(blob_msg.clone()) {
             failed += 1;
@@ -1090,10 +1241,12 @@ mod tests {
     use tokio_tungstenite::connect_async;
 
     /// Helper: create a test server on a random port and return the address.
+    /// Delivery jitter is disabled (0ms) for deterministic test behavior.
     async fn start_test_server() -> SocketAddr {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1757,6 +1910,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(50),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1807,6 +1961,7 @@ mod tests {
             max_connections_per_ip: 2,
             max_total_connections: 100,
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1837,6 +1992,7 @@ mod tests {
             max_connections_per_ip: 100,
             max_total_connections: 2,
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -1865,6 +2021,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             rate_limit_publishes_per_second: 2,
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -2078,6 +2235,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         // Storage with capacity of 2.
@@ -2130,6 +2288,7 @@ mod tests {
             max_connections_per_ip: 1,
             max_total_connections: 100,
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -2164,6 +2323,7 @@ mod tests {
     async fn shutdown_does_not_panic() {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -2178,6 +2338,7 @@ mod tests {
     async fn shutdown_stops_accepting_connections() {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();
@@ -2212,6 +2373,7 @@ mod tests {
     async fn in_flight_connection_survives_shutdown() {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();

@@ -1038,7 +1038,7 @@ pub fn ucan_mint(
 /// # Arguments
 ///
 /// * `context` -- The context handle the token belongs to.
-/// * `token_id` -- The unique ID of the token to revoke.
+/// * `token` -- The full encoded JWT string of the token to revoke.
 ///
 /// # Returns
 ///
@@ -1051,10 +1051,10 @@ pub fn ucan_mint(
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn ucan_revoke(context: &WasmContextHandle, token_id: String) -> Promise {
+pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let _ = (context_id, token_id);
+        let _ = (context_id, token);
 
         Err(ScpWasmError::Permission {
             message:

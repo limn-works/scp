@@ -107,7 +107,9 @@ dependencies {
 
     // Compose testing (SCP-118)
     testImplementation("androidx.compose.ui:ui-test-junit4")
-    debugImplementation("androidx.compose.ui:ui-test-manifest")
+    // Available in all test variants so Robolectric can resolve ComponentActivity
+    // in both debug and release unit tests (see #144)
+    testImplementation("androidx.compose.ui:ui-test-manifest")
 }
 
 detekt {

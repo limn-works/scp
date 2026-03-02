@@ -203,10 +203,11 @@ pub enum CeilingPolicy {
     /// security-conservative choice — members see the ceiling before
     /// joining, and it cannot change (no bait-and-switch).
     Immutable,
-    /// Ceiling can be modified through the context's governance model.
-    /// Changes require governance approval (e.g., unanimous consent,
-    /// admin decision). Ceiling can only be narrowed (capabilities
-    /// removed), never expanded beyond the original creation ceiling.
+    /// Ceiling can be modified through the context's governance model
+    /// (admin, multi-sig, consensus). Changes are logged in the event
+    /// log and visible to all members before taking effect. Members who
+    /// joined under a narrower ceiling are notified and may leave before
+    /// an expansion takes effect. See spec section 5.3.
     Governed,
 }
 
@@ -314,7 +315,7 @@ Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core
 ### Implementation
 
 - **Language:** Rust
-- **Library:** `rs-ucan` crate (or `ucan` crate — evaluate for UCAN 0.10+ spec compliance)
+- **Library:** `rs-ucan` crate (or `ucan` crate — evaluate for UCAN 0.10+ spec compliance) [Note: replaced by native impl in scp-core/src/crypto/ucan/]
 - **Crate:** `scp-core`
 - **Modules:** `scp-core/context/roles.rs` (role definitions, assignment), `scp-core/crypto/ucan/` (UCAN wrapper, validation, revocation)
 - **Nonce tracking:** In-memory set of seen nonces per context, persisted to storage.
@@ -324,7 +325,7 @@ Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core
 
 - **ADR-008 (Context):** Roles exist within contexts. Role assignment happens on member join. The capability ceiling is a context parameter.
 - **ADR-003 (DID):** UCAN tokens are signed by DIDs. Delegation chains reference DIDs. Validation requires DID resolution for public key lookup.
-- **rs-ucan library:** Third-party UCAN implementation. Must support UCAN 0.10+ spec with mandatory nonce field.
+- **rs-ucan library:** Third-party UCAN implementation. Must support UCAN 0.10+ spec with mandatory nonce field. [Note: replaced by native impl in scp-core/src/crypto/ucan/]
 
 ### Acceptance Criteria
 

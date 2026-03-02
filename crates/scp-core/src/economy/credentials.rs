@@ -28,6 +28,69 @@ use crate::identity::DID;
 use super::adapter::PaymentAdapter;
 
 // ---------------------------------------------------------------------------
+// EncryptedBlob
+// ---------------------------------------------------------------------------
+
+/// Encrypted data blob for adapter credential material.
+///
+/// This newtype wraps `Vec<u8>` to enforce at the type level that credential
+/// data has passed through the identity key encryption layer (spec section
+/// 3.7). Raw `Vec<u8>` could contain plaintext; `EncryptedBlob` communicates
+/// that the bytes are already encrypted and safe for storage.
+///
+/// The `from_encrypted` constructor is `pub(crate)` so that only code within
+/// `scp-core` (i.e., the encryption layer) can produce an `EncryptedBlob`.
+/// External consumers receive them from the SDK but cannot forge one from
+/// arbitrary plaintext.
+///
+/// See spec section 3.7 (Identity Private State) and 19.2.5 (Adapter
+/// Credential Management).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedBlob(Vec<u8>);
+
+impl EncryptedBlob {
+    /// Creates an `EncryptedBlob` from already-encrypted data.
+    ///
+    /// This is the only constructor. It should be called exclusively by the
+    /// identity private state encryption layer (spec section 3.7). Library
+    /// consumers should never construct this directly from plaintext.
+    #[allow(dead_code)] // Called by tests now; identity encryption layer will use it
+    pub(crate) const fn from_encrypted(data: Vec<u8>) -> Self {
+        Self(data)
+    }
+
+    /// Returns the encrypted bytes as a slice.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consumes the wrapper and returns the inner encrypted bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Returns the length of the encrypted data.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns true if the encrypted data is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for EncryptedBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EncryptedBlob([{} bytes])", self.0.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CredentialError
 // ---------------------------------------------------------------------------
 
@@ -82,7 +145,10 @@ pub struct AdapterCredential {
     /// Encrypted credential material. The encryption scheme follows
     /// identity key encryption (spec section 3.7). The plaintext
     /// format is adapter-specific and opaque to the protocol.
-    pub encrypted_data: Vec<u8>,
+    ///
+    /// Wrapped in [`EncryptedBlob`] to enforce at the type level that the
+    /// data has been encrypted. See [`EncryptedBlob::from_encrypted`].
+    pub encrypted_data: EncryptedBlob,
     /// Unix timestamp (seconds) when this credential was stored.
     pub created_at: u64,
     /// Unix timestamp (seconds) of the last credential rotation.
@@ -95,10 +161,7 @@ impl std::fmt::Debug for AdapterCredential {
         f.debug_struct("AdapterCredential")
             .field("adapter_id", &self.adapter_id)
             .field("identity", &self.identity)
-            .field(
-                "encrypted_data",
-                &format!("[{} bytes]", self.encrypted_data.len()),
-            )
+            .field("encrypted_data", &self.encrypted_data)
             .field("created_at", &self.created_at)
             .field("rotated_at", &self.rotated_at)
             .finish()
@@ -121,7 +184,8 @@ pub trait AdapterCredentialStore: Send + Sync {
     /// Stores an adapter credential for an identity.
     ///
     /// Overwrites any existing credential for the same (identity, `adapter_id`)
-    /// pair. The credential data must already be encrypted by the caller.
+    /// pair. The credential's `encrypted_data` field is an [`EncryptedBlob`],
+    /// which guarantees at the type level that the data is already encrypted.
     fn store_adapter_credential(
         &self,
         credential: &AdapterCredential,
@@ -212,9 +276,9 @@ pub fn validate_adapter(adapter: &impl PaymentAdapter) -> Result<(), CredentialE
 /// 1. Validates the adapter implements the `PaymentAdapter` trait correctly.
 /// 2. Stores the provided encrypted credential data via the credential store.
 ///
-/// The caller is responsible for encrypting the credential data before
-/// passing it to this function. The encryption follows identity key
-/// encryption (spec section 3.7).
+/// The caller provides an [`EncryptedBlob`] produced by the identity
+/// private state encryption layer (spec section 3.7). The type system
+/// ensures plaintext data cannot be passed directly.
 ///
 /// # Errors
 ///
@@ -225,7 +289,7 @@ pub fn validate_adapter(adapter: &impl PaymentAdapter) -> Result<(), CredentialE
 pub async fn configure_adapter<A: PaymentAdapter, S: AdapterCredentialStore>(
     adapter: &A,
     identity: &DID,
-    encrypted_credential_data: Vec<u8>,
+    encrypted_credential_data: EncryptedBlob,
     timestamp: u64,
     store: &S,
 ) -> Result<(), CredentialError> {
@@ -664,7 +728,7 @@ mod tests {
         let adapter = TestPaymentAdapter::new("x402");
         let identity = test_did();
         let store = InMemoryCredentialStore::new();
-        let cred_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let cred_data = EncryptedBlob::from_encrypted(vec![0xDE, 0xAD, 0xBE, 0xEF]);
         let timestamp = 1_700_000_000;
 
         let result =
@@ -691,7 +755,14 @@ mod tests {
         let identity = test_did();
         let store = InMemoryCredentialStore::new();
 
-        let result = configure_adapter(&adapter, &identity, vec![], 0, &store).await;
+        let result = configure_adapter(
+            &adapter,
+            &identity,
+            EncryptedBlob::from_encrypted(vec![]),
+            0,
+            &store,
+        )
+        .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -710,7 +781,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "lightning".to_owned(),
             identity: identity.clone(),
-            encrypted_data: vec![1, 2, 3, 4, 5],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![1, 2, 3, 4, 5]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -748,7 +819,7 @@ mod tests {
         let cred_a = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: identity_a.clone(),
-            encrypted_data: vec![0xAA],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xAA]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -756,7 +827,7 @@ mod tests {
         let cred_b = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: identity_b.clone(),
-            encrypted_data: vec![0xBB],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xBB]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -776,8 +847,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(loaded_a.encrypted_data, vec![0xAA]);
-        assert_eq!(loaded_b.encrypted_data, vec![0xBB]);
+        assert_eq!(loaded_a.encrypted_data.as_bytes(), &[0xAA]);
+        assert_eq!(loaded_b.encrypted_data.as_bytes(), &[0xBB]);
     }
 
     #[tokio::test]
@@ -797,7 +868,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: identity.clone(),
-            encrypted_data: vec![0xDE, 0xAD],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xDE, 0xAD]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -830,7 +901,7 @@ mod tests {
             let credential = AdapterCredential {
                 adapter_id: (*adapter_id).to_owned(),
                 identity: identity.clone(),
-                encrypted_data: vec![1],
+                encrypted_data: EncryptedBlob::from_encrypted(vec![1]),
                 created_at: 1_700_000_000,
                 rotated_at: 1_700_000_000,
             };
@@ -861,7 +932,7 @@ mod tests {
         let cred_a = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: identity_a.clone(),
-            encrypted_data: vec![1],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![1]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -869,7 +940,7 @@ mod tests {
         let cred_b = AdapterCredential {
             adapter_id: "lightning".to_owned(),
             identity: identity_b.clone(),
-            encrypted_data: vec![2],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![2]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -896,7 +967,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: identity.clone(),
-            encrypted_data: vec![1, 2, 3],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![1, 2, 3]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -947,7 +1018,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "spl".to_owned(),
             identity: identity.clone(),
-            encrypted_data: vec![9, 8, 7],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![9, 8, 7]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -981,7 +1052,7 @@ mod tests {
         let store = InMemoryCredentialStore::new();
         let identity = test_did();
 
-        let adapters = vec![
+        let adapters: Vec<(&str, Vec<u8>)> = vec![
             ("x402", vec![0x01]),
             ("lightning", vec![0x02]),
             ("spl", vec![0x03]),
@@ -992,7 +1063,7 @@ mod tests {
             let credential = AdapterCredential {
                 adapter_id: (*adapter_id).to_owned(),
                 identity: identity.clone(),
-                encrypted_data: data.clone(),
+                encrypted_data: EncryptedBlob::from_encrypted(data.clone()),
                 created_at: 1_700_000_000,
                 rotated_at: 1_700_000_000,
             };
@@ -1006,7 +1077,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(cred.encrypted_data, *expected_data);
+            assert_eq!(cred.encrypted_data.as_bytes(), expected_data.as_slice());
         }
 
         let ids = store.list_adapter_credentials(&identity).await.unwrap();
@@ -1025,7 +1096,7 @@ mod tests {
         let original = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: identity.clone(),
-            encrypted_data: vec![0x01],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0x01]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -1033,7 +1104,7 @@ mod tests {
         let rotated = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: identity.clone(),
-            encrypted_data: vec![0x02],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0x02]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_001_000,
         };
@@ -1046,7 +1117,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.encrypted_data, vec![0x02]);
+        assert_eq!(loaded.encrypted_data.as_bytes(), &[0x02]);
         assert_eq!(loaded.rotated_at, 1_700_001_000);
     }
 
@@ -1059,7 +1130,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: DID::from("did:dht:z6MkTestHuman"),
-            encrypted_data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_001_000,
         };
@@ -1074,7 +1145,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "lightning".to_owned(),
             identity: DID::from("did:dht:z6MkTestHuman"),
-            encrypted_data: vec![1, 2, 3, 4, 5],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![1, 2, 3, 4, 5]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -1093,13 +1164,13 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: DID::from("did:dht:z6MkTestHuman"),
-            encrypted_data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
 
         let debug_output = format!("{credential:?}");
-        // Should show byte count, not raw data
+        // Should show byte count via EncryptedBlob's Debug impl, not raw data
         assert!(debug_output.contains("[4 bytes]"));
         assert!(!debug_output.contains("0xDE"));
         assert!(!debug_output.contains("222")); // 0xDE = 222

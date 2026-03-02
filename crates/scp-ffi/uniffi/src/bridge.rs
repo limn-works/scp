@@ -1586,6 +1586,11 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 /// * `token` — The encoded UCAN token string (JWT format).
 /// * `capability` — The required capability URI (e.g.,
 ///   `"scp:ctx:abc123/messages:write"`).
+/// * `presenting_agent_did` — Optional DID of the agent presenting the
+///   token. Falls back to the token's audience field if `None`. Required
+///   for ADR-016 step 5 (audience verification).
+/// * `proof_tokens` — Optional list of encoded UCAN proof tokens for
+///   delegation chain traversal (ADR-016 step 3).
 ///
 /// # Errors
 ///
@@ -1597,10 +1602,18 @@ pub async fn ucan_validate(
     handle: Arc<ContextHandle>,
     token: String,
     capability: String,
+    presenting_agent_did: Option<String>,
+    proof_tokens: Option<Vec<String>>,
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, token, capability);
+            let _ = (
+                handle,
+                token,
+                capability,
+                presenting_agent_did,
+                proof_tokens,
+            );
             Err(ScpError::Permission {
                 message: "not yet connected to runtime — UCAN validation requires a live context"
                     .to_owned(),
@@ -1712,17 +1725,17 @@ pub async fn ucan_mint(
 /// # Arguments
 ///
 /// * `handle` — The context the token belongs to.
-/// * `token_id` — The unique ID of the token to revoke.
+/// * `token` — The full encoded JWT string of the token to revoke.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Permission` if revocation fails (token not found,
 /// revoker not authorized — must be the token's issuer or context creator).
 #[uniffi::export]
-pub async fn ucan_revoke(handle: Arc<ContextHandle>, token_id: String) -> Result<(), ScpError> {
+pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, token_id);
+            let _ = (handle, token);
             Err(ScpError::Permission {
                 message: "not yet connected to runtime — UCAN revocation requires a live context"
                     .to_owned(),

@@ -93,10 +93,11 @@ pub enum CeilingPolicy {
     /// joining, and it cannot change (no bait-and-switch).
     #[default]
     Immutable,
-    /// Ceiling can be modified through the context's governance model.
-    /// Changes require governance approval (e.g., unanimous consent,
-    /// admin decision). Ceiling can only be narrowed (capabilities
-    /// removed), never expanded beyond the original creation ceiling.
+    /// Ceiling can be modified through the context's governance model
+    /// (admin, multi-sig, consensus). Changes are logged in the event
+    /// log and visible to all members before taking effect. Members who
+    /// joined under a narrower ceiling are notified and may leave before
+    /// an expansion takes effect. See spec section 5.3.
     Governed,
 }
 

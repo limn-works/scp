@@ -16,6 +16,7 @@ tokio-util = { workspace = true }
 axum = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

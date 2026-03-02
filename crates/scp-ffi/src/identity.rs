@@ -36,6 +36,7 @@ use scp_platform::traits::{KeyCustody, Storage};
 
 use crate::error::ScpPyError;
 use crate::runtime::IdentityEntry;
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // PyIdentity — opaque Python object for SCP identity
@@ -410,6 +411,7 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 /// See SCP-217, spec section 17.3, and RED-013.
 #[pyfunction]
 fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
+    validate::validate_did(did)?;
     let did_owned = did.to_owned();
     let rt = crate::runtime()?;
 
@@ -489,6 +491,7 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
 /// See ADR-013 acceptance criterion 2.
 #[pyfunction]
 fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
+    validate::validate_did(did)?;
     let did_owned = did.to_owned();
     let rt = crate::runtime()?;
 
@@ -609,10 +612,8 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 .await
                 .map_err(|e| ScpPyError::IdentityError(format!("key generation failed: {e}")))?;
 
-            let rotated_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| ScpPyError::IdentityError(format!("system clock error: {e}")))?
-                .as_secs();
+            let rotated_at = scp_core::time::now_secs()
+                .map_err(|e| ScpPyError::IdentityError(format!("{e}")))?;
 
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,

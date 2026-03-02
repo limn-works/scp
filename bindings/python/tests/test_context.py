@@ -9,13 +9,11 @@ Covers all acceptance criteria from SCP-043:
 - Context.create signature matches spec
 - join(), leave(), close(), send(), receive(), invoke() methods
 - __aenter__/__aexit__ implemented
-- Receive buffer: 1,000-event default, oldest-drop overflow, BufferOverflow
-  warning, configurable buffer_size (100--10,000)
+- Receive buffer: 1,000-event default, configurable buffer_size (100--10,000)
+- __anext__ returns awaitables that do not block the asyncio event loop (#138)
 
 Receive stream buffer test IDs from .docs/standards/sdk-common.md:
 - receive-buffer-capacity-001
-- receive-buffer-overflow-drop-002
-- receive-buffer-overflow-warning-003
 - receive-buffer-configurable-004
 
 Tests mock the ``_scp_core`` bridge layer; no Rust extension required.
@@ -26,10 +24,9 @@ section "Receive stream buffer tests" for the canonical design.
 
 from __future__ import annotations
 
-import warnings
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -239,6 +236,142 @@ class TestContextCreate:
                 buffer_size=50,
             )
 
+    async def test_create_passes_mode(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                mode="broadcast",
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["mode"] == "broadcast"
+
+    async def test_create_passes_ceiling_policy(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                ceiling_policy="governed",
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["ceiling_policy"] == "governed"
+
+    async def test_create_passes_promotion_policy(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                promotion_policy="promotable",
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["promotion_policy"] == "promotable"
+
+    async def test_create_passes_template_id(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                template_id="PublicBroadcast",
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["template_id"] == "PublicBroadcast"
+
+    async def test_create_passes_economic_policy(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        ep_json = '{"locked": false, "cost_schedule": {}}'
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                economic_policy=ep_json,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["economic_policy"] == ep_json
+
+    async def test_create_default_new_fields(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["mode"] == "encrypted"
+        assert params["ceiling_policy"] == "immutable"
+        assert params["promotion_policy"] == "no_promotion"
+        assert params["template_id"] is None
+        assert params["economic_policy"] is None
+
+    async def test_create_accepts_enum_mode(self) -> None:
+        from scp_sdk.types import ContextMode
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                mode=ContextMode.BROADCAST,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["mode"] == "broadcast"
+
+    async def test_create_accepts_enum_ceiling_policy(self) -> None:
+        from scp_sdk.types import CeilingPolicy
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                ceiling_policy=CeilingPolicy.GOVERNED,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["ceiling_policy"] == "governed"
+
+    async def test_create_accepts_enum_promotion_policy(self) -> None:
+        from scp_sdk.types import PromotionPolicy
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["MessagesRead"],
+                promotion_policy=PromotionPolicy.PROMOTABLE,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["promotion_policy"] == "promotable"
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle method tests (join, leave, close)
@@ -414,8 +547,7 @@ class TestContextReceive:
 
     async def test_receive_returns_async_iterator(self) -> None:
         mock_bridge = MagicMock()
-        mock_receiver = MagicMock()
-        mock_receiver.__anext__ = MagicMock(side_effect=StopIteration)
+        mock_receiver = _FakeReceiver([])
         mock_bridge.py_context_receive.return_value = mock_receiver
 
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
@@ -432,17 +564,7 @@ class TestContextReceive:
             context_id="ctx-test-abc123",
         )
         mock_bridge = MagicMock()
-        mock_receiver = MagicMock()
-        call_count = 0
-
-        def anext_side_effect() -> Any:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return raw_msg
-            raise StopIteration
-
-        mock_receiver.__anext__ = MagicMock(side_effect=anext_side_effect)
+        mock_receiver = _FakeReceiver([raw_msg])
         mock_bridge.py_context_receive.return_value = mock_receiver
 
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
@@ -601,18 +723,27 @@ class TestBufferSizeValidation:
 
 
 class _FakeReceiver:
-    """A synchronous iterable that simulates the bridge receiver."""
+    """An async-compatible fake that simulates the bridge receiver.
+
+    ``__anext__`` returns a resolved ``asyncio.Future`` (or ``None``
+    when exhausted), matching the new non-blocking bridge behaviour
+    introduced by #138.
+    """
 
     def __init__(self, messages: list[_MockBridgeMessage]) -> None:
         self._messages = list(messages)
         self._index = 0
 
-    def __anext__(self) -> _MockBridgeMessage:
+    def __anext__(self) -> asyncio.Future[_MockBridgeMessage | None]:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[_MockBridgeMessage | None] = loop.create_future()
         if self._index >= len(self._messages):
-            raise StopIteration
-        msg = self._messages[self._index]
-        self._index += 1
-        return msg
+            future.set_result(None)
+        else:
+            msg = self._messages[self._index]
+            self._index += 1
+            future.set_result(msg)
+        return future
 
 
 class TestReceiveIterator:
@@ -690,96 +821,87 @@ class TestReceiveBufferCapacity001:
         assert collected[-1].content == f"msg-{_DEFAULT_BUFFER_SIZE - 1}"
 
 
-class TestReceiveBufferOverflowDrop002:
-    """receive-buffer-overflow-drop-002: oldest event dropped when full."""
+class TestNonBlockingAnext:
+    """Tests that __anext__ does not block the asyncio event loop (#138).
 
-    async def test_oldest_dropped_on_overflow(self) -> None:
-        buffer_size = 3
-        messages = [_MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i)) for i in range(5)]
-        receiver = _FakeReceiver(messages)
-        iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
+    Verifies acceptance criterion: concurrent asyncio tasks make progress
+    while waiting for messages.
+    """
 
-        with warnings.catch_warnings(record=True):
-            warnings.simplefilter("always")
+    async def test_concurrent_asyncio_tasks_progress_while_waiting(self) -> None:
+        """Start async-for on a receiver, run a timer task concurrently.
+
+        The timer task must complete on schedule (not blocked), confirming
+        that __anext__ yields control to the event loop.
+        """
+
+        class _DelayedReceiver:
+            """Returns a message after a delay, simulating async bridge."""
+
+            def __init__(self) -> None:
+                self._delivered = False
+
+            def __anext__(self) -> asyncio.Future[_MockBridgeMessage | None]:
+                loop = asyncio.get_running_loop()
+                future: asyncio.Future[_MockBridgeMessage | None] = loop.create_future()
+                if self._delivered:
+                    future.set_result(None)
+                else:
+                    self._delivered = True
+                    # Schedule resolution after 50ms to simulate async recv.
+                    loop.call_later(
+                        0.05,
+                        future.set_result,
+                        _MockBridgeMessage(payload="delayed"),
+                    )
+                return future
+
+        receiver = _DelayedReceiver()
+        iterator = _ReceiveIterator(receiver, buffer_size=_DEFAULT_BUFFER_SIZE)
+
+        timer_completed = False
+
+        async def timer_task() -> None:
+            nonlocal timer_completed
+            await asyncio.sleep(0.01)
+            timer_completed = True
+
+        # Run both tasks concurrently. If __anext__ blocked the event
+        # loop, the timer_task would never complete.
+        async def receive_task() -> list[Message]:
             collected = []
             async for msg in iterator:
                 collected.append(msg)
+            return collected
 
-        assert len(collected) == buffer_size
-        assert collected[0].content == "msg-2"
-        assert collected[1].content == "msg-3"
-        assert collected[2].content == "msg-4"
+        results = await asyncio.gather(
+            receive_task(),
+            timer_task(),
+        )
 
-    async def test_newest_is_preserved_not_dropped(self) -> None:
-        buffer_size = 2
-        messages = [
-            _MockBridgeMessage(payload="oldest", timestamp=1.0),
-            _MockBridgeMessage(payload="middle", timestamp=2.0),
-            _MockBridgeMessage(payload="newest", timestamp=3.0),
-        ]
-        receiver = _FakeReceiver(messages)
-        iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
+        assert timer_completed, "timer task should complete while receiver awaits"
+        messages = results[0]
+        assert len(messages) == 1
+        assert messages[0].content == "delayed"
 
-        with warnings.catch_warnings(record=True):
-            warnings.simplefilter("always")
-            collected = []
-            async for msg in iterator:
-                collected.append(msg)
+    async def test_multiple_receivers_concurrent_progress(self) -> None:
+        """Multiple receivers in concurrent asyncio tasks all make progress."""
+        messages_a = [_MockBridgeMessage(payload="a-1"), _MockBridgeMessage(payload="a-2")]
+        messages_b = [_MockBridgeMessage(payload="b-1"), _MockBridgeMessage(payload="b-2")]
 
-        assert collected[-1].content == "newest"
+        iter_a = _ReceiveIterator(_FakeReceiver(messages_a), buffer_size=_DEFAULT_BUFFER_SIZE)
+        iter_b = _ReceiveIterator(_FakeReceiver(messages_b), buffer_size=_DEFAULT_BUFFER_SIZE)
 
+        async def collect(it: _ReceiveIterator) -> list[str]:
+            out: list[str] = []
+            async for msg in it:
+                out.append(msg.content)
+            return out
 
-class TestReceiveBufferOverflowWarning003:
-    """receive-buffer-overflow-warning-003: BufferOverflow warning with count."""
+        result_a, result_b = await asyncio.gather(collect(iter_a), collect(iter_b))
 
-    async def test_warning_emitted_on_overflow(self) -> None:
-        buffer_size = 2
-        messages = [_MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i)) for i in range(4)]
-        receiver = _FakeReceiver(messages)
-        iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
-
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            collected = []
-            async for msg in iterator:
-                collected.append(msg)
-
-        overflow_warnings = [w for w in caught if "BufferOverflow" in str(w.message)]
-        assert len(overflow_warnings) > 0
-
-    async def test_warning_includes_dropped_count(self) -> None:
-        buffer_size = 2
-        messages = [_MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i)) for i in range(5)]
-        receiver = _FakeReceiver(messages)
-        iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
-
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            collected = []
-            async for msg in iterator:
-                collected.append(msg)
-
-        overflow_warnings = [w for w in caught if "BufferOverflow" in str(w.message)]
-        assert len(overflow_warnings) >= 1
-        last_warning_text = str(overflow_warnings[-1].message)
-        assert "dropped" in last_warning_text
-        assert "3" in last_warning_text
-
-    async def test_warning_includes_buffer_capacity(self) -> None:
-        buffer_size = 150
-        messages = [_MockBridgeMessage(payload=f"msg-{i}", timestamp=float(i)) for i in range(152)]
-        receiver = _FakeReceiver(messages)
-        iterator = _ReceiveIterator(receiver, buffer_size=buffer_size)
-
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            collected = []
-            async for msg in iterator:
-                collected.append(msg)
-
-        overflow_warnings = [w for w in caught if "BufferOverflow" in str(w.message)]
-        assert len(overflow_warnings) >= 1
-        assert "150" in str(overflow_warnings[-1].message)
+        assert result_a == ["a-1", "a-2"]
+        assert result_b == ["b-1", "b-2"]
 
 
 class TestReceiveBufferConfigurable004:
@@ -840,8 +962,7 @@ class TestReceiveBufferConfigurable004:
 
     async def test_configured_buffer_size_affects_new_iterators(self) -> None:
         mock_bridge = MagicMock()
-        mock_receiver = MagicMock()
-        mock_receiver.__anext__ = MagicMock(side_effect=StopIteration)
+        mock_receiver = _FakeReceiver([])
         mock_bridge.py_context_receive.return_value = mock_receiver
 
         ctx = _make_context(buffer_size=200)

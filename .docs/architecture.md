@@ -50,7 +50,7 @@
 │  │  │       │             │             │              │       │ │  │
 │  │  │  ┌────┴─────────────┴─────────────┴──────────────┴────┐ │ │  │
 │  │  │  │  CRYPTO LAYER                                       │ │ │  │
-│  │  │  │  MLS (OpenMLS) │ UCAN (rs-ucan) │ Merkle trees    │ │ │  │
+│  │  │  │  MLS (OpenMLS) │ UCAN (native)  │ Merkle trees    │ │ │  │
 │  │  │  └────────────────────────┬────────────────────────────┘ │ │  │
 │  │  └──────────────────────────┼──────────────────────────────┘ │  │
 │  │                              │                                │  │
@@ -306,6 +306,12 @@ scp/
 │   │   ├── tls.rs             # ACME TLS provisioning (Let's Encrypt)
 │   │   └── well_known.rs      # .well-known/scp generation from node state
 │   │
+│   ├── scp-relay/             # Standalone SCP native relay server binary
+│   │   └── main.rs
+│   │
+│   ├── scp-media/             # Real-time media transport types (§10.9)
+│   │   └── lib.rs             # WebRTC signaling types, MLS key export for DTLS-SRTP
+│   │
 │   ├── scp-ffi/               # Foreign function interface layer
 │   │   ├── uniffi/            # UniFFI definitions → Swift, Kotlin
 │   │   └── pyo3/              # PyO3 definitions → Python
@@ -518,7 +524,7 @@ State:
 │                                                                  │
 │  ┌──────────────────────┐  ┌──────────────────────┐            │
 │  │ MLS Module            │  │ UCAN Module          │            │
-│  │ (OpenMLS)             │  │ (rs-ucan)            │            │
+│  │ (OpenMLS)             │  │ (native impl)        │            │
 │  │                       │  │                      │            │
 │  │ • create_group        │  │ • create_token       │            │
 │  │ • add_member          │  │   (mandatory nonce)  │            │
@@ -611,6 +617,14 @@ State:
         ├──► scp-transport
         └──► scp-platform
 
+   scp-relay (standalone binary)
+        │
+        └──► scp-transport
+
+   scp-media (real-time media types, §10.9)
+        │
+        └──► scp-core
+
    scp-testing (dev-dependency, §16)
         │
         ├──► scp-core
@@ -639,6 +653,153 @@ Contexts can form parent-child relationships (spec §5.13, ADR-008). A child con
 **Cryptographic binding.** Parent context IDs and the content hash of the parent governance configuration are included in the MLS `group_context` extensions field. The child's `group_id` is derived from this `group_context`, making the parent lineage part of the cryptographic group identity. Lineage is unforgeable — claiming different parents would require a different MLS group. Two independent verification paths (MLS `group_context` and Merkle-tree event log) must both be compromised to forge lineage.
 
 **Depth limit.** The protocol enforces a maximum nesting depth as a protocol constant (suggested default: 3 levels). This bounds governance complexity, ceiling narrowing (deep nesting converges on empty ceilings), lifecycle cascade depth, and provenance evaluation cost.
+
+### 2.5 Abstraction Boundaries and Replaceable Subsystems
+
+SCP's architecture is built on trait-based dependency injection. Every external capability — key custody, storage, transport, DID resolution, event log persistence, crypto operations, payments — is abstracted behind a Rust trait. Production and testing implementations share identical API surfaces. Any implementation can be replaced without touching calling code.
+
+This section documents the layered dependency graph, every replaceable subsystem, the trait contracts they must uphold, and the architectural invariants that must never be violated.
+
+#### 2.5.1 Layered Dependency Graph
+
+Dependencies flow strictly upward. No crate may depend on a crate at the same or higher layer. Violations are compile errors (separate crates) or PR review failures (internal modules).
+
+```
+Layer 0 ─ scp-platform              Platform abstraction traits (KeyCustody, Storage,
+           │                          DeviceAttestation, Push). Zero protocol knowledge.
+           │
+Layer 1 ─ scp-core                  Protocol engine. Contexts, identity, trust, discovery,
+           │                          crypto, event log, store, envelope, provenance, economy.
+           │                          Depends only on scp-platform.
+           │
+Layer 2 ─ scp-transport             Transport abstraction + native relay adapter.
+           │  scp-mcp                 MCP bridge (server + client).
+           │  scp-media               Media session handling.
+           │                          All depend on scp-core (and transitively scp-platform).
+           │
+Layer 3 ─ scp-node                  Application deployment node (AGPL boundary).
+           │  scp-ffi                 Language bindings (PyO3, UniFFI, wasm-bindgen, napi-rs).
+           │  scp-relay               Standalone relay binary.
+           │                          Depend on layers 0-2 as needed.
+           │
+Layer 4 ─ scp-testing               Dev-dependency only. Network simulation harness,
+                                      trait conformance macros, distributed assertions.
+                                      Depends on scp-core, scp-transport, scp-platform.
+                                      Never imported by production code.
+```
+
+**Planned extractions:** The identity module (`scp-core/identity/`) and event log module (`scp-core/event_log/`) are candidates for extraction into standalone Layer 1 crates (`scp-identity`, `scp-event-log`). Both are already architecturally independent — identity depends only on scp-platform, and event log has no protocol dependencies. Extraction is tracked in issues #93 and #94.
+
+#### 2.5.2 Replaceable Subsystems
+
+Every subsystem in the table below is injected through a trait. Callers never construct concrete implementations directly.
+
+| Subsystem | Trait | Location | Replaceability | What breaks if replaced |
+|---|---|---|---|---|
+| Key custody | `KeyCustody` | `scp-platform/src/traits.rs` | Full | Nothing — designed for hardware (Secure Enclave, Android Keystore), software, and in-memory swap. |
+| Storage | `Storage` | `scp-platform/src/traits.rs` | Full | Nothing — Keychain, encrypted SQLite, IndexedDB, in-memory all supported. |
+| Device attestation | `DeviceAttestation` | `scp-platform/src/traits.rs` | Full | Nothing — App Attest, Play Integrity, synthetic for testing. |
+| Push notifications | `Push` | `scp-platform/src/traits.rs` | Full | Nothing — APNs, FCM, synthetic. |
+| Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
+| DID method | `DidMethod` | `scp-core/src/identity/mod.rs` | Full | Nothing — did:dht (primary), did:web (fallback), or custom method. |
+| DHT client | `DhtClient` | `scp-core/src/identity/dht_client.rs` | Full | Nothing — pkarr (production), in-memory (testing), or custom BEP44 client. |
+| Context crypto | `ContextCryptoProvider` | `scp-core/src/context/builder.rs` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
+| Context transport | `ContextTransportProvider` | `scp-core/src/context/builder.rs` | Full | Nothing — wraps transport for context-scoped operations. |
+| Context event log | `ContextEventLogProvider` | `scp-core/src/context/builder.rs` | Full | Nothing — in-memory, SQLite, custom backend. |
+| Cold-tier storage | `ColdTierProvider` | `scp-core/src/event_log/tiered_storage.rs` | Full | Nothing — relay-hosted cold storage, local archive, custom. |
+| Payment rail | `PaymentAdapter` | `scp-core/src/economy/adapter.rs` | Full | Nothing — x402, Lightning, SPL, Stripe, test ledger. |
+
+#### 2.5.3 Trait Contracts
+
+Each replaceable trait imposes invariants that every implementation must uphold. Full Rustdoc lives in the source; this section provides the map.
+
+**`KeyCustody`** (scp-platform) — `Send + Sync`, async methods.
+- Private key material never leaves the custody boundary. Callers receive opaque `KeyHandle` values.
+- `generate_keypair` returns a new handle; implementations may back this with hardware (Secure Enclave, Keystore) or software.
+- `sign` and `dh_agree` enforce `KeyType` correctness (Ed25519 for signing, X25519 for agreement). Wrong type returns `PlatformError::WrongKeyType`.
+- `derive_pseudonym` MUST produce deterministic output: `HMAC-SHA256(key_material, context_id || "scp-pseudonym")` seeded into Ed25519 keygen. All implementations produce identical output for identical inputs. See ADR-006.
+- `destroy_key` irrevocably removes material. Subsequent operations on the handle return `PlatformError::KeyNotFound`.
+
+**`Storage`** (scp-platform) — `Send + Sync`, async methods.
+- Six methods: `store`, `retrieve`, `delete`, `list_keys`, `delete_prefix`, `exists`.
+- Keys are UTF-8 strings; values are opaque `&[u8]`.
+- `list_keys` returns keys in lexicographic order.
+- `delete_prefix` returns the count of deleted keys.
+- `exists` checks presence without reading (used for UCAN nonce replay prevention).
+- Implementations must be durable across process restarts (exception: in-memory testing adapter).
+
+**`DeviceAttestation`** (scp-platform) — `Send + Sync`, async methods.
+- `attest` produces a platform-specific token. `verify` validates it.
+- The testing adapter always returns synthetic tokens that verify successfully.
+- Production implementations wrap App Attest (iOS) or Play Integrity (Android).
+
+**`Push`** (scp-platform) — `Send + Sync`, async methods.
+- `register` obtains a platform push token. `handle_notification` converts a raw payload to a `WakeSignal`.
+- The testing adapter returns a synthetic UUID token and passes payloads through.
+
+**`TransportAdapter`** (scp-transport) — `Send + Sync`, dyn-compatible (boxed futures).
+- Five methods: `send`, `subscribe`, `unsubscribe`, `query`, `delete`.
+- `send` returns a `BlobId` (SHA-256 of the envelope wire bytes).
+- `subscribe` returns a `Pin<Box<dyn Stream<Item = TransportEvent> + Send>>`. The stream emits `Envelope`, `Error`, `BackfillComplete`, `Reconnected`, `Terminated`, and `SuppressionDetected` events. Adapters handle reconnection internally.
+- `delete` is best-effort — untrusted transports may ignore it.
+- Adapters map transport-specific semantics (WebSocket, Nostr relay, libp2p, etc.) onto this uniform interface.
+
+**`DidMethod`** (scp-core/identity) — `Send + Sync`, async methods.
+- `create` generates three Ed25519 keypairs (identity, active signing, pre-rotation) via the provided `KeyCustody`. Returns `ScpIdentity` + `DidDocument`.
+- `verify` is a local, synchronous self-certification check (z-base-32 decode + public key comparison).
+- `publish` and `resolve` perform network I/O against the underlying DID infrastructure.
+- `rotate` generates a new active signing key, updates the DID document, and publishes. The DID string does not change.
+
+**`DhtClient`** (scp-core/identity) — `Send + Sync`, async methods.
+- Abstracts BEP44 signed mutable item operations on a DHT.
+- `publish` enforces monotonic sequence number semantics — a publish with `seq` less than or equal to the existing sequence is a no-op.
+- `resolve` returns `Option<DhtRecord>` (value bytes + signature + sequence number).
+
+**`ContextCryptoProvider`** (scp-core/context) — `Send + Sync`, synchronous methods.
+- Wraps MLS group creation/destruction, sender key generation/destruction, broadcast key initialization, member add/remove, key package validation, sender key distribution, and message encryption.
+- Rollback methods (`destroy_mls_group`, `destroy_sender_key`) are idempotent.
+- `validate_creator_identity` is read-only — zero side effects.
+
+**`ContextTransportProvider`** (scp-core/context) — `Send + Sync`, synchronous methods.
+- `is_connected` returns a boolean — no side effects.
+- `publish_context` and `delete_published` are scoped by context ID.
+- `send_message` delivers encrypted payloads through the transport layer.
+
+**`ContextEventLogProvider`** (scp-core/context) — `Send + Sync`, synchronous methods.
+- `init_event_log` creates an empty Merkle event log for a context.
+- `append_event` appends a named event. `append_context_event` is a convenience wrapper returning `ContextError`.
+- `destroy_event_log` is for rollback — idempotent.
+
+**`ColdTierProvider`** (scp-core/event_log) — `Send + Sync`, async methods.
+- Fetches Merkle inclusion proofs for cold-tier events from relay storage.
+- The provider does NOT verify proofs — the caller verifies against the expected Merkle root. Relays are untrusted.
+
+**`PaymentAdapter`** (scp-core/economy) — `Send + Sync`, async methods (RPITIT).
+- Authorize/capture two-phase pattern: `authorize` reserves funds, `capture` settles, `void` cancels.
+- `verify_authorization` confirms an authorization is authentic and unexpired (prevents forgery).
+- `verify` checks adapter-specific proof (on-chain state, preimage hash, etc.).
+- `refund` supports full and partial refunds.
+- `capabilities` returns supported currencies, streaming support, batch auth, single-step, and min/max amounts.
+
+#### 2.5.4 Architectural Invariants
+
+These rules must not be violated. They are enforced by the crate dependency graph (compile errors for cross-crate violations) and by PR review (for intra-crate violations).
+
+1. **scp-core must never import from scp-transport.** This is the transport independence invariant. The protocol engine has no knowledge of any specific transport mechanism. Transport is injected via `ContextTransportProvider` at the context builder level.
+
+2. **scp-platform has zero protocol knowledge.** It defines four platform abstraction traits and their supporting types. It must never import from scp-core, scp-transport, or any other protocol crate.
+
+3. **Identity module must never import from context module.** Identity is foundational — it creates DIDs, manages keys, and resolves DID documents. It must not depend on context lifecycle, membership, or governance. The reverse dependency (context depends on identity) is correct.
+
+4. **Event log module must never import from context, crypto, or identity.** The event log is a standalone Merkle tree data structure. It stores hashes of events — it does not interpret them. Any protocol-level meaning is the caller's responsibility.
+
+5. **All external dependencies are injected via traits, never constructed directly.** No module creates a concrete `InMemoryStorage` or `NativeRelayAdapter` — it receives an implementation through a generic parameter or trait object.
+
+6. **FFI crates expose the public API surface — no internal module structure leaks through.** Python, TypeScript, Swift, and Kotlin users see a flat, idiomatic API. Internal crate boundaries, module paths, and Rust-specific patterns are hidden by the FFI layer.
+
+7. **scp-testing is a dev-dependency only.** It must never be imported by production code. It provides InMemoryRelay, InMemoryTransport, SimulatedClock, ScenarioBuilder, trait conformance macros, and distributed assertion utilities.
+
+8. **Dependency direction is strictly downward through layers.** A crate at Layer N may depend on crates at Layer N-1 or below, never at Layer N or above. scp-transport (Layer 2) may depend on scp-core (Layer 1) and scp-platform (Layer 0), but scp-core must never depend on scp-transport.
 
 ---
 
@@ -786,7 +947,7 @@ These are Phase 5 deliverables (community SDKs). The C ABI is stable and version
 
 ```
 Build:
-  • scp-core/crypto/ — MLS wrapper (OpenMLS), UCAN wrapper (rs-ucan)
+  • scp-core/crypto/ — MLS wrapper (OpenMLS), UCAN (native implementation)
   • scp-core/envelope/ — SCP envelope creation, signing, verification
   • scp-core/identity/ — DID creation (did:dht)
   • scp-core/clock.rs — Clock trait + SystemClock (§16.3)
@@ -962,7 +1123,8 @@ Build:
   • Event log pruning/checkpointing
   • Performance optimization
   • Security audit
-  • Governance models beyond single-admin
+  • Governance models beyond single-admin — DONE: GovernanceEngine trait with SingleAdmin,
+    Threshold (M-of-N), Majority, and Unanimity models (ADR-031, SCP-129–133)
 
 Test:
   • Load testing: 1000 SimulatedIdentity instances in scp-testing simulator,
@@ -1034,7 +1196,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | DID method (fallback) | did:web | Contingency only if did:dht libraries prove unusable. Not a planned deployment. |
 | Group encryption | MLS (OpenMLS) | O(log n) removal, forward secrecy, clean key destruction. |
 | Transport | SCP native relay (canonical) + adapters | No dependency on any single transport. SCP native relay is simplest reference. Adapters: Nostr, Matrix, Holepunch/Hyperswarm, libp2p, WebSocket, WebRTC, QUIC, BLE, Tor, I2P, SSB, MQTT, NATS, ZeroMQ, Yggdrasil, cjdns. |
-| Capability tokens | UCAN (rs-ucan) | Per-agent, per-context, per-capability, revocable. |
+| Capability tokens | UCAN (native impl) | Per-agent, per-context, per-capability, revocable. Native implementation using ed25519-dalek + serde_json. |
 | Spec status | Ships with SDK, iterates | Don't wait for perfect spec. Working code first. |
 | Infrastructure owned | Almost nothing | did:dht uses Mainline DHT (existing). Everything else is existing or user-owned. |
 | MCP integration | SCP agent as MCP server | Every MCP-compatible model works with SCP. Zero model-side integration. |

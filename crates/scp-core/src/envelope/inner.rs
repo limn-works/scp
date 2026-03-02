@@ -171,10 +171,10 @@ pub async fn create_inner_envelope(
     signing_key: &KeyHandle,
 ) -> Result<InnerEnvelope, EnvelopeError> {
     // 1. Hash original plaintext.
-    let payload_hash = Sha256::digest(params.payload).to_vec();
+    let payload_hash: [u8; 32] = Sha256::digest(params.payload).into();
 
     // 2. Hash provenance.
-    let provenance_hash = compute_provenance_hash(params.provenance.as_ref())?;
+    let provenance_hash: [u8; 32] = compute_provenance_hash(params.provenance.as_ref())?;
 
     // 3. Compute canonical hash for signing.
     let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash);
@@ -196,10 +196,10 @@ pub async fn create_inner_envelope(
         generation: params.generation,
         sequence: params.sequence,
         timestamp: params.timestamp,
-        payload_hash,
+        payload_hash: payload_hash.to_vec(),
         payload: padded_payload,
         provenance: params.provenance.clone(),
-        provenance_hash,
+        provenance_hash: provenance_hash.to_vec(),
         signature: signature.into_bytes(),
     })
 }
@@ -223,27 +223,6 @@ pub fn verify_inner_signature(
     inner: &InnerEnvelope,
     sender_public_key: &[u8],
 ) -> Result<bool, EnvelopeError> {
-    // Parse the public key.
-    let pubkey_bytes: [u8; 32] = sender_public_key.try_into().map_err(|_| {
-        EnvelopeError::VerificationFailed(format!(
-            "public key must be 32 bytes, got {}",
-            sender_public_key.len()
-        ))
-    })?;
-
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes)
-        .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
-
-    // Parse the signature.
-    let sig_bytes: [u8; 64] = inner.signature.as_slice().try_into().map_err(|_| {
-        EnvelopeError::VerificationFailed(format!(
-            "signature must be 64 bytes, got {}",
-            inner.signature.len()
-        ))
-    })?;
-
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
     // Recompute the provenance hash from the stored provenance.
     let provenance_hash = compute_provenance_hash(inner.provenance.as_ref())
         .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
@@ -261,12 +240,32 @@ pub fn verify_inner_signature(
     };
 
     // Recompute the canonical hash.
-    let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
+    let payload_hash: &[u8; 32] = inner.payload_hash.as_slice().try_into().map_err(|_| {
+        EnvelopeError::VerificationFailed(format!(
+            "payload_hash must be 32 bytes, got {}",
+            inner.payload_hash.len()
+        ))
+    })?;
+    let canonical_hash = compute_canonical_hash(&params, payload_hash, &provenance_hash);
 
-    // Verify.
-    match verifying_key.verify_strict(&canonical_hash, &signature) {
+    // Verify using strict mode (rejects small-order points).
+    match crate::crypto::ed25519::verify_ed25519_signature_strict(
+        sender_public_key,
+        &canonical_hash,
+        &inner.signature,
+    ) {
         Ok(()) => Ok(true),
-        Err(_) => Ok(false),
+        Err(reason) => {
+            // Distinguish malformed inputs from valid-but-non-matching signatures.
+            if reason.contains("must be 32 bytes")
+                || reason.contains("must be 64 bytes")
+                || reason.contains("invalid public key")
+            {
+                Err(EnvelopeError::VerificationFailed(reason))
+            } else {
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -282,15 +281,15 @@ pub fn verify_inner_signature(
 const DOMAIN_SEPARATOR: &[u8] = b"SCP-INNER-ENVELOPE-V1:";
 
 /// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
-/// absent.
-fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, EnvelopeError> {
+/// absent. Returns a fixed-size 32-byte array (SHA-256 output).
+fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], EnvelopeError> {
     match provenance {
         Some(p) => {
             let serialized = rmp_serde::to_vec(p)
                 .map_err(|e| EnvelopeError::SerializationFailed(e.to_string()))?;
-            Ok(Sha256::digest(&serialized).to_vec())
+            Ok(Sha256::digest(&serialized).into())
         }
-        None => Ok(Sha256::digest([0x00]).to_vec()),
+        None => Ok(Sha256::digest([0x00]).into()),
     }
 }
 
@@ -298,31 +297,26 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<Vec<u8>, E
 ///
 /// A domain separator ([`DOMAIN_SEPARATOR`]) is prepended to prevent
 /// cross-protocol signature confusion when the same Ed25519 key is reused
-/// across different signing contexts. Variable-length fields (`context_id`,
-/// `sender_did`) are prefixed with their length as a 4-byte big-endian u32 to
-/// prevent field-boundary ambiguity (e.g., `"abc" || "def"` vs `"abcd" || "ef"`).
+/// across different signing contexts.
 ///
-/// Fixed-width fields (`epoch`, `generation`, `sequence`, `timestamp` as u64 BE;
-/// `payload_hash` and `provenance_hash` as 32-byte SHA-256 outputs) need no
-/// length prefix.
+/// Variable-length fields (`context_id`, `sender_did`) are prefixed with
+/// their length as a 4-byte big-endian u32 to prevent field-boundary
+/// ambiguity. `payload_hash` and `provenance_hash` are typed as `&[u8; 32]`
+/// (SHA-256 outputs) and are also length-prefixed for defense in depth.
+/// Fixed-width u64 fields (`epoch`, `generation`, `sequence`, `timestamp`)
+/// need no length prefix.
 ///
 /// ```text
 /// SHA-256(DOMAIN_SEPARATOR || len(context_id) || context_id
 ///         || len(sender_did) || sender_did || epoch_BE
 ///         || generation_BE || sequence_BE || timestamp_BE
-///         || payload_hash || provenance_hash)
+///         || len(payload_hash) || payload_hash
+///         || len(provenance_hash) || provenance_hash)
 /// ```
-///
-/// Variable-length fields (`context_id`, `sender_did`, `payload_hash`,
-/// `provenance_hash`) are length-prefixed with a `u32` big-endian byte count
-/// to prevent field-boundary collision attacks (e.g., `context_id="ab"` +
-/// `sender_did="cd"` must hash differently from `context_id="abc"` +
-/// `sender_did="d"`). Fixed-width fields (`epoch`, `generation`, `sequence`,
-/// `timestamp`) need no length prefix.
 fn compute_canonical_hash(
     params: &InnerEnvelopeParams<'_>,
-    payload_hash: &[u8],
-    provenance_hash: &[u8],
+    payload_hash: &[u8; 32],
+    provenance_hash: &[u8; 32],
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_SEPARATOR);
@@ -560,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn provenance_hash_absent_uses_sentinel() {
         // Verify that SHA-256(0x00) is used for absent provenance.
-        let expected = Sha256::digest([0x00]).to_vec();
+        let expected: [u8; 32] = Sha256::digest([0x00]).into();
         let hash = compute_provenance_hash(None).unwrap();
         assert_eq!(hash, expected);
     }
@@ -623,8 +617,8 @@ mod tests {
 
     #[test]
     fn domain_separator_changes_canonical_hash() {
-        let payload_hash = Sha256::digest(b"test").to_vec();
-        let provenance_hash = Sha256::digest([0x00]).to_vec();
+        let payload_hash: [u8; 32] = Sha256::digest(b"test").into();
+        let provenance_hash: [u8; 32] = Sha256::digest([0x00]).into();
 
         // Hash with the real domain separator (via the production function).
         let params = InnerEnvelopeParams {
@@ -652,8 +646,8 @@ mod tests {
             h.update(0u64.to_be_bytes());
             h.update(1u64.to_be_bytes());
             h.update(1_700_000_000u64.to_be_bytes());
-            h.update(&payload_hash);
-            h.update(&provenance_hash);
+            h.update(payload_hash);
+            h.update(provenance_hash);
             h.finalize().to_vec()
         };
 
@@ -670,8 +664,8 @@ mod tests {
             h.update(0u64.to_be_bytes());
             h.update(1u64.to_be_bytes());
             h.update(1_700_000_000u64.to_be_bytes());
-            h.update(&payload_hash);
-            h.update(&provenance_hash);
+            h.update(payload_hash);
+            h.update(provenance_hash);
             h.finalize().to_vec()
         };
 

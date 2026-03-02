@@ -235,6 +235,25 @@ pub enum AttestationType {
     BehavioralWitness,
 }
 
+/// Returns a stable numeric tag for each attestation type variant.
+///
+/// Used in canonical hash computation. The tag values are protocol constants
+/// and must never change. Follows the same pattern as `event_type_tag` in
+/// `event_log/tree.rs`.
+#[must_use]
+pub const fn attestation_type_tag(at: &AttestationType) -> u16 {
+    match at {
+        AttestationType::IdentityLink => 0,
+        AttestationType::CapabilityDelegation => 1,
+        AttestationType::ToolIntegrity => 2,
+        AttestationType::AgentCapability => 3,
+        AttestationType::Endorsement => 4,
+        AttestationType::RoleAssignment => 5,
+        AttestationType::ContextEndorsement => 6,
+        AttestationType::BehavioralWitness => 7,
+    }
+}
+
 // ConsequenceRule is now defined in consequence.rs and re-exported above.
 // ChallengeRequest and ChallengeResponse are now defined in challenge.rs and
 // re-exported above.
@@ -314,4 +333,53 @@ pub struct TrustInput {
     /// For each attestation type, records how many attestations of that type
     /// have been verified (`met`) out of how many are required (`required`).
     pub threshold_counts: HashMap<AttestationType, (u32, u32)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// All `AttestationType` variants, kept in sync via exhaustive match.
+    const ALL_ATTESTATION_TYPES: [AttestationType; 8] = [
+        AttestationType::IdentityLink,
+        AttestationType::CapabilityDelegation,
+        AttestationType::ToolIntegrity,
+        AttestationType::AgentCapability,
+        AttestationType::Endorsement,
+        AttestationType::RoleAssignment,
+        AttestationType::ContextEndorsement,
+        AttestationType::BehavioralWitness,
+    ];
+
+    #[test]
+    fn attestation_type_tag_returns_unique_values() {
+        let mut seen = HashSet::new();
+        for variant in &ALL_ATTESTATION_TYPES {
+            let tag = attestation_type_tag(variant);
+            assert!(
+                seen.insert(tag),
+                "duplicate attestation_type_tag value {tag} for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_type_tag_is_exhaustive() {
+        // This test documents intent: the const fn match is already
+        // exhaustive by Rust's type system, but this verifies all 8
+        // variants are covered and produce values in the expected range.
+        for (i, variant) in ALL_ATTESTATION_TYPES.iter().enumerate() {
+            let tag = attestation_type_tag(variant);
+            assert!(
+                (tag as usize) < ALL_ATTESTATION_TYPES.len(),
+                "attestation_type_tag({variant:?}) = {tag}, expected < {}",
+                ALL_ATTESTATION_TYPES.len()
+            );
+            assert_eq!(
+                tag as usize, i,
+                "attestation_type_tag({variant:?}) = {tag}, expected {i}"
+            );
+        }
+    }
 }

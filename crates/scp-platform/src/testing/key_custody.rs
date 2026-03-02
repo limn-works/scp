@@ -362,6 +362,65 @@ impl KeyCustody for InMemoryKeyCustody {
         }
     }
 
+    fn derive_rotatable_pseudonym(
+        &self,
+        key: &KeyHandle,
+        context_id: &[u8],
+        pseudonym_epoch: u64,
+    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+        let key_id = key.id();
+        let context_id = context_id.to_vec();
+        async move {
+            let mut store = self.store.lock().await;
+            let key_type = store.lookup_type(KeyHandle::new(key_id))?;
+
+            if key_type != StoredKeyType::Ed25519 {
+                return Err(PlatformError::WrongKeyType {
+                    expected: KeyType::Ed25519,
+                    actual: KeyType::X25519,
+                });
+            }
+
+            let signing_key = store
+                .ed25519_keys
+                .get(&key_id)
+                .ok_or(PlatformError::KeyNotFound)?;
+
+            // HMAC-SHA256(ed25519_public_key_bytes, context_id || epoch_BE || "scp-pseudonym-v2")
+            // ADR-027 amendment: uses verifying (public) key bytes, not signing
+            // (private) key bytes, for cross-platform determinism with hardware
+            // TEE adapters that cannot export private key material.
+            // BLACK-001 mitigation: epoch_BE breaks long-term pseudonym correlation.
+            let verifying_key = signing_key.verifying_key();
+            let mut mac =
+                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
+                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            mac.update(&context_id);
+            mac.update(&pseudonym_epoch.to_be_bytes());
+            mac.update(b"scp-pseudonym-v2");
+            let hmac_output = mac.finalize().into_bytes();
+
+            // Derive Ed25519 keypair from first 32 bytes of HMAC output.
+            let mut seed = Zeroizing::new([0u8; 32]);
+            seed.copy_from_slice(&hmac_output[..32]);
+            let pseudonym_signing_key = SigningKey::from_bytes(&seed);
+            let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
+
+            // Store the derived signing key and return a handle.
+            let handle = self.next_handle();
+            store
+                .ed25519_keys
+                .insert(handle.id(), pseudonym_signing_key);
+            store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
+            drop(store);
+
+            Ok(PseudonymKeypair {
+                public_key: PublicKey::new(pseudonym_verifying_key.to_bytes().to_vec()),
+                key_handle: handle,
+            })
+        }
+    }
+
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }
@@ -618,6 +677,128 @@ mod tests {
         assert_ne!(h1.id(), h2.id());
         assert_ne!(h2.id(), h3.id());
         assert_ne!(h1.id(), h3.id());
+    }
+
+    // -----------------------------------------------------------------------
+    // derive_rotatable_pseudonym tests — BLACK-001 mitigation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn derive_rotatable_pseudonym_is_deterministic() {
+        let custody = InMemoryKeyCustody::from_seed(42);
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let context_id = b"test-context";
+
+        let first = custody
+            .derive_rotatable_pseudonym(&handle, context_id, 5)
+            .await
+            .unwrap();
+        let second = custody
+            .derive_rotatable_pseudonym(&handle, context_id, 5)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.public_key.as_bytes(),
+            second.public_key.as_bytes(),
+            "same identity + context + epoch = same pseudonym"
+        );
+    }
+
+    #[tokio::test]
+    async fn derive_rotatable_pseudonym_different_epochs_produce_different_keys() {
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let context_id = b"test-context";
+
+        let epoch0 = custody
+            .derive_rotatable_pseudonym(&handle, context_id, 0)
+            .await
+            .unwrap();
+        let epoch1 = custody
+            .derive_rotatable_pseudonym(&handle, context_id, 1)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            epoch0.public_key.as_bytes(),
+            epoch1.public_key.as_bytes(),
+            "different epochs must produce different pseudonyms (BLACK-001)"
+        );
+    }
+
+    #[tokio::test]
+    async fn derive_rotatable_pseudonym_differs_from_v1() {
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let context_id = b"test-context";
+
+        let v1 = custody.derive_pseudonym(&handle, context_id).await.unwrap();
+        let v2_epoch0 = custody
+            .derive_rotatable_pseudonym(&handle, context_id, 0)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            v1.public_key.as_bytes(),
+            v2_epoch0.public_key.as_bytes(),
+            "v2 epoch 0 must differ from v1 (different domain separator)"
+        );
+    }
+
+    #[tokio::test]
+    async fn derive_rotatable_pseudonym_with_x25519_key_fails() {
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        let result = custody.derive_rotatable_pseudonym(&handle, b"ctx", 0).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PlatformError::WrongKeyType { expected, actual } => {
+                assert_eq!(expected, KeyType::Ed25519);
+                assert_eq!(actual, KeyType::X25519);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn derive_rotatable_pseudonym_golden_vector() {
+        // Known identity key seed: 0x00...01 (31 zeros, then 0x01).
+        let seed_bytes: [u8; 32] = {
+            let mut s = [0u8; 32];
+            s[31] = 1;
+            s
+        };
+        let context_id = b"test";
+        let epoch: u64 = 7;
+
+        // Compute expected pseudonym seed using the v2 reference algorithm:
+        // seed = HMAC-SHA256(public_key_bytes, context_id || epoch_BE || "scp-pseudonym-v2")
+        let identity_signing_key = SigningKey::from_bytes(&seed_bytes);
+        let identity_public_key = identity_signing_key.verifying_key();
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(identity_public_key.to_bytes().as_slice()).unwrap();
+        mac.update(context_id);
+        mac.update(&epoch.to_be_bytes());
+        mac.update(b"scp-pseudonym-v2");
+        let expected_seed: [u8; 32] = mac.finalize().into_bytes().into();
+
+        let expected_signing_key = SigningKey::from_bytes(&expected_seed);
+        let expected_pubkey = expected_signing_key.verifying_key();
+
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.import_ed25519_key(&seed_bytes).await;
+
+        let pseudo = custody
+            .derive_rotatable_pseudonym(&handle, context_id, epoch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pseudo.public_key.as_bytes(),
+            expected_pubkey.as_bytes(),
+            "v2 pseudonym must match reference HMAC-SHA256 algorithm output"
+        );
     }
 
     /// Cross-platform golden-value test for pseudonym derivation.

@@ -188,7 +188,7 @@ impl DidDocument {
         let pre_rotation_service = Service {
             id: format!("{did}#pre-rotation"),
             service_type: "PreRotationCommitment".to_owned(),
-            service_endpoint: format!("sha256:{}", hex_encode(pre_rotation_commitment)),
+            service_endpoint: format!("sha256:{}", hex::encode(pre_rotation_commitment)),
         };
 
         Self {
@@ -451,17 +451,6 @@ fn multibase_encode(bytes: &[u8]) -> String {
     format!("z{}", base58btc_encode(bytes))
 }
 
-/// Encodes bytes as lowercase hexadecimal.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut acc, b| {
-        use std::fmt::Write;
-        // write! to a String is infallible, but we must handle the Result
-        // to satisfy clippy. The error case is unreachable for String.
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
-}
-
 /// Base58btc encoding (Bitcoin alphabet) via the `bs58` crate.
 fn base58btc_encode(input: &[u8]) -> String {
     bs58::encode(input).into_string()
@@ -523,12 +512,6 @@ mod tests {
         let parsed = DidDocument::from_json(&json).unwrap();
 
         assert_eq!(doc, parsed);
-    }
-
-    #[test]
-    fn hex_encode_produces_lowercase_hex() {
-        let bytes = [0xDE, 0xAD, 0xBE, 0xEF];
-        assert_eq!(hex_encode(&bytes), "deadbeef");
     }
 
     #[test]

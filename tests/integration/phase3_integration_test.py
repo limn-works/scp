@@ -194,17 +194,23 @@ def _build_mock_bridge(
     bridge.py_context_send.return_value = None
 
     # Receive returns an iterator that yields one message from Alice.
+    # __anext__ returns an asyncio.Future (non-blocking bridge, #138).
     alice_msg = _mock_bridge_message(alice_did, "Hello from Python", context_id)
     receiver = MagicMock()
     _receive_calls = {"n": 0}
 
     def _receive_next(*_args: Any) -> Any:
-        # Accept *_args because MagicMock may pass self when calling
-        # methods assigned directly on the instance.
+        import asyncio
+
+        nonlocal _receive_calls
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
         if _receive_calls["n"] == 0:
             _receive_calls["n"] += 1
-            return alice_msg
-        raise StopIteration
+            future.set_result(alice_msg)
+        else:
+            future.set_result(None)
+        return future
 
     receiver.__anext__ = _receive_next
     bridge.py_context_receive.return_value = receiver

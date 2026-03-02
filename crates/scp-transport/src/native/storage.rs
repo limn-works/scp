@@ -12,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 
@@ -163,11 +162,12 @@ impl Default for InMemoryBlobStorage {
 }
 
 /// Returns the current unix timestamp in seconds.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+///
+/// # Errors
+///
+/// Returns [`StorageError::Internal`] if the system clock is unavailable.
+fn now_secs() -> Result<u64, StorageError> {
+    scp_core::time::now_secs().map_err(|e| StorageError::Internal(format!("clock error: {e}")))
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -180,7 +180,7 @@ impl BlobStorage for InMemoryBlobStorage {
         blob_ttl: u32,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
-        let stored_at = now_secs();
+        let stored_at = now_secs()?;
         let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
 
         let stored_blob = StoredBlob {
@@ -216,7 +216,7 @@ impl BlobStorage for InMemoryBlobStorage {
 
     async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError> {
         let blobs = self.blobs.read().await;
-        let now = now_secs();
+        let now = now_secs()?;
 
         Ok(blobs.get(blob_id).and_then(|entry| {
             if entry.expires_at > now {
@@ -235,7 +235,7 @@ impl BlobStorage for InMemoryBlobStorage {
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let blobs = self.blobs.read().await;
         let index = self.routing_index.read().await;
-        let now = now_secs();
+        let now = now_secs()?;
 
         let Some(blob_ids) = index.get(routing_id) else {
             return Ok(Vec::new());
@@ -289,7 +289,7 @@ impl BlobStorage for InMemoryBlobStorage {
     }
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
-        let now = now_secs();
+        let now = now_secs()?;
 
         // Phase 1: identify expired blob IDs under a read lock.
         let expired_ids: Vec<([u8; 32], [u8; 32])> = {

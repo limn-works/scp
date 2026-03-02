@@ -34,7 +34,9 @@ use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 
 use scp_core::crypto::ucan::capability::CapabilityUri;
-use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
+use scp_core::crypto::ucan::validate::{
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+};
 
 use scp_ffi_common::{
     BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
@@ -243,6 +245,7 @@ pub async fn ucan_validate(
         ceiling: &ceiling,
         context_creator_did: &creator_did,
         presenting_agent_did: agent_did,
+        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
     };
 
     // Execute the full 11-step validation pipeline.
@@ -357,7 +360,7 @@ pub async fn ucan_mint(
 /// # Arguments
 ///
 /// * `handle` — The context the token belongs to.
-/// * `token_id` — The unique ID of the token to revoke.
+/// * `token` — The full encoded JWT string of the token to revoke.
 ///
 /// # Errors
 ///
@@ -366,8 +369,8 @@ pub async fn ucan_mint(
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn ucan_revoke(handle: &NapiContextHandle, token_id: String) -> napi::Result<()> {
-    let _ = (handle, token_id);
+pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Result<()> {
+    let _ = (handle, token);
     Err(ScpNapiError::Permission {
         message: "not yet connected to runtime — UCAN revocation requires a live context"
             .to_owned(),
@@ -552,11 +555,8 @@ mod tests {
         let mut tracker =
             scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-test".to_owned(), SystemClock);
 
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let now_secs = (now_millis / 1000) as u64;
+        let now_millis = scp_core::time::now_millis().expect("clock unavailable in test");
+        let now_secs = now_millis / 1000;
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;
 

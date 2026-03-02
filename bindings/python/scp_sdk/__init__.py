@@ -42,6 +42,8 @@ from scp_sdk.mcp import (
     disable_stdio_allowlist,
     get_stdio_allowlist,
     register_tool_handler,
+    registry_cleanup,
+    registry_stats,
     reset_stdio_allowlist,
     serve_mcp,
 )
@@ -59,9 +61,12 @@ from scp_sdk.trust import (
 )
 from scp_sdk.types import (
     Capability,
+    CeilingPolicy,
+    ContextMode,
     DiscoveryMethod,
     MemoryScope,
     Message,
+    PromotionPolicy,
     Provenance,
     ProvenanceQuality,
     SourceType,
@@ -71,22 +76,18 @@ from scp_sdk.ucan import UcanToken, delegate, mint, revoke, validate
 __version__ = "0.1.0"
 
 __all__ = [
-    # Errors
     "BRIDGE_ERROR_MAP",
-    # Trust
     "Attestation",
     "BehavioralRecord",
-    # Types
     "Capability",
     "CapabilityValidation",
+    "CeilingPolicy",
     "ChallengeResult",
-    # Event log
     "Checkpoint",
-    # Context
     "Context",
     "ContextError",
+    "ContextMode",
     "CryptoError",
-    # Identity
     "DIDDocument",
     "DiscoveryMethod",
     "Endorsement",
@@ -94,7 +95,6 @@ __all__ = [
     "EventLog",
     "Identity",
     "IdentityError",
-    # MCP
     "McpClient",
     "McpProvenance",
     "McpServer",
@@ -103,25 +103,22 @@ __all__ = [
     "Membership",
     "MemoryScope",
     "Message",
+    "PromotionPolicy",
     "Proof",
     "Provenance",
     "ProvenanceQuality",
     "ScpError",
     "SourceType",
-    # Tools
     "TestVector",
     "ToolDefinition",
     "ToolError",
-    # Transport
     "TransportConfig",
     "TransportError",
     "TransportStatus",
     "TrustEvaluation",
     "UcanPermissionError",
-    # UCAN
     "UcanToken",
     "ValidationError",
-    # Version
     "__version__",
     "configure_stdio_allowlist",
     "connect_relay",
@@ -131,10 +128,11 @@ __all__ = [
     "get_stdio_allowlist",
     "mint",
     "register_tool_handler",
+    "registry_cleanup",
+    "registry_stats",
     "relay_status",
     "reset_stdio_allowlist",
     "revoke",
-    # Sync
     "run_sync",
     "serve_mcp",
     "validate",

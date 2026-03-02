@@ -41,12 +41,15 @@ use scp_core::crypto::ucan::UcanError as CoreUcanError;
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::mint::{DelegateParams, MintParams, delegate_ucan, mint_ucan};
 use scp_core::crypto::ucan::revoke::compute_revocation_cid;
-use scp_core::crypto::ucan::validate::{ValidationContext, parse_ucan, validate_ucan};
+use scp_core::crypto::ucan::validate::{
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+};
 
 use crate::bridge_adapters::{
     BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
 };
 use crate::error::ScpPyError;
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // PyUcanToken
@@ -153,6 +156,17 @@ pub fn py_ucan_validate(
     presenting_agent_did: Option<&str>,
     proof_tokens: Option<Vec<String>>,
 ) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_ucan_token(token)?;
+    validate::validate_capability_uri(capability)?;
+    if let Some(did) = presenting_agent_did {
+        validate::validate_did(did)?;
+    }
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
     // Step 1: Parse the UCAN token using scp-core's parser.
     let parsed_token = parse_ucan(token).map_err(ScpPyError::from)?;
 
@@ -185,6 +199,7 @@ pub fn py_ucan_validate(
             ceiling: &rt.ceiling_strings,
             context_creator_did: &rt.creator_did,
             presenting_agent_did: agent_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         };
 
         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
@@ -226,6 +241,16 @@ pub fn py_ucan_mint(
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> PyResult<PyUcanToken> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(member_did)?;
+    for cap in &capabilities {
+        validate::validate_capability_uri(cap)?;
+    }
+    if let Some(ref tokens) = proofs {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
     // Look up the context to get the creator DID (issuer).
     let creator_did = crate::runtime::with_context(context_id, |rt| Ok(rt.creator_did.clone()))?;
 
@@ -303,6 +328,13 @@ pub fn py_ucan_delegate(
     parent_token: &str,
     capabilities: Vec<String>,
 ) -> PyResult<PyUcanToken> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(delegator_did)?;
+    validate::validate_did(delegatee_did)?;
+    validate::validate_ucan_token(parent_token)?;
+    for cap in &capabilities {
+        validate::validate_capability_uri(cap)?;
+    }
     // Parse the parent token.
     let parsed_parent = parse_ucan(parent_token).map_err(ScpPyError::from)?;
 
@@ -384,6 +416,8 @@ pub fn py_ucan_delegate(
 #[pyfunction]
 #[pyo3(name = "ucan_revoke")]
 pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_ucan_token(token)?;
     // Parse the token to extract its payload for CID computation.
     let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
 
@@ -599,11 +633,8 @@ mod tests {
         let mut tracker =
             scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-test".to_owned(), SystemClock);
 
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let now_secs = (now_millis / 1000) as u64;
+        let now_millis = scp_core::time::now_millis().expect("clock unavailable in test");
+        let now_secs = now_millis / 1000;
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;
 

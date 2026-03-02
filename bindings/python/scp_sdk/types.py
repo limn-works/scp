@@ -1,7 +1,8 @@
 """Shared types for the SCP Python SDK.
 
 Contains dataclasses and enums used across multiple SDK modules:
-``Message``, ``Provenance``, ``Capability``, ``MemoryScope``,
+``Message``, ``Provenance``, ``Capability``, ``ContextMode``,
+``CeilingPolicy``, ``PromotionPolicy``, ``MemoryScope``,
 ``SourceType``, ``DiscoveryMethod``, and ``ProvenanceQuality``.
 
 All types mirror their Rust counterparts in ``scp-core`` and carry full
@@ -18,6 +19,45 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
+
+class ContextMode(enum.Enum):
+    """Context processing mode (spec section 5.1).
+
+    Determines the encryption strategy. Immutable after creation.
+    Mirrors ``scp_core::context::ContextMode``.
+    """
+
+    #: MLS-backed encryption with forward secrecy (default).
+    ENCRYPTED = "encrypted"
+    #: Per-author AES-256-GCM broadcast keys, no MLS. Unlimited subscribers.
+    BROADCAST = "broadcast"
+
+
+class CeilingPolicy(enum.Enum):
+    """Ceiling mutability policy (spec section 5.3).
+
+    Declared at creation, immutable thereafter.
+    Mirrors ``scp_core::context::CeilingPolicy``.
+    """
+
+    #: Ceiling is fixed at creation (default, security-conservative).
+    IMMUTABLE = "immutable"
+    #: Ceiling can be modified through governance (narrowing only).
+    GOVERNED = "governed"
+
+
+class PromotionPolicy(enum.Enum):
+    """Context promotion policy (spec section 5.10).
+
+    Declared at creation, immutable thereafter.
+    Mirrors ``scp_core::context::PromotionPolicy``.
+    """
+
+    #: Context cannot be promoted.
+    NO_PROMOTION = "no_promotion"
+    #: Context can be promoted through governance approval.
+    PROMOTABLE = "promotable"
 
 
 class MemoryScope(enum.Enum):
@@ -188,9 +228,12 @@ class Message:
 
 __all__ = [
     "Capability",
+    "CeilingPolicy",
+    "ContextMode",
     "DiscoveryMethod",
     "MemoryScope",
     "Message",
+    "PromotionPolicy",
     "Provenance",
     "ProvenanceQuality",
     "SourceType",

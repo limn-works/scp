@@ -29,7 +29,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashSet;
-use std::fmt::Write;
 use std::net::SocketAddr;
 
 use futures::StreamExt;
@@ -125,6 +124,15 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
+    fn derive_rotatable_pseudonym(
+        &self,
+        _key: &KeyHandle,
+        _context_id: &[u8],
+        _pseudonym_epoch: u64,
+    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
+
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }
@@ -134,6 +142,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
 async fn start_relay() -> SocketAddr {
     let config = RelayConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        delivery_jitter_ms: 0,
         ..RelayConfig::default()
     };
     let storage = InMemoryBlobStorage::new();
@@ -272,6 +281,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
         &alice_id.did,
         1,
         &block_list,
+        None,
     )
     .await
     .unwrap()
@@ -414,7 +424,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // context ID — unlinkable to Alice's DID without the identity key material.
 
     // Verify the routing_id is NOT Alice's DID or any recognizable identifier.
-    let routing_hex = hex_encode(&received_outer.routing_id);
+    let routing_hex = hex::encode(&received_outer.routing_id);
     assert!(
         !routing_hex.contains(&alice_id.did),
         "routing_id must not contain Alice's DID"
@@ -481,16 +491,6 @@ async fn native_relay_adapter_send_receive_roundtrip() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Hex-encodes bytes for assertion messages.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
-}
 
 /// Checks if `haystack` contains `needle` as a contiguous subsequence.
 fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {

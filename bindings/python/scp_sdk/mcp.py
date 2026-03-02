@@ -154,7 +154,7 @@ class McpServer:
     ``read_messages``, and ``list_members``.
     """
 
-    __slots__ = ("_contexts", "_handle", "_identity", "_transport")
+    __slots__ = ("_contexts", "_handle", "_identity", "_stopped", "_transport")
 
     def __init__(
         self,
@@ -167,6 +167,7 @@ class McpServer:
         self._identity = identity
         self._contexts = list(contexts)
         self._transport = transport
+        self._stopped = False
 
     @property
     def transport(self) -> str:
@@ -184,10 +185,61 @@ class McpServer:
         Raises:
             TransportError: If shutdown fails.
         """
+        if self._stopped:
+            return
         logger.info("Stopping MCP server (transport=%s)", self._transport)
         bridge = _bridge()
         bridge.py_mcp_server_stop(self._handle)
+        self._stopped = True
         logger.debug("MCP server stopped")
+
+    # -- Async context manager ----------------------------------------------
+
+    async def __aenter__(self) -> McpServer:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        """Stop the server on exit from the ``async with`` block.
+
+        Errors during cleanup are logged but never raised.
+        """
+        try:
+            await self.stop()
+        except Exception:
+            logger.debug(
+                "cleanup: failed to stop MCP server",
+                exc_info=True,
+            )
+
+    # -- Finalizer (GC safety for long-running processes) -------------------
+
+    def __del__(self) -> None:
+        """Stop the server if not already stopped.
+
+        Called by the garbage collector. Errors are silently suppressed.
+
+        During interpreter shutdown, module globals (including ``_bridge``)
+        may already be ``None``, so we import ``_scp_core`` directly to
+        avoid relying on module-level names that could be torn down.
+        """
+        try:
+            if self._stopped:
+                return
+        except Exception:
+            # _stopped may not exist if __init__ was never completed.
+            return
+        try:
+            import _scp_core
+
+            _scp_core.py_mcp_server_stop(self._handle)
+            self._stopped = True
+        except Exception:
+            pass
 
     def __repr__(self) -> str:
         ctx_ids = [c.context_id for c in self._contexts]
@@ -438,6 +490,58 @@ def register_tool_handler(
     )
 
 
+def registry_stats() -> dict[str, Any]:
+    """Return current entry counts for all FFI registries.
+
+    Intended for monitoring and debugging in long-running processes.
+
+    Returns:
+        A dict with keys:
+
+        - ``"contexts"``: number of active context entries
+        - ``"known_contexts"``: number of known-context discovery entries
+        - ``"identities"``: number of identity entries
+        - ``"relay_connected"``: whether a relay connection is active
+        - ``"mcp_servers"``: number of MCP server entries
+        - ``"mcp_servers_stopped"``: number of stopped (stale) server entries
+        - ``"mcp_clients"``: number of MCP client entries
+
+    Example::
+
+        from scp_sdk.mcp import registry_stats
+
+        stats = registry_stats()
+        print(f"Contexts: {stats['contexts']}, Servers: {stats['mcp_servers']}")
+    """
+    bridge = _bridge()
+    return bridge.py_registry_stats()
+
+
+def registry_cleanup() -> dict[str, Any]:
+    """Remove stale entries from all FFI registries.
+
+    Currently cleans up:
+
+    - Stopped MCP server entries (where ``stop()`` was called but the
+      entry was never removed from the registry)
+
+    Returns:
+        A dict with keys:
+
+        - ``"mcp_servers_removed"``: number of stopped server entries
+          cleaned up
+
+    Example::
+
+        from scp_sdk.mcp import registry_cleanup
+
+        result = registry_cleanup()
+        print(f"Cleaned up {result['mcp_servers_removed']} stopped servers")
+    """
+    bridge = _bridge()
+    return bridge.py_registry_cleanup()
+
+
 class McpClient:
     """Client for consuming external MCP servers with SCP provenance wrapping.
 
@@ -460,12 +564,13 @@ class McpClient:
         )
     """
 
-    __slots__ = ("_command", "_handle", "_transport")
+    __slots__ = ("_command", "_disconnected", "_handle", "_transport")
 
     def __init__(self, handle: Any, transport: str, command: list[str] | None) -> None:
         self._handle = handle
         self._transport = transport
         self._command = command
+        self._disconnected = False
 
     @classmethod
     async def connect(
@@ -638,10 +743,61 @@ class McpClient:
         Raises:
             TransportError: If disconnection fails.
         """
+        if self._disconnected:
+            return
         logger.info("Disconnecting MCP client (transport=%s)", self._transport)
         bridge = _bridge()
         bridge.py_mcp_client_disconnect(self._handle)
+        self._disconnected = True
         logger.debug("MCP client disconnected")
+
+    # -- Async context manager ----------------------------------------------
+
+    async def __aenter__(self) -> McpClient:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        """Disconnect the client on exit from the ``async with`` block.
+
+        Errors during cleanup are logged but never raised.
+        """
+        try:
+            await self.disconnect()
+        except Exception:
+            logger.debug(
+                "cleanup: failed to disconnect MCP client",
+                exc_info=True,
+            )
+
+    # -- Finalizer (GC safety for long-running processes) -------------------
+
+    def __del__(self) -> None:
+        """Disconnect the client if not already disconnected.
+
+        Called by the garbage collector. Errors are silently suppressed.
+
+        During interpreter shutdown, module globals (including ``_bridge``)
+        may already be ``None``, so we import ``_scp_core`` directly to
+        avoid relying on module-level names that could be torn down.
+        """
+        try:
+            if self._disconnected:
+                return
+        except Exception:
+            # _disconnected may not exist if __init__ was never completed.
+            return
+        try:
+            import _scp_core
+
+            _scp_core.py_mcp_client_disconnect(self._handle)
+            self._disconnected = True
+        except Exception:
+            pass
 
     def __repr__(self) -> str:
         return f"McpClient(transport={self._transport!r}, command={self._command!r})"
@@ -775,6 +931,8 @@ __all__ = [
     "disable_stdio_allowlist",
     "get_stdio_allowlist",
     "register_tool_handler",
+    "registry_cleanup",
+    "registry_stats",
     "reset_stdio_allowlist",
     "serve_mcp",
 ]

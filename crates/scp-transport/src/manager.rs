@@ -751,10 +751,10 @@ impl MergedStream {
         }
         self.last_suppression_check = now;
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let Ok(now_ms) = scp_core::time::now_millis() else {
+            // Clock unavailable — skip suppression check this cycle.
+            return;
+        };
 
         let warnings = if let Ok(mut tracker) = self.suppression_tracker.lock() {
             tracker.check_suppressions(now_ms, self.total_relays)
@@ -818,12 +818,10 @@ impl Stream for MergedStream {
 
                             // Record this delivery for suppression tracking,
                             // regardless of whether it's a duplicate.
-                            if let Ok(mut tracker) = this.suppression_tracker.lock() {
-                                #[allow(clippy::cast_possible_truncation)]
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
+                            if let (Ok(mut tracker), Ok(now_ms)) = (
+                                this.suppression_tracker.lock(),
+                                scp_core::time::now_millis(),
+                            ) {
                                 tracker.record_delivery(blob_id, adapter_idx, now_ms);
                             }
 
@@ -1630,13 +1628,7 @@ mod tests {
         // We can't peek directly into the LRU, but we can verify via check_suppressions:
         // 2 out of 2 relays delivered => no warning.
         drop(tracker);
-        #[allow(clippy::cast_possible_truncation)]
-        // millis since epoch fits in u64 until year 584556
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            + 31_000; // simulate 31 seconds later
+        let now_ms = scp_core::time::now_millis().expect("clock unavailable in test") + 31_000; // simulate 31 seconds later
         let warnings = manager
             .suppression_tracker
             .lock()
@@ -1703,13 +1695,7 @@ mod tests {
         // The suppression tracker should have 1 delivery from adapter 0 only.
         // With 4 total relays, threshold = ceil(4/2) = 2. Only 1 delivered
         // => 1 < 2 => warning should be emitted.
-        #[allow(clippy::cast_possible_truncation)]
-        // millis since epoch fits in u64 until year 584556
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            + 31_000;
+        let now_ms = scp_core::time::now_millis().expect("clock unavailable in test") + 31_000;
         let warnings = manager
             .suppression_tracker
             .lock()

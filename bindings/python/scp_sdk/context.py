@@ -17,16 +17,21 @@ canonical design.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import warnings
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from scp_sdk.errors import ContextError
-from scp_sdk.types import Capability, MemoryScope, Message
+from scp_sdk.types import (
+    Capability,
+    CeilingPolicy,
+    ContextMode,
+    MemoryScope,
+    Message,
+    PromotionPolicy,
+)
 
 if TYPE_CHECKING:
     from scp_sdk.identity import Identity
@@ -75,14 +80,15 @@ class Membership:
 
 
 class _ReceiveIterator(AsyncIterator[Message]):
-    """Async iterator over incoming messages with bounded buffer.
+    """Async iterator over incoming messages from an SCP context.
 
-    Wraps the bridge-level ``PyMessageReceiver`` and buffers events for
-    the application layer.  When the consumer falls behind:
+    Wraps the bridge-level ``PyMessageReceiver`` which returns
+    ``asyncio.Future`` objects from ``__anext__``.  Each await yields
+    control back to the asyncio event loop so other coroutines can
+    make progress while waiting for messages.
 
-    1. The oldest unconsumed event is dropped (not the newest).
-    2. A ``BufferOverflow`` :class:`warnings.Warning` is emitted with
-       the dropped count.
+    Oldest-drop overflow semantics are handled at the Rust bridge
+    level (see ``deliver_message`` in ``runtime.rs``).
 
     Buffer size defaults to :data:`_DEFAULT_BUFFER_SIZE` (1,000) and is
     configurable via :meth:`Context.create` or :meth:`Context.configure`.
@@ -92,7 +98,6 @@ class _ReceiveIterator(AsyncIterator[Message]):
         self._receiver = bridge_receiver
         self._buffer: deque[Message] = deque(maxlen=buffer_size)
         self._buffer_size = buffer_size
-        self._overflow_count = 0
         self._closed = False
 
     def __aiter__(self) -> _ReceiveIterator:
@@ -102,61 +107,28 @@ class _ReceiveIterator(AsyncIterator[Message]):
         if self._closed:
             raise StopAsyncIteration
 
-        # Drain any pending messages from the bridge into the buffer.
-        self._poll_bridge()
-
-        # If the buffer has messages, return the oldest.
+        # Return buffered messages first.
         if self._buffer:
             return self._buffer.popleft()
 
-        # No messages available -- yield control and retry.
-        # In a real transport scenario this would await a notification
-        # from the bridge.  For the current bridge layer (no live
-        # transport), we stop iteration when the channel is exhausted.
-        await asyncio.sleep(0)
-        self._poll_bridge()
+        # Await the bridge receiver's __anext__, which returns an
+        # asyncio.Future that resolves when a message arrives on the
+        # tokio channel.  This yields control to the asyncio event loop
+        # so other coroutines can make progress while waiting (fixes #138).
+        raw = await self._receiver.__anext__()
 
-        if self._buffer:
-            return self._buffer.popleft()
+        if raw is None:
+            # Channel closed (sender dropped) -- stop iteration.
+            self._closed = True
+            raise StopAsyncIteration
 
-        raise StopAsyncIteration
-
-    def _poll_bridge(self) -> None:
-        """Pull messages from the bridge receiver into the local buffer.
-
-        Applies oldest-drop overflow semantics: when the buffer is full,
-        the oldest unconsumed event is discarded and a
-        ``BufferOverflow`` warning is emitted.
-        """
-        while True:
-            try:
-                raw = self._receiver.__anext__()
-            except StopIteration:
-                break
-
-            if raw is None:
-                # Channel exhausted or empty.
-                break
-
-            msg = Message(
-                sender_did=raw.sender_did,
-                content=raw.payload,
-                timestamp=raw.timestamp,
-                sequence=0,
-                context_id=raw.context_id,
-            )
-
-            if len(self._buffer) >= self._buffer_size:
-                # Drop oldest.
-                self._buffer.popleft()
-                self._overflow_count += 1
-                warnings.warn(
-                    f"BufferOverflow: dropped {self._overflow_count} event(s) "
-                    f"(buffer capacity: {self._buffer_size})",
-                    stacklevel=2,
-                )
-
-            self._buffer.append(msg)
+        return Message(
+            sender_did=raw.sender_did,
+            content=raw.payload,
+            timestamp=raw.timestamp,
+            sequence=0,
+            context_id=raw.context_id,
+        )
 
     def close(self) -> None:
         """Mark the iterator as closed; subsequent iteration will stop."""
@@ -210,6 +182,11 @@ class Context:
         ttl: float | None = None,
         memory_scope: MemoryScope | str = MemoryScope.FULL,
         governance: str = "single_admin",
+        mode: ContextMode | str = ContextMode.ENCRYPTED,
+        ceiling_policy: CeilingPolicy | str = CeilingPolicy.IMMUTABLE,
+        promotion_policy: PromotionPolicy | str = PromotionPolicy.NO_PROMOTION,
+        template_id: str | None = None,
+        economic_policy: str | None = None,
         buffer_size: int = _DEFAULT_BUFFER_SIZE,
     ) -> Context:
         """Create a new SCP context.
@@ -228,6 +205,23 @@ class Context:
                 :attr:`MemoryScope.FULL`.
             governance: Governance model.  Defaults to
                 ``'single_admin'``.
+            mode: Context mode (spec section 5.1).  Accepts a
+                :class:`ContextMode` enum member or a raw string
+                (``'encrypted'``, ``'broadcast'``).  Defaults to
+                :attr:`ContextMode.ENCRYPTED`.
+            ceiling_policy: Ceiling mutability policy (spec section 5.3).
+                Accepts a :class:`CeilingPolicy` enum member or a raw
+                string (``'immutable'``, ``'governed'``).  Defaults to
+                :attr:`CeilingPolicy.IMMUTABLE`.
+            promotion_policy: Promotion policy (spec section 5.10).
+                Accepts a :class:`PromotionPolicy` enum member or a raw
+                string (``'no_promotion'``, ``'promotable'``).  Defaults
+                to :attr:`PromotionPolicy.NO_PROMOTION`.
+            template_id: Optional well-known template identifier
+                (spec section 5.14).  When present, all other fields
+                must match the template definition.
+            economic_policy: Optional economic policy as a JSON string
+                (spec section 19).  ``None`` means free context.
             buffer_size: Receive buffer capacity.  Defaults to 1,000.
                 Must be between 100 and 10,000.
 
@@ -250,6 +244,15 @@ class Context:
 
         ceiling_strs = [c.value if isinstance(c, Capability) else c for c in ceiling]
         scope_str = memory_scope.value if isinstance(memory_scope, MemoryScope) else memory_scope
+        mode_str = mode.value if isinstance(mode, ContextMode) else mode
+        ceiling_policy_str = (
+            ceiling_policy.value if isinstance(ceiling_policy, CeilingPolicy) else ceiling_policy
+        )
+        promotion_policy_str = (
+            promotion_policy.value
+            if isinstance(promotion_policy, PromotionPolicy)
+            else promotion_policy
+        )
 
         params: dict[str, Any] = {
             "ceiling": ceiling_strs,
@@ -258,6 +261,11 @@ class Context:
             "ttl": ttl,
             "memory_scope": scope_str,
             "governance": governance,
+            "mode": mode_str,
+            "ceiling_policy": ceiling_policy_str,
+            "promotion_policy": promotion_policy_str,
+            "template_id": template_id,
+            "economic_policy": economic_policy,
         }
 
         handle = _scp_core.py_context_create(creator.did, params)
@@ -508,6 +516,47 @@ class Context:
                 self.context_id,
                 exc_info=True,
             )
+
+    # -- Finalizer (GC safety for long-running processes) -------------------
+
+    def __del__(self) -> None:
+        """Release registry resources if the context was not properly closed.
+
+        Called by the garbage collector when the ``Context`` object is
+        reclaimed.  This is a last-resort cleanup for processes that do
+        not use ``async with`` or forget to call :meth:`close`.
+
+        Errors are silently suppressed -- ``__del__`` must never raise.
+        """
+        try:
+            # Capture handle in a local variable to avoid TOCTOU race:
+            # _handle could become None between the check and the use.
+            handle = getattr(self, "_handle", None)
+            if handle is None:
+                return
+
+            creator_did = getattr(self, "_creator_did", None)
+            if creator_did is None:
+                return
+
+            # Check state via the handle directly (not self.state which
+            # re-reads self._handle, re-introducing the race).
+            try:
+                state = handle.state
+            except Exception:
+                return
+
+            if state == "active":
+                try:
+                    import _scp_core
+
+                    _scp_core.py_context_close(handle, creator_did)
+                except Exception:
+                    # Best-effort: context may already be closed, or
+                    # interpreter may be shutting down.
+                    pass
+        except Exception:
+            pass
 
     # -- Representation -----------------------------------------------------
 

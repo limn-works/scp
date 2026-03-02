@@ -313,8 +313,8 @@ impl NativeRelayClient {
                 // Verify blob integrity: SHA-256(blob) must match relay-provided blob_id.
                 let computed_hash: [u8; 32] = Sha256::digest(blob).into();
                 if computed_hash != *blob_id {
-                    let expected = hex_encode(blob_id);
-                    let actual = hex_encode(&computed_hash);
+                    let expected = hex::encode(blob_id);
+                    let actual = hex::encode(computed_hash);
                     tracing::warn!(
                         expected = %expected,
                         actual = %actual,
@@ -359,20 +359,18 @@ impl NativeRelayClient {
 
                     // Plausibility check: warn if relay timestamp deviates
                     // significantly from local wall-clock time.
-                    let local_now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let deviation = local_now.abs_diff(*stored_at);
-                    if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
-                        tracing::warn!(
-                            relay_stored_at = *stored_at,
-                            local_time = local_now,
-                            deviation_secs = deviation,
-                            "relay stored_at deviates from local time by more \
-                             than {RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS}s; \
-                             possible malicious relay"
-                        );
+                    if let Ok(local_now) = scp_core::time::now_secs() {
+                        let deviation = local_now.abs_diff(*stored_at);
+                        if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
+                            tracing::warn!(
+                                relay_stored_at = *stored_at,
+                                local_time = local_now,
+                                deviation_secs = deviation,
+                                "relay stored_at deviates from local time by more \
+                                 than {RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS}s; \
+                                 possible malicious relay"
+                            );
+                        }
                     }
 
                     let _ = sub.tx.send(SubscriptionMessage::Relay(msg)).await;
@@ -420,10 +418,10 @@ impl NativeRelayClient {
                         break;
                     }
 
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let Ok(ts) = scp_core::time::now_secs() else {
+                        // Clock unavailable — skip this ping cycle.
+                        continue;
+                    };
 
                     let ping = ClientMessage::Ping { ts };
                     if let Ok(bytes) = ping.to_bytes() {
@@ -756,15 +754,14 @@ impl NativeRelayClient {
                     for (routing_id, last_local_receive) in subs_snapshot {
                         // Use local receive time (immune to relay timestamp
                         // manipulation) to compute the reconnect window.
-                        let since = last_local_receive.map(|instant| {
+                        let since = last_local_receive.and_then(|instant| {
                             let elapsed = instant.elapsed();
-                            let now_unix = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            now_unix
-                                .saturating_sub(elapsed.as_secs())
-                                .saturating_sub(RECONNECT_OVERLAP.as_secs())
+                            let now_unix = scp_core::time::now_secs().ok()?;
+                            Some(
+                                now_unix
+                                    .saturating_sub(elapsed.as_secs())
+                                    .saturating_sub(RECONNECT_OVERLAP.as_secs()),
+                            )
                         });
 
                         let msg = ClientMessage::Subscribe {
@@ -828,17 +825,6 @@ impl NativeRelayClient {
     async fn pending_len(&self) -> usize {
         self.inner.read().await.pending.len()
     }
-}
-
-/// Hex-encodes a byte slice into a lowercase hex string.
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }
 
 /// Assigns a `ref_id` to a [`ClientMessage`] for request-response correlation.
@@ -1064,17 +1050,6 @@ mod tests {
         assert!(inner.read().await.seen_blob_ids.contains(&correct_blob_id));
     }
 
-    #[test]
-    fn hex_encode_produces_lowercase_hex() {
-        let bytes = [0xAB, 0xCD, 0xEF, 0x01];
-        assert_eq!(hex_encode(&bytes), "abcdef01");
-    }
-
-    #[test]
-    fn hex_encode_empty_is_empty() {
-        assert_eq!(hex_encode(&[]), "");
-    }
-
     // -----------------------------------------------------------------------
     // Pending request timeout cleanup tests (SCP-196)
     // -----------------------------------------------------------------------
@@ -1193,6 +1168,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
         let storage = InMemoryBlobStorage::new();

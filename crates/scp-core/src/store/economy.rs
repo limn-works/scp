@@ -46,11 +46,13 @@ fn adapter_credentials_prefix(did: &DID) -> String {
 impl<S: Storage> ProtocolStore<S> {
     /// Stores adapter credentials for an identity.
     ///
-    /// Stores raw credential bytes under
-    /// `identity/{did}/adapter_credentials/{adapter_id}`.
+    /// Serializes credential bytes under
+    /// `identity/{did}/adapter_credentials/{adapter_id}` wrapped
+    /// in a `StoredValue` version envelope.
     ///
     /// # Errors
     ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
     /// Returns [`StoreError::Storage`] if the underlying storage write fails.
     pub async fn store_adapter_credentials(
         &self,
@@ -59,8 +61,7 @@ impl<S: Storage> ProtocolStore<S> {
         credentials: &[u8],
     ) -> Result<(), StoreError> {
         let key = adapter_credential_key(did, adapter_id);
-        self.storage.store(&key, credentials).await?;
-        Ok(())
+        self.store_value(&key, &credentials).await
     }
 
     /// Loads adapter credentials for an identity and adapter.
@@ -76,7 +77,7 @@ impl<S: Storage> ProtocolStore<S> {
         adapter_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let key = adapter_credential_key(did, adapter_id);
-        Ok(self.storage.retrieve(&key).await?)
+        self.load_value(&key).await
     }
 
     /// Lists all configured adapter IDs for an identity.
@@ -194,6 +195,7 @@ mod tests {
     use scp_platform::testing::InMemoryStorage;
 
     use super::*;
+    use crate::economy::credentials::EncryptedBlob;
 
     fn test_did() -> DID {
         DID::from("did:dht:z6MkTestHuman")
@@ -287,7 +289,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: did.clone(),
-            encrypted_data: vec![1, 2, 3, 4],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![1, 2, 3, 4]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -311,7 +313,7 @@ mod tests {
             let credential = AdapterCredential {
                 adapter_id: (*adapter_id).to_owned(),
                 identity: did.clone(),
-                encrypted_data: vec![1],
+                encrypted_data: EncryptedBlob::from_encrypted(vec![1]),
                 created_at: 1_700_000_000,
                 rotated_at: 1_700_000_000,
             };
@@ -336,7 +338,7 @@ mod tests {
         let cred_a = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: did_a.clone(),
-            encrypted_data: vec![0xAA],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xAA]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -344,7 +346,7 @@ mod tests {
         let cred_b = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: did_b.clone(),
-            encrypted_data: vec![0xBB],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![0xBB]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };
@@ -365,8 +367,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(loaded_a.encrypted_data, vec![0xAA]);
-        assert_eq!(loaded_b.encrypted_data, vec![0xBB]);
+        assert_eq!(loaded_a.encrypted_data.as_bytes(), &[0xAA]);
+        assert_eq!(loaded_b.encrypted_data.as_bytes(), &[0xBB]);
     }
 
     #[tokio::test]
@@ -377,7 +379,7 @@ mod tests {
         let credential = AdapterCredential {
             adapter_id: "x402".to_owned(),
             identity: did.clone(),
-            encrypted_data: vec![1],
+            encrypted_data: EncryptedBlob::from_encrypted(vec![1]),
             created_at: 1_700_000_000,
             rotated_at: 1_700_000_000,
         };

@@ -79,7 +79,7 @@ internal enum UcanBridge {
     /// Revoke a UCAN token. Maps to ``ucanRevoke`` in ScpBindings.
     internal typealias RevokeFn = @Sendable (
         _ handle: ContextHandle,
-        _ tokenId: String
+        _ token: String
     ) async throws -> Void
 
     /// Default validate function that delegates to the UniFFI-generated binding.
@@ -93,8 +93,8 @@ internal enum UcanBridge {
     }
 
     /// Default revoke function that delegates to the UniFFI-generated binding.
-    internal static let defaultRevoke: RevokeFn = { handle, tokenId in
-        try await ucanRevoke(handle: handle, tokenId: tokenId)
+    internal static let defaultRevoke: RevokeFn = { handle, token in
+        try await ucanRevoke(handle: handle, tokenId: token)
     }
 }
 
@@ -158,7 +158,7 @@ public func mintUcanToken(
 ///
 /// - Parameters:
 ///   - handle: The ``ContextHandle`` for the context.
-///   - tokenId: The ID of the token to revoke.
+///   - token: The full encoded JWT string of the token to revoke.
 ///   - revokeFn: Bridge function override for testing.
 /// - Throws: ``ScpError/Permission(message:code:)`` if revocation fails.
 ///
@@ -169,10 +169,10 @@ public func mintUcanToken(
 /// - Story SCP-221
 public func revokeUcanToken(
     handle: ContextHandle,
-    tokenId: String,
+    token: String,
     revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
 ) async throws {
-    try await revokeFn(handle, tokenId)
+    try await revokeFn(handle, token)
 }
 
 // MARK: - Legacy API (backward compatibility)
@@ -230,7 +230,7 @@ public func mint(
 /// Revokes a UCAN token.
 ///
 /// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
-/// to ``revokeUcanToken(handle:tokenId:revokeFn:)``. Prefer the
+/// to ``revokeUcanToken(handle:token:revokeFn:)``. Prefer the
 /// handle-based API for production use.
 ///
 /// ## Provenance

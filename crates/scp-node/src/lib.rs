@@ -212,6 +212,18 @@ impl<S: Storage> ApplicationNode<S> {
         contexts.push(BroadcastContext { id, name });
     }
 
+    /// Returns the hex-encoded bridge secret for the internal relay.
+    ///
+    /// This is the token that must be included as a `token` query parameter
+    /// when connecting directly to the relay's bound address. Used by tests
+    /// that bypass the axum bridge layer.
+    ///
+    /// **Security:** This value is a secret. Do not log or expose it.
+    #[must_use]
+    pub fn bridge_token_hex(&self) -> String {
+        scp_transport::native::server::hex_encode_32(&self.state.bridge_secret)
+    }
+
     /// Gracefully shuts down the relay server.
     ///
     /// In-flight connection handlers drain naturally — they are not cancelled.
@@ -564,7 +576,12 @@ impl<
         // 4. Add SCPRelay service entry to the DID document (local-only, no network).
         document.add_relay_service(&relay_url)?;
 
-        // 5. Start relay server — must be listening before we publish the DID
+        // 5. Generate a shared secret for the internal WebSocket bridge.
+        //    The axum handler includes this token when connecting to the relay;
+        //    the relay rejects connections without it (defense-in-depth, #85).
+        let bridge_secret: [u8; 32] = rand::random();
+
+        // 6. Start relay server — must be listening before we publish the DID
         //    so that clients resolving the DID can immediately connect.
         let bind_addr = self
             .bind_addr
@@ -572,6 +589,7 @@ impl<
 
         let relay_config = RelayConfig {
             bind_addr,
+            bridge_secret: Some(bridge_secret),
             ..RelayConfig::default()
         };
 
@@ -581,7 +599,7 @@ impl<
         let relay_server = RelayServer::new(relay_config, blob_storage);
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
-        // 6. Publish DID document now that the relay is confirmed listening.
+        // 7. Publish DID document now that the relay is confirmed listening.
         did_method.publish(&identity, &document).await?;
 
         tracing::info!(
@@ -597,6 +615,7 @@ impl<
             relay_url: relay_url.clone(),
             broadcast_contexts: RwLock::new(Vec::new()),
             relay_addr: bound_addr,
+            bridge_secret,
         });
 
         Ok(ApplicationNode {
@@ -683,6 +702,19 @@ impl KeyCustody for NoOpCustody {
         &self,
         _handle: &scp_platform::KeyHandle,
         _context_id: &[u8],
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::PseudonymKeypair, scp_platform::PlatformError>,
+    > + Send {
+        std::future::ready(Err(scp_platform::PlatformError::StorageError(
+            "NoOpCustody: not configured".to_owned(),
+        )))
+    }
+
+    fn derive_rotatable_pseudonym(
+        &self,
+        _handle: &scp_platform::KeyHandle,
+        _context_id: &[u8],
+        _pseudonym_epoch: u64,
     ) -> impl std::future::Future<
         Output = Result<scp_platform::PseudonymKeypair, scp_platform::PlatformError>,
     > + Send {
@@ -1032,7 +1064,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_accepts_connections_from_any_client() {
+    async fn relay_accepts_connections_with_valid_bridge_token() {
+        let node = test_builder()
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        let addr = node.relay().bound_addr();
+        let token = node.bridge_token_hex();
+
+        // Connect with the bridge token (explicit `/` path before query).
+        let url = format!("ws://{addr}/?token={token}");
+        let connect_result = tokio_tungstenite::connect_async(&url).await;
+
+        assert!(
+            connect_result.is_ok(),
+            "relay should accept connections with valid bridge token, got error: {:?}",
+            connect_result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_connections_without_bridge_token() {
         let node = test_builder()
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
             .build()
@@ -1041,14 +1095,13 @@ mod tests {
 
         let addr = node.relay().bound_addr();
 
-        // Connect as a plain WebSocket client (not the node's identity).
+        // Connect without the bridge token — should be rejected.
         let url = format!("ws://{addr}");
         let connect_result = tokio_tungstenite::connect_async(&url).await;
 
         assert!(
-            connect_result.is_ok(),
-            "relay should accept connections from any SCP client, got error: {:?}",
-            connect_result.err()
+            connect_result.is_err(),
+            "relay should reject connections without bridge token"
         );
     }
 

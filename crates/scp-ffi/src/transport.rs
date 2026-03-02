@@ -28,6 +28,7 @@ use pyo3::prelude::*;
 use scp_transport::native::adapter::NativeRelayAdapter;
 
 use crate::error::ScpPyError;
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // Connected relay URL tracking
@@ -106,6 +107,7 @@ impl PyTransportStatus {
 #[pyfunction]
 #[pyo3(name = "transport_connect")]
 pub fn py_transport_connect(relay_url: &str) -> PyResult<()> {
+    validate::validate_relay_url(relay_url)?;
     let rt = crate::runtime()?;
     let url = relay_url.to_owned();
 

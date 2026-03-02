@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand = "0.8"
 hmac = "0.12"
@@ -55,6 +55,7 @@ hex = "0.4"
 axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
+subtle = "2"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

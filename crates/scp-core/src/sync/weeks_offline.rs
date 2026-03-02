@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome, TIER_2_THRESHOLD_SECS};
+use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome};
 use crate::identity::DID;
 
 /// Safely compare a `u64` against a `usize` without truncation.
@@ -62,12 +62,14 @@ pub const MAX_EPOCH_DRIFT: u64 = 1_000;
 
 /// Maximum offline duration in seconds before forced re-join is required.
 ///
-/// Equals [`TIER_2_THRESHOLD_SECS`] (7 days). Any offline duration exceeding
-/// this triggers Tier 3 recovery. Defined separately for clarity and to allow
-/// governance-configurable overrides in the future.
+/// Equals [`super::TIER_2_THRESHOLD_SECS`] (7 days). Any offline duration
+/// exceeding this triggers Tier 3 recovery. Defined separately for clarity
+/// and to allow governance-configurable overrides.
+///
+/// For policy-aware code, use [`SyncPolicy::tier_2_threshold_secs`] instead.
 ///
 /// See ADR-029 section 4 trigger condition 1.
-pub const MAX_OFFLINE_DURATION_SECS: u64 = TIER_2_THRESHOLD_SECS;
+pub const MAX_OFFLINE_DURATION_SECS: u64 = super::TIER_2_THRESHOLD_SECS;
 
 /// Timeout for waiting for a Welcome message after publishing a
 /// [`ResetRequest`], in seconds.
@@ -759,6 +761,7 @@ pub fn determine_inflight_handling(
     clippy::match_wildcard_for_single_variants
 )]
 mod tests {
+    use super::super::SyncPolicy;
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -1473,7 +1476,10 @@ mod tests {
 
     #[test]
     fn max_offline_duration_matches_tier_2_threshold() {
-        assert_eq!(MAX_OFFLINE_DURATION_SECS, TIER_2_THRESHOLD_SECS);
+        assert_eq!(
+            MAX_OFFLINE_DURATION_SECS,
+            SyncPolicy::default().tier_2_threshold_secs,
+        );
     }
 
     #[test]

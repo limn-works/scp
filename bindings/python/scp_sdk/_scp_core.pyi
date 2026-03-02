@@ -11,6 +11,7 @@ in ``.docs/adrs/phase-3.md`` for the full bridge specification.
 
 from __future__ import annotations
 
+from asyncio import Future
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -242,7 +243,7 @@ class PyMessageReceiver:
     """
 
     def __aiter__(self) -> PyMessageReceiver: ...
-    def __anext__(self) -> PyMessage | None: ...
+    def __anext__(self) -> Future[PyMessage | None]: ...
 
 # ---------------------------------------------------------------------------
 # Tool types (crates/scp-ffi/src/tools.rs)

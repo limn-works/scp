@@ -131,7 +131,7 @@ Human-readable addressing (§22) adds a protocol-level resolution layer — disc
 
 Contexts support multiple governance models for who can change roles, settings, membership, and other context configuration. Models include but are not limited to: single admin, multi-sig (N-of-M approval), elected moderators, full member consensus, weighted voting.
 
-The governance model is declared at creation and visible to all. Governance implementations are **pluggable** — the protocol defines the interface (propose, approve, reject) but specific multi-sig, consensus, and voting implementations are not protocol-mandated. Context creators bring or select their own governance logic. Specific protocol-level primitives for the governance interface are TBD.
+The governance model is declared at creation and visible to all. Governance implementations are **pluggable** — the protocol defines the `GovernanceEngine` trait (propose, approve, reject) with four concrete models: `SingleAdmin` (single-admin authority), `Threshold` (M-of-N approval), `Majority` (majority vote), and `Unanimity` (full consensus). See ADR-008 (context lifecycle state machine with single-admin governance), ADR-009 (role assignment and capability ceiling enforcement), and ADR-031 (multi-admin governance models) for full specification. Context creators select a governance model at creation; the selection is visible in context metadata (§5.7) and cannot be changed after creation unless the model itself defines a governance transition mechanism.
 
 ## 5.10 Context TTL (Time-to-Live)
 
@@ -881,6 +881,8 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 4. Non-blocked subscribers request → get HPKE-encrypted key → continue reading.
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
+
+**Sybil resistance.** Broadcast contexts are the primary target for Sybil block bypass because key requests travel as relay messages (not MLS application messages). The membership gate in `handle_sender_key_request` verifies that the requester is a registered subscriber before distributing keys. Identity-linked block expansion and group blocking further mitigate Sybil attacks. See §9.16.6 for the full mitigation specification.
 
 ### 5.14.9 Capabilities
 

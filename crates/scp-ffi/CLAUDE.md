@@ -47,6 +47,25 @@ Additional global registries in `runtime.rs`:
 | `event_log.rs` | scp-core event_log | `py_event_log_query`, `py_event_log_verify` |
 | `mcp.rs` | scp-mcp | `py_mcp_serve`, `py_mcp_client_connect_stdio/sse`, `py_mcp_client_disconnect`, `py_mcp_client_list_tools`, `py_mcp_client_invoke`, `py_mcp_server_stop/wait`, `py_mcp_server_register/deregister_tool`, `py_mcp_server_list_contexts`, `py_register_tool_handler` |
 | `transport.rs` | scp-transport | `py_transport_connect`, `py_transport_disconnect`, `py_transport_status` |
+| `validate.rs` | (internal) | Input validation for all bridge functions |
+
+### Input Validation (`validate.rs`)
+
+All public `#[pyfunction]` bridge functions validate string inputs at the FFI boundary before passing them to scp-core. Validation is defense-in-depth: it catches malformed input early with clear `ValidationError` messages. All validators are O(n) string scans with no allocations on the happy path.
+
+| Input type | Validator | Checks | Max length |
+|-----------|-----------|--------|------------|
+| Context ID | `validate_context_id` | Non-empty, alphanumeric/hyphens/underscores, no control chars | 256 |
+| DID string | `validate_did` | Non-empty, `did:{method}:{id}` format, lowercase method, no control chars | 512 |
+| Tool name | `validate_tool_name` | Non-empty, no `{`/`}` (format string safety), no control chars | 256 |
+| Tool ID | `validate_tool_id` | Non-empty, no control chars | 512 |
+| Capability URI | `validate_capability_uri` | Non-empty, no control chars | 1024 |
+| UCAN token | `validate_ucan_token` | Non-empty, no control chars | 65536 |
+| MCP handle | `validate_mcp_handle` | Non-empty, no control chars | 256 |
+| Relay URL | `validate_relay_url` | Non-empty, valid scheme (ws/wss/http/https), no control chars (CRLF defense) | 2048 |
+| Transport mode | `validate_transport_mode` | Must be "stdio" or "sse" | 64 |
+
+Invalid inputs raise `ValidationError` (subclass of `ScpError`) with descriptive messages including the invalid value and what was expected. See GitHub issue #104.
 
 ### Build
 
@@ -100,7 +119,7 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - `SseClientTransport` uses raw `TcpStream` — `https://` URLs are explicitly rejected (no TLS). Only `http://` is supported; add `rustls` dependency for HTTPS.
 - `FfiBridgeProvider::validate_capability` performs real capability checking via `has_tool_invoke_capability` against the context's role state (SCP-210). Defense-in-depth alongside the UCAN layer. `invoke_tool` validates input against the tool's JSON schema and dispatches to a registered handler if one exists (SCP-212). If no handler is registered, falls back to echo mode with `"status": "validated"`. Handler output is also validated against the tool's output schema (defense-in-depth).
 - **Tool handler registration (SCP-212)**: `py_register_tool_handler(context_id, tool_name, handler)` wraps a Python callable in a Rust closure and stores it in `ContextRuntime::tool_handlers`. The handler is called by `FfiBridgeProvider::invoke_tool` when the tool is invoked via MCP. The tool must be registered in the `ToolRegistry` first. `ContextProvider::invoke_tool` is sync, and Python handlers are GIL-bound (inherently sync), so no async boundary crossing is needed at the FFI layer. Python SDK wrapper: `scp_sdk.mcp.register_tool_handler(context, tool_name, handler)`.
-- **Receive channel lifecycle (SCP-216)**: `py_context_receive` creates a bounded channel (capacity 1000, `RECEIVE_BUFFER_CAPACITY`), stores the sender in `ContextRuntime::message_tx` and a shared receiver `Arc` in both `ContextRuntime::message_rx` and `PyMessageReceiver`. `__anext__` uses `py.allow_threads` + `runtime().block_on(recv().await)` to async-wait for messages without holding the GIL. Channel closes on `py_context_leave` (via `close_receive_channel`) or `py_context_close` (via `remove_context` dropping the runtime). `deliver_message` in `runtime.rs` feeds messages and handles oldest-drop overflow: on full buffer, acquires `try_lock` on the shared receiver (never `blocking_lock` which would panic inside tokio), pops exactly 1 oldest item, sends the new message, then best-effort sends a `BufferOverflow` warning. If `try_lock` fails (consumer holds the mutex), returns `Err` instead of silently dropping the message.
+- **Receive channel lifecycle (SCP-216)**: `py_context_receive` creates a bounded channel (capacity 1000, `RECEIVE_BUFFER_CAPACITY`), stores the sender in `ContextRuntime::message_tx` and a shared receiver `Arc` in both `ContextRuntime::message_rx` and `PyMessageReceiver`. `__anext__` returns an `asyncio.Future` — it spawns the `recv()` on the tokio runtime and resolves the future via `call_soon_threadsafe` when a message arrives, so the asyncio event loop is never blocked (#138). Channel closes on `py_context_leave` (via `close_receive_channel`) or `py_context_close` (via `remove_context` dropping the runtime). `deliver_message` in `runtime.rs` feeds messages and handles oldest-drop overflow: on full buffer, acquires `try_lock` on the shared receiver (never `blocking_lock` which would panic inside tokio), pops exactly 1 oldest item, sends the new message, then best-effort sends a `BufferOverflow` warning. If `try_lock` fails (consumer holds the mutex), returns `Err` instead of silently dropping the message.
 - `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
 - SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
 - **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Only bare binary names are accepted — paths (absolute or relative) are rejected to prevent basename-spoofing bypasses. The OS resolves the binary via `PATH`. Per MCP Security Best Practices.

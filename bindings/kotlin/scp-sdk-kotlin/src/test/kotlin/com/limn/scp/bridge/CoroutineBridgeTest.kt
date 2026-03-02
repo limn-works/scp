@@ -178,7 +178,7 @@ class CoroutineBridgeTest {
         @Test
         fun `ucanRevoke dispatches on IO`() =
             runTest(ioDispatcher) {
-                bridge.ucan.revoke(1L, "token-id")
+                bridge.ucan.revoke(1L, "header.payload.signature")
                 assertTrue(stubBindings.ucanRevokeCalled)
             }
 
@@ -552,7 +552,7 @@ class StubNativeBindings : NativeBindings {
 
     override fun ucanRevoke(
         identityHandle: Long,
-        tokenId: String,
+        token: String,
     ) {
         ucanRevokeCalled = true
     }
