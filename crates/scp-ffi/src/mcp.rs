@@ -565,6 +565,14 @@ impl McpTransport for ClientTransport {
 // FFI bridge context provider
 // ---------------------------------------------------------------------------
 
+/// Default tool handler execution timeout in milliseconds (30 seconds).
+///
+/// Matches [`scp_core::context::tools::DEFAULT_TIMEOUT_MS`]. If a registered
+/// handler does not return within this duration, the invocation is aborted
+/// with a timeout error. Configurable per-provider via
+/// [`FfiBridgeProvider::tool_timeout_ms`].
+const FFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as u64;
+
 /// Implements [`ContextProvider`] by reading from the scp-ffi runtime registry.
 ///
 /// Bridges the MCP server's context/tool queries to the live runtime state
@@ -574,6 +582,12 @@ struct FfiBridgeProvider {
     agent_did: String,
     /// The context IDs this provider serves.
     context_ids: Vec<String>,
+    /// Maximum time (in milliseconds) to wait for a tool handler to complete.
+    ///
+    /// Defaults to [`FFI_TOOL_TIMEOUT_MS`] (30 seconds). If a registered
+    /// handler blocks longer than this, the invocation returns an error
+    /// instead of blocking indefinitely. See issue #123.
+    tool_timeout_ms: u64,
 }
 
 impl ContextProvider for FfiBridgeProvider {
@@ -659,6 +673,12 @@ impl ContextProvider for FfiBridgeProvider {
         // sync and Python handlers are GIL-bound (inherently sync). The async
         // invoke_tool in scp-core is for contexts where Rust itself executes
         // tools. See SCP-212, ADR-010, ADR-015.
+        //
+        // Handler execution is bounded by `tool_timeout_ms` to prevent a
+        // misbehaving handler from blocking the tokio runtime indefinitely.
+        // Uses std::thread::spawn + mpsc::recv_timeout (sync timeout) because
+        // ContextProvider::invoke_tool is a sync trait method. See issue #123.
+        let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
         crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::ContextError(format!(
@@ -680,9 +700,25 @@ impl ContextProvider for FfiBridgeProvider {
             // Dispatch to registered handler if available.
             if let Some(handler) = rt.tool_handlers.get(tool_name) {
                 let handler = handler.clone();
-                // Call the handler with validated input. The handler is a sync
-                // closure wrapping a Python callable (acquired via GIL).
-                let output = handler(arguments).map_err(|e| {
+                // Run the handler on a dedicated thread with a timeout to
+                // prevent indefinite blocking. The handler is Send + Sync
+                // (Arc<dyn Fn>), so it is safe to move across threads.
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = handler(arguments);
+                    // If the receiver has been dropped (timeout elapsed), the
+                    // send will fail silently — that is intentional.
+                    let _ = tx.send(result);
+                });
+
+                let handler_result = rx.recv_timeout(timeout).map_err(|_| {
+                    ScpPyError::ContextError(format!(
+                        "tool handler for '{tool_name}' timed out after {}ms",
+                        timeout.as_millis()
+                    ))
+                })?;
+
+                let output = handler_result.map_err(|e| {
                     ScpPyError::ContextError(format!("tool handler for '{tool_name}' failed: {e}"))
                 })?;
 
@@ -872,6 +908,7 @@ pub fn py_mcp_serve(
     let provider = FfiBridgeProvider {
         agent_did: identity_did.to_owned(),
         context_ids: context_ids.clone(),
+        tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
     };
     let server = McpServer::new(provider);
     let server = Arc::new(Mutex::new(server));
@@ -969,6 +1006,7 @@ pub fn py_mcp_serve(
                 let provider = FfiBridgeProvider {
                     agent_did: sse_agent_did,
                     context_ids: sse_context_ids,
+                    tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
                 };
                 let sse_server = McpServer::new(provider);
                 let config =
@@ -1864,6 +1902,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         assert_eq!(
             provider.active_context_ids(),
@@ -1876,6 +1915,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         assert_eq!(provider.agent_did(), "did:dht:z6MkTest");
     }
@@ -1885,6 +1925,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["nonexistent".to_owned()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         // Unknown context returns empty tool list (no panic).
         let tools = provider.context_tools("nonexistent");
@@ -1956,6 +1997,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         // Creator has ToolInvokeAll, so any tool name should pass.
         assert!(
@@ -1991,6 +2033,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: member.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         let result = provider.validate_capability(&ctx_id, "calculator");
         assert!(
@@ -2018,6 +2061,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2049,6 +2093,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         // Input schema requires an object with "a" and "b" as required fields.
@@ -2089,6 +2134,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
@@ -2203,6 +2249,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
         assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
     }
@@ -2235,6 +2282,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2294,6 +2342,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let result =
@@ -2325,6 +2374,7 @@ mod tests {
         let provider = FfiBridgeProvider {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         };
 
         let result =
@@ -2337,6 +2387,98 @@ mod tests {
         );
 
         crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool handler execution timeout (issue #123)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invoke_tool_handler_timeout_produces_clear_error() {
+        let creator = "did:dht:z6MkCreatorTimeout";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a handler that blocks for 5 seconds (will be timed out).
+        let blocking_handler: crate::runtime::ToolHandler = std::sync::Arc::new(|_input| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            Ok(serde_json::json!({"result": 42}))
+        });
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", blocking_handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: 50, // 50ms — will expire before the 5s sleep.
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        assert!(result.is_err(), "blocking handler should be timed out");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "error should mention timeout: {err}"
+        );
+        assert!(
+            err.contains("50ms"),
+            "error should include the timeout duration: {err}"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_handler_completes_within_timeout_succeeds() {
+        let creator = "did:dht:z6MkCreatorTimeoutOk";
+        let ctx_id = setup_test_context(creator, true);
+
+        // Register a fast handler.
+        let fast_handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(|input: serde_json::Value| {
+                let a = input
+                    .get("a")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let b = input
+                    .get("b")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                Ok(serde_json::json!({"result": a + b}))
+            });
+
+        crate::runtime::register_tool_handler(&ctx_id, "calculator", fast_handler).unwrap();
+
+        let provider = FfiBridgeProvider {
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            tool_timeout_ms: 5_000, // 5 seconds — plenty for an instant handler.
+        };
+
+        let result =
+            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 3, "b": 4}));
+        assert!(
+            result.is_ok(),
+            "fast handler should complete within timeout: {result:?}"
+        );
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({"result": 7.0}),
+            "handler output should be correct"
+        );
+
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn invoke_tool_handler_default_timeout_is_30s() {
+        // Verify the default timeout constant matches scp-core.
+        assert_eq!(
+            FFI_TOOL_TIMEOUT_MS,
+            u64::from(scp_core::context::tools::DEFAULT_TIMEOUT_MS),
+            "FFI default timeout should match scp-core default"
+        );
     }
 
     // -----------------------------------------------------------------------
