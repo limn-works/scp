@@ -19,3 +19,14 @@
 - Major: context state/custody remain stringly-typed in WASM/NAPI (UniFFI has enums), NAPI context_create accepts raw strings not typed structs, WASM payload as base64 instead of Uint8Array, WASM DIDDocument uses JSON strings where Vec<String> works
 - Pattern: UniFFI bridge is the most type-safe; WASM is the least. NAPI is in between but could match UniFFI since it has full runtime access.
 - Error code ranges: standard says TRANS=5000, TOOL=6000. NAPI swapped them. WASM uses SCP-IDENT- prefix, NAPI uses SCP-IDN- prefix. Must unify.
+
+## PR #127 Full-Stack API Review (2026-03-12)
+- Reviewed Rust core + all 4 FFI bridges + 4 SDK layers (181 files, 26K+ lines)
+- 12 changes, 10 observations. Verdict: NEEDS REVISION (3 blocking)
+- Blocking: (1) context_close capability check only in PyO3, missing from NAPI/WASM/UniFFI (security gap), (2) BroadcastContext.get_author_mut exposes mutable internals bypassing protocol invariants, (3) WASM uses single error code SCP-CTX-2000 for all context errors + base64 payload encoding diverges from other bridges
+- Recurring issues from PR #86 still open: PyO3 context state is still String not enum, WASM payload still base64 not Uint8Array
+- New pattern: UniFFI ContextHandle.state() and Identity.custody_type() return String despite having proper enums defined in same file -- loses type safety at the accessor level
+- Good patterns: InnerEnvelopeParams eliminates u64 transposition risk, BroadcastKey uses Zeroize/ZeroizeOnDrop, StoredValue version envelope for migration, Kotlin two-tier streaming (cold/hot), trust renewal re-verifies before updating timestamp
+- ProtocolStore takes raw &[u8] for context state/params -- should accept typed domain objects
+- AddressResolver.cache is needlessly public
+- Cross-SDK creation params diverge: PyO3 dict, NAPI JSON string, UniFFI typed record, WASM DID string + JSON

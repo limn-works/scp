@@ -307,6 +307,7 @@ class UcanToken:
     audience: str
     capabilities: list[str]
     expires_at: float | None
+    proofs: list[str]
 
     def __repr__(self) -> str: ...
 
@@ -331,6 +332,24 @@ class Proof:
     verified: bool
     proof_type: str
     details: Any
+
+    def __repr__(self) -> str: ...
+
+class Checkpoint:
+    """A signed consistency checkpoint from the event log.
+
+    Contains a snapshot of the event log's Merkle root and event count,
+    signed with the generating identity's Ed25519 key. Used for
+    equivocation detection.
+    """
+
+    context_id: str
+    sender_did: str
+    event_count: int
+    merkle_root: str
+    epoch: int | None
+    timestamp: int
+    signature: str
 
     def __repr__(self) -> str: ...
 
@@ -415,6 +434,40 @@ def py_identity_rotate_key(identity: PyIdentity) -> PyIdentity:
 
     Raises:
         IdentityError: If key rotation fails.
+    """
+    ...
+
+def py_identity_migrate(identity: PyIdentity) -> PyIdentity:
+    """Migrate an identity to a new DID (Layer 2 rotation).
+
+    Creates a new DID using the pre-rotation key as the new Identity Key.
+    The old DID document is updated with an ``alsoKnownAs`` pointing to the
+    new DID. Both documents are published. The old identity registry entry
+    is replaced with the new one.
+
+    Args:
+        identity: The ``PyIdentity`` to migrate.
+
+    Returns:
+        A new ``PyIdentity`` with the new DID string.
+
+    Raises:
+        IdentityError: If the identity is not in the registry, if key
+            generation fails, or if DHT publishing fails.
+    """
+    ...
+
+def py_init_storage(storage_type: str) -> None:
+    """Initialize the global storage provider for identity persistence.
+
+    Must be called before ``py_identity_create`` or ``py_identity_load``
+    if storage persistence is desired.
+
+    Args:
+        storage_type: The storage backend type (``"in_memory"``).
+
+    Raises:
+        ValidationError: If the storage type is not recognized.
     """
     ...
 
@@ -586,6 +639,19 @@ def transport_connect(relay_url: str) -> None:
     """
     ...
 
+def transport_disconnect() -> None:
+    """Disconnect from the current SCP relay.
+
+    Clears the global relay connection state. After this call,
+    ``py_mcp_load_contexts`` will fall back to local-only context discovery.
+
+    This is a no-op if no relay connection is active.
+
+    Raises:
+        TransportError: If clearing the connection state fails.
+    """
+    ...
+
 def transport_status() -> TransportStatus:
     """Return the current transport connection status.
 
@@ -601,17 +667,28 @@ def transport_status() -> TransportStatus:
 # UCAN bridge functions (crates/scp-ffi/src/ucan.rs)
 # ---------------------------------------------------------------------------
 
-def ucan_validate(context_id: str, token: str, capability: str) -> None:
+def ucan_validate(
+    context_id: str,
+    token: str,
+    capability: str,
+    presenting_agent_did: str | None = None,
+    proof_tokens: list[str] | None = None,
+) -> None:
     """Validate a UCAN token for a required capability.
 
-    Performs full UCAN validation: signature verification, time bounds
-    checking, delegation chain traversal, attenuation enforcement, nonce
-    replay detection, and capability matching.
+    Performs the full 11-step ADR-016 UCAN validation pipeline: signature
+    verification, time bounds checking, delegation chain traversal,
+    attenuation enforcement, nonce replay detection, and capability matching.
 
     Args:
         context_id: The ID of the context the token is presented in.
         token: The encoded UCAN token string (JWT format).
         capability: The required capability URI.
+        presenting_agent_did: Optional DID of the agent presenting the token.
+            If not provided, the token's ``aud`` field is used.
+        proof_tokens: Optional list of encoded parent UCAN token strings for
+            delegation chain verification. Required when validating delegated
+            tokens with non-empty proof chains.
 
     Raises:
         UcanError: If validation fails for any reason.
@@ -622,6 +699,7 @@ def ucan_mint(
     context_id: str,
     member_did: str,
     capabilities: list[str],
+    proofs: list[str] | None = None,
 ) -> UcanToken:
     """Mint a new UCAN token for a context member.
 
@@ -629,6 +707,8 @@ def ucan_mint(
         context_id: The ID of the context to mint the token for.
         member_did: The DID of the member receiving the token.
         capabilities: List of capability URIs to grant.
+        proofs: Optional list of parent UCAN token IDs forming the
+            delegation proof chain.
 
     Returns:
         A ``UcanToken`` with the minted token's metadata.
@@ -638,12 +718,46 @@ def ucan_mint(
     """
     ...
 
-def ucan_revoke(context_id: str, token_id: str) -> None:
+def ucan_delegate(
+    context_id: str,
+    delegator_did: str,
+    delegatee_did: str,
+    parent_token: str,
+    capabilities: list[str],
+) -> UcanToken:
+    """Delegate a UCAN token to another member.
+
+    Creates a delegated UCAN from an existing parent token, signed with the
+    delegator's Ed25519 key. Delegation enforces attenuation (capabilities
+    can only narrow, never widen).
+
+    Args:
+        context_id: The ID of the context.
+        delegator_did: The DID of the entity delegating (must match parent
+            token's audience).
+        delegatee_did: The DID of the entity receiving the delegation.
+        parent_token: The encoded parent UCAN token (JWT format).
+        capabilities: List of capability URI strings to delegate (must be
+            subset of parent's capabilities).
+
+    Returns:
+        A ``UcanToken`` with the delegated token's metadata.
+
+    Raises:
+        UcanError: If delegation fails (delegator not matching parent
+            audience, capabilities wider than parent, signing failure).
+    """
+    ...
+
+def ucan_revoke(context_id: str, token: str) -> None:
     """Revoke a UCAN token.
+
+    Adds the token to the context's revocation list. The token is identified
+    by its content-hash CID (SHA-256 of the JSON-serialized payload).
 
     Args:
         context_id: The ID of the context the token belongs to.
-        token_id: The unique ID of the token to revoke.
+        token: The full encoded UCAN token string (JWT format).
 
     Raises:
         UcanError: If revocation fails.
@@ -693,5 +807,313 @@ def event_log_verify(
 
     Raises:
         ContextError: If verification fails.
+    """
+    ...
+
+def event_log_checkpoint(
+    context_id: str,
+    identity_did: str,
+    epoch: int,
+) -> Checkpoint:
+    """Generate a signed consistency checkpoint from the current event log.
+
+    Creates a snapshot of the event log's Merkle root and event count,
+    signs it with the caller's identity key. Checkpoints enable
+    equivocation detection.
+
+    Args:
+        context_id: The ID of the context whose event log to checkpoint.
+        identity_did: The DID of the identity generating the checkpoint
+            (used for signing).
+        epoch: The current MLS epoch (pass ``0`` for Broadcast contexts).
+
+    Returns:
+        A ``Checkpoint`` containing the signed checkpoint data.
+
+    Raises:
+        ContextError: If the context is not found or signing fails.
+        IdentityError: If the identity is not found.
+    """
+    ...
+
+# ---------------------------------------------------------------------------
+# MCP bridge functions (crates/scp-ffi/src/mcp.rs)
+# ---------------------------------------------------------------------------
+
+def py_mcp_serve(
+    identity_did: str,
+    context_ids: list[str],
+    transport: str,
+) -> str:
+    """Start an MCP server exposing SCP contexts.
+
+    Creates and starts an MCP server that exposes the specified SCP
+    contexts over the given transport (``"stdio"`` or ``"sse"``).
+
+    Args:
+        identity_did: The DID of the serving identity.
+        context_ids: List of context IDs to expose via MCP.
+        transport: Transport mode -- ``"stdio"`` or ``"sse"``.
+
+    Returns:
+        An opaque server handle string.
+
+    Raises:
+        ValidationError: If the transport mode is invalid.
+        TransportError: If a referenced context is not registered.
+    """
+    ...
+
+def py_mcp_server_stop(handle: str) -> None:
+    """Stop a running MCP server.
+
+    Sends the shutdown signal to the server identified by the handle.
+
+    Args:
+        handle: The server handle returned by ``py_mcp_serve``.
+
+    Raises:
+        TransportError: If the server is not found or already stopped.
+    """
+    ...
+
+def py_mcp_server_wait(handle: str) -> None:
+    """Block until an MCP server exits.
+
+    Waits for the server's transport task to complete. Returns immediately
+    if the server has already stopped.
+
+    Args:
+        handle: The server handle returned by ``py_mcp_serve``.
+
+    Raises:
+        TransportError: If the server handle is not found.
+    """
+    ...
+
+def py_mcp_server_info(handle: str) -> dict[str, Any]:
+    """Return metadata about a running MCP server.
+
+    Args:
+        handle: The server handle returned by ``py_mcp_serve``.
+
+    Returns:
+        A dict with keys: ``identity_did``, ``context_ids``,
+        ``transport``, ``stopped``.
+
+    Raises:
+        TransportError: If the server handle is not found.
+    """
+    ...
+
+def py_mcp_client_connect_stdio(command: list[str]) -> str:
+    """Connect to an external MCP server via stdio transport.
+
+    Spawns the given command as a subprocess and communicates via
+    line-delimited JSON over stdin/stdout. Performs the MCP initialize
+    handshake before returning.
+
+    Args:
+        command: The command and arguments to spawn (e.g.,
+            ``["uvx", "some-mcp-server"]``).
+
+    Returns:
+        An opaque client handle string.
+
+    Raises:
+        ValidationError: If the command list is empty.
+        TransportError: If the subprocess fails to start or the MCP
+            initialize handshake fails.
+    """
+    ...
+
+def py_mcp_client_connect_sse(url: str) -> str:
+    """Connect to an external MCP server via SSE transport.
+
+    Establishes an HTTP SSE connection to the given URL and performs
+    the MCP initialize handshake before returning.
+
+    Args:
+        url: The SSE endpoint URL of the MCP server.
+
+    Returns:
+        An opaque client handle string.
+
+    Raises:
+        ValidationError: If the URL is empty.
+        TransportError: If the connection or MCP handshake fails.
+    """
+    ...
+
+def py_mcp_client_disconnect(handle: str) -> None:
+    """Disconnect from an external MCP server.
+
+    Removes the client from the registry and drops the transport
+    connection. For stdio clients, the subprocess is killed.
+
+    Args:
+        handle: The client handle returned by ``py_mcp_client_connect_*``.
+
+    Raises:
+        TransportError: If the client handle is not found.
+    """
+    ...
+
+def py_mcp_client_info(handle: str) -> dict[str, Any]:
+    """Return metadata about an active MCP client connection.
+
+    Args:
+        handle: The client handle returned by ``py_mcp_client_connect_*``.
+
+    Returns:
+        A dict with keys: ``transport``, ``command`` (nullable),
+        ``url`` (nullable).
+
+    Raises:
+        TransportError: If the client handle is not found.
+    """
+    ...
+
+def py_mcp_client_list_tools(handle: str) -> Any:
+    """List tools available on an external MCP server.
+
+    Sends a ``tools/list`` JSON-RPC request to the connected server.
+
+    Args:
+        handle: The client handle returned by ``py_mcp_client_connect_*``.
+
+    Returns:
+        A list of tool definition dicts, each with ``name``,
+        ``description``, and ``inputSchema`` keys.
+
+    Raises:
+        TransportError: If the client is not connected or the request fails.
+    """
+    ...
+
+def py_mcp_client_invoke(
+    handle: str,
+    tool_name: str,
+    input: dict[str, Any],
+    context_id: str,
+    identity_did: str,
+) -> Any:
+    """Invoke an external MCP tool with SCP provenance wrapping.
+
+    Sends a ``tools/call`` JSON-RPC request to the external MCP server
+    and wraps the result with provenance metadata.
+
+    Args:
+        handle: The client handle returned by ``py_mcp_client_connect_*``.
+        tool_name: The name of the external tool to invoke.
+        input: A dict of input parameters.
+        context_id: The SCP context ID for provenance tracking.
+        identity_did: The DID of the invoking identity.
+
+    Returns:
+        A dict with ``content``, ``is_error``, and ``provenance`` keys.
+
+    Raises:
+        TransportError: If the client is not connected or invocation fails.
+    """
+    ...
+
+def py_mcp_load_contexts(
+    identity_did: str,
+    relay_url: str,
+) -> list[Any]:
+    """Load active contexts for a DID from local registry and relay.
+
+    Combines local runtime contexts, known-contexts registry, and relay
+    discovery. Results are deduplicated by context ID.
+
+    Args:
+        identity_did: The DID to look up contexts for.
+        relay_url: The relay URL to query (hint; active transport connection
+            is preferred if available).
+
+    Returns:
+        A list of context dicts, each with ``context_id``, ``source``,
+        ``creator_did``, ``member_count``, ``tool_count``, and
+        ``relay_active`` keys.
+
+    Raises:
+        TransportError: If the relay query fails fatally.
+    """
+    ...
+
+def py_mcp_configure_stdio_allowlist(
+    additional_binaries: list[str] = ...,
+) -> None:
+    """Configure the stdio subprocess allowlist.
+
+    Sets up the allowlist with default safe binaries plus any additional
+    ones provided.
+
+    Args:
+        additional_binaries: Binary basenames to add to the default
+            allowlist.
+
+    Raises:
+        ValidationError: If any entry is invalid (path, NUL, empty).
+        TransportError: If the allowlist lock is poisoned.
+    """
+    ...
+
+def py_mcp_disable_stdio_allowlist() -> None:
+    """Disable the stdio allowlist entirely (unrestricted mode).
+
+    Allows any binary to be spawned as a subprocess. Only use when the
+    command source is fully trusted.
+
+    Raises:
+        TransportError: If the allowlist lock is poisoned.
+    """
+    ...
+
+def py_mcp_reset_stdio_allowlist() -> None:
+    """Reset the stdio allowlist to its default state.
+
+    Restores the default binaries and re-enables allowlist enforcement.
+
+    Raises:
+        TransportError: If the allowlist lock is poisoned.
+    """
+    ...
+
+def py_mcp_get_stdio_allowlist() -> dict[str, Any]:
+    """Return the current stdio allowlist state.
+
+    Returns:
+        A dict with ``allowed`` (sorted list of binary names) and
+        ``unrestricted`` (bool) keys.
+
+    Raises:
+        TransportError: If the allowlist lock is poisoned.
+    """
+    ...
+
+def mcp_register_tool_handler(
+    context_id: str,
+    tool_name: str,
+    handler: Any,
+) -> None:
+    """Register a Python callable as the handler for a tool in a context.
+
+    The handler is called when the tool is invoked via MCP. It receives
+    the tool's validated JSON input as a Python dict and must return a
+    Python dict representing the JSON output.
+
+    The tool must already be registered in the context's tool registry
+    (via ``tool_register``) before a handler can be attached.
+
+    Args:
+        context_id: The context containing the tool.
+        tool_name: The tool ID to attach the handler to.
+        handler: A Python callable ``(dict) -> dict``.
+
+    Raises:
+        ValidationError: If the handler is not callable.
+        ContextError: If the context or tool is not found.
     """
     ...

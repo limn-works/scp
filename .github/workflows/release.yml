@@ -22,6 +22,7 @@
 #   APPLE_ID_PASSWORD      — App-specific password for Apple ID
 #   WINDOWS_SIGN_CERT      — Base64-encoded Authenticode certificate (.pfx)
 #   WINDOWS_SIGN_PWD       — Password for the Authenticode certificate
+#   GPG_KEY_ID             — GPG key ID (short or long form) for Gradle signing
 #   GPG_PRIVATE_KEY        — GPG private key for Maven artifact signing
 #   GPG_PASSPHRASE         — Passphrase for GPG private key
 #   MAVEN_USERNAME         — Sonatype OSSRH username (Maven Central)
@@ -489,11 +490,8 @@ jobs:
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     steps:
-      - name: Download signed Maven artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: maven-signed
-          path: maven-artifacts/
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -501,25 +499,44 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Kotlin AAR: com.limn:scp-sdk-kotlin
-      - name: Publish Kotlin AAR to Maven Central
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Download Kotlin AAR artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kotlin-aar
+          path: kotlin-artifacts/
+
+      # Kotlin JVM JAR: com.limn:scp-sdk-kotlin
+      - name: Publish Kotlin JVM JAR to Maven Central
+        working-directory: bindings/kotlin
         env:
-          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
-          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_PASSWORD }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          echo "Maven Central publishing requires Gradle publishToSonatype task."
-          echo "This will be fully automated when bindings/kotlin/build.gradle.kts is scaffolded."
-          echo "For now, artifacts are available as GitHub Release attachments."
+          ./gradlew :scp-sdk-kotlin:publishMavenJavaPublicationToSonatypeStagingRepository
+
+      # Kotlin Android AAR: com.limn:scp-sdk-kotlin-android
+      - name: Publish Kotlin Android AAR to Maven Central
+        working-directory: bindings/kotlin
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_PASSWORD }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          ./gradlew :scp-sdk-kotlin-android:publishReleasePublicationToSonatypeStagingRepository
 
       # Java JAR: com.limn:scp-sdk-java
+      # Java bindings do not yet have a build.gradle.kts — skipping until scaffolded
       - name: Publish Java JAR to Maven Central
-        env:
-          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
-          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
         run: |
-          echo "Maven Central publishing requires Gradle publishToSonatype task."
-          echo "This will be fully automated when bindings/java/build.gradle.kts is scaffolded."
-          echo "For now, artifacts are available as GitHub Release attachments."
+          echo "::notice::Java bindings (bindings/java/build.gradle.kts) not yet scaffolded — skipping Maven Central publish. Artifacts available as GitHub Release attachments."
 
   publish-nuget:
     name: "Step 6e: Publish to NuGet"

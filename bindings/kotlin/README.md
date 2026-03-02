@@ -84,6 +84,54 @@ try {
 }
 ```
 
+## Publishing
+
+### Local
+
+Publish to Maven Local for integration testing:
+
+```bash
+./gradlew publishToMavenLocal
+```
+
+Artifacts are written to `~/.m2/repository/com/limn/scp-sdk-kotlin/`.
+
+### Maven Central (Release)
+
+Release publishing uses Sonatype OSSRH staging. Required environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `MAVEN_CENTRAL_USERNAME` | Sonatype OSSRH username |
+| `MAVEN_CENTRAL_TOKEN` | Sonatype OSSRH token |
+| `GPG_KEY_ID` | GPG signing key ID (short form) |
+| `GPG_PRIVATE_KEY` | ASCII-armored GPG private key |
+| `GPG_PASSPHRASE` | GPG key passphrase |
+
+```bash
+./gradlew publish
+```
+
+This deploys to the Sonatype staging repository. After deploy:
+
+1. Log in to https://s01.oss.sonatype.org
+2. Find the staging repository under "Staging Repositories"
+3. Close the repository (runs Maven Central validation rules)
+4. Release the repository (promotes to Maven Central)
+
+### Snapshots
+
+Snapshot versions (version ending in `-SNAPSHOT`) publish to the Sonatype snapshots repository automatically when using `./gradlew publish`.
+
+### CI Pipeline
+
+Release publishing is triggered by tagged releases in CI. The workflow:
+
+1. CI detects a version tag (e.g., `v0.1.0`)
+2. Runs `./gradlew build` (ktlint + detekt + compile + test)
+3. Runs `./gradlew publish` with signing credentials from GitHub Actions secrets
+4. Staging repository is closed and released via Sonatype API
+
 ## Source
 
 - Scaffold: `.docs/scaffold/kotlin.md`

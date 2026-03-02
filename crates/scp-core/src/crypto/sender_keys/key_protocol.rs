@@ -20,7 +20,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
@@ -280,10 +279,7 @@ pub async fn request_sender_key(
     // Generate cryptographic nonce and timestamp for replay protection.
     let mut nonce = [0u8; REQUEST_NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let timestamp = crate::time::now_secs()?;
 
     // Sign the request (including nonce and timestamp).
     let hash = compute_request_hash(
@@ -486,7 +482,7 @@ pub async fn send_block_notification(
     blocker_did: &str,
     blocked_did: &str,
 ) -> Result<Vec<u8>, SenderKeyError> {
-    let timestamp = current_timestamp_ms();
+    let timestamp = current_timestamp_ms()?;
 
     let hash = compute_block_notification_hash(context_id, blocker_did, blocked_did, timestamp);
 
@@ -830,17 +826,12 @@ fn verify_ed25519_signature(
 
 /// Returns the current Unix timestamp in milliseconds.
 ///
-/// Uses `as_secs() * 1000 + subsec_millis` to avoid u128 -> u64 truncation.
-/// Falls back to 0 if the system clock is before the Unix epoch.
-fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| {
-            d.as_secs()
-                .saturating_mul(1000)
-                .saturating_add(u64::from(d.subsec_millis()))
-        })
-        .unwrap_or(0)
+/// # Errors
+///
+/// Returns [`SenderKeyError::ClockError`] (via [`crate::time::ClockError`])
+/// if the system clock is before the Unix epoch.
+fn current_timestamp_ms() -> Result<u64, crate::time::ClockError> {
+    crate::time::now_millis()
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,7 +1506,7 @@ mod tests {
         .unwrap();
 
         let notification: BlockNotification = serde_json::from_slice(&msg).unwrap();
-        let now_ms = current_timestamp_ms();
+        let now_ms = current_timestamp_ms().unwrap();
         let result = validate_block_notification_freshness(&notification, now_ms);
         assert!(
             result.is_ok(),

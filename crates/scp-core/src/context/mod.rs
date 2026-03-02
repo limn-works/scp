@@ -26,6 +26,7 @@
 //! handles are serialized internally via `tokio::sync::RwLock`. See
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
+pub mod broadcast;
 pub mod builder;
 pub mod close;
 pub mod governance;
@@ -72,6 +73,9 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
     bytes.copy_from_slice(&result);
     bytes
 }
+
+// broadcast::validate_messages_read_ucan is intentionally module-private
+// after RED-012 fix (wildcard rejection). Callers use BroadcastContext methods.
 
 // Re-export all parameter types for convenience.
 pub use params::{
@@ -137,7 +141,13 @@ pub use standing::{StandingChannelError, StandingChannelManager};
 pub use governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
+    SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine, sign_vote, verify_vote,
+};
+
+// Re-export broadcast context types (SCP-227, spec section 5.14).
+pub use broadcast::{
+    AuthorState, BlockResult, BroadcastAdmission, BroadcastContext, SubscriberRecord,
+    SubscriptionResult,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).

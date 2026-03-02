@@ -4,7 +4,7 @@
 //!
 //! - [`py_dict_to_json`]: `Python dict` -> [`serde_json::Value`]
 //! - [`json_to_py_dict`]: [`serde_json::Value`] -> `Python object`
-//! - [`encode_hex`]: `&[u8]` -> lowercase hex `String`
+//! - [`encode_hex`]: `&[u8]` -> lowercase hex `String` (delegates to `hex::encode`)
 //! - [`generate_context_id`]: CSPRNG context ID (pure hex, spec-compliant)
 //! - [`generate_random_id`]: CSPRNG prefixed handle ID (internal use)
 //!
@@ -27,15 +27,10 @@ use crate::error::ScpPyError;
 /// Encodes a byte slice as a lowercase hex string.
 ///
 /// Used across the bridge for Merkle roots, token CIDs, nonces, and proof
-/// details. Centralised here to avoid duplicating the fold pattern.
+/// details. Delegates to `hex::encode`.
 #[must_use]
 pub fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{byte:02x}");
-    }
-    s
+    hex::encode(bytes)
 }
 
 // ---------------------------------------------------------------------------

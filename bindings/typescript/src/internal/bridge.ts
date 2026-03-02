@@ -52,7 +52,20 @@ export interface Bridge {
   identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle>;
 
   // Context
-  contextCreate(identityDid: string, paramsJson: string): Promise<BridgeContextHandle>;
+
+  /**
+   * Creates a new context owned by the given identity.
+   *
+   * Takes a full `BridgeIdentityHandle` (not a DID string) because context
+   * creation requires access to the identity's key material for MLS group
+   * setup. The remaining context methods (`contextJoin`, `contextLeave`, etc.)
+   * take a plain `identityDid: string` since they operate on an already-
+   * established context.
+   *
+   * WASM bridge implementers: the underlying `context_create` WASM export
+   * still accepts a DID string — extract `identity.did` before calling it.
+   */
+  contextCreate(identity: BridgeIdentityHandle, paramsJson: string): Promise<BridgeContextHandle>;
   contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void>;
   contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void>;
   contextClose(handle: BridgeContextHandle, identityDid: string): Promise<void>;

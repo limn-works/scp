@@ -139,7 +139,7 @@ func createReturnsActiveContext() async throws {
 @Test("Context.create propagates bridge errors")
 func createPropagatesBridgeErrors() async {
     let createFn: ContextBridge.CreateFn = { _, _ in
-        throw ScpError.Context(message: "creation failed", code: "SCP-CTX-100")
+        throw ScpError.Context(message: "creation failed", code: "SCP-CTX-2100")
     }
     let noOpSend: ContextBridge.SendFn = { _, _ in }
     let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
@@ -186,7 +186,7 @@ func sendThrowsWhenClosed() async throws {
     }
 }
 
-@Test("send throws SCP-CTX-001 when context is not active")
+@Test("send throws SCP-CTX-2001 when context is not active")
 func sendThrowsCorrectErrorCode() async throws {
     let context = makeTestContext()
     try await context.close()
@@ -196,7 +196,7 @@ func sendThrowsCorrectErrorCode() async throws {
         Issue.record("Expected send to throw after close")
     } catch let error as ScpError {
         if case .Context(let message, let code) = error {
-            #expect(code == "SCP-CTX-001")
+            #expect(code == "SCP-CTX-2001")
             #expect(message == "Context is not active")
         } else {
             Issue.record("Expected ScpError.Context, got \(error)")
@@ -214,7 +214,7 @@ func messagesYieldsMessages() async throws {
         capturedListener.withLock { $0 = listener }
     })
 
-    let stream = await context.messages
+    let stream = try await context.messages
 
     // Wait for listener to be captured (subscribeFn is called synchronously
     // within the actor-isolated `messages` property, so it should be set
@@ -278,7 +278,7 @@ func messagesStreamFinishesOnError() async throws {
         capturedListener.withLock { $0 = listener }
     })
 
-    let stream = await context.messages
+    let stream = try await context.messages
 
     var listener: (any MessageListener)?
     for _ in 0..<100 {
@@ -303,7 +303,7 @@ func messagesStreamFinishesOnError() async throws {
     ))
     resolvedListener.onError(error: ScpError.Transport(
         message: "connection lost",
-        code: "SCP-TXP-001"
+        code: "SCP-TRANS-5001"
     ))
 
     var received: [Message] = []
@@ -338,7 +338,7 @@ func leaveFinishesStream() async throws {
         capturedListener.withLock { $0 = listener }
     })
 
-    let stream = await context.messages
+    let stream = try await context.messages
 
     var listener: (any MessageListener)?
     for _ in 0..<100 {
@@ -421,7 +421,7 @@ func closeFinishesStream() async throws {
         capturedListener.withLock { $0 = listener }
     })
 
-    let stream = await context.messages
+    let stream = try await context.messages
 
     var listener: (any MessageListener)?
     for _ in 0..<100 {
@@ -487,13 +487,36 @@ func noForceUnwrapsInPublicAPI() async throws {
     try await context.send(Data("test".utf8))
 
     // messages returns a stream (does not crash)
-    let _ = await context.messages
+    let _ = try await context.messages
 
     // leave succeeds
     try await context.leave()
 
     // State is now closed
     #expect(await context.state == .closed)
+}
+
+// MARK: - Single-stream enforcement tests
+
+@Test("messages throws SCP-CTX-2002 when a stream is already active")
+func messagesThrowsWhenStreamAlreadyActive() async throws {
+    let context = makeTestContext()
+
+    let _ = try await context.messages
+
+    await #expect(throws: ScpError.self) {
+        let _ = try await context.messages
+    }
+}
+
+@Test("messages allows new stream after close nils the continuation")
+func messagesAllowsNewStreamAfterClose() async throws {
+    let context = makeTestContext()
+
+    let _ = try await context.messages
+    try await context.close()
+
+    let _ = try await context.messages
 }
 
 // MARK: - ContextState tests

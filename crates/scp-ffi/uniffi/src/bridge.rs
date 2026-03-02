@@ -717,9 +717,8 @@ impl Drop for Identity {
 
 /// Opaque handle to an SCP context.
 ///
-/// Stores context metadata (ID, state, creator DID). The actual context
-/// runtime (MLS group, transport connections) lives in scp-core and will be
-/// wired in full integration stories.
+/// Stores context metadata (ID, state, creator DID) and, for in-memory
+/// custody, the key custody and signing key needed for UCAN minting.
 ///
 /// Generated as `class ContextHandle` in both Swift and Kotlin.
 ///
@@ -732,6 +731,17 @@ pub struct ContextHandle {
     pub(crate) state: tokio::sync::Mutex<ContextState>,
     /// DID of the context creator.
     pub(crate) creator_did: String,
+    /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
+    ///
+    /// Set during `context_create` from the creating identity's custody.
+    /// Used by `ucan_mint` to produce real Ed25519 signatures.
+    #[allow(dead_code)]
+    pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
+    /// Handle to the creator's active signing key for UCAN minting (RED-102).
+    ///
+    /// Points into `in_memory_custody`. Used by `ucan_mint`.
+    #[allow(dead_code)]
+    pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
 }
 
 #[uniffi::export]
@@ -836,11 +846,14 @@ impl UcanToken {
     }
 }
 
-// NOTE: `Drop` for `UcanToken` is intentionally absent until `ucan_mint` is
-// wired to `scp-core`. When `ucan_mint` creates a real `UcanToken`, it MUST
-// call `increment_handle_count()` in the constructor path, and this `Drop`
-// impl MUST be re-added to call `decrement_handle_count()`. The symmetry
-// is required for `scp_shutdown` handle-drain logic to work correctly.
+// `Drop` for `UcanToken` — now that `ucan_mint` is wired to `scp-core` and
+// calls `increment_handle_count()`, this `Drop` impl decrements the counter
+// to maintain `scp_shutdown` handle-drain correctness (RED-102).
+impl Drop for UcanToken {
+    fn drop(&mut self) {
+        decrement_handle_count();
+    }
+}
 
 /// Opaque handle to the transport layer.
 ///
@@ -1102,10 +1115,16 @@ pub async fn context_create(
             let _ = params;
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
+            // Extract key custody and signing key from the identity (RED-102).
+            let in_memory_custody = identity.in_memory_custody.clone();
+            let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
+
             let handle = Arc::new(ContextHandle {
                 context_id,
                 state: tokio::sync::Mutex::new(ContextState::Active),
                 creator_did: identity.did.clone(),
+                in_memory_custody,
+                signing_key,
             });
             increment_handle_count();
             Ok(handle)
@@ -1220,8 +1239,20 @@ pub async fn context_close(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let mut state = handle.state.lock().await;
+            // Authorization: only the context creator can close the context.
+            let identity_did = identity.did.clone();
+            if identity_did != handle.creator_did {
+                return Err(ScpError::Permission {
+                    message: format!(
+                        "identity '{identity_did}' is not authorized to close this context \
+                         — only the context creator ('{}') can close it",
+                        handle.creator_did
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                });
+            }
 
+            let mut state = handle.state.lock().await;
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Context {
                     message: format!(
@@ -1231,8 +1262,6 @@ pub async fn context_close(
                     code: "SCP-CTX-2017".to_owned(),
                 });
             }
-
-            let _ = identity;
             *state = ContextState::Closed;
             drop(state);
 
@@ -1585,22 +1614,32 @@ pub async fn ucan_validate(
         })?
 }
 
-/// Mints a new UCAN token for a context member.
+/// Mints a new UCAN token for a context member with real Ed25519 signing.
+///
+/// Uses the context creator's [`InMemoryKeyCustody`] and active signing key
+/// (retained on the context handle during `context_create`) to produce a
+/// properly signed UCAN token via `scp_core::crypto::ucan::mint::mint_ucan`.
 ///
 /// # Arguments
 ///
-/// * `handle` — The context to mint the token for.
+/// * `handle` — The context to mint the token for (must have key custody
+///   from `context_create` with an `in_memory` identity).
 /// * `member_did` — The DID of the member receiving the token.
-/// * `capabilities` — List of capability URIs to grant.
+/// * `capabilities` — List of capability strings to grant (e.g.,
+///   `"messages:write"`). Scoped to the context automatically.
 ///
 /// # Returns
 ///
-/// A `UcanToken` handle with the minted token's metadata.
+/// A `UcanToken` handle with the minted token's metadata and a real
+/// Ed25519 signature.
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Permission` if minting fails (capabilities outside
-/// the context ceiling, issuer not authorized, etc.).
+/// Returns `ScpError::Permission` if the context does not have key custody
+/// (created from an `identity_load` handle without key material) or if
+/// signing fails.
+///
+/// See RED-102 for the `KeyCustody` wiring story.
 #[uniffi::export]
 pub async fn ucan_mint(
     handle: Arc<ContextHandle>,
@@ -1609,12 +1648,53 @@ pub async fn ucan_mint(
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, member_did, capabilities);
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN minting requires a live context"
+            // Extract key custody and signing key from the context handle (RED-102).
+            let custody =
+                handle
+                    .in_memory_custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        message: "UCAN minting requires key custody — create the context with \
+                              an in_memory identity (identity_create(\"in_memory\"))"
+                            .to_owned(),
+                        code: "SCP-PERM-3004".to_owned(),
+                    })?;
+            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
+                message: "UCAN minting requires a signing key — the context creator identity \
+                          must have an active signing key"
                     .to_owned(),
                 code: "SCP-PERM-3004".to_owned(),
-            })
+            })?;
+
+            let params = scp_core::crypto::ucan::mint::MintParams {
+                issuer_did: &handle.creator_did,
+                issuer_key: &signing_key,
+                audience_did: &member_did,
+                context_id: &handle.context_id,
+                capabilities: &capabilities,
+                lifetime_secs: 3600, // 1 hour default
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+            };
+
+            let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)
+                .await
+                .map_err(ScpError::from)?;
+
+            let data = UcanTokenData {
+                token_id: token.payload.nnc.clone(),
+                issuer: token.payload.iss.clone(),
+                audience: token.payload.aud.clone(),
+                capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
+                expires_at: Some(token.payload.exp),
+            };
+
+            increment_handle_count();
+            Ok(Arc::new(UcanToken {
+                data,
+                encoded: token.encoded,
+            }))
         })
         .await
         .map_err(|e| ScpError::Permission {

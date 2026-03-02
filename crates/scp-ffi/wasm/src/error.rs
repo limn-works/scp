@@ -47,54 +47,75 @@ use wasm_bindgen::JsError;
 /// `Result<T, ScpWasmError>` and convert to [`JsError`] via
 /// [`ScpWasmError::into_js`] for Promise rejection.
 ///
-/// The error code prefix is embedded in the `Display` output so that the JS
-/// caller can extract it via string matching or via a TypeScript wrapper that
-/// parses the prefix into a typed `ScpError` subclass.
+/// Every variant carries a stable error code (`SCP-{CATEGORY}-{NUMBER}`)
+/// and a human-readable message. The TypeScript SDK parses the bracketed
+/// code prefix to select the appropriate `ScpError` subclass.
 #[derive(Debug, thiserror::Error)]
 pub enum ScpWasmError {
     /// An identity operation failed (DID creation, resolution, key rotation).
-    ///
-    /// Error code prefix: `SCP-IDENT-1000`.
-    #[error("[SCP-IDENT-1000] identity error: {0}")]
-    Identity(String),
+    #[error("[{code}] identity error: {message}")]
+    Identity {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-IDENT-1000`).
+        code: String,
+    },
 
     /// A context lifecycle operation failed.
-    ///
-    /// Error code prefix: `SCP-CTX-2000`.
-    #[error("[SCP-CTX-2000] context error: {0}")]
-    Context(String),
+    #[error("[{code}] context error: {message}")]
+    Context {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-CTX-2001`).
+        code: String,
+    },
 
     /// A UCAN / permission operation failed.
-    ///
-    /// Error code prefix: `SCP-PERM-3000`.
-    #[error("[SCP-PERM-3000] permission error: {0}")]
-    Permission(String),
+    #[error("[{code}] permission error: {message}")]
+    Permission {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-PERM-3000`).
+        code: String,
+    },
 
     /// A cryptographic operation failed (MLS, sender keys, encryption).
     ///
     /// Note: messages never include key material or internal crypto state.
-    ///
-    /// Error code prefix: `SCP-CRYPTO-4000`.
-    #[error("[SCP-CRYPTO-4000] crypto error: {0}")]
-    Crypto(String),
+    #[error("[{code}] crypto error: {message}")]
+    Crypto {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-CRYPTO-4000`).
+        code: String,
+    },
 
     /// A transport operation failed (connection, send, subscription).
-    ///
-    /// Error code prefix: `SCP-TRANS-5000`.
-    #[error("[SCP-TRANS-5000] transport error: {0}")]
-    Transport(String),
+    #[error("[{code}] transport error: {message}")]
+    Transport {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-TRANS-5000`).
+        code: String,
+    },
 
     /// A tool operation failed (registration, invocation, verification).
-    ///
-    /// Error code prefix: `SCP-TOOL-6000`.
-    #[error("[SCP-TOOL-6000] tool error: {0}")]
-    Tool(String),
+    #[error("[{code}] tool error: {message}")]
+    Tool {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-TOOL-6000`).
+        code: String,
+    },
 
     /// Input validation failed (schema, format, constraint violation).
-    ///
-    /// Error code prefix: `SCP-VALID-7000`.
-    #[error("[SCP-VALID-7000] validation error: {0}")]
-    Validation(String),
+    #[error("[{code}] validation error: {message}")]
+    Validation {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-VALID-7000`).
+        code: String,
+    },
 }
 
 impl ScpWasmError {
@@ -115,8 +136,9 @@ impl ScpWasmError {
 
 impl From<serde_json::Error> for ScpWasmError {
     fn from(e: serde_json::Error) -> Self {
-        Self::Validation(format!(
-            "JSON serialization/deserialization failed: {e} — check input format"
-        ))
+        Self::Validation {
+            message: format!("JSON serialization/deserialization failed: {e} — check input format"),
+            code: "SCP-VALID-7006".to_owned(),
+        }
     }
 }

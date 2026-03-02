@@ -277,6 +277,10 @@ pub enum SpendingError {
     /// A UCAN-level error occurred during spending validation.
     #[error("UCAN error: {0}")]
     Ucan(#[from] UcanError),
+
+    /// The system clock is unavailable or before the Unix epoch.
+    #[error("clock error: {0}")]
+    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------
@@ -671,10 +675,7 @@ pub fn mint_spending_ucan_payload(
         });
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = crate::time::now_secs()?;
 
     let exp = now + params.lifetime_secs;
 
@@ -688,7 +689,7 @@ pub fn mint_spending_ucan_payload(
         .map(|v| serde_json::json!({ SPENDING_CAPABILITY_FACT_KEY: v }));
 
     // Generate a nonce.
-    let nonce = generate_spending_nonce();
+    let nonce = generate_spending_nonce()?;
 
     Ok(UcanPayload {
         iss: params.issuer_did.to_owned(),
@@ -703,11 +704,8 @@ pub fn mint_spending_ucan_payload(
 }
 
 /// Generates a nonce in the format `{unix_millis}-{16_random_bytes_hex}`.
-fn generate_spending_nonce() -> String {
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+fn generate_spending_nonce() -> Result<String, crate::time::ClockError> {
+    let now_millis = crate::time::now_millis()?;
 
     let mut random_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random_bytes);
@@ -720,7 +718,7 @@ fn generate_spending_nonce() -> String {
             acc
         });
 
-    format!("{now_millis}-{hex_suffix}")
+    Ok(format!("{now_millis}-{hex_suffix}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -780,10 +778,7 @@ pub fn validate_spending_ucan(
     let capability = SpendingCapability::from_ucan_token(token)?;
 
     // 4. Verify 24-hour maximum expiry.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = crate::time::now_secs()?;
 
     let lifetime = token.payload.exp.saturating_sub(now);
     if lifetime > MAX_EXPIRY_SECS {

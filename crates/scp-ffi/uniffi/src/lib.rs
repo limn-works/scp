@@ -57,6 +57,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub mod bridge;
+pub(crate) mod runtime;
 
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
@@ -310,6 +311,32 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// Returns an opaque key identifier string.
     async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError>;
+
+    /// Perform X25519 Diffie-Hellman key agreement.
+    ///
+    /// `key_id` — the X25519 key handle.
+    /// `peer_public` — 32-byte peer X25519 public key.
+    ///
+    /// Returns the 32-byte shared secret. The private key never leaves the
+    /// custody boundary.
+    async fn dh_agree(&self, key_id: String, peer_public: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+
+    /// Derive a deterministic, context-scoped Ed25519 pseudonym keypair.
+    ///
+    /// Algorithm (all implementations MUST produce identical output):
+    ///   1. `seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")`
+    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+    ///
+    /// ADR-027 amendment: use public key bytes as HMAC key for cross-platform
+    /// determinism with hardware TEE keys.
+    ///
+    /// Returns a two-element list: `[public_key_bytes (32), key_id (string as UTF-8)]`.
+    /// The bridge unpacks this into a `PseudonymKeypair`.
+    async fn derive_pseudonym(
+        &self,
+        key_id: String,
+        context_id: Vec<u8>,
+    ) -> Result<Vec<u8>, ScpError>;
 
     /// Return the custody type for `key_id`: `"hardware"`, `"software"`, or
     /// `"in_memory"`. Stays sync — no I/O required.
@@ -677,4 +704,12 @@ mod tests {
         // Should return without hanging even if handles are live.
         scp_shutdown(0);
     }
+
+    // -----------------------------------------------------------------------
+    // Cross-platform pseudonym derivation (SCP-214 criterion 16)
+    // -----------------------------------------------------------------------
+
+    // NOTE: routing_id tests removed — SA-15 changed ContextHandle to accept
+    // Identity (for KeyCustody signing), which removed the routing_id field.
+    // Routing ID tests will be re-added when routing is wired through KeyCustody.
 }

@@ -974,13 +974,20 @@ pub fn py_mcp_serve(
                 let config =
                     scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
 
-                tokio::select! {
-                    _ = shutdown_rx => {}
-                    result = scp_mcp::sse::run_sse(sse_server, config) => {
-                        if let Err(e) = result {
-                            tracing::error!("MCP SSE server error: {e}");
-                        }
-                    }
+                // Create a ShutdownHandle for the SSE server. Wire the
+                // oneshot shutdown_rx so that when py_mcp_server_stop sends
+                // the signal, the SSE server also receives it via the
+                // ShutdownHandle's CancellationToken.
+                let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
+                let sse_shutdown_trigger = sse_shutdown.clone();
+                tokio::spawn(async move {
+                    let _ = shutdown_rx.await;
+                    sse_shutdown_trigger.shutdown();
+                });
+
+                let result = scp_mcp::sse::run_sse(sse_server, config, sse_shutdown).await;
+                if let Err(e) = result {
+                    tracing::error!("MCP SSE server error: {e}");
                 }
             }
             _ => {} // Already validated above.

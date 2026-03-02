@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from scp_sdk.errors import ContextError
-from scp_sdk.types import Message
+from scp_sdk.types import Capability, MemoryScope, Message
 
 if TYPE_CHECKING:
     from scp_sdk.identity import Identity
@@ -204,11 +204,11 @@ class Context:
     async def create(
         cls,
         creator: Identity,
-        ceiling: list[str],
+        ceiling: list[Capability | str],
         tools: list[Any] | None = None,
         roles: dict[str, list[str]] | None = None,
         ttl: float | None = None,
-        memory_scope: str = "full",
+        memory_scope: MemoryScope | str = MemoryScope.FULL,
         governance: str = "single_admin",
         buffer_size: int = _DEFAULT_BUFFER_SIZE,
     ) -> Context:
@@ -217,12 +217,15 @@ class Context:
         Args:
             creator: The identity creating the context.
             ceiling: Capability ceiling -- maximum capabilities any
-                participant can hold.
+                participant can hold.  Accepts :class:`Capability` enum
+                members, raw strings, or a mix of both.
             tools: Optional list of tool definitions to register.
             roles: Optional mapping of role names to capability lists.
             ttl: Optional time-to-live in seconds.
-            memory_scope: Memory scope (``'ephemeral'``, ``'summary'``,
-                ``'full'``).  Defaults to ``'full'``.
+            memory_scope: Memory scope.  Accepts a :class:`MemoryScope`
+                enum member or a raw string (``'ephemeral'``,
+                ``'summary'``, ``'full'``).  Defaults to
+                :attr:`MemoryScope.FULL`.
             governance: Governance model.  Defaults to
                 ``'single_admin'``.
             buffer_size: Receive buffer capacity.  Defaults to 1,000.
@@ -245,12 +248,15 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
+        ceiling_strs = [c.value if isinstance(c, Capability) else c for c in ceiling]
+        scope_str = memory_scope.value if isinstance(memory_scope, MemoryScope) else memory_scope
+
         params: dict[str, Any] = {
-            "ceiling": ceiling,
+            "ceiling": ceiling_strs,
             "roles": roles or {},
             "tools": [t.name for t in tools] if tools else [],
             "ttl": ttl,
-            "memory_scope": memory_scope,
+            "memory_scope": scope_str,
             "governance": governance,
         }
 
@@ -447,22 +453,61 @@ class Context:
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None:
-        """Cleanup: leave context if still active.
+        """Cleanup: leave context if still active, then destroy local state.
+
+        When the context is in the ``'active'`` state, this method
+        performs *participant departure* (sends a ``MemberLeft`` event)
+        followed by local crypto-state destruction.  If the context has
+        already been left or closed, only local cleanup runs.
+
+        For *admin-level* context closure (which terminates the context
+        for all participants and destroys the MLS group), call
+        :meth:`close` explicitly before exiting the ``async with``
+        block.
 
         Errors during cleanup are logged but never raised -- callers
-        must not be penalized for disposing resources.
+        must not be penalized for disposing resources.  After this
+        method returns, all local state (sender keys, MLS epoch state,
+        transport handles) is released regardless of whether the remote
+        leave operation succeeded.
         """
-        if self.state == "active":
-            try:
-                import _scp_core
+        try:
+            if self.state == "active":
+                try:
+                    import _scp_core
 
-                _scp_core.py_context_leave(self._handle, self._creator_did)
-            except Exception:
-                logger.debug(
-                    "cleanup: failed to leave context %s",
-                    self.context_id,
-                    exc_info=True,
-                )
+                    _scp_core.py_context_leave(self._handle, self._creator_did)
+                except Exception:
+                    logger.debug(
+                        "cleanup: failed to leave context %s",
+                        self.context_id,
+                        exc_info=True,
+                    )
+        finally:
+            self._destroy_local_state()
+
+    # -- Local cleanup -------------------------------------------------------
+
+    def _destroy_local_state(self) -> None:
+        """Release local crypto state (sender keys, MLS epoch, handles).
+
+        Called unconditionally at the end of ``__aexit__`` to satisfy
+        the resource lifecycle invariant: after dispose returns, all
+        local state is released regardless of remote operation outcomes.
+
+        Errors during destruction are logged but never raised.
+        """
+        try:
+            import _scp_core
+
+            if hasattr(_scp_core, "py_context_destroy_local"):
+                _scp_core.py_context_destroy_local(self._handle)
+        except Exception:
+            logger.debug(
+                "cleanup: failed to destroy local state for context %s",
+                self.context_id,
+                exc_info=True,
+            )
 
     # -- Representation -----------------------------------------------------
 

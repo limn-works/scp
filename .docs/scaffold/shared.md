@@ -72,6 +72,9 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | Receive messages | `ctx.receive()` | `ctx.receive()` | `ctx.receive()` | `ctx.messages` | `ctx.receiveFlow()` | `ctx.Receive()` | `ctx.ReceiveAsync()` | `ctx.receive()` |
 | Leave context | `ctx.leave()` | `ctx.leave()` | `ctx.leave()` | `ctx.leave()` | `ctx.leave()` | `ctx.Leave()` | `ctx.LeaveAsync()` | `ctx.leave()` |
 | Close context | `ctx.close()` | `ctx.close()` | `ctx.close()` | `ctx.close()` | `ctx.close()` | `ctx.Close()` | `ctx.CloseAsync()` | `ctx.close()` |
+| UCAN validate | `ucan::validate` | `validate()` | `validate()` | `validateUcanToken()` | `ucanValidate()` | `UcanValidate()` | `UcanValidateAsync()` | `ucanValidate()` |
+| UCAN mint | `ucan::mint` | `mint()` | `mint()` | `mintUcanToken()` | `ucanMint()` | `UcanMint()` | `UcanMintAsync()` | `ucanMint()` |
+| UCAN revoke | `ucan::revoke` | `revoke()` | `revoke()` | `revokeUcanToken()` | `ucanRevoke()` | `UcanRevoke()` | `UcanRevokeAsync()` | `ucanRevoke()` |
 | Error base | `ScpError` | `ScpError` | `ScpError` | `ScpError` | `ScpException` | `ScpError` | `ScpException` | `ScpException` |
 | Package name | `scp-core` | `scp-sdk` | `@scp/sdk` | `SCP` | `com.limn:scp-sdk-kotlin` | `scp-go` | `Limn.Scp` | `com.limn:scp-sdk-java` |
 

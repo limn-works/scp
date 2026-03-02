@@ -1,0 +1,15 @@
+[package]
+name = "scp-ffi-common"
+version = "0.1.0"
+description = "Shared bridge adapter types for SCP FFI bridges (PyO3, napi-rs, UniFFI)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+scp-core = { path = "../../scp-core" }
+hex = { workspace = true }
+z-base-32 = { workspace = true }
+
+[lints]
+workspace = true

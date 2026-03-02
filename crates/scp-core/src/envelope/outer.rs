@@ -403,7 +403,7 @@ mod seal_open_tests {
     use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
     use crate::crypto::sender_keys::generate_sender_key;
-    use crate::envelope::inner::{Provenance, create_inner_envelope};
+    use crate::envelope::inner::{InnerEnvelopeParams, Provenance, create_inner_envelope};
     use crate::envelope::padding::strip_padding;
 
     #[allow(clippy::unwrap_used)]
@@ -461,14 +461,16 @@ mod seal_open_tests {
         let signing_key = custody.import_ed25519_key(&private_key_bytes).await;
 
         create_inner_envelope(
-            "ctx-1",
-            &scp_cred.did,
-            group.epoch().unwrap(),
-            0,
-            1,
-            1_700_000_000,
-            payload,
-            provenance,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: &scp_cred.did,
+                epoch: group.epoch().unwrap(),
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload,
+                provenance,
+            },
             &custody,
             &signing_key,
         )
@@ -483,14 +485,16 @@ mod seal_open_tests {
         let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         create_inner_envelope(
-            "ctx-1",
-            sender_did,
-            1,
-            0,
-            1,
-            1_700_000_000,
-            payload,
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did,
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload,
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )
@@ -695,14 +699,16 @@ mod seal_open_tests {
 
         // Create a legitimate inner envelope.
         let mut inner = create_inner_envelope(
-            "ctx-1",
-            &scp_cred.did,
-            alice_group.epoch().unwrap(),
-            0,
-            1,
-            1_700_000_000,
-            b"original data",
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: &scp_cred.did,
+                epoch: alice_group.epoch().unwrap(),
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"original data",
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )
@@ -931,14 +937,16 @@ mod seal_open_tests {
         let signing_key = custody.import_ed25519_key(&private_key_bytes).await;
 
         let inner = create_inner_envelope(
-            "ctx-1",
-            "did:dht:z6MkNOBODY",
-            alice_group.epoch().unwrap(),
-            0,
-            1,
-            1_700_000_000,
-            b"from unknown sender",
-            None,
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:z6MkNOBODY",
+                epoch: alice_group.epoch().unwrap(),
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"from unknown sender",
+                provenance: None,
+            },
             &custody,
             &signing_key,
         )

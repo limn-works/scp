@@ -68,13 +68,17 @@ pub struct GrowthRate {
 // ProofProfile
 // ---------------------------------------------------------------------------
 
-/// Timing data from a single proof operation.
+/// Timing and memory data from a single proof operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofProfile {
     /// Wall-clock duration of the operation.
     pub duration: Duration,
     /// Number of events in the log when the proof was generated/verified.
     pub log_size: u64,
+    /// Estimated memory consumed by the operation in bytes.
+    ///
+    /// Set to 0 when memory measurement is not available (e.g. benchmarks).
+    pub estimated_memory_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,12 +127,24 @@ pub struct MetricsExport {
     pub proof_generation_max: Option<Duration>,
     /// Mean proof generation duration.
     pub proof_generation_mean: Option<Duration>,
+    /// Minimum memory observed across proof generation samples (bytes).
+    pub proof_generation_memory_min: Option<u64>,
+    /// Maximum memory observed across proof generation samples (bytes).
+    pub proof_generation_memory_max: Option<u64>,
+    /// Mean memory across proof generation samples (bytes).
+    pub proof_generation_memory_mean: Option<u64>,
     /// Minimum proof verification duration observed.
     pub proof_verification_min: Option<Duration>,
     /// Maximum proof verification duration observed.
     pub proof_verification_max: Option<Duration>,
     /// Mean proof verification duration.
     pub proof_verification_mean: Option<Duration>,
+    /// Minimum memory observed across proof verification samples (bytes).
+    pub proof_verification_memory_min: Option<u64>,
+    /// Maximum memory observed across proof verification samples (bytes).
+    pub proof_verification_memory_max: Option<u64>,
+    /// Mean memory across proof verification samples (bytes).
+    pub proof_verification_memory_mean: Option<u64>,
     /// Current growth rate (if sufficient data exists).
     pub growth_rate: Option<GrowthRate>,
 }
@@ -222,16 +238,38 @@ impl EventLogMetrics {
         }
     }
 
-    /// Records a proof generation operation with its timing.
-    pub fn record_proof_generation(&mut self, duration: Duration, log_size: u64) {
-        self.proof_gen_profiles
-            .push(ProofProfile { duration, log_size });
+    /// Records a proof generation operation with its timing and memory cost.
+    ///
+    /// `estimated_memory_bytes` is the estimated memory consumed by the
+    /// operation. Pass 0 when memory measurement is not available.
+    pub fn record_proof_generation(
+        &mut self,
+        duration: Duration,
+        log_size: u64,
+        estimated_memory_bytes: u64,
+    ) {
+        self.proof_gen_profiles.push(ProofProfile {
+            duration,
+            log_size,
+            estimated_memory_bytes,
+        });
     }
 
-    /// Records a proof verification operation with its timing.
-    pub fn record_proof_verification(&mut self, duration: Duration, log_size: u64) {
-        self.proof_verify_profiles
-            .push(ProofProfile { duration, log_size });
+    /// Records a proof verification operation with its timing and memory cost.
+    ///
+    /// `estimated_memory_bytes` is the estimated memory consumed by the
+    /// operation. Pass 0 when memory measurement is not available.
+    pub fn record_proof_verification(
+        &mut self,
+        duration: Duration,
+        log_size: u64,
+        estimated_memory_bytes: u64,
+    ) {
+        self.proof_verify_profiles.push(ProofProfile {
+            duration,
+            log_size,
+            estimated_memory_bytes,
+        });
     }
 
     /// Computes the event log growth rate over the full snapshot window.
@@ -294,9 +332,15 @@ impl EventLogMetrics {
             proof_generation_min: min_duration(&self.proof_gen_profiles),
             proof_generation_max: max_duration(&self.proof_gen_profiles),
             proof_generation_mean: mean_duration(&self.proof_gen_profiles),
+            proof_generation_memory_min: min_memory(&self.proof_gen_profiles),
+            proof_generation_memory_max: max_memory(&self.proof_gen_profiles),
+            proof_generation_memory_mean: mean_memory(&self.proof_gen_profiles),
             proof_verification_min: min_duration(&self.proof_verify_profiles),
             proof_verification_max: max_duration(&self.proof_verify_profiles),
             proof_verification_mean: mean_duration(&self.proof_verify_profiles),
+            proof_verification_memory_min: min_memory(&self.proof_verify_profiles),
+            proof_verification_memory_max: max_memory(&self.proof_verify_profiles),
+            proof_verification_memory_mean: mean_memory(&self.proof_verify_profiles),
             growth_rate: self.growth_rate(),
         }
     }
@@ -327,7 +371,8 @@ pub struct BenchmarkResult {
 ///
 /// Generates inclusion proofs for `iterations` sequentially-selected leaf
 /// indices and returns timing statistics. The caller provides a pre-built
-/// [`super::EventLog`] with the desired number of events.
+/// [`super::EventLog`] with the desired number of events. Memory is not
+/// measured (set to 0 in profiles).
 ///
 /// # Panics
 ///
@@ -360,7 +405,7 @@ pub fn bench_proof_generation(log: &super::EventLog, iterations: u64) -> Benchma
 ///
 /// Generates an inclusion proof for each iteration and then verifies it,
 /// measuring only the verification time. The caller provides a pre-built
-/// [`super::EventLog`].
+/// [`super::EventLog`]. Memory is not measured (set to 0 in profiles).
 ///
 /// # Panics
 ///
@@ -447,6 +492,27 @@ fn mean_duration(profiles: &[ProofProfile]) -> Option<Duration> {
     }
     let total: Duration = profiles.iter().map(|p| p.duration).sum();
     let count = u32::try_from(profiles.len()).unwrap_or(u32::MAX);
+    Some(total / count)
+}
+
+/// Returns the minimum estimated memory from a slice of proof profiles.
+fn min_memory(profiles: &[ProofProfile]) -> Option<u64> {
+    profiles.iter().map(|p| p.estimated_memory_bytes).min()
+}
+
+/// Returns the maximum estimated memory from a slice of proof profiles.
+fn max_memory(profiles: &[ProofProfile]) -> Option<u64> {
+    profiles.iter().map(|p| p.estimated_memory_bytes).max()
+}
+
+/// Returns the mean estimated memory from a slice of proof profiles.
+fn mean_memory(profiles: &[ProofProfile]) -> Option<u64> {
+    if profiles.is_empty() {
+        return None;
+    }
+    let total: u64 = profiles.iter().map(|p| p.estimated_memory_bytes).sum();
+    #[allow(clippy::cast_possible_truncation)] // profile count will not exceed u64
+    let count = profiles.len() as u64;
     Some(total / count)
 }
 
@@ -717,10 +783,10 @@ mod tests {
     fn record_proof_profiles() {
         let mut m = EventLogMetrics::new("ctx-1".to_owned());
 
-        m.record_proof_generation(Duration::from_micros(50), 100);
-        m.record_proof_generation(Duration::from_micros(100), 100);
-        m.record_proof_verification(Duration::from_micros(20), 100);
-        m.record_proof_verification(Duration::from_micros(40), 100);
+        m.record_proof_generation(Duration::from_micros(50), 100, 1024);
+        m.record_proof_generation(Duration::from_micros(100), 100, 2048);
+        m.record_proof_verification(Duration::from_micros(20), 100, 512);
+        m.record_proof_verification(Duration::from_micros(40), 100, 768);
 
         let export = m.export();
         assert_eq!(export.proof_generation_count, 2);
@@ -761,7 +827,7 @@ mod tests {
         for i in 0..5u64 {
             m.record_event(150, 1_000_000 + i * 3600, i);
         }
-        m.record_proof_generation(Duration::from_micros(80), 5);
+        m.record_proof_generation(Duration::from_micros(80), 5, 0);
 
         let export = m.export();
 
@@ -785,7 +851,7 @@ mod tests {
         let mut m = EventLogMetrics::new("ctx-json".to_owned());
         m.record_event(100, 1_000_000, 0);
         m.record_event(100, 1_003_600, 1);
-        m.record_proof_generation(Duration::from_micros(42), 2);
+        m.record_proof_generation(Duration::from_micros(42), 2, 0);
 
         let export = m.export();
         let json = serde_json::to_string(&export).unwrap();
@@ -957,6 +1023,7 @@ mod tests {
         let profiles = [ProofProfile {
             duration: Duration::from_micros(42),
             log_size: 10,
+            estimated_memory_bytes: 0,
         }];
 
         assert_eq!(min_duration(&profiles), Some(Duration::from_micros(42)));

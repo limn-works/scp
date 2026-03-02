@@ -80,9 +80,15 @@ impl ToolRequest {
     ///
     /// Uses [`DEFAULT_TIMEOUT_MS`] as the default timeout and 0 as the default
     /// chain depth.
-    #[must_use]
-    pub fn new(tool_id: String, invoker_did: DID, input: serde_json::Value) -> Self {
-        Self {
+    /// # Errors
+    ///
+    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
+    pub fn new(
+        tool_id: String,
+        invoker_did: DID,
+        input: serde_json::Value,
+    ) -> Result<Self, crate::time::ClockError> {
+        Ok(Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             tool_id,
             invoker_did,
@@ -90,8 +96,8 @@ impl ToolRequest {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             session_id: None,
             chain_depth: 0,
-            timestamp: current_timestamp_ms(),
-        }
+            timestamp: crate::time::now_millis()?,
+        })
     }
 
     /// Clamps the timeout to the given context maximum, respecting the hard
@@ -283,22 +289,6 @@ pub struct ToolInvokedEvent {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the current Unix timestamp in milliseconds.
-#[allow(clippy::cast_possible_truncation)]
-fn current_timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| {
-            let millis = d.as_millis();
-            if millis > u128::from(u64::MAX) {
-                u64::MAX
-            } else {
-                millis as u64
-            }
-        })
-        .unwrap_or(0)
-}
-
 /// Computes a SHA-256 hash of a JSON value's canonical representation.
 ///
 /// The value is serialized to a compact JSON string (no whitespace), then
@@ -340,7 +330,8 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({"x": 1}),
-        );
+        )
+        .unwrap();
         // UUID v4 format: 8-4-4-4-12 hex digits.
         assert_eq!(request.request_id.len(), 36);
         assert!(request.request_id.contains('-'));
@@ -356,7 +347,8 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-        );
+        )
+        .unwrap();
         request.timeout_ms = 10_000;
         request.clamp_timeout(60_000);
         assert_eq!(request.timeout_ms, 10_000);
@@ -368,7 +360,8 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-        );
+        )
+        .unwrap();
         request.timeout_ms = 120_000;
         request.clamp_timeout(60_000);
         assert_eq!(request.timeout_ms, 60_000);
@@ -380,7 +373,8 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-        );
+        )
+        .unwrap();
         request.timeout_ms = 600_000;
         // Context max is above protocol max -- should clamp to protocol max.
         request.clamp_timeout(999_999);

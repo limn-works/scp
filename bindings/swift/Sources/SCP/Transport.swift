@@ -55,72 +55,84 @@ public nonisolated struct TransportConfig: Sendable {
     }
 }
 
-// MARK: - UniFFI Bridge Stubs
+// MARK: - TransportBridge
 
-/// Connect the transport layer via the UniFFI bridge.
+/// Namespace for UniFFI bridge function references used by transport operations.
+/// Each typealias maps 1:1 to a UniFFI-generated async function. Closures are
+/// injected for testability; defaults call through to ScpBindings.
 ///
-/// Placeholder stub for the UniFFI-generated `transport_connect` function.
-internal func scpTransportConnect(
-    config: TransportConfig,
-    completion: @Sendable @escaping (Result<Void, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Transport(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TRANSPORT-001"
-    )))
-}
+/// See ADR-026 for the flat delegation pattern and ADR-005 for transport spec.
+internal enum TransportBridge {
+    /// Connect to a relay. Maps to ``transportConnect`` in ScpBindings.
+    internal typealias ConnectFn = @Sendable (
+        _ relayUrl: String
+    ) async throws -> TransportManager
 
-/// Query transport status via the UniFFI bridge.
-///
-/// Placeholder stub for the UniFFI-generated `transport_status` function.
-internal func scpTransportStatus(
-    completion: @Sendable @escaping (Result<TransportStatus, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Transport(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-TRANSPORT-002"
-    )))
+    /// Query transport status. Maps to ``transportStatus`` in ScpBindings.
+    internal typealias StatusFn = @Sendable (
+        _ manager: TransportManager
+    ) async throws -> TransportStatus
+
+    /// Default connect function that delegates to the UniFFI-generated binding.
+    internal static let defaultConnect: ConnectFn = { relayUrl in
+        try await transportConnect(relayUrl: relayUrl)
+    }
+
+    /// Default status function that delegates to the UniFFI-generated binding.
+    internal static let defaultStatus: StatusFn = { manager in
+        try await transportStatus(manager: manager)
+    }
 }
 
 // MARK: - Transport Functions
 
 /// Connects the transport layer with the given configuration.
 ///
+/// Delegates to the UniFFI ``transportConnect`` bridge function for each
+/// relay URL in the configuration. The first successful connection is used.
+///
+/// - Parameters:
+///   - config: Transport configuration with relay URLs and/or bootstrap domain.
+///   - connectFn: Bridge function override for testing.
+/// - Returns: A ``TransportManager`` handle for the established connection.
+/// - Throws: ``ScpError/Transport(message:code:)`` if all connections fail.
+///
 /// ## Provenance
 ///
 /// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - Story SCP-101
-public func connectTransport(config: TransportConfig) async throws {
-    try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Void, Error>) in
-        scpTransportConnect(config: config) { result in
-            switch result {
-            case .success:
-                continuation.resume()
-            case .failure(let error):
-                continuation.resume(throwing: error)
-            }
-        }
+/// - Story SCP-221
+public func connectTransport(
+    config: TransportConfig,
+    connectFn: TransportBridge.ConnectFn = TransportBridge.defaultConnect
+) async throws -> TransportManager {
+    guard let firstUrl = config.relayUrls.first else {
+        throw ScpError.Transport(
+            message: "No relay URLs provided in transport configuration",
+            code: "SCP-TRANS-5001"
+        )
     }
+    return try await connectFn(firstUrl)
 }
 
 /// Queries the current transport connection status.
 ///
+/// Delegates to the UniFFI ``transportStatus`` bridge function.
+///
+/// - Parameters:
+///   - manager: The transport manager to query.
+///   - statusFn: Bridge function override for testing.
 /// - Returns: The current ``TransportStatus``.
 /// - Throws: ``ScpError/Transport(message:code:)`` if the status query fails.
-public func transportStatus() async throws -> TransportStatus {
-    try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<TransportStatus, Error>) in
-        scpTransportStatus { result in
-            switch result {
-            case .success(let status):
-                continuation.resume(returning: status)
-            case .failure(let error):
-                continuation.resume(throwing: error)
-            }
-        }
-    }
+///
+/// ## Provenance
+///
+/// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
+/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+/// - Story SCP-221
+public func queryTransportStatus(
+    manager: TransportManager,
+    statusFn: TransportBridge.StatusFn = TransportBridge.defaultStatus
+) async throws -> TransportStatus {
+    try await statusFn(manager)
 }

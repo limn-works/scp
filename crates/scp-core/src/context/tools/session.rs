@@ -220,7 +220,7 @@ pub async fn create_session(
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let now_ms = current_timestamp_ms();
+    let now_ms = crate::time::now_millis()?;
 
     let session = ToolSession {
         session_id: session_id.clone(),
@@ -303,7 +303,7 @@ where
         })?;
 
     // Check expiry.
-    let now_ms = current_timestamp_ms();
+    let now_ms = crate::time::now_millis()?;
     if session.is_expired(now_ms) {
         // Remove the expired session.
         store.sessions.remove(session_id);
@@ -355,26 +355,6 @@ where
 /// Returns the number of sessions removed.
 pub fn cleanup_expired(store: &mut SessionStore, now_ms: u64) -> usize {
     store.remove_expired(now_ms)
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Returns the current Unix timestamp in milliseconds.
-#[allow(clippy::cast_possible_truncation)]
-fn current_timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| {
-            let millis = d.as_millis();
-            if millis > u128::from(u64::MAX) {
-                u64::MAX
-            } else {
-                millis as u64
-            }
-        })
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,7 +1049,7 @@ mod tests {
             tool_id: "calculator".to_owned(),
             source_context: "ctx-source".to_owned(),
             state: serde_json::Value::Null,
-            created_at: current_timestamp_ms(),
+            created_at: crate::time::now_millis().unwrap(),
             ttl: Duration::from_secs(300),
             call_count: 0,
         });

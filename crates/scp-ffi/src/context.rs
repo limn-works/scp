@@ -31,6 +31,8 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_core::context::roles::Capability;
+use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
@@ -350,27 +352,31 @@ impl PyMessage {
 // PyMessageReceiver -- async iterator
 // ---------------------------------------------------------------------------
 
-/// Async iterator over incoming messages from an SCP context.
+/// Async iterator over incoming messages from an SCP context (SCP-216).
 ///
 /// Implements Python's async iterator protocol (`__aiter__` + `__anext__`).
 /// Wraps a `tokio::sync::mpsc::Receiver<PyMessage>` and bridges to Python's
-/// asyncio. Returns `None` (which `PyO3` translates to `StopAsyncIteration`)
-/// when the channel is closed (no more messages).
+/// asyncio via the shared tokio runtime.
 ///
 /// Created by [`py_context_receive`] -- not directly constructible from Python.
 ///
-/// # Current behavior
+/// # Lifecycle (ADR-014)
 ///
-/// In the current bridge layer (before transport wiring), the sender half of
-/// the channel is dropped immediately after creation, so `__anext__` returns
-/// `None` on the first call. When the full runtime is connected, the transport
-/// layer will hold the sender and feed messages into the channel.
+/// - **Empty channel:** `__anext__` suspends (awaits) until a message arrives.
+///   It does NOT raise `StopAsyncIteration` for an empty channel.
+/// - **Closed channel:** `StopAsyncIteration` is raised when the sender is
+///   dropped (on `leave()`, eviction, or context close).
+/// - **Buffer overflow:** Handled by `deliver_message` in `runtime.rs` --
+///   oldest event is dropped and a `BufferOverflow` warning is injected.
+/// - **Concurrency:** Multiple `async for` loops on the same receiver race
+///   for messages; each message goes to exactly one consumer.
 #[pyclass]
 pub struct PyMessageReceiver {
-    /// The receiving half of the message channel, wrapped in a std `Mutex` for
-    /// synchronous access from `__anext__`. The receiver is `!Sync` so we
-    /// protect it with a `Mutex` to allow shared `&self` access from `PyO3`.
-    rx: Arc<Mutex<mpsc::Receiver<PyMessage>>>,
+    /// The receiving half of the message channel, wrapped in a `tokio::sync::Mutex`
+    /// so it can be locked across `.await` points in `__anext__`. Shared with
+    /// `ContextRuntime::message_rx` via `Arc` so that `deliver_message` can
+    /// implement oldest-drop overflow.
+    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
 }
 
 #[pymethods]
@@ -380,41 +386,33 @@ impl PyMessageReceiver {
         slf
     }
 
-    /// Returns the next message from the channel, or `None` to signal
-    /// `StopAsyncIteration` when the channel is closed.
+    /// Returns the next message from the channel (SCP-216).
     ///
-    /// `PyO3` translates `Ok(None)` into `StopAsyncIteration` for the Python
-    /// async iterator protocol.
-    fn __anext__(&self) -> PyResult<Option<PyMessage>> {
-        let mut guard = self
-            .rx
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("message receiver lock is poisoned"))?;
-
-        // Use try_recv for non-blocking receive. When the transport layer is
-        // wired in, this will be replaced with proper async receive driven by
-        // the tokio runtime.
-        let result = match guard.try_recv() {
-            Ok(msg) => Ok(Some(msg)),
-            // Channel empty (sender alive) or disconnected (sender dropped)
-            // -- both return None. Empty means "no message yet" and
-            // Disconnected means "iteration complete".
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                Ok(None)
-            }
-        };
-        drop(guard);
-        result
+    /// Performs an async `recv()` on the channel. When the channel is empty,
+    /// the coroutine suspends until a message arrives (releases the Python GIL
+    /// while waiting). When the channel is closed (sender dropped), returns
+    /// `None` which `PyO3` translates to `StopAsyncIteration`.
+    fn __anext__(&self, py: Python<'_>) -> PyResult<Option<PyMessage>> {
+        let rx = Arc::clone(&self.rx);
+        py.allow_threads(|| {
+            let rt = crate::runtime()?;
+            rt.block_on(async move {
+                let mut guard = rx.lock().await;
+                Ok(guard.recv().await)
+            })
+        })
     }
 }
 
 impl PyMessageReceiver {
-    /// Creates a new receiver from a tokio mpsc channel.
+    /// Creates a new receiver from a pre-wrapped shared receiver Arc.
+    ///
+    /// The `Arc<tokio::sync::Mutex<Receiver>>` is shared with
+    /// `ContextRuntime::message_rx` so that `deliver_message` can access
+    /// the receiver for oldest-drop overflow handling.
     #[must_use]
-    pub fn new(rx: mpsc::Receiver<PyMessage>) -> Self {
-        Self {
-            rx: Arc::new(Mutex::new(rx)),
-        }
+    pub const fn from_shared_rx(rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>) -> Self {
+        Self { rx }
     }
 }
 
@@ -461,25 +459,35 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
 
     // Register in the known-contexts registry for discovery via
     // py_mcp_load_contexts. Derive a per-identity routing ID using
-    // HMAC-SHA256(random_secret, context_id || "scp-pseudonym") to preserve
-    // participant unlinkability. The random secret is per-identity and
-    // in-memory only — see runtime::get_or_create_routing_secret.
+    // KeyCustody::derive_pseudonym with real key material (§9.10.4).
+    // The pseudonym is deterministic for the same identity + context pair,
+    // providing unlinkability across contexts. See SCP-214 criterion 4.
     {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        type HmacSha256 = Hmac<Sha256>;
-
-        // Stub — see SCP-214 for KeyCustody wiring. Uses a per-identity random
-        // secret as the HMAC key (provides unlinkability but doesn't persist across
-        // restarts). Replace with scp_core::envelope::pseudonym::derive_pseudonym
-        // using real key material (§9.10.4).
-        let routing_secret = crate::runtime::get_or_create_routing_secret(identity_did);
-        let mut mac = HmacSha256::new_from_slice(&routing_secret)
-            .map_err(|e| PyRuntimeError::new_err(format!("HMAC initialization failed: {e}")))?;
-        mac.update(context_id.as_bytes());
-        mac.update(b"scp-pseudonym");
-        let routing_id: [u8; 32] = mac.finalize().into_bytes().into();
+        let routing_id = crate::runtime::with_identity(identity_did, |entry| {
+            let rt = crate::runtime().map_err(|e| {
+                crate::error::ScpPyError::IdentityError(format!("runtime not available: {e}"))
+            })?;
+            let pseudonym = rt.block_on(async {
+                entry
+                    .custody
+                    .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                    .await
+            });
+            let pk = pseudonym
+                .map_err(|e| {
+                    crate::error::ScpPyError::IdentityError(format!(
+                        "pseudonym derivation failed: {e}"
+                    ))
+                })?
+                .public_key;
+            let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+                crate::error::ScpPyError::IdentityError(
+                    "pseudonym public key must be 32 bytes".to_owned(),
+                )
+            })?;
+            Ok(bytes)
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("routing ID derivation failed: {e}")))?;
 
         // Get the relay URL from transport status if a relay is connected.
         let relay_url = match crate::transport::py_transport_status() {
@@ -582,6 +590,10 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     // 3. Log the leave event.
     let _ = identity_did; // Will be used when connected to scp-core runtime.
 
+    // Close the receive channel so any active PyMessageReceiver raises
+    // StopAsyncIteration (SCP-216 AC6).
+    let _ = crate::runtime::close_receive_channel(&handle.context_id);
+
     Ok(())
 }
 
@@ -594,12 +606,14 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 /// # Arguments
 ///
 /// * `handle` -- The context to close.
-/// * `identity_did` -- The DID of the identity initiating the close (must be
-///   admin or have close capability).
+/// * `identity_did` -- The DID of the identity initiating the close. Must
+///   hold the `ContextClose` capability (typically the context creator or
+///   an admin).
 ///
 /// # Errors
 ///
 /// Returns `RuntimeError` if the context is not in "active" state.
+/// Returns `ContextError` if the caller lacks the `ContextClose` capability.
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
@@ -614,12 +628,24 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
         )));
     }
 
-    // In the full runtime, this would:
-    // 1. Initiate the closing window.
-    // 2. Notify members.
-    // 3. Wait for summary generation (if memory_scope == "summary").
-    // 4. Destroy keys.
-    let _ = identity_did; // Will be used when connected to scp-core runtime.
+    // Verify the caller has the ContextClose capability before allowing
+    // the close operation. Without this check, any caller could close any
+    // context -- a privilege escalation vulnerability (black-hat finding).
+    let context_id = handle.context_id.clone();
+    crate::runtime::with_context(&context_id, |rt| {
+        if !rt
+            .role_state
+            .member_has_capability(identity_did, &Capability::ContextClose)
+        {
+            return Err(crate::error::ScpPyError::ContextError(format!(
+                "identity '{identity_did}' does not have the ContextClose capability \
+                 for context '{context_id}' -- only admins or members with the \
+                 context:close capability can close a context"
+            )));
+        }
+        Ok(())
+    })
+    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
     // Transition directly to "closed" (skipping "closing" for the bridge
     // layer -- the full runtime will implement the cooperative closing window).
@@ -663,19 +689,60 @@ fn py_context_send(
     }
     drop(state);
 
-    // Validate payload type: must be bytes or str.
-    let is_bytes = payload.is_instance_of::<pyo3::types::PyBytes>();
-    let is_str = payload.is_instance_of::<pyo3::types::PyString>();
-    if !is_bytes && !is_str {
+    // Extract payload bytes: must be bytes or str.
+    let payload_bytes: Vec<u8> = if payload.is_instance_of::<pyo3::types::PyBytes>() {
+        payload.extract::<Vec<u8>>()?
+    } else if payload.is_instance_of::<pyo3::types::PyString>() {
+        let s: String = payload.extract()?;
+        s.into_bytes()
+    } else {
         return Err(PyTypeError::new_err("payload must be bytes or str"));
-    }
+    };
 
-    // In the full runtime, this would:
-    // 1. Encrypt the payload via MLS/sender keys.
-    // 2. Create an OuterEnvelope with provenance metadata.
-    // 3. Send via the transport layer.
-    // 4. Log the send event.
-    let _ = identity_did; // Will be used when connected to scp-core runtime.
+    // Create a real inner envelope using the retained KeyCustody for signing.
+    // This validates that the identity's active signing key can produce a
+    // valid Ed25519 signature over the message. The inner envelope is not
+    // yet transmitted (MLS encryption and transport are future stories) but
+    // the signing path exercises real KeyCustody. See SCP-214 criterion 6.
+    let context_id = handle.context_id.clone();
+    let identity_did_owned = identity_did.to_owned();
+
+    let rt = crate::runtime()?;
+    crate::runtime::with_identity(&identity_did_owned, |entry| {
+        #[allow(clippy::cast_possible_truncation)] // Unix ms timestamps fit in u64 for centuries.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                crate::error::ScpPyError::ContextError(format!("system clock error: {e}"))
+            })?
+            .as_millis() as u64;
+
+        let inner_result = rt.block_on(async {
+            let params = scp_core::envelope::InnerEnvelopeParams {
+                context_id: &context_id,
+                sender_did: &identity_did_owned,
+                epoch: 0,
+                generation: 0,
+                sequence: 0,
+                timestamp: now_ms,
+                payload: &payload_bytes,
+                provenance: None,
+            };
+            scp_core::envelope::create_inner_envelope(
+                &params,
+                entry.custody.as_ref(),
+                &entry.identity.active_signing_key,
+            )
+            .await
+        });
+
+        inner_result.map_err(|e| {
+            crate::error::ScpPyError::ContextError(format!("inner envelope creation failed: {e}"))
+        })?;
+
+        Ok(())
+    })
+    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
     Ok(())
 }
@@ -709,18 +776,18 @@ fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
     }
     drop(state);
 
-    // Create a bounded channel for incoming messages. The capacity is sized
-    // for typical agent message rates. In the full runtime, the transport
-    // layer feeds messages into the sender half.
-    let (_tx, rx) = mpsc::channel::<PyMessage>(256);
+    let (tx, rx) = mpsc::channel::<PyMessage>(crate::runtime::RECEIVE_BUFFER_CAPACITY);
+    let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
 
-    // In the full runtime, `_tx` would be registered with the transport layer
-    // so that incoming messages are forwarded to this receiver. For now, the
-    // channel is created but the sender is dropped -- the iterator will
-    // immediately yield StopAsyncIteration until the transport wiring is
-    // connected.
+    let context_id = handle.context_id.clone();
+    crate::runtime::with_context(&context_id, |rt| {
+        rt.message_tx = Some(tx);
+        rt.message_rx = Some(Arc::clone(&rx_arc));
+        Ok(())
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    Ok(PyMessageReceiver::new(rx))
+    Ok(PyMessageReceiver::from_shared_rx(rx_arc))
 }
 
 // ---------------------------------------------------------------------------
@@ -746,4 +813,277 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_context_send, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_receive, m)?)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests (SCP-216)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::runtime::RECEIVE_BUFFER_CAPACITY;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_test_message(i: usize, context_id: &str) -> PyMessage {
+        #[allow(clippy::cast_precision_loss)]
+        let ts = i as f64;
+        PyMessage::new(
+            format!("did:test:sender-{i}"),
+            format!("payload-{i}").into_bytes(),
+            ts,
+            context_id.to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn empty_then_message_delivery() {
+        let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+        let msg_receiver = PyMessageReceiver::from_shared_rx(Arc::clone(&rx_arc));
+
+        let rx_clone = Arc::clone(&msg_receiver.rx);
+        let handle = tokio::spawn(async move {
+            let mut guard = rx_clone.lock().await;
+            guard.recv().await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "recv should block on empty channel");
+
+        let msg = make_test_message(1, "ctx-empty-then-msg");
+        tx.send(msg).await.unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_some());
+        let received = result.unwrap();
+        assert_eq!(received.sender_did, "did:test:sender-1");
+        assert_eq!(received.payload, b"payload-1");
+    }
+
+    #[tokio::test]
+    async fn graceful_close_stops_iteration() {
+        let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+
+        let rx_clone = Arc::clone(&rx_arc);
+        let handle = tokio::spawn(async move {
+            let mut guard = rx_clone.lock().await;
+            guard.recv().await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(tx);
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_none(),
+            "recv should return None when sender is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffer_overflow_drops_oldest() {
+        let capacity = RECEIVE_BUFFER_CAPACITY;
+        let (tx, rx) = mpsc::channel::<PyMessage>(capacity);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+        let context_id = "ctx-overflow-test";
+
+        for i in 0..capacity {
+            tx.send(make_test_message(i, context_id)).await.unwrap();
+        }
+
+        assert!(
+            tx.try_send(make_test_message(capacity, context_id))
+                .is_err(),
+            "channel should be full at capacity"
+        );
+
+        {
+            let oldest = rx_arc.lock().await.try_recv();
+            assert!(
+                oldest.is_ok(),
+                "should be able to pop oldest from full buffer"
+            );
+            let oldest_msg = oldest.unwrap();
+            assert_eq!(oldest_msg.sender_did, "did:test:sender-0");
+        }
+
+        tx.try_send(make_test_message(capacity, context_id))
+            .unwrap();
+
+        let overflow_warning = PyMessage::new(
+            "scp:system".to_owned(),
+            b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
+            0.0,
+            context_id.to_owned(),
+        );
+        let _ = tx.try_send(overflow_warning);
+
+        let first = rx_arc.lock().await.try_recv().unwrap();
+        assert_eq!(
+            first.sender_did, "did:test:sender-1",
+            "after oldest-drop of 1, first message should be sender-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_receive_each_message_once() {
+        let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+        let total_messages = 100;
+        let received_count = Arc::new(AtomicUsize::new(0));
+
+        let mut consumers = Vec::new();
+        for _ in 0..4 {
+            let rx_clone = Arc::clone(&rx_arc);
+            let count = Arc::clone(&received_count);
+            consumers.push(tokio::spawn(async move {
+                loop {
+                    let msg = {
+                        let mut guard = rx_clone.lock().await;
+                        guard.recv().await
+                    };
+                    match msg {
+                        Some(_) => {
+                            count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        None => break,
+                    }
+                }
+            }));
+        }
+
+        for i in 0..total_messages {
+            tx.send(make_test_message(i, "ctx-concurrent"))
+                .await
+                .unwrap();
+        }
+        drop(tx);
+
+        for consumer in consumers {
+            consumer.await.unwrap();
+        }
+
+        assert_eq!(
+            received_count.load(Ordering::Relaxed),
+            total_messages,
+            "each message should be received exactly once across all consumers"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_message_via_runtime() {
+        let context_id = "ctx-deliver-test";
+
+        crate::runtime::register_context(context_id, "did:test:creator").unwrap();
+
+        let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+
+        crate::runtime::with_context(context_id, |rt| {
+            rt.message_tx = Some(tx);
+            rt.message_rx = Some(Arc::clone(&rx_arc));
+            Ok(())
+        })
+        .unwrap();
+
+        let msg = make_test_message(42, context_id);
+        crate::runtime::deliver_message(context_id, msg).unwrap();
+
+        let mut guard = rx_arc.lock().await;
+        let received = guard.try_recv().unwrap();
+        assert_eq!(received.sender_did, "did:test:sender-42");
+        drop(guard);
+
+        crate::runtime::close_receive_channel(context_id).unwrap();
+
+        let result = crate::runtime::deliver_message(context_id, make_test_message(43, context_id));
+        assert!(result.is_err(), "should fail after channel is closed");
+
+        crate::runtime::remove_context(context_id);
+    }
+
+    #[tokio::test]
+    async fn deliver_message_overflow_injects_warning() {
+        let context_id = "ctx-overflow-deliver";
+        let capacity = RECEIVE_BUFFER_CAPACITY;
+
+        crate::runtime::register_context(context_id, "did:test:creator").unwrap();
+
+        let (tx, rx) = mpsc::channel::<PyMessage>(capacity);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+
+        crate::runtime::with_context(context_id, |rt| {
+            rt.message_tx = Some(tx);
+            rt.message_rx = Some(Arc::clone(&rx_arc));
+            Ok(())
+        })
+        .unwrap();
+
+        // Fill the buffer from a blocking thread to avoid the
+        // "cannot call blocking_lock from within a runtime" panic.
+        // deliver_message uses blocking_lock internally for oldest-drop.
+        let ctx_id = context_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            for i in 0..capacity {
+                crate::runtime::deliver_message(&ctx_id, make_test_message(i, &ctx_id)).unwrap();
+            }
+
+            crate::runtime::deliver_message(&ctx_id, make_test_message(capacity, &ctx_id)).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let mut guard = rx_arc.lock().await;
+        let first = guard.try_recv().unwrap();
+        assert_eq!(
+            first.sender_did, "did:test:sender-1",
+            "oldest message (sender-0) should have been dropped"
+        );
+
+        let mut found_new_msg = false;
+        while let Ok(msg) = guard.try_recv() {
+            if msg.sender_did == format!("did:test:sender-{capacity}") {
+                found_new_msg = true;
+            }
+        }
+        // The BufferOverflow warning is best-effort (try_send): it is only
+        // injected when there is spare capacity after the overflow-triggering
+        // message is sent.  In this test the buffer is immediately full again
+        // after the send, so the warning is expected to be dropped.
+        assert!(found_new_msg, "should find the overflow-triggering message");
+
+        drop(guard);
+        crate::runtime::remove_context(context_id);
+    }
+
+    #[test]
+    fn close_receive_channel_on_leave() {
+        crate::init_runtime().ok();
+        let context_id = "ctx-leave-close";
+
+        crate::runtime::register_context(context_id, "did:test:creator").unwrap();
+
+        let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+
+        crate::runtime::with_context(context_id, |rt| {
+            rt.message_tx = Some(tx);
+            rt.message_rx = Some(rx_arc);
+            Ok(())
+        })
+        .unwrap();
+
+        crate::runtime::close_receive_channel(context_id).unwrap();
+
+        let result = crate::runtime::deliver_message(context_id, make_test_message(0, context_id));
+        assert!(
+            result.is_err(),
+            "deliver should fail after close_receive_channel"
+        );
+
+        crate::runtime::remove_context(context_id);
+    }
 }

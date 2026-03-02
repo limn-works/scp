@@ -174,10 +174,7 @@ impl NonceTracker for InMemoryNonceTracker {
         }
 
         // Freshness check: timestamp within now +/- 5 minutes.
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))?
-            .as_millis();
+        let now_millis = u128::from(crate::time::now_millis()?);
 
         if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
             return Err(UcanError::NonceTooOld(nonce.to_owned()));
@@ -356,10 +353,7 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
 /// Returns [`UcanError::ClockError`] if the system clock is before the Unix
 /// epoch. Defaulting to zero would silently bypass all `nbf`/`exp` checks.
 fn now_secs() -> Result<u64, UcanError> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .map_err(|e| UcanError::ClockError(format!("system clock before Unix epoch: {e}")))
+    crate::time::now_secs().map_err(UcanError::from)
 }
 
 /// Validates a UCAN token using the 11-step pipeline from ADR-016.

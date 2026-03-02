@@ -122,6 +122,7 @@ pub enum CheckpointComparison {
 /// - 10 minutes have elapsed since the last checkpoint,
 ///
 /// whichever comes first. See ADR-011 acceptance criterion 8.
+#[deprecated(note = "Use CheckpointManager instead")]
 #[derive(Debug, Clone)]
 pub struct CheckpointScheduler {
     /// Number of events appended since the last checkpoint.
@@ -130,6 +131,7 @@ pub struct CheckpointScheduler {
     last_checkpoint_timestamp: u64,
 }
 
+#[allow(deprecated)]
 impl CheckpointScheduler {
     /// Creates a new scheduler with the given initial timestamp.
     ///
@@ -288,16 +290,18 @@ impl CheckpointManager {
         let elapsed = current_timestamp.saturating_sub(self.last_checkpoint_timestamp);
         let time_due = elapsed >= self.policy.time_interval_secs;
         let event_due = self.events_since_last >= self.policy.event_interval;
+        let min_events_met = self.events_since_last >= self.policy.min_events_since_last;
 
-        // Event threshold met: always create checkpoint.
-        if event_due {
+        // Event threshold met AND minimum events met: create checkpoint.
+        if event_due && min_events_met {
             return true;
         }
 
-        // Time threshold met: create checkpoint if minimum events met, or
-        // if the time interval has been reached (time is the upper bound on
-        // checkpoint staleness per ADR-030 §3).
-        if time_due {
+        // Time threshold met AND minimum events met: create checkpoint.
+        // The time interval is the upper bound on checkpoint staleness per
+        // ADR-030 §3, but we still require the minimum event threshold to
+        // prevent checkpoint spam in low-activity contexts.
+        if time_due && min_events_met {
             return true;
         }
 
@@ -329,19 +333,16 @@ impl CheckpointManager {
             return Ok(None);
         }
 
-        let checkpoint = generate_checkpoint_at(
-            log,
-            sender_did,
-            epoch,
-            current_timestamp,
-            key_custody,
-            signing_key,
-        )
-        .await?;
-
-        self.checkpoints.push(checkpoint.clone());
-        self.events_since_last = 0;
-        self.last_checkpoint_timestamp = current_timestamp;
+        let checkpoint = self
+            .create_and_store_checkpoint(
+                log,
+                sender_did,
+                epoch,
+                current_timestamp,
+                key_custody,
+                signing_key,
+            )
+            .await?;
 
         Ok(Some(checkpoint))
     }
@@ -356,6 +357,30 @@ impl CheckpointManager {
     ///
     /// Returns [`EventLogError::SigningFailed`] if signing fails.
     pub async fn force_create_checkpoint(
+        &mut self,
+        log: &EventLog,
+        sender_did: &DID,
+        epoch: u64,
+        current_timestamp: u64,
+        key_custody: &impl KeyCustody,
+        signing_key: &KeyHandle,
+    ) -> Result<ConsistencyCheckpoint, EventLogError> {
+        self.create_and_store_checkpoint(
+            log,
+            sender_did,
+            epoch,
+            current_timestamp,
+            key_custody,
+            signing_key,
+        )
+        .await
+    }
+
+    /// Creates a checkpoint, stores it, and resets the scheduler.
+    ///
+    /// Shared implementation for [`Self::maybe_create_checkpoint`] and
+    /// [`Self::force_create_checkpoint`].
+    async fn create_and_store_checkpoint(
         &mut self,
         log: &EventLog,
         sender_did: &DID,
@@ -798,36 +823,8 @@ pub async fn generate_checkpoint(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
 ) -> Result<ConsistencyCheckpoint, EventLogError> {
-    let context_id = log.context_id().to_owned();
-    let event_count = tree::event_count(log);
-    let merkle_root = tree::root(log);
-    let timestamp = current_timestamp();
-
-    // Compute the canonical hash for signing.
-    let canonical_hash = compute_checkpoint_canonical_hash(
-        &context_id,
-        sender_did,
-        event_count,
-        &merkle_root,
-        Some(epoch),
-        timestamp,
-    );
-
-    // Sign the canonical hash.
-    let signature = key_custody
-        .sign(signing_key, &canonical_hash)
-        .await
-        .map_err(|e| EventLogError::SigningFailed(e.to_string()))?;
-
-    Ok(ConsistencyCheckpoint {
-        context_id,
-        sender_did: sender_did.clone(),
-        event_count,
-        merkle_root,
-        epoch: Some(epoch),
-        timestamp,
-        signature: signature.into_bytes(),
-    })
+    let timestamp = current_timestamp()?;
+    generate_checkpoint_at(log, sender_did, epoch, timestamp, key_custody, signing_key).await
 }
 
 /// Compares a received remote checkpoint against the local event log state.
@@ -1050,9 +1047,14 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 /// Computes the canonical hash of a checkpoint for signing/verification.
 ///
 /// ```text
-/// SHA-256(context_id || sender_did || event_count_BE || merkle_root
+/// SHA-256("SCP-CHECKPOINT-V1:" || len(context_id) || context_id
+///         || len(sender_did) || sender_did || event_count_BE || merkle_root
 ///         || epoch_flag || epoch_BE || timestamp_BE)
 /// ```
+///
+/// Variable-length fields (`context_id`, `sender_did`) are prefixed with their
+/// length as a 4-byte big-endian u32 to prevent field-boundary ambiguity. The
+/// `SCP-CHECKPOINT-V1:` domain separator prevents cross-protocol hash confusion.
 ///
 /// The `epoch_flag` byte is `0x01` if epoch is `Some`, `0x00` if `None`.
 /// When `Some`, the epoch value follows as 8 big-endian bytes.
@@ -1065,8 +1067,16 @@ fn compute_checkpoint_canonical_hash(
     timestamp: u64,
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hasher.update(context_id.as_bytes());
-    hasher.update(sender_did.as_bytes());
+    hasher.update(b"SCP-CHECKPOINT-V1:");
+    // Length-prefix closure for variable-length fields. Field values (DIDs,
+    // context IDs) are short strings; truncation is not a concern.
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+    length_prefix(&mut hasher, context_id.as_bytes());
+    length_prefix(&mut hasher, sender_did.as_bytes());
     hasher.update(event_count.to_be_bytes());
     hasher.update(merkle_root);
     match epoch {
@@ -1084,14 +1094,12 @@ fn compute_checkpoint_canonical_hash(
 
 /// Returns the current Unix timestamp in seconds.
 ///
-/// Uses `std::time::SystemTime` for the timestamp. In production, this would
-/// be injected via a clock trait for testability. For Phase 2, direct system
-/// time is acceptable.
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// # Errors
+///
+/// Returns [`EventLogError::ClockError`] (via [`crate::time::ClockError`])
+/// if the system clock is before the Unix epoch.
+fn current_timestamp() -> Result<u64, crate::time::ClockError> {
+    crate::time::now_secs()
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1124,7 @@ mod tests {
     use crate::event_log::tree::{self, GENESIS_PREV_HASH};
     use crate::event_log::{Event, EventLog, EventPayload, EventType};
     use crate::identity::DID;
+    use crate::trust::compute_behavioral_record;
 
     // -------------------------------------------------------------------
     // Test helpers
@@ -1553,6 +1562,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[allow(deprecated)]
     fn scheduler_triggers_after_event_threshold() {
         let mut scheduler = CheckpointScheduler::new(1_000_000);
 
@@ -1573,6 +1583,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[allow(deprecated)]
     fn scheduler_triggers_after_time_threshold() {
         let scheduler = CheckpointScheduler::new(1_000_000);
 
@@ -1586,6 +1597,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[allow(deprecated)]
     fn scheduler_reset_clears_state() {
         let mut scheduler = CheckpointScheduler::new(1_000_000);
 
@@ -1844,9 +1856,17 @@ mod tests {
             time_interval_secs: 3600,
             min_events_since_last: 10,
         };
-        let mgr = CheckpointManager::new(policy, 1_000_000);
+        let mut mgr = CheckpointManager::new(policy, 1_000_000);
 
-        // Time threshold reached even with 0 events.
+        // Time threshold reached but min_events_since_last not met.
+        assert!(!mgr.is_checkpoint_due(1_003_600));
+
+        // Record enough events to meet min_events_since_last.
+        for _ in 0..10 {
+            mgr.record_event();
+        }
+
+        // Now both time threshold and min events are met.
         assert!(mgr.is_checkpoint_due(1_003_600));
     }
 
@@ -2415,7 +2435,282 @@ mod tests {
     // ===================================================================
 
     // -------------------------------------------------------------------
-    // 26. Pruned proofs work for all leaf positions in various tree sizes
+    // 26. Behavioral validation works with checkpointed logs (SCP-125 AC6)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn behavioral_validation_works_with_checkpointed_log() {
+        // Build a non-trivial event log with multiple event types and two
+        // participants. This exercises behavioral record computation against
+        // a checkpoint Merkle root -- the core of SCP-125 AC6.
+        let (vk_alice, sk_alice) = test_keypair();
+        let did_alice = did_from_pubkey(&vk_alice);
+        let (vk_bob, sk_bob) = test_keypair();
+        let did_bob = did_from_pubkey(&vk_bob);
+
+        let mut log = EventLog::new("ctx-behavioral-checkpoint".to_owned());
+        let mut prev_hash = GENESIS_PREV_HASH;
+        let mut all_events = Vec::new();
+
+        // Helper closure: append an event and track it.
+        let append = |log: &mut EventLog,
+                      events: &mut Vec<Event>,
+                      event_type: EventType,
+                      actor_did: &str,
+                      timestamp: u64,
+                      seq: u64,
+                      payload: Vec<u8>,
+                      signing_key: &ed25519_dalek::SigningKey,
+                      prev: [u8; 32]|
+         -> [u8; 32] {
+            let event = sign_event(
+                event_type,
+                actor_did,
+                timestamp,
+                seq,
+                payload,
+                prev,
+                signing_key,
+            );
+            tree::append(log, &event).unwrap();
+            let leaf_hash: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update([0x00]);
+                h.update(rmp_serde::to_vec(&event).unwrap());
+                h.finalize().into()
+            };
+            events.push(event);
+            leaf_hash
+        };
+
+        // Event 0: Alice creates context.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ContextCreated,
+            &did_alice,
+            1_000_000,
+            0,
+            vec![],
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 1: Alice joins.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::MemberJoined,
+            &did_alice,
+            1_000_001,
+            1,
+            vec![],
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 2: Bob joins.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::MemberJoined,
+            &did_bob,
+            1_000_002,
+            2,
+            vec![],
+            &sk_bob,
+            prev_hash,
+        );
+
+        // Event 3: Alice assigns role to Bob.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::RoleAssigned,
+            &did_alice,
+            1_000_003,
+            3,
+            did_bob.as_bytes().to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 4: Alice sends a message.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::MessageSent,
+            &did_alice,
+            1_000_004,
+            4,
+            b"hello from alice".to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 5: Bob sends a message.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::MessageSent,
+            &did_bob,
+            1_000_005,
+            5,
+            b"hello from bob".to_vec(),
+            &sk_bob,
+            prev_hash,
+        );
+
+        // Event 6: Alice invokes a tool.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ToolInvoked,
+            &did_alice,
+            1_000_006,
+            6,
+            b"search-tool".to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 7: Alice invokes the same tool again.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ToolInvoked,
+            &did_alice,
+            1_000_007,
+            7,
+            b"search-tool".to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 8: Bob invokes a different tool.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ToolInvoked,
+            &did_bob,
+            1_000_008,
+            8,
+            b"execute-tool".to_vec(),
+            &sk_bob,
+            prev_hash,
+        );
+
+        // Event 9: Alice performs a governance action targeting Bob.
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::GovernanceAction,
+            &did_alice,
+            1_000_009,
+            9,
+            did_bob.as_bytes().to_vec(),
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 10: Alice verifies a tool (attestation-adjacent).
+        prev_hash = append(
+            &mut log,
+            &mut all_events,
+            EventType::ToolVerified,
+            &did_alice,
+            1_000_010,
+            10,
+            vec![],
+            &sk_alice,
+            prev_hash,
+        );
+
+        // Event 11: Bob sends another message.
+        let _ = append(
+            &mut log,
+            &mut all_events,
+            EventType::MessageSent,
+            &did_bob,
+            1_000_011,
+            11,
+            b"final message".to_vec(),
+            &sk_bob,
+            prev_hash,
+        );
+
+        assert_eq!(tree::event_count(&log), 12);
+
+        // Create a checkpoint capturing the current Merkle root.
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let checkpoint = generate_checkpoint(&log, &did_alice, 1, &custody, &key)
+            .await
+            .unwrap();
+
+        assert_eq!(checkpoint.event_count, 12);
+        assert_eq!(checkpoint.merkle_root, tree::root(&log));
+
+        // Compute behavioral record for Alice using the checkpoint's Merkle root.
+        // This is the core assertion of SCP-125 AC6: behavioral validation
+        // continues to work with checkpointed logs.
+        let record = compute_behavioral_record(
+            &all_events,
+            &did_alice,
+            "ctx-behavioral-checkpoint",
+            checkpoint.merkle_root,
+            2_000_000,
+        )
+        .unwrap();
+
+        // Alice participated in events 0,1,3,4,6,7,9,10 = 8 events.
+        assert_eq!(record.participation_count, 8);
+        // Duration: 1_000_010 - 1_000_000 = 10 seconds.
+        assert_eq!(record.participation_duration_seconds, 10);
+        // Tool invocations: search-tool x2.
+        assert_eq!(record.tool_invocations.len(), 1);
+        assert_eq!(record.tool_invocations.get("search-tool"), Some(&2));
+        // Governance actions by Alice: 1 (targeting Bob).
+        assert_eq!(record.governance_actions_by.len(), 1);
+        // Governance actions against Alice: 0.
+        assert_eq!(record.governance_actions_against.len(), 0);
+        // Role history for Alice: 0 (Alice assigned Bob, not herself).
+        assert_eq!(record.role_history.len(), 0);
+        // Attestation history: 1 (ToolVerified event).
+        assert_eq!(record.attestation_history.len(), 1);
+        // Context creation: 1.
+        assert_eq!(record.context_creation_count, 1);
+        // Merkle root matches checkpoint.
+        assert_eq!(record.event_log_root, checkpoint.merkle_root);
+
+        // Also verify Bob's behavioral record against the same checkpoint.
+        let bob_record = compute_behavioral_record(
+            &all_events,
+            &did_bob,
+            "ctx-behavioral-checkpoint",
+            checkpoint.merkle_root,
+            2_000_000,
+        )
+        .unwrap();
+
+        // Bob participated in events 2,5,8,11 = 4 events.
+        assert_eq!(bob_record.participation_count, 4);
+        // Duration: 1_000_011 - 1_000_002 = 9 seconds.
+        assert_eq!(bob_record.participation_duration_seconds, 9);
+        // Bob's tool invocations: execute-tool x1.
+        assert_eq!(bob_record.tool_invocations.len(), 1);
+        assert_eq!(bob_record.tool_invocations.get("execute-tool"), Some(&1));
+        // Bob is the target of Alice's governance action.
+        assert_eq!(bob_record.governance_actions_against.len(), 1);
+        // Bob was assigned a role.
+        assert_eq!(bob_record.role_history.len(), 1);
+        assert_eq!(bob_record.event_log_root, checkpoint.merkle_root);
+    }
+
+    // -------------------------------------------------------------------
+    // 27. Pruned proofs work for all leaf positions in various tree sizes
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -2442,7 +2737,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 27. Checkpoint creation does not mutate the log (non-blocking)
+    // 28. Checkpoint creation does not mutate the log (non-blocking)
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -2463,7 +2758,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 28. Manager checkpoint creation with explicit timestamp
+    // 29. Manager checkpoint creation with explicit timestamp
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -2490,7 +2785,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 29. Pruned proof path length is O(log n)
+    // 30. Pruned proof path length is O(log n)
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -2518,7 +2813,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 30. compute_root_from_leaves matches tree::root
+    // 31. compute_root_from_leaves matches tree::root
     // -------------------------------------------------------------------
 
     #[test]
@@ -2529,7 +2824,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 31. compute_root_from_leaves empty returns zero hash
+    // 32. compute_root_from_leaves empty returns zero hash
     // -------------------------------------------------------------------
 
     #[test]
@@ -2539,7 +2834,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 32. compute_root_from_leaves single leaf returns leaf
+    // 33. compute_root_from_leaves single leaf returns leaf
     // -------------------------------------------------------------------
 
     #[test]
@@ -2550,7 +2845,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 33. Truncated log rejects checkpoint with more events than log
+    // 34. Truncated log rejects checkpoint with more events than log
     // -------------------------------------------------------------------
 
     #[test]

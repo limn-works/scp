@@ -41,13 +41,13 @@ PyO3 is the established Rust-Python FFI framework, and maturin is the standard b
 
 ### Decision
 
-Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. The bridge exposes a flat set of `#[pyfunction]` and `#[pyclass]` definitions that map directly to scp-core's public API. Async functions use PyO3's native async support (`#[pyfunction] async fn`) to bridge Rust futures (tokio) to Python coroutines (asyncio). Rust `Result<T, E>` types are mapped to Python exceptions via a unified error hierarchy. All SCP domain types (Identity, ContextHandle, OuterEnvelope, UcanToken, etc.) are exposed as opaque Python objects with attribute access — no raw structs, no Rust generics, no lifetime markers visible to Python.
+Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. The bridge exposes a flat set of `#[pyfunction]` and `#[pyclass]` definitions that map directly to scp-core's public API. Async operations use synchronous `#[pyfunction]` with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the Python GIL. PyO3's experimental native async (`#[pyfunction] async fn`) was evaluated but rejected: it holds the GIL during `Future::poll` and does not integrate with the tokio runtime. Rust `Result<T, E>` types are mapped to Python exceptions via a unified error hierarchy. All SCP domain types (Identity, ContextHandle, OuterEnvelope, UcanToken, etc.) are exposed as opaque Python objects with attribute access — no raw structs, no Rust generics, no lifetime markers visible to Python.
 
 ### Rationale
 
 - **PyO3 over cffi/ctypes:** PyO3 generates native Python extension modules with automatic type conversion, exception mapping, and GIL management. cffi/ctypes require manual C ABI definitions and offer no async bridging. PyO3 is the Rust-Python standard with mature tooling.
 - **maturin over setuptools-rust:** maturin is purpose-built for PyO3/Rust-Python projects. It handles cross-compilation, wheel building for multiple platforms (manylinux, macOS universal2, Windows), and integrates with PyPI publishing. setuptools-rust requires more configuration and has fewer CI/CD integrations.
-- **Native async bridging (PyO3 0.22+):** PyO3 natively supports `async fn` in `#[pyfunction]` and `#[pymethods]`, converting Rust `Future`s into Python coroutines directly. The tokio runtime runs in a background thread pool; async functions declared with `async fn` automatically bridge between the two event loops. The deprecated `pyo3-asyncio` crate is no longer needed.
+- **Sync bridge with GIL release over native async:** PyO3 0.23 supports `async fn` in `#[pyfunction]` (experimental), but it holds the GIL during `Future::poll` and does not integrate with the tokio runtime — polling happens on the Python event loop thread, not on tokio worker threads. The `py.allow_threads(|| rt.block_on(...))` pattern releases the GIL for the entire duration of the async operation and runs on the shared tokio thread pool, providing superior concurrency. The deprecated `pyo3-asyncio` crate is not needed.
 - **Flat function surface:** The bridge layer is deliberately flat (no deep class hierarchies). Each Python-visible function maps to one Rust function. The Pythonic API (context managers, method chaining, iterators) is built in the pure Python wrapper layer (ADR-014), not in the FFI bridge. This keeps the bridge thin and testable.
 - **Opaque types over data transfer:** SCP types like `Identity`, `ContextHandle`, and `MlsGroup` contain crypto state that must not be serialized to Python objects. They are exposed as opaque PyO3 classes with getter methods for safe fields (DID string, context ID, state) and no access to internal key material.
 
@@ -58,7 +58,7 @@ Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. Th
 - **Crate:** `scp-ffi` (workspace member)
 - **Module:** `scp-ffi/pyo3/`
 - **Build output:** Python extension module `_scp_core` (imported by the `scp_sdk` Python package)
-- **Async runtime:** A single tokio `Runtime` is created at module import time and shared across all async calls. The runtime runs in a background thread pool managed by PyO3's native async machinery.
+- **Async runtime:** A single tokio `Runtime` is created at module import time and shared across all async calls. Bridge functions use `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the GIL.
 - **Platform wheels:** maturin builds wheels for manylinux (x86_64, aarch64), macOS (x86_64, arm64 universal2), and Windows (x86_64). CI/CD via GitHub Actions with maturin's `maturin-action`.
 
 ### Dependencies
@@ -70,22 +70,26 @@ Implement the FFI bridge as the `scp-ffi/pyo3/` crate using PyO3 and maturin. Th
 
 1. **Tokio runtime initialization:**
    - A tokio `Runtime` is created once at Python module import (`_scp_core.__init__`).
-   - The runtime is multi-threaded (default thread count) and stored in a `OnceCell<Runtime>`.
-   - All async bridge functions declared with `async fn` use PyO3's native async support, which automatically bridges between the tokio runtime and Python's asyncio event loop.
-   - **Runtime isolation:** The tokio runtime is NEVER accessed via `block_on` from within an async context. All sync->async bridging happens in the Python layer (via `run_coroutine_threadsafe` to a dedicated asyncio loop), which then calls the async bridge functions normally. The Rust side only ever sees async function calls driven by PyO3's native async machinery.
-   - Runtime shutdown is handled on module finalization (Python interpreter exit). The `Runtime` is dropped, which waits for in-flight tasks to complete (with a 5-second timeout).
+   - The runtime is multi-threaded (default thread count) and stored in a `OnceLock<Runtime>`.
+   - All async bridge functions use synchronous `#[pyfunction]` with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the Python GIL. This is preferred over PyO3's experimental native async, which holds the GIL during `Future::poll`.
+   - **Runtime isolation:** Bridge functions access the tokio runtime exclusively through `crate::runtime()?.block_on()` wrapped in `py.allow_threads()`. No bridge function calls `block_on` from within a tokio async context (which would panic). Sync-to-async bridging in the Python SDK wrapper uses `run_coroutine_threadsafe` to a dedicated asyncio loop.
+   - Runtime shutdown uses a two-phase design: (1) An `atexit` handler calls `shutdown_runtime()`, which blocks for 100ms to let cooperative tasks observe shutdown — kept short to avoid holding the Python GIL during interpreter exit. (2) On process exit, the static `OnceLock` is reclaimed and the tokio runtime is dropped, which waits for remaining tasks to complete.
+   - **Thread pool sizing guidance:** The `py.allow_threads(|| rt.block_on(...))` pattern blocks one tokio worker thread per concurrent Python call. With the default tokio thread count (number of CPU cores), a Python application making N concurrent SCP calls can exhaust the pool if N >= core count. Deployers should size the tokio runtime based on expected concurrency, monitor thread pool exhaustion (increasing latency, timeouts), and prefer `await`-based async calls from Python whenever possible.
 
 2. **Identity bridge functions:**
 
    ```rust
    #[pyfunction]
-   async fn py_identity_create(custody: &str) -> PyResult<PyIdentity> {
-       let identity = Identity::create(parse_custody(custody)?).await?;
-       Ok(PyIdentity::from(identity))
+   fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
+       let (key_custody, custody_str) = parse_custody(custody)?;
+       let rt = crate::runtime()?;
+       py.allow_threads(|| {
+           rt.block_on(async {
+               let identity = Identity::create(key_custody.as_ref()).await?;
+               Ok(PyIdentity::from(identity))
+           })
+       })
    }
-
-   #[pyfunction]
-   fn py_identity_resolve<'py>(py: Python<'py>, did: &str) -> PyResult<Bound<'py, PyAny>> { ... }
    ```
 
    - `py_identity_create(custody) -> PyIdentity` — creates a new DID identity. `custody` is a string: `"platform"`, `"in_memory"`.

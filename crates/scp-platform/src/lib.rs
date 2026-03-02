@@ -41,6 +41,8 @@ pub mod testing;
 // valid for backwards compatibility.
 #[cfg(feature = "software_platform")]
 pub use testing as software;
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod traits;
 
 // Re-export all public types for ergonomic access.

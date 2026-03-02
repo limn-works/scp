@@ -24,7 +24,7 @@ export interface ContextParams {
   /** Memory scope for context data retention. */
   readonly memoryScope?: "ephemeral" | "summary" | "full";
   /** Governance model for the context. */
-  readonly governance?: "single_admin";
+  readonly governance?: "single_admin" | "threshold" | "majority" | "unanimity";
   /** Context mode: encrypted MLS group or broadcast. */
   readonly mode?: "Encrypted" | "Broadcast";
   /** Ceiling policy: immutable or governed. */
@@ -220,7 +220,7 @@ export interface Event {
 /** A Merkle proof from the event log. */
 export interface Proof {
   /** `true` if the claim was verified successfully. */
-  readonly valid: boolean;
+  readonly verified: boolean;
   /** Proof type: `"inclusion"` or `"absence"`. */
   readonly proofType: "inclusion" | "absence";
   /** Proof details (Merkle path or sorted neighbors). */

@@ -8,14 +8,18 @@
 //!
 //! # Modules
 //!
+//! - [`broadcast`] — Broadcast key lifecycle and `BroadcastEnvelope` seal/open
+//!   for `ContextMode::Broadcast` contexts (§5.14).
 //! - [`encrypt`] — AES-256-GCM encrypt and decrypt operations.
 //!
 //! # Key Types
 //!
 //! - [`SenderKey`] — Opaque 32-byte AES-256 key handle.
+//! - [`BroadcastKey`] — Per-author broadcast key with epoch counter.
 //! - [`SenderKeyStore`] — In-memory store keyed by `(context_id, sender_did)`.
 //! - [`SenderKeyError`] — Error type for sender key operations.
 
+pub mod broadcast;
 pub mod encrypt;
 pub mod key_protocol;
 
@@ -23,7 +27,12 @@ use std::collections::HashMap;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub use broadcast::{
+    BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, generate_broadcast_key,
+    open_broadcast, rotate_broadcast_key, seal_broadcast,
+};
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
     BlockNotification, NonceDedup, RotateForBlockResult, SenderKeyEpochAdvance, SenderKeyRequest,
@@ -41,7 +50,11 @@ pub use key_protocol::{
 ///
 /// Sender keys are used to encrypt messages before MLS group encryption,
 /// enabling per-relationship blocking. See ADR-007.
-#[derive(Clone)]
+///
+/// Key material is zeroized on drop to prevent sensitive bytes from
+/// persisting in freed memory. Clone is retained for API compatibility
+/// (e.g. `SenderKeyStore::get_all`).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SenderKey([u8; 32]);
 
 impl SenderKey {
@@ -151,6 +164,22 @@ pub enum SenderKeyError {
     /// The epoch counter overflowed (reached `u64::MAX`).
     #[error("epoch counter overflow: already at u64::MAX")]
     EpochOverflow,
+
+    /// The broadcast key epoch does not match the envelope epoch.
+    ///
+    /// The caller must provide a key whose epoch matches the envelope's
+    /// `key_epoch` field for decryption to succeed.
+    #[error("epoch mismatch: key epoch {expected}, envelope epoch {actual}")]
+    EpochMismatch {
+        /// The epoch of the provided key.
+        expected: u64,
+        /// The epoch specified in the envelope.
+        actual: u64,
+    },
+
+    /// The system clock is unavailable or before the Unix epoch.
+    #[error("clock error: {0}")]
+    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------

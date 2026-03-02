@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
 use super::capability::CapabilityUri;
+use super::nonce::generate_nonce;
 use super::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
@@ -67,38 +68,14 @@ pub struct MintParams<'a> {
     pub facts: Option<serde_json::Value>,
 }
 
-/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
-///
-/// The timestamp prefix enables efficient pruning of expired nonces. The 16
-/// random bytes (32 hex chars) ensure uniqueness even under high concurrency.
-///
-/// See ADR-009 acceptance criterion 7 and ADR-016 acceptance criterion 6.
-fn generate_nonce() -> String {
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-
-    let mut random_bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random_bytes);
-
-    let hex_suffix = random_bytes
-        .iter()
-        .fold(String::with_capacity(32), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-
-    format!("{now_millis}-{hex_suffix}")
-}
-
 /// Returns the current Unix timestamp in seconds.
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+///
+/// # Errors
+///
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix
+/// epoch. Defaulting to zero would silently produce expired tokens.
+fn now_secs() -> Result<u64, UcanError> {
+    crate::time::now_secs().map_err(UcanError::from)
 }
 
 /// Mints a new UCAN token with Ed25519 signature.
@@ -120,6 +97,7 @@ fn now_secs() -> u64 {
 ///
 /// # Errors
 ///
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix epoch.
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
 /// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
 ///
@@ -133,7 +111,7 @@ pub async fn mint_ucan(
         return Err(UcanError::ExpiryTooFar(params.lifetime_secs));
     }
 
-    let now = now_secs();
+    let now = now_secs()?;
     let exp = now + params.lifetime_secs;
 
     // Build attestations from capabilities, scoped to the context.
@@ -160,7 +138,7 @@ pub async fn mint_ucan(
         aud: params.audience_did.to_owned(),
         exp,
         nbf: params.not_before,
-        nnc: generate_nonce(),
+        nnc: generate_nonce()?,
         att,
         prf: params.proofs.clone(),
         fct: params.facts.clone(),
@@ -285,6 +263,7 @@ pub struct DelegateParams<'a> {
 /// `parent_token.payload.aud`.
 /// Returns [`UcanError::AttenuationViolation`] if any capability in
 /// `attenuated_capabilities` is not granted by the parent token.
+/// Returns [`UcanError::ClockError`] if the system clock is before the Unix epoch.
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
 /// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
 ///
@@ -303,13 +282,21 @@ pub async fn delegate_ucan(
 
     // Step 2: Verify attenuation — all requested capabilities must be a subset
     // of the parent token's capabilities (never widen).
+    // SECURITY: fail-closed — any unparseable parent URI rejects the entire delegation.
     let parent_caps: Vec<CapabilityUri> = params
         .parent_token
         .payload
         .att
         .iter()
-        .filter_map(|att| att.with.parse::<CapabilityUri>().ok())
-        .collect();
+        .map(|att| {
+            att.with.parse::<CapabilityUri>().map_err(|_| {
+                UcanError::MalformedToken(format!(
+                    "unparseable capability URI in parent token: {}",
+                    att.with
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     for child_att in params.attenuated_capabilities {
         let child_cap: CapabilityUri = child_att.with.parse().map_err(|e: UcanError| {
@@ -333,7 +320,7 @@ pub async fn delegate_ucan(
         return Err(UcanError::ExpiryTooFar(params.lifetime_secs));
     }
 
-    let now = now_secs();
+    let now = now_secs()?;
     let exp = now + params.lifetime_secs;
 
     // Step 4: Compute the parent token's CID for the proof chain.
@@ -349,7 +336,7 @@ pub async fn delegate_ucan(
         aud: params.delegatee_did.to_owned(),
         exp,
         nbf: None,
-        nnc: generate_nonce(),
+        nnc: generate_nonce()?,
         att: params.attenuated_capabilities.to_vec(),
         prf: proofs,
         fct: params.facts.clone(),

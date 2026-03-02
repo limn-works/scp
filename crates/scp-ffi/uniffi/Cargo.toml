@@ -20,15 +20,21 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
+scp-ffi-common = { path = "../common" }
+hex = { workspace = true }
 # The `testing` feature enables InMemoryKeyCustody, used by the `"in_memory"`
 # custody path in `identity_create`. This is an intentional bridge-layer
 # dependency: the in-memory custody path is needed for testing, CLI use, and
 # desktop contexts where no hardware security module is available.
 scp-platform = { path = "../../scp-platform", features = ["software_platform"] }
 scp-transport = { path = "../../scp-transport" }
+base64 = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+z-base-32 = { workspace = true }
 
 [dev-dependencies]
 scp-platform = { path = "../../scp-platform", features = ["software_platform"] }

@@ -38,7 +38,7 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// Wraps [`InMemoryKeyCustody`] with a redacted `Debug` impl.
 ///
 /// Prevents key material from appearing in log output or panic messages.
-struct OpaqueInMemoryKeyCustody(InMemoryKeyCustody);
+pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) InMemoryKeyCustody);
 
 impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -52,22 +52,20 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 
 /// Inner state for a [`NapiIdentity`] handle.
 #[derive(Debug)]
-struct NapiIdentityInner {
+pub(crate) struct NapiIdentityInner {
     /// The DID string (e.g., `"did:dht:z6Mk..."`).
-    did: String,
+    pub(crate) did: String,
     /// The custody type string: `"in_memory"`, `"platform"`, or `"software"`.
-    custody_type: String,
+    pub(crate) custody_type: String,
     /// Retained `ScpIdentity` for in-memory custody paths.
     ///
     /// Holds the `KeyHandle`s into `in_memory_custody`. Must outlive any
     /// signing or key-rotation operation on this handle.
-    #[allow(dead_code)]
-    scp_identity: Option<ScpIdentity>,
+    pub(crate) scp_identity: Option<ScpIdentity>,
     /// Retained `InMemoryKeyCustody` for in-memory custody paths.
     ///
     /// Key material lives here. Dropping this destroys all private keys.
-    #[allow(dead_code)]
-    in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
+    pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +87,7 @@ struct NapiIdentityInner {
 #[napi]
 pub struct NapiIdentity {
     /// Shared inner state.
-    inner: Arc<NapiIdentityInner>,
+    pub(crate) inner: Arc<NapiIdentityInner>,
 }
 
 #[napi]
@@ -132,6 +130,22 @@ impl NapiIdentity {
             code: "SCP-IDENT-1002".to_owned(),
         }
         .into())
+    }
+}
+
+impl NapiIdentity {
+    /// Returns the retained `InMemoryKeyCustody` if this identity uses in-memory
+    /// custody. Used by context creation for routing ID derivation (SCP-214).
+    #[allow(dead_code)]
+    pub(crate) fn in_memory_custody(&self) -> Option<&InMemoryKeyCustody> {
+        self.inner.in_memory_custody.as_ref().map(|c| &c.0)
+    }
+
+    /// Returns the retained `ScpIdentity` if available. Used by context creation
+    /// for routing ID derivation (SCP-214).
+    #[allow(dead_code)]
+    pub(crate) fn scp_identity(&self) -> Option<&ScpIdentity> {
+        self.inner.scp_identity.as_ref()
     }
 }
 
@@ -197,7 +211,7 @@ pub struct NapiDIDDocument {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-VAL-7007` if `custody` is not a recognized value.
+/// - Rejects with `SCP-VALID-7007` if `custody` is not a recognized value.
 /// - Rejects with `SCP-IDENT-1003` for `"platform"` or `"software"` custody
 ///   (not yet wired).
 /// - Rejects with `SCP-IDENT-1001` if key generation or DID creation fails.

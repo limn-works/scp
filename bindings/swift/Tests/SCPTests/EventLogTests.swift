@@ -11,10 +11,10 @@ import Testing
 /// UniFFI Event fields: eventType, actorDid, timestamp, payloadJson (String), sequence
 /// UniFFI Proof fields: verified (Bool), proofType (String), detailsJson (String)
 ///
-/// These tests validate the Swift ergonomics layer and type shapes. The
-/// UniFFI bridge stubs return placeholder errors until SCP-103 ships.
+/// Async roundtrip tests inject mock bridge functions to verify the delegation
+/// pattern works end-to-end without a real UniFFI binary.
 ///
-/// See ADR-011 (Event Log), ADR-026 (Swift SDK), and story SCP-102.
+/// See ADR-011 (Event Log), ADR-026 (Swift SDK), and story SCP-221.
 @Suite("Event Log Tests")
 struct EventLogTests {
 
@@ -22,8 +22,6 @@ struct EventLogTests {
 
     @Test("Event stores all fields correctly")
     func eventFields() {
-        // UniFFI Event uses payloadJson (String) instead of payload (Data).
-        // No prevHash or signature fields in the UniFFI version.
         let event = Event(
             eventType: "message_sent",
             actorDid: "did:dht:z6MkActor",
@@ -68,7 +66,6 @@ struct EventLogTests {
 
     @Test("Proof stores verified flag, type, and details JSON")
     func proofFields() {
-        // UniFFI Proof: verified (Bool), proofType (String), detailsJson (String)
         let proof = Proof(
             verified: true,
             proofType: "inclusion",
@@ -161,71 +158,120 @@ struct EventLogTests {
         #expect(log is EventLog)
     }
 
-    // MARK: - Append (query -- bridge stub error propagation)
+    // MARK: - Query via injectable bridge (async roundtrip)
 
-    @Test("EventLog query throws bridge error with SCP-ELOG-001")
-    func queryThrowsBridgeError() async {
-        let handle = EventLogHandle(contextId: "ctx-query")
+    @Test("EventLog query calls bridge and returns events")
+    func queryRoundtrip() async throws {
+        let contextHandle = ContextHandle(noPointer: .init())
+        let handle = EventLogHandle(contextHandle: contextHandle)
+
+        let mockEvents = [
+            Event(
+                eventType: "message_sent",
+                actorDid: "did:dht:z6MkActor",
+                timestamp: 1_700_000_000,
+                payloadJson: #"{"content": "test"}"#,
+                sequence: 1
+            ),
+            Event(
+                eventType: "message_sent",
+                actorDid: "did:dht:z6MkActor",
+                timestamp: 1_700_000_001,
+                payloadJson: #"{"content": "test2"}"#,
+                sequence: 2
+            ),
+        ]
+
+        let mockQuery: EventLogBridge.QueryFn = { _, filterJson in
+            #expect(filterJson != nil)
+            #expect(filterJson!.contains("after_sequence"))
+            return mockEvents
+        }
+
+        let log = EventLog(handle: handle, queryFn: mockQuery)
+        let events = try await log.query(fromSequence: 0, limit: 10)
+
+        #expect(events.count == 2)
+        #expect(events[0].sequence == 1)
+        #expect(events[1].sequence == 2)
+    }
+
+    @Test("EventLog query throws when not backed by ContextHandle")
+    func queryThrowsWithoutContextHandle() async {
+        let handle = EventLogHandle(contextId: "ctx-no-handle")
         let log = EventLog(handle: handle)
 
         do {
             _ = try await log.query(fromSequence: 0, limit: 10)
             Issue.record("Expected query to throw")
         } catch let error as ScpError {
-            if case .Validation(_, let code) = error {
-                #expect(code == "SCP-ELOG-001")
+            if case .Context(_, let code) = error {
+                #expect(code == "SCP-CTX-2030")
             } else {
-                Issue.record("Expected ScpError.Validation, got \(error)")
+                Issue.record("Expected ScpError.Context, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
     }
 
-    // MARK: - Prove inclusion (bridge stub error propagation)
+    // MARK: - Prove inclusion via injectable bridge (async roundtrip)
 
-    @Test("EventLog proveInclusion throws bridge error with SCP-ELOG-002")
-    func proveInclusionThrowsBridgeError() async {
-        let handle = EventLogHandle(contextId: "ctx-prove")
+    @Test("EventLog proveInclusion calls bridge and returns proof")
+    func proveInclusionRoundtrip() async throws {
+        let contextHandle = ContextHandle(noPointer: .init())
+        let handle = EventLogHandle(contextHandle: contextHandle)
+
+        let mockProof = Proof(
+            verified: true,
+            proofType: "inclusion",
+            detailsJson: #"{"leaf_index": 5}"#
+        )
+
+        let mockVerify: EventLogBridge.VerifyFn = { _, claimJson in
+            #expect(claimJson.contains("inclusion"))
+            #expect(claimJson.contains("leaf_index"))
+            return mockProof
+        }
+
+        let log = EventLog(handle: handle, verifyFn: mockVerify)
+        let proof = try await log.proveInclusion(leafIndex: 5)
+
+        #expect(proof.verified)
+        #expect(proof.proofType == "inclusion")
+    }
+
+    @Test("EventLog proveInclusion throws when not backed by ContextHandle")
+    func proveInclusionThrowsWithoutContextHandle() async {
+        let handle = EventLogHandle(contextId: "ctx-no-handle")
         let log = EventLog(handle: handle)
 
         do {
             _ = try await log.proveInclusion(leafIndex: 0)
             Issue.record("Expected proveInclusion to throw")
         } catch let error as ScpError {
-            if case .Validation(_, let code) = error {
-                #expect(code == "SCP-ELOG-002")
+            if case .Context(_, let code) = error {
+                #expect(code == "SCP-CTX-2031")
             } else {
-                Issue.record("Expected ScpError.Validation, got \(error)")
+                Issue.record("Expected ScpError.Context, got \(error)")
             }
         } catch {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
     }
 
-    // MARK: - Verify proof (bridge stub error propagation)
+    // MARK: - Verify proof (pure function, no bridge)
 
-    @Test("EventLog verifyInclusion throws bridge error with SCP-ELOG-003")
-    func verifyInclusionThrowsBridgeError() async {
-        // UniFFI Proof: verified, proofType, detailsJson
-        let proof = Proof(
-            verified: false,
-            proofType: "inclusion",
-            detailsJson: "{}"
-        )
+    @Test("EventLog verifyInclusion returns proof.verified")
+    func verifyInclusionReturnsVerified() async throws {
+        let validProof = Proof(verified: true, proofType: "inclusion", detailsJson: "{}")
+        let invalidProof = Proof(verified: false, proofType: "inclusion", detailsJson: "{}")
 
-        do {
-            _ = try await EventLog.verifyInclusion(proof)
-            Issue.record("Expected verifyInclusion to throw")
-        } catch let error as ScpError {
-            if case .Validation(_, let code) = error {
-                #expect(code == "SCP-ELOG-003")
-            } else {
-                Issue.record("Expected ScpError.Validation, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
+        let validResult = try await EventLog.verifyInclusion(validProof)
+        let invalidResult = try await EventLog.verifyInclusion(invalidProof)
+
+        #expect(validResult == true)
+        #expect(invalidResult == false)
     }
 
 } // end EventLogTests

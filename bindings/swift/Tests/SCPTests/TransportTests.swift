@@ -13,11 +13,10 @@ import Testing
 ///   - relayUrl: String?
 ///   - latencyMs: Double?
 ///
-/// These tests validate the Swift ergonomics layer and type shapes for
-/// transport operations. The UniFFI bridge stubs return placeholder errors
-/// until SCP-103 ships.
+/// Async roundtrip tests inject mock bridge functions to verify the delegation
+/// pattern works end-to-end without a real UniFFI binary.
 ///
-/// See ADR-032 (Transport), ADR-026 (Swift SDK), and story SCP-102.
+/// See ADR-032 (Transport), ADR-026 (Swift SDK), and story SCP-221.
 @Suite("Transport Tests")
 struct TransportTests {
 
@@ -111,34 +110,34 @@ struct TransportTests {
         #expect(status is TransportStatus)
     }
 
-    // MARK: - Connect (bridge stub error propagation)
+    // MARK: - Connect via injectable bridge (async roundtrip)
 
-    @Test("connectTransport throws bridge error with SCP-TRANSPORT-001")
-    func connectThrowsBridgeError() async {
-        let config = TransportConfig(relayUrls: ["wss://relay.test/scp/v1"])
-        do {
-            try await connectTransport(config: config)
-            Issue.record("Expected connectTransport to throw")
-        } catch let error as ScpError {
-            if case .Transport(_, let code) = error {
-                #expect(code == "SCP-TRANSPORT-001")
-            } else {
-                Issue.record("Expected ScpError.Transport, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
+    @Test("connectTransport calls bridge and returns manager")
+    func connectRoundtrip() async throws {
+        let mockManager = TransportManager(noPointer: .init())
+        var receivedUrl: String?
+
+        let mockConnect: TransportBridge.ConnectFn = { relayUrl in
+            receivedUrl = relayUrl
+            return mockManager
         }
+
+        let config = TransportConfig(relayUrls: ["wss://relay.test/scp/v1"])
+        let manager = try await connectTransport(config: config, connectFn: mockConnect)
+
+        #expect(receivedUrl == "wss://relay.test/scp/v1")
+        #expect(manager === mockManager)
     }
 
-    @Test("connectTransport with empty relay URLs throws bridge error")
-    func connectWithEmptyUrlsThrowsBridgeError() async {
+    @Test("connectTransport throws with empty relay URLs")
+    func connectWithEmptyUrlsThrows() async {
         let config = TransportConfig()
         do {
-            try await connectTransport(config: config)
+            _ = try await connectTransport(config: config)
             Issue.record("Expected connectTransport to throw")
         } catch let error as ScpError {
             if case .Transport(_, let code) = error {
-                #expect(code == "SCP-TRANSPORT-001")
+                #expect(code == "SCP-TRANS-5001")
             } else {
                 Issue.record("Expected ScpError.Transport, got \(error)")
             }
@@ -147,30 +146,35 @@ struct TransportTests {
         }
     }
 
-    // MARK: - Status query (bridge stub error propagation)
+    // MARK: - Status via injectable bridge (async roundtrip)
 
-    @Test("transportStatus throws bridge error with SCP-TRANSPORT-002")
-    func statusThrowsBridgeError() async {
-        do {
-            _ = try await transportStatus()
-            Issue.record("Expected transportStatus to throw")
-        } catch let error as ScpError {
-            if case .Transport(_, let code) = error {
-                #expect(code == "SCP-TRANSPORT-002")
-            } else {
-                Issue.record("Expected ScpError.Transport, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
+    @Test("queryTransportStatus calls bridge and returns status")
+    func statusRoundtrip() async throws {
+        let mockManager = TransportManager(noPointer: .init())
+        let expectedStatus = TransportStatus(
+            connected: true,
+            relayUrl: "wss://relay.test/scp/v1",
+            latencyMs: 15.0
+        )
+
+        let mockStatus: TransportBridge.StatusFn = { _ in
+            return expectedStatus
         }
+
+        let result = try await queryTransportStatus(
+            manager: mockManager,
+            statusFn: mockStatus
+        )
+
+        #expect(result.connected)
+        #expect(result.relayUrl == "wss://relay.test/scp/v1")
+        #expect(result.latencyMs == 15.0)
     }
 
     // MARK: - Envelope sending (via Context)
 
     @Test("Context send delegates payload to bridge function")
     func contextSendDelegatesPayload() async throws {
-        // This is effectively an envelope send test -- Context.send() wraps
-        // the payload in an MLS-encrypted envelope via the bridge function.
         let handle = MockTransportContextHandle(id: "transport-ctx", state: "active")
         var sentPayload: Data?
 
@@ -205,7 +209,6 @@ struct TransportTests {
         let sendFn: ContextBridge.SendFn = { _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, listener in
             subscribed = true
-            // Immediately complete to avoid hanging
             listener.onComplete()
         }
         let leaveFn: ContextBridge.LeaveFn = { _ in }
@@ -220,7 +223,6 @@ struct TransportTests {
         )
 
         let stream = await context.messages
-        // Consume the stream to trigger subscription
         for await _ in stream {}
 
         #expect(subscribed)

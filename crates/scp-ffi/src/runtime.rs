@@ -5,6 +5,17 @@
 //! UCAN state). This module provides a global registry that maps context IDs
 //! to their associated runtime state.
 //!
+//! # Safety: Single-Tenant Only (RED-017)
+//!
+//! **All registries in this module are process-global.** In multi-tenant
+//! deployments (e.g., Django/FastAPI serving multiple SCP users), all tenants
+//! share these registries. Context IDs and identity DIDs from one tenant are
+//! accessible to another. This is a known architectural limitation.
+//!
+//! The NAPI (`Node.js`), `UniFFI` (Swift/Kotlin), and WASM bridges avoid this
+//! issue by using per-instance handle objects instead of global registries.
+//! The `PyO3` bridge must be refactored to match. See SCP-228.
+//!
 //! # Pattern
 //!
 //! Uses [`DashMap`] for lock-free concurrent reads. Most bridge operations
@@ -44,14 +55,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
-use scp_core::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::event_log::EventLog;
 use scp_core::identity::cache::SystemClock;
+use scp_core::identity::{DidDocument, ScpIdentity};
+use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::adapter::NativeRelayAdapter;
+use tokio::sync::mpsc;
 
+use crate::context::PyMessage;
 use crate::error::ScpPyError;
 
 /// A sync tool handler function that takes JSON input and returns JSON output.
@@ -65,6 +80,16 @@ pub type ToolHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 /// Global registry of per-context runtime state.
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. In multi-tenant deployments (e.g., a web
+/// server serving multiple SCP users), ALL tenants share this registry. Context
+/// IDs and identity DIDs from one tenant are accessible to another. This is a
+/// known architectural limitation tracked for resolution before production
+/// multi-tenant deployment.
+///
+/// See RED-017 in the security review. Follow-on story: SCP-228.
 static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::new();
 
 /// Global registry of known context-to-relay mappings for discovery (SCP-213).
@@ -73,6 +98,16 @@ static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::n
 /// routing IDs and relay URLs. This allows `py_mcp_load_contexts` to probe
 /// relays for context activity even across process restarts (when combined
 /// with persistence, a future story).
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. In multi-tenant deployments (e.g., a web
+/// server serving multiple SCP users), ALL tenants share this registry. Context
+/// IDs and identity DIDs from one tenant are accessible to another. This is a
+/// known architectural limitation tracked for resolution before production
+/// multi-tenant deployment.
+///
+/// See RED-017 in the security review. Follow-on story: SCP-228.
 static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new();
 
 /// Global relay connection for context discovery probing.
@@ -80,7 +115,29 @@ static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new()
 /// Set by [`set_relay_connection`] when `py_transport_connect` succeeds.
 /// Read by `py_mcp_load_contexts` to probe routing IDs on the relay.
 /// Uses `RwLock` for infrequent writes (connect) and concurrent reads (probe).
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. In multi-tenant deployments (e.g., a web
+/// server serving multiple SCP users), ALL tenants share this registry. Context
+/// IDs and identity DIDs from one tenant are accessible to another. This is a
+/// known architectural limitation tracked for resolution before production
+/// multi-tenant deployment.
+///
+/// See RED-017 in the security review. Follow-on story: SCP-228.
 static RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>> = OnceLock::new();
+
+/// Global identity registry mapping DID strings to retained identity state.
+///
+/// Stores the [`ScpIdentity`] (with opaque [`KeyHandle`]s), the
+/// [`Arc<InMemoryKeyCustody>`] that owns the key material, and the
+/// [`DidDocument`]. This allows bridge functions to perform crypto
+/// operations (signing, pseudonym derivation, key rotation) without private
+/// key material crossing the FFI boundary (ADR-006).
+///
+/// Uses [`DashMap`] for lock-free concurrent access matching the context
+/// registry pattern.
+static IDENTITY_REGISTRY: OnceLock<DashMap<String, IdentityEntry>> = OnceLock::new();
 
 /// Returns a reference to the global context registry.
 fn registry() -> &'static DashMap<String, ContextRuntime> {
@@ -95,6 +152,111 @@ fn known_contexts_registry() -> &'static DashMap<String, KnownContext> {
 /// Returns a reference to the global relay connection state.
 fn relay_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
     RELAY_CONNECTION.get_or_init(|| RwLock::new(None))
+}
+
+/// Buffer capacity for the receive channel (SCP-216, sketch.md §receive).
+///
+/// When the buffer is full, the oldest unconsumed event is dropped and a
+/// `BufferOverflow` warning is injected into the stream.
+pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
+
+/// Returns a reference to the global identity registry.
+fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
+    IDENTITY_REGISTRY.get_or_init(DashMap::new)
+}
+
+// ---------------------------------------------------------------------------
+// Identity registry (SCP-214: KeyCustody wiring)
+// ---------------------------------------------------------------------------
+
+/// Retained identity state for a single DID.
+///
+/// Stores the [`ScpIdentity`] (opaque key handles), the [`InMemoryKeyCustody`]
+/// that owns the key material, and the [`DidDocument`]. The custody provider
+/// is behind an `Arc` so it can be shared with context-scoped operations
+/// (pseudonym derivation, signing, UCAN minting) without moving or cloning
+/// the key material.
+///
+/// See ADR-006 and SCP-214 criterion 3.
+pub struct IdentityEntry {
+    /// The scp-core identity handle (DID string, key handles, pre-rotation).
+    pub identity: ScpIdentity,
+    /// The key custody provider that manages the actual key material.
+    pub custody: Arc<InMemoryKeyCustody>,
+    /// The DID document for this identity.
+    pub document: DidDocument,
+}
+
+/// Registers an identity in the global identity registry.
+///
+/// Called by `py_identity_create` after successfully creating an identity.
+/// Subsequent bridge functions (UCAN minting, pseudonym derivation, key
+/// rotation) look up the identity by DID to access the retained custody
+/// provider and key handles.
+///
+/// Overwrites any existing entry for the same DID (idempotent).
+pub fn register_identity(did: &str, entry: IdentityEntry) {
+    identity_registry().insert(did.to_owned(), entry);
+}
+
+/// Executes a closure with a reference to an identity's retained state.
+///
+/// Looks up the identity by DID in the global registry and calls `f` with
+/// a reference to the [`IdentityEntry`]. Uses `DashMap::get` for fine-grained
+/// per-key locking.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if the DID is not found.
+pub fn with_identity<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+where
+    F: FnOnce(&IdentityEntry) -> Result<T, ScpPyError>,
+{
+    let entry = identity_registry().get(did).ok_or_else(|| {
+        ScpPyError::IdentityError(format!(
+            "identity '{did}' not found in registry \
+             -- was it created with py_identity_create?"
+        ))
+    })?;
+
+    f(entry.value())
+}
+
+/// Executes a closure with mutable access to an identity's retained state.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if the DID is not found.
+pub fn with_identity_mut<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+where
+    F: FnOnce(&mut IdentityEntry) -> Result<T, ScpPyError>,
+{
+    let mut entry = identity_registry().get_mut(did).ok_or_else(|| {
+        ScpPyError::IdentityError(format!(
+            "identity '{did}' not found in registry \
+             -- was it created with py_identity_create?"
+        ))
+    })?;
+
+    f(entry.value_mut())
+}
+
+/// Returns `true` if the identity registry contains an entry for the given DID.
+///
+/// Used by `py_identity_load` to check whether a loaded identity has live
+/// crypto state before returning it. Without registry presence, a loaded
+/// identity would be a dangling handle (SCP-IDENT-1010).
+#[must_use]
+pub fn identity_registry_contains(did: &str) -> bool {
+    identity_registry().contains_key(did)
+}
+
+/// Removes an identity from the global registry.
+///
+/// Called when an identity is migrated to a new DID. The old entry is
+/// removed and the new entry is registered under the new DID.
+pub fn remove_identity(did: &str) {
+    identity_registry().remove(did);
 }
 
 /// Per-context runtime state: the live objects needed by bridge functions.
@@ -129,26 +291,25 @@ pub struct ContextRuntime {
     ///
     /// See SCP-212 for the handler registration design.
     pub tool_handlers: HashMap<String, ToolHandler>,
+    /// Sender half of the receive channel (SCP-216).
+    ///
+    /// Stored here so that the transport layer (and `deliver_message`) can
+    /// feed messages into the channel. The receiver half is held by the
+    /// `PyMessageReceiver` returned from `py_context_receive`. Dropping
+    /// the sender closes the channel, causing `__anext__` to raise
+    /// `StopAsyncIteration`.
+    pub message_tx: Option<mpsc::Sender<PyMessage>>,
+    /// Shared reference to the receiver half of the receive channel (SCP-216).
+    ///
+    /// Shared with `PyMessageReceiver` via `Arc`. Used by `deliver_message`
+    /// to implement oldest-drop overflow: when the buffer is full, the
+    /// oldest item is popped from the receiver before sending the new one.
+    /// Uses `tokio::sync::Mutex` so the lock can be held across `.await`
+    /// points in `__anext__`.
+    pub message_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>>,
 }
 
-/// Default capability ceiling for new contexts.
-///
-/// Includes all standard SCP capabilities. This matches the ceiling used in
-/// scp-core test helpers.
-fn default_ceiling() -> CapabilityCeiling {
-    CapabilityCeiling::new([
-        Capability::MessagesRead,
-        Capability::MessagesWrite,
-        Capability::ToolRegister,
-        Capability::ToolInvokeAll,
-        Capability::RoleAssign,
-        Capability::MemberInvite,
-        Capability::MemberRemove,
-        Capability::GovernancePropose,
-        Capability::GovernanceVote,
-        Capability::ContextClose,
-    ])
-}
+// default_ceiling() imported from scp_core::context::roles.
 
 /// Registers a new context in the global runtime registry.
 ///
@@ -196,6 +357,8 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
                 ceiling_strings,
                 creator_did: creator_did.to_owned(),
                 tool_handlers: HashMap::new(),
+                message_tx: None,
+                message_rx: None,
             };
 
             vacant.insert(runtime);
@@ -278,11 +441,100 @@ pub fn register_tool_handler(
 /// Removes a context from the global runtime registry.
 ///
 /// Called when a context is closed. All associated runtime objects are dropped.
+/// Dropping the `ContextRuntime` also drops `message_tx`, which closes the
+/// receive channel and causes `__anext__` to raise `StopAsyncIteration`.
 /// Does not error if the context was not found (idempotent).
 pub fn remove_context(context_id: &str) {
     registry().remove(context_id);
-    // Also remove from known-contexts registry.
     known_contexts_registry().remove(context_id);
+}
+
+/// Closes the receive channel for a context by dropping the sender (SCP-216).
+///
+/// Called by `py_context_leave` when a member leaves. Dropping the sender
+/// causes any `PyMessageReceiver` holding the receiver half to observe
+/// channel closure: `recv()` returns `None` and `__anext__` raises
+/// `StopAsyncIteration`.
+///
+/// Does nothing if no channel was open (idempotent).
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context is not found.
+pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
+    with_context(context_id, |rt| {
+        rt.message_tx.take();
+        rt.message_rx.take();
+        Ok(())
+    })
+}
+
+/// Delivers a message to a context's receive channel (SCP-216).
+///
+/// Implements oldest-drop overflow per sketch.md: when the buffer is full
+/// (1000 events), exactly 1 oldest unconsumed event is popped from the
+/// receiver, and the new message is sent in the freed slot. If there is
+/// additional capacity after the send (i.e. the consumer drained an item
+/// between the pop and the send), a `BufferOverflow` warning is also
+/// injected so consumers can track drop events.
+///
+/// The function extracts channel references from the runtime registry (brief
+/// `DashMap` shard lock), then operates on the channel outside the lock to
+/// avoid holding the shard lock during overflow handling.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context is not found, has no
+/// active receive channel, or if the channel is closed.
+pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPyError> {
+    let (tx, rx_arc) = with_context(context_id, |rt| {
+        let tx = rt.message_tx.clone().ok_or_else(|| {
+            ScpPyError::ContextError(format!(
+                "context '{context_id}' has no active receive channel \
+                 -- call py_context_receive first"
+            ))
+        })?;
+        let rx = rt.message_rx.clone().ok_or_else(|| {
+            ScpPyError::ContextError("receive channel has no shared receiver reference".to_owned())
+        })?;
+        Ok((tx, rx))
+    })?;
+
+    match tx.try_send(message.clone()) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Use blocking_lock() instead of try_lock() to guarantee
+            // oldest-drop semantics. try_lock() would drop the NEW message
+            // on lock contention -- the opposite of documented behavior
+            // (RED-021). The lock is only held for a single try_recv()
+            // (VecDeque pop_front), so blocking is brief and safe.
+            let mut rx_guard = rx_arc.blocking_lock();
+
+            let _ = rx_guard.try_recv();
+            drop(rx_guard);
+
+            tx.try_send(message).map_err(|e| {
+                ScpPyError::ContextError(format!(
+                    "failed to deliver message to context '{context_id}' \
+                     after overflow drop: {e}"
+                ))
+            })?;
+
+            let overflow_warning = PyMessage::new(
+                "scp:system".to_owned(),
+                b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                context_id.to_owned(),
+            );
+            let _ = tx.try_send(overflow_warning);
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(ScpPyError::ContextError(format!(
+            "receive channel for context '{context_id}' is closed"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,31 +594,67 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 }
 
 // ---------------------------------------------------------------------------
-// Stub — see SCP-214 for KeyCustody wiring (interim pseudonym derivation)
+// Storage provider registry (SCP-217: identity persistence)
 // ---------------------------------------------------------------------------
 
-/// Returns a 32-byte random secret for the given identity DID, creating one
-/// if none exists.
+/// Global storage provider for identity persistence.
 ///
-/// This is an interim mechanism for pseudonym derivation until `KeyCustody`
-/// is wired into the FFI bridge. The secret provides actual unlinkability
-/// (unlike using the public DID as the HMAC key). The secret is in-memory
-/// only and will not match across process restarts.
+/// Injected via [`init_storage`] at Python initialization time. Bridge
+/// functions use [`get_storage`] to access the provider for storing and
+/// loading identity state. The storage backend is `InMemoryStorage` for
+/// now -- persistent backends (`SQLite` via [`SqliteStorage`]) will replace it
+/// when platform storage adapters land.
 ///
-/// **Note:** The internal `IDENTITY_ROUTING_SECRETS` map grows without eviction,
-/// but is bounded by unique identity DIDs (typically 1–2 per process). This
-/// entire function is removed when `KeyCustody` is wired in (SCP-214).
+/// Uses the same `OnceLock` pattern as `CONTEXT_REGISTRY` and
+/// `RELAY_CONNECTION`. The `Arc` enables shared ownership across bridge
+/// functions without lifetime issues.
 ///
-/// When `KeyCustody` is wired in, replace callers with
-/// `scp_core::envelope::pseudonym::derive_pseudonym` using real key material.
-pub fn get_or_create_routing_secret(identity_did: &str) -> [u8; 32] {
-    static IDENTITY_ROUTING_SECRETS: OnceLock<DashMap<String, [u8; 32]>> = OnceLock::new();
+/// See spec section 17.3 for key conventions and section 17.4 for
+/// `ProtocolStore` design.
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. In multi-tenant deployments,
+/// ALL tenants share the storage provider. See RED-017 / SCP-228.
+static STORAGE_PROVIDER: OnceLock<Arc<InMemoryStorage>> = OnceLock::new();
 
-    let map = IDENTITY_ROUTING_SECRETS.get_or_init(DashMap::new);
-    *map.entry(identity_did.to_owned()).or_insert_with(|| {
-        let mut secret = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
-        secret
+/// Initializes the global storage provider.
+///
+/// Must be called before any storage-dependent bridge function
+/// (`py_identity_create`, `py_identity_load`). Calling multiple times is
+/// a no-op — the first call wins.
+///
+/// # Arguments
+///
+/// * `storage_type` — Currently only `"in_memory"` is supported.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ValidationError` if the storage type is not
+/// recognized.
+pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
+    match storage_type {
+        "in_memory" => {
+            let _ = STORAGE_PROVIDER.set(Arc::new(InMemoryStorage::new()));
+            Ok(())
+        }
+        other => Err(ScpPyError::ValidationError(format!(
+            "unknown storage type: {other:?} — expected \"in_memory\""
+        ))),
+    }
+}
+
+/// Returns a reference to the global storage provider.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if storage has not been initialized
+/// via [`init_storage`].
+pub fn get_storage() -> Result<&'static Arc<InMemoryStorage>, ScpPyError> {
+    STORAGE_PROVIDER.get().ok_or_else(|| {
+        ScpPyError::IdentityError(
+            "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
+        )
     })
 }
 

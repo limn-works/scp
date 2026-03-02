@@ -190,7 +190,7 @@ impl WasmProof {
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `filter_json` is malformed.
-/// - Rejects with `[SCP-CTX-2000]` if the event log is not accessible.
+/// - Rejects with `[SCP-CTX-2007]` if the event log is not accessible.
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
@@ -200,17 +200,22 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
         // Validate filter JSON if provided.
         if let Some(ref filter) = filter_json {
             let _f: serde_json::Value = serde_json::from_str(filter).map_err(|e| {
-                ScpWasmError::Validation(format!("filter_json is not valid JSON: {e}")).into_js()
+                ScpWasmError::Validation {
+                    message: format!("filter_json is not valid JSON: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                }
+                .into_js()
             })?;
         }
 
         let _ = context_id;
 
-        Err(ScpWasmError::Context(
-            "not yet connected to runtime — event log query requires a live context handle \
-             wired to scp-core"
+        Err(ScpWasmError::Context {
+            message: "not yet connected to runtime — event log query requires a live context \
+                      handle wired to scp-core"
                 .to_owned(),
-        )
+            code: "SCP-CTX-2007".to_owned(),
+        }
         .into_js()
         .into())
     })
@@ -237,7 +242,7 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `claim_json` is malformed.
-/// - Rejects with `[SCP-CTX-2000]` if verification fails (empty log,
+/// - Rejects with `[SCP-CTX-2007]` if verification fails (empty log,
 ///   invalid index, not connected to runtime).
 ///
 /// See ADR-022 acceptance criterion 1.
@@ -247,16 +252,21 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
     future_to_promise(async move {
         // Validate claim_json.
         let _claim: serde_json::Value = serde_json::from_str(&claim_json).map_err(|e| {
-            ScpWasmError::Validation(format!("claim_json is not valid JSON: {e}")).into_js()
+            ScpWasmError::Validation {
+                message: format!("claim_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
         })?;
 
         let _ = context_id;
 
-        Err(ScpWasmError::Context(
-            "not yet connected to runtime — event log verification requires a live context \
-             handle wired to scp-core"
+        Err(ScpWasmError::Context {
+            message: "not yet connected to runtime — event log verification requires a live \
+                      context handle wired to scp-core"
                 .to_owned(),
-        )
+            code: "SCP-CTX-2007".to_owned(),
+        }
         .into_js()
         .into())
     })

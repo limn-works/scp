@@ -16,10 +16,10 @@ import Testing
 ///   - tokenData() -> UcanTokenData
 ///
 /// Tests that need mock UcanToken instances use subclasses with `noPointer:`.
-/// Tests that exercise bridge stubs verify error propagation through
-/// CheckedContinuation.
+/// Async roundtrip tests inject mock bridge functions to verify the delegation
+/// pattern works end-to-end without a real UniFFI binary.
 ///
-/// See ADR-016 (UCAN), ADR-026 (Swift SDK), and story SCP-102.
+/// See ADR-016 (UCAN), ADR-026 (Swift SDK), and story SCP-221.
 @Suite("UCAN Tests")
 struct UcanTests {
 
@@ -161,95 +161,128 @@ struct UcanTests {
         #expect(result.failureReason == "Token expired")
     }
 
-    // MARK: - Validate (bridge stub error propagation)
+    // MARK: - Validate via injectable bridge (async roundtrip)
 
-    @Test("validate throws bridge error with SCP-UCAN-001")
-    func validateThrowsBridgeError() async {
-        do {
-            _ = try await validate(
-                encoded: "eyJhbGciOiJFZERTQSJ9.test.sig",
-                contextId: "ctx-001",
-                presenterDid: "did:dht:z6MkPresenter"
-            )
-            Issue.record("Expected validate to throw")
-        } catch let error as ScpError {
-            if case .Permission(_, let code) = error {
-                #expect(code == "SCP-UCAN-001")
-            } else {
-                Issue.record("Expected ScpError.Permission, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
+    @Test("validateUcanToken calls bridge successfully")
+    func validateRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        var receivedToken: String?
+        var receivedCapability: String?
+
+        let mockValidate: UcanBridge.ValidateFn = { _, token, capability in
+            receivedToken = token
+            receivedCapability = capability
         }
+
+        try await validateUcanToken(
+            handle: handle,
+            token: "eyJhbGciOiJFZERTQSJ9.test.sig",
+            capability: "messages:write",
+            validateFn: mockValidate
+        )
+
+        #expect(receivedToken == "eyJhbGciOiJFZERTQSJ9.test.sig")
+        #expect(receivedCapability == "messages:write")
     }
 
-    // MARK: - Mint (bridge stub error propagation)
+    // MARK: - Mint via injectable bridge (async roundtrip)
 
-    @Test("mint throws bridge error with SCP-UCAN-002")
-    func mintThrowsBridgeError() async {
-        do {
-            _ = try await mint(
-                issuerDid: "did:dht:z6MkIssuer",
-                audienceDid: "did:dht:z6MkAudience",
-                capabilities: [
-                    UcanCapability(resource: "scp:ctx:test/messages:write", action: "invoke"),
-                ],
-                expirySecs: 3_600,
-                proofs: []
-            )
-            Issue.record("Expected mint to throw")
-        } catch let error as ScpError {
-            if case .Permission(_, let code) = error {
-                #expect(code == "SCP-UCAN-002")
-            } else {
-                Issue.record("Expected ScpError.Permission, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
+    @Test("mintUcanToken calls bridge and returns token")
+    func mintRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let mockToken = MockUcanToken(
+            issuer: "did:dht:z6MkIssuer",
+            audience: "did:dht:z6MkAudience",
+            expiry: 1_700_086_400,
+            tokenId: "minted-token-001",
+            capabilities: ["scp:ctx:abc/messages:write"]
+        )
+
+        let mockMint: UcanBridge.MintFn = { _, memberDid, capabilities in
+            #expect(memberDid == "did:dht:z6MkMember")
+            #expect(capabilities.count == 1)
+            return mockToken
         }
+
+        let result = try await mintUcanToken(
+            handle: handle,
+            memberDid: "did:dht:z6MkMember",
+            capabilities: ["scp:ctx:abc/messages:write"],
+            mintFn: mockMint
+        )
+
+        #expect(result.tokenId() == "minted-token-001")
+        #expect(result.issuer() == "did:dht:z6MkIssuer")
     }
 
-    @Test("mint with default expiry and empty proofs")
-    func mintWithDefaults() async {
-        // Verify the default parameter values are accepted by the function signature.
-        do {
-            _ = try await mint(
-                issuerDid: "did:dht:z6MkIssuer",
-                audienceDid: "did:dht:z6MkAudience",
-                capabilities: []
-            )
-            Issue.record("Expected mint to throw")
-        } catch let error as ScpError {
-            // The bridge stub error is expected -- we're verifying default params work.
-            if case .Permission(_, let code) = error {
-                #expect(code == "SCP-UCAN-002")
-            } else {
-                Issue.record("Expected ScpError.Permission, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
+    // MARK: - Revoke via injectable bridge (async roundtrip)
+
+    @Test("revokeUcanToken calls bridge successfully")
+    func revokeRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        var revokedTokenId: String?
+
+        let mockRevoke: UcanBridge.RevokeFn = { _, tokenId in
+            revokedTokenId = tokenId
         }
+
+        try await revokeUcanToken(
+            handle: handle,
+            tokenId: "token-to-revoke",
+            revokeFn: mockRevoke
+        )
+
+        #expect(revokedTokenId == "token-to-revoke")
     }
 
-    // MARK: - Revoke (bridge stub error propagation)
+    // MARK: - Legacy API
 
-    @Test("revoke throws bridge error with SCP-UCAN-003")
-    func revokeThrowsBridgeError() async {
-        do {
-            try await revoke(
-                encoded: "eyJhbGciOiJFZERTQSJ9.test.sig",
-                revokerDid: "did:dht:z6MkRevoker"
-            )
-            Issue.record("Expected revoke to throw")
-        } catch let error as ScpError {
-            if case .Permission(_, let code) = error {
-                #expect(code == "SCP-UCAN-003")
-            } else {
-                Issue.record("Expected ScpError.Permission, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
+    @Test("legacy validate returns UcanValidationResult via bridge")
+    func legacyValidateRoundtrip() async throws {
+        let mockValidate: UcanBridge.ValidateFn = { _, _, _ in }
+
+        let result = try await validate(
+            encoded: "eyJhbGciOiJFZERTQSJ9.test.sig",
+            contextId: "ctx-001",
+            presenterDid: "did:dht:z6MkPresenter",
+            validateFn: mockValidate
+        )
+
+        #expect(result.isValid)
+    }
+
+    @Test("legacy mint delegates to bridge")
+    func legacyMintRoundtrip() async throws {
+        let mockToken = MockUcanToken(
+            issuer: "did:dht:z6MkIssuer",
+            audience: "did:dht:z6MkAudience",
+            expiry: nil,
+            tokenId: "legacy-mint-token"
+        )
+        let mockMint: UcanBridge.MintFn = { _, _, _ in mockToken }
+
+        let result = try await mint(
+            issuerDid: "did:dht:z6MkIssuer",
+            audienceDid: "did:dht:z6MkAudience",
+            capabilities: [UcanCapability(resource: "scp:ctx:test", action: "write")],
+            mintFn: mockMint
+        )
+
+        #expect(result.tokenId() == "legacy-mint-token")
+    }
+
+    @Test("legacy revoke delegates to bridge")
+    func legacyRevokeRoundtrip() async throws {
+        var revoked = false
+        let mockRevoke: UcanBridge.RevokeFn = { _, _ in revoked = true }
+
+        try await revoke(
+            encoded: "eyJhbGciOiJFZERTQSJ9.test.sig",
+            revokerDid: "did:dht:z6MkRevoker",
+            revokeFn: mockRevoke
+        )
+
+        #expect(revoked)
     }
 
 } // end UcanTests

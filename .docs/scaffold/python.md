@@ -149,7 +149,7 @@ impl PyIdentity {
 
 ### Async bridging
 
-Use PyO3 0.22+ native coroutine support (`#[pyfunction] async fn`) instead of the deprecated `pyo3_asyncio` crate. See PyO3 documentation for current patterns.
+Use synchronous `#[pyfunction]` with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while releasing the Python GIL. PyO3's experimental native async (`#[pyfunction] async fn`) was evaluated but rejected: it holds the GIL during `Future::poll` and does not integrate with the tokio runtime. The deprecated `pyo3_asyncio` crate is not needed.
 
 ## Exception Hierarchy
 

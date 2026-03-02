@@ -10,11 +10,15 @@
 // SDK method (Scp.kt, Context.kt, Identity.kt, etc.) delegates through this bridge
 // to exactly one UniFFI function — zero protocol logic lives in the Kotlin layer.
 //
-// UniFFI-generated NativeLib.kt does not exist yet. The NativeBindings interface
-// defines the expected UniFFI function signatures from ADR-028. When UniFFI bindings
-// are generated, swap the NativeBindings implementation to delegate to NativeLib.
+// UniFFI-generated NativeLib.kt does not exist yet — generation requires a compiled
+// Rust cdylib (see scripts/generate-uniffi-kotlin.sh and the generateUniffiBindings
+// Gradle task). The NativeBindings interface defines a flat-function abstraction layer
+// matching the ADR-028 bridge surface. When UniFFI generates the actual bindings into
+// internal/NativeLib.kt, the generated code will use opaque Kotlin classes (Identity,
+// ContextHandle, etc.) rather than Long handles — a concrete NativeBindings adapter
+// must be written to bridge the two calling conventions.
 //
-// Provenance: ADR-028 (Kotlin SDK), ADR-021 (UniFFI Bridge), SCP-115
+// Provenance: ADR-028 (Kotlin SDK), ADR-021 (UniFFI Bridge), SCP-115, SCP-211
 
 package com.limn.scp.bridge
 
@@ -191,11 +195,16 @@ interface InfraBindings {
 }
 
 /**
- * Composite interface defining the full set of UniFFI-generated native binding functions.
+ * Composite interface defining the flat-function abstraction over UniFFI native bindings.
  *
- * Each method corresponds to a UniFFI bridge function listed in ADR-028.
- * When UniFFI generates `NativeLib.kt`, replace the implementation with delegation
- * to the generated bindings.
+ * Each method corresponds to a UniFFI bridge function listed in ADR-028. The actual
+ * UniFFI-generated bindings (internal/NativeLib.kt) will expose opaque Kotlin classes
+ * (Identity, ContextHandle, UcanToken, TransportManager) with suspend methods, records
+ * as data classes, and sealed error hierarchies — not flat functions with Long handles.
+ * A concrete adapter implementing this interface must translate between the two styles.
+ *
+ * Generation: `./gradlew :scp-sdk-kotlin:generateUniffiBindings` or
+ * `./scripts/generate-uniffi-kotlin.sh` (requires compiled Rust cdylib).
  *
  * Split into domain sub-interfaces ([IdentityBindings], [ContextBindings],
  * [ToolBindings], [UcanBindings], [InfraBindings]) for modularity.
@@ -434,7 +443,7 @@ class ContextBridge internal constructor(
                     override fun onMessage(messageJson: String) {
                         val result = trySend(messageJson)
                         if (result.isFailure && !result.isClosed) {
-                            close(BridgeException("Message buffer overflow", "SCP-BRIDGE-001"))
+                            close(BridgeException("Message buffer overflow", "SCP-CTX-2001"))
                         }
                     }
 
@@ -626,7 +635,7 @@ class InfraBridge internal constructor(
 /**
  * Exception thrown by the coroutine bridge when an FFI call fails.
  *
- * Carries a structured error code from the Rust engine (e.g., "SCP-CTX-001").
+ * Carries a structured error code from the Rust engine (e.g., "SCP-CTX-2001").
  * The ergonomics layer maps this to the SDK's public exception hierarchy.
  *
  * @property code Structured SCP error code.

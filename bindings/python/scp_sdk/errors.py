@@ -36,7 +36,7 @@ class ScpError(Exception):
     """
 
     #: Default error code for the base class.
-    _default_code: str = "SCP-ERR-0000"
+    _default_code: str = "SCP-UNKNOWN-0000"
 
     def __init__(self, message: str, code: str | None = None) -> None:
         self.message = message

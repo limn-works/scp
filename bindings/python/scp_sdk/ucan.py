@@ -53,6 +53,8 @@ class UcanToken:
         capabilities: List of capability URIs granted by this token.
         expires_at: Expiry timestamp (seconds since Unix epoch), or ``None``
             if the token does not expire.
+        proofs: Proof chain -- CIDs/IDs of parent UCAN tokens forming the
+            delegation chain. Empty for root tokens.
     """
 
     #: Unique token identifier (derived from the UCAN nonce).
@@ -69,6 +71,10 @@ class UcanToken:
 
     #: Expiry timestamp (seconds since Unix epoch), or ``None``.
     expires_at: float | None = None
+
+    #: Proof chain -- CIDs/IDs of parent UCAN tokens forming the delegation
+    #: chain. Empty for root tokens.
+    proofs: list[str] = field(default_factory=list)
 
     @classmethod
     def _from_bridge(cls, bridge_token: object) -> UcanToken:
@@ -88,6 +94,7 @@ class UcanToken:
             audience=bridge_token.audience,  # type: ignore[attr-defined]
             capabilities=list(bridge_token.capabilities),  # type: ignore[attr-defined]
             expires_at=bridge_token.expires_at,  # type: ignore[attr-defined]
+            proofs=list(bridge_token.proofs),  # type: ignore[attr-defined]
         )
 
 
@@ -125,26 +132,29 @@ async def validate(context: str, token: str, capability: str) -> None:
 
 
 async def mint(
-    issuer: str,
     audience: str,
     capabilities: Sequence[str],
     context: str,
     expiry: float | None = None,
+    proofs: Sequence[str] | None = None,
 ) -> UcanToken:
     """Mint a new UCAN token.
 
     Creates a new UCAN token granting the specified capabilities to the
     audience DID, scoped to the given context.  The token is signed by
-    the issuer's key.
+    the context creator's key (the issuer is determined automatically by
+    the Rust bridge from the context's creator DID).
 
     Args:
-        issuer: DID of the entity minting (signing) the token.
         audience: DID of the entity receiving the token.
         capabilities: Capability URIs to grant
             (e.g., ``["messages:write", "tool_invoke:assistant"]``).
         context: The context ID to scope the token to.
         expiry: Token lifetime in seconds from now, or ``None`` for no
             expiry (not recommended).
+        proofs: Optional list of parent UCAN token IDs forming the
+            delegation proof chain.  Required when minting a delegated
+            token (see :func:`delegate`).
 
     Returns:
         A :class:`UcanToken` containing the minted token's metadata.
@@ -152,10 +162,19 @@ async def mint(
     Raises:
         UcanPermissionError: If minting fails (capabilities outside the
             context ceiling, issuer not authorized, etc.).
+
+    Note:
+        The issuer is always the context creator. The Rust bridge
+        (``_scp_core.ucan_mint``) derives the issuer from the context's
+        ``creator_did`` and does not accept an explicit issuer parameter.
     """
     try:
         bridge_token = await asyncio.to_thread(
-            _scp_core.ucan_mint, context, audience, list(capabilities)
+            _scp_core.ucan_mint,
+            context,
+            audience,
+            list(capabilities),
+            list(proofs) if proofs else None,
         )
     except Exception as exc:
         raise UcanPermissionError(str(exc)) from exc
@@ -234,13 +253,14 @@ async def delegate(
         )
 
     # Delegate by minting a new token from the delegator to the delegatee
-    # with the attenuated capabilities.  The bridge layer handles proof
-    # chain construction and signing.
+    # with the attenuated capabilities.  The parent token's ID is included
+    # in the proof chain so that validators can verify the delegation chain
+    # back to the root token.
     return await mint(
-        issuer=delegator,
         audience=delegatee,
         capabilities=list(capabilities),
         context=context,
+        proofs=[parent_token.token_id],
     )
 
 

@@ -28,6 +28,7 @@ pub mod identity;
 pub mod provenance;
 pub mod store;
 pub mod sync;
+pub mod time;
 pub mod trust;
 pub mod uri;
 pub mod well_known;

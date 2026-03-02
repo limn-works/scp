@@ -1,4 +1,4 @@
-//! `PyO3` bridge functions for event log queries and verification.
+//! `PyO3` bridge functions for event log queries, verification, and checkpoints.
 //!
 //! Exposes SCP event log operations to Python:
 //!
@@ -6,15 +6,20 @@
 //!   filters.
 //! - [`py_event_log_verify`] -- Verify a claim against the event log
 //!   (inclusion/absence proofs).
+//! - [`py_event_log_checkpoint`] -- Generate a signed consistency checkpoint
+//!   from the current event log state.
 //!
 //! # Types
 //!
 //! - [`PyEvent`] -- A protocol event (type, actor, timestamp, payload,
 //!   sequence).
 //! - [`PyProof`] -- A verification proof (verified, proof type, details).
+//! - [`PyCheckpoint`] -- A signed consistency checkpoint (context ID, sender
+//!   DID, event count, Merkle root, epoch, timestamp, signature).
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` §7 and ADR-011 for the event
-//! log specification.
+//! log specification. See ADR-030 in `.docs/adrs/phase-6.md` for checkpoint
+//! and pruning design.
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -105,6 +110,61 @@ impl PyProof {
         format!(
             "Proof(verified={}, proof_type={:?})",
             self.verified, self.proof_type
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyCheckpoint
+// ---------------------------------------------------------------------------
+
+/// A signed consistency checkpoint from the context event log, exposed to
+/// Python.
+///
+/// Checkpoints are signed snapshots of the event log state at a point in time.
+/// Members exchange checkpoints to detect relay equivocation: if two members
+/// have different Merkle roots for the same event count, the relay is showing
+/// different histories to different members.
+///
+/// See ADR-011 acceptance criterion 8 and ADR-030 (pruning/checkpointing).
+#[pyclass(name = "Checkpoint")]
+#[derive(Debug)]
+pub struct PyCheckpoint {
+    /// The context this checkpoint belongs to.
+    #[pyo3(get)]
+    pub context_id: String,
+
+    /// The DID of the member who generated this checkpoint.
+    #[pyo3(get)]
+    pub sender_did: String,
+
+    /// The number of events in the log at checkpoint time.
+    #[pyo3(get)]
+    pub event_count: u64,
+
+    /// The Merkle root hash at checkpoint time, hex-encoded.
+    #[pyo3(get)]
+    pub merkle_root: String,
+
+    /// Current MLS epoch. `None` for Broadcast contexts.
+    #[pyo3(get)]
+    pub epoch: Option<u64>,
+
+    /// Unix timestamp (seconds) when the checkpoint was generated.
+    #[pyo3(get)]
+    pub timestamp: u64,
+
+    /// Ed25519 signature over the canonical checkpoint fields, hex-encoded.
+    #[pyo3(get)]
+    pub signature: String,
+}
+
+#[pymethods]
+impl PyCheckpoint {
+    fn __repr__(&self) -> String {
+        format!(
+            "Checkpoint(context_id={:?}, sender_did={:?}, event_count={}, timestamp={})",
+            self.context_id, self.sender_did, self.event_count, self.timestamp
         )
     }
 }
@@ -376,26 +436,85 @@ pub fn py_event_log_verify(
     }
 }
 
+/// Generates a signed consistency checkpoint from the current event log state.
+///
+/// Creates a snapshot of the event log's Merkle root and event count, signs it
+/// with the caller's identity key, and returns the checkpoint. Checkpoints
+/// enable equivocation detection: members exchange signed Merkle roots and
+/// compare them to detect relay misbehavior.
+///
+/// # Arguments
+///
+/// * `context_id` -- The ID of the context whose event log to checkpoint.
+/// * `identity_did` -- The DID of the identity generating the checkpoint
+///   (used for signing).
+/// * `epoch` -- The current MLS epoch (pass 0 for Broadcast contexts).
+///
+/// # Returns
+///
+/// A [`PyCheckpoint`] containing the signed checkpoint data.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the context is not connected to the runtime
+/// or if signing fails. Raises `IdentityError` if the identity is not
+/// found in the registry.
+///
+/// See ADR-011 acceptance criterion 8 and ADR-030.
+#[pyfunction]
+#[pyo3(name = "event_log_checkpoint")]
+pub fn py_event_log_checkpoint(
+    context_id: &str,
+    identity_did: &str,
+    epoch: u64,
+) -> PyResult<PyCheckpoint> {
+    let rt = crate::runtime()?;
+
+    let context_id_owned = context_id.to_owned();
+    let identity_did_owned = identity_did.to_owned();
+
+    let sender_did = scp_core::identity::DID(identity_did_owned.clone());
+
+    let checkpoint = crate::runtime::with_identity(&identity_did_owned, |entry| {
+        crate::runtime::with_context(&context_id_owned, |ctx_rt| {
+            let result = rt.block_on(async {
+                scp_core::event_log::checkpoint::generate_checkpoint(
+                    &ctx_rt.event_log,
+                    &sender_did,
+                    epoch,
+                    entry.custody.as_ref(),
+                    &entry.identity.active_signing_key,
+                )
+                .await
+            });
+
+            result
+                .map_err(|e| ScpPyError::ContextError(format!("checkpoint generation failed: {e}")))
+        })
+    })?;
+
+    Ok(PyCheckpoint {
+        context_id: checkpoint.context_id,
+        sender_did: checkpoint.sender_did.0,
+        event_count: checkpoint.event_count,
+        merkle_root: encode_hex(&checkpoint.merkle_root),
+        epoch: checkpoint.epoch,
+        timestamp: checkpoint.timestamp,
+        signature: encode_hex(&checkpoint.signature),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 /// Decodes a hex string into a 32-byte hash.
-fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!(
-            "expected 64 hex characters (32 bytes), got {}",
-            hex.len()
-        ));
-    }
-
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
-        bytes[i] =
-            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
-    }
-    Ok(bytes)
+fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
+    Ok(arr)
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +531,9 @@ fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
 pub fn register_event_log(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEvent>()?;
     m.add_class::<PyProof>()?;
+    m.add_class::<PyCheckpoint>()?;
     m.add_function(wrap_pyfunction!(py_event_log_query, m)?)?;
     m.add_function(wrap_pyfunction!(py_event_log_verify, m)?)?;
+    m.add_function(wrap_pyfunction!(py_event_log_checkpoint, m)?)?;
     Ok(())
 }

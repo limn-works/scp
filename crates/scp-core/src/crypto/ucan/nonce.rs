@@ -55,6 +55,31 @@ const PRUNE_TIME_INTERVAL_SECS: u64 = 600;
 const DEFAULT_MAX_CAPACITY: usize = 100_000;
 
 // ---------------------------------------------------------------------------
+// Nonce generation
+// ---------------------------------------------------------------------------
+
+/// Generates a nonce in the format `{unix_millis_timestamp}-{16_random_bytes_hex}`.
+///
+/// The timestamp prefix enables efficient pruning of expired nonces. The 16
+/// random bytes (32 hex chars) ensure uniqueness even under high concurrency.
+/// Uses `OsRng` for cryptographic randomness.
+///
+/// See ADR-009 acceptance criterion 7 and ADR-016 acceptance criterion 6.
+///
+/// # Errors
+///
+/// Returns [`crate::time::ClockError`] if the system clock is unavailable.
+pub fn generate_nonce() -> Result<String, crate::time::ClockError> {
+    let now_millis = crate::time::now_millis()?;
+
+    let mut random_bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random_bytes);
+
+    let hex_suffix = hex::encode(random_bytes);
+    Ok(format!("{now_millis}-{hex_suffix}"))
+}
+
+// ---------------------------------------------------------------------------
 // NonceTracker
 // ---------------------------------------------------------------------------
 

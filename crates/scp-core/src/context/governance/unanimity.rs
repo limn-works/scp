@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    SignedVote, VoteType, compute_proposal_id, hex_encode,
+    VoteType, compute_proposal_id, hex_encode, sign_vote,
 };
 use crate::identity::DID;
 
@@ -191,6 +191,7 @@ impl GovernanceEngine for UnanimityEngine {
         proposer: &DID,
         action: GovernanceAction,
         context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
         // Only voters can propose.
         if !self.is_voter(proposer) {
@@ -214,12 +215,13 @@ impl GovernanceEngine for UnanimityEngine {
         let voting_deadline = context.now + self.voting_window_secs;
 
         // The proposer's vote counts as the first approval.
-        let proposer_vote = SignedVote {
-            voter_did: proposer.clone(),
-            vote: VoteType::Approve,
-            timestamp: context.now,
-            signature: Vec::new(), // Signature validation deferred to UCAN layer.
-        };
+        let proposer_vote = sign_vote(
+            &proposal_id,
+            &VoteType::Approve,
+            proposer.as_ref(),
+            context.now,
+            signing_key,
+        )?;
 
         let proposal = GovernanceProposal {
             proposal_id,
@@ -275,6 +277,7 @@ impl GovernanceEngine for UnanimityEngine {
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         // Voter must be in the voter set.
         if !self.is_voter(voter) {
@@ -309,13 +312,14 @@ impl GovernanceEngine for UnanimityEngine {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        // Record the vote.
-        let vote = SignedVote {
-            voter_did: voter.clone(),
-            vote: VoteType::Approve,
-            timestamp: context.now,
-            signature: Vec::new(),
-        };
+        // Record the signed vote.
+        let vote = sign_vote(
+            proposal_id,
+            &VoteType::Approve,
+            voter.as_ref(),
+            context.now,
+            signing_key,
+        )?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -340,6 +344,7 @@ impl GovernanceEngine for UnanimityEngine {
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         // Voter must be in the voter set.
         if !self.is_voter(voter) {
@@ -374,13 +379,14 @@ impl GovernanceEngine for UnanimityEngine {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        // Record the rejection vote.
-        let vote = SignedVote {
-            voter_did: voter.clone(),
-            vote: VoteType::Reject,
-            timestamp: context.now,
-            signature: Vec::new(),
-        };
+        // Record the signed rejection vote.
+        let vote = sign_vote(
+            proposal_id,
+            &VoteType::Reject,
+            voter.as_ref(),
+            context.now,
+            signing_key,
+        )?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -504,6 +510,26 @@ mod tests {
         DID::from("did:dht:z6MkEve")
     }
 
+    fn sk_alice() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
+    }
+
+    fn sk_bob() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[2u8; 32])
+    }
+
+    fn sk_carol() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
+    }
+
+    fn sk_dave() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[4u8; 32])
+    }
+
+    fn sk_eve() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+    }
+
     /// Create a test context at a given timestamp.
     fn test_context_at(now: u64) -> GovernanceContext {
         GovernanceContext {
@@ -592,7 +618,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, events) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
 
         // Proposal should be pending (3 voters, only 1 approval so far).
@@ -614,7 +640,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, events) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
 
         // 1-of-1: proposer's approval meets unanimity immediately.
@@ -634,7 +660,7 @@ mod tests {
         let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
         let ctx = test_context();
 
-        let result = engine.propose(&dave(), default_action(), &ctx);
+        let result = engine.propose(&dave(), default_action(), &ctx, &sk_dave());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::NotEligible(_)
@@ -647,9 +673,9 @@ mod tests {
         let ctx = test_context();
 
         let _ = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
-        let result = engine.propose(&alice(), default_action(), &ctx);
+        let result = engine.propose(&alice(), default_action(), &ctx, &sk_alice());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::DuplicateProposal(_)
@@ -667,17 +693,19 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob approves -> 2 of 3 -> still pending.
-        let (status, events) = engine.approve(&pid, &bob(), &ctx).expect("ok");
+        let (status, events) = engine.approve(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
         assert_eq!(status, ProposalStatus::Pending);
         assert_eq!(events.len(), 1); // VoteCast only, no resolve
 
         // Carol approves -> 3 of 3 -> Approved.
-        let (status, events) = engine.approve(&pid, &carol(), &ctx).expect("ok");
+        let (status, events) = engine
+            .approve(&pid, &carol(), &ctx, &sk_carol())
+            .expect("ok");
         assert_eq!(status, ProposalStatus::Approved);
         assert_eq!(events.len(), 2); // VoteCast + Resolved
         assert!(matches!(
@@ -695,9 +723,9 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
-        let result = engine.approve(&proposal.proposal_id, &dave(), &ctx);
+        let result = engine.approve(&proposal.proposal_id, &dave(), &ctx, &sk_dave());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::NotEligible(_)
@@ -711,10 +739,10 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         // Alice already voted (as proposer).
-        let result = engine.approve(&proposal.proposal_id, &alice(), &ctx);
+        let result = engine.approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice());
         assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
     }
 
@@ -725,9 +753,9 @@ mod tests {
 
         // Single voter -> auto-approved.
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
-        let result = engine.approve(&proposal.proposal_id, &alice(), &ctx);
+        let result = engine.approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::ProposalNotPending { .. }
@@ -745,12 +773,12 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob rejects -> unanimity broken immediately.
-        let (status, events) = engine.reject(&pid, &bob(), &ctx).expect("ok");
+        let (status, events) = engine.reject(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -776,16 +804,18 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob approves -> 2 of 3.
-        let (status, _) = engine.approve(&pid, &bob(), &ctx).expect("ok");
+        let (status, _) = engine.approve(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
         assert_eq!(status, ProposalStatus::Pending);
 
         // Carol rejects -> unanimity broken despite 2 approvals.
-        let (status, _) = engine.reject(&pid, &carol(), &ctx).expect("ok");
+        let (status, _) = engine
+            .reject(&pid, &carol(), &ctx, &sk_carol())
+            .expect("ok");
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -800,9 +830,9 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
-        let result = engine.reject(&proposal.proposal_id, &dave(), &ctx);
+        let result = engine.reject(&proposal.proposal_id, &dave(), &ctx, &sk_dave());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::NotEligible(_)
@@ -816,10 +846,10 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         // Alice already voted (as proposer); trying to reject should fail.
-        let result = engine.reject(&proposal.proposal_id, &alice(), &ctx);
+        let result = engine.reject(&proposal.proposal_id, &alice(), &ctx, &sk_alice());
         assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
     }
 
@@ -830,15 +860,15 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob rejects -> vetoed.
-        engine.reject(&pid, &bob(), &ctx).expect("ok");
+        engine.reject(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
 
         // Carol tries to reject on already-resolved proposal.
-        let result = engine.reject(&pid, &carol(), &ctx);
+        let result = engine.reject(&pid, &carol(), &ctx, &sk_carol());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::ProposalNotPending { .. }
@@ -856,13 +886,13 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         let expired_ctx = test_context_at(ctx.now + 86_400);
 
-        let result = engine.approve(&pid, &bob(), &expired_ctx);
+        let result = engine.approve(&pid, &bob(), &expired_ctx, &sk_bob());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::VotingWindowExpired { .. }
@@ -876,13 +906,13 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         let expired_ctx = test_context_at(ctx.now + 86_400);
 
-        let result = engine.reject(&pid, &bob(), &expired_ctx);
+        let result = engine.reject(&pid, &bob(), &expired_ctx, &sk_bob());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::VotingWindowExpired { .. }
@@ -896,14 +926,14 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // One second before deadline should still work.
         let just_before = test_context_at(ctx.now + 86_400 - 1);
 
-        let result = engine.approve(&pid, &bob(), &just_before);
+        let result = engine.approve(&pid, &bob(), &just_before, &sk_bob());
         assert!(result.is_ok());
     }
 
@@ -918,7 +948,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
@@ -946,7 +976,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
@@ -963,12 +993,12 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob rejects -> vetoed.
-        engine.reject(&pid, &bob(), &ctx).expect("ok");
+        engine.reject(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
 
         // Resolve again on already-resolved proposal.
         let (status, events) = engine.resolve(&pid, &ctx).expect("ok");
@@ -988,12 +1018,12 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob approves -> 2 of 3.
-        engine.approve(&pid, &bob(), &ctx).expect("ok");
+        engine.approve(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
 
         // Carol never votes. Deadline passes.
         let expired_ctx = test_context_at(ctx.now + 86_400);
@@ -1026,7 +1056,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
@@ -1039,7 +1069,9 @@ mod tests {
         assert!(p.approvals.is_empty());
 
         // Alice can now re-vote (as a rejection this time).
-        let (status, _) = engine.reject(&pid, &alice(), &ctx).expect("ok");
+        let (status, _) = engine
+            .reject(&pid, &alice(), &ctx, &sk_alice())
+            .expect("ok");
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -1055,7 +1087,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
@@ -1070,7 +1102,9 @@ mod tests {
         assert!(p.rejections.is_empty());
 
         // Alice re-approves.
-        let (status, _) = engine.approve(&pid, &alice(), &ctx).expect("ok");
+        let (status, _) = engine
+            .approve(&pid, &alice(), &ctx, &sk_alice())
+            .expect("ok");
         assert_eq!(status, ProposalStatus::Pending);
     }
 
@@ -1081,7 +1115,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
@@ -1099,7 +1133,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let result = engine.withdraw_vote(&proposal.proposal_id, &dave(), &ctx);
         assert!(matches!(
@@ -1115,7 +1149,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
@@ -1134,12 +1168,12 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob rejects -> vetoed.
-        engine.reject(&pid, &bob(), &ctx).expect("ok");
+        engine.reject(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
 
         // Cannot withdraw on resolved proposal.
         let result = engine.withdraw_vote(&pid, &alice(), &ctx);
@@ -1165,7 +1199,9 @@ mod tests {
         let mut boxed: Box<dyn GovernanceEngine> = Box::new(engine);
         let ctx = test_context();
 
-        let (proposal, _) = boxed.propose(&alice(), default_action(), &ctx).expect("ok");
+        let (proposal, _) = boxed
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("ok");
         let pid = proposal.proposal_id;
 
         // withdraw_vote is callable through the trait object.
@@ -1182,7 +1218,9 @@ mod tests {
         let mut boxed: Box<dyn GovernanceEngine> = Box::new(engine);
         let ctx = test_context();
 
-        let (proposal, _) = boxed.propose(&alice(), default_action(), &ctx).expect("ok");
+        let (proposal, _) = boxed
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("ok");
         let pid = proposal.proposal_id;
 
         // resolve is callable through the trait object.
@@ -1224,7 +1262,7 @@ mod tests {
         let ctx = test_context();
         let fake_id = [0u8; 32];
 
-        let result = engine.approve(&fake_id, &alice(), &ctx);
+        let result = engine.approve(&fake_id, &alice(), &ctx, &sk_alice());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::ProposalNotFound { .. }
@@ -1237,7 +1275,7 @@ mod tests {
         let ctx = test_context();
         let fake_id = [0u8; 32];
 
-        let result = engine.reject(&fake_id, &alice(), &ctx);
+        let result = engine.reject(&fake_id, &alice(), &ctx, &sk_alice());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::ProposalNotFound { .. }
@@ -1269,21 +1307,21 @@ mod tests {
 
         // 1. Alice proposes (counts as first approval).
         let (proposal, create_events) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         assert_eq!(proposal.status, ProposalStatus::Pending);
         assert_eq!(create_events.len(), 2); // Created + VoteCast
 
         // 2. Bob approves.
         let (status, approve_events) = engine
-            .approve(&proposal.proposal_id, &bob(), &ctx)
+            .approve(&proposal.proposal_id, &bob(), &ctx, &sk_bob())
             .expect("ok");
         assert_eq!(status, ProposalStatus::Pending);
         assert_eq!(approve_events.len(), 1); // VoteCast only
 
         // 3. Carol approves -> unanimity.
         let (status, final_events) = engine
-            .approve(&proposal.proposal_id, &carol(), &ctx)
+            .approve(&proposal.proposal_id, &carol(), &ctx, &sk_carol())
             .expect("ok");
         assert_eq!(status, ProposalStatus::Approved);
         assert_eq!(final_events.len(), 2); // VoteCast + Resolved
@@ -1302,12 +1340,12 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob rejects -> immediate veto.
-        let (status, _) = engine.reject(&pid, &bob(), &ctx).expect("ok");
+        let (status, _) = engine.reject(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -1316,7 +1354,7 @@ mod tests {
         );
 
         // Carol cannot vote on resolved proposal.
-        let result = engine.approve(&pid, &carol(), &ctx);
+        let result = engine.approve(&pid, &carol(), &ctx, &sk_carol());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::ProposalNotPending { .. }
@@ -1336,7 +1374,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
@@ -1356,19 +1394,19 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
         // Bob approves.
-        engine.approve(&pid, &bob(), &ctx).expect("ok");
+        engine.approve(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
 
         // Bob changes mind: withdraw, then reject.
         engine.withdraw_vote(&pid, &bob(), &ctx).expect("ok");
         let p = engine.get_proposal(&pid).expect("found");
         assert_eq!(p.approvals.len(), 1); // Only Alice's approval remains.
 
-        let (status, _) = engine.reject(&pid, &bob(), &ctx).expect("ok");
+        let (status, _) = engine.reject(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -1388,14 +1426,16 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
-        engine.approve(&pid, &bob(), &ctx).expect("ok");
-        engine.approve(&pid, &carol(), &ctx).expect("ok");
-        engine.approve(&pid, &dave(), &ctx).expect("ok");
-        let (status, _) = engine.approve(&pid, &eve(), &ctx).expect("ok");
+        engine.approve(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
+        engine
+            .approve(&pid, &carol(), &ctx, &sk_carol())
+            .expect("ok");
+        engine.approve(&pid, &dave(), &ctx, &sk_dave()).expect("ok");
+        let (status, _) = engine.approve(&pid, &eve(), &ctx, &sk_eve()).expect("ok");
 
         assert_eq!(status, ProposalStatus::Approved);
     }
@@ -1407,15 +1447,17 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
-        engine.approve(&pid, &bob(), &ctx).expect("ok");
-        engine.approve(&pid, &carol(), &ctx).expect("ok");
+        engine.approve(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
+        engine
+            .approve(&pid, &carol(), &ctx, &sk_carol())
+            .expect("ok");
 
         // Dave rejects despite 3 approvals so far.
-        let (status, _) = engine.reject(&pid, &dave(), &ctx).expect("ok");
+        let (status, _) = engine.reject(&pid, &dave(), &ctx, &sk_dave()).expect("ok");
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -1442,7 +1484,7 @@ mod tests {
         ctx.current_epoch = Some(42);
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         assert_eq!(proposal.created_at_epoch, Some(42));
     }
@@ -1453,7 +1495,7 @@ mod tests {
         let ctx = test_context();
 
         let (_, events) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
 
         match &events[0] {
@@ -1472,7 +1514,7 @@ mod tests {
         let ctx = test_context();
 
         let (proposal, _) = engine
-            .propose(&alice(), default_action(), &ctx)
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
             .expect("ok");
         let pid = proposal.proposal_id;
 
@@ -1480,7 +1522,7 @@ mod tests {
         assert_eq!(proposal.status, ProposalStatus::Pending);
 
         // Bob approves -> 2 of 2 -> unanimity.
-        let (status, _) = engine.approve(&pid, &bob(), &ctx).expect("ok");
+        let (status, _) = engine.approve(&pid, &bob(), &ctx, &sk_bob()).expect("ok");
         assert_eq!(status, ProposalStatus::Approved);
     }
 }

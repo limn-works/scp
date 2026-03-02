@@ -20,9 +20,12 @@ export declare class ContextError extends ScpError {
   readonly name: "ContextError";
 }
 
-export declare class PermissionError extends ScpError {
-  readonly name: "PermissionError";
+export declare class UcanPermissionError extends ScpError {
+  readonly name: "UcanPermissionError";
 }
+
+/** @deprecated Use `UcanPermissionError` instead. */
+export declare const PermissionError: typeof UcanPermissionError;
 
 export declare class CryptoError extends ScpError {
   readonly name: "CryptoError";
@@ -38,6 +41,18 @@ export declare class ToolError extends ScpError {
 
 export declare class ValidationError extends ScpError {
   readonly name: "ValidationError";
+}
+
+export declare class StorageError extends ScpError {
+  readonly name: "StorageError";
+}
+
+export declare class AttestationError extends ScpError {
+  readonly name: "AttestationError";
+}
+
+export declare class McpError extends ScpError {
+  readonly name: "McpError";
 }
 
 // -- Value types --------------------------------------------------------------
@@ -85,7 +100,7 @@ export interface ContextParams {
   readonly roles?: Record<string, string[]>;
   readonly ttl?: number;
   readonly memoryScope?: "ephemeral" | "summary" | "full";
-  readonly governance?: "single_admin";
+  readonly governance?: "single_admin" | "threshold" | "majority" | "unanimity";
 }
 
 export interface TrustEvaluation {

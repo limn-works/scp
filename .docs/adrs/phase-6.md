@@ -749,7 +749,7 @@ class Context internal constructor(internal val handle: ContextHandle) : AutoClo
 
     /** Send a message to this context. */
     suspend fun send(payload: ByteArray): Unit = withContext(Dispatchers.IO) {
-        if (state != "active") throw ContextException("Context is not active", "SCP-CTX-3001")
+        if (state != "active") throw ContextException("Context is not active", "SCP-CTX-2001")
         handle.send(payload)
     }
 
@@ -1102,7 +1102,7 @@ dependencies {
    - `scp.createContext(params)` returns a `Context` with `state == "active"`.
    - `context.send(payload)` delivers an encrypted message (no throw for valid payload and active state).
    - `context.leave()` completes without throwing for a valid active context.
-   - After `close()`, `send()` throws `ContextException` with code `"SCP-CTX-3001"`.
+   - After `close()`, `send()` throws `ContextException` with code `"SCP-CTX-2001"`.
    - `context.use { }` block calls `AutoCloseable.close()` on exit — verified by collecting the flow and asserting it completes after the block exits.
 
 5. **Message streaming via `Flow<Message>`:**

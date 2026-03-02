@@ -54,142 +54,195 @@ public nonisolated struct UcanValidationResult: Sendable {
     }
 }
 
-// MARK: - UniFFI Bridge Stubs
+// MARK: - UcanBridge
 
-/// Validate a UCAN token via the UniFFI bridge.
+/// Namespace for UniFFI bridge function references used by UCAN operations.
+/// Each typealias maps 1:1 to a UniFFI-generated async function. Closures are
+/// injected for testability; defaults call through to ScpBindings.
 ///
-/// Placeholder stub for the UniFFI-generated `ucan_validate` function.
-/// Performs the full 11-step validation pipeline specified in ADR-016.
-internal func scpUcanValidate(
-    encoded: String,
-    contextId: String,
-    presenterDid: String,
-    completion: @Sendable @escaping (Result<UcanValidationResult, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Permission(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-UCAN-001"
-    )))
-}
+/// See ADR-026 for the flat delegation pattern and ADR-016 for UCAN spec.
+internal enum UcanBridge {
+    /// Validate a UCAN token. Maps to ``ucanValidate`` in ScpBindings.
+    internal typealias ValidateFn = @Sendable (
+        _ handle: ContextHandle,
+        _ token: String,
+        _ capability: String
+    ) async throws -> Void
 
-/// Mint a new UCAN token via the UniFFI bridge.
-///
-/// Placeholder stub for the UniFFI-generated `ucan_mint` function.
-internal func scpUcanMint(
-    issuerDid: String,
-    audienceDid: String,
-    capabilities: [UcanCapability],
-    expirySecs: UInt64,
-    proofs: [String],
-    completion: @Sendable @escaping (Result<UcanToken, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Permission(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-UCAN-002"
-    )))
-}
+    /// Mint a UCAN token. Maps to ``ucanMint`` in ScpBindings.
+    internal typealias MintFn = @Sendable (
+        _ handle: ContextHandle,
+        _ memberDid: String,
+        _ capabilities: [String]
+    ) async throws -> UcanToken
 
-/// Revoke a UCAN token via the UniFFI bridge.
-///
-/// Placeholder stub for the UniFFI-generated `ucan_revoke` function.
-internal func scpUcanRevoke(
-    encoded: String,
-    revokerDid: String,
-    completion: @Sendable @escaping (Result<Void, ScpError>) -> Void
-) {
-    // Placeholder: replaced by UniFFI-generated binding (SCP-103).
-    completion(.failure(.Permission(
-        message: "UniFFI bridge not yet available — build ScpFFI.xcframework (SCP-103)",
-        code: "SCP-UCAN-003"
-    )))
+    /// Revoke a UCAN token. Maps to ``ucanRevoke`` in ScpBindings.
+    internal typealias RevokeFn = @Sendable (
+        _ handle: ContextHandle,
+        _ tokenId: String
+    ) async throws -> Void
+
+    /// Default validate function that delegates to the UniFFI-generated binding.
+    internal static let defaultValidate: ValidateFn = { handle, token, capability in
+        try await ucanValidate(handle: handle, token: token, capability: capability)
+    }
+
+    /// Default mint function that delegates to the UniFFI-generated binding.
+    internal static let defaultMint: MintFn = { handle, memberDid, capabilities in
+        try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities)
+    }
+
+    /// Default revoke function that delegates to the UniFFI-generated binding.
+    internal static let defaultRevoke: RevokeFn = { handle, tokenId in
+        try await ucanRevoke(handle: handle, tokenId: tokenId)
+    }
 }
 
 // MARK: - UCAN Public API
 
-/// Validates a UCAN token against the full 11-step validation pipeline.
+/// Validates a UCAN token against a required capability.
 ///
-/// This function bridges the asynchronous UniFFI `ucan_validate` call to
-/// Swift concurrency via `CheckedContinuation`.
+/// Delegates to the UniFFI ``ucanValidate`` bridge function. The UniFFI
+/// function performs the full 11-step validation pipeline specified in ADR-016.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context.
+///   - token: The encoded UCAN token string.
+///   - capability: The required capability string to validate against.
+///   - validateFn: Bridge function override for testing.
+/// - Throws: ``ScpError/Permission(message:code:)`` if validation fails.
 ///
 /// ## Provenance
 ///
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - Story SCP-101
+/// - Story SCP-221
+public func validateUcanToken(
+    handle: ContextHandle,
+    token: String,
+    capability: String,
+    validateFn: UcanBridge.ValidateFn = UcanBridge.defaultValidate
+) async throws {
+    try await validateFn(handle, token, capability)
+}
+
+/// Mints a new UCAN token with the specified capabilities.
+///
+/// Delegates to the UniFFI ``ucanMint`` bridge function.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context.
+///   - memberDid: The DID of the member to mint the token for.
+///   - capabilities: An array of capability strings.
+///   - mintFn: Bridge function override for testing.
+/// - Returns: The minted ``UcanToken``.
+/// - Throws: ``ScpError/Permission(message:code:)`` if minting fails.
+///
+/// ## Provenance
+///
+/// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
+/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+/// - Story SCP-221
+public func mintUcanToken(
+    handle: ContextHandle,
+    memberDid: String,
+    capabilities: [String],
+    mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
+) async throws -> UcanToken {
+    try await mintFn(handle, memberDid, capabilities)
+}
+
+/// Revokes a UCAN token.
+///
+/// Delegates to the UniFFI ``ucanRevoke`` bridge function.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context.
+///   - tokenId: The ID of the token to revoke.
+///   - revokeFn: Bridge function override for testing.
+/// - Throws: ``ScpError/Permission(message:code:)`` if revocation fails.
+///
+/// ## Provenance
+///
+/// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
+/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+/// - Story SCP-221
+public func revokeUcanToken(
+    handle: ContextHandle,
+    tokenId: String,
+    revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
+) async throws {
+    try await revokeFn(handle, tokenId)
+}
+
+// MARK: - Legacy API (backward compatibility)
+
+/// Validates a UCAN token against the full 11-step validation pipeline.
+///
+/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
+/// to ``validateUcanToken(handle:token:capability:validateFn:)``. Prefer the
+/// handle-based API for production use.
+///
+/// ## Provenance
+///
+/// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
+/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+/// - Story SCP-221
 public func validate(
     encoded: String,
     contextId: String,
-    presenterDid: String
+    presenterDid: String,
+    validateFn: UcanBridge.ValidateFn = UcanBridge.defaultValidate
 ) async throws -> UcanValidationResult {
-    try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<UcanValidationResult, Error>) in
-        scpUcanValidate(
-            encoded: encoded,
-            contextId: contextId,
-            presenterDid: presenterDid
-        ) { result in
-            switch result {
-            case .success(let validationResult):
-                continuation.resume(returning: validationResult)
-            case .failure(let error):
-                continuation.resume(throwing: error)
-            }
-        }
+    let handle = ContextHandle(noPointer: .init())
+    do {
+        try await validateFn(handle, encoded, presenterDid)
+        return UcanValidationResult(isValid: true, token: nil, failureReason: nil)
+    } catch {
+        return UcanValidationResult(isValid: false, token: nil, failureReason: "\(error)")
     }
 }
 
 /// Mints a new UCAN token with the specified capabilities.
 ///
+/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
+/// to ``mintUcanToken(handle:memberDid:capabilities:mintFn:)``. Prefer the
+/// handle-based API for production use.
+///
 /// ## Provenance
 ///
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - Story SCP-101
+/// - Story SCP-221
 public func mint(
     issuerDid: String,
     audienceDid: String,
     capabilities: [UcanCapability],
     expirySecs: UInt64 = 3_600,
-    proofs: [String] = []
+    proofs: [String] = [],
+    mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
 ) async throws -> UcanToken {
-    try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<UcanToken, Error>) in
-        scpUcanMint(
-            issuerDid: issuerDid,
-            audienceDid: audienceDid,
-            capabilities: capabilities,
-            expirySecs: expirySecs,
-            proofs: proofs
-        ) { result in
-            switch result {
-            case .success(let token):
-                continuation.resume(returning: token)
-            case .failure(let error):
-                continuation.resume(throwing: error)
-            }
-        }
-    }
+    let handle = ContextHandle(noPointer: .init())
+    let capStrings = capabilities.map { "\($0.resource):\($0.action)" }
+    return try await mintFn(handle, audienceDid, capStrings)
 }
 
 /// Revokes a UCAN token.
+///
+/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
+/// to ``revokeUcanToken(handle:tokenId:revokeFn:)``. Prefer the
+/// handle-based API for production use.
 ///
 /// ## Provenance
 ///
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - Story SCP-101
-public func revoke(encoded: String, revokerDid: String) async throws {
-    try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Void, Error>) in
-        scpUcanRevoke(encoded: encoded, revokerDid: revokerDid) { result in
-            switch result {
-            case .success:
-                continuation.resume()
-            case .failure(let error):
-                continuation.resume(throwing: error)
-            }
-        }
-    }
+/// - Story SCP-221
+public func revoke(
+    encoded: String,
+    revokerDid: String,
+    revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
+) async throws {
+    let handle = ContextHandle(noPointer: .init())
+    try await revokeFn(handle, encoded)
 }
