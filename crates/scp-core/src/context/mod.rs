@@ -144,10 +144,10 @@ pub use governance::{
     SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine, sign_vote, verify_vote,
 };
 
-// Re-export broadcast context types (SCP-227, spec section 5.14).
+// Re-export broadcast context types (SCP-227, spec section 5.14, #101).
 pub use broadcast::{
-    AuthorState, BlockResult, BroadcastAdmission, BroadcastContext, SubscriberRecord,
-    SubscriptionResult,
+    AuthorState, BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision,
+    SubscriberRecord, SubscriptionResult, UnsubscribeResult,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).

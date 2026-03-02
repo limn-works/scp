@@ -140,6 +140,69 @@ pub struct BlockResult {
 }
 
 // ---------------------------------------------------------------------------
+// UnsubscribeResult
+// ---------------------------------------------------------------------------
+
+/// Result returned by [`BroadcastContext::unsubscribe`].
+///
+/// Contains the subscriber DID for `MemberLeft` event production, and
+/// optionally the list of authors whose keys were rotated as a consequence
+/// of the unsubscription (when `rotate_keys` is requested). Callers use this
+/// to emit `MemberLeft` + `KeyEpochAdvance` events and distribute new keys.
+#[derive(Debug)]
+pub struct UnsubscribeResult {
+    /// The DID of the unsubscribed member (for `MemberLeft` event).
+    pub subscriber_did: String,
+    /// Per-author key rotation results triggered by the unsubscription.
+    /// Empty if `rotate_keys` was `false` or there are no authors.
+    pub key_rotations: Vec<BlockResult>,
+}
+
+// ---------------------------------------------------------------------------
+// KeyRequestDecision
+// ---------------------------------------------------------------------------
+
+/// Decision returned by [`BroadcastContext::handle_key_request`].
+///
+/// The author-side broadcast context evaluates whether a subscriber is
+/// authorized to receive key material. The decision is one of:
+///
+/// - **Grant**: the subscriber is registered, not blocked, and (for gated
+///   contexts) holds a valid UCAN. The caller should proceed with HPKE key
+///   distribution.
+/// - **Deny**: the subscriber is blocked, unregistered, or unauthorized.
+///   The author sends no response (cryptographic exclusion per §5.14.8).
+#[derive(Clone, PartialEq, Eq)]
+pub enum KeyRequestDecision {
+    /// Grant: subscriber is authorized. Includes the author's current
+    /// broadcast key bytes and epoch for HPKE wrapping.
+    Grant {
+        /// The raw 32-byte AES-256 broadcast key material.
+        key_bytes: [u8; 32],
+        /// The current key epoch.
+        epoch: u64,
+    },
+    /// Deny: subscriber is blocked, unregistered, or unauthorized.
+    Deny {
+        /// Human-readable reason for the denial.
+        reason: String,
+    },
+}
+
+impl std::fmt::Debug for KeyRequestDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Grant { epoch, .. } => f
+                .debug_struct("Grant")
+                .field("key_bytes", &"[REDACTED]")
+                .field("epoch", epoch)
+                .finish(),
+            Self::Deny { reason } => f.debug_struct("Deny").field("reason", reason).finish(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BroadcastContext
 // ---------------------------------------------------------------------------
 
@@ -490,6 +553,147 @@ impl BroadcastContext {
     pub fn can_read(&self, did: &str) -> bool {
         self.subscribers.contains_key(did) || self.authors.contains_key(did)
     }
+
+    // -----------------------------------------------------------------------
+    // Unsubscribe (spec section 5.14.7)
+    // -----------------------------------------------------------------------
+
+    /// Removes a subscriber from the broadcast context.
+    ///
+    /// Produces an [`UnsubscribeResult`] containing the subscriber DID for
+    /// `MemberLeft` event production. When `rotate_keys` is `true`, all
+    /// authors rotate their broadcast keys to exclude the departing
+    /// subscriber (equivalent to blocking, ensuring forward secrecy of
+    /// future content).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MemberNotFound`] if the subscriber DID is not
+    ///   registered.
+    /// - [`ContextError::CryptoFailed`] if key rotation fails (epoch
+    ///   overflow).
+    pub fn unsubscribe(
+        &mut self,
+        subscriber_did: &str,
+        rotate_keys: bool,
+    ) -> Result<UnsubscribeResult, ContextError> {
+        if !self.subscribers.contains_key(subscriber_did) {
+            return Err(ContextError::MemberNotFound(format!(
+                "subscriber not found: {subscriber_did}"
+            )));
+        }
+
+        self.subscribers.remove(subscriber_did);
+
+        let mut key_rotations = Vec::new();
+
+        if rotate_keys {
+            // Collect author DIDs first to avoid borrowing conflict.
+            let author_dids: Vec<String> = self.authors.keys().cloned().collect();
+
+            for author_did in &author_dids {
+                // Safety: `author_did` was just collected from `self.authors.keys()`,
+                // so the entry is guaranteed to exist.
+                if let Some(author) = self.authors.get_mut(author_did.as_str()) {
+                    let new_epoch = author.epoch.checked_add(1).ok_or_else(|| {
+                        ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
+                    })?;
+
+                    let new_key = generate_sender_key();
+                    author.epoch = new_epoch;
+                    author.broadcast_key = new_key.clone();
+
+                    key_rotations.push(BlockResult {
+                        new_key,
+                        new_epoch,
+                        author_did: author_did.clone(),
+                        block_list: author.block_list.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(UnsubscribeResult {
+            subscriber_did: subscriber_did.to_owned(),
+            key_rotations,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Key request handling (spec sections 5.14.2, 5.14.4, 5.14.8)
+    // -----------------------------------------------------------------------
+
+    /// Evaluates whether a subscriber's broadcast key request should be
+    /// granted or denied.
+    ///
+    /// This is the author-side decision function for the pull-based key
+    /// distribution protocol (§9.16.2). The author checks:
+    ///
+    /// 1. The requester is a registered subscriber (or author).
+    /// 2. The requester is not on the author's block list.
+    /// 3. For gated contexts: the requester presented a valid UCAN at
+    ///    registration time (recorded in [`SubscriberRecord::has_ucan`]).
+    ///
+    /// If all checks pass, returns [`KeyRequestDecision::Grant`] with the
+    /// author's current broadcast key material and epoch. The caller is
+    /// responsible for HPKE-wrapping the key material to the requester's
+    /// wrapping public key (using `crypto::sender_keys::key_protocol`).
+    ///
+    /// If any check fails, returns [`KeyRequestDecision::Deny`]. Per
+    /// §5.14.8, the author sends **no response** to denied requests --
+    /// the requester times out and cannot decrypt future content.
+    #[must_use]
+    pub fn handle_key_request(&self, author_did: &str, requester_did: &str) -> KeyRequestDecision {
+        // Author must exist.
+        let Some(author) = self.authors.get(author_did) else {
+            return KeyRequestDecision::Deny {
+                reason: format!("author not found: {author_did}"),
+            };
+        };
+
+        // Requester must not be blocked.
+        if author.block_list.contains(requester_did) {
+            return KeyRequestDecision::Deny {
+                reason: format!("requester is blocked by {author_did}"),
+            };
+        }
+
+        // Requester must be a registered subscriber or author.
+        if !self.subscribers.contains_key(requester_did)
+            && !self.authors.contains_key(requester_did)
+        {
+            return KeyRequestDecision::Deny {
+                reason: format!("requester is not a registered subscriber: {requester_did}"),
+            };
+        }
+
+        // For gated contexts, the subscriber must have presented a UCAN at
+        // registration time. Authors requesting keys from other authors are
+        // always allowed (they hold messagesWrite which implies messagesRead).
+        if self.admission == BroadcastAdmission::Gated
+            && let Some(record) = self.subscribers.get(requester_did)
+            && !record.has_ucan
+        {
+            return KeyRequestDecision::Deny {
+                reason: "gated context requires UCAN-authenticated subscriber".to_owned(),
+            };
+        }
+
+        KeyRequestDecision::Grant {
+            key_bytes: *author.broadcast_key.as_bytes(),
+            epoch: author.epoch,
+        }
+    }
+
+    /// Returns an iterator over all subscriber records.
+    pub fn subscribers(&self) -> impl Iterator<Item = &SubscriberRecord> {
+        self.subscribers.values()
+    }
+
+    /// Returns an iterator over all author DIDs.
+    pub fn author_dids(&self) -> impl Iterator<Item = &String> {
+        self.authors.keys()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +737,7 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::crypto::sender_keys::{decrypt_sender_layer, encrypt_sender_layer};
+    use crate::crypto::sender_keys::{SenderKey, decrypt_sender_layer, encrypt_sender_layer};
     use crate::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
         InMemoryProofResolver, InMemoryRevocationChecker,
@@ -1512,5 +1716,446 @@ mod tests {
                 role_name: "subscriber".to_owned(),
             }
         );
+    }
+
+    // =======================================================================
+    // Unsubscribe tests (§5.14.7, #101 AC: unsubscribe produces MemberLeft)
+    // =======================================================================
+
+    #[test]
+    fn unsubscribe_removes_subscriber() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+        assert!(ctx.is_subscriber("did:example:bob"));
+        assert_eq!(ctx.subscriber_count(), 1);
+
+        let result = ctx.unsubscribe("did:example:bob", false).unwrap();
+
+        assert_eq!(result.subscriber_did, "did:example:bob");
+        assert!(!ctx.is_subscriber("did:example:bob"));
+        assert_eq!(ctx.subscriber_count(), 0);
+        // No key rotations when rotate_keys is false.
+        assert!(result.key_rotations.is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_unknown_subscriber_returns_error() {
+        let mut ctx = make_open_ctx();
+        let result = ctx.unsubscribe("did:example:unknown", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unsubscribe_revokes_read_access() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        assert!(ctx.can_read("did:example:bob"));
+        ctx.unsubscribe("did:example:bob", false).unwrap();
+        assert!(
+            !ctx.can_read("did:example:bob"),
+            "unsubscribed member must lose read access"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_with_key_rotation_rotates_all_authors() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:carol").unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        let alice_epoch_before = ctx.get_author("did:example:alice").unwrap().epoch;
+        let carol_epoch_before = ctx.get_author("did:example:carol").unwrap().epoch;
+
+        let result = ctx.unsubscribe("did:example:bob", true).unwrap();
+
+        assert_eq!(result.key_rotations.len(), 2);
+        assert_eq!(
+            ctx.get_author("did:example:alice").unwrap().epoch,
+            alice_epoch_before + 1
+        );
+        assert_eq!(
+            ctx.get_author("did:example:carol").unwrap().epoch,
+            carol_epoch_before + 1
+        );
+    }
+
+    #[test]
+    fn unsubscribe_without_key_rotation_preserves_epochs() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        let epoch_before = ctx.get_author("did:example:alice").unwrap().epoch;
+        ctx.unsubscribe("did:example:bob", false).unwrap();
+        assert_eq!(
+            ctx.get_author("did:example:alice").unwrap().epoch,
+            epoch_before,
+            "epoch must not change when rotate_keys is false"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_result_contains_subscriber_did_for_member_left_event() {
+        let mut ctx = make_open_ctx();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        let result = ctx.unsubscribe("did:example:bob", false).unwrap();
+        // Caller uses this to emit a MemberLeft { member_did: result.subscriber_did }
+        assert_eq!(result.subscriber_did, "did:example:bob");
+    }
+
+    #[test]
+    fn subscribe_result_contains_author_epochs_for_key_requests() {
+        // After subscription, the subscriber knows each author's current epoch
+        // and can immediately request broadcast keys via the pull-based protocol.
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:carol").unwrap();
+
+        // Block a third party to advance Alice's epoch.
+        subscribe_open(&mut ctx, "did:example:eve", None, 500).unwrap();
+        ctx.block_subscriber("did:example:alice", "did:example:eve")
+            .unwrap();
+        // Alice is now at epoch 1, Carol still at epoch 0.
+
+        let result = subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+        assert_eq!(result.author_epochs["did:example:alice"], 1);
+        assert_eq!(result.author_epochs["did:example:carol"], 0);
+    }
+
+    // =======================================================================
+    // Key request handling tests (§5.14.2, §5.14.4, §5.14.8, #101 AC)
+    // =======================================================================
+
+    #[test]
+    fn handle_key_request_grants_registered_subscriber() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        match decision {
+            KeyRequestDecision::Grant { key_bytes, epoch } => {
+                assert_eq!(epoch, 0);
+                assert_eq!(
+                    key_bytes,
+                    *ctx.get_author("did:example:alice")
+                        .unwrap()
+                        .broadcast_key
+                        .as_bytes()
+                );
+            }
+            KeyRequestDecision::Deny { reason } => {
+                panic!("expected Grant, got Deny: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn handle_key_request_denies_blocked_subscriber() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+        ctx.block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:dave");
+        assert!(
+            matches!(decision, KeyRequestDecision::Deny { .. }),
+            "blocked subscriber must be denied"
+        );
+    }
+
+    #[test]
+    fn handle_key_request_denies_unregistered_did() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:unknown");
+        assert!(
+            matches!(decision, KeyRequestDecision::Deny { .. }),
+            "unregistered DID must be denied"
+        );
+    }
+
+    #[test]
+    fn handle_key_request_denies_unknown_author() {
+        let mut ctx = make_open_ctx();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        let decision = ctx.handle_key_request("did:example:unknown", "did:example:bob");
+        assert!(
+            matches!(decision, KeyRequestDecision::Deny { .. }),
+            "unknown author must result in deny"
+        );
+    }
+
+    #[test]
+    fn handle_key_request_grants_author_requesting_another_authors_key() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:carol").unwrap();
+
+        // Authors have implicit read access and can request each other's keys.
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:carol");
+        assert!(
+            matches!(decision, KeyRequestDecision::Grant { .. }),
+            "authors should be able to request each other's keys"
+        );
+    }
+
+    #[test]
+    fn handle_key_request_returns_current_epoch_after_rotation() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:eve", None, 1001).unwrap();
+
+        // Block eve to advance Alice's epoch.
+        ctx.block_subscriber("did:example:alice", "did:example:eve")
+            .unwrap();
+
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        match decision {
+            KeyRequestDecision::Grant { epoch, .. } => {
+                assert_eq!(epoch, 1, "should return the post-rotation epoch");
+            }
+            KeyRequestDecision::Deny { reason } => {
+                panic!("expected Grant, got Deny: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn handle_key_request_gated_denies_subscriber_without_ucan() {
+        // In a gated context, if somehow a subscriber was registered without
+        // a UCAN (e.g. restored from storage with has_ucan=false), the key
+        // request must be denied.
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        // Force-insert a subscriber record without UCAN (simulates a
+        // data integrity issue or manual insertion).
+        ctx.subscribers.insert(
+            "did:example:bob".to_owned(),
+            SubscriberRecord {
+                subscriber_did: "did:example:bob".to_owned(),
+                registered_at: 1000,
+                has_ucan: false,
+            },
+        );
+
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        assert!(
+            matches!(decision, KeyRequestDecision::Deny { .. }),
+            "gated context must deny subscriber without UCAN"
+        );
+    }
+
+    // =======================================================================
+    // Subscriber / author iteration (#101 AC: roster maintenance)
+    // =======================================================================
+
+    #[test]
+    fn subscribers_iterator_returns_all_records() {
+        let mut ctx = make_open_ctx();
+        subscribe_open(&mut ctx, "did:example:alice", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1001).unwrap();
+        subscribe_open(&mut ctx, "did:example:carol", None, 1002).unwrap();
+
+        let mut dids: Vec<&str> = ctx
+            .subscribers()
+            .map(|r| r.subscriber_did.as_str())
+            .collect();
+        dids.sort_unstable();
+        assert_eq!(
+            dids,
+            vec!["did:example:alice", "did:example:bob", "did:example:carol"]
+        );
+    }
+
+    #[test]
+    fn author_dids_iterator_returns_all_authors() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+
+        let mut dids: Vec<&str> = ctx.author_dids().map(String::as_str).collect();
+        dids.sort_unstable();
+        assert_eq!(dids, vec!["did:example:alice", "did:example:bob"]);
+    }
+
+    // =======================================================================
+    // Integration: full subscriber lifecycle (#101 AC 7)
+    // =======================================================================
+
+    /// Integration test: create broadcast context -> subscribe -> receive
+    /// broadcast message -> unsubscribe -> verify no further access.
+    #[test]
+    fn integration_full_subscriber_lifecycle() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        // Step 1: Subscribe.
+        let sub_result = subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+        assert_eq!(sub_result.author_epochs["did:example:alice"], 0);
+        assert!(ctx.is_subscriber("did:example:bob"));
+
+        // Step 2: Key request succeeds.
+        let key_decision = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        let (key_bytes, epoch) = match key_decision {
+            KeyRequestDecision::Grant { key_bytes, epoch } => (key_bytes, epoch),
+            KeyRequestDecision::Deny { reason } => panic!("expected Grant: {reason}"),
+        };
+        assert_eq!(epoch, 0);
+
+        // Step 3: Decrypt a broadcast message with the granted key.
+        let author_key = &ctx.get_author("did:example:alice").unwrap().broadcast_key;
+        let plaintext = b"Hello broadcast subscribers!";
+        let ciphertext = encrypt_sender_layer(author_key, plaintext).unwrap();
+        let received_key = SenderKey::from_bytes(key_bytes);
+        let decrypted = decrypt_sender_layer(&received_key, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // Step 4: Unsubscribe with key rotation.
+        let unsub_result = ctx.unsubscribe("did:example:bob", true).unwrap();
+        assert_eq!(unsub_result.subscriber_did, "did:example:bob");
+        assert_eq!(unsub_result.key_rotations.len(), 1);
+        assert_eq!(unsub_result.key_rotations[0].new_epoch, 1);
+
+        // Step 5: Verify no further access.
+        assert!(!ctx.is_subscriber("did:example:bob"));
+        assert!(!ctx.can_read("did:example:bob"));
+
+        // Step 6: Key request now denied.
+        let denied = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        assert!(matches!(denied, KeyRequestDecision::Deny { .. }));
+
+        // Step 7: Old key cannot decrypt new content.
+        let new_author_key = &ctx.get_author("did:example:alice").unwrap().broadcast_key;
+        let new_plaintext = b"Post-unsubscribe message";
+        let new_ciphertext = encrypt_sender_layer(new_author_key, new_plaintext).unwrap();
+        let old_decrypt_result = decrypt_sender_layer(&received_key, &new_ciphertext);
+        assert!(
+            old_decrypt_result.is_err(),
+            "old key must not decrypt post-unsubscribe messages"
+        );
+    }
+
+    /// Integration test: gated subscribe -> key request -> unsubscribe.
+    #[test]
+    fn integration_gated_subscriber_lifecycle() {
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let ucan = setup.make_ucan("ctx-gated-1", "did:example:sub1");
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:sub1",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        // Subscribe with UCAN.
+        ctx.subscribe("did:example:sub1", Some(&ucan), 1000, Some(&mut val_ctx))
+            .unwrap();
+        assert!(ctx.is_subscriber("did:example:sub1"));
+
+        // Key request succeeds (has_ucan = true).
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:sub1");
+        assert!(matches!(decision, KeyRequestDecision::Grant { .. }));
+
+        // Unsubscribe.
+        let result = ctx.unsubscribe("did:example:sub1", false).unwrap();
+        assert_eq!(result.subscriber_did, "did:example:sub1");
+        assert!(!ctx.is_subscriber("did:example:sub1"));
+    }
+
+    /// Integration test: multiple subscribers, one unsubscribes, others
+    /// continue receiving.
+    #[test]
+    fn integration_partial_unsubscribe() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub2", None, 1001).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub3", None, 1002).unwrap();
+
+        // Unsubscribe sub2 with key rotation.
+        ctx.unsubscribe("did:example:sub2", true).unwrap();
+
+        // sub1 and sub3 can still request keys.
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            KeyRequestDecision::Grant { .. }
+        ));
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub3"),
+            KeyRequestDecision::Grant { .. }
+        ));
+
+        // sub2 is denied.
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub2"),
+            KeyRequestDecision::Deny { .. }
+        ));
+    }
+
+    /// Integration test: unsubscribe with key rotation produces keys that
+    /// are different from the pre-unsubscribe keys.
+    #[test]
+    fn integration_unsubscribe_key_rotation_changes_key_material() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
+
+        let old_key = ctx
+            .get_author("did:example:alice")
+            .unwrap()
+            .broadcast_key
+            .as_bytes()
+            .to_owned();
+
+        let result = ctx.unsubscribe("did:example:bob", true).unwrap();
+        let new_key = result.key_rotations[0].new_key.as_bytes();
+
+        assert_ne!(
+            &old_key[..],
+            new_key,
+            "key must change after unsubscribe with rotation"
+        );
+    }
+
+    // =======================================================================
+    // KeyRequestDecision Debug redaction
+    // =======================================================================
+
+    #[test]
+    fn key_request_decision_debug_redacts_key_bytes() {
+        let decision = KeyRequestDecision::Grant {
+            key_bytes: [42u8; 32],
+            epoch: 5,
+        };
+        let debug = format!("{decision:?}");
+        assert!(
+            debug.contains("REDACTED"),
+            "Grant debug must redact key bytes"
+        );
+        assert!(
+            !debug.contains("42"),
+            "Grant debug must not contain raw key byte values"
+        );
+        assert!(debug.contains('5'), "Grant debug must contain epoch");
     }
 }
