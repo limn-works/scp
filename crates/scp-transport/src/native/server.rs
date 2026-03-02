@@ -112,7 +112,7 @@ impl Default for RelayConfig {
             ttl_check_interval: Duration::from_secs(10),
             max_connections_per_ip: 10,
             max_total_connections: 1000,
-            rate_limit_publishes_per_second: 1,
+            rate_limit_publishes_per_second: 100,
             rate_limit_subscribes_per_minute: 20,
             delivery_jitter_ms: 50,
             bridge_secret: None,
@@ -1341,8 +1341,6 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            // ADR-004 default is 1/sec; tests need higher for rapid publishes.
-            rate_limit_publishes_per_second: 100,
             ..RelayConfig::default()
         };
         let storage = Arc::new(InMemoryBlobStorage::new());
@@ -2007,7 +2005,6 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(50),
             delivery_jitter_ms: 0,
-            rate_limit_publishes_per_second: 100,
             ..RelayConfig::default()
         };
         let storage = Arc::new(InMemoryBlobStorage::new());
@@ -2333,7 +2330,6 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            rate_limit_publishes_per_second: 100,
             ..RelayConfig::default()
         };
         // Storage with capacity of 2.

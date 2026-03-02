@@ -144,8 +144,6 @@ async fn start_relay() -> SocketAddr {
     let config = RelayConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
-        // ADR-004 default is 1/sec; tests need higher for rapid publishes.
-        rate_limit_publishes_per_second: 100,
         ..RelayConfig::default()
     };
     let storage = Arc::new(InMemoryBlobStorage::new());

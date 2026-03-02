@@ -589,7 +589,7 @@ Published out-of-band (relay metadata page, DID document service endpoint). Rela
 | `max_blob_ttl` | 604800 | Max TTL seconds |
 | `max_subscriptions_per_connection` | 100 | Concurrent subscriptions per WebSocket |
 | `max_query_limit` | 1000 | Max QUERY limit |
-| `rate_limit_publish` | 60/min | PUBLISH rate per connection |
+| `rate_limit_publish` | 6000/min | PUBLISH rate per IP (100/sec) |
 | `rate_limit_subscribe` | 20/min | SUBSCRIBE rate per connection |
 | `idle_timeout` | 90s | Seconds before idle connection close |
 
