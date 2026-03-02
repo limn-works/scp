@@ -449,29 +449,10 @@ mod tests {
     const ATTESTATION_ID: &str = "attest-claim-001";
 
     // -------------------------------------------------------------------
-    // Crypto helpers
+    // Crypto helpers (imported from shared test helpers)
     // -------------------------------------------------------------------
 
-    /// Creates an Ed25519 signing keypair for testing.
-    fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
-        let mut rng = rand::thread_rng();
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
-        let verifying_key = signing_key.verifying_key();
-        (verifying_key, signing_key)
-    }
-
-    /// Encodes a public key as a test DID (`did:key:<hex>`).
-    fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
-        let hex: String = verifying_key
-            .as_bytes()
-            .iter()
-            .fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        format!("did:key:{hex}")
-    }
+    use crate::event_log::test_helpers::{did_from_pubkey, test_keypair};
 
     // -------------------------------------------------------------------
     // Helpers
@@ -587,7 +568,7 @@ mod tests {
         let event = claim_shadow(&mut registry, &request).unwrap();
 
         assert_eq!(event.shadow_id, SHADOW_ID);
-        assert_eq!(event.claimant_did, did.as_str());
+        assert_eq!(event.claimant_did, did);
     }
 
     #[test]
@@ -623,7 +604,7 @@ mod tests {
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
         let event = claim_shadow(&mut registry, &request).unwrap();
         assert_eq!(event.shadow_id, SHADOW_ID);
-        assert_eq!(event.claimant_did, did.as_str());
+        assert_eq!(event.claimant_did, did);
         assert_eq!(event.platform_handle, HANDLE);
         assert_eq!(event.attestation_id, ATTESTATION_ID);
         assert_eq!(event.context_id, CTX);

@@ -28,6 +28,10 @@ pub mod pruning;
 pub mod tiered_storage;
 pub mod tree;
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod test_helpers;
+
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
