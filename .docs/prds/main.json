@@ -1698,7 +1698,7 @@
         "Create `crates/scp-core/crypto/ucan/mod.rs` with UcanToken types, UcanError enum, module re-exports",
         "Implement `mint_ucan` in `crates/scp-core/crypto/ucan/mint.rs`: token creation with proper iss/aud/att/nnc/exp fields, delegation chain construction, nonce generation in required format",
         "Implement `validate_ucan` in `crates/scp-core/crypto/ucan/validate.rs` with all 11 validation steps per ADR-016 criterion 2",
-        "Integrate with rs-ucan crate (evaluate for UCAN 0.10+ spec compliance)",
+        "Integrate native UCAN implementation in scp-core/src/crypto/ucan/ (UCAN 0.10+ spec compliant)",
         "Write comprehensive unit tests for all validation checks and failure modes"
       ],
       "blockedBy": [
@@ -1714,7 +1714,7 @@
       ],
       "details": {
         "Validation pipeline note": "Implements the full 11-step validation pipeline from ADR-016 criterion 2. All 11 steps are built from the start (ADR-016 is normative, not a future extension). Phase 2 integration tests exercise steps 1\u20132, 4\u20136, 8, 10\u201311 (8 steps not requiring delegation chain depth > 1). Phase 3 adds integration tests for steps 3 (chain verification), 7 (attenuation), and 9 (structured nonce validation).",
-        "Implementation notes": "Language: Rust. Library: rs-ucan crate (or ucan crate \u2014 evaluate for UCAN 0.10+ spec compliance). Crate: scp-core. Modules: scp-core/crypto/ucan/ (UCAN wrapper, validation, revocation). Nonce tracking: In-memory set of seen nonces per context, persisted to storage. Revocation: Revocation list per context, distributed as MLS application messages."
+        "Implementation notes": "Language: Rust. Library: native UCAN implementation in scp-core/src/crypto/ucan/ (UCAN 0.10+ spec compliant). Crate: scp-core. Modules: scp-core/crypto/ucan/ (UCAN wrapper, validation, revocation). Nonce tracking: In-memory set of seen nonces per context, persisted to storage. Revocation: Revocation list per context, distributed as MLS application messages."
       },
       "result": "UCAN minting (mint.rs) and 11-step validation pipeline (validate.rs). 28 new tests. Ed25519 signing via KeyCustody trait."
     },

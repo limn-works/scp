@@ -205,7 +205,7 @@ scp:identity:{did}/attestations       → create, revoke
 
 **Delegation chain:** Human DID → Agent → Context-scoped token. Every token traces back to the human who authorized it. Revocation is per-token — revoke one capability in one context without affecting others.
 
-**Libraries:** ucanto (TypeScript), rs-ucan (Rust), ucan-wasm.
+**Libraries:** ucanto (TypeScript), rs-ucan (Rust), ucan-wasm. [Note: rs-ucan replaced by native impl in scp-core/src/crypto/ucan/]
 
 ---
 
@@ -260,7 +260,7 @@ SCP.App.declare(manifest)             Merkle tree event logs
 │  ┌───────┴──────────────────┴───────────────────┴───────┐            │
 │  │ CRYPTO LAYER                                          │            │
 │  │                                                       │            │
-│  │  MLS (OpenMLS)     UCAN (rs-ucan)     Merkle Trees   │            │
+│  │  MLS (OpenMLS)     UCAN (rs-ucan*)    Merkle Trees   │            │
 │  │  - group mgmt      - token create     - event log    │            │
 │  │  - key rotation     - chain validate  - proofs       │            │
 │  │  - encrypt/decrypt  - revocation      - integrity    │            │
@@ -278,6 +278,8 @@ SCP.App.declare(manifest)             Merkle tree event logs
 │                                                                       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+*rs-ucan was replaced by a native implementation in scp-core/src/crypto/ucan/.
 
 ### Tech Stack
 
@@ -911,7 +913,7 @@ If this works, everything else is elaboration. If this doesn't work, the spec is
 | Transport architecture | Abstraction + bindings (option 2 from session 02) | Pick one transport (option 3), define relay protocol (option 1) |
 | Core language | Rust | Go (weaker crypto ecosystem), TypeScript (performance), Swift (not cross-platform) |
 | Cross-platform bindings | UniFFI (Mozilla) | Manual FFI (fragile), cbindgen (C-only) |
-| UCAN library | rs-ucan (Rust) | ucanto (TypeScript only) |
+| UCAN library | rs-ucan (Rust) [Note: replaced by native impl in scp-core/src/crypto/ucan/] | ucanto (TypeScript only) |
 
 ---
 
