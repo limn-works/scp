@@ -221,7 +221,8 @@ fun <T> rememberScpStateIn(
  * @param start Suspend factory lambda that creates the [SharedFlow]. Called
  *   once per [key] value. Runs in a coroutine scoped to the Composable.
  * @param onStop Suspend cleanup lambda invoked when the Composable leaves
- *   composition.
+ *   composition. Called inside `runBlocking` on the Main thread, so it
+ *   must not dispatch to `Dispatchers.Main` — doing so will deadlock.
  * @return Compose [State] holding the [SharedFlow], or `null` until
  *   the subscription is established.
  */
