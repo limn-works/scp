@@ -1168,6 +1168,7 @@ mod tests {
         use crate::native::server::{RelayConfig, RelayServer};
         use crate::native::storage::InMemoryBlobStorage;
         use std::net::SocketAddr;
+        use std::sync::Arc;
 
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -1175,7 +1176,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
         let url = format!("ws://{addr}/scp/v1");

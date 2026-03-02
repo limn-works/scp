@@ -6,8 +6,10 @@
 //!
 //! See spec section 18.6.2 for the SDK surface.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::State;
@@ -18,7 +20,10 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::RwLock;
 
 use scp_platform::traits::Storage;
+use scp_transport::native::server::RelayConfig as TransportRelayConfig;
+use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 
+use crate::projection::ProjectedContext;
 use crate::well_known::well_known_handler;
 use crate::{ApplicationNode, NodeError};
 
@@ -39,10 +44,16 @@ pub struct BroadcastContext {
 
 /// Shared state accessible by axum handlers.
 ///
-/// Contains the node's identity information and registered broadcast
-/// contexts. Read on every `.well-known/scp` request to generate
-/// the response dynamically (spec section 18.6.4).
-pub struct NodeState {
+/// Contains the node's identity information, registered broadcast
+/// contexts, dev API configuration, and blob storage reference.
+/// Read on every `.well-known/scp` request to generate the response
+/// dynamically (spec section 18.6.4).
+///
+/// # Type parameter
+///
+/// `B` is the blob storage backend, shared between the relay server and
+/// projection handlers via `Arc<B>` (spec section 18.11.5).
+pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     /// The operator's DID string.
     pub(crate) did: String,
     /// The relay URL (e.g., `wss://example.com/scp/v1`).
@@ -58,6 +69,32 @@ pub struct NodeState {
     /// axum handler connects to the internal relay. The relay validates
     /// this token during the WebSocket handshake (defense-in-depth, #85).
     pub(crate) bridge_secret: [u8; 32],
+    /// Bearer token for the dev API (`scp_local_token_<32 hex chars>`).
+    ///
+    /// `Some` when `local_api()` was called on the builder, `None` otherwise.
+    /// See spec section 18.10.2.
+    pub(crate) dev_token: Option<String>,
+    /// Bind address for the dev API server.
+    ///
+    /// `Some` when `local_api()` was called on the builder, `None` otherwise.
+    /// See spec section 18.10.2.
+    pub(crate) dev_bind_addr: Option<SocketAddr>,
+    /// Registry of broadcast contexts whose messages are projected (decrypted
+    /// and served) by this node's HTTP endpoints. Keyed by routing ID.
+    ///
+    /// See spec section 18.11.5.
+    pub(crate) projected_contexts: RwLock<HashMap<[u8; 32], ProjectedContext>>,
+    /// Shared blob storage instance, used by both the relay server and
+    /// projection handlers to read stored blobs.
+    ///
+    /// See spec section 18.11.5.
+    pub(crate) blob_storage: Arc<B>,
+    /// Relay operational parameters exposed in `.well-known/scp`
+    /// `relay_config` (spec section 18.3.3).
+    pub(crate) relay_config: TransportRelayConfig,
+    /// The instant the node was started, used to compute uptime for the
+    /// dev API health endpoint (spec section 18.10.3).
+    pub(crate) start_time: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,9 +105,9 @@ pub struct NodeState {
 ///
 /// The handler dynamically generates the `.well-known/scp` JSON document
 /// from the provided [`NodeState`]. See spec section 18.3.
-pub fn well_known_router(state: Arc<NodeState>) -> Router {
+pub fn well_known_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Router {
     Router::new()
-        .route("/.well-known/scp", get(well_known_handler))
+        .route("/.well-known/scp", get(well_known_handler::<B>))
         .with_state(state)
 }
 
@@ -80,9 +117,9 @@ pub fn well_known_router(state: Arc<NodeState>) -> Router {
 /// relay server. The axum handler upgrades the HTTP connection to
 /// WebSocket, then connects to the relay on localhost and forwards
 /// frames bidirectionally.
-pub fn relay_router(state: Arc<NodeState>) -> Router {
+pub fn relay_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Router {
     Router::new()
-        .route("/scp/v1", get(ws_upgrade_handler))
+        .route("/scp/v1", get(ws_upgrade_handler::<B>))
         .with_state(state)
 }
 
@@ -91,9 +128,9 @@ pub fn relay_router(state: Arc<NodeState>) -> Router {
 /// Bridges the incoming WebSocket connection to the node's internal
 /// relay server by connecting to `relay_addr` on localhost, authenticated
 /// with the bridge secret.
-async fn ws_upgrade_handler(
+async fn ws_upgrade_handler<B: BlobStorage + 'static>(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<NodeState>>,
+    State(state): State<Arc<NodeState<B>>>,
 ) -> impl IntoResponse {
     let relay_addr = state.relay_addr;
     let bridge_secret = state.bridge_secret;
@@ -191,7 +228,7 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret:
 // ApplicationNode HTTP methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
+impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNode<S, B> {
     /// Returns an axum [`Router`] serving `GET /.well-known/scp`.
     ///
     /// The response is dynamically generated from the node's current state:
@@ -214,14 +251,56 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         relay_router(Arc::clone(&self.state))
     }
 
+    /// Returns an axum [`Router`] serving broadcast projection endpoints.
+    ///
+    /// Includes:
+    /// - `GET /scp/broadcast/<routing_id>/feed` -- recent messages feed
+    /// - `GET /scp/broadcast/<routing_id>/messages/<blob_id>` -- single message
+    ///
+    /// These are **public endpoints** with no authentication middleware --
+    /// broadcast content is intended for broad distribution (spec section
+    /// 18.11.6).
+    ///
+    /// Served on the public HTTPS port alongside `.well-known/scp` and
+    /// `/scp/v1`.
+    ///
+    /// See spec section 18.11.8.
+    #[must_use = "returns the projection router, which must be mounted into an axum application"]
+    pub fn broadcast_projection_router(&self) -> Router {
+        crate::projection::broadcast_projection_router(Arc::clone(&self.state))
+    }
+
+    /// Returns the dev API router if the dev API is enabled.
+    ///
+    /// Returns `Some(Router)` when [`ApplicationNodeBuilder::local_api`] was
+    /// called (i.e., a dev token was generated), `None` otherwise. The
+    /// returned router includes all `/scp/dev/v1/*` routes with bearer token
+    /// middleware applied.
+    ///
+    /// See spec section 18.10.5.
+    #[must_use = "returns the dev API router, which must be served on a separate listener"]
+    pub fn dev_router(&self) -> Option<Router> {
+        let token = self.state.dev_token.clone()?;
+        Some(crate::dev_api::dev_router(Arc::clone(&self.state), token))
+    }
+
     /// Binds HTTPS on the configured address, merging:
     ///
     /// 1. Application-provided routes (`app_router`)
     /// 2. `.well-known/scp` route
     /// 3. `/scp/v1` WebSocket upgrade route
+    /// 4. `/scp/broadcast/*` broadcast projection routes
     ///
-    /// SCP routes take precedence for `/.well-known/scp` and `/scp/v1`.
-    /// All other paths route to `app_router`.
+    /// SCP routes take precedence for `/.well-known/scp`, `/scp/v1`, and
+    /// `/scp/broadcast/*`. All other paths route to `app_router`.
+    ///
+    /// When the dev API is configured (via [`ApplicationNodeBuilder::local_api`]),
+    /// a separate tokio task is spawned to serve the dev API on the configured
+    /// address. The dev API listener runs concurrently with the public HTTPS
+    /// listener. When the dev API is not configured, `serve()` behaves exactly
+    /// as before -- no additional listener is spawned.
+    ///
+    /// See spec sections 18.10.5 and 18.11.8.
     ///
     /// # Errors
     ///
@@ -230,10 +309,43 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     pub async fn serve(self, app_router: Router) -> Result<(), NodeError> {
         let well_known = self.well_known_router();
         let relay = self.relay_router();
+        let projection = self.broadcast_projection_router();
+
+        // Extract dev API configuration before self is consumed.
+        let dev_router = self.dev_router();
+        let dev_bind_addr = self.state.dev_bind_addr;
 
         // SCP routes take precedence: merge them last so they override
         // any conflicting paths in app_router.
-        let merged = app_router.merge(well_known).merge(relay);
+        let merged = app_router.merge(well_known).merge(relay).merge(projection);
+
+        // Spawn the dev API listener if configured.
+        if let (Some(dev_router), Some(dev_addr)) = (dev_router, dev_bind_addr) {
+            tokio::spawn(async move {
+                match tokio::net::TcpListener::bind(dev_addr).await {
+                    Ok(dev_listener) => {
+                        let local_addr = dev_listener.local_addr().unwrap_or(dev_addr);
+                        tracing::info!(
+                            addr = %local_addr,
+                            "dev API server started"
+                        );
+                        if let Err(e) = axum::serve(dev_listener, dev_router).await {
+                            tracing::error!(
+                                error = %e,
+                                "dev API server exited with error"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            addr = %dev_addr,
+                            error = %e,
+                            "failed to bind dev API server"
+                        );
+                    }
+                }
+            });
+        }
 
         let bind_addr = self.relay.bound_addr;
 
@@ -247,7 +359,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 
         tracing::info!(
             addr = %local_addr,
-            "application node HTTP server started"
+            "application node HTTP server started (broadcast projection endpoints active)"
         );
 
         axum::serve(listener, merged)

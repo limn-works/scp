@@ -442,3 +442,256 @@ async fn scenario5_relay_rejects_connection_without_bridge_token() {
         .expect("relay should accept connections with valid bridge token");
     drop(ws_stream);
 }
+
+// =========================================================================
+// Scenario 6: Dev API reachable on localhost while public server runs on
+//             separate port (SCP-245)
+// =========================================================================
+
+/// Builds a test node with the dev API enabled on an OS-assigned port.
+async fn build_test_node_with_dev_api() -> (
+    scp_node::ApplicationNode<InMemoryStorage>,
+    Arc<InMemoryDhtClient>,
+) {
+    let custody = Arc::new(InMemoryKeyCustody::new());
+    let (dht_client, did_dht) = make_shared_dht(&custody);
+
+    let node = ApplicationNodeBuilder::new()
+        .storage(Arc::new(InMemoryStorage::new()))
+        .domain("test.example.com")
+        .tls_provider(Arc::new(SucceedingTlsProvider {
+            domain: "test.example.com".to_owned(),
+        }))
+        .generate_identity_with(custody, Arc::new(did_dht))
+        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .local_api(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .build()
+        .await
+        .expect("ApplicationNode with dev API should build successfully");
+
+    (node, dht_client)
+}
+
+/// Sends a raw HTTP/1.1 request to `addr` and returns the full response as a string.
+///
+/// Uses raw TCP to avoid adding `hyper-util` as a dev-dependency.
+async fn raw_http_request(addr: SocketAddr, request: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("should connect");
+
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    // Read the response. The server sees `Connection: close` and will
+    // close its end after sending, which unblocks read_to_string.
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
+}
+
+#[tokio::test]
+async fn scenario6_dev_router_returns_none_when_not_configured() {
+    let (node, _) = build_test_node().await;
+    assert!(
+        node.dev_router().is_none(),
+        "dev_router() should return None when local_api was not configured"
+    );
+}
+
+#[tokio::test]
+async fn scenario6_dev_api_reachable_alongside_public_server() {
+    let (node, _dht_client) = build_test_node_with_dev_api().await;
+
+    // --- Assert: dev_router() returns Some when local_api was configured ---
+    let dev_router = node
+        .dev_router()
+        .expect("dev_router() should return Some when local_api was configured");
+
+    let dev_token = node
+        .dev_token()
+        .expect("dev_token() should return Some when local_api was configured")
+        .to_owned();
+
+    // --- Bind the dev API to a real TCP listener (port 0) ---
+    let dev_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind dev API listener");
+    let dev_addr = dev_listener
+        .local_addr()
+        .expect("should get dev API local addr");
+
+    // --- Also bind the public router to a real TCP listener (port 0) ---
+    let public_router = node.well_known_router().merge(node.relay_router());
+    let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind public listener");
+    let public_addr = public_listener
+        .local_addr()
+        .expect("should get public local addr");
+
+    // --- Verify the two listeners are on different ports ---
+    assert_ne!(
+        dev_addr.port(),
+        public_addr.port(),
+        "dev API and public server must run on different ports"
+    );
+
+    // --- Start both servers concurrently ---
+    tokio::spawn(async move {
+        axum::serve(dev_listener, dev_router).await.ok();
+    });
+    tokio::spawn(async move {
+        axum::serve(public_listener, public_router).await.ok();
+    });
+
+    // Wait for the spawned servers to start accepting connections.
+    // A fixed sleep is flaky under CI load; instead, retry with backoff.
+    for addr in [dev_addr, public_addr] {
+        let mut retries = 0u64;
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(_) => break,
+                Err(_) if retries < 10 => {
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * retries)).await;
+                }
+                Err(e) => panic!("server at {addr} failed to start: {e}"),
+            }
+        }
+    }
+
+    // --- Make authenticated HTTP request to the dev API health endpoint ---
+    let response = raw_http_request(
+        dev_addr,
+        &format!(
+            "GET /scp/dev/v1/health HTTP/1.1\r\n\
+             Host: {dev_addr}\r\n\
+             Authorization: Bearer {dev_token}\r\n\
+             Connection: close\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "dev API health endpoint should return 200, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("uptime_seconds"),
+        "health response should include uptime_seconds"
+    );
+    assert!(
+        response.contains("storage_status"),
+        "health response should include storage_status"
+    );
+
+    // --- Verify public server is also reachable ---
+    let response = raw_http_request(
+        public_addr,
+        &format!(
+            "GET /.well-known/scp HTTP/1.1\r\n\
+             Host: {public_addr}\r\n\
+             Connection: close\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "public .well-known/scp endpoint should return 200, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+
+    // --- Verify unauthenticated dev API request is rejected ---
+    let response = raw_http_request(
+        dev_addr,
+        &format!(
+            "GET /scp/dev/v1/health HTTP/1.1\r\n\
+             Host: {dev_addr}\r\n\
+             Connection: close\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "dev API should reject unauthenticated requests, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+}
+
+// =========================================================================
+// Scenario 7: Broadcast projection endpoints coexist with .well-known/scp
+//             on the same public listener (SCP-249)
+// =========================================================================
+
+#[tokio::test]
+async fn scenario7_projection_endpoints_coexist_with_well_known() {
+    let (node, _dht_client) = build_test_node().await;
+
+    // Merge well-known, relay, and broadcast projection routers — the same
+    // composition that serve() performs internally.
+    let router = node
+        .well_known_router()
+        .merge(node.relay_router())
+        .merge(node.broadcast_projection_router());
+
+    // --- Assert: GET /.well-known/scp still works ---
+    let well_known_req = Request::builder()
+        .uri("/.well-known/scp")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.clone().oneshot(well_known_req).await.unwrap();
+    assert_eq!(response.status(), 200, ".well-known/scp should return 200");
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let well_known: WellKnownScp =
+        serde_json::from_slice(&body_bytes).expect("response should be valid JSON");
+    assert_eq!(well_known.version, 1);
+
+    // --- Assert: GET /scp/broadcast/<routing_id>/feed returns 404 (no projected context) ---
+    // Use a fake routing_id hex — the route is matched but the handler
+    // returns 404 because no context with that routing_id is projected.
+    let fake_routing_id = "aa".repeat(32); // 64 hex chars = 32 bytes
+    let feed_req = Request::builder()
+        .uri(format!("/scp/broadcast/{fake_routing_id}/feed"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.clone().oneshot(feed_req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        404,
+        "feed endpoint should return 404 for unknown routing_id"
+    );
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    assert!(
+        body_str.contains("unknown routing_id"),
+        "404 response should indicate unknown routing_id, got: {body_str}"
+    );
+
+    // --- Assert: GET /scp/broadcast/<routing_id>/messages/<blob_id> returns 404 ---
+    let fake_blob_id = "bb".repeat(32);
+    let message_req = Request::builder()
+        .uri(format!(
+            "/scp/broadcast/{fake_routing_id}/messages/{fake_blob_id}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(message_req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        404,
+        "message endpoint should return 404 for unknown routing_id"
+    );
+}

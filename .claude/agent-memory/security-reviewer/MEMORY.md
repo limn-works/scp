@@ -156,6 +156,21 @@
 - GOOD: MintParams uses real KeyCustody; build_proof_resolver indexes by CID
 - GOOD: Tool handler cloned (Arc) before execution -- DashMap shard lock no longer held
 
+### scp-node HTTP Features (SCP-242/245/249) -- 2026-03-02
+- dev_api.rs: constant-time bearer token via subtle::ConstantTimeEq -- GOOD
+- dev_api.rs: generic error messages on auth failure -- GOOD
+- http.rs: bridge secret via query param ws://localhost -- acceptable, document limitation
+- projection.rs: public endpoints (no auth) per spec 18.11.6 -- correct by design
+- projection.rs: routing_id cross-check on blob fetch prevents cross-context leakage -- GOOD
+- projection.rs: BroadcastKey ZeroizeOnDrop; cloned snapshot also zeroed -- GOOD
+- HIGH: dev_token logged at INFO level in plaintext (lib.rs line 697-703) -- credential leak to log aggregators
+- HIGH: dev_token uses thread_rng() not OsRng (lib.rs line 689) -- also bridge_secret (line 660)
+- MEDIUM: No localhost enforcement on local_api() bind address (lib.rs line 485)
+- MEDIUM: CreateContextRequest no input validation; name not URL-encoded in well_known.rs URI
+- MEDIUM: ProjectedContext.keys HashMap unbounded epoch growth
+- MEDIUM: broadcast_contexts Vec unbounded growth + no duplicate check via dev API
+- MEDIUM: Bridge secret in WebSocket URL query param (http.rs line 144)
+
 ### General Patterns
 - No `unwrap`/`expect` in lib code -- project standard via clippy deny
 - `thiserror` for error types; Rust edition 2024; `#![forbid(unsafe_code)]` on all crates except scp-ffi

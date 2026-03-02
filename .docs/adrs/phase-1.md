@@ -589,8 +589,8 @@ Published out-of-band (relay metadata page, DID document service endpoint). Rela
 | `max_blob_ttl` | 604800 | Max TTL seconds |
 | `max_subscriptions_per_connection` | 100 | Concurrent subscriptions per WebSocket |
 | `max_query_limit` | 1000 | Max QUERY limit |
-| `rate_limit_publish` | 60/min | PUBLISH rate per connection |
-| `rate_limit_subscribe` | 20/min | SUBSCRIBE rate per connection |
+| `rate_limit_publish` | 6000/min | PUBLISH rate per IP (100/sec). Per-IP shared across connections; operator-adjustable. Priced relays have economic DDoS resistance (§19.7). |
+| `rate_limit_subscribe` | 100 | Max concurrent subscriptions per connection. SUBSCRIBE operation rate is separately enforced at 20/min per connection but not exposed in `.well-known/scp`. |
 | `idle_timeout` | 90s | Seconds before idle connection close |
 
 #### Reference Rust Types

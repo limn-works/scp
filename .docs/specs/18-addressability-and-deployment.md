@@ -94,8 +94,8 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
   "relay_config": {
     "max_blob_size": 262144,
     "max_blob_ttl": 86400,
-    "rate_limit_publish": 100,
-    "rate_limit_subscribe": 50
+    "rate_limit_publish": 6000,
+    "rate_limit_subscribe": 100
   }
 }
 ```
@@ -162,8 +162,8 @@ The `relay_config` object exposes operational parameters that agents need to eva
 |-------|------|------|-------------|
 | `max_blob_size` | integer | bytes | Maximum blob size the relay accepts. |
 | `max_blob_ttl` | integer | seconds | Maximum blob TTL the relay enforces. |
-| `rate_limit_publish` | integer | per minute | PUBLISH rate limit per connection. |
-| `rate_limit_subscribe` | integer | per connection | Maximum concurrent subscriptions per connection. |
+| `rate_limit_publish` | integer | per minute | PUBLISH rate limit per IP address (default: 6000/min = 100/sec). |
+| `rate_limit_subscribe` | integer | per connection | Maximum concurrent subscriptions per connection (default: 100). |
 | `economic` | object | — | Relay economic configuration (§19.8). Optional. Absence = free relay. |
 | `economic.currency` | string | — | Currency code for all amounts in this economic config (e.g., `"USD"`). |
 | `economic.per_publish` | integer | smallest unit | Cost per PUBLISH operation as `Amount` in smallest currency unit (§19.1.1). |

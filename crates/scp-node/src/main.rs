@@ -145,7 +145,7 @@ async fn run_relay_only() {
         "starting scp-node in relay-only mode"
     );
 
-    let storage = InMemoryBlobStorage::new();
+    let storage = Arc::new(InMemoryBlobStorage::new());
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {

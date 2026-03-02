@@ -30,6 +30,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use futures::StreamExt;
 
@@ -145,7 +146,7 @@ async fn start_relay() -> SocketAddr {
         delivery_jitter_ms: 0,
         ..RelayConfig::default()
     };
-    let storage = InMemoryBlobStorage::new();
+    let storage = Arc::new(InMemoryBlobStorage::new());
     let server = RelayServer::new(config, storage);
     let (_handle, addr) = server.start().await.unwrap();
     addr

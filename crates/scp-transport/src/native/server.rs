@@ -8,12 +8,13 @@
 //! # Usage
 //!
 //! ```rust,no_run
+//! use std::sync::Arc;
 //! use scp_transport::native::server::{RelayConfig, RelayServer};
 //! use scp_transport::native::storage::InMemoryBlobStorage;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = RelayConfig::default();
-//! let storage = InMemoryBlobStorage::new();
+//! let storage = Arc::new(InMemoryBlobStorage::new());
 //! let server = RelayServer::new(config, storage);
 //! server.run().await?;
 //! # Ok(())
@@ -197,11 +198,15 @@ pub struct RelayServer<S: BlobStorage> {
 
 impl<S: BlobStorage + 'static> RelayServer<S> {
     /// Creates a new relay server with the given configuration and storage.
+    ///
+    /// Accepts `Arc<S>` so the same storage instance can be shared between
+    /// the relay server and other components (e.g., broadcast projection
+    /// handlers). See spec section 18.11.5.
     #[must_use]
-    pub fn new(config: RelayConfig, storage: S) -> Self {
+    pub fn new(config: RelayConfig, storage: Arc<S>) -> Self {
         Self {
             config,
-            storage: Arc::new(storage),
+            storage,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             next_connection_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             connection_tracker: Arc::new(RwLock::new(HashMap::new())),
@@ -1338,7 +1343,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
         addr
@@ -2002,7 +2007,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2053,7 +2058,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2084,7 +2089,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2113,7 +2118,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2163,7 +2168,7 @@ mod tests {
             ttl_check_interval: Duration::from_millis(100),
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2210,7 +2215,7 @@ mod tests {
             ttl_check_interval: Duration::from_millis(100),
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2274,7 +2279,7 @@ mod tests {
             ttl_check_interval: Duration::from_millis(100),
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2328,7 +2333,7 @@ mod tests {
             ..RelayConfig::default()
         };
         // Storage with capacity of 2.
-        let storage = InMemoryBlobStorage::with_capacity(2);
+        let storage = Arc::new(InMemoryBlobStorage::with_capacity(2));
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2380,7 +2385,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2415,7 +2420,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (handle, _addr) = server.start().await.unwrap();
 
@@ -2430,7 +2435,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (handle, addr) = server.start().await.unwrap();
 
@@ -2465,7 +2470,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (handle, addr) = server.start().await.unwrap();
 
@@ -2494,7 +2499,7 @@ mod tests {
             delivery_jitter_ms: 1,
             ..RelayConfig::default()
         };
-        let storage = InMemoryBlobStorage::new();
+        let storage = Arc::new(InMemoryBlobStorage::new());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 

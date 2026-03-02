@@ -1,5 +1,27 @@
 # White Hat Agent Memory
 
+## HTTP Features Security Review (2026-03-02)
+
+### P1 Findings
+- well_known.rs L42-49: context name in URI not percent-encoded (injection via &, =, # chars)
+- No cap on broadcast_contexts Vec or projected_contexts.keys HashMap (OOM from auth'd attacker)
+- No explicit body size limit on POST /scp/dev/v1/contexts (relies on Axum 2MB default)
+- Dev API responses lack Cache-Control: no-store
+
+### P2 Findings
+- bridge_secret/dev_token not Zeroized (tls.rs does zeroize key PEM, inconsistent)
+- No rate limit on public broadcast projection decryption endpoints
+- Missing X-Content-Type-Options: nosniff
+
+### Well-Defended
+- ct_eq on bearer token and bridge secret; OsRng for both
+- Error responses sanitized; internal details logged only
+- Blob ownership check (routing_id) prevents cross-context access
+- Feed pagination clamped (MAX_FEED_LIMIT=100)
+- #![forbid(unsafe_code)] on crate; dev API disabled by default
+- TLS 1.3 enforced; private key PEM zeroized+debug-redacted
+- Conditional GET before expensive work
+
 ## PR #127 Defense-in-Depth Review (2026-03-01)
 
 ### Fixed Since Prior Review
