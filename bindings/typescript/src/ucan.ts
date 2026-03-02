@@ -71,13 +71,13 @@ export async function mintUcan(
  * members.
  *
  * @param ctx - The context the token belongs to.
- * @param tokenId - The unique ID of the token to revoke.
+ * @param token - The full encoded JWT string of the token to revoke.
  * @throws {UcanPermissionError} If revocation fails.
  */
-export async function revokeUcan(ctx: Context, tokenId: string): Promise<void> {
+export async function revokeUcan(ctx: Context, token: string): Promise<void> {
   try {
     const bridge = await getBridge();
-    await bridge.ucanRevoke(ctx._handle, tokenId);
+    await bridge.ucanRevoke(ctx._handle, token);
   } catch (error) {
     throw mapBridgeError(error);
   }

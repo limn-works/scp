@@ -176,7 +176,7 @@ class ConformanceStubBindings : NativeBindings {
 
     override fun ucanRevoke(
         identityHandle: Long,
-        tokenId: String,
+        token: String,
     ) {
         ucanRevokeError?.let { throw it }
     }

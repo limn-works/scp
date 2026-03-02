@@ -161,7 +161,7 @@ class UcanConformanceTest {
         fun `ucan_revoke succeeds`() = runTest(testDispatcher) {
             val result = dispatcher.dispatch(
                 "ucan_revoke",
-                mapOf("identity_handle" to "1", "token_id" to "tok-001"),
+                mapOf("identity_handle" to "1", "token" to "header.payload.signature"),
             )
             assertEquals("revoked", result["status"])
         }
@@ -172,7 +172,7 @@ class UcanConformanceTest {
                 BridgeException("Not authorized to revoke", "SCP-PERM-3003")
             val result = dispatcher.dispatch(
                 "ucan_revoke",
-                mapOf("identity_handle" to "1", "token_id" to "tok-001"),
+                mapOf("identity_handle" to "1", "token" to "header.payload.signature"),
             )
             assertEquals("SCP-PERM-3003", result["error"])
         }

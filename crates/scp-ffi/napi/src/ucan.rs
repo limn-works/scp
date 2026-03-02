@@ -357,7 +357,7 @@ pub async fn ucan_mint(
 /// # Arguments
 ///
 /// * `handle` — The context the token belongs to.
-/// * `token_id` — The unique ID of the token to revoke.
+/// * `token` — The full encoded JWT string of the token to revoke.
 ///
 /// # Errors
 ///
@@ -366,8 +366,8 @@ pub async fn ucan_mint(
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn ucan_revoke(handle: &NapiContextHandle, token_id: String) -> napi::Result<()> {
-    let _ = (handle, token_id);
+pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Result<()> {
+    let _ = (handle, token);
     Err(ScpNapiError::Permission {
         message: "not yet connected to runtime — UCAN revocation requires a live context"
             .to_owned(),

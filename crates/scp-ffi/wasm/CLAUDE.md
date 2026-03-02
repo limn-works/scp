@@ -58,7 +58,7 @@ Do NOT claim "full validation" in docstrings until all steps are implemented. Se
 
 ## UCAN Revocation — CID Consistency
 
-`ucan_revoke` and `ucan_validate` MUST hash the same input to compute the revocation CID. **Both must call `compute_token_cid` on the full JWT string** — not the token_id nonce, not the payload struct. Any deviation silently breaks revocation. See `.docs/lessons/wasm-cid-consistency.md`.
+`ucan_revoke` and `ucan_validate` MUST hash the same input to compute the revocation CID. **Both must call `compute_token_cid` on the full JWT string** — not a nonce-derived ID, not the payload struct. Any deviation silently breaks revocation. See `.docs/lessons/wasm-cid-consistency.md`.
 
 `ucan_revoke` parameter: full encoded JWT string (same as PyO3 `py_ucan_revoke`).
 `ucan_validate` revocation check: `compute_token_cid(&token)` where `token` is the full JWT parameter.

@@ -1712,17 +1712,17 @@ pub async fn ucan_mint(
 /// # Arguments
 ///
 /// * `handle` — The context the token belongs to.
-/// * `token_id` — The unique ID of the token to revoke.
+/// * `token` — The full encoded JWT string of the token to revoke.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Permission` if revocation fails (token not found,
 /// revoker not authorized — must be the token's issuer or context creator).
 #[uniffi::export]
-pub async fn ucan_revoke(handle: Arc<ContextHandle>, token_id: String) -> Result<(), ScpError> {
+pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, token_id);
+            let _ = (handle, token);
             Err(ScpError::Permission {
                 message: "not yet connected to runtime — UCAN revocation requires a live context"
                     .to_owned(),

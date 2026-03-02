@@ -88,9 +88,9 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly (no wrapper). Forma
 
 ## Gotchas
 
-- `NapiUcanToken.encoded` is `#[allow(dead_code)]` because `ucan_revoke` takes `token_id: String`
-  (not the full token). When revocation is wired to the runtime, the NAPI bridge will need a way
-  to look up the encoded token by ID (e.g., a handle registry or passing the full token to revoke).
+- `NapiUcanToken.encoded` is `#[allow(dead_code)]` because `ucan_revoke` currently returns a stub
+  error. When revocation is wired to the runtime, the bridge will parse the full JWT `token`
+  parameter to compute the revocation CID (matching the PyO3 bridge pattern).
 
 - Bridge functions returning `Err(...)` immediately without constructing the output type leave
   `encoded` / other fields unset. Always construct the output struct before the feature is

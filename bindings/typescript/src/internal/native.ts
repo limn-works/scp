@@ -303,10 +303,10 @@ export function createNativeBridge(): Bridge {
       return token;
     },
 
-    async ucanRevoke(handle: BridgeContextHandle, tokenId: string): Promise<void> {
+    async ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void> {
       await (addon.ucanRevoke as (h: BridgeContextHandle, t: string) => Promise<void>)(
         handle,
-        tokenId,
+        token,
       );
     },
 

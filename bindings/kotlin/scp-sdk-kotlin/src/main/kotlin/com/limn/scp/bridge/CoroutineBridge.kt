@@ -166,7 +166,7 @@ interface UcanBindings {
 
     fun ucanRevoke(
         identityHandle: Long,
-        tokenId: String,
+        token: String,
     )
 }
 
@@ -566,12 +566,12 @@ class UcanBridge internal constructor(
      * Revoke a previously minted UCAN token.
      *
      * @param identityHandle Handle from identity create or load.
-     * @param tokenId The token ID to revoke.
+     * @param token The full encoded JWT string of the token to revoke.
      */
     suspend fun revoke(
         identityHandle: Long,
-        tokenId: String,
-    ): Unit = bridge.ffiCall { bindings.ucanRevoke(identityHandle, tokenId) }
+        token: String,
+    ): Unit = bridge.ffiCall { bindings.ucanRevoke(identityHandle, token) }
 }
 
 /**
