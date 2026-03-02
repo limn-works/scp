@@ -625,7 +625,7 @@ UniFFI supports two definition approaches: UDL files (external interface definit
 
 ### Decision
 
-Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros (`#[uniffi::export]`) as the primary definition approach, with a UDL file (`scp.udl`) as a supplementary definition for callback interfaces and complex type mappings that proc-macros cannot express. The bridge exposes a flat set of exported functions and object interfaces that map directly to scp-core's public API — mirroring the PyO3 bridge surface (ADR-013). Async functions use UniFFI's native async support (`async fn` in `#[uniffi::export]`) to bridge Rust futures (tokio) to Swift async/await and Kotlin suspend functions. Rust `Result<T, E>` types are mapped to Swift `throws` and Kotlin exceptions via a unified `ScpError` enum. All SCP domain types are exposed as either opaque object interfaces (for types holding crypto state) or record/enum value types (for pure data). Platform-specific traits (`KeyCustody`, `PushProvider`, `Storage`) are exposed as UniFFI callback interfaces, allowing Swift and Kotlin implementations to be injected into the Rust engine.
+Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc-macros (`#[uniffi::export]`) as the primary definition approach, with a UDL file (`scp.udl`) as a supplementary definition for callback interfaces and complex type mappings that proc-macros cannot express. The bridge exposes a flat set of exported functions and object interfaces that map directly to scp-core's public API — mirroring the PyO3 bridge surface (ADR-013). Async functions use UniFFI's native async support (`async fn` in `#[uniffi::export]`) to bridge Rust futures (tokio) to Swift async/await and Kotlin suspend functions. Rust `Result<T, E>` types are mapped to Swift `throws` and Kotlin exceptions via a unified `ScpError` enum. All SCP domain types are exposed as either opaque object interfaces (for types holding crypto state) or record/enum value types (for pure data). Platform-specific traits (`KeyCustody`, `PushProvider`, `Storage`) are exposed as UniFFI callback interfaces, allowing Swift and Kotlin implementations to be injected into the Rust engine.
 
 ### Rationale
 
@@ -641,7 +641,7 @@ Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros
 
 - **Language:** Rust (UniFFI proc-macros + UDL) generating Swift and Kotlin bindings
 - **Libraries:** `uniffi` (latest stable), `tokio` (async runtime)
-- **Crate:** `scp-ffi/uniffi` (workspace member)
+- **Crate:** `crates/scp-ffi/uniffi` (workspace member)
 - **UDL file:** `crates/scp-ffi/uniffi/src/scp.udl` — callback interface definitions and supplementary type mappings
 - **Build output:**
   - Swift: `ScpBindings.swift` — imported by the `SCP` Swift package (bindings/swift/)
@@ -888,10 +888,10 @@ Implement the FFI bridge as the `scp-ffi/uniffi/` crate using UniFFI proc-macros
 
 | File | Purpose |
 |------|---------|
-| `scp-ffi/uniffi/Cargo.toml` | Crate manifest with `uniffi` dependency and build configuration |
-| `scp-ffi/uniffi/src/lib.rs` | Crate root, `uniffi::setup_scaffolding!()`, tokio runtime init, re-exports of bridge modules |
-| `scp-ffi/uniffi/src/bridge.rs` | All `#[uniffi::export]` function definitions, opaque object `impl` blocks, record/enum derive macros, `ScpError` definition, `From` conversions from scp-core errors |
-| `scp-ffi/uniffi/src/scp.udl` | Supplementary UDL: callback interface definitions (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`, `MessageListener`), any type mappings that require UDL |
+| `crates/scp-ffi/uniffi/Cargo.toml` | Crate manifest with `uniffi` dependency and build configuration |
+| `crates/scp-ffi/uniffi/src/lib.rs` | Crate root, `uniffi::setup_scaffolding!()`, tokio runtime init, re-exports of bridge modules |
+| `crates/scp-ffi/uniffi/src/bridge.rs` | All `#[uniffi::export]` function definitions, opaque object `impl` blocks, record/enum derive macros, `ScpError` definition, `From` conversions from scp-core errors |
+| `crates/scp-ffi/uniffi/src/scp.udl` | Supplementary UDL: callback interface definitions (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`, `MessageListener`), any type mappings that require UDL |
 
 **Estimated functions:** ~25-30 bridge functions, ~15-20 type definitions (records + enums + objects), ~10-15 conversion helpers, 5 callback interfaces.
 
@@ -922,7 +922,7 @@ The ADR-013 PyO3 bridge and ADR-021 UniFFI bridge established the project-wide F
 
 ### Decision
 
-Implement the TypeScript SDK as two FFI bridge crates — `scp-ffi/wasm` (wasm-bindgen) and `scp-ffi/napi` (napi-rs) — with a unified TypeScript wrapper package at `bindings/typescript/` published as `@scp/sdk` on npm. The bridge crates are thin translation layers (zero protocol logic); the TypeScript wrapper layer builds the idiomatic API on top. A runtime detection module (`internal/bridge.ts`) selects the correct backend at package import time using synchronous environment checks, with no top-level await, to preserve CJS compatibility.
+Implement the TypeScript SDK as two FFI bridge crates — `crates/scp-ffi/wasm` (wasm-bindgen) and `crates/scp-ffi/napi` (napi-rs) — with a unified TypeScript wrapper package at `bindings/typescript/` published as `@scp/sdk` on npm. The bridge crates are thin translation layers (zero protocol logic); the TypeScript wrapper layer builds the idiomatic API on top. A runtime detection module (`internal/bridge.ts`) selects the correct backend at package import time using synchronous environment checks, with no top-level await, to preserve CJS compatibility.
 
 Both bridge crates expose the same flat function surface, mirroring the ADR-013 and ADR-021 patterns. All functions that perform I/O are async (Rust `Future` bridged to JS `Promise`). Message streaming uses a callback-to-`AsyncIterable` adapter in the TypeScript wrapper. `Context` and `Identity` implement `AsyncDisposable` via `Symbol.asyncDispose` for automatic resource cleanup.
 
@@ -1404,7 +1404,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 
 ### Context
 
-ADR-022 specifies a wasm-bindgen bridge crate (`scp-ffi/wasm/`) that compiles scp-core to WebAssembly for browser environments. In practice, scp-core cannot be compiled to `wasm32-unknown-unknown` due to two hard dependencies:
+ADR-022 specifies a wasm-bindgen bridge crate (`crates/scp-ffi/wasm/`) that compiles scp-core to WebAssembly for browser environments. In practice, scp-core cannot be compiled to `wasm32-unknown-unknown` due to two hard dependencies:
 
 1. **tokio multi-thread runtime.** scp-core uses `tokio::runtime::Runtime` with the multi-thread scheduler (required by PyO3 native async, MLS group operations, and transport concurrency). The `wasm32-unknown-unknown` target does not support `std::thread`, so `tokio::runtime::Builder::new_multi_thread()` fails to compile. While tokio offers a `current_thread` runtime that compiles to WASM, switching would require pervasive changes throughout scp-core and all FFI bridges, breaking the single-implementation invariant.
 
@@ -1414,7 +1414,7 @@ These are not feature-flag-able constraints — they are structural incompatibil
 
 ### Decision
 
-The WASM bridge (`scp-ffi/wasm/`) uses **verbatim re-implementation** of scp-core's public API surface in WASM-compatible Rust. The re-implementation:
+The WASM bridge (`crates/scp-ffi/wasm/`) uses **verbatim re-implementation** of scp-core's public API surface in WASM-compatible Rust. The re-implementation:
 
 - Implements the same public API types and function signatures as the napi-rs bridge.
 - Uses `wasm-bindgen-futures` for async bridging (single-threaded, cooperative scheduling on the browser event loop).
