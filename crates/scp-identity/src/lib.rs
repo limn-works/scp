@@ -32,12 +32,17 @@ pub mod dht;
 pub mod dht_client;
 pub mod document;
 pub mod republish;
+pub mod resolution;
 
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{DidDht, verify_migration};
 pub use dht_client::{DhtClient, InMemoryDhtClient};
 pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 pub use republish::RepublishManager;
+pub use resolution::{
+    InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id,
+    relay_resolve,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -205,6 +210,23 @@ pub enum IdentityError {
     /// An invalid relay URL was provided (must use wss:// scheme and /scp/v1 path).
     #[error("invalid relay URL: {0}")]
     InvalidRelayUrl(String),
+
+    /// Publishing a DID document to an SCP relay failed.
+    #[error("relay publish failed: {0}")]
+    RelayPublishFailed(String),
+
+    /// Querying an SCP relay for a DID document failed.
+    #[error("relay query failed: {0}")]
+    RelayQueryFailed(String),
+
+    /// The resolved document has a stale sequence number (lower than last known).
+    #[error("stale sequence number: received {received}, last known {last_known}")]
+    StaleSequenceNumber {
+        /// The sequence number in the received document.
+        received: u64,
+        /// The last known sequence number for this DID.
+        last_known: u64,
+    },
 }
 
 /// Abstract trait for DID method implementations.
