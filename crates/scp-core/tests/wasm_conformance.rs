@@ -3,7 +3,8 @@
     clippy::too_many_lines,
     clippy::items_after_statements,
     clippy::unused_async,
-    clippy::redundant_field_names
+    clippy::redundant_field_names,
+    dead_code
 )]
 //! WASM conformance tests (RED-014).
 //!
@@ -1507,4 +1508,441 @@ fn context_registry_default_ceiling_populated() {
     assert!(ceiling.contains("governance_vote:*"));
     assert!(ceiling.contains("context_close:*"));
     assert_eq!(ceiling.len(), 10);
+}
+
+// ===========================================================================
+// UCAN attenuation conformance (verbatim from scp-ffi-wasm/src/ucan.rs)
+//
+// These types and functions are exact copies of the WASM bridge's UCAN
+// attenuation logic. Tests validate the fail-closed pattern for parent
+// capability parsing (issue #135).
+// ===========================================================================
+
+mod wasm_ucan_mirror {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct UcanHeader {
+        pub alg: String,
+        pub typ: String,
+        pub ucv: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Attenuation {
+        pub with: String,
+        pub can: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct UcanPayload {
+        pub iss: String,
+        pub aud: String,
+        pub exp: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub nbf: Option<u64>,
+        pub nnc: String,
+        pub att: Vec<Attenuation>,
+        pub prf: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub fct: Option<serde_json::Value>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ParsedUcanToken {
+        pub header: UcanHeader,
+        pub payload: UcanPayload,
+        pub signature: Vec<u8>,
+        pub encoded: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CapabilityUri {
+        pub context_id: Option<String>,
+        pub resource: String,
+        pub action: String,
+    }
+
+    impl CapabilityUri {
+        pub fn parse(s: &str) -> Result<Self, String> {
+            let rest = s
+                .strip_prefix("scp:ctx:")
+                .ok_or_else(|| format!("missing 'scp:ctx:' prefix in '{s}'"))?;
+
+            let (ctx_part, capability_part) = rest
+                .split_once('/')
+                .ok_or_else(|| format!("missing '/' separator in '{s}'"))?;
+
+            if ctx_part.is_empty() {
+                return Err(format!("empty context ID in '{s}'"));
+            }
+
+            let context_id = if ctx_part == "*" {
+                None
+            } else {
+                Some(ctx_part.to_owned())
+            };
+
+            let (resource, action) = capability_part
+                .split_once(':')
+                .ok_or_else(|| format!("missing ':' separator in capability '{s}'"))?;
+
+            if resource.is_empty() {
+                return Err(format!("empty resource in '{s}'"));
+            }
+            if action.is_empty() {
+                return Err(format!("empty action in '{s}'"));
+            }
+
+            Ok(Self {
+                context_id,
+                resource: resource.to_owned(),
+                action: action.to_owned(),
+            })
+        }
+
+        pub fn matches(&self, required: &Self) -> bool {
+            if self.resource != required.resource || self.action != required.action {
+                return false;
+            }
+            match (&self.context_id, &required.context_id) {
+                (None, _) => true,
+                (Some(granted), Some(req)) => granted == req,
+                (Some(_), None) => false,
+            }
+        }
+    }
+
+    pub fn parse_ucan(encoded: &str) -> Result<ParsedUcanToken, String> {
+        let parts: Vec<&str> = encoded.split('.').collect();
+        if parts.len() != 3 {
+            return Err(format!("expected 3 JWT segments, got {}", parts.len()));
+        }
+
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .map_err(|e| format!("header base64url decode failed: {e}"))?;
+
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|e| format!("payload base64url decode failed: {e}"))?;
+
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .map_err(|e| format!("signature base64url decode failed: {e}"))?;
+
+        let header: UcanHeader = serde_json::from_slice(&header_bytes)
+            .map_err(|e| format!("header deserialization failed: {e}"))?;
+
+        let payload: UcanPayload = serde_json::from_slice(&payload_bytes)
+            .map_err(|e| format!("payload deserialization failed: {e}"))?;
+
+        Ok(ParsedUcanToken {
+            header,
+            payload,
+            signature: sig_bytes,
+            encoded: encoded.to_owned(),
+        })
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+    }
+
+    pub fn compute_token_cid(encoded: &str) -> String {
+        let hash = Sha256::digest(encoded.as_bytes());
+        format!("bafyrei{}", encode_hex(&hash))
+    }
+
+    /// Step 7: Attenuation enforcement -- child capabilities must be subset of parent's.
+    ///
+    /// Verbatim mirror of `verify_attenuation` in `scp-ffi-wasm/src/ucan.rs`.
+    /// SECURITY: uses fail-closed `.map()` + `collect::<Result>()` for parent capabilities.
+    pub fn verify_attenuation(
+        token: &ParsedUcanToken,
+        proof_tokens: Option<&[String]>,
+    ) -> Result<(), String> {
+        let proofs = proof_tokens.unwrap_or(&[]);
+
+        // Build proof map.
+        let mut proof_map: HashMap<String, ParsedUcanToken> = HashMap::new();
+        for encoded in proofs {
+            let parsed = parse_ucan(encoded)?;
+            let cid = compute_token_cid(encoded);
+            proof_map.insert(cid, parsed);
+        }
+
+        // For each proof in the chain, verify child capabilities are subset of parent.
+        for proof_cid in &token.payload.prf {
+            let parent = proof_map.get(proof_cid).ok_or_else(|| {
+                format!("attenuation check failed: proof CID not found: {proof_cid}")
+            })?;
+
+            // Parse parent capabilities.
+            // SECURITY: fail-closed -- any unparseable parent capability URI rejects the chain.
+            let parent_caps: Vec<CapabilityUri> = parent
+                .payload
+                .att
+                .iter()
+                .map(|att| {
+                    CapabilityUri::parse(&att.with).map_err(|e| {
+                        format!("unparseable capability URI in parent attestation: {e}")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Every child capability must be matched by at least one parent capability.
+            for child_att in &token.payload.att {
+                let child_cap = CapabilityUri::parse(&child_att.with)
+                    .map_err(|e| format!("unparseable child capability: {e}"))?;
+
+                let is_subset = parent_caps
+                    .iter()
+                    .any(|parent_cap| parent_cap.matches(&child_cap));
+                if !is_subset {
+                    return Err(format!(
+                        "attenuation violation: child capability '{}' not granted by parent",
+                        child_att.with
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper: build a minimal JWT-encoded UCAN token from a payload.
+    /// Uses a dummy header and empty signature (signature verification is not
+    /// part of attenuation checks).
+    pub fn build_test_token(payload: &UcanPayload) -> String {
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+        };
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(payload).unwrap();
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(b"fakesig");
+        format!("{header_b64}.{payload_b64}.{sig_b64}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attenuation fail-closed tests (issue #135)
+// ---------------------------------------------------------------------------
+
+/// Test: parent token with valid capability URIs -- attenuation check passes.
+#[test]
+fn wasm_attenuation_valid_parent_capabilities_pass() {
+    use wasm_ucan_mirror::*;
+
+    let parent_payload = UcanPayload {
+        iss: "did:key:parent".to_owned(),
+        aud: "did:key:child".to_owned(),
+        exp: u64::MAX,
+        nbf: None,
+        nnc: "nonce1".to_owned(),
+        att: vec![Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let parent_jwt = build_test_token(&parent_payload);
+    let parent_cid = compute_token_cid(&parent_jwt);
+
+    let child_payload = UcanPayload {
+        iss: "did:key:child".to_owned(),
+        aud: "did:key:grandchild".to_owned(),
+        exp: u64::MAX,
+        nbf: None,
+        nnc: "nonce2".to_owned(),
+        att: vec![Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = build_test_token(&child_payload);
+    let child_token = parse_ucan(&child_jwt).unwrap();
+
+    let result = verify_attenuation(&child_token, Some(&[parent_jwt]));
+    assert!(
+        result.is_ok(),
+        "valid attenuation check should pass: {result:?}"
+    );
+}
+
+/// Test: parent token with malformed capability URI -- attenuation check
+/// MUST reject (fail-closed). This is the core regression test for issue #135.
+#[test]
+fn wasm_attenuation_malformed_parent_capability_rejects() {
+    use wasm_ucan_mirror::*;
+
+    // Parent has a malformed capability URI (missing scheme prefix).
+    let parent_payload = UcanPayload {
+        iss: "did:key:parent".to_owned(),
+        aud: "did:key:child".to_owned(),
+        exp: u64::MAX,
+        nbf: None,
+        nnc: "nonce1".to_owned(),
+        att: vec![Attenuation {
+            with: "MALFORMED-no-scp-prefix".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let parent_jwt = build_test_token(&parent_payload);
+    let parent_cid = compute_token_cid(&parent_jwt);
+
+    let child_payload = UcanPayload {
+        iss: "did:key:child".to_owned(),
+        aud: "did:key:grandchild".to_owned(),
+        exp: u64::MAX,
+        nbf: None,
+        nnc: "nonce2".to_owned(),
+        att: vec![Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = build_test_token(&child_payload);
+    let child_token = parse_ucan(&child_jwt).unwrap();
+
+    let result = verify_attenuation(&child_token, Some(&[parent_jwt]));
+    assert!(
+        result.is_err(),
+        "malformed parent capability must cause rejection (fail-closed)"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("unparseable capability URI in parent attestation"),
+        "error message should indicate unparseable parent capability, got: {err}"
+    );
+}
+
+/// Test: child claims capability not in (malformed) parent -- error, not silent pass.
+/// With fail-open (old behavior), the malformed parent capability would be silently
+/// dropped, leaving an empty `parent_caps` list, and the child capability would appear
+/// to have no parent to compare against. This tests the complete attack scenario.
+#[test]
+fn wasm_attenuation_child_claims_capability_with_malformed_parent_rejects() {
+    use wasm_ucan_mirror::*;
+
+    // Parent has TWO capabilities: one valid, one malformed.
+    let parent_payload = UcanPayload {
+        iss: "did:key:parent".to_owned(),
+        aud: "did:key:child".to_owned(),
+        exp: u64::MAX,
+        nbf: None,
+        nnc: "nonce1".to_owned(),
+        att: vec![
+            Attenuation {
+                with: "scp:ctx:test-ctx/messages:read".to_owned(),
+                can: "messages:read".to_owned(),
+            },
+            Attenuation {
+                // Malformed: missing resource:action separator
+                with: "scp:ctx:test-ctx/badcapability".to_owned(),
+                can: "admin:manage".to_owned(),
+            },
+        ],
+        prf: vec![],
+        fct: None,
+    };
+    let parent_jwt = build_test_token(&parent_payload);
+    let parent_cid = compute_token_cid(&parent_jwt);
+
+    let child_payload = UcanPayload {
+        iss: "did:key:child".to_owned(),
+        aud: "did:key:grandchild".to_owned(),
+        exp: u64::MAX,
+        nbf: None,
+        nnc: "nonce2".to_owned(),
+        att: vec![Attenuation {
+            with: "scp:ctx:test-ctx/messages:read".to_owned(),
+            can: "messages:read".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = build_test_token(&child_payload);
+    let child_token = parse_ucan(&child_jwt).unwrap();
+
+    // Even though the child only claims a capability that the valid parent
+    // capability grants, the malformed second parent capability must cause
+    // the entire chain to be rejected.
+    let result = verify_attenuation(&child_token, Some(&[parent_jwt]));
+    assert!(
+        result.is_err(),
+        "any malformed parent capability must reject the entire chain, not just skip it"
+    );
+}
+
+/// Test: parent with all valid capabilities, child with subset -- normal attenuation passes.
+#[test]
+fn wasm_attenuation_child_subset_of_valid_parent_passes() {
+    use wasm_ucan_mirror::*;
+
+    let parent_payload = UcanPayload {
+        iss: "did:key:parent".to_owned(),
+        aud: "did:key:child".to_owned(),
+        exp: u64::MAX,
+        nbf: None,
+        nnc: "nonce1".to_owned(),
+        att: vec![
+            Attenuation {
+                with: "scp:ctx:test-ctx/messages:write".to_owned(),
+                can: "messages:write".to_owned(),
+            },
+            Attenuation {
+                with: "scp:ctx:test-ctx/messages:read".to_owned(),
+                can: "messages:read".to_owned(),
+            },
+        ],
+        prf: vec![],
+        fct: None,
+    };
+    let parent_jwt = build_test_token(&parent_payload);
+    let parent_cid = compute_token_cid(&parent_jwt);
+
+    // Child claims only a subset (messages:read).
+    let child_payload = UcanPayload {
+        iss: "did:key:child".to_owned(),
+        aud: "did:key:grandchild".to_owned(),
+        exp: u64::MAX,
+        nbf: None,
+        nnc: "nonce2".to_owned(),
+        att: vec![Attenuation {
+            with: "scp:ctx:test-ctx/messages:read".to_owned(),
+            can: "messages:read".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = build_test_token(&child_payload);
+    let child_token = parse_ucan(&child_jwt).unwrap();
+
+    let result = verify_attenuation(&child_token, Some(&[parent_jwt]));
+    assert!(
+        result.is_ok(),
+        "child with subset of valid parent caps should pass: {result:?}"
+    );
 }

@@ -686,12 +686,16 @@ fn verify_attenuation(
             .ok_or_else(|| format!("attenuation check failed: proof CID not found: {proof_cid}"))?;
 
         // Parse parent capabilities.
+        // SECURITY: fail-closed -- any unparseable parent capability URI rejects the chain.
         let parent_caps: Vec<CapabilityUri> = parent
             .payload
             .att
             .iter()
-            .filter_map(|att| CapabilityUri::parse(&att.with).ok())
-            .collect();
+            .map(|att| {
+                CapabilityUri::parse(&att.with)
+                    .map_err(|e| format!("unparseable capability URI in parent attestation: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Every child capability must be matched by at least one parent capability.
         for child_att in &token.payload.att {
