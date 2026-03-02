@@ -17,8 +17,9 @@
 //! # Failure Handling
 //!
 //! Exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped
-//! at 30 minutes. After 6 consecutive failures, a [`DhtPublishDegraded`]
-//! warning is emitted via the warning callback.
+//! at 30 minutes. After 6 consecutive failures, a [`DhtPublishDegraded`] or
+//! [`RelayPublishDegraded`] warning is emitted via the respective warning
+//! callback.
 //!
 //! # Anti-Segmentation Invariant (§3.10.6)
 //!
@@ -305,6 +306,18 @@ pub struct DhtPublishDegraded {
 /// Callback type for degraded warnings.
 pub type WarningCallback = Arc<dyn Fn(DhtPublishDegraded) + Send + Sync>;
 
+/// A warning event emitted when relay publishing has degraded.
+#[derive(Debug, Clone)]
+pub struct RelayPublishDegraded {
+    /// The DID that failed to publish to relays.
+    pub did: String,
+    /// Number of consecutive relay publish failures.
+    pub consecutive_failures: u32,
+}
+
+/// Callback type for relay degraded warnings.
+pub type RelayWarningCallback = Arc<dyn Fn(RelayPublishDegraded) + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // RepublishManager
 // ---------------------------------------------------------------------------
@@ -333,8 +346,10 @@ pub struct RepublishManager<D: DhtClient, R: RelayPublisher = InMemoryRelayPubli
     dht_tasks: Mutex<HashMap<String, TaskHandle>>,
     /// Active relay republish tasks, keyed by DID string.
     relay_tasks: Mutex<HashMap<String, TaskHandle>>,
-    /// Optional callback for degraded warnings.
+    /// Optional callback for degraded DHT warnings.
     warning_callback: Option<WarningCallback>,
+    /// Optional callback for degraded relay warnings.
+    relay_warning_callback: Option<RelayWarningCallback>,
 }
 
 impl<D: DhtClient, R: RelayPublisher> std::fmt::Debug for RepublishManager<D, R> {
@@ -344,6 +359,10 @@ impl<D: DhtClient, R: RelayPublisher> std::fmt::Debug for RepublishManager<D, R>
             .field(
                 "warning_callback",
                 &self.warning_callback.as_ref().map(|_| "..."),
+            )
+            .field(
+                "relay_warning_callback",
+                &self.relay_warning_callback.as_ref().map(|_| "..."),
             )
             .finish_non_exhaustive()
     }
@@ -369,6 +388,7 @@ impl<D: DhtClient + 'static> RepublishManager<D> {
             dht_tasks: Mutex::new(HashMap::new()),
             relay_tasks: Mutex::new(HashMap::new()),
             warning_callback: None,
+            relay_warning_callback: None,
         }
     }
 
@@ -382,6 +402,7 @@ impl<D: DhtClient + 'static> RepublishManager<D> {
             dht_tasks: Mutex::new(HashMap::new()),
             relay_tasks: Mutex::new(HashMap::new()),
             warning_callback: Some(callback),
+            relay_warning_callback: None,
         }
     }
 }
@@ -401,6 +422,7 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
             dht_tasks: Mutex::new(HashMap::new()),
             relay_tasks: Mutex::new(HashMap::new()),
             warning_callback: None,
+            relay_warning_callback: None,
         }
     }
 
@@ -420,7 +442,18 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
             dht_tasks: Mutex::new(HashMap::new()),
             relay_tasks: Mutex::new(HashMap::new()),
             warning_callback: Some(callback),
+            relay_warning_callback: None,
         }
+    }
+
+    /// Sets the relay warning callback for degraded relay publish events.
+    ///
+    /// The callback is invoked when relay publishing has failed at least
+    /// [`DEGRADED_THRESHOLD`] consecutive times.
+    #[must_use]
+    pub fn with_relay_warning_callback(mut self, callback: RelayWarningCallback) -> Self {
+        self.relay_warning_callback = Some(callback);
+        self
     }
 
     /// Starts republishing a DID document on all enabled layers.
@@ -466,8 +499,10 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
 
             let relay_pub = Arc::clone(relay_publisher);
             let did = entry.did.clone();
+            let relay_warning_cb = self.relay_warning_callback.clone();
 
-            let join_handle = tokio::spawn(relay_republish_loop(relay_pub, entry));
+            let join_handle =
+                tokio::spawn(relay_republish_loop(relay_pub, entry, relay_warning_cb));
 
             relay_tasks.insert(
                 did,
@@ -589,7 +624,11 @@ async fn dht_republish_loop<D: DhtClient>(
 ///
 /// Then waits for the relay republish interval (6 days) before the next
 /// publish. On failure, retries with exponential backoff.
-async fn relay_republish_loop<R: RelayPublisher>(relay_publisher: Arc<R>, entry: RepublishEntry) {
+async fn relay_republish_loop<R: RelayPublisher>(
+    relay_publisher: Arc<R>,
+    entry: RepublishEntry,
+    warning_cb: Option<RelayWarningCallback>,
+) {
     let routing_id = did_routing_id(&entry.did);
     let mut consecutive_failures: u32 = 0;
 
@@ -606,6 +645,17 @@ async fn relay_republish_loop<R: RelayPublisher>(relay_publisher: Arc<R>, entry:
             .await;
         } else {
             consecutive_failures = consecutive_failures.saturating_add(1);
+
+            // Emit degraded warning after threshold.
+            if consecutive_failures >= DEGRADED_THRESHOLD
+                && let Some(ref cb) = warning_cb
+            {
+                cb(RelayPublishDegraded {
+                    did: entry.did.clone(),
+                    consecutive_failures,
+                });
+            }
+
             let backoff = backoff_secs(consecutive_failures.saturating_sub(1));
             tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
         }
@@ -905,6 +955,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Guard is explicitly dropped before await
     async fn disable_dht_skips_dht_publishing() {
         let dht = Arc::new(InMemoryDhtClient::new());
         let relay = Arc::new(InMemoryRelayPublisher::new());
@@ -1077,5 +1128,76 @@ mod tests {
         // Give the runtime time to process the abort.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         assert!(!handle.is_active());
+    }
+
+    // --- Relay degraded warning tests ---
+
+    /// A relay publisher that always fails, for testing degraded warnings.
+    struct AlwaysFailRelayPublisher;
+
+    #[allow(clippy::manual_async_fn)]
+    impl RelayPublisher for AlwaysFailRelayPublisher {
+        fn publish(
+            &self,
+            _routing_id: &[u8; 32],
+            _blob_ttl: u64,
+            _blob: &[u8],
+        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+            async move { Err(IdentityError::RelayPublishFailed("always fails".into())) }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // Guard is explicitly dropped before await
+    async fn relay_warning_callback_fires_after_degraded_threshold() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(AlwaysFailRelayPublisher);
+        let config = RepublishConfig::new();
+
+        let warnings: Arc<std::sync::Mutex<Vec<RelayPublishDegraded>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warnings_clone = Arc::clone(&warnings);
+
+        let manager =
+            RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config)
+                .with_relay_warning_callback(Arc::new(move |degraded| {
+                    let mut w = warnings_clone.lock().unwrap();
+                    w.push(degraded);
+                }));
+
+        let entry = make_entry("did:dht:zTestRelay");
+        manager.start_republishing(entry).await;
+
+        // With start_paused, advance time through the backoff schedule step by
+        // step so the spawned task gets polled between each timer expiry.
+        //
+        // Attempt 1: immediate, fails, backoff 30s
+        // Attempt 2: after 30s, fails, backoff 60s
+        // Attempt 3: after 60s, fails, backoff 120s
+        // Attempt 4: after 120s, fails, backoff 240s
+        // Attempt 5: after 240s, fails, backoff 480s
+        // Attempt 6: after 480s, fails -> WARNING fires
+        //
+        // Yield after the spawn to let attempt 1 run immediately.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Advance through each backoff, yielding between to let the task process.
+        for backoff in [30u64, 60, 120, 240, 480] {
+            tokio::time::advance(tokio::time::Duration::from_secs(backoff + 1)).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+
+        let logged = warnings.lock().unwrap();
+        assert!(
+            !logged.is_empty(),
+            "relay degraded warning should have fired after {DEGRADED_THRESHOLD} consecutive failures",
+        );
+        assert_eq!(logged[0].did, "did:dht:zTestRelay");
+        assert_eq!(logged[0].consecutive_failures, DEGRADED_THRESHOLD);
+        drop(logged);
+
+        manager.stop_all().await;
     }
 }

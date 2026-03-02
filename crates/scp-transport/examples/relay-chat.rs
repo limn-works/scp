@@ -51,6 +51,7 @@ async fn main() {
     let rid = RoutingId::new(routing_id);
 
     eprintln!("Connecting to {url}...");
+    #[allow(deprecated)] // example uses legacy connect(); production should use connect_sourced()
     let adapter = Arc::new(NativeRelayAdapter::connect(url).await.unwrap_or_else(|e| {
         eprintln!("connection failed: {e}");
         std::process::exit(1);

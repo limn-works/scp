@@ -94,6 +94,10 @@ impl NativeRelayAdapter {
     ///
     /// Returns [`TransportError::ConnectionFailed`] if the initial connection
     /// cannot be established.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use connect_sourced() for provenance-based transport security validation (section 10.12.6)"
+    )]
     pub async fn connect(url: &str) -> Result<Self, TransportError> {
         let client = NativeRelayClient::connect(url).await?;
         Ok(Self { client })

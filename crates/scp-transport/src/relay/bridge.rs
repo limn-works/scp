@@ -129,15 +129,29 @@ pub struct BridgeRegistry {
 
     /// Track how many registrations each connection has (for limits).
     connection_counts: RwLock<HashMap<u64, usize>>,
+
+    /// Maximum number of total registrations across all connections.
+    max_registrations: usize,
 }
 
 impl BridgeRegistry {
-    /// Creates a new, empty bridge registry.
+    /// Creates a new, empty bridge registry with a default limit of 1000 registrations.
     #[must_use]
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
             connection_counts: RwLock::new(HashMap::new()),
+            max_registrations: 1000,
+        }
+    }
+
+    /// Creates a new bridge registry with the given maximum registration limit.
+    #[must_use]
+    pub fn with_max_registrations(max_registrations: usize) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            connection_counts: RwLock::new(HashMap::new()),
+            max_registrations,
         }
     }
 
@@ -153,21 +167,31 @@ impl BridgeRegistry {
     /// # Errors
     ///
     /// Returns [`TransportError::ProtocolError`] if the connection has
-    /// exceeded [`MAX_REGISTRATIONS_PER_CONNECTION`].
+    /// exceeded [`MAX_REGISTRATIONS_PER_CONNECTION`] or the global
+    /// `max_registrations` limit has been reached.
     pub async fn register(
         &self,
         routing_id: [u8; 32],
         connection_id: u64,
     ) -> Result<BridgeForwardReceiver, TransportError> {
+        // Acquire BOTH write locks up front to prevent TOCTOU races:
+        // a concurrent register() between our read-check and write-insert
+        // could violate limits.
+        let mut entries = self.entries.write().await;
+        let mut counts = self.connection_counts.write().await;
+
+        // Check global registration limit (replacements don't increase count).
+        let is_replacement = entries.contains_key(&routing_id);
+        if !is_replacement && entries.len() >= self.max_registrations {
+            return Err(TransportError::ProtocolError(format!(
+                "bridge global registration limit exceeded: max {} registrations",
+                self.max_registrations
+            )));
+        }
+
         // Check per-connection limit.
-        let count = self
-            .connection_counts
-            .read()
-            .await
-            .get(&connection_id)
-            .copied()
-            .unwrap_or(0);
-        if count >= MAX_REGISTRATIONS_PER_CONNECTION {
+        let conn_count = counts.get(&connection_id).copied().unwrap_or(0);
+        if !is_replacement && conn_count >= MAX_REGISTRATIONS_PER_CONNECTION {
             return Err(TransportError::ProtocolError(format!(
                 "bridge registration limit exceeded: max {MAX_REGISTRATIONS_PER_CONNECTION} \
                  registrations per connection"
@@ -176,8 +200,8 @@ impl BridgeRegistry {
 
         let (tx, rx) = mpsc::channel(256);
 
-        // Check if we're replacing an existing registration for this routing_id.
-        let old_entry = self.entries.write().await.insert(
+        // Insert (or replace) the entry.
+        let old_entry = entries.insert(
             routing_id,
             BridgeRegistryEntry {
                 connection_id,
@@ -186,7 +210,6 @@ impl BridgeRegistry {
         );
 
         // Update connection counts.
-        let mut counts = self.connection_counts.write().await;
         if let Some(old) = &old_entry {
             // Decrement old connection's count if it was a different connection.
             if old.connection_id != connection_id
@@ -204,6 +227,7 @@ impl BridgeRegistry {
 
         let replaced = old_entry.is_some();
         drop(counts);
+        drop(entries);
 
         info!(
             routing_id = hex::encode(routing_id),
@@ -448,42 +472,6 @@ impl BridgeDiscovery {
     /// Returns the number of known bridge relays (active and inactive).
     pub async fn relay_count(&self) -> usize {
         self.relays.read().await.len()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// hex encoding helpers (no external dep beyond what's in scope)
-// ---------------------------------------------------------------------------
-
-/// Minimal hex encoding/decoding for bridge target routing hints.
-///
-/// Avoids pulling in the `hex` crate — bridge targets are 32 bytes max
-/// and hex operations are infrequent.
-mod hex {
-    use std::fmt::Write;
-
-    /// Encodes bytes as a lowercase hex string.
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        let bytes = bytes.as_ref();
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            let _ = write!(s, "{b:02x}");
-        }
-        s
-    }
-
-    /// Decodes a hex string to bytes.
-    ///
-    /// Returns `Err` if the string contains non-hex characters or has
-    /// odd length.
-    pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if !s.len().is_multiple_of(2) {
-            return Err(());
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
-            .collect()
     }
 }
 
@@ -766,29 +754,49 @@ mod tests {
         assert_eq!(discovery.routing_id(), &routing_id);
     }
 
-    // -- hex helpers --
+    #[tokio::test]
+    async fn registry_global_limit_enforced() {
+        let registry = BridgeRegistry::with_max_registrations(2);
 
-    #[test]
-    fn hex_encode_decode_roundtrip() {
-        let data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF];
-        let encoded = hex::encode(&data);
-        assert_eq!(encoded, "deadbeef00ff");
-        let decoded = hex::decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
+        // Two registrations from different connections — both succeed.
+        let _rx1 = registry.register([0x01; 32], 1).await.unwrap();
+        let _rx2 = registry.register([0x02; 32], 2).await.unwrap();
+
+        // Third registration from yet another connection — must fail.
+        let result = registry.register([0x03; 32], 3).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("global registration limit"),
+            "expected global limit error, got: {err_msg}"
+        );
     }
 
-    #[test]
-    fn hex_decode_odd_length_fails() {
-        assert!(hex::decode("abc").is_err());
-    }
+    #[tokio::test]
+    async fn registry_per_connection_limit_atomic() {
+        let registry = BridgeRegistry::new();
+        let conn_id = 1;
 
-    #[test]
-    fn hex_decode_invalid_chars_fails() {
-        assert!(hex::decode("zzzz").is_err());
-    }
+        // Register up to the per-connection limit.
+        #[allow(clippy::cast_possible_truncation)]
+        for i in 0..MAX_REGISTRATIONS_PER_CONNECTION {
+            let mut routing_id = [0u8; 32];
+            routing_id[0] = (i & 0xFF) as u8;
+            routing_id[1] = ((i >> 8) & 0xFF) as u8;
+            let _rx = registry.register(routing_id, conn_id).await.unwrap();
+        }
 
-    #[test]
-    fn hex_encode_empty() {
-        assert_eq!(hex::encode(Vec::<u8>::new()), "");
+        // One more on the same connection should fail (per-connection limit).
+        let result = registry.register([0xFF; 32], conn_id).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("registrations per connection"),
+            "expected per-connection limit error, got: {err_msg}"
+        );
+
+        // A different connection should still succeed (global limit is 1000).
+        let result2 = registry.register([0xFE; 32], 2).await;
+        assert!(result2.is_ok());
     }
 }
