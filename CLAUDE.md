@@ -21,7 +21,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — the social layer 
 - **No deferral.** Everything gets specced and implemented now. Nothing is "v2" or "future."
 - **No DOA decisions.** Design decisions are permanent commitments. If it needs replacing later, it's the wrong choice now.
 - **Simple over complex.** Never at the expense of functionality, security, or completeness.
-- **Completeness is the baseline.** Every feature, every edge case, every acceptance criterion — implemented fully or not at all. Maximum breadth. Improve post-completion, not to reach completion. Partial implementations are failures.
+- **Completeness is the baseline.** Every feature, every edge case, every acceptance criterion — implemented fully or not at all. Maximum breadth. Improve post-completion, not to reach completion. Partial implementations are failures. Every struct field the spec defines must have a real value — never `None` when data exists elsewhere in the system. Never fabricate story references to justify gaps. Never create tracking issues instead of doing the work. Never call an incomplete implementation a "planned deferral." When a gap is caught, fix it immediately — do not rationalize it.
 - **SDK first.** Rust core + bindings before any app.
 - **Enforce mechanically.** Linters, structural tests, and the type system — not documentation.
 - **Artifacts are the system of record.** If an agent can't find it, it doesn't exist.

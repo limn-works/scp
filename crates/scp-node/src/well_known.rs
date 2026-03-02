@@ -13,7 +13,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-use scp_core::well_known::{WellKnownContext, WellKnownScp};
+use scp_core::well_known::{RelayConfig, WellKnownContext, WellKnownScp};
 use scp_transport::native::storage::BlobStorage;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -71,12 +71,21 @@ pub async fn well_known_handler<B: BlobStorage>(
         }
     };
 
+    let rc = &state.relay_config;
+    let relay_config = RelayConfig {
+        max_blob_size: Some(rc.max_blob_size as u64),
+        max_blob_ttl: Some(u64::from(rc.max_blob_ttl)),
+        rate_limit_publish: Some(rc.rate_limit_publishes_per_second),
+        rate_limit_subscribe: Some(rc.rate_limit_subscribes_per_minute),
+        economic: None,
+    };
+
     let doc = WellKnownScp {
         version: 1,
         did: state.did.clone(),
         relay: state.relay_url.clone(),
         contexts,
-        relay_config: None,
+        relay_config: Some(relay_config),
         handles: None,
     };
 

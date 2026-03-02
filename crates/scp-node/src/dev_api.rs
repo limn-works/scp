@@ -517,6 +517,7 @@ mod tests {
             dev_bind_addr: Some("127.0.0.1:9100".parse::<SocketAddr>().unwrap()),
             projected_contexts: RwLock::new(HashMap::new()),
             blob_storage: Arc::new(InMemoryBlobStorage::default()),
+            relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
         })
     }

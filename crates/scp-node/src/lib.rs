@@ -15,6 +15,7 @@ pub mod projection;
 pub mod tls;
 mod well_known;
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -951,7 +952,6 @@ impl<
         // The runtime check is a defensive fallback — the type system
         // prevents reaching this code without both fields configured.
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
-
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
@@ -975,19 +975,20 @@ impl<
         let bridge_secret: [u8; 32] = rand::random();
 
         // 6. Start relay server — must be listening before DID publish.
+        let bind_addr = self
+            .bind_addr
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
         let relay_config = RelayConfig {
-            bind_addr: self
-                .bind_addr
-                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+            bind_addr,
             bridge_secret: Some(bridge_secret),
             ..RelayConfig::default()
         };
 
-        let blob_storage = Arc::new(
-            self.blob_storage
-                .ok_or(NodeError::MissingField("blob_storage"))?,
-        );
-        let relay_server = RelayServer::new(relay_config, Arc::clone(&blob_storage));
+        let blob_storage = self
+            .blob_storage
+            .ok_or(NodeError::MissingField("blob_storage"))?;
+        let blob_storage = Arc::new(blob_storage);
+        let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 7. Generate dev API token if local_api was configured.
@@ -995,13 +996,12 @@ impl<
 
         // 8. Attempt TLS provisioning (§10.12.8 step 4).
         //    Success → domain deployment; failure → NAT-traversed fallthrough.
-        let tls_provider: Arc<dyn TlsProvider> = self.tls_provider.unwrap_or_else(|| {
-            let mut provider = tls::AcmeProvider::new(&domain, Arc::clone(&storage));
-            if let Some(ref email) = self.acme_email {
-                provider = provider.with_email(email);
-            }
-            Arc::new(provider)
-        });
+        let tls_provider = resolve_tls(
+            self.tls_provider,
+            &domain,
+            &storage,
+            self.acme_email.as_ref(),
+        );
 
         match tls_provider.provision().await {
             Ok(_cert_data) => {
@@ -1021,15 +1021,19 @@ impl<
                     "application node started (domain mode)"
                 );
 
-                let state = Arc::new(http::NodeState::new(
-                    identity.did.clone(),
-                    relay_url.clone(),
-                    bound_addr,
+                let state = Arc::new(http::NodeState {
+                    did: identity.did.clone(),
+                    relay_url: relay_url.clone(),
+                    broadcast_contexts: tokio::sync::RwLock::new(Vec::new()),
+                    relay_addr: bound_addr,
                     bridge_secret,
                     dev_token,
-                    self.local_api_addr,
+                    dev_bind_addr: self.local_api_addr,
+                    projected_contexts: tokio::sync::RwLock::new(HashMap::new()),
                     blob_storage,
-                ));
+                    relay_config,
+                    start_time: std::time::Instant::now(),
+                });
 
                 Ok(ApplicationNode {
                     domain: Some(domain),
@@ -1049,12 +1053,7 @@ impl<
                     "domain-based TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
                 );
 
-                let strategy: Arc<dyn NatStrategy> = self.nat_strategy.unwrap_or_else(|| {
-                    Arc::new(DefaultNatStrategy::new(
-                        self.stun_server.clone(),
-                        self.bridge_relay.clone(),
-                    ))
-                });
+                let strategy = resolve_nat(self.nat_strategy, self.stun_server, self.bridge_relay);
 
                 build_no_domain_inner(
                     identity,
@@ -1068,6 +1067,7 @@ impl<
                     dev_token,
                     self.local_api_addr,
                     blob_storage,
+                    relay_config,
                 )
                 .await
             }
@@ -1099,6 +1099,41 @@ fn generate_dev_token(addr: SocketAddr) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// TLS provider resolution (§10.12.8 step 4)
+// ---------------------------------------------------------------------------
+
+/// Resolves the TLS provider: uses the explicitly provided one, or constructs
+/// a default [`AcmeProvider`](tls::AcmeProvider) for the given domain.
+fn resolve_tls<S: Storage + 'static>(
+    provider: Option<Arc<dyn TlsProvider>>,
+    domain: &str,
+    storage: &Arc<S>,
+    acme_email: Option<&String>,
+) -> Arc<dyn TlsProvider> {
+    provider.unwrap_or_else(|| {
+        let mut acme = tls::AcmeProvider::new(domain, Arc::clone(storage));
+        if let Some(email) = acme_email {
+            acme = acme.with_email(email);
+        }
+        Arc::new(acme)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// NAT strategy resolution (§10.12.8 step 5)
+// ---------------------------------------------------------------------------
+
+/// Resolves the NAT traversal strategy: uses the explicitly provided one, or
+/// constructs a [`DefaultNatStrategy`] from the STUN/bridge configuration.
+fn resolve_nat(
+    strategy: Option<Arc<dyn NatStrategy>>,
+    stun_server: Option<String>,
+    bridge_relay: Option<String>,
+) -> Arc<dyn NatStrategy> {
+    strategy.unwrap_or_else(|| Arc::new(DefaultNatStrategy::new(stun_server, bridge_relay)))
+}
+
+// ---------------------------------------------------------------------------
 // Shared no-domain build logic (used by HasNoDomain::build and domain fallthrough)
 // ---------------------------------------------------------------------------
 
@@ -1119,6 +1154,7 @@ async fn build_no_domain_inner<
     dev_token: Option<String>,
     dev_bind_addr: Option<SocketAddr>,
     blob_storage: Arc<B>,
+    relay_config: RelayConfig,
 ) -> Result<ApplicationNode<S, B>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
@@ -1152,15 +1188,19 @@ async fn build_no_domain_inner<
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    let state = Arc::new(http::NodeState::new(
-        identity.did.clone(),
+    let state = Arc::new(http::NodeState {
+        did: identity.did.clone(),
         relay_url,
-        bound_addr,
+        broadcast_contexts: tokio::sync::RwLock::new(Vec::new()),
+        relay_addr: bound_addr,
         bridge_secret,
         dev_token,
         dev_bind_addr,
+        projected_contexts: tokio::sync::RwLock::new(HashMap::new()),
         blob_storage,
-    ));
+        relay_config,
+        start_time: std::time::Instant::now(),
+    });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
     Ok(ApplicationNode {
@@ -1244,7 +1284,7 @@ impl<
             self.blob_storage
                 .ok_or(NodeError::MissingField("blob_storage"))?,
         );
-        let relay_server = RelayServer::new(relay_config, Arc::clone(&blob_storage));
+        let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 4. Generate dev API token if local_api was configured.
@@ -1270,6 +1310,7 @@ impl<
             dev_token,
             self.local_api_addr,
             blob_storage,
+            relay_config,
         )
         .await
     }

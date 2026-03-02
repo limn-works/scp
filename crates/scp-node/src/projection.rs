@@ -946,6 +946,7 @@ mod tests {
             dev_bind_addr: None,
             projected_contexts: RwLock::new(projected),
             blob_storage: Arc::new(storage),
+            relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
         })
     }
