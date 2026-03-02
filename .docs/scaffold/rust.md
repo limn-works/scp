@@ -197,11 +197,11 @@ redb = "2"
 | `async-trait` | latest | scp-transport, scp-testing | Async trait support (BlobStore, TransportAdapter) |
 | `proptest` | 1.x | all crates (dev) | Property-based testing |
 | `scp-testing` | path | all crates (dev) | Network simulation harness, trait conformance macros (§16) |
-| `pyo3` | 0.23+ | scp-ffi/pyo3 | Python FFI |
-| `uniffi` | latest | scp-ffi/uniffi | Swift/Kotlin FFI |
-| `cbindgen` | latest | scp-ffi/cbindgen | C header generation |
-| `wasm-bindgen` | latest | scp-ffi/wasm | Browser WASM FFI |
-| `napi` | latest | scp-ffi/napi | Node/Bun native addon |
+| `pyo3` | 0.23+ | crates/scp-ffi/pyo3 | Python FFI |
+| `uniffi` | latest | crates/scp-ffi/uniffi | Swift/Kotlin FFI |
+| `cbindgen` | latest | crates/scp-ffi/cbindgen | C header generation |
+| `wasm-bindgen` | latest | crates/scp-ffi/wasm | Browser WASM FFI |
+| `napi` | latest | crates/scp-ffi/napi | Node/Bun native addon |
 
 ## Error Types
 
