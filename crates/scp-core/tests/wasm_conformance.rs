@@ -1786,10 +1786,63 @@ mod wasm_ucan_mirror {
             .map_err(|_| "signature verification failed".to_owned())
     }
 
+    /// Maximum token lifetime: 24 hours in seconds.
+    const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
+
+    pub fn now_secs() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs()
+    }
+
+    pub fn verify_time_bounds(token: &ParsedUcanToken) -> Result<(), String> {
+        let now = now_secs();
+
+        if let Some(nbf) = token.payload.nbf {
+            if now < nbf {
+                return Err("token not yet valid (nbf > now)".to_owned());
+            }
+            if nbf >= token.payload.exp {
+                return Err(format!(
+                    "invalid time range: nbf ({nbf}) must be less than exp ({})",
+                    token.payload.exp
+                ));
+            }
+        }
+
+        if now >= token.payload.exp {
+            return Err("token expired".to_owned());
+        }
+
+        if token.payload.exp > now + MAX_EXPIRY_SECS {
+            return Err(format!(
+                "expiry too far in the future: {}s exceeds 24h maximum",
+                token.payload.exp - now
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn compute_revocation_cid(payload: &UcanPayload) -> Result<String, String> {
+        let payload_bytes = serde_json::to_vec(payload)
+            .map_err(|e| format!("revocation CID serialization failed: {e}"))?;
+        let hash = Sha256::digest(&payload_bytes);
+        let hex = hash.iter().fold(String::with_capacity(64), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        Ok(hex)
+    }
+
     /// Verbatim mirror of WASM `verify_delegation_chain`.
     pub fn verify_delegation_chain(
         token: &ParsedUcanToken,
         proof_tokens: Option<&[String]>,
+        revoked_cids: &HashSet<String>,
     ) -> Result<String, String> {
         if token.payload.prf.is_empty() {
             return Ok(token.payload.iss.clone());
@@ -1807,14 +1860,16 @@ mod wasm_ucan_mirror {
         let mut seen_issuers = HashSet::new();
         seen_issuers.insert(token.payload.iss.clone());
 
-        verify_chain_recursive(token, &proof_map, 0, &mut seen_issuers)
+        verify_chain_recursive(token, &proof_map, revoked_cids, 0, &mut seen_issuers)
     }
 
     /// Verbatim mirror of WASM `verify_chain_recursive` with circular
-    /// delegation detection (issue #134 fix).
+    /// delegation detection (issue #134 fix) and parent expiry/revocation
+    /// checks (issue #133 fix).
     pub fn verify_chain_recursive(
         token: &ParsedUcanToken,
         proof_map: &HashMap<String, ParsedUcanToken>,
+        revoked_cids: &HashSet<String>,
         depth: usize,
         seen_issuers: &mut HashSet<String>,
     ) -> Result<String, String> {
@@ -1849,7 +1904,17 @@ mod wasm_ucan_mirror {
                 ));
             }
 
-            let issuer = verify_chain_recursive(parent, proof_map, depth + 1, seen_issuers)?;
+            // Verify parent token has not expired (spec 7.2).
+            verify_time_bounds(parent)?;
+
+            // Verify parent token has not been revoked (spec 7.2).
+            let parent_revocation_cid = compute_revocation_cid(&parent.payload)?;
+            if revoked_cids.contains(&parent_revocation_cid) {
+                return Err(format!("token revoked: {parent_revocation_cid}"));
+            }
+
+            let issuer =
+                verify_chain_recursive(parent, proof_map, revoked_cids, depth + 1, seen_issuers)?;
             root_issuer = Some(issuer);
         }
 
@@ -1871,7 +1936,7 @@ mod wasm_ucan_mirror {
         let payload = UcanPayload {
             iss: iss.to_owned(),
             aud: aud.to_owned(),
-            exp: u64::MAX / 2,
+            exp: now_secs() + 3600, // 1 hour from now (within 24h max)
             nbf: None,
             nnc: format!("nonce-{iss}-{aud}"),
             att: vec![Attenuation {
@@ -2137,7 +2202,11 @@ fn circular_delegation_a_b_a_detected() {
     let proof_tokens = vec![token_a_to_b, token_b_to_a];
     let parsed = wasm_ucan_mirror::parse_ucan(&token_a_final).unwrap();
 
-    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, Some(&proof_tokens));
+    let result = wasm_ucan_mirror::verify_delegation_chain(
+        &parsed,
+        Some(&proof_tokens),
+        &std::collections::HashSet::new(),
+    );
 
     assert!(
         result.is_err(),
@@ -2163,7 +2232,11 @@ fn self_delegation_a_a_detected() {
     let proof_tokens = vec![root_token];
     let parsed = wasm_ucan_mirror::parse_ucan(&child_token).unwrap();
 
-    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, Some(&proof_tokens));
+    let result = wasm_ucan_mirror::verify_delegation_chain(
+        &parsed,
+        Some(&proof_tokens),
+        &std::collections::HashSet::new(),
+    );
 
     assert!(
         result.is_err(),
@@ -2194,7 +2267,11 @@ fn diamond_delegation_not_circular() {
     let proof_tokens = vec![root_token];
     let parsed = wasm_ucan_mirror::parse_ucan(&child_token).unwrap();
 
-    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, Some(&proof_tokens));
+    let result = wasm_ucan_mirror::verify_delegation_chain(
+        &parsed,
+        Some(&proof_tokens),
+        &std::collections::HashSet::new(),
+    );
 
     assert!(
         result.is_ok(),
@@ -2230,7 +2307,11 @@ fn three_node_circular_delegation_detected() {
     let proof_tokens = vec![token_a_to_b, token_b_to_c, token_c_to_a];
     let parsed = wasm_ucan_mirror::parse_ucan(&final_token).unwrap();
 
-    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, Some(&proof_tokens));
+    let result = wasm_ucan_mirror::verify_delegation_chain(
+        &parsed,
+        Some(&proof_tokens),
+        &std::collections::HashSet::new(),
+    );
 
     assert!(
         result.is_err(),
@@ -2253,7 +2334,8 @@ fn root_token_no_proofs_passes() {
     let root_token = wasm_ucan_mirror::mint_test_token(&key_a, &did_a, &did_b, vec![]);
     let parsed = wasm_ucan_mirror::parse_ucan(&root_token).unwrap();
 
-    let result = wasm_ucan_mirror::verify_delegation_chain(&parsed, None);
+    let result =
+        wasm_ucan_mirror::verify_delegation_chain(&parsed, None, &std::collections::HashSet::new());
 
     assert!(result.is_ok(), "root token should pass: {result:?}");
     assert_eq!(result.unwrap(), did_a, "root issuer should be A");
@@ -2287,7 +2369,11 @@ fn wasm_circular_delegation_error_matches_core_format() {
 
     let proof_tokens = vec![token_a_to_b, token_b_to_a];
     let parsed_wasm = wasm_ucan_mirror::parse_ucan(&final_token).unwrap();
-    let wasm_result = wasm_ucan_mirror::verify_delegation_chain(&parsed_wasm, Some(&proof_tokens));
+    let wasm_result = wasm_ucan_mirror::verify_delegation_chain(
+        &parsed_wasm,
+        Some(&proof_tokens),
+        &std::collections::HashSet::new(),
+    );
 
     assert!(wasm_result.is_err(), "WASM must reject circular delegation");
     let wasm_err = wasm_result.unwrap_err();
@@ -2295,5 +2381,229 @@ fn wasm_circular_delegation_error_matches_core_format() {
     assert!(
         wasm_err.starts_with("circular delegation detected:"),
         "WASM error must match core format prefix. Got: {wasm_err}"
+    );
+}
+
+// ===========================================================================
+// WASM delegation chain parent expiry/revocation tests (issue #133)
+//
+// Verifies that parent token expiry and revocation checks are correctly
+// applied at every chain level, matching scp-core behavior per spec 7.2.
+// ===========================================================================
+
+/// Helper: creates a signed UCAN JWT string from a payload using the given
+/// signing key. Returns the encoded JWT string.
+fn make_signed_ucan(
+    payload: &wasm_ucan_mirror::UcanPayload,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::Signer;
+
+    let header = wasm_ucan_mirror::UcanHeader {
+        alg: "EdDSA".to_owned(),
+        typ: "JWT".to_owned(),
+        ucv: "0.10.0".to_owned(),
+    };
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+
+    let signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    format!("{signing_input}.{sig_b64}")
+}
+
+/// Test: expired parent token in a 2-level delegation chain is rejected.
+///
+/// Acceptance criterion 3: A test with an expired parent token fails WASM
+/// validation with a "token expired" error.
+#[test]
+fn wasm_delegation_chain_rejects_expired_parent() {
+    use std::collections::HashSet;
+
+    let root_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+    let child_key = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+    let root_did = wasm_ucan_mirror::did_from_key(&root_key);
+    let child_did = wasm_ucan_mirror::did_from_key(&child_key);
+
+    // Parent token: EXPIRED (exp = 1, long in the past).
+    let parent_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_did,
+        aud: child_did.clone(),
+        exp: 1, // Expired
+        nbf: None,
+        nnc: "parent-nonce-001".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let parent_jwt = make_signed_ucan(&parent_payload, &root_key);
+    let parent_cid = wasm_ucan_mirror::compute_token_cid(&parent_jwt);
+
+    // Child token: valid (not expired), references expired parent.
+    let now = wasm_ucan_mirror::now_secs();
+    let child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: child_did,
+        aud: "did:key:deadbeef00000000000000000000000000000000000000000000000000000000".to_owned(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "child-nonce-001".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = make_signed_ucan(&child_payload, &child_key);
+    let child_token = wasm_ucan_mirror::parse_ucan(&child_jwt).unwrap();
+
+    let revoked_cids = HashSet::new();
+    let result =
+        wasm_ucan_mirror::verify_delegation_chain(&child_token, Some(&[parent_jwt]), &revoked_cids);
+
+    assert!(
+        result.is_err(),
+        "expired parent must be rejected: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("expired"),
+        "error must mention 'expired', got: {err}"
+    );
+}
+
+/// Test: revoked parent token in a 2-level delegation chain is rejected.
+///
+/// Acceptance criterion 4: A test with a revoked parent token fails WASM
+/// validation with a "token revoked" error.
+#[test]
+fn wasm_delegation_chain_rejects_revoked_parent() {
+    use std::collections::HashSet;
+
+    let root_key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+    let child_key = ed25519_dalek::SigningKey::from_bytes(&[14u8; 32]);
+    let root_did = wasm_ucan_mirror::did_from_key(&root_key);
+    let child_did = wasm_ucan_mirror::did_from_key(&child_key);
+
+    let now = wasm_ucan_mirror::now_secs();
+
+    // Parent token: valid time bounds but will be revoked.
+    let parent_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_did,
+        aud: child_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "parent-nonce-002".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let parent_jwt = make_signed_ucan(&parent_payload, &root_key);
+    let parent_cid = wasm_ucan_mirror::compute_token_cid(&parent_jwt);
+
+    // Compute the parent's revocation CID (hash of the payload).
+    let parent_revocation_cid = wasm_ucan_mirror::compute_revocation_cid(&parent_payload).unwrap();
+
+    // Add parent's revocation CID to the revocation set.
+    let mut revoked_cids = HashSet::new();
+    revoked_cids.insert(parent_revocation_cid);
+
+    // Child token: valid, references revoked parent.
+    let child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: child_did,
+        aud: "did:key:deadbeef00000000000000000000000000000000000000000000000000000000".to_owned(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "child-nonce-002".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = make_signed_ucan(&child_payload, &child_key);
+    let child_token = wasm_ucan_mirror::parse_ucan(&child_jwt).unwrap();
+
+    let result =
+        wasm_ucan_mirror::verify_delegation_chain(&child_token, Some(&[parent_jwt]), &revoked_cids);
+
+    assert!(
+        result.is_err(),
+        "revoked parent must be rejected: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("revoked"),
+        "error must mention 'revoked', got: {err}"
+    );
+}
+
+/// Test: valid parent token (not expired, not revoked) passes delegation
+/// chain verification.
+#[test]
+fn wasm_delegation_chain_accepts_valid_parent() {
+    use std::collections::HashSet;
+
+    let root_key = ed25519_dalek::SigningKey::from_bytes(&[15u8; 32]);
+    let child_key = ed25519_dalek::SigningKey::from_bytes(&[16u8; 32]);
+    let root_did = wasm_ucan_mirror::did_from_key(&root_key);
+    let child_did = wasm_ucan_mirror::did_from_key(&child_key);
+
+    let now = wasm_ucan_mirror::now_secs();
+
+    // Parent token: valid time bounds, not revoked.
+    let parent_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_did.clone(),
+        aud: child_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "parent-nonce-003".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let parent_jwt = make_signed_ucan(&parent_payload, &root_key);
+    let parent_cid = wasm_ucan_mirror::compute_token_cid(&parent_jwt);
+
+    // Child token: valid, references valid parent.
+    let child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: child_did,
+        aud: "did:key:deadbeef00000000000000000000000000000000000000000000000000000000".to_owned(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "child-nonce-003".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = make_signed_ucan(&child_payload, &child_key);
+    let child_token = wasm_ucan_mirror::parse_ucan(&child_jwt).unwrap();
+
+    let revoked_cids = HashSet::new();
+    let result =
+        wasm_ucan_mirror::verify_delegation_chain(&child_token, Some(&[parent_jwt]), &revoked_cids);
+
+    assert!(result.is_ok(), "valid parent must be accepted: {result:?}");
+    assert_eq!(
+        result.unwrap(),
+        root_did,
+        "root issuer must be the parent's issuer"
     );
 }

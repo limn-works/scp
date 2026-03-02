@@ -483,7 +483,9 @@ fn validate_ucan_full(
     verify_signature(token)?;
 
     // Step 3 + Step 4: Delegation chain verification -> root issuer must be creator.
-    let root_issuer = verify_delegation_chain(token, proof_tokens)?;
+    // Read revoked CIDs from per-context state for parent token revocation checks.
+    let revoked_cids = with_ucan_state(context_id, |state| Ok(state.revoked_cids.clone()))?;
+    let root_issuer = verify_delegation_chain(token, proof_tokens, &revoked_cids)?;
 
     if root_issuer != creator_did {
         return Err(format!(
@@ -602,6 +604,7 @@ fn verify_time_bounds(token: &ParsedUcanToken) -> Result<(), String> {
 fn verify_delegation_chain(
     token: &ParsedUcanToken,
     proof_tokens: Option<&[String]>,
+    revoked_cids: &HashSet<String>,
 ) -> Result<String, String> {
     if token.payload.prf.is_empty() {
         // Root token -- issuer IS the root.
@@ -623,10 +626,14 @@ fn verify_delegation_chain(
     seen_issuers.insert(token.payload.iss.clone());
 
     // Walk the chain from current token upward.
-    verify_chain_recursive(token, &proof_map, 0, &mut seen_issuers)
+    verify_chain_recursive(token, &proof_map, revoked_cids, 0, &mut seen_issuers)
 }
 
 /// Recursively verifies the delegation chain.
+///
+/// Per spec section 7.2, every token in the delegation chain must be valid:
+/// not expired, not revoked, and properly signed. An expired or revoked
+/// parent invalidates the entire delegation.
 ///
 /// `seen_issuers` tracks all issuer DIDs encountered during the chain walk
 /// to detect circular delegations (e.g., A->B->A). This mirrors scp-core's
@@ -634,6 +641,7 @@ fn verify_delegation_chain(
 fn verify_chain_recursive(
     token: &ParsedUcanToken,
     proof_map: &HashMap<String, ParsedUcanToken>,
+    revoked_cids: &HashSet<String>,
     depth: usize,
     seen_issuers: &mut HashSet<String>,
 ) -> Result<String, String> {
@@ -674,8 +682,18 @@ fn verify_chain_recursive(
             ));
         }
 
+        // Verify parent token has not expired (spec 7.2).
+        verify_time_bounds(parent)?;
+
+        // Verify parent token has not been revoked (spec 7.2).
+        let parent_revocation_cid = compute_revocation_cid(&parent.payload)?;
+        if revoked_cids.contains(&parent_revocation_cid) {
+            return Err(format!("token revoked: {parent_revocation_cid}"));
+        }
+
         // Recurse up the chain.
-        let issuer = verify_chain_recursive(parent, proof_map, depth + 1, seen_issuers)?;
+        let issuer =
+            verify_chain_recursive(parent, proof_map, revoked_cids, depth + 1, seen_issuers)?;
         root_issuer = Some(issuer);
     }
 
