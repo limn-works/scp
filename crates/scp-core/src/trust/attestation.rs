@@ -527,6 +527,7 @@ fn compute_independence_score(attestors: &[&AttestorInfo]) -> f64 {
         return 1.0;
     }
 
+    // pair_count is a small integer; precision loss is negligible.
     #[allow(clippy::cast_precision_loss)]
     let score = total_pair_score / pair_count as f64;
     score

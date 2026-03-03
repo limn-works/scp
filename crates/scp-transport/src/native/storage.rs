@@ -170,6 +170,7 @@ fn now_secs() -> Result<u64, StorageError> {
     scp_core::time::now_secs().map_err(|e| StorageError::Internal(format!("clock error: {e}")))
 }
 
+// Lock guards are held for the minimal scope needed across async operations.
 #[allow(clippy::significant_drop_tightening)]
 impl BlobStorage for InMemoryBlobStorage {
     async fn store(

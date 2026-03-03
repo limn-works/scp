@@ -198,6 +198,8 @@ async fn receive_envelope(
 /// envelope (ADR-002), transport trait (ADR-005), native relay (ADR-004),
 /// platform adapters (ADR-006), and sender keys (ADR-007).
 #[tokio::test]
+// Integration test exercises full Phase 1 flow; splitting would
+// fragment the sequential scenario.
 #[allow(clippy::too_many_lines)]
 async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------

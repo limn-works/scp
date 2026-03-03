@@ -154,6 +154,8 @@ impl InMemoryRelayPublisher {
     }
 }
 
+// Trait uses RPITIT with explicit `+ Send` bound; async fn in trait does
+// not guarantee Send futures, so manual impl Future is required.
 #[allow(clippy::manual_async_fn)]
 impl RelayPublisher for InMemoryRelayPublisher {
     fn publish(
@@ -179,6 +181,9 @@ impl RelayPublisher for InMemoryRelayPublisher {
 // RepublishConfig
 // ---------------------------------------------------------------------------
 
+/// Thread-safe callback for layer-disabled warnings.
+type LayerDisabledCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Configuration for which publishing layers are enabled.
 ///
 /// By default, both DHT and relay layers are enabled per the anti-segmentation
@@ -191,8 +196,7 @@ pub struct RepublishConfig {
     /// Whether relay publishing is enabled.
     relay_enabled: bool,
     /// Warning callback invoked when a layer is disabled.
-    #[allow(clippy::type_complexity)]
-    layer_disabled_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    layer_disabled_callback: Option<LayerDisabledCallback>,
 }
 
 impl std::fmt::Debug for RepublishConfig {
@@ -230,10 +234,7 @@ impl RepublishConfig {
     /// The callback receives the warning message string. In production,
     /// this would typically log via `tracing::warn!` or equivalent.
     #[must_use]
-    pub fn with_layer_disabled_callback(
-        mut self,
-        callback: Arc<dyn Fn(&str) + Send + Sync>,
-    ) -> Self {
+    pub fn with_layer_disabled_callback(mut self, callback: LayerDisabledCallback) -> Self {
         self.layer_disabled_callback = Some(callback);
         self
     }
@@ -1135,6 +1136,8 @@ mod tests {
     /// A relay publisher that always fails, for testing degraded warnings.
     struct AlwaysFailRelayPublisher;
 
+    // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
+    // does not guarantee Send futures, so manual impl Future is required.
     #[allow(clippy::manual_async_fn)]
     impl RelayPublisher for AlwaysFailRelayPublisher {
         fn publish(

@@ -2817,6 +2817,8 @@ mod tests {
     /// SCP-227 AC7: integration test -- blocked author's subsequent messages
     /// are undecryptable by blocked subscriber.
     #[tokio::test]
+    // Integration test exercises full context lifecycle; splitting would
+    // fragment a sequential scenario that must be verified end-to-end.
     #[allow(clippy::too_many_lines)]
     async fn broadcast_blocked_subscriber_cannot_decrypt() {
         use crate::crypto::sender_keys::open_broadcast;
@@ -3370,6 +3372,8 @@ mod tests {
     /// subsequent messages are undecryptable by subscribers (because the
     /// author can no longer produce them).
     #[tokio::test]
+    // Integration test exercises full broadcast lifecycle; splitting would
+    // fragment a sequential scenario that must be verified end-to-end.
     #[allow(clippy::too_many_lines)]
     async fn broadcast_blocked_author_messages_undecryptable() {
         use crate::crypto::sender_keys::open_broadcast;

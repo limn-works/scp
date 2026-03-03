@@ -281,6 +281,7 @@ fn build_binding_response(transaction_id: &[u8; 12], src: SocketAddr) -> Vec<u8>
     // so msg_len and attr_payload.len() always fit in u16.
     #[allow(clippy::cast_possible_truncation)]
     let msg_len_u16 = msg_len as u16;
+    // STUN attribute payloads are always < 65535 bytes.
     #[allow(clippy::cast_possible_truncation)]
     let attr_payload_len_u16 = attr_payload.len() as u16;
 

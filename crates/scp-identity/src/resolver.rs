@@ -218,6 +218,8 @@ impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
     }
 }
 
+// Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
+// does not guarantee Send futures, so manual impl Future is required.
 #[allow(clippy::manual_async_fn)]
 impl<R: MultiRelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static> DidResolver
     for DualLayerResolver<R, D, C>

@@ -230,6 +230,7 @@ pub struct BridgeRegistry {
 impl BridgeRegistry {
     /// Creates a new empty bridge registry for the given context.
     #[must_use]
+    // Contains HashMap::new() which is not const.
     #[allow(clippy::missing_const_for_fn)]
     pub fn new(context_id: ContextId) -> Self {
         Self {

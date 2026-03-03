@@ -846,6 +846,7 @@ fn aes128gcm_decrypt(key: &[u8; 16], sealed: &[u8]) -> Result<Vec<u8>, SenderKey
 fn compute_epoch_advance_hash(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"SCP-EPOCH-ADVANCE-V1:");
+    // DID and key bytes are always < 4 GiB; length prefix fits in u32.
     #[allow(clippy::cast_possible_truncation)]
     let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
         hasher.update((bytes.len() as u32).to_be_bytes());
@@ -875,6 +876,7 @@ fn compute_request_hash(
     timestamp: u64,
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
+    // DID and key bytes are always < 4 GiB; length prefix fits in u32.
     hasher.update(b"SCP-KEY-REQUEST-V1:");
     #[allow(clippy::cast_possible_truncation)]
     let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
@@ -904,6 +906,7 @@ fn compute_block_notification_hash(
     blocked_did: &str,
     timestamp: u64,
 ) -> Vec<u8> {
+    // DID and key bytes are always < 4 GiB; length prefix fits in u32.
     let mut hasher = Sha256::new();
     hasher.update(b"SCP-BLOCK-NOTIFICATION-V1:");
     #[allow(clippy::cast_possible_truncation)]

@@ -39,7 +39,7 @@ pub mod time;
 pub mod tree;
 
 #[cfg(any(test, feature = "testing"))]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used)] // Test helper module; panics on invalid setup are intentional.
 pub mod test_helpers;
 
 use std::collections::BTreeSet;

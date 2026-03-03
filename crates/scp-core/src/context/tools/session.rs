@@ -80,6 +80,7 @@ impl ToolSession {
         if ttl_ms > u128::from(u64::MAX) {
             return false;
         }
+        // ttl_ms is a small positive duration; fits in u64.
         #[allow(clippy::cast_possible_truncation)]
         let ttl_ms_u64 = ttl_ms as u64;
         now_ms.saturating_sub(self.created_at) >= ttl_ms_u64

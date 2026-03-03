@@ -356,6 +356,7 @@ pub fn prove_inclusion(log: &WasmEventLog, leaf_index: u64) -> Result<InclusionP
     }
 
     let leaves = log.leaves();
+    // leaf_index validated against leaves.len(); fits in usize.
     #[allow(clippy::cast_possible_truncation)]
     let leaf_idx_usize = leaf_index as usize;
     let leaf_hash = leaves[leaf_idx_usize];
