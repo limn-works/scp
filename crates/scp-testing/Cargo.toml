@@ -32,5 +32,17 @@ rmp-serde = { workspace = true }
 name = "phase1"
 path = "tests/integration/phase1.rs"
 
+[[test]]
+name = "persistence"
+path = "tests/integration/persistence.rs"
+
+[[test]]
+name = "persistence_advanced"
+path = "tests/integration/persistence_advanced.rs"
+
+[[test]]
+name = "protocol_store"
+path = "tests/integration/protocol_store.rs"
+
 [lints]
 workspace = true
