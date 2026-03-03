@@ -3989,4 +3989,35 @@ mod tests {
             "blocked subscriber should receive Deny decision"
         );
     }
+
+    /// #234: DID validation runs before context lookup. When a non-local DID
+    /// is used AND the context doesn't exist, the result is `PermissionDenied`
+    /// (not `MembershipFailed` or "context not registered"). This documents
+    /// the intentional fail-closed ordering: unauthenticated callers cannot
+    /// probe for context existence.
+    #[tokio::test]
+    async fn handle_broadcast_key_request_rejects_non_local_did_before_context_lookup() {
+        // Create a manager but don't create any contexts.
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        // Neither the author DID nor the context exist.
+        let result = manager
+            .handle_broadcast_key_request(
+                "nonexistent-context",
+                &"did:key:unregistered-author".into(),
+                &"did:key:some-requester".into(),
+            )
+            .await;
+
+        assert!(result.is_err(), "should reject non-local author DID");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(_)),
+            "should be PermissionDenied (DID check), not MembershipFailed (context lookup): {err}"
+        );
+    }
 }
