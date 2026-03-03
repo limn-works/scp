@@ -87,12 +87,14 @@ pub struct RelayConfig {
     pub delivery_jitter_ms: u64,
     /// Optional shared secret for authenticating internal bridge connections.
     ///
-    /// When set, the relay rejects any WebSocket upgrade whose URI does not
-    /// include a `token` query parameter matching this value (hex-encoded,
-    /// constant-time comparison). Used by [`ApplicationNode`] to prevent
-    /// unauthorized connections to the internal relay port.
+    /// When set, the relay rejects any WebSocket upgrade whose
+    /// `Authorization: Bearer <hex>` header does not match this value
+    /// (hex-encoded, constant-time comparison). Used by
+    /// [`ApplicationNode`] to prevent unauthorized connections to the
+    /// internal relay port.
     ///
-    /// See GitHub issue #85 for the threat model.
+    /// See GitHub issue #85 for the threat model and #225 for the
+    /// migration from query parameter to header.
     pub bridge_secret: Option<[u8; 32]>,
     /// Whether this relay supports the BRIDGE operation for symmetric NAT
     /// fallback (spec section 10.12.4). When `true`, the relay accepts
@@ -549,11 +551,14 @@ async fn check_publish_rate_limit(
 
 /// Callback for `accept_hdr_async` that validates the bridge secret.
 ///
-/// Extracts the `token` query parameter from the WebSocket upgrade URI,
+/// Extracts the token from the `Authorization: Bearer <hex>` header,
 /// hex-decodes it, and performs a constant-time comparison against the
 /// expected secret. Returns HTTP 403 on mismatch or missing token.
 ///
-/// The token is never included in error messages or logs to prevent leakage.
+/// The token is transmitted via HTTP header rather than query parameter
+/// to prevent leakage through server logs, error messages, or debug
+/// output (#225). The token value is never included in error messages
+/// or logs.
 struct BridgeSecretCallback {
     expected: [u8; 32],
 }
@@ -562,17 +567,16 @@ impl Callback for BridgeSecretCallback {
     fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
         use tokio_tungstenite::tungstenite::http::StatusCode;
 
-        let uri = request.uri();
-        let query = uri.query().unwrap_or("");
+        // Extract the `Authorization: Bearer <hex>` header.
+        let auth_header = request
+            .headers()
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok());
 
-        // Parse the `token` parameter from the query string.
-        let provided_token = query.split('&').find_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            if key == "token" { Some(value) } else { None }
-        });
+        let hex_token = auth_header.and_then(|v| v.strip_prefix("Bearer "));
 
-        let Some(hex_token) = provided_token else {
-            tracing::warn!("bridge connection rejected: missing token");
+        let Some(hex_token) = hex_token else {
+            tracing::warn!("bridge connection rejected: missing or malformed Authorization header");
             let mut err = ErrorResponse::new(None);
             *err.status_mut() = StatusCode::FORBIDDEN;
             return Err(err);
@@ -642,9 +646,10 @@ pub fn hex_encode_32(bytes: &[u8; 32]) -> String {
 /// Handles a single WebSocket connection.
 ///
 /// When `config.bridge_secret` is set, the WebSocket upgrade request must
-/// include a `token` query parameter whose hex-decoded value matches the
-/// secret (constant-time comparison). Connections without a valid token are
-/// rejected during the handshake — no protocol messages are exchanged.
+/// include an `Authorization: Bearer <hex>` header whose hex-decoded value
+/// matches the secret (constant-time comparison). Connections without a
+/// valid token are rejected during the handshake — no protocol messages
+/// are exchanged.
 // Relay handler passes through connection state; bundling into a struct
 // would add allocation overhead per-message with no readability gain.
 #[allow(clippy::too_many_arguments)]
