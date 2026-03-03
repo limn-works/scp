@@ -125,6 +125,16 @@
 - Attestation renewal: mandatory re-verification before renewed_at update, SOUND
 - MessageType::as_discriminator_byte() exists but NOT used in compute_canonical_hash -- docstring misleading
 
+### Bridge Relay Auth + DID Healing (PR #255, SCP-247/SCP-245)
+- Bridge auth: "SCP-BRIDGE-REGISTER-V1:" || routing_id[32] || be-u64(timestamp) = 63B fixed, SOUND
+- verify_strict() used, verification order: timestamp->sig->routing_id (fast-reject)
+- Routing ID: SHA-256("scp:did:" || did_string) -- domain-separated, golden vector verified
+- DID derivation: did:dht:z + zbase32(pubkey) -- deterministic, invertible
+- 60s replay window, no nonce tracking -- acceptable (idempotent registration)
+- DualLayerResolver: tokio::join!, BEP44 verify_strict on both layers, anti-rollback via cached seq
+- Healing: async best-effort republish to stale layer, panic-monitored
+- PRE-EXISTING: migration proof hash (dht.rs:607) has var-length concat ambiguity (old_did||new_did)
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs
@@ -152,3 +162,7 @@
 - `bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/` -- Android adapters
 - `crates/scp-core/src/envelope/pseudonym.rs` -- pseudonym derivation spec (delegates to KeyCustody)
 - `crates/scp-platform/src/testing/key_custody.rs` -- InMemoryKeyCustody reference impl + golden vectors
+- `crates/scp-transport/src/relay/bridge.rs` -- bridge auth, SCP-BRIDGE-REGISTER-V1 domain separator
+- `crates/scp-identity/src/resolver.rs` -- DualLayerResolver, healing publisher, anti-rollback
+- `crates/scp-identity/src/resolution.rs` -- did_routing_id(), relay-based resolution
+- `crates/scp-identity/src/dht.rs` -- DidDht, BEP44, did_from_ed25519_public_key, migration proofs

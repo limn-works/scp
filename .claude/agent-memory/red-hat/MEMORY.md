@@ -29,6 +29,24 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **Wildcard prefix matching**: `starts_with` on context_id without delimiter allows cross-context access for IDs sharing a prefix.
 - **"Caller is responsible" pattern**: Still present from PR #76. claim_shadow, upgrade_shadow_role defer sig verification.
 
+## PR #255 Reachability Assessment (2026-03-03)
+- **RED-204 (HIGH)**: BRIDGE_REGISTER replay within 60s window. No nonce/connection binding. Fix: add nonce to signed payload.
+- **RED-206 (MEDIUM)**: No debounce on tier re-evaluation. NetworkChangeDetector flooding causes STUN/DID publish storm.
+- **RED-208 (MEDIUM)**: apply_tier_change publishes DID without verifying new URL reachability.
+- **RED-201/202 (MEDIUM)**: STUN spoofing (on-path). Known limitation. 96-bit txn ID protects remote.
+- Controls that hold: Ed25519 verify_strict bridge auth, TOCTOU-safe BridgeRegistry, anti-rollback cached_seq, healing fresher-wins.
+
+## Key Attack Patterns for This Codebase
+- **Bridge parity gap**: WASM bridge cannot depend on scp-core (tokio incompatibility), so it re-implements validation partially. ALWAYS check WASM bridge when core validation changes.
+- **Two UcanToken types**: `roles::UcanToken` (stub, no sig/expiry) vs `crypto::ucan::UcanToken` (full, has sig/encoded). Broadcast uses the stub. Any code accepting the stub has no sig verification.
+- **CID computation divergence**: `compute_cid` (JWT hash + bafyrei prefix) vs `compute_revocation_cid` (payload JSON hash, hex). PyO3/UniFFI use `compute_cid` for proofs (correct); NAPI uses `compute_revocation_cid` (wrong). Cross-bridge delegation chains break.
+- **Zero-signature tokens**: NAPI and UniFFI bridges mint `[0u8; 64]` placeholder sigs. These pass structural parsing but fail Ed25519 verification.
+- **SSE broadcast model**: All SSE clients receive all responses. No per-session isolation.
+- **Wildcard prefix matching**: `starts_with` on context_id without delimiter allows cross-context access for IDs sharing a prefix.
+- **"Caller is responsible" pattern**: Still present from PR #76. claim_shadow, upgrade_shadow_role defer sig verification.
+- **Replay without nonce**: BRIDGE_REGISTER uses timestamp-only replay protection (60s window). No nonce, no connection binding. Captured frames are replayable within window.
+- **Unbounded event-driven loops**: tier re-evaluation loop has no debounce. Any channel sender can trigger unlimited STUN probes + DID publishes.
+
 ## Critical Files
 - `crates/scp-ffi/wasm/src/ucan.rs` -- Missing 5 validation steps (RED-101), wildcard bypass (RED-105)
 - `crates/scp-core/src/context/broadcast.rs` -- Stub UcanToken no sig (RED-103), block doesn't remove (RED-108)
@@ -36,3 +54,5 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - `crates/scp-ffi/napi/src/ucan.rs` -- Zero-sig mint (RED-102), wrong proof CID function (RED-111)
 - `crates/scp-mcp/src/sse.rs` -- No auth (RED-107), notification confusion (RED-106)
 - `crates/scp-core/src/discovery/handles.rs` -- Context target squatting (RED-109)
+- `crates/scp-transport/src/relay/bridge.rs` -- Replay within 60s window (RED-204)
+- `crates/scp-node/src/lib.rs` -- No debounce on re-eval loop (RED-206), no post-change self-test (RED-208)
