@@ -33,6 +33,8 @@ pub(crate) mod client;
 pub mod error;
 pub mod protocol;
 pub mod server;
+#[cfg(feature = "sqlite-blob")]
+pub mod sqlite_blob;
 pub mod storage;
 
 // Re-export primary types for convenience.

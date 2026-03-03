@@ -60,6 +60,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 subtle = "2"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+redb = "2"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
