@@ -181,7 +181,7 @@ DID resolution is the trust root for the entire protocol. If resolution can be M
 
 ## 3.9 Key Lifecycle
 
-Identity keys follow a defined lifecycle: generation (in hardware security modules where available), distribution (via DID document publication), rotation (DID document update with authorization chain from old key), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4 and §9.12.
+Identity keys follow a defined lifecycle: generation (in hardware security modules where available), distribution (via DID document publication), rotation (DID document update with authorization chain from old key), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4.
 
 ## 3.10 DID Resolution Layers
 
