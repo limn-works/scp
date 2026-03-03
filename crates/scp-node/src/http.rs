@@ -299,11 +299,9 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
     /// SCP routes take precedence for `/.well-known/scp`, `/scp/v1`, and
     /// `/scp/broadcast/*`. All other paths route to `app_router`.
     ///
-    /// The `shutdown` future is awaited for graceful shutdown: when it
-    /// completes, the server stops accepting new connections and drains
-    /// in-flight requests. Callers should also call
-    /// [`ApplicationNode::shutdown`] after `serve` returns to stop the
-    /// internal relay server.
+    /// This method consumes the node. Callers that need to retain access
+    /// to the relay's [`ShutdownHandle`] should extract it before calling
+    /// `serve` (via [`ApplicationNode::relay`]).
     ///
     /// When the dev API is configured (via [`ApplicationNodeBuilder::local_api`]),
     /// a separate tokio task is spawned to serve the dev API on the configured
@@ -317,11 +315,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
     ///
     /// Returns [`NodeError::Serve`] if the server cannot bind or encounters
     /// a fatal I/O error.
-    pub async fn serve(
-        &self,
-        app_router: Router,
-        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Result<(), NodeError> {
+    pub async fn serve(self, app_router: Router) -> Result<(), NodeError> {
         let well_known = self.well_known_router();
         let relay = self.relay_router();
         let projection = self.broadcast_projection_router();
@@ -378,7 +372,6 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
         );
 
         axum::serve(listener, merged)
-            .with_graceful_shutdown(shutdown)
             .await
             .map_err(|e| NodeError::Serve(e.to_string()))?;
 

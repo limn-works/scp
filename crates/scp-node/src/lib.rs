@@ -35,8 +35,16 @@ pub use projection::ProjectedContext;
 
 /// Default bind address for the public HTTP server (`0.0.0.0:8443`).
 ///
+/// This binds to **all network interfaces** (`0.0.0.0`), which is
+/// appropriate for public-facing deployments where the node must be
+/// reachable from external clients.
+///
 /// Port 8443 is the standard unprivileged HTTPS alternative port, avoiding
 /// the need for root/elevated privileges required by port 443.
+///
+/// For development or internal-only deployments, use `127.0.0.1` (loopback
+/// only) via [`ApplicationNodeBuilder::http_bind_addr`] to avoid exposing
+/// the server to the network.
 pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8443);
 
