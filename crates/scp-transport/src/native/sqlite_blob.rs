@@ -19,6 +19,11 @@ use super::storage::{BlobStorage, ClockFn, StorageError, StoredBlob, system_cloc
 
 /// `SQLite`-backed blob storage for relay-side encrypted message blobs.
 ///
+/// No at-rest encryption is applied because relay blob stores contain
+/// already-encrypted data (MLS ciphertexts or broadcast AES-256-GCM
+/// payloads). Operators who want at-rest encryption can use
+/// filesystem-level encryption (e.g., LUKS, FileVault).
+///
 /// Schema per spec section 17.7:
 ///
 /// ```sql
@@ -101,6 +106,11 @@ impl SqliteBlobStore {
 
     /// Initializes the connection with WAL mode and schema.
     fn init_connection(conn: Connection, clock: ClockFn) -> Result<Self, StorageError> {
+        // PRAGMA synchronous = NORMAL with WAL mode: the last transaction
+        // before a power failure may be lost, but the database will not be
+        // corrupted. This is acceptable for relay blob storage because
+        // messages can always be retransmitted by senders. The performance
+        // benefit (fewer fsyncs) outweighs the minor durability trade-off.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;",
@@ -188,14 +198,26 @@ impl BlobStorage for SqliteBlobStore {
             let stored_at: u64 = row.get(3)?;
             let blob: Vec<u8> = row.get(4)?;
 
-            let mut routing_id = [0u8; 32];
-            routing_id.copy_from_slice(&routing_id_vec);
+            let routing_id: [u8; 32] =
+                routing_id_vec.as_slice().try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "routing_id".to_owned(),
+                        rusqlite::types::Type::Blob,
+                    )
+                })?;
 
-            let recipient_hint = hint_opt.map(|h| {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&h);
-                arr
-            });
+            let recipient_hint = hint_opt
+                .map(|h| -> Result<[u8; 32], rusqlite::Error> {
+                    h.as_slice().try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            1,
+                            "recipient_hint".to_owned(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })
+                })
+                .transpose()?;
 
             Ok(StoredBlob {
                 routing_id,
@@ -245,14 +267,26 @@ impl BlobStorage for SqliteBlobStore {
                     let stored_at: u64 = row.get(3)?;
                     let blob: Vec<u8> = row.get(4)?;
 
-                    let mut blob_id = [0u8; 32];
-                    blob_id.copy_from_slice(&blob_id_vec);
+                    let blob_id: [u8; 32] =
+                        blob_id_vec.as_slice().try_into().map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                0,
+                                "blob_id".to_owned(),
+                                rusqlite::types::Type::Blob,
+                            )
+                        })?;
 
-                    let recipient_hint = hint_opt.map(|h| {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&h);
-                        arr
-                    });
+                    let recipient_hint = hint_opt
+                        .map(|h| -> Result<[u8; 32], rusqlite::Error> {
+                            h.as_slice().try_into().map_err(|_| {
+                                rusqlite::Error::InvalidColumnType(
+                                    1,
+                                    "recipient_hint".to_owned(),
+                                    rusqlite::types::Type::Blob,
+                                )
+                            })
+                        })
+                        .transpose()?;
 
                     Ok(StoredBlob {
                         routing_id: *routing_id,

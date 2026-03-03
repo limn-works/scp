@@ -10,6 +10,9 @@
 //!   implementations (spec section 19.2.6).
 //! - [`storage_conformance!`] — 13 tests for [`Storage`](scp_platform::Storage)
 //!   implementations (spec sections 17.11, 17.13).
+//! - [`blob_store_conformance!`] — 11 tests for
+//!   [`BlobStorage`](scp_transport::native::storage::BlobStorage)
+//!   implementations (spec sections 17.11, 17.13).
 //!
 //! # Integration tests
 //!

@@ -10,8 +10,11 @@ use scp_platform::filesystem::FilesystemStorage;
 
 fn make_filesystem_storage() -> FilesystemStorage {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    // Keep the tempdir so it lives for the duration of the test.
-    let dir_path = dir.keep();
+    let dir_path = dir.path().to_path_buf();
+    // Leak the TempDir so it outlives the test — the directory must remain
+    // on disk while storage operations run. Cleanup is not critical for test
+    // directories; the OS reclaims on process exit.
+    let _ = Box::leak(Box::new(dir));
     FilesystemStorage::new(&dir_path).expect("FilesystemStorage::new should succeed")
 }
 

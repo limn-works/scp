@@ -34,8 +34,7 @@ const ROUTING_TABLE: MultimapTableDefinition<&[u8; 32], &[u8; 32]> =
 struct SerializedBlob {
     routing_id: [u8; 32],
     blob_id: [u8; 32],
-    #[serde(with = "serde_bytes")]
-    recipient_hint: Option<Vec<u8>>,
+    recipient_hint: Option<[u8; 32]>,
     blob_ttl: u32,
     stored_at: u64,
     expires_at: u64,
@@ -44,17 +43,16 @@ struct SerializedBlob {
 }
 
 impl SerializedBlob {
-    /// Converts to a [`StoredBlob`], extracting the recipient hint array.
+    /// Converts to a [`StoredBlob`].
+    ///
+    /// `recipient_hint` is `Option<[u8; 32]>` in both types, so no manual
+    /// conversion is needed — serde validates the length at deserialization
+    /// time.
     fn to_stored_blob(&self) -> StoredBlob {
-        let recipient_hint = self.recipient_hint.as_ref().map(|h| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(h);
-            arr
-        });
         StoredBlob {
             routing_id: self.routing_id,
             blob_id: self.blob_id,
-            recipient_hint,
+            recipient_hint: self.recipient_hint,
             blob_ttl: self.blob_ttl,
             stored_at: self.stored_at,
             blob: self.blob.clone(),
@@ -171,7 +169,7 @@ impl BlobStorage for RedbBlobStore {
         let entry = SerializedBlob {
             routing_id,
             blob_id,
-            recipient_hint: recipient_hint.map(|h| h.to_vec()),
+            recipient_hint,
             blob_ttl,
             stored_at,
             expires_at,

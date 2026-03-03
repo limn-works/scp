@@ -351,6 +351,27 @@ macro_rules! blob_store_conformance {
                     purge_result.is_ok(),
                     "purge_expired should succeed during concurrent stores"
                 );
+
+                // Verify that the newly stored blobs (stored after clock
+                // advance, with long TTL) are still retrievable — purge must
+                // not have corrupted them.
+                for i in 10u8..15 {
+                    let data = vec![i; 10];
+                    let blob_id = sha256_blob_id(&data);
+                    let result = store
+                        .get(&blob_id)
+                        .await
+                        .expect("get should succeed after concurrent purge");
+                    assert!(
+                        result.is_some(),
+                        "newly stored blob {i} should survive concurrent purge"
+                    );
+                    assert_eq!(
+                        result.unwrap().blob,
+                        data,
+                        "blob {i} content should be intact after concurrent purge"
+                    );
+                }
             }
 
             #[tokio::test]
