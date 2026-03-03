@@ -57,7 +57,6 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
-use sha2::{Digest, Sha256};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
@@ -81,12 +80,8 @@ const MAX_REGISTRATIONS_PER_CONNECTION: usize = 64;
 /// allowing reasonable clock drift between peers (SCP-247).
 const BRIDGE_REGISTER_REPLAY_WINDOW_SECS: u64 = 60;
 
-/// Domain separator for DID routing IDs (same as §3.10.2 in scp-identity).
-///
-/// This is intentionally duplicated from `scp-identity::resolution` to avoid
-/// adding a cross-crate dependency. The value MUST match
-/// `scp_identity::resolution::DID_ROUTING_DOMAIN_SEPARATOR`.
-const DID_ROUTING_DOMAIN_SEPARATOR: &[u8] = b"scp:did:";
+// Identity functions imported from scp-identity to avoid cross-crate duplication.
+use scp_identity::{did_from_ed25519_public_key, resolution::did_routing_id};
 
 // ---------------------------------------------------------------------------
 // BridgeRequest — wire-level operation type
@@ -124,7 +119,8 @@ pub struct BridgeRequest {
 ///
 /// The registration MUST include an Ed25519 signature proving the sender
 /// owns the DID that maps to the claimed `routing_id`. The signature
-/// covers `routing_id || timestamp` (concatenated bytes).
+/// covers `"SCP-BRIDGE-REGISTER-V1:" || routing_id || timestamp`
+/// (domain-separated payload, 23 + 32 + 8 = 63 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeRegistration {
     /// The routing ID this self-hosted relay is responsible for.
@@ -135,8 +131,9 @@ pub struct BridgeRegistration {
     /// `SHA-256("scp:did:" || did_string) == routing_id`.
     pub public_key: [u8; 32],
 
-    /// Ed25519 signature over `routing_id || timestamp` (64 bytes).
-    /// Proves the sender holds the private key corresponding to `public_key`.
+    /// Ed25519 signature over `"SCP-BRIDGE-REGISTER-V1:" || routing_id || timestamp`
+    /// (64 bytes). Proves the sender holds the private key corresponding to
+    /// `public_key`. The domain separator prevents cross-protocol signature confusion.
     pub signature: [u8; 64],
 
     /// Unix timestamp (seconds since epoch) included in the signed payload.
@@ -148,24 +145,6 @@ pub struct BridgeRegistration {
 // ---------------------------------------------------------------------------
 // Authentication helpers (SCP-247)
 // ---------------------------------------------------------------------------
-
-/// Derives a `did:dht:z...` string from a raw Ed25519 public key.
-///
-/// Uses z-base-32 encoding per the did:dht method specification:
-/// `did:dht:z` + zbase32-encode(public_key_bytes).
-fn did_from_ed25519_public_key(public_key: &[u8; 32]) -> String {
-    format!("did:dht:z{}", zbase32::encode(public_key))
-}
-
-/// Computes the DID routing ID: `SHA-256("scp:did:" || did_string)`.
-///
-/// This matches `scp_identity::resolution::did_routing_id` (§3.10.2).
-fn compute_did_routing_id(did_string: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(DID_ROUTING_DOMAIN_SEPARATOR);
-    hasher.update(did_string.as_bytes());
-    hasher.finalize().into()
-}
 
 /// Domain separator prefix for `BRIDGE_REGISTER` signable payloads.
 ///
@@ -275,7 +254,7 @@ pub fn verify_bridge_registration(
 
     // Step 3: Verify routing_id == SHA-256("scp:did:" || did_string).
     let did_string = did_from_ed25519_public_key(&registration.public_key);
-    let derived_routing_id = compute_did_routing_id(&did_string);
+    let derived_routing_id = did_routing_id(&did_string);
     if derived_routing_id != registration.routing_id {
         return Err(BridgeAuthError::RoutingIdMismatch {
             claimed: registration.routing_id,
@@ -735,7 +714,7 @@ mod tests {
     fn make_registration(signing_key: &SigningKey, timestamp: u64) -> BridgeRegistration {
         let public_key = signing_key.verifying_key().to_bytes();
         let did_string = did_from_ed25519_public_key(&public_key);
-        let routing_id = compute_did_routing_id(&did_string);
+        let routing_id = did_routing_id(&did_string);
         let signable = bridge_register_signable(&routing_id, timestamp);
         let signature = signing_key.sign(&signable);
         BridgeRegistration {
@@ -948,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_did_routing_id_matches_identity_crate() {
+    fn did_routing_id_matches_identity_crate() {
         // Verify our local computation matches the canonical derivation.
         let did = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
         let expected: [u8; 32] = [
@@ -956,7 +935,7 @@ mod tests {
             0xd8, 0xdf, 0x2b, 0x55, 0x38, 0x10, 0x92, 0xf6, 0x23, 0x96, 0xdb, 0x81, 0x1e, 0xd5,
             0xe2, 0x5f, 0xf7, 0x1b,
         ];
-        assert_eq!(compute_did_routing_id(did), expected);
+        assert_eq!(did_routing_id(did), expected);
     }
 
     // -- BridgeRegistry with authentication --

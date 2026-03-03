@@ -1041,6 +1041,19 @@ pub fn verify_bep44_signature(
     })
 }
 
+/// Derives the `did:dht:z...` string from a raw Ed25519 public key.
+///
+/// Encodes the 32-byte public key as z-base-32 and prepends the `did:dht:z`
+/// prefix per the did:dht method specification. This is the inverse of
+/// [`extract_public_key`].
+///
+/// Used by bridge authentication (SCP-247) to verify that a claimed
+/// `routing_id` corresponds to the DID derived from the provided public key.
+#[must_use]
+pub fn did_from_ed25519_public_key(public_key: &[u8; 32]) -> String {
+    format!("{DID_DHT_PREFIX}z{}", zbase32::encode(public_key))
+}
+
 /// Extracts the 32-byte Ed25519 public key from a `did:dht:z...` string.
 ///
 /// Strips the `did:dht:z` prefix and z-base-32 decodes the remainder to recover
