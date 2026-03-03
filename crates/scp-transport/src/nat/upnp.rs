@@ -118,11 +118,15 @@ pub enum PortMappingError {
 // NatTierChange
 // ---------------------------------------------------------------------------
 
-/// Events emitted by the [`PortMappingManager`] when the NAT mapping state changes.
+/// Events emitted when the NAT mapping or reachability tier state changes.
 ///
 /// Consumers should listen for these events to update the relay's advertised
 /// address in the DID document (spec 10.12.2: "Mapping loss triggers immediate
 /// DID document update if the tier changes").
+///
+/// The `TierChanged` variant is emitted by the periodic re-evaluation loop
+/// (spec 10.12.1, SCP-243) when the reachability tier changes during a
+/// 30-minute re-evaluation cycle or on a network change event.
 #[derive(Debug, Clone)]
 pub enum NatTierChange {
     /// A port mapping was successfully acquired.
@@ -139,6 +143,20 @@ pub enum NatTierChange {
 
     /// A port mapping lease was successfully renewed.
     MappingRenewed(PortMappingResult),
+
+    /// The reachability tier changed during periodic re-evaluation (§10.12.1,
+    /// SCP-243). The `previous_relay_url` is the URL that was previously
+    /// published in the DID document. The `new_relay_url` is the URL that
+    /// should replace it. The `reason` describes what triggered the change
+    /// (periodic 30-minute cycle or network change event).
+    TierChanged {
+        /// The relay URL previously published in the DID document.
+        previous_relay_url: String,
+        /// The new relay URL to publish.
+        new_relay_url: String,
+        /// Human-readable reason for the tier change.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

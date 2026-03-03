@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 x509-parser = "0.16"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }

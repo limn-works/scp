@@ -19,10 +19,12 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use scp_identity::document::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
+use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::BlobStorageBackend;
 use tokio_util::sync::CancellationToken;
@@ -198,6 +200,11 @@ pub struct ApplicationNode<S: Storage> {
     storage: Arc<S>,
     /// Shared state for HTTP handlers (`.well-known/scp`, relay bridge).
     state: Arc<http::NodeState>,
+    /// Handle to the periodic tier re-evaluation background task (§10.12.1, SCP-243).
+    /// `None` in domain mode with successful TLS (Tier 4 doesn't need NAT re-eval).
+    tier_reeval: Option<TierReEvalHandle>,
+    /// Channel for tier change events (§10.12.1, SCP-243).
+    tier_change_rx: Option<tokio::sync::mpsc::Receiver<NatTierChange>>,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -207,6 +214,10 @@ impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
             .field("relay", &self.relay)
             .field("identity", &self.identity)
             .field("storage", &"<Storage>")
+            .field(
+                "tier_reeval",
+                &self.tier_reeval.as_ref().map(|_| "<active>"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -329,7 +340,8 @@ impl<S: Storage> ApplicationNode<S> {
         self.state.dev_token.as_deref()
     }
 
-    /// Gracefully shuts down the node.
+    /// Gracefully shuts down the relay server and the tier re-evaluation
+    /// background task (§10.12.1, SCP-243).
     ///
     /// Signals the relay server, the public HTTPS listener, and the dev API
     /// listener (if running) to stop accepting new connections. In-flight
@@ -340,6 +352,21 @@ impl<S: Storage> ApplicationNode<S> {
     pub fn shutdown(&self) {
         self.relay.shutdown_handle.shutdown();
         self.state.shutdown_token.cancel();
+        if let Some(ref handle) = self.tier_reeval {
+            handle.stop();
+        }
+    }
+
+    /// Returns a mutable reference to the tier change event receiver
+    /// (§10.12.1, SCP-243).
+    ///
+    /// The receiver yields [`NatTierChange::TierChanged`] events when the
+    /// periodic re-evaluation loop detects a tier change. Returns `None`
+    /// if the node is in domain mode with successful TLS (Tier 4).
+    pub const fn tier_change_rx(
+        &mut self,
+    ) -> Option<&mut tokio::sync::mpsc::Receiver<NatTierChange>> {
+        self.tier_change_rx.as_mut()
     }
 
     /// Maximum number of simultaneously projected broadcast contexts per node.
@@ -518,22 +545,139 @@ const DEFAULT_STUN_ENDPOINTS: &[(&str, &str)] = &[
 
 /// Default NAT strategy using real STUN probing, `UPnP`, and bridge relay.
 ///
-/// Uses [`NatProber`](scp_transport::nat::NatProber) for STUN probing and
-/// [`PortMappingManager`](scp_transport::nat::PortMappingManager) for `UPnP`.
+/// Implements the tier selection algorithm from spec 10.12.8:
+/// 1. Probe NAT type via STUN.
+/// 2. Attempt Tier 1 (UPnP/NAT-PMP) if a [`PortMapper`] is configured.
+///    Run reachability self-test on the mapped address (spec 10.12.2 step 4).
+/// 3. If Tier 1 fails and NAT is non-symmetric, attempt Tier 2 (STUN address).
+///    Run reachability self-test on the STUN-discovered address (spec 10.12.3).
+/// 4. If Tier 2 fails or NAT is symmetric, attempt Tier 3 (bridge relay).
+///
+/// The reachability self-test (SCP-242) sends a STUN Binding Request from the
+/// SAME socket that holds the NAT mapping to a STUN server intermediary. If
+/// the server confirms the expected external address, the mapping is valid.
+///
+/// Uses [`NatProber`](scp_transport::nat::NatProber) for STUN probing,
+/// [`PortMapper`](scp_transport::nat::PortMapper) for `UPnP`, and
+/// [`ReachabilityProbe`](scp_transport::nat::ReachabilityProbe) for self-test.
 pub struct DefaultNatStrategy {
     /// STUN server URL override (if set via `.stun_server()`).
     stun_server: Option<String>,
     /// Bridge relay URL override (if set via `.bridge_relay()`).
     bridge_relay: Option<String>,
+    /// Optional UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
+    port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
+    /// Optional reachability probe for self-test (spec 10.12.2 step 4, SCP-242).
+    /// If `None`, a [`DefaultReachabilityProbe`](scp_transport::nat::DefaultReachabilityProbe)
+    /// is constructed from the first STUN endpoint.
+    reachability_probe: Option<Arc<dyn scp_transport::nat::ReachabilityProbe>>,
 }
 
 impl DefaultNatStrategy {
     /// Creates a new default NAT strategy with optional overrides.
     #[must_use]
-    pub const fn new(stun_server: Option<String>, bridge_relay: Option<String>) -> Self {
+    pub fn new(stun_server: Option<String>, bridge_relay: Option<String>) -> Self {
         Self {
             stun_server,
             bridge_relay,
+            port_mapper: None,
+            reachability_probe: None,
+        }
+    }
+
+    /// Sets the UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
+    #[must_use]
+    pub fn with_port_mapper(mut self, mapper: Arc<dyn scp_transport::nat::PortMapper>) -> Self {
+        self.port_mapper = Some(mapper);
+        self
+    }
+
+    /// Sets the reachability probe for self-test verification (SCP-242).
+    ///
+    /// If not set, a [`DefaultReachabilityProbe`](scp_transport::nat::DefaultReachabilityProbe)
+    /// is constructed from the first STUN endpoint at probe time.
+    #[must_use]
+    pub fn with_reachability_probe(
+        mut self,
+        probe: Arc<dyn scp_transport::nat::ReachabilityProbe>,
+    ) -> Self {
+        self.reachability_probe = Some(probe);
+        self
+    }
+
+    /// Builds the STUN endpoint list from configuration.
+    fn build_stun_endpoints(&self) -> Result<Vec<scp_transport::nat::StunEndpoint>, NodeError> {
+        use scp_transport::nat::StunEndpoint;
+        if let Some(ref override_url) = self.stun_server {
+            let addr: SocketAddr = override_url.parse().map_err(|e| {
+                NodeError::Nat(format!("invalid STUN server address '{override_url}': {e}"))
+            })?;
+            Ok(vec![StunEndpoint {
+                addr,
+                label: override_url.clone(),
+            }])
+        } else {
+            Ok(DEFAULT_STUN_ENDPOINTS
+                .iter()
+                .map(|(addr_str, label)| {
+                    // SAFETY: DEFAULT_STUN_ENDPOINTS are compile-time string literals
+                    // verified by the `default_stun_endpoints_parseable` unit test.
+                    #[allow(clippy::expect_used)]
+                    let addr: SocketAddr = addr_str
+                        .parse()
+                        .expect("DEFAULT_STUN_ENDPOINTS contains valid SocketAddr literals");
+                    StunEndpoint {
+                        addr,
+                        label: (*label).to_owned(),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    /// Attempts Tier 1 `UPnP`/NAT-PMP port mapping with reachability self-test.
+    ///
+    /// Returns `Some(ReachabilityTier::Upnp)` if mapping and self-test both
+    /// succeed, `None` if either fails (caller should fall through to Tier 2).
+    async fn try_tier1_upnp(
+        &self,
+        relay_port: u16,
+        socket: &tokio::net::UdpSocket,
+        probe: &dyn scp_transport::nat::ReachabilityProbe,
+    ) -> Option<ReachabilityTier> {
+        let mapper = self.port_mapper.as_ref()?;
+        tracing::info!("attempting Tier 1 UPnP/NAT-PMP port mapping");
+        match mapper.map_port(relay_port).await {
+            Ok(mapping) => {
+                tracing::info!(
+                    protocol = %mapping.protocol,
+                    external_addr = %mapping.external_addr,
+                    "UPnP port mapping acquired, running reachability self-test"
+                );
+                let reachable = probe
+                    .probe_reachability(socket, mapping.external_addr)
+                    .await
+                    .unwrap_or(false);
+
+                if reachable {
+                    tracing::info!(
+                        external_addr = %mapping.external_addr,
+                        "Tier 1 reachability self-test passed"
+                    );
+                    return Some(ReachabilityTier::Upnp {
+                        external_addr: mapping.external_addr,
+                    });
+                }
+                tracing::warn!("Tier 1 reachability self-test failed, falling through to Tier 2");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "UPnP port mapping failed, falling through to Tier 2"
+                );
+                None
+            }
         }
     }
 }
@@ -541,48 +685,39 @@ impl DefaultNatStrategy {
 impl NatStrategy for DefaultNatStrategy {
     fn select_tier(
         &self,
-        _relay_port: u16,
+        relay_port: u16,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
     > {
         Box::pin(async move {
-            use scp_transport::nat::{NatProber, StunEndpoint};
+            use scp_transport::nat::{DefaultReachabilityProbe, NatProber, ReachabilityProbe};
 
             // Step 1: Build STUN endpoint list.
-            let endpoints: Vec<StunEndpoint> = if let Some(ref override_url) = self.stun_server {
-                // User-provided override: single endpoint.
-                let addr: SocketAddr = override_url.parse().map_err(|e| {
-                    NodeError::Nat(format!("invalid STUN server address '{override_url}': {e}"))
-                })?;
-                vec![StunEndpoint {
-                    addr,
-                    label: override_url.clone(),
-                }]
+            let endpoints = self.build_stun_endpoints()?;
+
+            // Resolve or construct the reachability probe for self-test.
+            // Uses the first STUN endpoint as intermediary if no explicit probe
+            // is configured (SCP-242 AC5: self-test via known relay intermediary).
+            let probe: Arc<dyn ReachabilityProbe> = if let Some(ref p) = self.reachability_probe {
+                Arc::clone(p)
             } else {
-                // Default: two pre-resolved endpoints for NAT classification.
-                DEFAULT_STUN_ENDPOINTS
-                    .iter()
-                    .map(|(addr_str, label)| {
-                        // SAFETY: DEFAULT_STUN_ENDPOINTS are compile-time string literals
-                        // verified by the `default_stun_endpoints_parseable` unit test.
-                        #[allow(clippy::expect_used)]
-                        let addr: SocketAddr = addr_str
-                            .parse()
-                            .expect("DEFAULT_STUN_ENDPOINTS contains valid SocketAddr literals");
-                        StunEndpoint {
-                            addr,
-                            label: (*label).to_owned(),
-                        }
-                    })
-                    .collect()
+                Arc::new(DefaultReachabilityProbe::new(endpoints[0].addr, None))
             };
+
+            // Bind a UDP socket for NAT probing. This socket is reused for
+            // the reachability self-test so the NAT mapping is preserved.
+            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| {
+                    NodeError::Nat(format!("failed to bind UDP socket for NAT probing: {e}"))
+                })?;
 
             let prober = NatProber::new(endpoints, None)
                 .map_err(|e| NodeError::Nat(format!("failed to create NAT prober: {e}")))?;
 
-            // Step 2: Probe NAT type.
+            // Step 2: Probe NAT type using the shared socket.
             let probe_result = prober
-                .probe()
+                .probe_with_socket(&socket)
                 .await
                 .map_err(|e| NodeError::Nat(format!("NAT probing failed: {e}")))?;
 
@@ -592,17 +727,34 @@ impl NatStrategy for DefaultNatStrategy {
                 "NAT type probed"
             );
 
-            // Step 3: Attempt Tier 1 (UPnP) — requires real UPnP gateway discovery.
-            // UPnP is best-effort; failure falls through to Tier 2.
-            // Full UPnP integration requires `PortMappingManager` with real mappers.
-            // For now, the DefaultNatStrategy attempts STUN-based tiers.
-            // UPnP can be added when production PortMapper impls exist.
+            // Step 3: Attempt Tier 1 (UPnP/NAT-PMP) — spec 10.12.2.
+            if let Some(tier) = self.try_tier1_upnp(relay_port, &socket, &*probe).await {
+                return Ok(tier);
+            }
 
-            // Step 4: For non-symmetric NAT, use Tier 2 (STUN address).
+            // Step 4: For non-symmetric NAT, attempt Tier 2 (STUN address).
+            // Run reachability self-test before accepting (spec 10.12.3).
             if probe_result.nat_type.is_hole_punchable()
                 && let Some(external_addr) = probe_result.external_addr
             {
-                return Ok(ReachabilityTier::Stun { external_addr });
+                tracing::info!(
+                    external_addr = %external_addr,
+                    "attempting Tier 2 STUN, running reachability self-test"
+                );
+                let reachable = probe
+                    .probe_reachability(&socket, external_addr)
+                    .await
+                    .unwrap_or(false);
+
+                if reachable {
+                    tracing::info!(
+                        external_addr = %external_addr,
+                        "Tier 2 reachability self-test passed"
+                    );
+                    return Ok(ReachabilityTier::Stun { external_addr });
+                }
+
+                tracing::warn!("Tier 2 reachability self-test failed, falling through to Tier 3");
             }
 
             // Step 5: Tier 3 (bridge relay).
@@ -661,6 +813,224 @@ impl<S: Storage + 'static> TlsProvider for tls::AcmeProvider<S> {
 }
 
 // ---------------------------------------------------------------------------
+// DidPublisher — object-safe trait for DID document publishing (SCP-243)
+// ---------------------------------------------------------------------------
+
+/// Object-safe trait for publishing DID documents.
+///
+/// The full [`DidMethod`] trait is not object-safe because it uses `impl Future`
+/// in return types. This trait wraps just the `publish` method with a boxed
+/// future, enabling the tier re-evaluation background task (SCP-243) to
+/// republish the DID document on tier changes without requiring generic
+/// parameters.
+pub(crate) trait DidPublisher: Send + Sync {
+    /// Publishes a DID document to the underlying DID infrastructure.
+    fn publish<'a>(
+        &'a self,
+        identity: &'a ScpIdentity,
+        document: &'a DidDocument,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>>;
+}
+
+/// Blanket implementation wrapping any [`DidMethod`] into a [`DidPublisher`].
+struct DidMethodPublisher<D: DidMethod> {
+    inner: Arc<D>,
+}
+
+impl<D: DidMethod + 'static> DidPublisher for DidMethodPublisher<D> {
+    fn publish<'a>(
+        &'a self,
+        identity: &'a ScpIdentity,
+        document: &'a DidDocument,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>>
+    {
+        Box::pin(self.inner.publish(identity, document))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier re-evaluation (§10.12.1, SCP-243)
+// ---------------------------------------------------------------------------
+
+/// Default re-evaluation interval per §10.12.1 recommendation.
+const TIER_REEVALUATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Handle to the tier re-evaluation background task (SCP-243).
+///
+/// The task re-evaluates the reachability tier every 30 minutes and on
+/// network change events. When the tier changes, it updates the DID
+/// document with the new relay address and logs at INFO level (§10.12.1).
+struct TierReEvalHandle {
+    /// Handle to the background task. Retained so the task is not detached
+    /// and can be awaited for clean shutdown if needed.
+    task: tokio::task::JoinHandle<()>,
+    /// Cancellation token: send `true` to stop the background task.
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl TierReEvalHandle {
+    /// Gracefully stops the background re-evaluation task.
+    fn stop(&self) {
+        let _ = self.cancel_tx.send(true);
+    }
+}
+
+impl Drop for TierReEvalHandle {
+    fn drop(&mut self) {
+        // Send the cancel signal so the task exits cleanly. If send fails
+        // (already sent), abort as a safety net to prevent busy-spin when the
+        // watch sender is dropped without sending `true`.
+        if self.cancel_tx.send(true).is_err() {
+            self.task.abort();
+        }
+    }
+}
+
+/// Converts a [`ReachabilityTier`] to a relay URL string.
+fn tier_to_relay_url(tier: &ReachabilityTier) -> String {
+    match tier {
+        ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
+            format!("ws://{external_addr}/scp/v1")
+        }
+        ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
+    }
+}
+
+/// Handles a detected tier change: updates the DID document, republishes it,
+/// and emits the event only after successful publish. Returns the new URL and
+/// document on success.
+async fn apply_tier_change(
+    current_url: &str,
+    new_relay_url: &str,
+    trigger_reason: &str,
+    current_doc: &DidDocument,
+    publisher: &dyn DidPublisher,
+    identity: &ScpIdentity,
+    event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
+) -> Option<(String, DidDocument)> {
+    let mut updated_doc = current_doc.clone();
+    for svc in &mut updated_doc.service {
+        if svc.service_type == "SCPRelay" && svc.service_endpoint == current_url {
+            new_relay_url.clone_into(&mut svc.service_endpoint);
+        }
+    }
+    match publisher.publish(identity, &updated_doc).await {
+        Ok(()) => {
+            // Emit the tier-change event only after the DID document has been
+            // successfully published. This ensures consumers see events that
+            // correspond to actual state changes in the DHT.
+            if let Some(tx) = event_tx {
+                let _ = tx
+                    .send(NatTierChange::TierChanged {
+                        previous_relay_url: current_url.to_owned(),
+                        new_relay_url: new_relay_url.to_owned(),
+                        reason: trigger_reason.to_owned(),
+                    })
+                    .await;
+            }
+            tracing::info!(new_url = %new_relay_url, did = %identity.did,
+                "DID document republished with new relay URL");
+            Some((new_relay_url.to_owned(), updated_doc))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "DID document republish failed after tier change");
+            None
+        }
+    }
+}
+
+/// Spawns the periodic tier re-evaluation background task (§10.12.1, SCP-243).
+///
+/// The task uses `tokio::select!` to wait for either:
+/// - The 30-minute periodic timer
+/// - A network change event from the `NetworkChangeDetector`
+///
+/// On each trigger, it calls `NatStrategy::select_tier()` and compares the
+/// result to the current tier. If the tier changed, it updates the DID
+/// document and republishes it, logging at INFO level.
+#[allow(clippy::too_many_arguments)]
+fn spawn_tier_reevaluation(
+    nat_strategy: Arc<dyn NatStrategy>,
+    network_detector: Option<Arc<dyn NetworkChangeDetector>>,
+    publisher: Arc<dyn DidPublisher>,
+    identity: ScpIdentity,
+    document: DidDocument,
+    relay_port: u16,
+    current_relay_url: String,
+    event_tx: Option<tokio::sync::mpsc::Sender<NatTierChange>>,
+    reevaluation_interval: Duration,
+) -> TierReEvalHandle {
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut current_url = current_relay_url;
+        let mut current_doc = document;
+        loop {
+            let trigger_reason = tokio::select! {
+                () = tokio::time::sleep(reevaluation_interval) => {
+                    "periodic 30-minute re-evaluation (§10.12.1)"
+                }
+                result = async {
+                    match network_detector.as_ref() {
+                        Some(d) => d.wait_for_change().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
+                        Ok(()) => "network change event detected",
+                        Err(e) => {
+                            tracing::warn!(error = %e, "network change detector error");
+                            continue;
+                        }
+                    }
+                }
+                result = cancel_rx.changed() => {
+                    // Err means the sender was dropped — treat as shutdown.
+                    // Ok means value changed — check if it's the cancel signal.
+                    if result.is_err() || *cancel_rx.borrow() { return; }
+                    continue;
+                }
+            };
+            tracing::debug!(reason = trigger_reason, "tier re-evaluation triggered");
+            let new_tier = match nat_strategy.select_tier(relay_port).await {
+                Ok(tier) => tier,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tier re-evaluation failed, keeping current tier");
+                    continue;
+                }
+            };
+            let new_relay_url = tier_to_relay_url(&new_tier);
+            if new_relay_url == current_url {
+                tracing::debug!(relay_url = %current_url, "tier re-evaluation: no change");
+                continue;
+            }
+            tracing::info!(
+                previous_url = %current_url, new_url = %new_relay_url,
+                tier = ?new_tier, reason = trigger_reason,
+                "reachability tier changed, updating DID document (§10.12.1)"
+            );
+            if let Some((url, doc)) = apply_tier_change(
+                &current_url,
+                &new_relay_url,
+                trigger_reason,
+                &current_doc,
+                &*publisher,
+                &identity,
+                event_tx.as_ref(),
+            )
+            .await
+            {
+                current_url = url;
+                current_doc = doc;
+            }
+        }
+    });
+    TierReEvalHandle {
+        task,
+        cancel_tx,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ApplicationNodeBuilder
 // ---------------------------------------------------------------------------
 
@@ -702,8 +1072,15 @@ pub struct ApplicationNodeBuilder<
     bridge_relay: Option<String>,
     /// Pluggable NAT strategy for testability.
     nat_strategy: Option<Arc<dyn NatStrategy>>,
+    /// Optional UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
+    port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
+    /// Optional reachability probe for self-test (SCP-242, spec 10.12.2 step 4).
+    reachability_probe: Option<Arc<dyn scp_transport::nat::ReachabilityProbe>>,
     /// Pluggable TLS provider for testability (domain mode only).
     tls_provider: Option<Arc<dyn TlsProvider>>,
+    /// Network change detector for tier re-evaluation (§10.12.1, SCP-243).
+    /// When present, network change events trigger immediate re-evaluation.
+    network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     /// Bind address for the local dev API server. `None` = dev API disabled.
     local_api_addr: Option<SocketAddr>,
     /// Bind address for the public HTTP server. Separate from the relay's
@@ -734,7 +1111,10 @@ impl ApplicationNodeBuilder {
             stun_server: None,
             bridge_relay: None,
             nat_strategy: None,
+            port_mapper: None,
+            reachability_probe: None,
             tls_provider: None,
+            network_detector: None,
             local_api_addr: None,
             http_bind_addr: None,
             cors_origins: None,
@@ -772,7 +1152,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            port_mapper: self.port_mapper,
+            reachability_probe: self.reachability_probe,
             tls_provider: self.tls_provider,
+            network_detector: self.network_detector,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
@@ -802,7 +1185,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            port_mapper: self.port_mapper,
+            reachability_probe: self.reachability_probe,
             tls_provider: self.tls_provider,
+            network_detector: self.network_detector,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
@@ -827,8 +1213,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
     /// Sets the ACME email for TLS certificate provisioning.
     ///
     /// Used for Let's Encrypt certificate requests (spec section 18.6.3).
-    /// Optional -- TLS provisioning is not implemented in this scaffold but
-    /// the configuration is captured for future use.
+    /// When `.domain()` is set, the email is passed to
+    /// [`AcmeProvider`](tls::AcmeProvider) during `build()` for ACME account
+    /// registration (SCP-246). Optional -- if omitted, the ACME account is
+    /// created without a contact email.
     #[must_use]
     pub fn acme_email(mut self, email: &str) -> Self {
         self.acme_email = Some(email.to_owned());
@@ -865,6 +1253,34 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
         self
     }
 
+    /// Sets a UPnP/NAT-PMP port mapper for Tier 1 NAT traversal (spec 10.12.2).
+    ///
+    /// When set, the [`DefaultNatStrategy`] will attempt `UPnP` port mapping
+    /// before falling through to STUN (Tier 2). Has no effect if a custom
+    /// [`NatStrategy`] is provided via [`nat_strategy`](Self::nat_strategy).
+    #[must_use]
+    pub fn port_mapper(mut self, mapper: Arc<dyn scp_transport::nat::PortMapper>) -> Self {
+        self.port_mapper = Some(mapper);
+        self
+    }
+
+    /// Sets a reachability probe for self-test verification (SCP-242).
+    ///
+    /// The self-test verifies that an external address is actually reachable
+    /// before publishing it in the DID document (spec 10.12.2 step 4). When
+    /// not set, the [`DefaultNatStrategy`] constructs a
+    /// [`DefaultReachabilityProbe`](scp_transport::nat::DefaultReachabilityProbe)
+    /// from the first configured STUN endpoint. Has no effect if a custom
+    /// [`NatStrategy`] is provided via [`nat_strategy`](Self::nat_strategy).
+    #[must_use]
+    pub fn reachability_probe(
+        mut self,
+        probe: Arc<dyn scp_transport::nat::ReachabilityProbe>,
+    ) -> Self {
+        self.reachability_probe = Some(probe);
+        self
+    }
+
     /// Sets a custom TLS provider for testability.
     ///
     /// Production code uses [`AcmeProvider`](tls::AcmeProvider) (created
@@ -873,6 +1289,22 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
     #[must_use]
     pub fn tls_provider(mut self, provider: Arc<dyn TlsProvider>) -> Self {
         self.tls_provider = Some(provider);
+        self
+    }
+
+    /// Sets a network change detector for tier re-evaluation (§10.12.1, SCP-243).
+    ///
+    /// When provided, network change events (IP change, interface up/down)
+    /// trigger immediate re-evaluation of the reachability tier. Without a
+    /// detector, only the periodic 30-minute timer triggers re-evaluation.
+    ///
+    /// Use [`ChannelNetworkChangeDetector`](scp_transport::nat::ChannelNetworkChangeDetector)
+    /// for channel-based event injection, or implement
+    /// [`NetworkChangeDetector`](scp_transport::nat::NetworkChangeDetector)
+    /// for platform-specific detection.
+    #[must_use]
+    pub fn network_detector(mut self, detector: Arc<dyn NetworkChangeDetector>) -> Self {
+        self.network_detector = Some(detector);
         self
     }
 
@@ -966,7 +1398,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            port_mapper: self.port_mapper,
+            reachability_probe: self.reachability_probe,
             tls_provider: self.tls_provider,
+            network_detector: self.network_detector,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
@@ -1017,7 +1452,10 @@ impl<S: Storage + 'static, Dom>
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            port_mapper: self.port_mapper,
+            reachability_probe: self.reachability_probe,
             tls_provider: self.tls_provider,
+            network_detector: self.network_detector,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
@@ -1047,7 +1485,10 @@ impl<S: Storage + 'static, Dom>
             stun_server: self.stun_server,
             bridge_relay: self.bridge_relay,
             nat_strategy: self.nat_strategy,
+            port_mapper: self.port_mapper,
+            reachability_probe: self.reachability_probe,
             tls_provider: self.tls_provider,
+            network_detector: self.network_detector,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
@@ -1142,7 +1583,13 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     domain = %domain, error = %tls_err,
                     "TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
                 );
-                let strategy = resolve_nat(self.nat_strategy, self.stun_server, self.bridge_relay);
+                let strategy = resolve_nat(
+                    self.nat_strategy,
+                    self.stun_server,
+                    self.bridge_relay,
+                    self.port_mapper,
+                    self.reachability_probe,
+                );
                 build_no_domain_inner(
                     identity,
                     document,
@@ -1158,6 +1605,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     relay_config,
                     Some(http_bind_addr),
                     self.cors_origins,
+                    self.network_detector,
                 )
                 .await
             }
@@ -1194,6 +1642,7 @@ fn generate_bridge_secret() -> Zeroizing<[u8; 32]> {
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     Zeroizing::new(bytes)
 }
+
 
 // ---------------------------------------------------------------------------
 // Dev API token generation (spec §18.10.2)
@@ -1244,13 +1693,24 @@ fn resolve_tls<S: Storage + 'static>(
 // ---------------------------------------------------------------------------
 
 /// Resolves the NAT traversal strategy: uses the explicitly provided one, or
-/// constructs a [`DefaultNatStrategy`] from the STUN/bridge configuration.
+/// constructs a [`DefaultNatStrategy`] from the STUN/bridge/port-mapper configuration.
 fn resolve_nat(
     strategy: Option<Arc<dyn NatStrategy>>,
     stun_server: Option<String>,
     bridge_relay: Option<String>,
+    port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
+    reachability_probe: Option<Arc<dyn scp_transport::nat::ReachabilityProbe>>,
 ) -> Arc<dyn NatStrategy> {
-    strategy.unwrap_or_else(|| Arc::new(DefaultNatStrategy::new(stun_server, bridge_relay)))
+    strategy.unwrap_or_else(|| {
+        let mut default = DefaultNatStrategy::new(stun_server, bridge_relay);
+        if let Some(mapper) = port_mapper {
+            default = default.with_port_mapper(mapper);
+        }
+        if let Some(probe) = reachability_probe {
+            default = default.with_reachability_probe(probe);
+        }
+        Arc::new(default)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,6 +1779,8 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         identity: IdentityHandle { identity, document },
         storage,
         state,
+        tier_reeval: None,
+        tier_change_rx: None,
     })
 }
 
@@ -1343,6 +1805,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     relay_config: RelayConfig,
     http_bind_addr: Option<SocketAddr>,
     cors_origins: Option<Vec<String>>,
+    network_detector: Option<Arc<dyn NetworkChangeDetector>>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
@@ -1378,6 +1841,31 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 
     let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
+    // 5. Spawn periodic tier re-evaluation (§10.12.1, SCP-243).
+    let publisher: Arc<dyn DidPublisher> = Arc::new(DidMethodPublisher {
+        inner: Arc::clone(&did_method),
+    });
+    let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
+    // Construct a copy of the identity for the background task (ScpIdentity
+    // fields are all Copy/Clone but the struct itself doesn't derive Clone).
+    let bg_identity = ScpIdentity {
+        identity_key: identity.identity_key,
+        active_signing_key: identity.active_signing_key,
+        pre_rotation_commitment: identity.pre_rotation_commitment,
+        did: identity.did.clone(),
+    };
+    let tier_reeval = spawn_tier_reevaluation(
+        nat_strategy,
+        network_detector,
+        publisher,
+        bg_identity,
+        document.clone(),
+        bound_addr.port(),
+        relay_url.clone(),
+        Some(tier_event_tx),
+        TIER_REEVALUATION_INTERVAL,
+    );
+
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         relay_url,
@@ -1407,6 +1895,8 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         identity: IdentityHandle { identity, document },
         storage,
         state,
+        tier_reeval: Some(tier_reeval),
+        tier_change_rx: Some(tier_event_rx),
     })
 }
 
@@ -1469,7 +1959,13 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
         let dev_token = self.local_api_addr.map(generate_dev_token);
 
         // 5-8. Delegate to shared no-domain logic.
-        let strategy = resolve_nat(self.nat_strategy, self.stun_server, self.bridge_relay);
+        let strategy = resolve_nat(
+            self.nat_strategy,
+            self.stun_server,
+            self.bridge_relay,
+            self.port_mapper,
+            self.reachability_probe,
+        );
 
         build_no_domain_inner(
             identity,
@@ -1486,6 +1982,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             relay_config,
             self.http_bind_addr,
             self.cors_origins,
+            self.network_detector,
         )
         .await
     }
@@ -2582,6 +3079,383 @@ mod tests {
         }
     }
 
+    // -- DefaultNatStrategy self-test integration (SCP-242) -------------------
+
+    /// Builds a minimal STUN Binding Response for test mock servers.
+    ///
+    /// This is a test-local re-implementation of the logic in
+    /// `build_stun_binding_response`,
+    /// which is `#[cfg(test)]` and not accessible cross-crate.
+    fn build_stun_binding_response(addr: SocketAddr, transaction_id: &[u8; 12]) -> Vec<u8> {
+        const MAGIC_COOKIE: u32 = 0x2112_A442;
+        const BINDING_RESPONSE: u16 = 0x0101;
+        const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+
+        // Encode XOR-MAPPED-ADDRESS value.
+        let mut attr_data = Vec::new();
+        attr_data.push(0x00); // Reserved.
+        match addr {
+            SocketAddr::V4(v4) => {
+                attr_data.push(0x01); // IPv4 family.
+                let xor_port = v4.port() ^ (MAGIC_COOKIE >> 16) as u16;
+                attr_data.extend_from_slice(&xor_port.to_be_bytes());
+                let ip_bits: u32 = (*v4.ip()).into();
+                let xor_ip = ip_bits ^ MAGIC_COOKIE;
+                attr_data.extend_from_slice(&xor_ip.to_be_bytes());
+            }
+            SocketAddr::V6(v6) => {
+                attr_data.push(0x02); // IPv6 family.
+                let xor_port = v6.port() ^ (MAGIC_COOKIE >> 16) as u16;
+                attr_data.extend_from_slice(&xor_port.to_be_bytes());
+                let ip_bytes = v6.ip().octets();
+                let mut xor_key = [0u8; 16];
+                xor_key[0..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+                xor_key[4..16].copy_from_slice(transaction_id);
+                for i in 0..16 {
+                    attr_data.push(ip_bytes[i] ^ xor_key[i]);
+                }
+            }
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let attr_len = attr_data.len() as u16;
+        #[allow(clippy::cast_possible_truncation)]
+        let padded_attr_len = ((attr_data.len() + 3) & !3) as u16;
+        let msg_len = 4 + padded_attr_len;
+
+        let mut buf = Vec::with_capacity(20 + msg_len as usize);
+
+        // Header.
+        buf.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        buf.extend_from_slice(&msg_len.to_be_bytes());
+        buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(transaction_id);
+
+        // Attribute header.
+        buf.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&attr_data);
+
+        // Padding.
+        let padding = (4 - (attr_data.len() % 4)) % 4;
+        buf.extend(std::iter::repeat_n(0u8, padding));
+
+        buf
+    }
+
+    /// Spawns a mock STUN server that responds to `count` requests with the
+    /// given external address.
+    fn spawn_mock_stun_server(
+        socket: tokio::net::UdpSocket,
+        external_addr: SocketAddr,
+        count: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for _ in 0..count {
+                let mut buf = [0u8; 576];
+                let (_, from) = socket.recv_from(&mut buf).await.expect("recv");
+                let mut txn_id = [0u8; 12];
+                txn_id.copy_from_slice(&buf[8..20]);
+                let response = build_stun_binding_response(external_addr, &txn_id);
+                socket.send_to(&response, from).await.expect("send");
+            }
+        })
+    }
+
+    /// Mock reachability probe for testing `DefaultNatStrategy` directly.
+    struct MockReachabilityProbe {
+        /// Whether the probe should succeed (return true) or fail (return false).
+        reachable: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockReachabilityProbe {
+        fn new(reachable: bool) -> Self {
+            Self {
+                reachable: std::sync::atomic::AtomicBool::new(reachable),
+            }
+        }
+    }
+
+    impl scp_transport::nat::ReachabilityProbe for MockReachabilityProbe {
+        fn probe_reachability<'a>(
+            &'a self,
+            _socket: &'a tokio::net::UdpSocket,
+            _external_addr: SocketAddr,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<bool, scp_transport::TransportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let reachable = self.reachable.load(std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move { Ok(reachable) })
+        }
+    }
+
+    /// Mock `PortMapper` for testing `DefaultNatStrategy`'s Tier 1 `UPnP` integration.
+    struct MockPortMapper {
+        result: tokio::sync::Mutex<
+            Option<
+                Result<scp_transport::nat::PortMappingResult, scp_transport::nat::PortMappingError>,
+            >,
+        >,
+    }
+
+    impl MockPortMapper {
+        fn ok(addr: SocketAddr) -> Self {
+            Self {
+                result: tokio::sync::Mutex::new(Some(Ok(scp_transport::nat::PortMappingResult {
+                    external_addr: addr,
+                    ttl: std::time::Duration::from_secs(600),
+                    protocol: scp_transport::nat::MappingProtocol::UpnpIgd,
+                }))),
+            }
+        }
+
+        fn fail(msg: &str) -> Self {
+            Self {
+                result: tokio::sync::Mutex::new(Some(Err(
+                    scp_transport::nat::PortMappingError::DiscoveryFailed(msg.to_owned()),
+                ))),
+            }
+        }
+    }
+
+    impl scp_transport::nat::PortMapper for MockPortMapper {
+        fn map_port(
+            &self,
+            _internal_port: u16,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            scp_transport::nat::PortMappingResult,
+                            scp_transport::nat::PortMappingError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                let mut r = self.result.lock().await;
+                r.take().unwrap_or_else(|| {
+                    Err(scp_transport::nat::PortMappingError::Internal(
+                        "no more results".to_owned(),
+                    ))
+                })
+            })
+        }
+
+        fn renew(
+            &self,
+            _internal_port: u16,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            scp_transport::nat::PortMappingResult,
+                            scp_transport::nat::PortMappingError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Err(scp_transport::nat::PortMappingError::Internal(
+                    "renew not expected".to_owned(),
+                ))
+            })
+        }
+
+        fn remove(
+            &self,
+            _internal_port: u16,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), scp_transport::nat::PortMappingError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// SCP-242 AC3: `DefaultNatStrategy` `UPnP` self-test failure triggers
+    /// fallthrough to Tier 2 STUN.
+    ///
+    /// Uses mock STUN servers and a mock `PortMapper` to exercise
+    /// `DefaultNatStrategy` directly (not through a custom mock strategy).
+    #[tokio::test]
+    async fn default_nat_strategy_upnp_self_test_failure_falls_through_to_bridge() {
+        // Single STUN server for NAT probing (single-STUN fallback → AddressRestricted).
+        let stun = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let stun_addr = stun.local_addr().expect("addr");
+        let stun_external = SocketAddr::from(([203, 0, 113, 42], 32891_u16));
+
+        // NAT probing needs 1 request only (mock reachability probe handles self-test).
+        let h = spawn_mock_stun_server(stun, stun_external, 1);
+
+        // UPnP returns a mapping, but self-test probe always returns false.
+        let upnp_external = SocketAddr::from(([198, 51, 100, 1], 8443_u16));
+        let mapper = Arc::new(MockPortMapper::ok(upnp_external));
+        let probe = Arc::new(MockReachabilityProbe::new(false));
+
+        let strategy = DefaultNatStrategy::new(
+            Some(stun_addr.to_string()),
+            Some("wss://bridge.example.com/scp/v1".to_owned()),
+        )
+        .with_port_mapper(mapper)
+        .with_reachability_probe(probe);
+
+        let tier = strategy.select_tier(4000).await.expect("should succeed");
+
+        // UPnP self-test failed, STUN self-test also failed (same probe),
+        // so it should fall through to Tier 3 bridge.
+        assert!(
+            matches!(tier, ReachabilityTier::Bridge { .. }),
+            "should fall through to bridge when all self-tests fail, got: {tier:?}"
+        );
+
+        h.await.expect("server");
+    }
+
+    /// SCP-242 AC1/AC2: `DefaultNatStrategy` `UPnP` self-test success returns Tier 1.
+    #[tokio::test]
+    async fn default_nat_strategy_upnp_self_test_success_returns_tier1() {
+        let stun = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let stun_addr = stun.local_addr().expect("addr");
+        let stun_external = SocketAddr::from(([203, 0, 113, 42], 32891_u16));
+
+        // NAT probing: 1 request.
+        let h = spawn_mock_stun_server(stun, stun_external, 1);
+
+        // UPnP mapping succeeds and self-test passes.
+        let upnp_external = SocketAddr::from(([198, 51, 100, 1], 8443_u16));
+        let mapper = Arc::new(MockPortMapper::ok(upnp_external));
+        let probe = Arc::new(MockReachabilityProbe::new(true));
+
+        let strategy = DefaultNatStrategy::new(Some(stun_addr.to_string()), None)
+            .with_port_mapper(mapper)
+            .with_reachability_probe(probe);
+
+        let tier = strategy.select_tier(4000).await.expect("should succeed");
+
+        match tier {
+            ReachabilityTier::Upnp { external_addr } => {
+                assert_eq!(external_addr, upnp_external);
+            }
+            other => panic!("expected Tier 1 Upnp, got: {other:?}"),
+        }
+
+        h.await.expect("server");
+    }
+
+    /// SCP-242 AC3: `DefaultNatStrategy` `UPnP` mapping failure falls through
+    /// to Tier 2 STUN, where self-test succeeds.
+    #[tokio::test]
+    async fn default_nat_strategy_upnp_mapping_failure_falls_through_to_stun() {
+        let stun = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let stun_addr = stun.local_addr().expect("addr");
+        let stun_external = SocketAddr::from(([203, 0, 113, 42], 32891_u16));
+
+        // NAT probing + Tier 2 self-test: 2 requests total
+        // (probe uses DefaultReachabilityProbe which sends to the STUN server).
+        // But since we use MockReachabilityProbe, only 1 request (NAT probing).
+        let h = spawn_mock_stun_server(stun, stun_external, 1);
+
+        // UPnP mapping FAILS, self-test probe returns true.
+        let mapper = Arc::new(MockPortMapper::fail("no UPnP gateway"));
+        let probe = Arc::new(MockReachabilityProbe::new(true));
+
+        let strategy = DefaultNatStrategy::new(
+            Some(stun_addr.to_string()),
+            Some("wss://bridge.example.com/scp/v1".to_owned()),
+        )
+        .with_port_mapper(mapper)
+        .with_reachability_probe(probe);
+
+        let tier = strategy.select_tier(4000).await.expect("should succeed");
+
+        match tier {
+            ReachabilityTier::Stun { external_addr } => {
+                assert_eq!(external_addr, stun_external);
+            }
+            other => panic!("expected Tier 2 Stun, got: {other:?}"),
+        }
+
+        h.await.expect("server");
+    }
+
+    /// SCP-242: `DefaultNatStrategy` without `port_mapper` skips Tier 1.
+    #[tokio::test]
+    async fn default_nat_strategy_no_port_mapper_skips_tier1() {
+        let stun = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let stun_addr = stun.local_addr().expect("addr");
+        let stun_external = SocketAddr::from(([203, 0, 113, 42], 32891_u16));
+
+        // NAT probing only: 1 request (mock probe handles self-test).
+        let h = spawn_mock_stun_server(stun, stun_external, 1);
+
+        let probe = Arc::new(MockReachabilityProbe::new(true));
+
+        let strategy = DefaultNatStrategy::new(Some(stun_addr.to_string()), None)
+            .with_reachability_probe(probe);
+
+        let tier = strategy.select_tier(4000).await.expect("should succeed");
+
+        match tier {
+            ReachabilityTier::Stun { external_addr } => {
+                assert_eq!(external_addr, stun_external);
+            }
+            other => panic!("expected Tier 2 Stun, got: {other:?}"),
+        }
+
+        h.await.expect("server");
+    }
+
+    /// SCP-242 AC4: Tier 2 STUN self-test failure triggers fallthrough to Tier 3.
+    #[tokio::test]
+    async fn default_nat_strategy_stun_self_test_failure_falls_through_to_bridge() {
+        let stun = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let stun_addr = stun.local_addr().expect("addr");
+        let stun_external = SocketAddr::from(([203, 0, 113, 42], 32891_u16));
+
+        // NAT probing: 1 request.
+        let h = spawn_mock_stun_server(stun, stun_external, 1);
+
+        // Self-test probe returns false (fails).
+        let probe = Arc::new(MockReachabilityProbe::new(false));
+
+        let strategy = DefaultNatStrategy::new(
+            Some(stun_addr.to_string()),
+            Some("wss://bridge.example.com/scp/v1".to_owned()),
+        )
+        .with_reachability_probe(probe);
+
+        let tier = strategy.select_tier(4000).await.expect("should succeed");
+
+        match tier {
+            ReachabilityTier::Bridge { bridge_url } => {
+                assert_eq!(bridge_url, "wss://bridge.example.com/scp/v1");
+            }
+            other => panic!("expected Tier 3 Bridge, got: {other:?}"),
+        }
+
+        h.await.expect("server");
+    }
+
     // -- HTTP tests (SCP-147) ------------------------------------------------
 
     mod http_tests {
@@ -2790,5 +3664,470 @@ mod tests {
             let doc: WellKnownScp = serde_json::from_slice(&body).unwrap();
             assert_eq!(doc.version, 1);
         }
+    }
+
+    // -- Periodic tier re-evaluation tests (SCP-243) ---------------------------
+
+    /// Mock NAT strategy that returns different tiers on successive calls.
+    /// Used to test that the re-evaluation loop detects tier changes.
+    struct SequenceNatStrategy {
+        tiers: std::sync::Mutex<Vec<ReachabilityTier>>,
+        call_count: std::sync::atomic::AtomicU32,
+    }
+
+    impl SequenceNatStrategy {
+        fn new(tiers: Vec<ReachabilityTier>) -> Self {
+            Self {
+                tiers: std::sync::Mutex::new(tiers),
+                call_count: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl NatStrategy for SequenceNatStrategy {
+        fn select_tier(
+            &self,
+            _relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            let idx = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as usize;
+            let tiers = self.tiers.lock().unwrap();
+            // Cycle through the tiers if we exhaust the list.
+            let tier = tiers[idx % tiers.len()].clone();
+            drop(tiers);
+            Box::pin(async move { Ok(tier) })
+        }
+    }
+
+    /// Mock `DidPublisher` that records publish calls.
+    struct RecordingPublisher {
+        publish_count: std::sync::atomic::AtomicU32,
+    }
+
+    impl RecordingPublisher {
+        fn new() -> Self {
+            Self {
+                publish_count: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn count(&self) -> u32 {
+            self.publish_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DidPublisher for RecordingPublisher {
+        fn publish<'a>(
+            &'a self,
+            _identity: &'a ScpIdentity,
+            _document: &'a DidDocument,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>,
+        > {
+            self.publish_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Short interval used in tests instead of the production 30-minute interval.
+    const TEST_REEVALUATION_INTERVAL: Duration = Duration::from_millis(50);
+
+    /// Timeout for waiting on events in tests (generous to avoid flakiness).
+    const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn tier_change_after_30_minutes_triggers_did_republish() {
+        // AC: A background task re-evaluates the reachability tier every 30 minutes.
+        // AC: Tier change triggers DID document update with the new relay address.
+        // AC: Tier change is logged at INFO level (§10.12.1).
+        let initial_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
+        let new_addr = SocketAddr::from(([203, 0, 113, 42], 8443));
+
+        // First call returns Stun, second returns Upnp (different URL → tier change).
+        let strategy = Arc::new(SequenceNatStrategy::new(vec![
+            ReachabilityTier::Stun {
+                external_addr: initial_addr,
+            },
+            ReachabilityTier::Upnp {
+                external_addr: new_addr,
+            },
+        ]));
+
+        let publisher = Arc::new(RecordingPublisher::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+
+        let identity = ScpIdentity {
+            identity_key: scp_platform::KeyHandle::new(1),
+            active_signing_key: scp_platform::KeyHandle::new(2),
+            pre_rotation_commitment: [0u8; 32],
+            did: "did:dht:test123".to_owned(),
+        };
+
+        let document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: "did:dht:test123".to_owned(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            also_known_as: vec![],
+            service: vec![scp_identity::document::Service {
+                id: "did:dht:test123#scp-relay-1".to_owned(),
+                service_type: "SCPRelay".to_owned(),
+                service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            }],
+        };
+
+        let handle = spawn_tier_reevaluation(
+            Arc::clone(&strategy) as Arc<dyn NatStrategy>,
+            None,
+            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            identity,
+            document,
+            32891,
+            "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            Some(event_tx),
+            TEST_REEVALUATION_INTERVAL,
+        );
+
+        // Wait for the periodic timer to fire (50ms test interval).
+        let event = tokio::time::timeout(TEST_EVENT_TIMEOUT, event_rx.recv())
+            .await
+            .expect("timeout waiting for tier change event")
+            .expect("channel closed unexpectedly");
+
+        match event {
+            NatTierChange::TierChanged {
+                previous_relay_url,
+                new_relay_url,
+                reason,
+            } => {
+                assert_eq!(previous_relay_url, "ws://198.51.100.7:32891/scp/v1");
+                assert_eq!(new_relay_url, "ws://203.0.113.42:8443/scp/v1");
+                assert!(
+                    reason.contains("periodic"),
+                    "reason should mention periodic: {reason}"
+                );
+            }
+            other => panic!("expected TierChanged, got {other:?}"),
+        }
+
+        // Verify the DID document was republished.
+        assert_eq!(
+            publisher.count(),
+            1,
+            "DID document should be republished after tier change"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn network_event_triggers_immediate_reevaluation() {
+        // AC: Network change events (IP change, interface up/down) trigger
+        //     immediate re-evaluation.
+        let new_addr = SocketAddr::from(([10, 0, 0, 1], 9999));
+
+        // The first select_tier call is the re-evaluation triggered by the
+        // network change — it should return a DIFFERENT address than the
+        // current relay URL to trigger a TierChanged event.
+        let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+            external_addr: new_addr,
+        }]));
+
+        let publisher = Arc::new(RecordingPublisher::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+
+        // Create a network change detector with a channel for injecting events.
+        let (net_change_tx, net_change_rx) = tokio::sync::mpsc::channel(16);
+        let detector = Arc::new(scp_transport::nat::ChannelNetworkChangeDetector::new(
+            net_change_rx,
+        ));
+
+        let identity = ScpIdentity {
+            identity_key: scp_platform::KeyHandle::new(1),
+            active_signing_key: scp_platform::KeyHandle::new(2),
+            pre_rotation_commitment: [0u8; 32],
+            did: "did:dht:testnet123".to_owned(),
+        };
+
+        let document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: "did:dht:testnet123".to_owned(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            also_known_as: vec![],
+            service: vec![scp_identity::document::Service {
+                id: "did:dht:testnet123#scp-relay-1".to_owned(),
+                service_type: "SCPRelay".to_owned(),
+                service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            }],
+        };
+
+        let handle = spawn_tier_reevaluation(
+            Arc::clone(&strategy) as Arc<dyn NatStrategy>,
+            Some(detector as Arc<dyn NetworkChangeDetector>),
+            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            identity,
+            document,
+            32891,
+            "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            Some(event_tx),
+            // Use a long interval so the periodic timer does NOT fire first.
+            Duration::from_secs(60 * 60),
+        );
+
+        // Give the spawned task a chance to enter the select! and start
+        // listening on the network change detector before we send the event.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Trigger a network change event — should NOT need to wait for the timer.
+        net_change_tx.send(()).await.expect("send network change");
+
+        // The network change triggers immediate re-evaluation.
+        let event = tokio::time::timeout(TEST_EVENT_TIMEOUT, event_rx.recv())
+            .await
+            .expect("timeout waiting for tier change event")
+            .expect("channel closed unexpectedly");
+
+        match event {
+            NatTierChange::TierChanged {
+                previous_relay_url,
+                new_relay_url,
+                reason,
+            } => {
+                assert_eq!(previous_relay_url, "ws://198.51.100.7:32891/scp/v1");
+                assert_eq!(new_relay_url, "ws://10.0.0.1:9999/scp/v1");
+                assert!(
+                    reason.contains("network change"),
+                    "reason should mention network change: {reason}"
+                );
+            }
+            other => panic!("expected TierChanged, got {other:?}"),
+        }
+
+        // Verify the DID document was republished immediately.
+        assert_eq!(
+            publisher.count(),
+            1,
+            "DID document should be republished after network change"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn no_event_when_tier_unchanged_after_reevaluation() {
+        // Verify that no TierChanged event is emitted when the tier stays the same.
+        let addr = SocketAddr::from(([198, 51, 100, 7], 32891));
+
+        // Return the same tier every time.
+        let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+            external_addr: addr,
+        }]));
+
+        let publisher = Arc::new(RecordingPublisher::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+
+        let identity = ScpIdentity {
+            identity_key: scp_platform::KeyHandle::new(1),
+            active_signing_key: scp_platform::KeyHandle::new(2),
+            pre_rotation_commitment: [0u8; 32],
+            did: "did:dht:unchanged123".to_owned(),
+        };
+
+        let document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: "did:dht:unchanged123".to_owned(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            also_known_as: vec![],
+            service: vec![scp_identity::document::Service {
+                id: "did:dht:unchanged123#scp-relay-1".to_owned(),
+                service_type: "SCPRelay".to_owned(),
+                service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            }],
+        };
+
+        let handle = spawn_tier_reevaluation(
+            Arc::clone(&strategy) as Arc<dyn NatStrategy>,
+            None,
+            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            identity,
+            document,
+            32891,
+            "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            Some(event_tx),
+            TEST_REEVALUATION_INTERVAL,
+        );
+
+        // Wait long enough for the periodic timer to fire and the task to
+        // complete its re-evaluation (same tier → no event, no publish).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // No DID republish should happen.
+        assert_eq!(
+            publisher.count(),
+            0,
+            "DID document should NOT be republished when tier is unchanged"
+        );
+
+        // No event should be emitted.
+        let recv_result = event_rx.try_recv();
+        assert!(
+            recv_result.is_err(),
+            "no TierChanged event should be emitted when tier is unchanged"
+        );
+
+        handle.stop();
+    }
+
+    /// NAT strategy that fails on the first call and succeeds on subsequent calls.
+    struct FailThenSucceedStrategy {
+        call_count: std::sync::atomic::AtomicU32,
+        success_tier: ReachabilityTier,
+    }
+
+    impl NatStrategy for FailThenSucceedStrategy {
+        fn select_tier(
+            &self,
+            _relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            let n = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let tier = self.success_tier.clone();
+            Box::pin(async move {
+                if n == 0 {
+                    Err(NodeError::Nat("transient STUN failure".into()))
+                } else {
+                    Ok(tier)
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reevaluation_loop_survives_nat_probe_failure() {
+        // Verify the loop continues when a NAT probe fails.
+        let addr = SocketAddr::from(([198, 51, 100, 7], 32891));
+        let new_addr = SocketAddr::from(([10, 0, 0, 1], 5000));
+
+        let strategy = Arc::new(FailThenSucceedStrategy {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+            success_tier: ReachabilityTier::Stun {
+                external_addr: new_addr,
+            },
+        });
+
+        let publisher = Arc::new(RecordingPublisher::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+
+        let identity = ScpIdentity {
+            identity_key: scp_platform::KeyHandle::new(1),
+            active_signing_key: scp_platform::KeyHandle::new(2),
+            pre_rotation_commitment: [0u8; 32],
+            did: "did:dht:resilient123".to_owned(),
+        };
+
+        let document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: "did:dht:resilient123".to_owned(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            also_known_as: vec![],
+            service: vec![scp_identity::document::Service {
+                id: "did:dht:resilient123#scp-relay-1".to_owned(),
+                service_type: "SCPRelay".to_owned(),
+                service_endpoint: format!("ws://{addr}/scp/v1"),
+            }],
+        };
+
+        let handle = spawn_tier_reevaluation(
+            strategy as Arc<dyn NatStrategy>,
+            None,
+            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            identity,
+            document,
+            addr.port(),
+            format!("ws://{addr}/scp/v1"),
+            Some(event_tx),
+            TEST_REEVALUATION_INTERVAL,
+        );
+
+        // The first cycle fails (NAT probe error), the second succeeds with
+        // a new tier. With a 50ms interval, the event should arrive within
+        // a few hundred ms.
+        let event = tokio::time::timeout(TEST_EVENT_TIMEOUT, event_rx.recv())
+            .await
+            .expect("timeout waiting for tier change event after recovery")
+            .expect("channel closed unexpectedly");
+        assert!(matches!(event, NatTierChange::TierChanged { .. }));
+
+        // The first cycle produced an error (no publish), the second
+        // succeeded and triggered a publish — exactly 1 total.
+        assert_eq!(
+            publisher.count(),
+            1,
+            "republish after successful re-evaluation"
+        );
+
+        handle.stop();
+    }
+
+    #[tokio::test]
+    async fn no_domain_build_spawns_tier_reevaluation_task() {
+        // Verify that the no-domain build path spawns the re-evaluation task.
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+
+        let node = test_no_domain_builder(tier)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            node.tier_reeval.is_some(),
+            "no-domain mode should spawn the tier re-evaluation task"
+        );
+        assert!(
+            node.tier_change_rx.is_some(),
+            "no-domain mode should provide a tier change event channel"
+        );
+
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn domain_build_does_not_spawn_tier_reevaluation_task() {
+        // Verify that the domain build path does NOT spawn re-evaluation
+        // (Tier 4 doesn't need NAT re-eval).
+        let node = test_builder()
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            node.tier_reeval.is_none(),
+            "domain mode should NOT spawn the tier re-evaluation task"
+        );
+        assert!(
+            node.tier_change_rx.is_none(),
+            "domain mode should NOT provide a tier change event channel"
+        );
+
+        node.shutdown();
     }
 }

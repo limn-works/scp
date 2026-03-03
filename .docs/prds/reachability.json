@@ -683,7 +683,7 @@
       "gate": "gate-reachability-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/tls.rs"
@@ -716,7 +716,8 @@
       "details": {
         "phase": 3,
         "crate": "scp-node"
-      }
+      },
+      "result": "AcmeProvider fully wired into domain build path: resolve_tls() constructs AcmeProvider with acme_email, TlsProvider trait enables mock injection, success produces wss:// relay URL, failure falls through to build_no_domain_inner via NAT tiers. Stale scaffold comment updated to reference SCP-246. Tests: SucceedingTlsProvider/FailingTlsProvider mocks, domain_build_uses_wss_no_regression, domain_fallthrough_on_acme_failure_probes_nat (111 unit + 8 integration tests pass)"
     },
     {
       "id": "SCP-247",

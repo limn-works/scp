@@ -14,6 +14,8 @@ tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
 sha2 = { workspace = true }
 hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+z-base-32 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_bytes = { workspace = true }
@@ -26,6 +28,7 @@ subtle = "2"
 
 [dev-dependencies]
 scp-core = { path = "../scp-core" }
+ed25519-dalek = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"

@@ -60,6 +60,13 @@ pub mod code {
     /// integrated into the relay server. The client should retry later.
     pub const BRIDGE_NOT_INTEGRATED: u16 = 4033;
 
+    /// Bridge registration authentication failed (SCP-247, §10.12.4).
+    ///
+    /// The `BRIDGE_REGISTER` message had a missing, invalid, or expired
+    /// Ed25519 signature, or the signing DID does not map to the claimed
+    /// `routing_id`. The client should fix its signature and retry.
+    pub const BRIDGE_AUTH_FAILED: u16 = 4034;
+
     // -----------------------------------------------------------------------
     // Server errors (5xxx) -- retry with backoff or switch relay
     // -----------------------------------------------------------------------
@@ -131,6 +138,7 @@ mod tests {
             code::BRIDGE_LIMIT_EXCEEDED,
             code::BRIDGE_TARGET_NOT_FOUND,
             code::BRIDGE_NOT_INTEGRATED,
+            code::BRIDGE_AUTH_FAILED,
         ];
 
         for c in client_codes {
@@ -196,6 +204,7 @@ mod tests {
         assert_eq!(code::BRIDGE_LIMIT_EXCEEDED, 4031);
         assert_eq!(code::BRIDGE_TARGET_NOT_FOUND, 4032);
         assert_eq!(code::BRIDGE_NOT_INTEGRATED, 4033);
+        assert_eq!(code::BRIDGE_AUTH_FAILED, 4034);
         assert_eq!(code::INTERNAL_ERROR, 5000);
         assert_eq!(code::STORAGE_FULL, 5001);
         assert_eq!(code::SHUTTING_DOWN, 5002);

@@ -3798,6 +3798,7 @@ dependencies = [
 name = "scp-transport"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "futures",
  "hex",
  "lru",
@@ -3816,6 +3817,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "z-base-32",
 ]
 
 [[package]]
