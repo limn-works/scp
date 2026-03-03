@@ -178,10 +178,10 @@ impl<S: Storage> ProtocolStore<S> {
                 if seq_str >= end_suffix.as_str() {
                     break;
                 }
-                if seq_str >= start_suffix.as_str() {
-                    if let Some(data) = self.load_value::<Vec<u8>>(&key).await? {
-                        results.push(data);
-                    }
+                if seq_str >= start_suffix.as_str()
+                    && let Some(data) = self.load_value::<Vec<u8>>(&key).await?
+                {
+                    results.push(data);
                 }
             }
         }

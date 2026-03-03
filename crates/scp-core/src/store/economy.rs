@@ -117,7 +117,7 @@ impl<S: Storage> ProtocolStore<S> {
         credentials: &[u8],
     ) -> Result<(), StoreError> {
         let key = adapter_credential_key(did, adapter_id)?;
-        self.store_value(&key, &credentials).await
+        self.store_value(&key, &credentials.to_vec()).await
     }
 
     /// Loads adapter credentials for an identity and adapter.
