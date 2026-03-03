@@ -221,11 +221,13 @@ async fn run_full_node() {
         "application node identity ready"
     );
 
-    if let Err(e) = node.serve(axum::Router::new()).await {
+    if let Err(e) = node.serve(axum::Router::new(), shutdown_signal()).await {
         tracing::error!(error = %e, "application node exited with error");
         std::process::exit(1);
     }
 
+    tracing::info!("shutdown signal received, stopping node");
+    node.shutdown();
     tracing::info!("scp-node stopped");
 }
 

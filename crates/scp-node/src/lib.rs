@@ -30,6 +30,17 @@ pub use http::BroadcastContext;
 pub use projection::ProjectedContext;
 
 // ---------------------------------------------------------------------------
+// Default HTTP bind address
+// ---------------------------------------------------------------------------
+
+/// Default bind address for the public HTTP server (`0.0.0.0:8443`).
+///
+/// Port 8443 is the standard unprivileged HTTPS alternative port, avoiding
+/// the need for root/elevated privileges required by port 443.
+pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8443);
+
+// ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
 
@@ -600,7 +611,7 @@ pub struct ApplicationNodeBuilder<
     local_api_addr: Option<SocketAddr>,
     /// Bind address for the public HTTP server. Separate from the relay's
     /// internal listener to avoid double-binding (#224). Defaults to
-    /// `0.0.0.0:443`.
+    /// [`DEFAULT_HTTP_BIND_ADDR`] (`0.0.0.0:8443`).
     http_bind_addr: Option<SocketAddr>,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
@@ -814,7 +825,7 @@ impl<
     /// [`bind_addr`](Self::bind_addr)), which is a localhost-only listener
     /// used for the internal WebSocket bridge.
     ///
-    /// Defaults to `0.0.0.0:443` if not specified.
+    /// Defaults to [`DEFAULT_HTTP_BIND_ADDR`] (`0.0.0.0:8443`) if not specified.
     #[must_use]
     pub const fn http_bind_addr(mut self, addr: SocketAddr) -> Self {
         self.http_bind_addr = Some(addr);
@@ -1011,9 +1022,7 @@ impl<
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
         let dev_token = self.local_api_addr.map(generate_dev_token);
-        let http_bind_addr = self
-            .http_bind_addr
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 443)));
+        let http_bind_addr = self.http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
         let tls_provider = resolve_tls(
             self.tls_provider,
@@ -1244,7 +1253,7 @@ async fn build_no_domain_inner<
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    let http_bind_addr = http_bind_addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 443)));
+    let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),

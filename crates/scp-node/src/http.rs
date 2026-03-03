@@ -98,7 +98,7 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     /// Bind address for the public HTTP server used by [`ApplicationNode::serve`].
     ///
     /// Separate from `relay_addr` (the relay's internal listener) to avoid
-    /// double-binding the same port (#224). Defaults to `0.0.0.0:443`.
+    /// double-binding the same port (#224). Defaults to `0.0.0.0:8443`.
     pub(crate) http_bind_addr: SocketAddr,
 }
 
@@ -299,6 +299,12 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
     /// SCP routes take precedence for `/.well-known/scp`, `/scp/v1`, and
     /// `/scp/broadcast/*`. All other paths route to `app_router`.
     ///
+    /// The `shutdown` future is awaited for graceful shutdown: when it
+    /// completes, the server stops accepting new connections and drains
+    /// in-flight requests. Callers should also call
+    /// [`ApplicationNode::shutdown`] after `serve` returns to stop the
+    /// internal relay server.
+    ///
     /// When the dev API is configured (via [`ApplicationNodeBuilder::local_api`]),
     /// a separate tokio task is spawned to serve the dev API on the configured
     /// address. The dev API listener runs concurrently with the public HTTPS
@@ -311,12 +317,16 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
     ///
     /// Returns [`NodeError::Serve`] if the server cannot bind or encounters
     /// a fatal I/O error.
-    pub async fn serve(self, app_router: Router) -> Result<(), NodeError> {
+    pub async fn serve(
+        &self,
+        app_router: Router,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), NodeError> {
         let well_known = self.well_known_router();
         let relay = self.relay_router();
         let projection = self.broadcast_projection_router();
 
-        // Extract dev API configuration before self is consumed.
+        // Extract dev API configuration before building the merged router.
         let dev_router = self.dev_router();
         let dev_bind_addr = self.state.dev_bind_addr;
 
@@ -368,6 +378,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
         );
 
         axum::serve(listener, merged)
+            .with_graceful_shutdown(shutdown)
             .await
             .map_err(|e| NodeError::Serve(e.to_string()))?;
 
