@@ -24,7 +24,7 @@ use scp_identity::document::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
-use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
+use scp_transport::native::storage::BlobStorageBackend;
 use tokio_util::sync::CancellationToken;
 
 pub use http::BroadcastContext;
@@ -175,7 +175,7 @@ impl IdentityHandle {
 /// `InMemoryStorage` for testing, `SqliteStorage` for production).
 ///
 /// See spec section 18.6 for the full design.
-pub struct ApplicationNode<S: Storage, B: BlobStorage = InMemoryBlobStorage> {
+pub struct ApplicationNode<S: Storage> {
     /// The domain this node serves. `None` for zero-config no-domain mode (§10.12.8).
     domain: Option<String>,
     /// Handle to the running relay server.
@@ -185,10 +185,10 @@ pub struct ApplicationNode<S: Storage, B: BlobStorage = InMemoryBlobStorage> {
     /// The storage backend.
     storage: Arc<S>,
     /// Shared state for HTTP handlers (`.well-known/scp`, relay bridge).
-    state: Arc<http::NodeState<B>>,
+    state: Arc<http::NodeState>,
 }
 
-impl<S: Storage + std::fmt::Debug, B: BlobStorage> std::fmt::Debug for ApplicationNode<S, B> {
+impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApplicationNode")
             .field("domain", &self.domain)
@@ -199,7 +199,7 @@ impl<S: Storage + std::fmt::Debug, B: BlobStorage> std::fmt::Debug for Applicati
     }
 }
 
-impl<S: Storage, B: BlobStorage> ApplicationNode<S, B> {
+impl<S: Storage> ApplicationNode<S> {
     /// Returns the domain this node serves.
     ///
     /// Returns `None` in zero-config no-domain mode (§10.12.8).
@@ -619,14 +619,13 @@ pub struct ApplicationNodeBuilder<
     K: KeyCustody = NoOpCustody,
     D: DidMethod = NoOpDidMethod,
     S: Storage = NoOpStorage,
-    B: BlobStorage = InMemoryBlobStorage,
     Dom = NoDomain,
     Id = NoIdentity,
 > {
     domain: Option<String>,
     identity_source: Option<IdentitySource<K, D>>,
     storage: Option<Arc<S>>,
-    blob_storage: Option<B>,
+    blob_storage: Option<BlobStorageBackend>,
     bind_addr: Option<SocketAddr>,
     acme_email: Option<String>,
     /// Override the STUN endpoint for NAT type probing (§10.12.8).
@@ -653,7 +652,7 @@ pub struct ApplicationNodeBuilder<
 impl ApplicationNodeBuilder {
     /// Creates a new builder with all fields unset.
     ///
-    /// The relay uses [`InMemoryBlobStorage`] by default. Call
+    /// The relay uses [`BlobStorageBackend::default()`] (in-memory) by default. Call
     /// [`blob_storage`](Self::blob_storage) to use a different backend.
     #[must_use]
     pub fn new() -> Self {
@@ -661,7 +660,7 @@ impl ApplicationNodeBuilder {
             domain: None,
             identity_source: None,
             storage: None,
-            blob_storage: Some(InMemoryBlobStorage::new()),
+            blob_storage: Some(BlobStorageBackend::default()),
             bind_addr: None,
             acme_email: None,
             stun_server: None,
@@ -678,27 +677,15 @@ impl ApplicationNodeBuilder {
 }
 
 impl Default
-    for ApplicationNodeBuilder<
-        NoOpCustody,
-        NoOpDidMethod,
-        NoOpStorage,
-        InMemoryBlobStorage,
-        NoDomain,
-        NoIdentity,
-    >
+    for ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, NoOpStorage, NoDomain, NoIdentity>
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
-    S: Storage + 'static,
-    B: BlobStorage + 'static,
-    Id,
-> ApplicationNodeBuilder<K, D, S, B, NoDomain, Id>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
+    ApplicationNodeBuilder<K, D, S, NoDomain, Id>
 {
     /// Sets the domain this node serves.
     ///
@@ -706,7 +693,7 @@ impl<
     /// 18.5.2). Either `.domain()` or `.no_domain()` must be called —
     /// the builder cannot be built without one (§10.12.8).
     #[must_use]
-    pub fn domain(self, domain: &str) -> ApplicationNodeBuilder<K, D, S, B, HasDomain, Id> {
+    pub fn domain(self, domain: &str) -> ApplicationNodeBuilder<K, D, S, HasDomain, Id> {
         ApplicationNodeBuilder {
             domain: Some(domain.to_owned()),
             identity_source: self.identity_source,
@@ -736,7 +723,7 @@ impl<
     /// This is the zero-config deployment path for self-hosted relays
     /// behind residential NAT.
     #[must_use]
-    pub fn no_domain(self) -> ApplicationNodeBuilder<K, D, S, B, HasNoDomain, Id> {
+    pub fn no_domain(self) -> ApplicationNodeBuilder<K, D, S, HasNoDomain, Id> {
         ApplicationNodeBuilder {
             domain: None,
             identity_source: self.identity_source,
@@ -757,14 +744,8 @@ impl<
     }
 }
 
-impl<
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
-    S: Storage + 'static,
-    B: BlobStorage + 'static,
-    Dom,
-    Id,
-> ApplicationNodeBuilder<K, D, S, B, Dom, Id>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom, Id>
+    ApplicationNodeBuilder<K, D, S, Dom, Id>
 {
     /// Sets the socket address for the relay server to bind to.
     ///
@@ -897,8 +878,8 @@ impl<
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, Dom, Id>
-    ApplicationNodeBuilder<K, D, NoOpStorage, B, Dom, Id>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
+    ApplicationNodeBuilder<K, D, NoOpStorage, Dom, Id>
 {
     /// Sets an explicit storage backend.
     ///
@@ -906,7 +887,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, 
     pub fn storage<S2: Storage + 'static>(
         self,
         storage: Arc<S2>,
-    ) -> ApplicationNodeBuilder<K, D, S2, B, Dom, Id> {
+    ) -> ApplicationNodeBuilder<K, D, S2, Dom, Id> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: self.identity_source,
@@ -928,38 +909,21 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, 
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom, Id>
-    ApplicationNodeBuilder<K, D, S, InMemoryBlobStorage, Dom, Id>
+    ApplicationNodeBuilder<K, D, S, Dom, Id>
 {
     /// Sets a custom blob storage backend for the relay server.
     ///
-    /// If not called, the relay uses [`InMemoryBlobStorage`] (all blobs lost on restart).
-    /// Accepts any type implementing [`BlobStorage`].
-    pub fn blob_storage<B2: BlobStorage + 'static>(
-        self,
-        blob_storage: B2,
-    ) -> ApplicationNodeBuilder<K, D, S, B2, Dom, Id> {
-        ApplicationNodeBuilder {
-            domain: self.domain,
-            identity_source: self.identity_source,
-            storage: self.storage,
-            blob_storage: Some(blob_storage),
-            bind_addr: self.bind_addr,
-            acme_email: self.acme_email,
-            stun_server: self.stun_server,
-            bridge_relay: self.bridge_relay,
-            nat_strategy: self.nat_strategy,
-            tls_provider: self.tls_provider,
-            local_api_addr: self.local_api_addr,
-            http_bind_addr: self.http_bind_addr,
-            cors_origins: self.cors_origins,
-            _domain_state: PhantomData,
-            _identity_state: PhantomData,
-        }
+    /// If not called, the relay uses in-memory storage (all blobs lost on restart).
+    /// Accepts any type that converts into [`BlobStorageBackend`].
+    #[must_use]
+    pub fn blob_storage(mut self, blob_storage: impl Into<BlobStorageBackend>) -> Self {
+        self.blob_storage = Some(blob_storage.into());
+        self
     }
 }
 
-impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
-    ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S, B, Dom, NoIdentity>
+impl<S: Storage + 'static, Dom>
+    ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S, Dom, NoIdentity>
 {
     /// Sets an explicit identity and DID document to use.
     ///
@@ -970,7 +934,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
         identity: ScpIdentity,
         document: DidDocument,
         did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<NoOpCustody, D2, S, B, Dom, HasIdentity> {
+    ) -> ApplicationNodeBuilder<NoOpCustody, D2, S, Dom, HasIdentity> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: Some(IdentitySource::Explicit(Box::new(ExplicitIdentity {
@@ -1001,7 +965,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
         self,
         key_custody: Arc<K2>,
         did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<K2, D2, S, B, Dom, HasIdentity> {
+    ) -> ApplicationNodeBuilder<K2, D2, S, Dom, HasIdentity> {
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: Some(IdentitySource::Generate {
@@ -1025,12 +989,8 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
     }
 }
 
-impl<
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
-    S: Storage + Default + 'static,
-    B: BlobStorage + 'static,
-> ApplicationNodeBuilder<K, D, S, B, HasDomain, HasIdentity>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static>
+    ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`].
     ///
@@ -1055,7 +1015,7 @@ impl<
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
-    pub async fn build(self) -> Result<ApplicationNode<S, B>, NodeError> {
+    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
         let identity_source = self
             .identity_source
@@ -1211,11 +1171,7 @@ fn resolve_nat(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-async fn build_domain_inner<
-    D: DidMethod + 'static,
-    S: Storage + 'static,
-    B: BlobStorage + 'static,
->(
+async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     domain: String,
     identity: ScpIdentity,
     mut document: DidDocument,
@@ -1226,12 +1182,12 @@ async fn build_domain_inner<
     bridge_secret: [u8; 32],
     dev_token: Option<String>,
     dev_bind_addr: Option<SocketAddr>,
-    blob_storage: Arc<B>,
+    blob_storage: Arc<BlobStorageBackend>,
     relay_config: RelayConfig,
     http_bind_addr: SocketAddr,
     cors_origins: Option<Vec<String>>,
     cert_data: tls::CertificateData,
-) -> Result<ApplicationNode<S, B>, NodeError> {
+) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
     document.add_relay_service(&relay_url)?;
     did_method.publish(&identity, &document).await?;
@@ -1285,11 +1241,7 @@ async fn build_domain_inner<
 
 // Node builder internal: all parameters are required for server construction.
 #[allow(clippy::too_many_arguments)]
-async fn build_no_domain_inner<
-    D: DidMethod + 'static,
-    S: Storage + 'static,
-    B: BlobStorage + 'static,
->(
+async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
@@ -1300,11 +1252,11 @@ async fn build_no_domain_inner<
     bridge_secret: [u8; 32],
     dev_token: Option<String>,
     dev_bind_addr: Option<SocketAddr>,
-    blob_storage: Arc<B>,
+    blob_storage: Arc<BlobStorageBackend>,
     relay_config: RelayConfig,
     http_bind_addr: Option<SocketAddr>,
     cors_origins: Option<Vec<String>>,
-) -> Result<ApplicationNode<S, B>, NodeError> {
+) -> Result<ApplicationNode<S>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
     let relay_url = match &tier {
@@ -1375,12 +1327,8 @@ async fn build_no_domain_inner<
 // Build for HasNoDomain — zero-config NAT-traversed mode (§10.12.8)
 // ---------------------------------------------------------------------------
 
-impl<
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
-    S: Storage + Default + 'static,
-    B: BlobStorage + 'static,
-> ApplicationNodeBuilder<K, D, S, B, HasNoDomain, HasIdentity>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static>
+    ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`] in zero-config no-domain mode (§10.12.8).
     ///
@@ -1404,7 +1352,7 @@ impl<
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
-    pub async fn build(self) -> Result<ApplicationNode<S, B>, NodeError> {
+    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
@@ -1747,7 +1695,6 @@ mod tests {
         InMemoryKeyCustody,
         TestDidDht,
         InMemoryStorage,
-        InMemoryBlobStorage,
         HasDomain,
         HasIdentity,
     > {
@@ -2189,7 +2136,6 @@ mod tests {
         InMemoryKeyCustody,
         TestDidDht,
         InMemoryStorage,
-        InMemoryBlobStorage,
         HasNoDomain,
         HasIdentity,
     > {

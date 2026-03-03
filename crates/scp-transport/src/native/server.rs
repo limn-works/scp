@@ -10,11 +10,11 @@
 //! ```rust,no_run
 //! use std::sync::Arc;
 //! use scp_transport::native::server::{RelayConfig, RelayServer};
-//! use scp_transport::native::storage::InMemoryBlobStorage;
+//! use scp_transport::native::storage::BlobStorageBackend;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = RelayConfig::default();
-//! let storage = Arc::new(InMemoryBlobStorage::new());
+//! let storage = Arc::new(BlobStorageBackend::in_memory());
 //! let server = RelayServer::new(config, storage);
 //! server.run().await?;
 //! # Ok(())
@@ -44,7 +44,7 @@ use super::protocol::{
     ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT, MIN_BLOB_TTL,
     RelayMessage,
 };
-use super::storage::{BlobStorage, StoredBlob};
+use super::storage::{BlobStorage, BlobStorageBackend, StoredBlob};
 
 /// Configuration for the relay server.
 ///
@@ -184,12 +184,13 @@ type PublishRateLimiter = Arc<tokio::sync::Mutex<HashMap<IpAddr, RateLimitBucket
 /// blob storage and subscriptions. The relay never inspects blob contents --
 /// it is a dumb store-and-forward pipe.
 ///
-/// # Type parameter
-///
-/// `S` is the blob storage backend. Phase 1 uses [`InMemoryBlobStorage`].
-pub struct RelayServer<S: BlobStorage> {
+/// Uses [`BlobStorageBackend`] for blob storage, which is a concrete enum
+/// dispatching to all available backends. This eliminates the generic
+/// parameter that previously propagated through all handler functions.
+/// See issue [#242](https://github.com/limn-works/scp/issues/242).
+pub struct RelayServer {
     config: RelayConfig,
-    storage: Arc<S>,
+    storage: Arc<BlobStorageBackend>,
     subscriptions: SubscriptionRegistry,
     next_connection_id: Arc<std::sync::atomic::AtomicU64>,
     /// Tracks active connection count per IP address.
@@ -198,17 +199,19 @@ pub struct RelayServer<S: BlobStorage> {
     publish_rate_limiter: PublishRateLimiter,
 }
 
-impl<S: BlobStorage + 'static> RelayServer<S> {
+impl RelayServer {
     /// Creates a new relay server with the given configuration and storage.
     ///
-    /// Accepts `Arc<S>` so the same storage instance can be shared between
-    /// the relay server and other components (e.g., broadcast projection
-    /// handlers). See spec section 18.11.5.
+    /// Accepts any type that implements [`Into<BlobStorageBackend>`], which
+    /// includes [`InMemoryBlobStorage`](super::storage::InMemoryBlobStorage)
+    /// and [`BlobStorageBackend`] itself. Also accepts `Arc<BlobStorageBackend>`
+    /// for sharing between the relay and other components (e.g., broadcast
+    /// projection handlers). See spec section 18.11.5.
     #[must_use]
-    pub fn new(config: RelayConfig, storage: Arc<S>) -> Self {
+    pub fn new(config: RelayConfig, storage: impl Into<Arc<BlobStorageBackend>>) -> Self {
         Self {
             config,
-            storage,
+            storage: storage.into(),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             next_connection_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             connection_tracker: Arc::new(RwLock::new(HashMap::new())),
@@ -402,7 +405,7 @@ pub enum RelayError {
 }
 
 /// Background task that periodically purges expired blobs.
-async fn ttl_expiry_task<S: BlobStorage>(storage: Arc<S>, interval: Duration) {
+async fn ttl_expiry_task(storage: Arc<BlobStorageBackend>, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
@@ -653,11 +656,11 @@ pub fn hex_encode_32(bytes: &[u8; 32]) -> String {
 // Relay handler passes through connection state; bundling into a struct
 // would add allocation overhead per-message with no readability gain.
 #[allow(clippy::too_many_arguments)]
-async fn handle_connection<S: BlobStorage + 'static>(
+async fn handle_connection(
     stream: TcpStream,
     connection_id: u64,
     ip: IpAddr,
-    storage: Arc<S>,
+    storage: Arc<BlobStorageBackend>,
     subscriptions: SubscriptionRegistry,
     config: RelayConfig,
     rate_limiter: PublishRateLimiter,
@@ -780,12 +783,12 @@ async fn handle_connection<S: BlobStorage + 'static>(
 
 /// Dispatches a client message to the appropriate handler.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn handle_client_message<S: BlobStorage>(
+async fn handle_client_message(
     msg: &ClientMessage,
     connection_id: u64,
     ip: IpAddr,
     tx: &mpsc::Sender<RelayMessage>,
-    storage: &Arc<S>,
+    storage: &Arc<BlobStorageBackend>,
     subscriptions: &SubscriptionRegistry,
     my_subscriptions: &Arc<RwLock<HashSet<[u8; 32]>>>,
     config: &RelayConfig,
@@ -926,7 +929,7 @@ async fn handle_client_message<S: BlobStorage>(
 // PUBLISH handler receives protocol-defined fields plus connection state;
 // grouping would obscure the protocol-level parameters.
 #[allow(clippy::too_many_arguments)]
-async fn handle_publish<S: BlobStorage>(
+async fn handle_publish(
     ref_id: Option<String>,
     routing_id: [u8; 32],
     recipient_hint: Option<[u8; 32]>,
@@ -934,7 +937,7 @@ async fn handle_publish<S: BlobStorage>(
     blob: &[u8],
     ip: IpAddr,
     tx: &mpsc::Sender<RelayMessage>,
-    storage: &Arc<S>,
+    storage: &Arc<BlobStorageBackend>,
     subscriptions: &SubscriptionRegistry,
     config: &RelayConfig,
     rate_limiter: &PublishRateLimiter,
@@ -1131,13 +1134,13 @@ async fn deliver_to_subscribers(
 // SUBSCRIBE handler receives protocol-defined fields plus connection state;
 // grouping would obscure the protocol-level parameters.
 #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
-async fn handle_subscribe<S: BlobStorage>(
+async fn handle_subscribe(
     ref_id: Option<String>,
     routing_id: [u8; 32],
     since: Option<u64>,
     connection_id: u64,
     tx: &mpsc::Sender<RelayMessage>,
-    storage: &Arc<S>,
+    storage: &Arc<BlobStorageBackend>,
     subscriptions: &SubscriptionRegistry,
     my_subscriptions: &Arc<RwLock<HashSet<[u8; 32]>>>,
     config: &RelayConfig,
@@ -1261,13 +1264,13 @@ async fn handle_unsubscribe(
 }
 
 /// Handles a QUERY operation.
-async fn handle_query<S: BlobStorage>(
+async fn handle_query(
     ref_id: Option<String>,
     routing_id: [u8; 32],
     since: Option<u64>,
     limit: Option<u32>,
     tx: &mpsc::Sender<RelayMessage>,
-    storage: &Arc<S>,
+    storage: &Arc<BlobStorageBackend>,
     config: &RelayConfig,
 ) {
     let effective_limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
@@ -1320,11 +1323,11 @@ async fn handle_query<S: BlobStorage>(
 }
 
 /// Handles a DELETE operation.
-async fn handle_delete<S: BlobStorage>(
+async fn handle_delete(
     ref_id: Option<String>,
     blob_id: [u8; 32],
     tx: &mpsc::Sender<RelayMessage>,
-    storage: &Arc<S>,
+    storage: &Arc<BlobStorageBackend>,
 ) {
     // Best-effort deletion -- always return OK.
     let _ = storage.delete(&blob_id).await;
@@ -1345,7 +1348,7 @@ async fn handle_delete<S: BlobStorage>(
 )]
 mod tests {
     use super::*;
-    use crate::native::storage::InMemoryBlobStorage;
+    use crate::native::storage::BlobStorageBackend;
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
 
@@ -1358,7 +1361,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
         addr
@@ -2022,7 +2025,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2073,7 +2076,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2104,7 +2107,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2133,7 +2136,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2183,7 +2186,7 @@ mod tests {
             ttl_check_interval: Duration::from_millis(100),
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2230,7 +2233,7 @@ mod tests {
             ttl_check_interval: Duration::from_millis(100),
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2294,7 +2297,7 @@ mod tests {
             ttl_check_interval: Duration::from_millis(100),
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2348,7 +2351,7 @@ mod tests {
             ..RelayConfig::default()
         };
         // Storage with capacity of 2.
-        let storage = Arc::new(InMemoryBlobStorage::with_capacity(2));
+        let storage = Arc::new(BlobStorageBackend::in_memory_with_capacity(2));
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2400,7 +2403,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 
@@ -2435,7 +2438,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (handle, _addr) = server.start().await.unwrap();
 
@@ -2450,7 +2453,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (handle, addr) = server.start().await.unwrap();
 
@@ -2485,7 +2488,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (handle, addr) = server.start().await.unwrap();
 
@@ -2514,7 +2517,7 @@ mod tests {
             delivery_jitter_ms: 1,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
 

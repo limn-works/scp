@@ -55,7 +55,7 @@ use scp_platform::traits::{
 };
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
-use scp_transport::native::storage::InMemoryBlobStorage;
+use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 use scp_transport::traits::{RoutingId, TransportAdapter, TransportEvent};
 
@@ -147,7 +147,7 @@ async fn start_relay() -> SocketAddr {
         delivery_jitter_ms: 0,
         ..RelayConfig::default()
     };
-    let storage = Arc::new(InMemoryBlobStorage::new());
+    let storage = Arc::new(BlobStorageBackend::in_memory());
     let server = RelayServer::new(config, storage);
     let (_handle, addr) = server.start().await.unwrap();
     addr

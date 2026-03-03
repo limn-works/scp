@@ -19,7 +19,7 @@ use scp_identity::{DidCache, DidDht, InMemoryDhtClient};
 use scp_node::{ApplicationNodeBuilder, TlsProvider};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::server::{RelayConfig, RelayServer};
-use scp_transport::native::storage::InMemoryBlobStorage;
+use scp_transport::native::storage::BlobStorageBackend;
 use tracing_subscriber::EnvFilter;
 
 // ---------------------------------------------------------------------------
@@ -172,7 +172,7 @@ async fn run_relay_only() {
         "starting scp-node in relay-only mode"
     );
 
-    let storage = Arc::new(InMemoryBlobStorage::new());
+    let storage = Arc::new(BlobStorageBackend::in_memory());
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {

@@ -1166,7 +1166,7 @@ mod tests {
     #[tokio::test]
     async fn send_request_success_still_works() {
         use crate::native::server::{RelayConfig, RelayServer};
-        use crate::native::storage::InMemoryBlobStorage;
+        use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
         use std::sync::Arc;
 
@@ -1176,7 +1176,7 @@ mod tests {
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
         let url = format!("ws://{addr}/scp/v1");
