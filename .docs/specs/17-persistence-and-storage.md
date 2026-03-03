@@ -170,7 +170,8 @@ impl<S: Storage> ProtocolStore<S> {
 
     // --- DID cache ---
     pub async fn cache_did_document(&self, did: &DID, doc: &[u8], expires_at: u64) -> Result<(), StoreError>;
-    pub async fn load_cached_did_document(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
+    // `now` parameter enables testable expiry checks without hidden clock dependencies.
+    pub async fn load_cached_did_document(&self, did: &DID, now: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
     // --- TOFU records ---
     pub async fn store_tofu_record(&self, did: &DID, record: &[u8]) -> Result<(), StoreError>;

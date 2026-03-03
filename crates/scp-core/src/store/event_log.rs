@@ -61,11 +61,12 @@ fn event_root_key(context_id: &str) -> Result<String, StoreError> {
 
 /// Builds the storage key for a Merkle tree node.
 ///
-/// Format: `context/{context_id}/event_tree/{level}/{index}`
+/// Format: `context/{context_id}/event_tree/{level:05}/{index:020}`
+/// Uses zero-padding for consistency with event key conventions.
 /// See spec section 17.3 and ADR-011.
 fn event_tree_node_key(context_id: &str, level: u32, index: u64) -> Result<String, StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
-    Ok(format!("context/{ctx}/event_tree/{level}/{index}"))
+    Ok(format!("context/{ctx}/event_tree/{level:05}/{index:020}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -79,16 +80,38 @@ impl<S: Storage> ProtocolStore<S> {
     /// `context/{context_id}/event/{seq:020d}` and updates the event
     /// count metadata at `context/{context_id}/event_meta/count`.
     ///
+    /// Enforces strict append-only monotonicity: `seq` must equal the
+    /// current event count (i.e., the next expected sequence number).
+    /// Out-of-order or duplicate appends are rejected.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::SerializationFailed`] if `seq` does not equal
+    /// the current event count (monotonicity violation), or if serialization
+    /// fails.
     /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    ///
+    /// # Consistency note
+    ///
+    /// The event count is maintained as a separate metadata key and is
+    /// updated after the event write. If `append_event` fails between the
+    /// event write and the count update, the count can drift behind the
+    /// actual number of stored events. Callers that detect this condition
+    /// should treat it as a data integrity issue.
     pub async fn append_event(
         &self,
         context_id: &str,
         seq: u64,
         event_hash: &[u8; 32],
     ) -> Result<(), StoreError> {
+        // Enforce strict monotonicity: seq must be exactly the current count.
+        let current_count = self.event_count(context_id).await?;
+        if seq != current_count {
+            return Err(StoreError::SerializationFailed(format!(
+                "non-monotonic event append: seq={seq}, expected={current_count}"
+            )));
+        }
+
         let key = event_key(context_id, seq)?;
         self.store_value(&key, &event_hash.to_vec()).await?;
 
@@ -121,6 +144,15 @@ impl<S: Storage> ProtocolStore<S> {
     /// prefix and filters by sequence bounds. Missing sequences within
     /// the range are silently skipped.
     ///
+    /// # Performance
+    ///
+    /// The thin `Storage` trait only provides `list_keys(prefix)` which
+    /// returns all keys under the prefix (O(N) in total events). This
+    /// method terminates early once keys exceed `end_suffix` (keys are
+    /// sorted lexicographically), avoiding unnecessary I/O for events
+    /// beyond the requested range. Storage backends that support native
+    /// range queries should be preferred for large event logs.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
@@ -140,12 +172,17 @@ impl<S: Storage> ProtocolStore<S> {
 
         let mut results = Vec::new();
         for key in keys {
-            if let Some(seq_str) = key.strip_prefix(&prefix)
-                && seq_str >= start_suffix.as_str()
-                && seq_str < end_suffix.as_str()
-                && let Some(data) = self.load_value::<Vec<u8>>(&key).await?
-            {
-                results.push(data);
+            if let Some(seq_str) = key.strip_prefix(&prefix) {
+                // Keys are sorted lexicographically; once we pass end_suffix
+                // no further keys can be in range — terminate early.
+                if seq_str >= end_suffix.as_str() {
+                    break;
+                }
+                if seq_str >= start_suffix.as_str() {
+                    if let Some(data) = self.load_value::<Vec<u8>>(&key).await? {
+                        results.push(data);
+                    }
+                }
             }
         }
         Ok(results)
@@ -155,6 +192,15 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Reads from the `event_meta/count` metadata key. Returns 0 if no
     /// events have been appended.
+    ///
+    /// # Consistency
+    ///
+    /// The count is maintained as a separate metadata key, updated after
+    /// each event write in `append_event`. If `append_event` fails between
+    /// the event write and the count update, the count can fall behind the
+    /// actual number of stored events. Callers that detect a mismatch
+    /// (e.g., an event exists at `seq == count`) should treat it as a data
+    /// integrity issue requiring recovery.
     ///
     /// # Errors
     ///
@@ -362,6 +408,31 @@ mod tests {
         assert_eq!(key, "context/ctx-1/event/00000000000000000042");
     }
 
+    #[tokio::test]
+    async fn append_event_rejects_out_of_order_sequence() {
+        let store = make_store();
+
+        store.append_event("ctx-1", 0, &test_hash(1)).await.unwrap();
+
+        // Attempting to append at seq=5 when count is 1 should fail.
+        let result = store.append_event("ctx-1", 5, &test_hash(2)).await;
+        assert!(result.is_err());
+        assert_eq!(store.event_count("ctx-1").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_event_rejects_duplicate_sequence() {
+        let store = make_store();
+
+        store.append_event("ctx-1", 0, &test_hash(1)).await.unwrap();
+        store.append_event("ctx-1", 1, &test_hash(2)).await.unwrap();
+
+        // Attempting to re-append at seq=0 should fail (duplicate).
+        let result = store.append_event("ctx-1", 0, &test_hash(3)).await;
+        assert!(result.is_err());
+        assert_eq!(store.event_count("ctx-1").await.unwrap(), 2);
+    }
+
     // -------------------------------------------------------------------
     // Merkle tree methods (SCP-PERSIST-017)
     // -------------------------------------------------------------------
@@ -439,7 +510,7 @@ mod tests {
     fn event_tree_node_key_follows_convention() {
         assert_eq!(
             event_tree_node_key("ctx-123", 2, 5).unwrap(),
-            "context/ctx-123/event_tree/2/5"
+            "context/ctx-123/event_tree/00002/00000000000000000005"
         );
     }
 }
