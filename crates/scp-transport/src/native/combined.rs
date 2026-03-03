@@ -43,6 +43,18 @@ pub fn system_clock() -> ClockFn {
 /// Returns `None` if the prefix is empty or consists entirely of `0xFF` bytes
 /// (no finite successor exists). Otherwise, increments the last non-`0xFF`
 /// byte and truncates.
+/// Converts a `Vec<u8>` to a `[u8; 32]` array, returning a `rusqlite::Error`
+/// if the length doesn't match.
+fn vec_to_array(v: Vec<u8>, field: &str) -> Result<[u8; 32], rusqlite::Error> {
+    v.try_into().map_err(|v: Vec<u8>| {
+        rusqlite::Error::InvalidColumnType(
+            0,
+            format!("{field} has wrong length: expected 32, got {}", v.len()),
+            rusqlite::types::Type::Blob,
+        )
+    })
+}
+
 fn prefix_successor(prefix: &str) -> Option<String> {
     let mut bytes = prefix.as_bytes().to_vec();
     // Pop trailing 0xFF bytes.
@@ -124,14 +136,25 @@ impl CombinedNodeStorage {
     }
 
     fn new_with_clock(dir: &Path, key: &[u8], clock: ClockFn) -> Result<Self, StorageError> {
+        // Ensure the target directory exists.
+        std::fs::create_dir_all(dir)
+            .map_err(|e| StorageError::Internal(format!("failed to create directory: {e}")))?;
+
         let db_path = dir.join("node.db");
         let conn = Connection::open(&db_path)
             .map_err(|e| StorageError::Internal(format!("failed to open database: {e}")))?;
 
-        // Apply SQLCipher encryption key.
+        // Apply SQLCipher encryption key and hardening PRAGMAs.
+        // Matches SqliteStorage settings for consistent security posture.
         let hex_key = hex::encode(key);
-        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
-            .map_err(|e| StorageError::Internal(format!("failed to set encryption key: {e}")))?;
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{hex_key}'\";\n\
+             PRAGMA cipher_page_size = 4096;\n\
+             PRAGMA kdf_iter = 256000;\n\
+             PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\
+             PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;"
+        ))
+        .map_err(|e| StorageError::Internal(format!("failed to set encryption key: {e}")))?;
 
         // Enable WAL mode for concurrent reads.
         conn.execute_batch("PRAGMA journal_mode = WAL;")
@@ -424,14 +447,8 @@ impl BlobStorage for CombinedNodeStorage {
                 let stored_at: u64 = row.get(3)?;
                 let blob: Vec<u8> = row.get(4)?;
 
-                let mut routing_id = [0u8; 32];
-                routing_id.copy_from_slice(&routing_id_vec);
-
-                let recipient_hint = hint_vec.map(|h| {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&h);
-                    arr
-                });
+                let routing_id: [u8; 32] = vec_to_array(routing_id_vec, "routing_id")?;
+                let recipient_hint = hint_vec.map(|h| vec_to_array(h, "recipient_hint")).transpose()?;
 
                 Ok(StoredBlob {
                     routing_id,
@@ -479,14 +496,9 @@ impl BlobStorage for CombinedNodeStorage {
                     let stored_at: u64 = row.get(3)?;
                     let blob: Vec<u8> = row.get(4)?;
 
-                    let mut blob_id = [0u8; 32];
-                    blob_id.copy_from_slice(&blob_id_vec);
-
-                    let recipient_hint = hint_vec.map(|h| {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&h);
-                        arr
-                    });
+                    let blob_id: [u8; 32] = vec_to_array(blob_id_vec, "blob_id")?;
+                    let recipient_hint =
+                        hint_vec.map(|h| vec_to_array(h, "recipient_hint")).transpose()?;
 
                     Ok(StoredBlob {
                         routing_id: *routing_id,

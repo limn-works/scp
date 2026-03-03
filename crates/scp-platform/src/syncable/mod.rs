@@ -17,6 +17,7 @@
 //! See SCP-PERSIST-064.
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::error::PlatformError;
 use crate::traits::Storage;
@@ -68,13 +69,20 @@ pub type Changeset = Vec<ChangeEntry>;
 /// `identity/`, `mls/`, etc.), so there is no collision risk.
 pub struct SyncableStorage<S: Storage> {
     inner: S,
+    /// Serializes mutations to ensure atomic seq allocation + log append.
+    /// Without this, concurrent `store`/`delete` calls could read the same
+    /// sequence number and overwrite each other's changelog entries.
+    seq_lock: Mutex<()>,
 }
 
 impl<S: Storage> SyncableStorage<S> {
     /// Wraps an existing [`Storage`] implementation with mutation tracking.
     #[must_use]
-    pub const fn new(inner: S) -> Self {
-        Self { inner }
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            seq_lock: Mutex::new(()),
+        }
     }
 
     /// Returns the next sequence number, reading from persistent storage.
@@ -204,7 +212,9 @@ impl<S: Storage> Storage for SyncableStorage<S> {
                 return Ok(());
             }
 
-            // Append mutation to changelog.
+            // Serialize seq allocation + log append to prevent concurrent
+            // store/delete calls from producing duplicate sequence numbers.
+            let _guard = self.seq_lock.lock().await;
             let seq = self.allocate_seq().await?;
             let entry = ChangeEntry {
                 seq,
@@ -234,7 +244,9 @@ impl<S: Storage> Storage for SyncableStorage<S> {
                 return Ok(());
             }
 
-            // Append delete mutation to changelog.
+            // Serialize seq allocation + log append to prevent concurrent
+            // store/delete calls from producing duplicate sequence numbers.
+            let _guard = self.seq_lock.lock().await;
             let seq = self.allocate_seq().await?;
             let entry = ChangeEntry {
                 seq,
@@ -276,13 +288,13 @@ impl<S: Storage> Storage for SyncableStorage<S> {
                 // Allow direct deletion of sync keys (e.g., for cleanup).
                 return self.inner.delete_prefix(&prefix).await;
             }
-            // List matching keys, filter out _sync/ keys, then delete each.
-            // This ensures delete_prefix never touches internal sync state.
+            // List matching keys, filter out _sync/ keys, then delete each
+            // through self.delete() to log each deletion in the changelog.
             let keys = self.inner.list_keys(&prefix).await?;
             let mut count: u64 = 0;
             for key in keys {
                 if !key.starts_with(SYNC_PREFIX) {
-                    self.inner.delete(&key).await?;
+                    self.delete(&key).await?;
                     count += 1;
                 }
             }

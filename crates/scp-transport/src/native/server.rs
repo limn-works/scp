@@ -835,29 +835,65 @@ async fn handle_connection(
     }
 
     // Cleanup: remove this connection's subscriptions.
-    // Collect the routing IDs under a read lock, then acquire the write lock
-    // only for the brief mutation -- minimises contention on the registry.
-    let routing_ids: Vec<[u8; 32]> = {
-        let my_subs = my_subscriptions.read().await;
-        my_subs.iter().copied().collect()
-    };
-    if !routing_ids.is_empty() {
-        let mut registry = subscriptions.write().await;
-        for routing_id in &routing_ids {
-            if let Some(entries) = registry.get_mut(routing_id) {
-                entries.retain(|e| e.connection_id != connection_id);
-                if entries.is_empty() {
-                    registry.remove(routing_id);
-                }
-            }
-        }
-    }
+    cleanup_connection_subscriptions(
+        connection_id,
+        &my_subscriptions,
+        &subscriptions,
+        persistence.as_ref(),
+    )
+    .await;
 
     // Drop the sender to signal the forward task to stop.
     drop(tx);
     let _ = forward_handle.await;
 
     Ok(())
+}
+
+/// Removes a disconnected connection's subscriptions from the registry.
+///
+/// Collects routing IDs under a read lock, then acquires the write lock
+/// only for the brief mutation — minimises contention on the registry.
+/// When a routing ID has no remaining subscribers, it is removed from
+/// both the registry and persistence (SCP-PERSIST-066).
+async fn cleanup_connection_subscriptions(
+    connection_id: u64,
+    my_subscriptions: &RwLock<HashSet<[u8; 32]>>,
+    subscriptions: &SubscriptionRegistry,
+    persistence: Option<&Arc<dyn RelayPersistence>>,
+) {
+    let routing_ids: Vec<[u8; 32]> = {
+        let my_subs = my_subscriptions.read().await;
+        my_subs.iter().copied().collect()
+    };
+    if routing_ids.is_empty() {
+        return;
+    }
+    let mut registry = subscriptions.write().await;
+    let mut removed_ids = Vec::new();
+    for routing_id in &routing_ids {
+        if let Some(entries) = registry.get_mut(routing_id) {
+            entries.retain(|e| e.connection_id != connection_id);
+            if entries.is_empty() {
+                registry.remove(routing_id);
+                removed_ids.push(*routing_id);
+            }
+        }
+    }
+    drop(registry);
+
+    // Persist removal for routing IDs that no longer have any subscribers.
+    if let Some(persistence) = persistence {
+        for routing_id in &removed_ids {
+            if let Err(e) = persistence.remove_subscription(routing_id) {
+                tracing::warn!(
+                    error = %e,
+                    routing_id = hex::encode(routing_id),
+                    "failed to remove persisted subscription on disconnect"
+                );
+            }
+        }
+    }
 }
 
 /// Dispatches a client message to the appropriate handler.
@@ -1351,6 +1387,7 @@ async fn handle_unsubscribe(
         } else {
             routing_id_removed = false;
         }
+        drop(registry);
     }
 
     {
