@@ -111,6 +111,47 @@ pub struct StoredValue<T> {
 /// Migration logic (spec section 17.10) uses this to detect stale data.
 pub const CURRENT_STORE_VERSION: u16 = 1;
 
+/// Current key-space schema version.
+///
+/// Used by `ProtocolStore::initialize()` to detect whether key-space
+/// migrations need to run on startup. Incremented when the key
+/// convention changes (e.g., key format changes, key renames).
+///
+/// See spec section 17.10.
+pub const CURRENT_SCHEMA_VERSION: u16 = 1;
+
+// ---------------------------------------------------------------------------
+// Migratable trait (SCP-PERSIST-018)
+// ---------------------------------------------------------------------------
+
+/// Trait for types that support lazy on-read migration.
+///
+/// Each `Migratable` type declares its `CURRENT_VERSION` and provides a
+/// `migrate` function that transforms raw `StoredValue` bytes from an
+/// older version to the current version. Migration functions are pure --
+/// no I/O, no side effects, independently testable.
+///
+/// On read, `ProtocolStore` checks the stored `StoredValue.version`. If it
+/// is behind `CURRENT_VERSION`, the migration chain is applied iteratively
+/// and the upgraded value is written back to storage. If the version is
+/// ahead, `StoreError::IncompatibleVersion` is returned.
+///
+/// The `data` parameter to `migrate` contains the raw `MessagePack` bytes
+/// of the full `StoredValue` envelope as originally stored. The migration
+/// function must deserialize the old format and produce the current type.
+///
+/// See spec section 17.10. See SCP-PERSIST-018.
+pub trait Migratable: Sized + Serialize + DeserializeOwned {
+    /// Current version number for this type.
+    const CURRENT_VERSION: u16;
+
+    /// Migrate from `old_version` raw stored bytes to the current version.
+    ///
+    /// `data` is the full raw bytes of the `StoredValue` envelope as stored.
+    /// Returns `None` if migration from this version is not supported.
+    fn migrate(old_version: u16, data: &[u8]) -> Option<Self>;
+}
+
 // ---------------------------------------------------------------------------
 // ProtocolStore
 // ---------------------------------------------------------------------------
@@ -191,6 +232,154 @@ impl<S: Storage> ProtocolStore<S> {
             None => Ok(None),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Version-aware read/write for Migratable types (SCP-PERSIST-018)
+    // -----------------------------------------------------------------------
+
+    /// Stores a `Migratable` value with its type-specific version.
+    ///
+    /// Wraps the value in a `StoredValue` envelope using the type's
+    /// `CURRENT_VERSION` rather than the global `CURRENT_STORE_VERSION`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_migratable<T: Migratable + Sync>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), StoreError> {
+        let envelope = StoredValue {
+            version: T::CURRENT_VERSION,
+            data: value,
+        };
+        let bytes = rmp_serde::to_vec(&envelope)
+            .map_err(|e| StoreError::SerializationFailed(e.to_string()))?;
+        self.storage.store(key, &bytes).await?;
+        Ok(())
+    }
+
+    /// Loads a `Migratable` value, applying migration if needed.
+    ///
+    /// If the stored version is behind `T::CURRENT_VERSION`, calls
+    /// `T::migrate()` to upgrade the data, then writes the upgraded
+    /// value back to storage so future reads do not re-migrate.
+    ///
+    /// If the stored version is ahead, returns
+    /// `StoreError::IncompatibleVersion`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::IncompatibleVersion`] if the stored version
+    /// is ahead of `T::CURRENT_VERSION`.
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization
+    /// or migration fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage fails.
+    pub async fn load_migratable<T: Migratable + Sync>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, StoreError> {
+        let Some(raw) = self.storage.retrieve(key).await? else {
+            return Ok(None);
+        };
+
+        // Peek at the version field without fully deserializing the data.
+        // We use `IgnoredAny` to skip the data field efficiently.
+        let peek: StoredValue<serde::de::IgnoredAny> = rmp_serde::from_slice(&raw)
+            .map_err(|e| StoreError::DeserializationFailed(e.to_string()))?;
+
+        if peek.version == T::CURRENT_VERSION {
+            // No migration needed — deserialize the data directly.
+            let full: StoredValue<T> = rmp_serde::from_slice(&raw)
+                .map_err(|e| StoreError::DeserializationFailed(e.to_string()))?;
+            return Ok(Some(full.data));
+        }
+
+        if peek.version > T::CURRENT_VERSION {
+            return Err(StoreError::IncompatibleVersion {
+                stored: peek.version,
+                current: T::CURRENT_VERSION,
+            });
+        }
+
+        // Version is behind — pass the full raw bytes to migrate().
+        match T::migrate(peek.version, &raw) {
+            Some(migrated) => {
+                // Write back the upgraded value.
+                self.store_migratable(key, &migrated).await?;
+                Ok(Some(migrated))
+            }
+            None => Err(StoreError::DeserializationFailed(format!(
+                "migration from version {} not supported for this type",
+                peek.version
+            ))),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema version startup check (SCP-PERSIST-019)
+    // -----------------------------------------------------------------------
+
+    /// Initializes the `ProtocolStore`, checking and setting the schema version.
+    ///
+    /// On startup:
+    /// - If `_meta/schema_version` is missing, writes the current version.
+    /// - If it matches the current version, proceeds normally.
+    /// - If it is behind, executes registered key-space migrations in order.
+    /// - If it is ahead, returns `StoreError::IncompatibleVersion`.
+    ///
+    /// Key-space migrations are the only blocking startup operation.
+    ///
+    /// See spec section 17.10. See SCP-PERSIST-019.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::IncompatibleVersion`] if the stored schema
+    /// version is ahead of the current version.
+    /// Returns [`StoreError::Storage`] if the underlying storage fails.
+    pub async fn initialize(&self) -> Result<(), StoreError> {
+        let key = "_meta/schema_version";
+        let stored_version: Option<u16> = self.load_value(key).await?;
+
+        match stored_version {
+            None => {
+                // Fresh store — write current version.
+                self.store_value(key, &CURRENT_SCHEMA_VERSION).await?;
+                Ok(())
+            }
+            Some(v) if v == CURRENT_SCHEMA_VERSION => {
+                // Up to date.
+                Ok(())
+            }
+            Some(v) if v > CURRENT_SCHEMA_VERSION => Err(StoreError::IncompatibleVersion {
+                stored: v,
+                current: CURRENT_SCHEMA_VERSION,
+            }),
+            Some(v) => {
+                // Behind current — run key-space migrations.
+                self.run_schema_migrations(v).await?;
+                // Update to current version after successful migration.
+                self.store_value(key, &CURRENT_SCHEMA_VERSION).await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Runs key-space migrations from `from_version` to `CURRENT_SCHEMA_VERSION`.
+    ///
+    /// Currently no key-space migrations are registered (schema version
+    /// has never changed). This hook is functional and ready for future
+    /// versions to register migration steps.
+    #[allow(clippy::unused_async)]
+    async fn run_schema_migrations(&self, _from_version: u16) -> Result<(), StoreError> {
+        // Migration steps would be registered here as the schema evolves.
+        // Example:
+        // if from_version < 2 { self.migrate_v1_to_v2().await?; }
+        // if from_version < 3 { self.migrate_v2_to_v3().await?; }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +441,182 @@ mod tests {
         let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
         let loaded: Option<String> = store.load_value("nonexistent").await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Migratable trait tests (SCP-PERSIST-018)
+    // -------------------------------------------------------------------
+
+    /// Test type at version 3, with migration from v1 and v2.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestMigratable {
+        value: String,
+        extra: u32,
+    }
+
+    impl Migratable for TestMigratable {
+        const CURRENT_VERSION: u16 = 3;
+
+        fn migrate(old_version: u16, data: &[u8]) -> Option<Self> {
+            match old_version {
+                1 => {
+                    // v1 stored data as a plain String in the envelope.
+                    let envelope: StoredValue<String> = rmp_serde::from_slice(data).ok()?;
+                    Some(Self {
+                        value: envelope.data,
+                        extra: 0, // default for v1 data
+                    })
+                }
+                2 => {
+                    // v2 stored data as (String, u32) tuple in the envelope.
+                    let envelope: StoredValue<(String, u32)> = rmp_serde::from_slice(data).ok()?;
+                    Some(Self {
+                        value: envelope.data.0,
+                        extra: envelope.data.1,
+                    })
+                }
+                _ => None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migratable_current_version_roundtrip() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let original = TestMigratable {
+            value: "hello".to_owned(),
+            extra: 42,
+        };
+
+        store
+            .store_migratable("test/migratable", &original)
+            .await
+            .unwrap();
+        let loaded: Option<TestMigratable> =
+            store.load_migratable("test/migratable").await.unwrap();
+        assert_eq!(loaded, Some(original));
+    }
+
+    #[tokio::test]
+    async fn migratable_migration_from_v1() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        // Manually store a v1 value (just a String).
+        let v1_data = "migrated-value".to_owned();
+        let envelope = StoredValue {
+            version: 1u16,
+            data: &v1_data,
+        };
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        store.storage.store("test/migrate", &bytes).await.unwrap();
+
+        // Load should trigger migration.
+        let loaded: Option<TestMigratable> = store.load_migratable("test/migrate").await.unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.value, "migrated-value");
+        assert_eq!(loaded.extra, 0); // default from migration
+
+        // Verify the migrated value was written back at v3.
+        let raw = store
+            .storage
+            .retrieve("test/migrate")
+            .await
+            .unwrap()
+            .unwrap();
+        let check: StoredValue<TestMigratable> = rmp_serde::from_slice(&raw).unwrap();
+        assert_eq!(check.version, 3);
+    }
+
+    #[tokio::test]
+    async fn migratable_rejects_future_version() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        // Manually store a future version.
+        let envelope = StoredValue {
+            version: 99u16,
+            data: "future",
+        };
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        store.storage.store("test/future", &bytes).await.unwrap();
+
+        let result: Result<Option<TestMigratable>, _> = store.load_migratable("test/future").await;
+        assert!(matches!(
+            result,
+            Err(StoreError::IncompatibleVersion {
+                stored: 99,
+                current: 3
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn migratable_returns_none_for_missing() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        let loaded: Option<TestMigratable> = store.load_migratable("nonexistent").await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Schema version startup check tests (SCP-PERSIST-019)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn initialize_writes_version_on_fresh_store() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+        store.initialize().await.unwrap();
+
+        let version: Option<u16> = store.load_value("_meta/schema_version").await.unwrap();
+        assert_eq!(version, Some(CURRENT_SCHEMA_VERSION));
+    }
+
+    #[tokio::test]
+    async fn initialize_proceeds_on_matching_version() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        // Pre-set the version.
+        store
+            .store_value("_meta/schema_version", &CURRENT_SCHEMA_VERSION)
+            .await
+            .unwrap();
+
+        // Should succeed without error.
+        store.initialize().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_errors_on_future_version() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        let future_version: u16 = CURRENT_SCHEMA_VERSION + 5;
+        store
+            .store_value("_meta/schema_version", &future_version)
+            .await
+            .unwrap();
+
+        let result = store.initialize().await;
+        assert!(matches!(
+            result,
+            Err(StoreError::IncompatibleVersion { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn initialize_triggers_migration_for_old_version() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        // Set a behind version. Currently no migrations exist, but the
+        // hook should still execute and update to current.
+        let old_version: u16 = 0;
+        store
+            .store_value("_meta/schema_version", &old_version)
+            .await
+            .unwrap();
+
+        store.initialize().await.unwrap();
+
+        // Version should be updated to current.
+        let version: Option<u16> = store.load_value("_meta/schema_version").await.unwrap();
+        assert_eq!(version, Some(CURRENT_SCHEMA_VERSION));
     }
 
     // -------------------------------------------------------------------
