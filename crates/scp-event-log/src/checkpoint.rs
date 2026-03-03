@@ -618,7 +618,6 @@ impl TruncatedEventLog {
             });
         }
         // leaf_index validated against pruned_leaf_hashes.len().
-
         #[allow(clippy::cast_possible_truncation)]
         let idx = leaf_index as usize;
         let leaf_hash = self.pruned_leaf_hashes[idx];
