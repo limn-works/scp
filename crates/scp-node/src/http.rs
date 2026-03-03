@@ -130,6 +130,14 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     /// Built from [`tls::CertificateData`] during [`ApplicationNodeBuilder::build`]
     /// via [`tls::build_reloadable_tls_config`] (spec section 18.6.3).
     pub(crate) tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// The TLS certificate resolver for ACME hot-reload.
+    ///
+    /// When `Some`, the ACME renewal loop can call [`CertResolver::update`]
+    /// to hot-swap certificates without restarting the server.
+    /// When `None` (no-domain mode), ACME is not active.
+    ///
+    /// See spec section 18.6.3 (auto-renewal).
+    pub(crate) cert_resolver: Option<Arc<crate::tls::CertResolver>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,28 +525,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
             .merge(relay_rt)
             .merge(projection);
 
-        // Spawn the dev API listener if configured. The JoinHandle is
-        // stored so we can detect early exit (e.g., bind failure) and
-        // propagate the error to the caller. Dev API always uses plain
-        // HTTP (loopback-only, spec section 18.10.5).
-        let dev_api_handle = if let (Some(dev_router), Some(dev_addr)) = (dev_router, dev_bind_addr)
-        {
-            let dev_shutdown = state.shutdown_token.clone();
-            Some(tokio::spawn(async move {
-                let dev_listener = tokio::net::TcpListener::bind(dev_addr).await.map_err(|e| {
-                    NodeError::Serve(format!("failed to bind dev API server on {dev_addr}: {e}"))
-                })?;
-                let local_addr = dev_listener.local_addr().unwrap_or(dev_addr);
-                tracing::info!(addr = %local_addr, "dev API server started");
-
-                axum::serve(dev_listener, dev_router)
-                    .with_graceful_shutdown(dev_shutdown.cancelled_owned())
-                    .await
-                    .map_err(|e| NodeError::Serve(format!("dev API server error: {e}")))
-            }))
-        } else {
-            None
-        };
+        let dev_api_handle = spawn_dev_api(dev_router, dev_bind_addr, state.shutdown_token.clone());
 
         let bind_addr = state.http_bind_addr;
 
@@ -635,6 +622,37 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
 }
 
 // ---------------------------------------------------------------------------
+// Dev API spawning (extracted for clippy::too_many_lines)
+// ---------------------------------------------------------------------------
+
+/// Spawns the dev API listener if configured.
+///
+/// Returns a `JoinHandle` so the caller can detect early exit (e.g., bind
+/// failure) and propagate the error. Dev API always uses plain HTTP
+/// (loopback-only, spec section 18.10.5).
+fn spawn_dev_api(
+    dev_router: Option<Router>,
+    dev_bind_addr: Option<SocketAddr>,
+    shutdown_token: CancellationToken,
+) -> Option<tokio::task::JoinHandle<Result<(), NodeError>>> {
+    let (Some(dev_router), Some(dev_addr)) = (dev_router, dev_bind_addr) else {
+        return None;
+    };
+    Some(tokio::spawn(async move {
+        let dev_listener = tokio::net::TcpListener::bind(dev_addr).await.map_err(|e| {
+            NodeError::Serve(format!("failed to bind dev API server on {dev_addr}: {e}"))
+        })?;
+        let local_addr = dev_listener.local_addr().unwrap_or(dev_addr);
+        tracing::info!(addr = %local_addr, "dev API server started");
+
+        axum::serve(dev_listener, dev_router)
+            .with_graceful_shutdown(shutdown_token.cancelled_owned())
+            .await
+            .map_err(|e| NodeError::Serve(format!("dev API server error: {e}")))
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -672,6 +690,7 @@ mod tests {
             shutdown_token: CancellationToken::new(),
             cors_origins,
             tls_config: None,
+            cert_resolver: None,
         })
     }
 

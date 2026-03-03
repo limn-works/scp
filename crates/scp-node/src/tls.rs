@@ -708,10 +708,28 @@ pub async fn serve_tls(
         let (tcp_stream, peer_addr) = tokio::select! {
             biased;
             () = shutdown_token.cancelled() => {
-                tracing::info!("TLS server shutting down");
-                // In-flight connection tasks will complete naturally as
-                // the runtime drains. The caller can await those tasks
-                // via the runtime shutdown sequence.
+                tracing::info!("TLS server shutting down, draining in-flight connections");
+                // Wait for in-flight connections to complete, with a 30s
+                // timeout to prevent indefinite hangs.
+                let drain_start = tokio::time::Instant::now();
+                let drain_timeout = Duration::from_secs(30);
+                loop {
+                    let count = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+                    if count == 0 {
+                        tracing::info!("all connections drained");
+                        break;
+                    }
+                    if drain_start.elapsed() >= drain_timeout {
+                        tracing::warn!(
+                            remaining = count,
+                            "drain timeout reached (30s), {count} connections still active"
+                        );
+                        break;
+                    }
+                    // Wait for a connection to finish, with remaining timeout.
+                    let remaining = drain_timeout.saturating_sub(drain_start.elapsed());
+                    let _ = tokio::time::timeout(remaining, connection_tracker.notified()).await;
+                }
                 return Ok(());
             }
             result = listener.accept() => {
@@ -734,14 +752,28 @@ pub async fn serve_tls(
         active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         tokio::spawn(async move {
-            // TLS handshake.
-            let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                Ok(stream) => stream,
-                Err(e) => {
+            // TLS handshake with timeout to prevent slowloris-style attacks.
+            let tls_stream = match tokio::time::timeout(
+                Duration::from_secs(10),
+                tls_acceptor.accept(tcp_stream),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
                     tracing::debug!(
                         peer = %peer_addr,
                         error = %e,
                         "TLS handshake failed"
+                    );
+                    active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    notify.notify_waiters();
+                    return;
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        peer = %peer_addr,
+                        "TLS handshake timed out (10s)"
                     );
                     active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     notify.notify_waiters();
@@ -758,7 +790,10 @@ pub async fn serve_tls(
             });
 
             // Serve with HTTP/2 auto-detection and WebSocket upgrade support.
-            let result = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+            // Limit concurrent HTTP/2 streams to prevent resource exhaustion.
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            builder.http2().max_concurrent_streams(100);
+            let result = builder
                 .serve_connection_with_upgrades(io, hyper_service)
                 .await;
 

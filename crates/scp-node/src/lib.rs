@@ -235,6 +235,20 @@ impl<S: Storage, B: BlobStorage> ApplicationNode<S, B> {
         &self.state.relay_url
     }
 
+    /// Returns the TLS certificate resolver for ACME hot-reload.
+    ///
+    /// Returns `Some` in domain mode when TLS is active, `None` in
+    /// no-domain mode. The ACME renewal loop should call
+    /// [`CertResolver::update`](tls::CertResolver::update) on the
+    /// returned resolver to hot-swap certificates without restarting
+    /// the server.
+    ///
+    /// See spec section 18.6.3 (auto-renewal).
+    #[must_use]
+    pub fn cert_resolver(&self) -> Option<&Arc<tls::CertResolver>> {
+        self.state.cert_resolver.as_ref()
+    }
+
     /// Registers a broadcast context so it appears in subsequent
     /// `GET /.well-known/scp` responses.
     ///
@@ -1225,7 +1239,7 @@ async fn build_domain_inner<
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
     // without restarting the server (spec section 18.6.3).
-    let (tls_server_config, _cert_resolver) =
+    let (tls_server_config, cert_resolver) =
         tls::build_reloadable_tls_config(&cert_data).map_err(NodeError::Tls)?;
 
     tracing::info!(
@@ -1250,6 +1264,7 @@ async fn build_domain_inner<
         shutdown_token: CancellationToken::new(),
         cors_origins,
         tls_config: Some(Arc::new(tls_server_config)),
+        cert_resolver: Some(cert_resolver),
     });
 
     Ok(ApplicationNode {
@@ -1340,6 +1355,7 @@ async fn build_no_domain_inner<
         shutdown_token: CancellationToken::new(),
         cors_origins,
         tls_config: None,
+        cert_resolver: None,
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).

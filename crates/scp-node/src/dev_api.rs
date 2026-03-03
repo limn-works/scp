@@ -535,6 +535,7 @@ mod tests {
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             tls_config: None,
+            cert_resolver: None,
         })
     }
 
