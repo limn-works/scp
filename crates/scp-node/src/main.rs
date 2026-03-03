@@ -196,14 +196,14 @@ async fn run_full_node() {
     let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
     let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
 
-    // The relay binds to an ephemeral port on localhost; the HTTP server
-    // (below) is the public-facing listener that bridges WebSocket
-    // connections to the internal relay.
+    // The relay binds to an ephemeral port on localhost; the public HTTP
+    // server (serve()) binds separately on http_addr.
     let node = match ApplicationNodeBuilder::new()
         .storage(Arc::new(InMemoryStorage::new()))
         .domain(&domain)
         .generate_identity_with(custody, did_method)
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .http_bind_addr(http_addr)
         .build()
         .await
     {
@@ -221,36 +221,9 @@ async fn run_full_node() {
         "application node identity ready"
     );
 
-    // Compose the HTTP server manually: .well-known/scp + /scp/v1
-    // WebSocket bridge. We don't use node.serve() because it tries to
-    // re-bind the relay's internal address (a pre-existing issue).
-    let merged = axum::Router::new()
-        .merge(node.well_known_router())
-        .merge(node.relay_router());
-
-    let listener = match tokio::net::TcpListener::bind(http_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(addr = %http_addr, error = %e, "failed to bind HTTP listener");
-            std::process::exit(1);
-        }
-    };
-
-    let local_addr = listener.local_addr().unwrap_or(http_addr);
-    tracing::info!(addr = %local_addr, "application node HTTP server started");
-
-    let shutdown = shutdown_signal();
-    tokio::select! {
-        result = axum::serve(listener, merged) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "application node exited with error");
-                std::process::exit(1);
-            }
-        }
-        () = shutdown => {
-            tracing::info!("shutdown signal received, stopping node");
-            node.shutdown();
-        }
+    if let Err(e) = node.serve(axum::Router::new()).await {
+        tracing::error!(error = %e, "application node exited with error");
+        std::process::exit(1);
     }
 
     tracing::info!("scp-node stopped");

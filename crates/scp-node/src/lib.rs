@@ -598,6 +598,10 @@ pub struct ApplicationNodeBuilder<
     tls_provider: Option<Arc<dyn TlsProvider>>,
     /// Bind address for the local dev API server. `None` = dev API disabled.
     local_api_addr: Option<SocketAddr>,
+    /// Bind address for the public HTTP server. Separate from the relay's
+    /// internal listener to avoid double-binding (#224). Defaults to
+    /// `0.0.0.0:443`.
+    http_bind_addr: Option<SocketAddr>,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -621,6 +625,7 @@ impl ApplicationNodeBuilder {
             nat_strategy: None,
             tls_provider: None,
             local_api_addr: None,
+            http_bind_addr: None,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -669,6 +674,7 @@ impl<
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
+            http_bind_addr: self.http_bind_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -697,6 +703,7 @@ impl<
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
+            http_bind_addr: self.http_bind_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -795,6 +802,24 @@ impl<
         self.local_api_addr = Some(addr);
         self
     }
+
+    /// Sets the bind address for the public HTTP server.
+    ///
+    /// This is the address where [`ApplicationNode::serve`] listens for
+    /// incoming HTTP/HTTPS connections (`.well-known/scp`, `/scp/v1`
+    /// WebSocket upgrade, broadcast projection endpoints, and any
+    /// application routes).
+    ///
+    /// This is distinct from the relay's internal bind address (set via
+    /// [`bind_addr`](Self::bind_addr)), which is a localhost-only listener
+    /// used for the internal WebSocket bridge.
+    ///
+    /// Defaults to `0.0.0.0:443` if not specified.
+    #[must_use]
+    pub const fn http_bind_addr(mut self, addr: SocketAddr) -> Self {
+        self.http_bind_addr = Some(addr);
+        self
+    }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, Dom, Id>
@@ -819,6 +844,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, 
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
+            http_bind_addr: self.http_bind_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -848,6 +874,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
+            http_bind_addr: self.http_bind_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -883,6 +910,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
+            http_bind_addr: self.http_bind_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -911,6 +939,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             nat_strategy: self.nat_strategy,
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
+            http_bind_addr: self.http_bind_addr,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -948,18 +977,12 @@ impl<
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
     pub async fn build(self) -> Result<ApplicationNode<S, B>, NodeError> {
-        // Type-state guarantees domain and identity_source are set.
-        // The runtime check is a defensive fallback — the type system
-        // prevents reaching this code without both fields configured.
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
-
-        // 2. Initialize storage.
         let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
 
-        // 3. Obtain identity.
         let (identity, document, did_method) = match identity_source {
             IdentitySource::Generate {
                 key_custody,
@@ -971,10 +994,7 @@ impl<
             IdentitySource::Explicit(e) => (e.identity, e.document, e.did_method),
         };
 
-        // 4. Bridge secret for internal WebSocket relay connection (#85).
         let bridge_secret: [u8; 32] = rand::random();
-
-        // 6. Start relay server — must be listening before DID publish.
         let bind_addr = self
             .bind_addr
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
@@ -984,18 +1004,17 @@ impl<
             ..RelayConfig::default()
         };
 
-        let blob_storage = self
-            .blob_storage
-            .ok_or(NodeError::MissingField("blob_storage"))?;
-        let blob_storage = Arc::new(blob_storage);
+        let blob_storage = Arc::new(
+            self.blob_storage
+                .ok_or(NodeError::MissingField("blob_storage"))?,
+        );
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
-
-        // 7. Generate dev API token if local_api was configured.
         let dev_token = self.local_api_addr.map(generate_dev_token);
+        let http_bind_addr = self
+            .http_bind_addr
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 443)));
 
-        // 8. Attempt TLS provisioning (§10.12.8 step 4).
-        //    Success → domain deployment; failure → NAT-traversed fallthrough.
         let tls_provider = resolve_tls(
             self.tls_provider,
             &domain,
@@ -1005,56 +1024,29 @@ impl<
 
         match tls_provider.provision().await {
             Ok(_cert_data) => {
-                // TLS provisioned successfully — proceed with domain deployment.
-                let relay_url = format!("wss://{domain}/scp/v1");
-
-                let mut document = document;
-                document.add_relay_service(&relay_url)?;
-
-                did_method.publish(&identity, &document).await?;
-
-                tracing::info!(
-                    domain = %domain,
-                    relay_url = %relay_url,
-                    bound_addr = %bound_addr,
-                    did = %identity.did,
-                    "application node started (domain mode)"
-                );
-
-                let state = Arc::new(http::NodeState {
-                    did: identity.did.clone(),
-                    relay_url: relay_url.clone(),
-                    broadcast_contexts: tokio::sync::RwLock::new(Vec::new()),
-                    relay_addr: bound_addr,
+                build_domain_inner(
+                    domain,
+                    identity,
+                    document,
+                    did_method,
+                    storage,
+                    shutdown_handle,
+                    bound_addr,
                     bridge_secret,
                     dev_token,
-                    dev_bind_addr: self.local_api_addr,
-                    projected_contexts: tokio::sync::RwLock::new(HashMap::new()),
+                    self.local_api_addr,
                     blob_storage,
                     relay_config,
-                    start_time: std::time::Instant::now(),
-                });
-
-                Ok(ApplicationNode {
-                    domain: Some(domain),
-                    relay: RelayHandle {
-                        bound_addr,
-                        shutdown_handle,
-                    },
-                    identity: IdentityHandle { identity, document },
-                    storage,
-                    state,
-                })
+                    http_bind_addr,
+                )
+                .await
             }
             Err(tls_err) => {
                 tracing::warn!(
-                    domain = %domain,
-                    error = %tls_err,
-                    "domain-based TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
+                    domain = %domain, error = %tls_err,
+                    "TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
                 );
-
                 let strategy = resolve_nat(self.nat_strategy, self.stun_server, self.bridge_relay);
-
                 build_no_domain_inner(
                     identity,
                     document,
@@ -1068,6 +1060,7 @@ impl<
                     self.local_api_addr,
                     blob_storage,
                     relay_config,
+                    Some(http_bind_addr),
                 )
                 .await
             }
@@ -1134,6 +1127,67 @@ fn resolve_nat(
 }
 
 // ---------------------------------------------------------------------------
+// Shared domain build logic (extracted for clippy::too_many_lines)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn build_domain_inner<
+    D: DidMethod + 'static,
+    S: Storage + 'static,
+    B: BlobStorage + 'static,
+>(
+    domain: String,
+    identity: ScpIdentity,
+    mut document: DidDocument,
+    did_method: Arc<D>,
+    storage: Arc<S>,
+    shutdown_handle: ShutdownHandle,
+    bound_addr: SocketAddr,
+    bridge_secret: [u8; 32],
+    dev_token: Option<String>,
+    dev_bind_addr: Option<SocketAddr>,
+    blob_storage: Arc<B>,
+    relay_config: RelayConfig,
+    http_bind_addr: SocketAddr,
+) -> Result<ApplicationNode<S, B>, NodeError> {
+    let relay_url = format!("wss://{domain}/scp/v1");
+    document.add_relay_service(&relay_url)?;
+    did_method.publish(&identity, &document).await?;
+
+    tracing::info!(
+        domain = %domain, relay_url = %relay_url,
+        bound_addr = %bound_addr, did = %identity.did,
+        "application node started (domain mode)"
+    );
+
+    let state = Arc::new(http::NodeState {
+        did: identity.did.clone(),
+        relay_url,
+        broadcast_contexts: tokio::sync::RwLock::new(Vec::new()),
+        relay_addr: bound_addr,
+        bridge_secret,
+        dev_token,
+        dev_bind_addr,
+        projected_contexts: tokio::sync::RwLock::new(HashMap::new()),
+        blob_storage,
+        relay_config,
+        start_time: std::time::Instant::now(),
+        http_bind_addr,
+    });
+
+    Ok(ApplicationNode {
+        domain: Some(domain),
+        relay: RelayHandle {
+            bound_addr,
+            shutdown_handle,
+        },
+        identity: IdentityHandle { identity, document },
+        storage,
+        state,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Shared no-domain build logic (used by HasNoDomain::build and domain fallthrough)
 // ---------------------------------------------------------------------------
 
@@ -1156,6 +1210,7 @@ async fn build_no_domain_inner<
     dev_bind_addr: Option<SocketAddr>,
     blob_storage: Arc<B>,
     relay_config: RelayConfig,
+    http_bind_addr: Option<SocketAddr>,
 ) -> Result<ApplicationNode<S, B>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
@@ -1189,6 +1244,8 @@ async fn build_no_domain_inner<
         "application node started (no-domain mode, §10.12.8)"
     );
 
+    let http_bind_addr = http_bind_addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 443)));
+
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         relay_url,
@@ -1201,6 +1258,7 @@ async fn build_no_domain_inner<
         blob_storage,
         relay_config,
         start_time: std::time::Instant::now(),
+        http_bind_addr,
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
@@ -1307,6 +1365,7 @@ impl<
             self.local_api_addr,
             blob_storage,
             relay_config,
+            self.http_bind_addr,
         )
         .await
     }

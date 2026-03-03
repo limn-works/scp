@@ -958,6 +958,7 @@ mod tests {
             blob_storage: Arc::new(storage),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
+            http_bind_addr: "0.0.0.0:443".parse::<SocketAddr>().unwrap(),
         })
     }
 
