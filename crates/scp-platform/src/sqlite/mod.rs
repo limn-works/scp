@@ -33,6 +33,13 @@ use crate::traits::Storage;
 ///
 /// See spec section 17.6.
 pub struct SqliteStorage {
+    // Uses `std::sync::Mutex` deliberately rather than `tokio::sync::Mutex`.
+    // All rusqlite operations are sub-millisecond (single-row KV on WAL-mode
+    // SQLite with no network I/O), so blocking the async runtime for that
+    // duration is preferable to the overhead and complexity of
+    // `spawn_blocking` per call. The mutex hold time is bounded by SQLite's
+    // single-writer guarantee — only one thread can hold the lock at a time,
+    // and each operation completes quickly.
     conn: Mutex<Connection>,
 }
 
@@ -56,9 +63,12 @@ impl SqliteStorage {
             .map_err(|e| PlatformError::StorageError(format!("failed to open database: {e}")))?;
 
         // Apply SQLCipher pragmas (spec section 17.6).
+        // The hex key format is `PRAGMA key = "x'<hex>'"` — a double-quoted
+        // string containing `x'...'`. This tells SQLCipher to interpret the
+        // value as raw hex key bytes rather than a passphrase.
         let hex_key = hex::encode(key);
         conn.execute_batch(&format!(
-            "PRAGMA key = 'x\"{hex_key}\"';\n\
+            "PRAGMA key = \"x'{hex_key}'\";\n\
              PRAGMA cipher_page_size = 4096;\n\
              PRAGMA kdf_iter = 256000;\n\
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\

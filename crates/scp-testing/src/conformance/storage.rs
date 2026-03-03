@@ -282,6 +282,21 @@ macro_rules! storage_conformance {
                     .await
                     .expect("list_keys should succeed");
                 assert_eq!(keys.len(), 10);
+
+                // Verify each value matches what was stored.
+                for i in 0u32..10 {
+                    let key = format!("concurrent/{i}");
+                    let expected = i.to_le_bytes().to_vec();
+                    let actual = storage
+                        .retrieve(&key)
+                        .await
+                        .expect("retrieve should succeed")
+                        .expect("key should exist");
+                    assert_eq!(
+                        actual, expected,
+                        "value mismatch for key {key}"
+                    );
+                }
             }
 
             #[tokio::test]

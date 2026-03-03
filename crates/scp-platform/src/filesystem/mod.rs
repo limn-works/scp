@@ -9,9 +9,13 @@
 //! See spec section 17.6.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::PlatformError;
 use crate::traits::Storage;
+
+/// Monotonic counter for generating unique temp file names across threads.
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Filesystem-backed storage adapter.
 ///
@@ -44,12 +48,28 @@ impl FilesystemStorage {
 }
 
 /// Converts a storage key to a filesystem path under `base_dir`.
-fn key_to_path(base_dir: &Path, key: &str) -> PathBuf {
+///
+/// # Errors
+///
+/// Returns [`PlatformError::StorageError`] if the key contains path traversal
+/// components (`.` or `..`) or resolves outside `base_dir`.
+fn key_to_path(base_dir: &Path, key: &str) -> Result<PathBuf, PlatformError> {
     let mut path = base_dir.to_path_buf();
     for component in key.split('/') {
+        if component == "." || component == ".." {
+            return Err(PlatformError::StorageError(format!(
+                "key contains forbidden path component: {component:?}"
+            )));
+        }
         path.push(component);
     }
-    path
+    // Belt-and-suspenders: verify the resolved path is still under base_dir.
+    if !path.starts_with(base_dir) {
+        return Err(PlatformError::StorageError(
+            "key resolves outside base directory".to_owned(),
+        ));
+    }
+    Ok(path)
 }
 
 /// Converts a filesystem path back to a storage key relative to `base_dir`.
@@ -104,8 +124,17 @@ fn remove_empty_parents(path: &Path, base_dir: &Path) {
     }
 }
 
-#[allow(clippy::manual_async_fn)]
+/// Converts a `tokio::task::JoinError` to a `PlatformError`.
+fn join_err(e: tokio::task::JoinError) -> PlatformError {
+    PlatformError::StorageError(format!("blocking task failed: {e}"))
+}
+
 impl Storage for FilesystemStorage {
+    // All file I/O is wrapped in `tokio::task::spawn_blocking` to avoid
+    // blocking the async runtime. Filesystem operations can stall on slow
+    // disks, NFS mounts, or under heavy I/O contention, making them unsafe
+    // to run directly in an async context.
+
     fn store(
         &self,
         key: &str,
@@ -114,31 +143,42 @@ impl Storage for FilesystemStorage {
         let path = key_to_path(&self.base_dir, key);
         let data = data.to_vec();
         async move {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    PlatformError::StorageError(format!("failed to create parent directory: {e}"))
+            let path = path?;
+            tokio::task::spawn_blocking(move || {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        PlatformError::StorageError(format!(
+                            "failed to create parent directory: {e}"
+                        ))
+                    })?;
+                }
+
+                // Atomic write: write to temp file, then rename.
+                // Temp file name includes PID + atomic counter for uniqueness
+                // across concurrent tasks (timestamp alone can collide).
+                let parent = path.parent().unwrap_or(&path);
+                let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let pid = std::process::id();
+                let temp_path = parent.join(format!(
+                    ".tmp.{}.{pid}.{counter}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_nanos())
+                ));
+
+                std::fs::write(&temp_path, &data).map_err(|e| {
+                    PlatformError::StorageError(format!("failed to write temp file: {e}"))
                 })?;
-            }
 
-            // Atomic write: write to temp file, then rename.
-            let parent = path.parent().unwrap_or(&path);
-            let temp_path = parent.join(format!(
-                ".tmp.{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos())
-            ));
+                std::fs::rename(&temp_path, &path).map_err(|e| {
+                    let _ = std::fs::remove_file(&temp_path);
+                    PlatformError::StorageError(format!("failed to rename temp file: {e}"))
+                })?;
 
-            std::fs::write(&temp_path, &data).map_err(|e| {
-                PlatformError::StorageError(format!("failed to write temp file: {e}"))
-            })?;
-
-            std::fs::rename(&temp_path, &path).map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                PlatformError::StorageError(format!("failed to rename temp file: {e}"))
-            })?;
-
-            Ok(())
+                Ok(())
+            })
+            .await
+            .map_err(join_err)?
         }
     }
 
@@ -148,13 +188,16 @@ impl Storage for FilesystemStorage {
     ) -> impl Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
         let path = key_to_path(&self.base_dir, key);
         async move {
-            match std::fs::read(&path) {
+            let path = path?;
+            tokio::task::spawn_blocking(move || match std::fs::read(&path) {
                 Ok(data) => Ok(Some(data)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(PlatformError::StorageError(format!(
                     "failed to read file: {e}"
                 ))),
-            }
+            })
+            .await
+            .map_err(join_err)?
         }
     }
 
@@ -162,7 +205,8 @@ impl Storage for FilesystemStorage {
         let path = key_to_path(&self.base_dir, key);
         let base_dir = self.base_dir.clone();
         async move {
-            match std::fs::remove_file(&path) {
+            let path = path?;
+            tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
                 Ok(()) => {
                     if let Some(parent) = path.parent() {
                         remove_empty_parents(parent, &base_dir);
@@ -173,7 +217,9 @@ impl Storage for FilesystemStorage {
                 Err(e) => Err(PlatformError::StorageError(format!(
                     "failed to delete file: {e}"
                 ))),
-            }
+            })
+            .await
+            .map_err(join_err)?
         }
     }
 
@@ -187,7 +233,7 @@ impl Storage for FilesystemStorage {
             let search_dir = if prefix.is_empty() {
                 base_dir.clone()
             } else {
-                let prefix_path = key_to_path(&base_dir, &prefix);
+                let prefix_path = key_to_path(&base_dir, &prefix)?;
                 if prefix_path.is_dir() {
                     prefix_path
                 } else {
@@ -197,25 +243,37 @@ impl Storage for FilesystemStorage {
                 }
             };
 
-            let mut files = Vec::new();
-            walk_dir(&search_dir, &mut files)?;
+            let bd = base_dir.clone();
+            let pf = prefix.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut files = Vec::new();
+                walk_dir(&search_dir, &mut files)?;
 
-            let mut keys: Vec<String> = files
-                .iter()
-                .filter_map(|path| {
-                    let key = path_to_key(&base_dir, path)?;
-                    if key.starts_with(&prefix) {
-                        Some(key)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            keys.sort();
-            Ok(keys)
+                let mut keys: Vec<String> = files
+                    .iter()
+                    .filter_map(|path| {
+                        let key = path_to_key(&bd, path)?;
+                        if key.starts_with(&pf) {
+                            Some(key)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                keys.sort();
+                Ok(keys)
+            })
+            .await
+            .map_err(join_err)?
         }
     }
 
+    /// Deletes all keys matching the given prefix. Returns the count of
+    /// successfully deleted files.
+    ///
+    /// Note: `FilesystemStorage` does not support transactional semantics.
+    /// If a deletion fails partway through, the returned count reflects
+    /// only the files actually removed (best-effort).
     fn delete_prefix(
         &self,
         prefix: &str,
@@ -223,41 +281,56 @@ impl Storage for FilesystemStorage {
         let base_dir = self.base_dir.clone();
         let prefix = prefix.to_owned();
         async move {
-            let mut files = Vec::new();
-            walk_dir(&base_dir, &mut files)?;
+            tokio::task::spawn_blocking(move || {
+                let mut files = Vec::new();
+                walk_dir(&base_dir, &mut files)?;
 
-            let matching: Vec<PathBuf> = files
-                .into_iter()
-                .filter(|path| {
-                    path_to_key(&base_dir, path).is_some_and(|key| key.starts_with(&prefix))
-                })
-                .collect();
+                let matching: Vec<PathBuf> = files
+                    .into_iter()
+                    .filter(|path| {
+                        path_to_key(&base_dir, path)
+                            .is_some_and(|key| key.starts_with(&prefix))
+                    })
+                    .collect();
 
-            let count = matching.len() as u64;
+                let mut deleted_count: u64 = 0;
 
-            for path in &matching {
-                if let Err(e) = std::fs::remove_file(path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(PlatformError::StorageError(format!(
-                        "failed to delete file: {e}"
-                    )));
+                for path in &matching {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => deleted_count += 1,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // File was already removed (e.g. concurrent deletion);
+                            // not counted.
+                        }
+                        Err(e) => {
+                            return Err(PlatformError::StorageError(format!(
+                                "failed to delete file: {e}"
+                            )));
+                        }
+                    }
                 }
-            }
 
-            for path in &matching {
-                if let Some(parent) = path.parent() {
-                    remove_empty_parents(parent, &base_dir);
+                for path in &matching {
+                    if let Some(parent) = path.parent() {
+                        remove_empty_parents(parent, &base_dir);
+                    }
                 }
-            }
 
-            Ok(count)
+                Ok(deleted_count)
+            })
+            .await
+            .map_err(join_err)?
         }
     }
 
     fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send {
         let path = key_to_path(&self.base_dir, key);
-        async move { Ok(path.is_file()) }
+        async move {
+            let path = path?;
+            tokio::task::spawn_blocking(move || Ok(path.is_file()))
+                .await
+                .map_err(join_err)?
+        }
     }
 }
 
@@ -267,14 +340,26 @@ mod tests {
 
     #[test]
     fn key_to_path_simple() {
-        let path = key_to_path(Path::new("/tmp/test-fs"), "context/abc/state");
+        let path = key_to_path(Path::new("/tmp/test-fs"), "context/abc/state").unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test-fs/context/abc/state"));
+    }
+
+    #[test]
+    fn key_to_path_rejects_dot_dot() {
+        let result = key_to_path(Path::new("/tmp/test-fs"), "../../etc/passwd");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn key_to_path_rejects_single_dot() {
+        let result = key_to_path(Path::new("/tmp/test-fs"), "foo/./bar");
+        assert!(result.is_err());
     }
 
     #[test]
     fn path_to_key_roundtrip() {
         let base = Path::new("/tmp/test-fs");
-        let path = key_to_path(base, "context/abc/state");
+        let path = key_to_path(base, "context/abc/state").unwrap();
         let key = path_to_key(base, &path);
         assert_eq!(key, Some("context/abc/state".to_owned()));
     }

@@ -12,9 +12,11 @@ fn make_sqlite_storage() -> SqliteStorage {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
     // Use a fixed 32-byte test key.
     let key = [0xABu8; 32];
-    // Keep the tempdir so it lives for the duration of the test. The OS
-    // reclaims on process exit.
-    let dir_path = dir.keep();
+    let dir_path = dir.path().to_path_buf();
+    // Leak the TempDir so it outlives the test — the directory must remain
+    // on disk while the SQLite connection is open. Cleanup is not critical
+    // for test directories; the OS reclaims on process exit.
+    let _ = Box::leak(Box::new(dir));
     SqliteStorage::new(&dir_path, &key).expect("SqliteStorage::new should succeed")
 }
 
