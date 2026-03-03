@@ -184,10 +184,15 @@ type PublishRateLimiter = Arc<tokio::sync::Mutex<HashMap<IpAddr, RateLimitBucket
 /// blob storage and subscriptions. The relay never inspects blob contents --
 /// it is a dumb store-and-forward pipe.
 ///
-/// Uses [`BlobStorageBackend`] for blob storage, which is a concrete enum
-/// dispatching to all available backends. This eliminates the generic
-/// parameter that previously propagated through all handler functions.
-/// See issue [#242](https://github.com/limn-works/scp/issues/242).
+/// # Storage backend
+///
+/// This struct previously took a generic `B: BlobStorage` parameter that
+/// propagated through every handler function, router builder, and test
+/// helper. That generic was replaced with concrete [`BlobStorageBackend`]
+/// enum dispatch (see [#242]), which provides the same extensibility without
+/// the generic propagation cost.
+///
+/// [#242]: https://github.com/limn-works/scp/issues/242
 pub struct RelayServer {
     config: RelayConfig,
     storage: Arc<BlobStorageBackend>,

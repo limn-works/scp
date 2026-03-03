@@ -54,10 +54,8 @@ pub struct BroadcastContext {
 /// Read on every `.well-known/scp` request to generate the response
 /// dynamically (spec section 18.6.4).
 ///
-/// # Type parameter
-///
-/// `B` is the blob storage backend, shared between the relay server and
-/// projection handlers via `Arc<BlobStorageBackend>` (spec section 18.11.5).
+/// Blob storage uses [`BlobStorageBackend`] (enum dispatch), shared between
+/// the relay server and projection handlers via `Arc` (spec section 18.11.5).
 pub struct NodeState {
     /// The operator's DID string.
     pub(crate) did: String,
