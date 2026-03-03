@@ -22,6 +22,7 @@ pub mod context;
 pub mod economy;
 pub mod event_log;
 pub mod identity;
+pub mod nonce;
 pub mod tools;
 pub mod ucan;
 
