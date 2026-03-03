@@ -18,6 +18,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
@@ -100,6 +101,13 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     /// Separate from `relay_addr` (the relay's internal listener) to avoid
     /// double-binding the same port (#224). Defaults to `0.0.0.0:8443`.
     pub(crate) http_bind_addr: SocketAddr,
+    /// Shared cancellation token for graceful shutdown of both the public
+    /// HTTPS listener and the dev API listener. Cancelled by
+    /// [`ApplicationNode::shutdown`].
+    ///
+    /// See SCP-245 action item: "Ensure graceful shutdown of dev API
+    /// listener alongside main server."
+    pub(crate) shutdown_token: CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +297,8 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
         Some(crate::dev_api::dev_router(Arc::clone(&self.state), token))
     }
 
+    /// Takes ownership of the node and starts serving HTTP traffic.
+    ///
     /// Binds HTTPS on the configured address, merging:
     ///
     /// 1. Application-provided routes (`app_router`)
@@ -299,64 +309,78 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
     /// SCP routes take precedence for `/.well-known/scp`, `/scp/v1`, and
     /// `/scp/broadcast/*`. All other paths route to `app_router`.
     ///
-    /// This method consumes the node. Callers that need to retain access
-    /// to the relay's [`ShutdownHandle`] should extract it before calling
-    /// `serve` (via [`ApplicationNode::relay`]).
+    /// The `shutdown` future is awaited as a graceful shutdown signal: when
+    /// it completes, the server stops accepting new connections, drains
+    /// in-flight requests, cancels the internal shutdown token (stopping
+    /// the dev API listener if running), and shuts down the relay server.
+    /// The node is consumed -- callers do not need to call
+    /// [`ApplicationNode::shutdown`] separately.
     ///
     /// When the dev API is configured (via [`ApplicationNodeBuilder::local_api`]),
     /// a separate tokio task is spawned to serve the dev API on the configured
     /// address. The dev API listener runs concurrently with the public HTTPS
-    /// listener. When the dev API is not configured, `serve()` behaves exactly
-    /// as before -- no additional listener is spawned.
+    /// listener and uses the node's internal [`CancellationToken`] for
+    /// graceful shutdown. If the dev API task exits early (e.g., bind
+    /// failure), the shutdown token is cancelled and the error is propagated.
+    /// Likewise, if the main server exits first, the dev API task is
+    /// cancelled via the shutdown token and aborted.
     ///
-    /// See spec sections 18.10.5 and 18.11.8.
+    /// See spec sections 18.6.2, 18.10.5, and 18.11.8.
     ///
     /// # Errors
     ///
-    /// Returns [`NodeError::Serve`] if the server cannot bind or encounters
-    /// a fatal I/O error.
-    pub async fn serve(self, app_router: Router) -> Result<(), NodeError> {
-        let well_known = self.well_known_router();
-        let relay = self.relay_router();
-        let projection = self.broadcast_projection_router();
+    /// Returns [`NodeError::Serve`] if either server cannot bind or
+    /// encounters a fatal I/O error.
+    pub async fn serve(
+        self,
+        app_router: Router,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), NodeError> {
+        let well_known = well_known_router(Arc::clone(&self.state));
+        let relay_rt = relay_router(Arc::clone(&self.state));
+        let projection = crate::projection::broadcast_projection_router(Arc::clone(&self.state));
 
         // Extract dev API configuration before building the merged router.
-        let dev_router = self.dev_router();
+        let dev_router = {
+            let token = self.state.dev_token.clone();
+            token.map(|t| crate::dev_api::dev_router(Arc::clone(&self.state), t))
+        };
         let dev_bind_addr = self.state.dev_bind_addr;
+
+        // Destructure self so we own the relay handle and state directly.
+        let relay = self.relay;
+        let state = self.state;
 
         // SCP routes take precedence: merge them last so they override
         // any conflicting paths in app_router.
-        let merged = app_router.merge(well_known).merge(relay).merge(projection);
+        let merged = app_router
+            .merge(well_known)
+            .merge(relay_rt)
+            .merge(projection);
 
-        // Spawn the dev API listener if configured.
-        if let (Some(dev_router), Some(dev_addr)) = (dev_router, dev_bind_addr) {
-            tokio::spawn(async move {
-                match tokio::net::TcpListener::bind(dev_addr).await {
-                    Ok(dev_listener) => {
-                        let local_addr = dev_listener.local_addr().unwrap_or(dev_addr);
-                        tracing::info!(
-                            addr = %local_addr,
-                            "dev API server started"
-                        );
-                        if let Err(e) = axum::serve(dev_listener, dev_router).await {
-                            tracing::error!(
-                                error = %e,
-                                "dev API server exited with error"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            addr = %dev_addr,
-                            error = %e,
-                            "failed to bind dev API server"
-                        );
-                    }
-                }
-            });
-        }
+        // Spawn the dev API listener if configured. The JoinHandle is
+        // stored so we can detect early exit (e.g., bind failure) and
+        // propagate the error to the caller.
+        let dev_api_handle = if let (Some(dev_router), Some(dev_addr)) = (dev_router, dev_bind_addr)
+        {
+            let dev_shutdown = state.shutdown_token.clone();
+            Some(tokio::spawn(async move {
+                let dev_listener = tokio::net::TcpListener::bind(dev_addr).await.map_err(|e| {
+                    NodeError::Serve(format!("failed to bind dev API server on {dev_addr}: {e}"))
+                })?;
+                let local_addr = dev_listener.local_addr().unwrap_or(dev_addr);
+                tracing::info!(addr = %local_addr, "dev API server started");
 
-        let bind_addr = self.state.http_bind_addr;
+                axum::serve(dev_listener, dev_router)
+                    .with_graceful_shutdown(dev_shutdown.cancelled_owned())
+                    .await
+                    .map_err(|e| NodeError::Serve(format!("dev API server error: {e}")))
+            }))
+        } else {
+            None
+        };
+
+        let bind_addr = state.http_bind_addr;
 
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
@@ -371,10 +395,50 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
             "application node HTTP server started (broadcast projection endpoints active)"
         );
 
-        axum::serve(listener, merged)
-            .await
-            .map_err(|e| NodeError::Serve(e.to_string()))?;
+        let main_server = axum::serve(listener, merged).with_graceful_shutdown(shutdown);
 
-        Ok(())
+        // If a dev API task is running, select! on both: if either exits
+        // early we propagate the result. This ensures a dev API bind
+        // failure doesn't go unnoticed while the main server keeps running.
+        let result = match dev_api_handle {
+            Some(handle) => {
+                tokio::pin!(handle);
+                tokio::select! {
+                    result = main_server => {
+                        // Main server exited — cancel shutdown token so the
+                        // dev API task also drains, then abort its handle.
+                        state.shutdown_token.cancel();
+                        handle.abort();
+                        result.map_err(|e| NodeError::Serve(e.to_string()))
+                    }
+                    result = &mut handle => {
+                        // Dev API exited early — cancel shutdown token so the
+                        // main server also drains.
+                        state.shutdown_token.cancel();
+                        // JoinError (task panic/cancel) or NodeError from inner.
+                        match result {
+                            Ok(inner) => inner,
+                            Err(join_err) => {
+                                Err(NodeError::Serve(
+                                    format!("dev API task failed: {join_err}")
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+            None => main_server
+                .await
+                .map_err(|e| NodeError::Serve(e.to_string())),
+        };
+
+        // Graceful shutdown: cancel the shutdown token (idempotent if
+        // already cancelled above) and stop the relay server. This ensures
+        // callers don't need to call shutdown() separately.
+        state.shutdown_token.cancel();
+        relay.shutdown_handle.shutdown();
+        tracing::info!("application node shut down");
+
+        result
     }
 }
