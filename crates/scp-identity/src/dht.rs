@@ -605,7 +605,9 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ) -> Result<MigrationProof, IdentityError> {
         let mut hasher = Sha256::new();
         hasher.update(DOMAIN_MIGRATION_V1);
+        hasher.update((identity.did.len() as u32).to_be_bytes());
         hasher.update(identity.did.as_bytes());
+        hasher.update((new_did.len() as u32).to_be_bytes());
         hasher.update(new_did.as_bytes());
         hasher.update(rotated_at.to_be_bytes());
         let digest = hasher.finalize();
@@ -953,10 +955,15 @@ pub fn verify_migration(
     rotated_at: u64,
 ) -> Result<bool, IdentityError> {
     // Step 1: Verify the migration proof signature.
-    // Reconstruct the signed digest: SHA-256(DOMAIN_MIGRATION_V1 || old_did || new_did || rotated_at).
+    // Reconstruct the signed digest:
+    //   SHA-256(DOMAIN_MIGRATION_V1 || len(old_did) || old_did || len(new_did) || new_did || rotated_at)
+    // Length prefixes (u32 big-endian) prevent concatenation ambiguity between
+    // variable-length DID strings.
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_MIGRATION_V1);
+    hasher.update((old_did.len() as u32).to_be_bytes());
     hasher.update(old_did.as_bytes());
+    hasher.update((new_did.len() as u32).to_be_bytes());
     hasher.update(new_did.as_bytes());
     hasher.update(rotated_at.to_be_bytes());
     let digest = hasher.finalize();
