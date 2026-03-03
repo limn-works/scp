@@ -1,0 +1,486 @@
+{
+  "project": "scp",
+  "description": "Content access control: identity-level DID-to-DID blocking (§3.6), per-member access key wrapping layer (§9.17, ADR-038), governance-gated content access actions (ADR-031), and unblocking with forward-only restoration. Three enforcement layers: key distribution denial (existing), SDK-mandated state destruction (new), access key wrapping (new). Three tiers: per-relationship in-context, identity-level cross-context, governance-gated per-context.",
+  "gates": [
+    {
+      "id": "gate-identity-blocking",
+      "name": "Identity-Level Blocking Foundation",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-CAC-001",
+        "SCP-CAC-002",
+        "SCP-CAC-003"
+      ]
+    },
+    {
+      "id": "gate-access-key-layer",
+      "name": "Content Access Key Layer (Layer 3)",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-CAC-004",
+        "SCP-CAC-005",
+        "SCP-CAC-006"
+      ]
+    },
+    {
+      "id": "gate-governance-content-access",
+      "name": "Governance Content Access Actions",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-CAC-007",
+        "SCP-CAC-008"
+      ]
+    },
+    {
+      "id": "gate-integration",
+      "name": "Content Access Integration Testing",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-CAC-009",
+        "SCP-CAC-010"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-CAC-001",
+      "title": "Implement identity private state block list storage",
+      "gate": "gate-identity-blocking",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/block_list.rs",
+        "crates/scp-core/src/identity/mod.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Implement block list storage in identity private state per §3.7.1. Two granularities: global block list (Tier 2, cross-context) and per-context block list (Tier 1, single context). Block lists are append-only event logs with commutative operations (BlockDID/UnblockDID for global, BlockDIDInContext/UnblockDIDInContext for per-context). Current state is derived by replaying the event log.\n\nAdd ProtocolStore methods: get_global_block_list(), is_globally_blocked(), get_context_block_list(), is_blocked_in_context(). Implementations MAY maintain materialized views for query performance.\n\nMulti-device sync is conflict-free because all operations are commutative — two devices can independently add blocks and the union is correct.",
+      "acceptanceCriteria": [
+        "BlockListEvent enum has four variants: BlockDID { target_did, timestamp }, UnblockDID { target_did, timestamp }, BlockDIDInContext { target_did, context_id, timestamp }, UnblockDIDInContext { target_did, context_id, timestamp }",
+        "get_global_block_list(did) returns Vec<DID> of all globally blocked DIDs",
+        "is_globally_blocked(blocker, target) returns bool",
+        "get_context_block_list(did, context_id) returns Vec<DID> of DIDs blocked in that context",
+        "is_blocked_in_context(blocker, target, context_id) returns bool",
+        "Block list state is derived from append-only event log replay",
+        "BlockDID followed by UnblockDID for the same target results in unblocked state",
+        "Operations are commutative: BlockDID(X) then BlockDID(Y) == BlockDID(Y) then BlockDID(X)",
+        "Block list events are persisted to ProtocolStore under identity private state keys",
+        "All types derive Debug, Clone, Serialize, Deserialize",
+        "Tests verify round-trip serialization of all BlockListEvent variants",
+        "Tests verify block/unblock lifecycle for both global and per-context lists",
+        "Tests verify commutativity of concurrent block operations"
+      ],
+      "actionItems": [
+        "Define BlockListEvent enum with four variants",
+        "Implement block list event log append and replay",
+        "Add ProtocolStore key constants for block list storage",
+        "Implement get_global_block_list and is_globally_blocked",
+        "Implement get_context_block_list and is_blocked_in_context",
+        "Add unit tests for all operations"
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/specs/03-identity.md", "section": "### 3.7.1 Block List Storage" },
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.7 Identity Private State" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-002",
+      "title": "Implement DID-to-DID blocking orchestration with cross-context propagation",
+      "gate": "gate-identity-blocking",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/blocking.rs",
+        "crates/scp-core/src/identity/mod.rs",
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Implement the blocking orchestration for Tiers 1 and 2 per §3.6. Tier 1 (in-context): block a DID in a single context — rotate sender key excluding the target (Layer 1, existing §9.16.3), trigger SDK-mandated destruction (Layer 2, §9.16.7), delete target's access key (Layer 3, §9.17). Tier 2 (global): block a DID across all shared contexts — store in identity private state (SCP-CAC-001), enumerate shared contexts, execute Tier 1 protocol in each.\n\nPropagation is best-effort and idempotent — if the SDK is offline for some contexts, the block executes on next connection. The identity private state event log is authoritative; per-context enforcement is the mechanism.\n\nBlocking is bidirectional: when Alice blocks Dave, both sides rotate their sender keys excluding each other (§9.16.3). The block notification is signed to prevent forgery.",
+      "acceptanceCriteria": [
+        "block_did_in_context(blocker, target, context_id) executes the three-layer block protocol for a single context",
+        "Layer 1: sender key rotation excluding target via existing rotate_sender_key() (§9.16.3)",
+        "Layer 2: SDK-mandated destruction event emitted so target's SDK destroys cached material",
+        "Layer 3: target's access key deleted from blocker's key store (SCP-CAC-004 dependency)",
+        "block_did_global(blocker, target) stores block in identity private state and propagates to all shared contexts",
+        "Propagation enumerates all contexts where both blocker and target are members",
+        "Propagation is idempotent — re-executing against an already-blocked context is a no-op",
+        "Propagation is best-effort — offline contexts are queued for execution on reconnection",
+        "Block notification is signed with blocker's Active Signing Key per §9.16.3",
+        "Bidirectional: both blocker and target rotate sender keys excluding each other",
+        "Tests verify Tier 1 block protocol execution in a single context",
+        "Tests verify Tier 2 propagation across multiple shared contexts",
+        "Tests verify idempotency of repeated block operations"
+      ],
+      "actionItems": [
+        "Implement block_did_in_context with three-layer enforcement",
+        "Implement block_did_global with identity private state storage",
+        "Implement shared context enumeration for propagation",
+        "Wire sender key rotation (Layer 1) from existing §9.16.3 implementation",
+        "Wire SDK-mandated destruction event (Layer 2)",
+        "Wire access key deletion (Layer 3) — depends on SCP-CAC-004",
+        "Implement idempotent propagation with offline queueing",
+        "Add tests for single-context and cross-context blocking"
+      ],
+      "blockedBy": ["SCP-CAC-001"],
+      "sources": [
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.6 Social Graph" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.16.3 Block Protocol" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.16.7 SDK-Mandated State Destruction (Layer 2)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-003",
+      "title": "Implement DID-to-DID unblocking with forward-only restoration",
+      "gate": "gate-identity-blocking",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/blocking.rs",
+        "crates/scp-core/src/identity/mod.rs"
+      ],
+      "description": "Implement unblocking for Tiers 1 and 2 per §9.16.8. Unblocking reverses key distribution denial (Layer 1) but does NOT restore historical access. The blocker removes the target from their block list. The blocker does NOT rotate their sender key — the current key remains valid. On next SenderKeyRequest from the previously-blocked party, the blocker's SDK checks the updated block list and responds with the current sender key.\n\nHistorical gap is permanent: content encrypted during the block period used sender key epochs the blocked party never received and cannot retroactively obtain. Access keys destroyed during the block (Layer 3) are not restored for historical content.\n\nTier stacking: if governance (Tier 3) has also revoked access, the identity-level unblock does NOT restore access. Both must be independently reversed.",
+      "acceptanceCriteria": [
+        "unblock_did_in_context(blocker, target, context_id) removes target from context block list",
+        "unblock_did_global(blocker, target) removes target from global block list and all per-context block lists",
+        "After unblock, SenderKeyRequest from previously-blocked party receives a response (key distribution denial reversed)",
+        "After unblock, target can decrypt blocker's future messages",
+        "After unblock, target CANNOT decrypt messages from during the block period (historical gap permanent)",
+        "Blocker does NOT rotate sender key on unblock (current key remains valid)",
+        "If governance Tier 3 has also revoked access, identity-level unblock alone does not restore access",
+        "Unblock events recorded in identity private state event log (UnblockDID or UnblockDIDInContext)",
+        "Tests verify forward-only restoration: future messages decryptable, historical messages not",
+        "Tests verify tier stacking: governance revocation blocks access even after identity unblock"
+      ],
+      "actionItems": [
+        "Implement unblock_did_in_context with block list removal",
+        "Implement unblock_did_global with global + per-context block list removal",
+        "Wire sender key request handler to check updated block list",
+        "Implement tier stacking check (governance revocation overrides identity unblock)",
+        "Add tests for forward-only restoration",
+        "Add tests for tier stacking"
+      ],
+      "blockedBy": ["SCP-CAC-002"],
+      "sources": [
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.16.8 Unblocking (Forward-Only Restoration)" },
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.6 Social Graph" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-004",
+      "title": "Implement per-member access key lifecycle",
+      "gate": "gate-access-key-layer",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/access_keys/mod.rs",
+        "crates/scp-core/src/crypto/access_keys/lifecycle.rs",
+        "crates/scp-core/src/crypto/access_keys/wire.rs",
+        "crates/scp-core/src/crypto/mod.rs",
+        "crates/scp-core/src/store/mod.rs"
+      ],
+      "description": "Implement per-member access key generation, distribution, and storage per ADR-038 §2. Each context member holds an AES-256 access key generated at join time. Access keys are distributed via the pull-based protocol (same pattern as sender keys, §9.16.2): AccessKeyRequest/AccessKeyResponse wire types using HPKE with ephemeral X25519 keypairs.\n\nAccessKey struct: 32-byte AES-256 key, context_id, member_did, epoch counter. Key material uses Zeroize/ZeroizeOnDrop for secure cleanup. Persisted to ProtocolStore under context/{context_id}/access_key/{did_hex}.\n\nAccess key generation is triggered by AddMember governance action execution. The executor generates the key and distributes it to the new member.",
+      "acceptanceCriteria": [
+        "AccessKey struct with 32-byte key, context_id, member_did, epoch fields; derives Zeroize and ZeroizeOnDrop",
+        "generate_access_key(context_id, member_did) returns a cryptographically random AccessKey with epoch 0",
+        "AccessKeyRequest wire type with requester_did, context_id, wrapping_pubkey (ephemeral X25519), signature",
+        "AccessKeyResponse wire type with context_id, member_did, epoch, hpke_sealed_key, ephemeral_pubkey",
+        "Distribution uses HPKE: ECDH between ephemeral secret and requester wrapping pubkey, HKDF derive, AES-128-GCM encrypt the access key",
+        "Access key persisted to ProtocolStore under context/{context_id}/access_key/{did_hex}",
+        "Access key epoch counter persisted under context/{context_id}/access_key/{did_hex}/epoch",
+        "Revocation deletes the access key and increments epoch (new key on restoration)",
+        "Context-wide rotation generates new keys for all members, old keys retained for historical access",
+        "All wire types derive Debug, Clone, Serialize, Deserialize",
+        "Tests verify key generation produces 32 random bytes",
+        "Tests verify HPKE distribution round-trip (request -> response -> unwrap)",
+        "Tests verify ProtocolStore persistence round-trip"
+      ],
+      "actionItems": [
+        "Create crypto/access_keys/ module directory",
+        "Define AccessKey struct with Zeroize/ZeroizeOnDrop",
+        "Implement generate_access_key",
+        "Define AccessKeyRequest and AccessKeyResponse wire types",
+        "Implement HPKE-based distribution (reuse sender key distribution pattern)",
+        "Add ProtocolStore key constants and persistence methods",
+        "Implement revocation (key deletion + epoch increment)",
+        "Implement context-wide rotation",
+        "Add unit tests"
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-038: Content Access Key Layer" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.17.2 Access Key Lifecycle" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-005",
+      "title": "Implement CEK wrapping and unwrapping in encryption pipeline",
+      "gate": "gate-access-key-layer",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/access_keys/wrapping.rs",
+        "crates/scp-core/src/crypto/access_keys/mod.rs"
+      ],
+      "description": "Implement CEK generation, AES-256-KW wrapping/unwrapping, and the WrappedContent wire format per ADR-038 §§2,4. Each message gets a fresh 32-byte CEK. Content is encrypted with AES-256-GCM using the CEK. The CEK is wrapped with each recipient's access key using AES-256-KW (RFC 3394), producing a 40-byte wrapped key (32-byte CEK + 8-byte integrity check).\n\nWrappedContent struct: ciphertext, nonce (12 bytes), wrapped_ceks (Vec<WrappedCek>), content_hash (SHA-256 of plaintext). wrapped_ceks uses truncated DID hashes (first 8 bytes of SHA-256(member_did)) as lookup keys to avoid publishing full DIDs.\n\nLayer ordering: access key wrapping occurs BEFORE sender key encryption (encrypted contexts) or broadcast key encryption (broadcast contexts).",
+      "acceptanceCriteria": [
+        "ContentEncryptionKey::generate() produces a fresh 32-byte random key with Zeroize/ZeroizeOnDrop",
+        "wrap_cek(cek, access_key) uses AES-256-KW (RFC 3394) and produces 40-byte output",
+        "unwrap_cek(wrapped_cek, access_key) verifies integrity check and returns ContentEncryptionKey",
+        "unwrap_cek with wrong access key returns CryptoError (integrity check fails)",
+        "wrap_content(plaintext, recipients) generates CEK, encrypts with AES-256-GCM, wraps CEK for each recipient",
+        "unwrap_content(wrapped, access_key) finds own wrapped CEK by member_id, unwraps, decrypts, verifies content_hash",
+        "member_id is first 8 bytes of SHA-256(member_did)",
+        "unwrap_content with member not in wrapped_ceks returns CryptoError::NotRecipient",
+        "unwrap_content with tampered content_hash returns CryptoError::IntegrityFailure",
+        "WrappedContent serializable via MessagePack (round-trip test passes)",
+        "WrappedCek uses Vec<WrappedCek> (not HashMap) for deterministic serialization",
+        "Tests verify wrap/unwrap round-trip for single and multiple recipients",
+        "Tests verify integrity check failure on wrong access key",
+        "Tests verify content_hash verification catches tampering"
+      ],
+      "actionItems": [
+        "Implement ContentEncryptionKey struct with generate()",
+        "Implement AES-256-KW wrap_cek and unwrap_cek",
+        "Define WrappedCek and WrappedContent structs",
+        "Implement member_id computation (truncated SHA-256 of DID)",
+        "Implement wrap_content (CEK generation + AES-GCM encrypt + per-recipient KW wrap)",
+        "Implement unwrap_content (lookup + KW unwrap + AES-GCM decrypt + hash verify)",
+        "Add MessagePack serialization for WrappedContent",
+        "Add unit tests for all paths including error cases"
+      ],
+      "blockedBy": ["SCP-CAC-004"],
+      "sources": [
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-038: Content Access Key Layer" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.17.1 Key Architecture" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.17.3 Wire Format" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-006",
+      "title": "Implement SDK-mandated state destruction on block event",
+      "gate": "gate-access-key-layer",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/mod.rs",
+        "crates/scp-core/src/crypto/access_keys/lifecycle.rs",
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Implement Layer 2 (SDK-mandated state destruction) per §9.16.7. When a block event is received and verified, the blocked party's SDK MUST destroy all locally cached material from the blocking party: cached sender keys (all epochs), cached plaintext (decrypted message content), and cached access keys.\n\nDestruction MUST occur before the SDK processes any subsequent messages — the block handler is synchronous with respect to message processing. This is a protocol requirement for compliant clients.\n\nAlso wire the complementary side: when the blocker's SDK processes a block it initiated, it deletes the target's access key from its local store (Layer 3 enforcement on the blocker's side).",
+      "acceptanceCriteria": [
+        "On verified block notification, blocked party's SDK deletes all sender key epochs from the blocker",
+        "On verified block notification, blocked party's SDK purges cached plaintext originating from the blocker",
+        "On verified block notification, blocked party's SDK deletes the blocker's access key from local store",
+        "Destruction occurs synchronously before processing subsequent messages (not in a background task)",
+        "On block initiation, blocker's SDK deletes the target's access key from local store",
+        "Block notification signature is verified against blocker's Active Signing Key before destruction",
+        "Invalid block notification signature causes discard + anomaly log (no destruction)",
+        "Tests verify sender key deletion on verified block notification",
+        "Tests verify access key deletion on both sides (blocker and blocked)",
+        "Tests verify invalid signature causes discard without destruction"
+      ],
+      "actionItems": [
+        "Add block notification handler in sender key module",
+        "Implement sender key epoch purge for specific DID",
+        "Implement plaintext cache purge for specific DID",
+        "Implement access key deletion for specific DID",
+        "Wire block handler synchronously in message processing pipeline",
+        "Wire blocker-side access key deletion on block initiation",
+        "Add signature verification before destruction",
+        "Add unit tests for all destruction paths"
+      ],
+      "blockedBy": ["SCP-CAC-004"],
+      "sources": [
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.16.7 SDK-Mandated State Destruction (Layer 2)" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.16.3 Block Protocol" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-007",
+      "title": "Add content access governance actions to GovernanceAction enum and wire execution",
+      "gate": "gate-governance-content-access",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/governance/mod.rs",
+        "crates/scp-core/src/context/manager.rs",
+        "crates/scp-core/src/context/mod.rs"
+      ],
+      "description": "Add the five content access GovernanceAction variants to the enum per ADR-031: RevokeReadAccess { did, scope: RevocationScope }, RestoreReadAccess { did }, RevokeWriteAccess { did, scope: RevocationScope }, RestoreWriteAccess { did }, RotateContentKeys { reason: Option<String> }. Add RevocationScope enum with Full and FutureOnly variants.\n\nAdd corresponding GovernanceActionResult variants: ReadAccessRevoked, ReadAccessRestored, WriteAccessRevoked, WriteAccessRestored, ContentKeysRotated.\n\nWire execution in execute_governance_action() in ContextManager:\n- RevokeReadAccess(Full): delete target's access key from all members, emit AccessKeyRevoked event\n- RevokeReadAccess(FutureOnly): add target to exclusion list for future CEK wrapping\n- RestoreReadAccess: generate new access key for target, distribute via pull protocol\n- RevokeWriteAccess(Full): destroy target's sender/broadcast key, revoke messagesWrite UCAN, suppress historical content\n- RevokeWriteAccess(FutureOnly): revoke messagesWrite UCAN only\n- RestoreWriteAccess: re-grant messagesWrite UCAN, forward-only\n- RotateContentKeys: rotate all access keys context-wide\n\nThis story depends on SCP-CAC-004/005 (access key layer) and on SCP-269 (GovernanceAction enum expansion) from the governance-integration PRD — the GovernanceAction enum and GovernanceActionResult enum must already include the content access variants before this story can wire their execution. SCP-269 is a cross-PRD dependency (governance-integration.json) and cannot be listed in blockedBy.",
+      "acceptanceCriteria": [
+        "GovernanceAction enum includes RevokeReadAccess { did, scope: RevocationScope }",
+        "GovernanceAction enum includes RestoreReadAccess { did }",
+        "GovernanceAction enum includes RevokeWriteAccess { did, scope: RevocationScope }",
+        "GovernanceAction enum includes RestoreWriteAccess { did }",
+        "GovernanceAction enum includes RotateContentKeys { reason: Option<String> }",
+        "RevocationScope enum has Full and FutureOnly variants",
+        "GovernanceActionResult includes ReadAccessRevoked, ReadAccessRestored, WriteAccessRevoked, WriteAccessRestored, ContentKeysRotated",
+        "RevokeReadAccess(Full) execution deletes target's access key from all members' stores",
+        "RevokeReadAccess(FutureOnly) execution adds target to exclusion list",
+        "RestoreReadAccess execution generates new access key for target (new epoch)",
+        "RevokeWriteAccess(Full) execution destroys target's sender key and revokes messagesWrite UCAN",
+        "RevokeWriteAccess(FutureOnly) execution revokes messagesWrite UCAN only",
+        "RestoreWriteAccess execution re-grants messagesWrite UCAN (forward-only)",
+        "RotateContentKeys execution rotates all access keys context-wide",
+        "Content access actions do NOT remove the target from the context (membership/access decoupling per §5.9)",
+        "Tests verify execution of each content access action through governance path",
+        "Tests verify membership/access decoupling: revoked member remains in context"
+      ],
+      "actionItems": [
+        "Add 5 content access variants to GovernanceAction enum",
+        "Add RevocationScope enum",
+        "Add 5 GovernanceActionResult variants",
+        "Implement RevokeReadAccess execution (Full and FutureOnly paths)",
+        "Implement RestoreReadAccess execution",
+        "Implement RevokeWriteAccess execution (Full and FutureOnly paths)",
+        "Implement RestoreWriteAccess execution",
+        "Implement RotateContentKeys execution",
+        "Wire all in execute_governance_action() match arms",
+        "Add tests for each execution path"
+      ],
+      "blockedBy": ["SCP-CAC-005"],
+      "sources": [
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-038: Content Access Key Layer" },
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.17 Content Access Key Layer" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-008",
+      "title": "Replace BlockAuthor with RevokeWriteAccess in broadcast context wiring",
+      "gate": "gate-governance-content-access",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/broadcast.rs",
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Update broadcast context author removal to use RevokeWriteAccess instead of BlockAuthor per §5.14.8. The existing block_broadcast_author() code path in ContextManager should route through RevokeWriteAccess { did, scope } governance action.\n\nRevokeWriteAccess(Full) in broadcast mode: destroy author's broadcast key, revoke messagesWrite UCAN, deny key requests for that author, emit WriteAccessRevoked event. RevokeWriteAccess(FutureOnly): revoke messagesWrite UCAN only, existing broadcast key remains for historical decryption.\n\nRemove any standalone block_broadcast_author() method or make it delegate to governance. Remove the AuthorBlocked event type — replace with WriteAccessRevoked { did, scope }.\n\nRestoreWriteAccess in broadcast mode: re-grant messagesWrite UCAN, author generates new broadcast key (new epoch). Forward-only — previously suppressed content remains suppressed.",
+      "acceptanceCriteria": [
+        "No standalone block_broadcast_author() method on ContextManager (removed or delegates to governance)",
+        "Author removal in broadcast contexts uses GovernanceAction::RevokeWriteAccess { did, scope }",
+        "RevokeWriteAccess(Full) in broadcast mode: destroys author broadcast key, revokes messagesWrite UCAN, denies key requests",
+        "RevokeWriteAccess(FutureOnly) in broadcast mode: revokes messagesWrite UCAN only",
+        "RestoreWriteAccess in broadcast mode: re-grants messagesWrite UCAN, author generates new broadcast key",
+        "AuthorBlocked event type replaced with WriteAccessRevoked { did, scope }",
+        "No references to BlockAuthor or AuthorBlocked remain in broadcast module",
+        "Tests verify author removal through governance RevokeWriteAccess path",
+        "Tests verify RestoreWriteAccess author restoration in broadcast context"
+      ],
+      "actionItems": [
+        "Remove or refactor block_broadcast_author() to use RevokeWriteAccess",
+        "Wire RevokeWriteAccess execution for broadcast mode in ContextManager",
+        "Wire RestoreWriteAccess execution for broadcast mode",
+        "Replace AuthorBlocked event with WriteAccessRevoked",
+        "Remove all BlockAuthor/AuthorBlocked references from broadcast module",
+        "Add tests for governance-gated author removal and restoration"
+      ],
+      "blockedBy": ["SCP-CAC-007"],
+      "sources": [
+        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.8 Blocking" },
+        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.10 Event Log" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-009",
+      "title": "Integration test: full block/unblock lifecycle across context types",
+      "gate": "gate-integration",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/tests/content_access_integration.rs"
+      ],
+      "description": "Integration test exercising the full block/unblock lifecycle across encrypted and broadcast context types. Tests all three tiers (in-context, global, governance-gated), all three enforcement layers (key distribution denial, SDK-mandated destruction, access key wrapping), and forward-only restoration semantics.",
+      "acceptanceCriteria": [
+        "Test creates an encrypted context with Alice, Bob, Dave",
+        "Tier 1 test: Alice blocks Dave in the encrypted context. Dave cannot decrypt Alice's future messages. Dave can still decrypt Bob's messages. Alice's historical messages become undecryptable by Dave.",
+        "Tier 1 unblock test: Alice unblocks Dave. Dave can decrypt Alice's future messages. Dave still cannot decrypt Alice's messages from during the block (forward-only).",
+        "Tier 2 test: Alice globally blocks Eve. Eve is blocked in all shared contexts simultaneously.",
+        "Tier 2 unblock test: Alice globally unblocks Eve. Eve regains access in all shared contexts, forward-only.",
+        "Test creates a broadcast context with Author and Subscriber",
+        "Broadcast test: governance RevokeWriteAccess removes Author. Subscribers cannot get Author's new key. RestoreWriteAccess restores Author, forward-only.",
+        "Tier stacking test: both Alice (Tier 1) and governance (Tier 3) revoke Dave's access. Reversing only one does not restore access. Both must be reversed.",
+        "Layer verification: after Full revocation, target's access key is gone (Layer 3), cached material is destroyed (Layer 2), and key requests are denied (Layer 1)",
+        "Forward-only verification: after unblock/restore, historical messages remain inaccessible"
+      ],
+      "actionItems": [
+        "Create integration test file",
+        "Implement Tier 1 block/unblock test in encrypted context",
+        "Implement Tier 2 global block/unblock test across multiple contexts",
+        "Implement Tier 3 governance-gated block/unblock test in broadcast context",
+        "Implement tier stacking test",
+        "Implement three-layer enforcement verification",
+        "Implement forward-only restoration verification"
+      ],
+      "blockedBy": ["SCP-CAC-003", "SCP-CAC-006", "SCP-CAC-008"],
+      "sources": [
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.6 Social Graph" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.16 Sender-Side Key Layer (Blocking)" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.17 Content Access Key Layer" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-CAC-010",
+      "title": "Integration test: governance-gated content access control",
+      "gate": "gate-integration",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/tests/content_access_governance_integration.rs"
+      ],
+      "description": "Integration test specifically exercising governance-gated content access control (Tier 3) through the GovernanceEngine. Tests all five content access governance actions through multiple governance models. Verifies membership/access decoupling — revoked members remain in context for governance/presence.",
+      "acceptanceCriteria": [
+        "Test creates a Threshold(2-of-3) context with Alice, Bob, Carol, Dave",
+        "RevokeReadAccess(Full) test: governance proposal to revoke Dave's read access. Alice proposes, Bob approves (threshold met). Dave's access key deleted. Dave cannot decrypt existing or future messages. Dave remains a context member.",
+        "RestoreReadAccess test: governance proposal to restore Dave's read access. Alice proposes, Bob approves. Dave gets new access key. Dave can decrypt future messages. Dave still cannot decrypt messages from during revocation (forward-only).",
+        "RevokeWriteAccess(Full) test: governance proposal to revoke Dave's write access. Dave's sender key destroyed, messagesWrite UCAN revoked. Dave cannot publish. Dave can still read (if read not revoked).",
+        "RevokeWriteAccess(FutureOnly) test: governance proposal with FutureOnly scope. Dave cannot publish future messages but historical messages remain readable by others.",
+        "RestoreWriteAccess test: Dave's write access restored. Dave gets new sender key. Forward-only.",
+        "RotateContentKeys test: governance proposal for context-wide rotation. All members get new access keys. Historical content remains accessible with old keys.",
+        "Membership/access decoupling verified: Dave with revoked read+write can still participate in governance votes",
+        "SingleAdmin model test: admin proposes RevokeReadAccess, auto-executes",
+        "Unanimity model test: all members must approve RotateContentKeys"
+      ],
+      "actionItems": [
+        "Create integration test file",
+        "Implement RevokeReadAccess lifecycle test (Full scope)",
+        "Implement RestoreReadAccess test with forward-only verification",
+        "Implement RevokeWriteAccess test (Full and FutureOnly)",
+        "Implement RestoreWriteAccess test",
+        "Implement RotateContentKeys test",
+        "Implement membership/access decoupling verification",
+        "Test across multiple governance models (SingleAdmin, Threshold, Unanimity)"
+      ],
+      "blockedBy": ["SCP-CAC-007"],
+      "sources": [
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" },
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-038: Content Access Key Layer" }
+      ],
+      "details": {}
+    }
+  ]
+}

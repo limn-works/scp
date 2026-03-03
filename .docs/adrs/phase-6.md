@@ -2560,13 +2560,37 @@ pub enum GovernanceAction {
     /// Requires unanimous consent from ALL current members regardless of
     /// governance model — protocol-level override enforced by ContextManager.
     PromoteContext,
-    /// Block an author in a broadcast context (§5.14.8).
-    /// Removes the author's sender key and revokes publishing authority.
-    /// Governance-gated because author removal is a membership change.
-    /// NOTE: UnblockAuthor and context-level key governance actions will be
-    /// added when the unblock mechanism (Task 3) and context-as-channel
-    /// publishing model (Task 2) designs are finalized.
-    BlockAuthor { author_did: DID, reason: Option<String> },
+    /// Revoke a member's read access to context content (§9.17).
+    /// Full scope: retroactive (destroy access keys for historical + future content).
+    /// FutureOnly scope: exclude from future content key distribution only.
+    /// Does NOT remove the member — they remain for governance/presence.
+    RevokeReadAccess { did: DID, scope: RevocationScope },
+    /// Restore a member's read access to context content (§9.17).
+    /// Always forward-only — historical content from before/during revocation
+    /// remains inaccessible (access keys were destroyed, not archived).
+    RestoreReadAccess { did: DID },
+    /// Revoke a member's write access to context content (§9.17).
+    /// Full scope: stop publishing + suppress historical content.
+    /// FutureOnly scope: stop future publishing only.
+    RevokeWriteAccess { did: DID, scope: RevocationScope },
+    /// Restore a member's write access to context content (§9.17).
+    /// Always forward-only — previously suppressed content remains suppressed.
+    RestoreWriteAccess { did: DID },
+    /// Context-wide content key rotation (§9.17).
+    /// Not DID-targeted — rotates keys for all members.
+    /// Use after compromise detection, bulk revocations, or periodic hygiene.
+    RotateContentKeys { reason: Option<String> },
+}
+
+/// Scope of content access revocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RevocationScope {
+    /// Retroactive: destroy access keys for historical content AND
+    /// exclude from future content key distribution.
+    Full,
+    /// Forward-only: exclude from future content key distribution.
+    /// Historical content remains accessible with existing cached keys.
+    FutureOnly,
 }
 ```
 
@@ -2804,7 +2828,7 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 2. **`GovernanceProposal` struct and `GovernanceAction` enum:**
 
    - `GovernanceProposal` with `proposal_id`, `context_id`, `proposer_did`, `action`, `status`, `created_at`, `voting_deadline`, `approvals`, `rejections`, `created_at_epoch`.
-   - `GovernanceAction` with all variants listed in section 3.
+   - `GovernanceAction` with all 23 variants listed in section 3 (including content access actions: RevokeReadAccess, RestoreReadAccess, RevokeWriteAccess, RestoreWriteAccess, RotateContentKeys) and `RevocationScope` enum (Full, FutureOnly).
    - `ProposalStatus` with `Pending`, `Approved`, `Rejected`, `Expired`, `Cancelled`, `Invalidated`.
    - Proposals are persisted to `ProtocolStore` on creation and on every status change.
 
@@ -2971,3 +2995,308 @@ GovernanceDeadlockRecovery {
 | `timeout.rs` | `GovernanceTimeoutTask`, periodic proposal resolution, voter departure handling, epoch invalidation |
 
 **Estimated functions:** ~25-30 public functions, ~15-20 internal helpers.
+
+## ADR-038: Content Access Key Layer
+
+**Status:** Decided
+
+### Context
+
+The sender-side key layer (ADR-007, §9.16) provides selective readability through key distribution denial: when Alice blocks Dave, she rotates her sender key and denies Dave's re-request. This prevents Dave from decrypting Alice's future messages. However, it has three gaps:
+
+1. **No retroactive enforcement.** Dave retains cached sender keys from before the block and can continue decrypting historical messages. The block is future-only at Layer 1.
+2. **No SDK-mandated cleanup.** The protocol does not require Dave's SDK to destroy cached material. A non-compliant SDK could retain everything.
+3. **No relay-level enforcement.** The relay stores ciphertext encrypted with the sender key. Anyone who retains the sender key can decrypt it, even after a block — the relay cannot distinguish authorized from unauthorized decryption.
+
+PR #243 review identified that these gaps are unacceptable for the protocol's user promise: "if you're blocked, you can't see anything — past or future." Three additional enforcement layers are needed: SDK-mandated destruction (Layer 2, specified in §9.16.7), access key wrapping (Layer 3, this ADR), and governance-gated content access control (ADR-031 content access actions).
+
+This ADR specifies Layer 3: the per-member access key wrapping model that provides cryptographic revocation of stored content.
+
+### Scope
+
+**What this ADR covers:**
+
+- Per-member access key lifecycle (generation, distribution, revocation, restoration).
+- Content Encryption Key (CEK) generation and wrapping with AES-256-KW.
+- Revocation mechanics: Full (retroactive) and FutureOnly.
+- Restoration mechanics: forward-only, no re-wrapping of historical content.
+- Interaction with MLS (encrypted contexts) and sender keys (broadcast contexts).
+- Wire format for wrapped content.
+- Performance characteristics and scaling guidance.
+- SDK-mandated destruction requirements (cross-reference to §9.16.7).
+
+**What this ADR does NOT cover:**
+
+- Sender-side key rotation protocol (ADR-007).
+- Governance proposal lifecycle for content access actions (ADR-031).
+- Identity-level block list storage and propagation (§3.7.1).
+- MLS group management (ADR-001).
+
+### Decision
+
+Implement a per-member access key wrapping layer in `scp-core/crypto/access_keys/`. Each context member holds an AES-256 access key generated at join time. Content Encryption Keys (CEKs) are wrapped with each intended recipient's access key using AES-256-KW (RFC 3394). Deleting a member's access key from all compliant clients makes stored ciphertext undecryptable — cryptographic revocation that the sender-key layer alone cannot provide.
+
+#### 1. Key Types
+
+```rust
+/// Per-member access key for content decryption in a context.
+/// Generated at join time, destroyed on revocation.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct AccessKey {
+    /// AES-256 key material (32 bytes).
+    key: [u8; 32],
+    /// Context this key belongs to.
+    context_id: ContextId,
+    /// DID this key belongs to.
+    member_did: DID,
+    /// Epoch counter — incremented on rotation (restoration generates new key).
+    epoch: u64,
+}
+
+/// Content Encryption Key — ephemeral, per-message.
+/// Generated fresh for each message, used once, then discarded.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct ContentEncryptionKey {
+    key: [u8; 32],
+}
+
+/// A CEK wrapped (encrypted) with a member's access key.
+pub struct WrappedCek {
+    /// Truncated SHA-256 of the member's DID (first 8 bytes).
+    /// Used as lookup key in the wrapped_ceks map.
+    pub member_id: [u8; 8],
+    /// AES-256-KW wrapped CEK (40 bytes: 32-byte key + 8-byte integrity check).
+    pub wrapped_key: [u8; 40],
+}
+```
+
+#### 2. Access Key Lifecycle
+
+**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE using the same pull-based protocol as sender keys (ADR-007 §9.16.2): the new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-encrypted access key.
+
+**Distribution.** Access keys are distributed via two new wire types:
+
+```rust
+pub struct AccessKeyRequest {
+    pub requester_did: DID,
+    pub context_id: ContextId,
+    pub wrapping_pubkey: X25519PublicKey,  // Ephemeral, per-request
+    pub signature: Ed25519Signature,
+}
+
+pub struct AccessKeyResponse {
+    pub context_id: ContextId,
+    pub member_did: DID,
+    pub epoch: u64,
+    pub hpke_sealed_key: Vec<u8>,
+    pub ephemeral_pubkey: X25519PublicKey,
+}
+```
+
+**Normal operation.** On each message send:
+
+1. Generate a fresh CEK (32 random bytes).
+2. Encrypt the message content with AES-256-GCM using the CEK.
+3. For each intended recipient: wrap the CEK with AES-256-KW using the recipient's access key.
+4. Publish: `{ ciphertext, nonce, wrapped_ceks, content_hash }`.
+
+On receive:
+
+1. Look up own `member_id` (truncated DID hash) in `wrapped_ceks`.
+2. Unwrap the CEK with own access key using AES-256-KW.
+3. Decrypt the ciphertext with AES-256-GCM using the unwrapped CEK.
+4. Verify `content_hash == SHA-256(plaintext)`.
+
+**Revocation (Full).** On `RevokeReadAccess { did, scope: Full }` or identity-level block:
+
+1. Broadcast `AccessKeyRevoked { did, scope: Full, timestamp }` event.
+2. All compliant SDKs delete the target's access key from their local key store.
+3. The target's SDK destroys its own access key (Layer 2, §9.16.7).
+4. Future messages do not include a wrapped CEK for the target.
+5. Historical wrapped CEKs for the target are now permanently undecryptable — the access key needed to unwrap them no longer exists on any compliant client.
+
+**Revocation (FutureOnly).** On `RevokeReadAccess { did, scope: FutureOnly }`:
+
+1. Add the target to the exclusion list for future CEK wrapping.
+2. Future messages do not include a wrapped CEK for the target.
+3. The target retains their existing access key — historical content remains decryptable.
+
+**Restoration.** On `RestoreReadAccess { did }` or unblock:
+
+1. Generate a NEW access key for the target (new epoch).
+2. Distribute via pull-based protocol.
+3. Future messages include a wrapped CEK for the target using the new key.
+4. Historical wrapped CEKs used the old (destroyed) access key — permanently inaccessible.
+
+**Context-wide rotation.** On `RotateContentKeys { reason }`:
+
+1. Generate new access keys for ALL members.
+2. Distribute via pull-based protocol.
+3. Members retain old access keys for historical decryption.
+4. Future content uses new CEKs wrapped with new access keys.
+
+#### 3. Encryption Layer Ordering
+
+**Encrypted contexts:**
+
+```
+Send:    plaintext → AES-GCM(CEK) → {ciphertext, wrapped_ceks} → sender_key_encrypt → MLS_encrypt → relay
+Receive: relay → MLS_decrypt → sender_key_decrypt → unwrap_cek → AES-GCM_decrypt(CEK) → plaintext
+```
+
+**Broadcast contexts:**
+
+```
+Send:    plaintext → AES-GCM(CEK) → {ciphertext, wrapped_ceks} → broadcast_key_encrypt → relay
+Receive: relay → broadcast_key_decrypt → unwrap_cek → AES-GCM_decrypt(CEK) → plaintext
+```
+
+The access key layer sits innermost (closest to plaintext) because it provides per-member selectivity that is independent of the group-level encryption (MLS/broadcast key) and the sender-level selectivity (sender key).
+
+#### 4. Wire Format
+
+```rust
+/// Content with per-member access-key-wrapped CEKs.
+pub struct WrappedContent {
+    /// AES-256-GCM encrypted content.
+    pub ciphertext: Vec<u8>,
+    /// AES-256-GCM nonce (12 bytes).
+    pub nonce: [u8; 12],
+    /// Per-recipient wrapped CEKs.
+    /// Key: first 8 bytes of SHA-256(member_did) — prevents DID publication.
+    /// Value: AES-256-KW wrapped CEK (40 bytes).
+    pub wrapped_ceks: Vec<WrappedCek>,
+    /// SHA-256 of plaintext for integrity verification.
+    pub content_hash: [u8; 32],
+}
+```
+
+The `wrapped_ceks` field uses a `Vec<WrappedCek>` (not a HashMap) for deterministic serialization and to avoid hash-table overhead in the wire format. Recipients scan linearly for their `member_id` — for typical context sizes (<1000 members), linear scan is faster than hash lookup.
+
+#### 5. SDK-Mandated Destruction Cross-Reference
+
+Layer 2 (§9.16.7) and Layer 3 (this ADR) are complementary:
+
+- **Layer 2** requires the target's SDK to destroy cached material from the blocker.
+- **Layer 3** requires all SDKs to destroy the target's access key.
+
+Together: the target cannot decrypt historical content (Layer 3 — access key gone from all clients) AND the target's local cache is purged (Layer 2 — cached plaintext destroyed). Defense-in-depth: either layer alone is sufficient against a compliant SDK; both together provide robustness against bugs in either layer's implementation.
+
+### Rationale
+
+**Why AES-256-KW (RFC 3394) for key wrapping:**
+
+AES-256-KW is the standard key-wrapping algorithm used by JOSE/JWE, CMS, and HPKE. It provides integrity protection (8-byte check value) without requiring a nonce or IV — the wrapping is deterministic, which simplifies the wire format (no per-recipient nonce storage). The 40-byte output (32 key + 8 check) is compact. Alternative: HPKE per recipient — more complex, requires per-recipient ephemeral keypairs, larger wire format. AES-256-KW is simpler and sufficient because the access keys are symmetric (no need for public-key wrapping).
+
+**Why per-message CEKs:**
+
+A per-message CEK limits the blast radius of key compromise: one compromised CEK reveals one message, not the entire conversation. This is standard practice (Signal, MLS, age). The alternative — reusing a content key across multiple messages — would make the access key revocation mechanism less granular.
+
+**Why truncated DID hashes in wrapped_ceks:**
+
+Publishing full DIDs in the wrapped_ceks map would leak membership information to anyone who can observe the ciphertext (relays, network observers). The truncated 8-byte hash provides a lookup key that the recipient can compute from their own DID but that does not reveal the DID to observers. Collision probability for 8-byte hashes is ~1 in 10^18 — negligible for any practical context size.
+
+**Why forward-only restoration:**
+
+The access key is destroyed on Full revocation and not archived. Re-wrapping historical CEKs with a new access key would require: (1) all senders to re-encrypt historical messages, which is impractical for large histories; and (2) retaining old access keys somewhere, which defeats the purpose of destruction. Forward-only restoration is the correct design: it enforces the user promise that blocked content is gone, and it avoids the complexity and security risks of historical re-wrapping.
+
+### Implementation
+
+- **Language:** Rust
+- **Async runtime:** tokio (for pull-based key distribution)
+- **Crate:** `scp-core`
+- **Module:** `scp-core/crypto/access_keys/`
+- **Persistence:** Via `ProtocolStore` (§17.4). Key conventions:
+  - `context/{context_id}/access_key/{did_hex}` — member's access key (encrypted at rest)
+  - `context/{context_id}/access_key/{did_hex}/epoch` — current epoch counter
+  - `context/{context_id}/access_key/exclusion_list` — DIDs excluded from future wrapping
+  - `context/{context_id}/access_key/revocation_log` — append-only revocation events
+
+### Dependencies
+
+- **ADR-007 (Sender Key Layer):** Pull-based key distribution protocol reused for access key distribution. `AccessKeyRequest`/`AccessKeyResponse` follow the same pattern as `SenderKeyRequest`/`SenderKeyResponse`.
+- **ADR-001 (MLS):** Access key layer sits inside MLS encryption in encrypted contexts.
+- **ADR-008 (Context Lifecycle):** Access key generation triggered by `AddMember` governance action.
+- **ADR-031 (Governance):** `RevokeReadAccess`, `RestoreReadAccess`, `RevokeWriteAccess`, `RestoreWriteAccess`, `RotateContentKeys` governance actions trigger access key operations.
+- **ADR-011 (Event Log):** `AccessKeyRevoked`, `AccessKeyRestored`, `ContentKeysRotated` events.
+
+### Acceptance Criteria
+
+1. **Access key generation and distribution:**
+
+   - `AccessKey` struct with 32-byte AES-256 key, context_id, member_did, epoch.
+   - `generate_access_key(context_id, member_did) -> AccessKey` generates a cryptographically random key.
+   - `AccessKeyRequest`/`AccessKeyResponse` wire types follow the pull-based protocol pattern from ADR-007.
+   - Distribution uses HPKE with ephemeral X25519 keypairs (same as sender key distribution).
+
+2. **CEK generation and wrapping:**
+
+   - `ContentEncryptionKey::generate() -> ContentEncryptionKey` generates a fresh 32-byte random key.
+   - `wrap_cek(cek, access_key) -> WrappedCek` uses AES-256-KW (RFC 3394), producing 40-byte output.
+   - `unwrap_cek(wrapped_cek, access_key) -> Result<ContentEncryptionKey, CryptoError>` verifies integrity check.
+   - `wrap_content(plaintext, recipients: &[AccessKey]) -> WrappedContent` generates CEK, encrypts content, wraps CEK for each recipient.
+   - `unwrap_content(wrapped: &WrappedContent, access_key: &AccessKey) -> Result<Vec<u8>, CryptoError>` finds own wrapped CEK, unwraps, decrypts, verifies content_hash.
+
+3. **Full revocation:**
+
+   - On `RevokeReadAccess { did, scope: Full }`: target's access key is deleted from all members' local stores.
+   - `AccessKeyRevoked { did, scope: Full }` event emitted.
+   - Future messages exclude the target from wrapped_ceks.
+   - Historical wrapped CEKs for the target are permanently undecryptable.
+
+4. **FutureOnly revocation:**
+
+   - On `RevokeReadAccess { did, scope: FutureOnly }`: target added to exclusion list.
+   - Future messages exclude the target from wrapped_ceks.
+   - Target retains access key for historical content.
+
+5. **Restoration:**
+
+   - On `RestoreReadAccess { did }`: new access key generated (new epoch), distributed via pull protocol.
+   - Future messages include wrapped CEK for target.
+   - Historical content remains inaccessible (old access key destroyed).
+
+6. **Context-wide rotation:**
+
+   - On `RotateContentKeys`: all access keys rotated, old keys retained by members for historical decryption.
+   - New access keys distributed via pull protocol.
+
+7. **Layer ordering:**
+
+   - In encrypted contexts: access key wrapping occurs before sender key encryption, which occurs before MLS encryption.
+   - In broadcast contexts: access key wrapping occurs before broadcast key encryption.
+
+8. **Wire format:**
+
+   - `WrappedContent` struct serializable via MessagePack.
+   - `member_id` is first 8 bytes of SHA-256(member_did).
+   - Serialization round-trip test passes.
+
+9. **Integration test:**
+
+```
+1. Create a context with Alice, Bob, Dave.
+2. Alice sends a message. Bob and Dave can decrypt (both have access keys).
+3. Governance revokes Dave's read access (scope: Full).
+4. Dave's access key is deleted from Alice's and Bob's key stores.
+5. Dave cannot decrypt the message from step 2 (access key gone).
+6. Alice sends a new message. Bob can decrypt. Dave cannot (excluded from wrapped_ceks).
+7. Governance restores Dave's read access.
+8. Dave receives a new access key.
+9. Alice sends another message. Dave can decrypt (new access key).
+10. Dave still cannot decrypt the messages from steps 2 and 6 (old access key destroyed).
+```
+
+### Scope
+
+**Files (~4-5):**
+
+| File | Purpose |
+|------|---------|
+| `mod.rs` | Module root, `AccessKey`, `ContentEncryptionKey`, `WrappedCek`, `WrappedContent`, re-exports |
+| `wrapping.rs` | AES-256-KW wrap/unwrap, CEK generation, content encryption/decryption |
+| `lifecycle.rs` | Access key generation, distribution (pull-based), revocation, restoration, rotation |
+| `wire.rs` | `AccessKeyRequest`, `AccessKeyResponse`, serialization |
+| `exclusion.rs` | Exclusion list management, member_id computation |
+
+**Estimated functions:** ~15-20 public functions, ~10 internal helpers.
