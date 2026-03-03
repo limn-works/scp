@@ -192,7 +192,7 @@ pub struct ContextManager {
     /// [`handle_broadcast_key_request`](Self::handle_broadcast_key_request):
     /// the method verifies the `author_did` is locally controlled before
     /// processing the request. While transport-layer auth (spec section
-    /// 9.16.2) is the primary enforcement mechanism, this check prevents
+    /// 9.16.6) is the primary enforcement mechanism, this check prevents
     /// misuse if the method is called from an unexpected context.
     ///
     /// Populated via [`register_local_did`](Self::register_local_did).
@@ -1283,7 +1283,7 @@ impl ContextManager {
     /// granted or denied.
     ///
     /// This is the author-side decision function for the pull-based key
-    /// distribution protocol (spec section 9.16.2).
+    /// distribution protocol (spec section 9.16.6).
     ///
     /// # Defense-in-depth validation (#234)
     ///
@@ -1291,7 +1291,7 @@ impl ContextManager {
     /// method verifies that `author_did` is registered as a locally
     /// controlled DID via [`register_local_did`](Self::register_local_did).
     /// This prevents misuse if the method is called from an unexpected
-    /// context. Transport-layer auth (spec section 9.16.2) remains the
+    /// context. Transport-layer auth (spec section 9.16.6) remains the
     /// primary enforcement mechanism; this check is an additional layer.
     ///
     /// # Errors
@@ -1309,7 +1309,7 @@ impl ContextManager {
         requester_did: &DID,
     ) -> Result<KeyRequestDecision, ContextError> {
         // Defense-in-depth: verify the local SDK controls the author DID.
-        // Transport-layer auth (section 9.16.2) is the primary gate; this prevents
+        // Transport-layer auth (section 9.16.6) is the primary gate; this prevents
         // misuse if the method is ever called from a different context.
         if !self.local_dids.read().await.contains(author_did) {
             return Err(ContextError::PermissionDenied(format!(
