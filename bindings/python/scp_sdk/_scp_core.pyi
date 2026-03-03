@@ -629,14 +629,26 @@ def tool_verify(context_id: str, tool_id: str) -> ToolVerificationResult:
 # Transport bridge functions (crates/scp-ffi/src/transport.rs)
 # ---------------------------------------------------------------------------
 
-def transport_connect(relay_url: str) -> None:
-    """Connect to an SCP relay.
+def transport_connect(relay_url: str, source: str = "explicit") -> None:
+    """Connect to an SCP relay with provenance-based transport security
+    validation (section 10.12.6).
+
+    The ``source`` parameter specifies how the relay URL was discovered,
+    which determines whether ``ws://`` (plaintext) is permitted:
+
+    - ``"dht_resolved"`` -- resolved from a BEP44-signed DID document.
+      ``ws://`` is permitted.
+    - ``"well_known"`` -- discovered via ``.well-known/scp``. ``wss://`` only.
+    - ``"explicit"`` (default) -- user/operator configured. ``wss://`` only.
+    - ``"peer_discovered"`` -- discovered from a peer. ``wss://`` only.
 
     Args:
         relay_url: The URL of the SCP relay (e.g., ``"wss://relay.example.com"``).
+        source: How the URL was discovered (default: ``"explicit"``).
 
     Raises:
-        TransportError: If the connection fails.
+        TransportError: If the URL scheme is not permitted for the given
+            source or the connection fails.
     """
     ...
 

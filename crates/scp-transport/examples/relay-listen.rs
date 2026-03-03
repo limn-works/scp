@@ -10,6 +10,7 @@
 
 use futures::StreamExt;
 use scp_transport::native::NativeRelayAdapter;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 use scp_transport::{RoutingId, TransportAdapter, TransportEvent};
 
 fn hex_to_32(hex: &str) -> [u8; 32] {
@@ -47,11 +48,22 @@ async fn main() {
     let rid = RoutingId::new(routing_id);
 
     eprintln!("Connecting to {url}...");
-    #[allow(deprecated)] // example uses legacy connect(); production should use connect_sourced()
-    let adapter = NativeRelayAdapter::connect(url).await.unwrap_or_else(|e| {
-        eprintln!("connection failed: {e}");
-        std::process::exit(1);
-    });
+    // Semantic note: DhtResolved is used here because it is the only
+    // RelayUrlSource variant that permits ws:// (plaintext) connections
+    // (§10.12.6). The URL was not actually resolved via DHT -- it is a
+    // CLI-provided local address. This is acceptable for examples targeting
+    // local development relays. Production code must use the variant matching
+    // the actual discovery path (Explicit, WellKnown, PeerDiscovered, etc.).
+    let sourced = SourcedRelayUrl {
+        url: url.to_owned(),
+        source: RelayUrlSource::DhtResolved,
+    };
+    let adapter = NativeRelayAdapter::connect_sourced(&sourced)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("connection failed: {e}");
+            std::process::exit(1);
+        });
 
     eprintln!("Subscribing to routing_id {}...", hex(&routing_id));
     let mut stream = adapter.subscribe(&rid, None).await.unwrap_or_else(|e| {
