@@ -754,17 +754,23 @@ impl BroadcastContext {
     /// the requester times out and cannot decrypt future content.
     #[must_use]
     pub fn handle_key_request(&self, author_did: &str, requester_did: &str) -> KeyRequestDecision {
+        // All deny paths use a uniform reason string so denial causes
+        // (blocked, unsubscribed, gated, unknown author) are indistinguishable
+        // in diagnostic output. This prevents block list status leakage
+        // through logging. See §5.14.8.
+        const DENY_REASON: &str = "key request denied";
+
         // Author must exist.
         let Some(author) = self.authors.get(author_did) else {
             return KeyRequestDecision::Deny {
-                reason: format!("author not found: {author_did}"),
+                reason: DENY_REASON.to_owned(),
             };
         };
 
         // Requester must not be blocked.
         if author.block_list.contains(requester_did) {
             return KeyRequestDecision::Deny {
-                reason: format!("requester is blocked by {author_did}"),
+                reason: DENY_REASON.to_owned(),
             };
         }
 
@@ -773,7 +779,7 @@ impl BroadcastContext {
             && !self.authors.contains_key(requester_did)
         {
             return KeyRequestDecision::Deny {
-                reason: format!("requester is not a registered subscriber: {requester_did}"),
+                reason: DENY_REASON.to_owned(),
             };
         }
 
@@ -785,7 +791,7 @@ impl BroadcastContext {
             && !record.has_ucan
         {
             return KeyRequestDecision::Deny {
-                reason: "gated context requires UCAN-authenticated subscriber".to_owned(),
+                reason: DENY_REASON.to_owned(),
             };
         }
 
