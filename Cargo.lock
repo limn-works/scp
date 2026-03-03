@@ -3806,6 +3806,7 @@ dependencies = [
  "rmp-serde",
  "rmpv",
  "scp-core",
+ "scp-identity",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -3817,7 +3818,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "z-base-32",
 ]
 
 [[package]]

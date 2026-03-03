@@ -37,7 +37,8 @@ pub mod resolver;
 
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
-    DidDht, extract_public_key, verify_bep44_signature, verify_migration, verify_self_certification,
+    DidDht, did_from_ed25519_public_key, extract_public_key, verify_bep44_signature,
+    verify_migration, verify_self_certification,
 };
 pub use dht_client::{DhtClient, InMemoryDhtClient};
 pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};

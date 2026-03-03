@@ -253,10 +253,12 @@ pub enum ClientMessage {
     ///
     /// The message MUST include an Ed25519 signature proving the sender
     /// owns the DID that maps to the claimed `routing_id`. The signature
-    /// covers `routing_id || timestamp` (concatenated bytes, big-endian
-    /// timestamp). The relay responds with `OK` on success, `ERR` with
-    /// code `BRIDGE_AUTH_FAILED` (4034) if authentication fails, or `ERR`
-    /// with `BRIDGE_NOT_SUPPORTED` (4030) if bridging is not enabled.
+    /// covers `"SCP-BRIDGE-REGISTER-V1:" || routing_id || timestamp`
+    /// (domain-separated payload: 23-byte prefix + 32-byte routing ID +
+    /// 8-byte big-endian timestamp = 63 bytes). The relay responds with
+    /// `OK` on success, `ERR` with code `BRIDGE_AUTH_FAILED` (4034) if
+    /// authentication fails, or `ERR` with `BRIDGE_NOT_SUPPORTED` (4030)
+    /// if bridging is not enabled.
     #[serde(rename = "BRIDGE_REGISTER")]
     BridgeRegister {
         /// Client-assigned request ID.
@@ -273,8 +275,8 @@ pub enum ClientMessage {
         #[serde(with = "serde_bytes")]
         public_key: [u8; 32],
 
-        /// Ed25519 signature over `routing_id || timestamp` (64 bytes).
-        /// Proves the sender holds the private key for `public_key` (SCP-247).
+        /// Ed25519 signature over `"SCP-BRIDGE-REGISTER-V1:" || routing_id || timestamp`
+        /// (64 bytes). Proves the sender holds the private key for `public_key` (SCP-247).
         #[serde(with = "serde_bytes")]
         signature: [u8; 64],
 
