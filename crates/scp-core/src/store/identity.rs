@@ -12,6 +12,7 @@
 //! See spec sections 17.3 and 17.4.
 
 use scp_platform::traits::Storage;
+use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
 
@@ -55,6 +56,43 @@ fn identity_private_state_key(did: &DID, seq: u64) -> Result<String, super::Stor
 fn identity_prefix(did: &DID) -> Result<String, super::StoreError> {
     let did_str = super::sanitize_key_component(did.as_ref())?;
     Ok(format!("identity/{did_str}/"))
+}
+
+/// Builds the storage key for a cached DID document.
+///
+/// Format: `did_cache/{did}`
+/// See spec section 17.3.
+fn did_cache_key(did: &DID) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("did_cache/{did_str}"))
+}
+
+/// Builds the storage key for a TOFU record.
+///
+/// Format: `tofu/{did}`
+/// See spec section 17.3.
+fn tofu_key(did: &DID) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("tofu/{did_str}"))
+}
+
+// ---------------------------------------------------------------------------
+// DID cache entry
+// ---------------------------------------------------------------------------
+
+/// A cached DID document with an expiration timestamp.
+///
+/// Stored under `did_cache/{did}`. The `expires_at` field is checked
+/// on load: if the current time exceeds it, the entry is treated as
+/// expired and `None` is returned.
+///
+/// See spec section 17.4 and SCP-PERSIST-014.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedDidDocument {
+    /// The raw DID document bytes.
+    doc: Vec<u8>,
+    /// Unix timestamp (seconds) when this cache entry expires.
+    expires_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +190,92 @@ impl<S: Storage> ProtocolStore<S> {
         seq: u64,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let key = identity_private_state_key(did, seq)?;
+        self.load_value(&key).await
+    }
+
+    // -----------------------------------------------------------------------
+    // DID cache methods (SCP-PERSIST-014)
+    // -----------------------------------------------------------------------
+
+    /// Caches a DID document with an expiration timestamp.
+    ///
+    /// Stores the document bytes and expiry under `did_cache/{did}`.
+    /// Overwrites any existing cached entry for the same DID.
+    ///
+    /// See spec section 17.4. See SCP-PERSIST-014.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn cache_did_document(
+        &self,
+        did: &DID,
+        doc: &[u8],
+        expires_at: u64,
+    ) -> Result<(), StoreError> {
+        let key = did_cache_key(did)?;
+        let entry = CachedDidDocument {
+            doc: doc.to_vec(),
+            expires_at,
+        };
+        self.store_value(&key, &entry).await
+    }
+
+    /// Loads a cached DID document if it has not expired.
+    ///
+    /// Returns `None` if no cache entry exists or if `now >= expires_at`.
+    /// The caller provides the current time for testability.
+    ///
+    /// See spec section 17.4. See SCP-PERSIST-014.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_cached_did_document(
+        &self,
+        did: &DID,
+        now: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = did_cache_key(did)?;
+        let entry: Option<CachedDidDocument> = self.load_value(&key).await?;
+        match entry {
+            Some(cached) if now < cached.expires_at => Ok(Some(cached.doc)),
+            _ => Ok(None),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TOFU record methods (SCP-PERSIST-014)
+    // -----------------------------------------------------------------------
+
+    /// Stores a Trust-On-First-Use (TOFU) record for a DID.
+    ///
+    /// Serializes the record bytes under `tofu/{did}` wrapped in a
+    /// `StoredValue` version envelope.
+    ///
+    /// See spec section 17.4. See SCP-PERSIST-014.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_tofu_record(&self, did: &DID, record: &[u8]) -> Result<(), StoreError> {
+        let key = tofu_key(did)?;
+        self.store_value(&key, &record.to_vec()).await
+    }
+
+    /// Loads a TOFU record for a DID.
+    ///
+    /// Returns `None` if no TOFU record exists for the given DID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_tofu_record(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = tofu_key(did)?;
         self.load_value(&key).await
     }
 
@@ -274,6 +398,124 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // -------------------------------------------------------------------
+    // DID cache (SCP-PERSIST-014)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cache_and_load_did_document_roundtrip() {
+        let store = make_store();
+        let did = test_did();
+        let doc = b"cached-did-document-bytes".to_vec();
+
+        store
+            .cache_did_document(&did, &doc, 2_000_000_000)
+            .await
+            .unwrap();
+        // now < expires_at, so document should be returned.
+        let loaded = store
+            .load_cached_did_document(&did, 1_500_000_000)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(doc));
+    }
+
+    #[tokio::test]
+    async fn cached_did_document_returns_none_when_expired() {
+        let store = make_store();
+        let did = test_did();
+
+        store
+            .cache_did_document(&did, b"doc", 1_000_000_000)
+            .await
+            .unwrap();
+        // now >= expires_at, so None.
+        let loaded = store
+            .load_cached_did_document(&did, 1_000_000_000)
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+
+        let loaded = store
+            .load_cached_did_document(&did, 1_500_000_000)
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_did_document_returns_none_for_missing() {
+        let store = make_store();
+        let did = test_did();
+
+        let loaded = store
+            .load_cached_did_document(&did, 1_000_000_000)
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_did_document_overwrites_with_later_expiry() {
+        let store = make_store();
+        let did = test_did();
+
+        store
+            .cache_did_document(&did, b"doc-v1", 1_000_000_000)
+            .await
+            .unwrap();
+        store
+            .cache_did_document(&did, b"doc-v2", 3_000_000_000)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_cached_did_document(&did, 2_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(b"doc-v2".to_vec()));
+    }
+
+    // -------------------------------------------------------------------
+    // TOFU records (SCP-PERSIST-014)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_and_load_tofu_record_roundtrip() {
+        let store = make_store();
+        let did = test_did();
+        let record = b"tofu-binding-data".to_vec();
+
+        store.store_tofu_record(&did, &record).await.unwrap();
+        let loaded = store.load_tofu_record(&did).await.unwrap();
+        assert_eq!(loaded, Some(record));
+    }
+
+    #[tokio::test]
+    async fn load_tofu_record_returns_none_for_missing() {
+        let store = make_store();
+        let did = test_did();
+
+        let loaded = store.load_tofu_record(&did).await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Key convention tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn did_cache_key_follows_convention() {
+        let did = DID::from("did:dht:z6MkTest");
+        assert_eq!(did_cache_key(&did).unwrap(), "did_cache/did:dht:z6MkTest");
+    }
+
+    #[test]
+    fn tofu_key_follows_convention() {
+        let did = DID::from("did:dht:z6MkTest");
+        assert_eq!(tofu_key(&did).unwrap(), "tofu/did:dht:z6MkTest");
     }
 
     #[test]
