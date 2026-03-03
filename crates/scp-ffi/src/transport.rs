@@ -26,6 +26,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use pyo3::prelude::*;
 use scp_transport::native::adapter::NativeRelayAdapter;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 use crate::error::ScpPyError;
 use crate::validate;
@@ -86,33 +87,62 @@ impl PyTransportStatus {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Connects to an SCP relay.
+/// Connects to an SCP relay with provenance-based transport security
+/// validation (§10.12.6).
 ///
 /// Establishes a WebSocket connection to the specified relay URL using
-/// [`NativeRelayAdapter`]. The adapter is stored in the global relay
-/// connection state for use by `py_mcp_load_contexts` (context discovery)
-/// and future transport operations.
+/// [`NativeRelayAdapter::connect_sourced`]. The adapter is stored in the
+/// global relay connection state for use by `py_mcp_load_contexts` (context
+/// discovery) and future transport operations.
+///
+/// The `source` parameter specifies how the relay URL was discovered,
+/// which determines whether `ws://` (plaintext) is permitted:
+///
+/// - `"dht_resolved"` -- resolved from a BEP44-signed DID document. `ws://`
+///   is permitted.
+/// - `"well_known"` -- discovered via `.well-known/scp`. `wss://` only.
+/// - `"explicit"` (default) -- user/operator configured. `wss://` only.
+/// - `"peer_discovered"` -- discovered from a peer. `wss://` only.
 ///
 /// # Arguments
 ///
 /// * `relay_url` -- The URL of the SCP relay to connect to (e.g.,
-///   `"ws://127.0.0.1:9000/scp/v1"`).
+///   `"wss://relay.example.com/scp/v1"`).
+/// * `source` -- How the URL was discovered (default: `"explicit"`).
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the connection fails (unreachable relay,
-/// protocol mismatch, timeout, etc.).
+/// Raises `TransportError` if the URL scheme is not permitted for the
+/// given source (e.g., `ws://` from `"explicit"`) or if the connection
+/// fails (unreachable relay, protocol mismatch, timeout, etc.).
 ///
 /// See ADR-013 section 5: `py_transport_connect(relay_url) -> None`.
 #[pyfunction]
-#[pyo3(name = "transport_connect")]
-pub fn py_transport_connect(relay_url: &str) -> PyResult<()> {
+#[pyo3(name = "transport_connect", signature = (relay_url, source = "explicit"))]
+pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
     validate::validate_relay_url(relay_url)?;
     let rt = crate::runtime()?;
     let url = relay_url.to_owned();
 
-    #[allow(deprecated)] // Stub — see #220: migrate to connect_sourced() with provenance tracking
-    let adapter = rt.block_on(async { NativeRelayAdapter::connect(&url).await });
+    let relay_source = match source {
+        "dht_resolved" => RelayUrlSource::DhtResolved,
+        "well_known" => RelayUrlSource::WellKnown,
+        "explicit" => RelayUrlSource::Explicit,
+        "peer_discovered" => RelayUrlSource::PeerDiscovered,
+        other => {
+            return Err(ScpPyError::ValidationError(format!(
+                "invalid relay URL source: {other:?}. Expected one of: \
+                 \"dht_resolved\", \"well_known\", \"explicit\", \"peer_discovered\""
+            ))
+            .into());
+        }
+    };
+
+    let sourced = SourcedRelayUrl {
+        url: url.clone(),
+        source: relay_source,
+    };
+    let adapter = rt.block_on(async { NativeRelayAdapter::connect_sourced(&sourced).await });
 
     match adapter {
         Ok(adapter) => {
@@ -231,7 +261,16 @@ mod tests {
         // Connecting to an unreachable URL should fail with TransportError.
         // We need the tokio runtime to be initialized first.
         crate::init_runtime().ok();
-        let result = py_transport_connect("ws://127.0.0.1:1/nonexistent");
+        // ws:// from "explicit" source is rejected per §10.12.6 (only
+        // DHT-resolved URLs may use plaintext WebSocket).
+        let result = py_transport_connect("ws://127.0.0.1:1/nonexistent", "explicit");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn transport_connect_rejects_invalid_source() {
+        crate::init_runtime().ok();
+        let result = py_transport_connect("wss://relay.example.com/scp/v1", "invalid_source");
         assert!(result.is_err());
     }
 }

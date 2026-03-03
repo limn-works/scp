@@ -11,6 +11,7 @@
 
 use scp_core::envelope::create_outer_envelope;
 use scp_transport::native::NativeRelayAdapter;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 use scp_transport::{RoutingId, TransportAdapter};
 
 fn hex_to_32(hex: &str) -> [u8; 32] {
@@ -69,11 +70,18 @@ async fn main() {
     let rid_hex = hex(&routing_id);
 
     eprintln!("Connecting to {url}...");
-    #[allow(deprecated)] // example uses legacy connect(); production should use connect_sourced()
-    let adapter = NativeRelayAdapter::connect(url).await.unwrap_or_else(|e| {
-        eprintln!("connection failed: {e}");
-        std::process::exit(1);
-    });
+    // Examples use DhtResolved source for local ws:// relay URLs.
+    // Production code should use the actual discovery source.
+    let sourced = SourcedRelayUrl {
+        url: url.to_owned(),
+        source: RelayUrlSource::DhtResolved,
+    };
+    let adapter = NativeRelayAdapter::connect_sourced(&sourced)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("connection failed: {e}");
+            std::process::exit(1);
+        });
 
     eprintln!("Connected. Routing ID: {rid_hex}\n");
 

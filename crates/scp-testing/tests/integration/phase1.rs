@@ -56,6 +56,7 @@ use scp_platform::traits::{
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::InMemoryBlobStorage;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 use scp_transport::traits::{RoutingId, TransportAdapter, TransportEvent};
 
 /// A [`KeyCustody`] adapter that delegates signing to an [`ScpMlsGroup`]'s
@@ -197,7 +198,7 @@ async fn receive_envelope(
 /// envelope (ADR-002), transport trait (ADR-005), native relay (ADR-004),
 /// platform adapters (ADR-006), and sender keys (ADR-007).
 #[tokio::test]
-#[allow(clippy::too_many_lines, deprecated)]
+#[allow(clippy::too_many_lines)]
 async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 1 & 2: Alice and Bob create did:dht identities (ADR-003, ADR-006)
@@ -365,13 +366,19 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     let relay_addr = start_relay().await;
     let relay_url = format!("ws://{relay_addr}/scp/v1");
 
+    // Connect via connect_sourced with DhtResolved source (local ws:// relay, §10.12.6).
+    let sourced = SourcedRelayUrl {
+        url: relay_url,
+        source: RelayUrlSource::DhtResolved,
+    };
+
     // Bob subscribes first so the relay delivers the message when Alice sends.
-    let bob_adapter = NativeRelayAdapter::connect(&relay_url).await.unwrap();
+    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
     let bob_routing = RoutingId::new(routing_arr);
     let mut stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
 
     // Alice connects and sends.
-    let alice_adapter = NativeRelayAdapter::connect(&relay_url).await.unwrap();
+    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
     let _blob_id = alice_adapter.send(&outer_env).await.unwrap();
 
     let received_outer = receive_envelope(&mut stream).await;
@@ -456,7 +463,6 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
 /// Tests that the transport adapter trait (ADR-005) correctly routes
 /// envelopes through the native relay server (ADR-004).
 #[tokio::test]
-#[allow(deprecated)]
 async fn native_relay_adapter_send_receive_roundtrip() {
     let relay_addr = start_relay().await;
     let relay_url = format!("ws://{relay_addr}/scp/v1");
@@ -471,9 +477,14 @@ async fn native_relay_adapter_send_receive_roundtrip() {
     )
     .unwrap();
 
-    // Connect sender and subscriber adapters.
-    let send_adapter = NativeRelayAdapter::connect(&relay_url).await.unwrap();
-    let recv_adapter = NativeRelayAdapter::connect(&relay_url).await.unwrap();
+    // Connect sender and subscriber adapters via connect_sourced with
+    // DhtResolved source (local ws:// relay, §10.12.6).
+    let sourced = SourcedRelayUrl {
+        url: relay_url,
+        source: RelayUrlSource::DhtResolved,
+    };
+    let send_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let recv_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
 
     // Subscribe first, then send.
     let routing = RoutingId::new(routing_id);
@@ -501,8 +512,6 @@ async fn native_relay_adapter_send_receive_roundtrip() {
 /// not just exercised in isolation by unit tests.
 #[tokio::test]
 async fn ws_relay_connect_sourced_validation_scp234() {
-    use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
-
     let relay_addr = start_relay().await;
     let relay_url = format!("ws://{relay_addr}/scp/v1");
 

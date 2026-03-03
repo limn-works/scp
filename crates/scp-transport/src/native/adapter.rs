@@ -43,10 +43,14 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///
 /// # Construction
 ///
-/// Use [`NativeRelayAdapter::connect_sourced`] for production connections
-/// with provenance-based transport security validation (§10.12.6), or
-/// [`NativeRelayAdapter::connect`] for internal/test usage without
-/// provenance tracking.
+/// Use [`NativeRelayAdapter::connect_sourced`] to connect with
+/// provenance-based transport security validation (§10.12.6). All relay
+/// URLs must have known provenance — there is no unvalidated connection
+/// path.
+///
+/// For tests using local `ws://` relays, use
+/// [`RelayUrlSource::DhtResolved`] as the source — DHT-resolved URLs are
+/// the only source permitted to use plaintext WebSocket.
 ///
 /// # Examples
 ///
@@ -61,8 +65,12 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// };
 /// let adapter = NativeRelayAdapter::connect_sourced(&sourced).await?;
 ///
-/// // Test/internal: no provenance validation.
-/// let adapter = NativeRelayAdapter::connect("ws://127.0.0.1:9000/scp/v1").await?;
+/// // Test: local ws:// relay with DhtResolved source.
+/// let sourced = SourcedRelayUrl {
+///     url: "ws://127.0.0.1:9000/scp/v1".to_owned(),
+///     source: RelayUrlSource::DhtResolved,
+/// };
+/// let adapter = NativeRelayAdapter::connect_sourced(&sourced).await?;
 /// ```
 pub struct NativeRelayAdapter {
     /// The underlying WebSocket client.
@@ -76,33 +84,6 @@ impl std::fmt::Debug for NativeRelayAdapter {
 }
 
 impl NativeRelayAdapter {
-    /// Creates a new adapter connected to the given relay URL **without**
-    /// provenance-based transport security validation.
-    ///
-    /// The URL should be of the form `ws://host:port/scp/v1` or
-    /// `wss://host:port/scp/v1`.
-    ///
-    /// **Important:** This method does not enforce the `ws://` vs `wss://`
-    /// rules from spec section 10.12.6. Use [`connect_sourced`] when the
-    /// relay URL has known provenance (e.g., DHT-resolved, `.well-known`,
-    /// explicit config). This method exists for backwards compatibility and
-    /// internal/test usage where provenance is not tracked.
-    ///
-    /// [`connect_sourced`]: Self::connect_sourced
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransportError::ConnectionFailed`] if the initial connection
-    /// cannot be established.
-    #[deprecated(
-        since = "0.1.0",
-        note = "use connect_sourced() for provenance-based transport security validation (section 10.12.6)"
-    )]
-    pub async fn connect(url: &str) -> Result<Self, TransportError> {
-        let client = NativeRelayClient::connect(url).await?;
-        Ok(Self { client })
-    }
-
     /// Creates a new adapter connected to a relay URL with provenance-based
     /// transport security validation (§10.12.6).
     ///
@@ -114,8 +95,8 @@ impl NativeRelayAdapter {
     /// - `ws://` from any other source (`.well-known`, explicit config, peer
     ///   discovery) is rejected to prevent downgrade attacks.
     ///
-    /// This is the recommended connection method for production use. All relay
-    /// URLs with known provenance should go through this path.
+    /// All relay URLs must go through this path — there is no unvalidated
+    /// connection method.
     ///
     /// [`RelayUrlSource::DhtResolved`]: crate::relay::connection::RelayUrlSource::DhtResolved
     ///

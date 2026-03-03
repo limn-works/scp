@@ -13,6 +13,7 @@
 use futures::StreamExt;
 use scp_core::envelope::create_outer_envelope;
 use scp_transport::native::NativeRelayAdapter;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 use scp_transport::{RoutingId, TransportAdapter, TransportEvent};
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
@@ -51,11 +52,20 @@ async fn main() {
     let rid = RoutingId::new(routing_id);
 
     eprintln!("Connecting to {url}...");
-    #[allow(deprecated)] // example uses legacy connect(); production should use connect_sourced()
-    let adapter = Arc::new(NativeRelayAdapter::connect(url).await.unwrap_or_else(|e| {
-        eprintln!("connection failed: {e}");
-        std::process::exit(1);
-    }));
+    // Examples use DhtResolved source for local ws:// relay URLs.
+    // Production code should use the actual discovery source.
+    let sourced = SourcedRelayUrl {
+        url: url.to_owned(),
+        source: RelayUrlSource::DhtResolved,
+    };
+    let adapter = Arc::new(
+        NativeRelayAdapter::connect_sourced(&sourced)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("connection failed: {e}");
+                std::process::exit(1);
+            }),
+    );
 
     eprintln!("Subscribing to routing_id {}...", hex(&routing_id));
     let mut stream = adapter.subscribe(&rid, None).await.unwrap_or_else(|e| {
