@@ -99,7 +99,7 @@ pub use builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle, create_context,
 };
-pub use manager::{BroadcastPersistence, ContextManager, GovernanceActionResult};
+pub use manager::{ContextManager, ContextPersistence, ContextSnapshot, GovernanceActionResult};
 
 // Re-export membership types.
 pub use membership::{
@@ -299,11 +299,11 @@ pub enum ContextError {
     #[error("payment integration failed: {0}")]
     IntegrationFailed(#[from] crate::economy::IntegrationError),
 
-    /// A broadcast persistence operation failed (store or load).
+    /// A persistence operation failed (store or load).
     ///
-    /// Returned when the `BroadcastPersistence` provider reports an error
-    /// during broadcast context state persistence or restoration.
-    #[error("broadcast persistence failed: {0}")]
+    /// Returned when the [`ContextPersistence`] provider reports an error
+    /// during context or broadcast state persistence or restoration.
+    #[error("persistence failed: {0}")]
     PersistenceFailed(String),
 }
 
