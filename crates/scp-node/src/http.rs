@@ -26,6 +26,8 @@ use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 
+use crate::tls;
+
 use crate::projection::ProjectedContext;
 use crate::well_known::well_known_handler;
 use crate::{ApplicationNode, NodeError};
@@ -118,6 +120,24 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     ///
     /// See issue #231.
     pub(crate) cors_origins: Option<Vec<String>>,
+    /// TLS configuration for the public HTTPS listener.
+    ///
+    /// When `Some`, [`ApplicationNode::serve`] terminates TLS using
+    /// [`tokio_rustls::TlsAcceptor`] before passing connections to axum.
+    /// When `None` (no-domain mode or explicit opt-out), the listener serves
+    /// plain HTTP/WS (spec section 10.12.8).
+    ///
+    /// Built from [`tls::CertificateData`] during [`ApplicationNodeBuilder::build`]
+    /// via [`tls::build_reloadable_tls_config`] (spec section 18.6.3).
+    pub(crate) tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// The TLS certificate resolver for ACME hot-reload.
+    ///
+    /// When `Some`, the ACME renewal loop can call [`CertResolver::update`]
+    /// to hot-swap certificates without restarting the server.
+    /// When `None` (no-domain mode), ACME is not active.
+    ///
+    /// See spec section 18.6.3 (auto-renewal).
+    pub(crate) cert_resolver: Option<Arc<crate::tls::CertResolver>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +443,8 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
 
     /// Takes ownership of the node and starts serving HTTP traffic.
     ///
-    /// Binds HTTPS on the configured address, merging:
+    /// Binds HTTPS (or plain HTTP when TLS is not configured) on the
+    /// configured address, merging:
     ///
     /// 1. Application-provided routes (`app_router`)
     /// 2. `.well-known/scp` route
@@ -433,6 +454,26 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
     /// SCP routes take precedence for `/.well-known/scp`, `/scp/v1`, and
     /// `/scp/broadcast/*`. All other paths route to `app_router`.
     ///
+    /// ## TLS termination
+    ///
+    /// When a TLS configuration was provisioned during
+    /// [`ApplicationNodeBuilder::build`] (domain mode with successful ACME or
+    /// injected TLS provider), `serve()` terminates TLS using
+    /// [`tokio_rustls::TlsAcceptor`] and serves HTTPS/WSS. When no TLS
+    /// configuration is present (no-domain mode, or TLS provisioning opted
+    /// out), `serve()` falls back to plain HTTP/WS. See spec section 18.6.3.
+    ///
+    /// ## Dev API
+    ///
+    /// When the dev API is configured (via [`ApplicationNodeBuilder::local_api`]),
+    /// a separate tokio task is spawned to serve the dev API on the configured
+    /// address. The dev API listener runs concurrently with the public
+    /// listener. When the dev API is not configured, `serve()` behaves exactly
+    /// as before -- no additional listener is spawned. The dev API always
+    /// uses plain HTTP (it is bound to loopback only).
+    ///
+    /// ## Graceful shutdown
+    ///
     /// The `shutdown` future is awaited as a graceful shutdown signal: when
     /// it completes, the server stops accepting new connections, drains
     /// in-flight requests, cancels the internal shutdown token (stopping
@@ -440,16 +481,12 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
     /// The node is consumed -- callers do not need to call
     /// [`ApplicationNode::shutdown`] separately.
     ///
-    /// When the dev API is configured (via [`ApplicationNodeBuilder::local_api`]),
-    /// a separate tokio task is spawned to serve the dev API on the configured
-    /// address. The dev API listener runs concurrently with the public HTTPS
-    /// listener and uses the node's internal [`CancellationToken`] for
-    /// graceful shutdown. If the dev API task exits early (e.g., bind
-    /// failure), the shutdown token is cancelled and the error is propagated.
-    /// Likewise, if the main server exits first, the dev API task is
-    /// cancelled via the shutdown token and aborted.
+    /// If the dev API task exits early (e.g., bind failure), the shutdown
+    /// token is cancelled and the error is propagated. Likewise, if the
+    /// main server exits first, the dev API task is cancelled via the
+    /// shutdown token and aborted.
     ///
-    /// See spec sections 18.6.2, 18.10.5, and 18.11.8.
+    /// See spec sections 18.6.3, 18.10.5, and 18.11.8.
     ///
     /// # Errors
     ///
@@ -475,6 +512,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
             token.map(|t| crate::dev_api::dev_router(Arc::clone(&self.state), t))
         };
         let dev_bind_addr = self.state.dev_bind_addr;
+        let tls_config = self.state.tls_config.clone();
 
         // Destructure self so we own the relay handle and state directly.
         let relay = self.relay;
@@ -487,27 +525,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
             .merge(relay_rt)
             .merge(projection);
 
-        // Spawn the dev API listener if configured. The JoinHandle is
-        // stored so we can detect early exit (e.g., bind failure) and
-        // propagate the error to the caller.
-        let dev_api_handle = if let (Some(dev_router), Some(dev_addr)) = (dev_router, dev_bind_addr)
-        {
-            let dev_shutdown = state.shutdown_token.clone();
-            Some(tokio::spawn(async move {
-                let dev_listener = tokio::net::TcpListener::bind(dev_addr).await.map_err(|e| {
-                    NodeError::Serve(format!("failed to bind dev API server on {dev_addr}: {e}"))
-                })?;
-                let local_addr = dev_listener.local_addr().unwrap_or(dev_addr);
-                tracing::info!(addr = %local_addr, "dev API server started");
-
-                axum::serve(dev_listener, dev_router)
-                    .with_graceful_shutdown(dev_shutdown.cancelled_owned())
-                    .await
-                    .map_err(|e| NodeError::Serve(format!("dev API server error: {e}")))
-            }))
-        } else {
-            None
-        };
+        let dev_api_handle = spawn_dev_api(dev_router, dev_bind_addr, state.shutdown_token.clone());
 
         let bind_addr = state.http_bind_addr;
 
@@ -519,12 +537,45 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
             .local_addr()
             .map_err(|e| NodeError::Serve(e.to_string()))?;
 
-        tracing::info!(
-            addr = %local_addr,
-            "application node HTTP server started (broadcast projection endpoints active)"
-        );
+        // Wire the caller-provided shutdown future to the node's cancellation
+        // token so that both the main server and the dev API shut down together.
+        let shutdown_token = state.shutdown_token.clone();
+        {
+            let token = shutdown_token.clone();
+            tokio::spawn(async move {
+                shutdown.await;
+                token.cancel();
+            });
+        }
 
-        let main_server = axum::serve(listener, merged).with_graceful_shutdown(shutdown);
+        // Branch: TLS-terminated HTTPS or plain HTTP.
+        let main_server: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send>,
+        > = if let Some(tls_cfg) = tls_config {
+            let scheme = "HTTPS";
+            tracing::info!(
+                addr = %local_addr, %scheme,
+                "application node server started (TLS active, broadcast projection endpoints active)"
+            );
+            Box::pin(tls::serve_tls(
+                listener,
+                tls_cfg,
+                merged,
+                shutdown_token.clone(),
+            ))
+        } else {
+            tracing::info!(
+                addr = %local_addr, scheme = "HTTP",
+                "application node server started (plain HTTP, broadcast projection endpoints active)"
+            );
+            let token = shutdown_token.clone();
+            Box::pin(async move {
+                axum::serve(listener, merged)
+                    .with_graceful_shutdown(token.cancelled_owned())
+                    .await
+                    .map_err(|e| NodeError::Serve(e.to_string()))
+            })
+        };
 
         // If a dev API task is running, select! on both: if either exits
         // early we propagate the result. This ensures a dev API bind
@@ -538,7 +589,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
                         // dev API task also drains, then abort its handle.
                         state.shutdown_token.cancel();
                         handle.abort();
-                        result.map_err(|e| NodeError::Serve(e.to_string()))
+                        result
                     }
                     result = &mut handle => {
                         // Dev API exited early — cancel shutdown token so the
@@ -556,9 +607,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
                     }
                 }
             }
-            None => main_server
-                .await
-                .map_err(|e| NodeError::Serve(e.to_string())),
+            None => main_server.await,
         };
 
         // Graceful shutdown: cancel the shutdown token (idempotent if
@@ -570,6 +619,37 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
 
         result
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dev API spawning (extracted for clippy::too_many_lines)
+// ---------------------------------------------------------------------------
+
+/// Spawns the dev API listener if configured.
+///
+/// Returns a `JoinHandle` so the caller can detect early exit (e.g., bind
+/// failure) and propagate the error. Dev API always uses plain HTTP
+/// (loopback-only, spec section 18.10.5).
+fn spawn_dev_api(
+    dev_router: Option<Router>,
+    dev_bind_addr: Option<SocketAddr>,
+    shutdown_token: CancellationToken,
+) -> Option<tokio::task::JoinHandle<Result<(), NodeError>>> {
+    let (Some(dev_router), Some(dev_addr)) = (dev_router, dev_bind_addr) else {
+        return None;
+    };
+    Some(tokio::spawn(async move {
+        let dev_listener = tokio::net::TcpListener::bind(dev_addr).await.map_err(|e| {
+            NodeError::Serve(format!("failed to bind dev API server on {dev_addr}: {e}"))
+        })?;
+        let local_addr = dev_listener.local_addr().unwrap_or(dev_addr);
+        tracing::info!(addr = %local_addr, "dev API server started");
+
+        axum::serve(dev_listener, dev_router)
+            .with_graceful_shutdown(shutdown_token.cancelled_owned())
+            .await
+            .map_err(|e| NodeError::Serve(format!("dev API server error: {e}")))
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +689,8 @@ mod tests {
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
             shutdown_token: CancellationToken::new(),
             cors_origins,
+            tls_config: None,
+            cert_resolver: None,
         })
     }
 

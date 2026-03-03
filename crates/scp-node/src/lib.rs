@@ -235,6 +235,20 @@ impl<S: Storage, B: BlobStorage> ApplicationNode<S, B> {
         &self.state.relay_url
     }
 
+    /// Returns the TLS certificate resolver for ACME hot-reload.
+    ///
+    /// Returns `Some` in domain mode when TLS is active, `None` in
+    /// no-domain mode. The ACME renewal loop should call
+    /// [`CertResolver::update`](tls::CertResolver::update) on the
+    /// returned resolver to hot-swap certificates without restarting
+    /// the server.
+    ///
+    /// See spec section 18.6.3 (auto-renewal).
+    #[must_use]
+    pub fn cert_resolver(&self) -> Option<&Arc<tls::CertResolver>> {
+        self.state.cert_resolver.as_ref()
+    }
+
     /// Registers a broadcast context so it appears in subsequent
     /// `GET /.well-known/scp` responses.
     ///
@@ -1086,7 +1100,7 @@ impl<
         );
 
         match tls_provider.provision().await {
-            Ok(_cert_data) => {
+            Ok(cert_data) => {
                 build_domain_inner(
                     domain,
                     identity,
@@ -1101,7 +1115,8 @@ impl<
                     blob_storage,
                     relay_config,
                     http_bind_addr,
-                    self.cors_origins,
+                    self.cors_origins.clone(),
+                    cert_data,
                 )
                 .await
             }
@@ -1215,15 +1230,22 @@ async fn build_domain_inner<
     relay_config: RelayConfig,
     http_bind_addr: SocketAddr,
     cors_origins: Option<Vec<String>>,
+    cert_data: tls::CertificateData,
 ) -> Result<ApplicationNode<S, B>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
     document.add_relay_service(&relay_url)?;
     did_method.publish(&identity, &document).await?;
 
+    // Build the rustls ServerConfig from the provisioned certificate.
+    // Uses the reloadable config so that ACME renewal can hot-swap certs
+    // without restarting the server (spec section 18.6.3).
+    let (tls_server_config, cert_resolver) =
+        tls::build_reloadable_tls_config(&cert_data).map_err(NodeError::Tls)?;
+
     tracing::info!(
         domain = %domain, relay_url = %relay_url,
         bound_addr = %bound_addr, did = %identity.did,
-        "application node started (domain mode)"
+        "application node started (domain mode, TLS active)"
     );
 
     let state = Arc::new(http::NodeState {
@@ -1241,6 +1263,8 @@ async fn build_domain_inner<
         http_bind_addr,
         shutdown_token: CancellationToken::new(),
         cors_origins,
+        tls_config: Some(Arc::new(tls_server_config)),
+        cert_resolver: Some(cert_resolver),
     });
 
     Ok(ApplicationNode {
@@ -1330,6 +1354,8 @@ async fn build_no_domain_inner<
         http_bind_addr,
         shutdown_token: CancellationToken::new(),
         cors_origins,
+        tls_config: None,
+        cert_resolver: None,
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).

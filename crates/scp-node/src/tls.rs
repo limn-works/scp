@@ -664,6 +664,155 @@ pub fn acme_challenge_router(
 }
 
 // ---------------------------------------------------------------------------
+// TLS accept loop for ApplicationNode::serve()
+// ---------------------------------------------------------------------------
+
+/// Serves an axum router over TLS using the provided `rustls::ServerConfig`.
+///
+/// Accepts TCP connections from `listener`, performs the TLS handshake via
+/// [`tokio_rustls::TlsAcceptor`], then hands each connection to hyper for
+/// HTTP/1.1 or HTTP/2 serving (auto-detected via ALPN). WebSocket upgrades
+/// (`/scp/v1`) work transparently through hyper's `serve_connection_with_upgrades`.
+///
+/// The loop terminates when `shutdown_token` is cancelled. In-flight
+/// connections are given a grace period to drain — the accept loop stops
+/// immediately, but spawned connection tasks run until the connection closes
+/// or the runtime shuts down.
+///
+/// See spec section 18.6.3 (TLS requirement) and 9.13 (TLS 1.3).
+///
+/// # Errors
+///
+/// Returns [`NodeError::Serve`](crate::NodeError::Serve) on fatal bind or
+/// accept errors.
+pub async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
+    app: axum::Router,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) -> Result<(), crate::NodeError> {
+    use axum::extract::Request;
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tower_service::Service;
+
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+
+    // Track in-flight connections for graceful draining. Wrapped in Arc
+    // so spawned tasks can hold permits across the `'static` boundary.
+    let connection_tracker = Arc::new(tokio::sync::Notify::new());
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    loop {
+        // Wait for a new TCP connection or shutdown signal.
+        let (tcp_stream, peer_addr) = tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => {
+                tracing::info!("TLS server shutting down, draining in-flight connections");
+                // Wait for in-flight connections to complete, with a 30s
+                // timeout to prevent indefinite hangs.
+                let drain_start = tokio::time::Instant::now();
+                let drain_timeout = Duration::from_secs(30);
+                loop {
+                    let count = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+                    if count == 0 {
+                        tracing::info!("all connections drained");
+                        break;
+                    }
+                    if drain_start.elapsed() >= drain_timeout {
+                        tracing::warn!(
+                            remaining = count,
+                            "drain timeout reached (30s), {count} connections still active"
+                        );
+                        break;
+                    }
+                    // Wait for a connection to finish, with remaining timeout.
+                    let remaining = drain_timeout.saturating_sub(drain_start.elapsed());
+                    let _ = tokio::time::timeout(remaining, connection_tracker.notified()).await;
+                }
+                return Ok(());
+            }
+            result = listener.accept() => {
+                match result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // Transient accept errors (fd exhaustion, etc.) should not crash
+                        // the server. Log and continue.
+                        tracing::warn!(error = %e, "TCP accept error");
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let tls_acceptor = tls_acceptor.clone();
+        let tower_service = app.clone();
+        let active = Arc::clone(&active_connections);
+        let notify = Arc::clone(&connection_tracker);
+        active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            // TLS handshake with timeout to prevent slowloris-style attacks.
+            let tls_stream = match tokio::time::timeout(
+                Duration::from_secs(10),
+                tls_acceptor.accept(tcp_stream),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        peer = %peer_addr,
+                        error = %e,
+                        "TLS handshake failed"
+                    );
+                    active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    notify.notify_waiters();
+                    return;
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        peer = %peer_addr,
+                        "TLS handshake timed out (10s)"
+                    );
+                    active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    notify.notify_waiters();
+                    return;
+                }
+            };
+
+            // Wrap in hyper's IO adapter.
+            let io = TokioIo::new(tls_stream);
+
+            // Build a hyper service from the tower/axum router.
+            let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                tower_service.clone().call(request)
+            });
+
+            // Serve with HTTP/2 auto-detection and WebSocket upgrade support.
+            // Limit concurrent HTTP/2 streams to prevent resource exhaustion.
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            builder.http2().max_concurrent_streams(100);
+            let result = builder
+                .serve_connection_with_upgrades(io, hyper_service)
+                .await;
+
+            if let Err(e) = result {
+                // Connection-level errors are common (client disconnects, etc.).
+                tracing::debug!(
+                    peer = %peer_addr,
+                    error = %e,
+                    "connection error"
+                );
+            }
+
+            active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            notify.notify_waiters();
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Self-signed certificate generation (testing / development)
 // ---------------------------------------------------------------------------
 

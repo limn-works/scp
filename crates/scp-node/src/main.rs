@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidCache, DidDht, InMemoryDhtClient};
-use scp_node::ApplicationNodeBuilder;
+use scp_node::{ApplicationNodeBuilder, TlsProvider};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::InMemoryBlobStorage;
@@ -85,6 +85,33 @@ fn relay_config_from_env() -> RelayConfig {
         max_connections_per_ip: env_or("SCP_RELAY_MAX_CONNECTIONS_PER_IP", 10),
         rate_limit_publishes_per_second: env_or("SCP_RELAY_RATE_LIMIT", 100),
         ..RelayConfig::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Self-signed TLS provider (development mode)
+// ---------------------------------------------------------------------------
+
+/// TLS provider that generates a self-signed certificate for development.
+///
+/// Activated by `SCP_NODE_TLS_SELF_SIGNED=1`. NOT for production use.
+struct SelfSignedTlsProvider {
+    domain: String,
+}
+
+impl TlsProvider for SelfSignedTlsProvider {
+    fn provision(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<scp_node::tls::CertificateData, scp_node::tls::TlsError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let domain = self.domain.clone();
+        Box::pin(async move { scp_node::tls::generate_self_signed(&domain) })
     }
 }
 
@@ -196,17 +223,29 @@ async fn run_full_node() {
     let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
     let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
 
+    // If SCP_NODE_TLS_SELF_SIGNED=1, use a self-signed certificate for
+    // development/testing. In production, the builder uses ACME by default.
+    let use_self_signed = env::var("SCP_NODE_TLS_SELF_SIGNED")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+
     // The relay binds to an ephemeral port on localhost; the public HTTP
     // server (serve()) binds separately on http_addr.
-    let node = match ApplicationNodeBuilder::new()
+    let mut builder = ApplicationNodeBuilder::new()
         .storage(Arc::new(InMemoryStorage::new()))
         .domain(&domain)
         .generate_identity_with(custody, did_method)
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .http_bind_addr(http_addr)
-        .build()
-        .await
-    {
+        .http_bind_addr(http_addr);
+
+    if use_self_signed {
+        tracing::info!(domain = %domain, "using self-signed TLS certificate (development mode)");
+        builder = builder.tls_provider(Arc::new(SelfSignedTlsProvider {
+            domain: domain.clone(),
+        }));
+    }
+
+    let node = match builder.build().await {
         Ok(n) => n,
         Err(e) => {
             tracing::error!(error = %e, "application node failed to build");

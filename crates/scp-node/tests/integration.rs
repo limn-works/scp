@@ -640,12 +640,168 @@ async fn scenario6_dev_api_reachable_alongside_public_server() {
 }
 
 // =========================================================================
-// Scenario 7: Broadcast projection endpoints coexist with .well-known/scp
+// Scenario 7 (TLS): serve() terminates TLS when cert_data is present (#230)
+// =========================================================================
+
+#[tokio::test]
+async fn scenario7_serve_terminates_tls_when_configured() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Test the TLS accept loop directly via `tls::serve_tls`.
+    let cert_data =
+        scp_node::tls::generate_self_signed("test.example.com").expect("self-signed should work");
+    let (tls_cfg, _resolver) =
+        scp_node::tls::build_reloadable_tls_config(&cert_data).expect("TLS config should build");
+    let tls_config = Arc::new(tls_cfg);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind");
+    let addr = listener.local_addr().expect("should get addr");
+
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    let shutdown_clone = shutdown_token.clone();
+
+    let app = axum::Router::new().route("/", axum::routing::get(|| async { "hello from TLS" }));
+
+    // Start the TLS server in a background task.
+    let server_handle = tokio::spawn(async move {
+        scp_node::tls::serve_tls(listener, tls_config, app, shutdown_token)
+            .await
+            .expect("serve_tls should not error");
+    });
+
+    // Wait for the server to start accepting.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Connect with a TLS client using a custom rustls config that trusts
+    // the self-signed certificate.
+    let certs = cert_data
+        .certificate_chain_der()
+        .expect("should parse certs");
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in &certs {
+        root_store.add(cert.clone()).expect("should add cert");
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions should be valid")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let tcp_stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("should connect via TCP");
+
+    let server_name = rustls::pki_types::ServerName::try_from("test.example.com")
+        .expect("should parse server name");
+
+    let mut tls_stream = connector
+        .connect(server_name, tcp_stream)
+        .await
+        .expect("TLS handshake should succeed with trusted self-signed cert");
+
+    // Send an HTTP/1.1 request over the TLS stream.
+    let request = "GET / HTTP/1.1\r\nHost: test.example.com\r\nConnection: close\r\n\r\n";
+    tls_stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("should write request");
+
+    let mut response = String::new();
+    tls_stream
+        .read_to_string(&mut response)
+        .await
+        .expect("should read response");
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "TLS server should respond with 200 OK, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("hello from TLS"),
+        "response body should contain the expected content"
+    );
+
+    // Shutdown the server.
+    shutdown_clone.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_handle).await;
+}
+
+/// Verifies that a plain TCP connection to the TLS server fails the
+/// handshake (no unencrypted fallback).
+#[tokio::test]
+async fn scenario7_tls_server_rejects_plain_tcp() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let cert_data =
+        scp_node::tls::generate_self_signed("test.example.com").expect("self-signed should work");
+    let (tls_cfg, _resolver) =
+        scp_node::tls::build_reloadable_tls_config(&cert_data).expect("TLS config should build");
+    let tls_config = Arc::new(tls_cfg);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind");
+    let addr = listener.local_addr().expect("should get addr");
+
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    let shutdown_clone = shutdown_token.clone();
+
+    let app =
+        axum::Router::new().route("/", axum::routing::get(|| async { "should not see this" }));
+
+    tokio::spawn(async move {
+        scp_node::tls::serve_tls(listener, tls_config, app, shutdown_token)
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send plain HTTP (no TLS) — the server should not respond with valid HTTP.
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("TCP connect should succeed");
+
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write should succeed");
+
+    let mut buf = vec![0u8; 512];
+    let result =
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf)).await;
+
+    match result {
+        Ok(Ok(0) | Err(_)) | Err(_) => {
+            // Expected: server closes connection, timeout, or connection
+            // error (TLS handshake fails on non-TLS data).
+        }
+        Ok(Ok(n)) => {
+            let response = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                !response.starts_with("HTTP/1.1 200"),
+                "plain TCP should NOT get a valid HTTP 200 response from a TLS server"
+            );
+        }
+    }
+
+    shutdown_clone.cancel();
+}
+
+// =========================================================================
+// Scenario 8: Broadcast projection endpoints coexist with .well-known/scp
 //             on the same public listener (SCP-249)
 // =========================================================================
 
 #[tokio::test]
-async fn scenario7_projection_endpoints_coexist_with_well_known() {
+async fn scenario8_projection_endpoints_coexist_with_well_known() {
     let (node, _dht_client) = build_test_node().await;
 
     // Merge well-known, relay, and broadcast projection routers — the same

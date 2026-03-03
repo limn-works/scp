@@ -18,7 +18,7 @@ scp-platform = { path = "../scp-platform", features = ["testing"] }
 axum = { workspace = true, features = ["ws"] }
 instant-acme = "0.8"
 rcgen = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
 rustls-pemfile = "2"
 base64 = { workspace = true }
 rmp-serde = { workspace = true }
@@ -28,10 +28,13 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 tokio-util = { workspace = true }
 tokio-tungstenite = { version = "0.24" }
 tower-http = { workspace = true }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+tower-service = "0.3"
 futures = "0.3"
 hex = { workspace = true }
 percent-encoding = { workspace = true }
