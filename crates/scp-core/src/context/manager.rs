@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use super::broadcast::{
     AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
@@ -186,6 +186,19 @@ pub struct ContextManager {
     /// process restarts. When `Some`, the manager persists broadcast state
     /// after every broadcast-mutating operation.
     broadcast_persistence: Option<Arc<dyn BroadcastPersistence>>,
+    /// DIDs controlled by the local node/SDK.
+    ///
+    /// Used for defense-in-depth validation in
+    /// [`handle_broadcast_key_request`](Self::handle_broadcast_key_request):
+    /// the method verifies the `author_did` is locally controlled before
+    /// processing the request. While transport-layer auth (spec section
+    /// 9.16.2) is the primary enforcement mechanism, this check prevents
+    /// misuse if the method is called from an unexpected context.
+    ///
+    /// Populated via [`register_local_did`](Self::register_local_did).
+    /// Uses `RwLock` because reads (validation checks) are frequent and
+    /// writes (DID registration) are rare.
+    local_dids: RwLock<HashSet<DID>>,
     /// Per-context state, keyed by `context_id` string.
     contexts: Mutex<HashMap<String, PerContextState>>,
 }
@@ -212,6 +225,7 @@ impl ContextManager {
             transport: Arc::from(transport),
             event_log: Arc::from(event_log),
             broadcast_persistence: None,
+            local_dids: RwLock::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
         }
     }
@@ -241,6 +255,7 @@ impl ContextManager {
             transport: Arc::from(transport),
             event_log: Arc::from(event_log),
             broadcast_persistence: Some(Arc::from(broadcast_persistence)),
+            local_dids: RwLock::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
         }
     }
@@ -353,6 +368,31 @@ impl ContextManager {
         }
         contexts.insert(context_id, per_context);
         Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Local DID management (defense-in-depth, #234)
+    // -------------------------------------------------------------------
+
+    /// Registers a DID as controlled by the local node/SDK.
+    ///
+    /// The node layer calls this at startup (and when new DIDs are created)
+    /// to inform the `ContextManager` which DIDs are locally controlled.
+    /// This enables defense-in-depth validation in
+    /// [`handle_broadcast_key_request`](Self::handle_broadcast_key_request),
+    /// which verifies the `author_did` is locally controlled before
+    /// processing the key request.
+    ///
+    /// Registering the same DID multiple times is idempotent.
+    pub async fn register_local_did(&self, did: DID) {
+        self.local_dids.write().await.insert(did);
+    }
+
+    /// Returns `true` if the given DID is registered as locally controlled.
+    ///
+    /// This is a read-only query useful for diagnostics and testing.
+    pub async fn is_local_did(&self, did: &DID) -> bool {
+        self.local_dids.read().await.contains(did)
     }
 
     /// Creates a new SCP context with the two-phase commit pattern.
@@ -1245,7 +1285,19 @@ impl ContextManager {
     /// This is the author-side decision function for the pull-based key
     /// distribution protocol (spec section 9.16.2).
     ///
+    /// # Defense-in-depth validation (#234)
+    ///
+    /// Before delegating to `BroadcastContext::handle_key_request`, this
+    /// method verifies that `author_did` is registered as a locally
+    /// controlled DID via [`register_local_did`](Self::register_local_did).
+    /// This prevents misuse if the method is called from an unexpected
+    /// context. Transport-layer auth (spec section 9.16.2) remains the
+    /// primary enforcement mechanism; this check is an additional layer.
+    ///
     /// # Errors
+    ///
+    /// Returns [`ContextError::PermissionDenied`] if `author_did` is not
+    /// registered as a locally controlled DID.
     ///
     /// Returns [`ContextError::MembershipFailed`] if the context is not
     /// registered or not a broadcast context.
@@ -1256,6 +1308,15 @@ impl ContextManager {
         author_did: &DID,
         requester_did: &DID,
     ) -> Result<KeyRequestDecision, ContextError> {
+        // Defense-in-depth: verify the local SDK controls the author DID.
+        // Transport-layer auth (section 9.16.2) is the primary gate; this prevents
+        // misuse if the method is ever called from a different context.
+        if !self.local_dids.read().await.contains(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "author DID is not controlled by the local node: {author_did}"
+            )));
+        }
+
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
@@ -2450,12 +2511,18 @@ mod tests {
 
     /// Helper: creates a broadcast context with open admission and returns
     /// the manager, handle, and `context_id`.
+    ///
+    /// Registers `did:key:author1` as a local DID for defense-in-depth
+    /// validation in `handle_broadcast_key_request` (#234).
     async fn setup_broadcast_context() -> (ContextManager, ContextHandle, String) {
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
         );
+
+        // Register the author DID as locally controlled (#234).
+        manager.register_local_did("did:key:author1".into()).await;
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
@@ -3125,12 +3192,17 @@ mod tests {
     ///
     /// Both authors are registered in the `BroadcastContext` (for publish
     /// capability) and in `MembershipState` (for sequence number tracking).
+    /// Both author DIDs are registered as locally controlled (#234).
     async fn setup_broadcast_context_two_authors() -> (ContextManager, ContextHandle, String) {
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
         );
+
+        // Register both author DIDs as locally controlled (#234).
+        manager.register_local_did("did:key:alice".into()).await;
+        manager.register_local_did("did:key:bob".into()).await;
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
@@ -3737,5 +3809,184 @@ mod tests {
             result.unwrap_err(),
             ContextError::MembershipFailed(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Caller identity validation tests (#234)
+    // -----------------------------------------------------------------------
+
+    /// #234: `register_local_did` registers a DID as locally controlled,
+    /// and `is_local_did` confirms it.
+    #[tokio::test]
+    async fn register_local_did_is_queryable() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let did: DID = "did:key:local1".into();
+        assert!(!manager.is_local_did(&did).await);
+
+        manager.register_local_did(did.clone()).await;
+        assert!(manager.is_local_did(&did).await);
+
+        // Idempotent: re-registering is a no-op.
+        manager.register_local_did(did.clone()).await;
+        assert!(manager.is_local_did(&did).await);
+    }
+
+    /// #234: `handle_broadcast_key_request` with a locally controlled DID
+    /// succeeds (positive case -- defense-in-depth validation passes).
+    #[tokio::test]
+    async fn handle_broadcast_key_request_succeeds_with_local_did() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe a requester.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // author1 is registered as a local DID by setup_broadcast_context.
+        let decision = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:sub1".into(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(decision, super::KeyRequestDecision::Grant { .. }),
+            "key request with locally controlled author DID should be granted"
+        );
+    }
+
+    /// #234: `handle_broadcast_key_request` with an uncontrolled DID returns
+    /// `PermissionDenied` (negative case -- defense-in-depth validation
+    /// rejects the request before reaching `BroadcastContext`).
+    #[tokio::test]
+    async fn handle_broadcast_key_request_rejects_non_local_did() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe a requester.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // "did:key:unknown-author" is NOT registered as a local DID.
+        let result = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:unknown-author".into(),
+                &"did:key:sub1".into(),
+            )
+            .await;
+
+        assert!(result.is_err(), "should reject non-local author DID");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("not controlled")),
+            "error should be PermissionDenied with descriptive message, got: {err}"
+        );
+    }
+
+    /// #234: blocked subscriber's key request still returns `Deny` (not
+    /// `PermissionDenied`) -- block list information is not leaked through
+    /// the new validation layer. The defense-in-depth check runs first,
+    /// but when the caller IS the local author, the existing block list
+    /// logic applies as before.
+    #[tokio::test]
+    async fn handle_broadcast_key_request_deny_does_not_leak_block_info() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe then block.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:blocked-sub".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        manager
+            .block_broadcast_subscriber(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:blocked-sub".into(),
+            )
+            .await
+            .unwrap();
+
+        // Key request for blocked subscriber returns Deny (not a
+        // PermissionDenied error). The deny reason is generic and does
+        // not reveal whether the subscriber is blocked or unregistered.
+        let decision = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:blocked-sub".into(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(decision, super::KeyRequestDecision::Deny { .. }),
+            "blocked subscriber should receive Deny decision"
+        );
     }
 }
