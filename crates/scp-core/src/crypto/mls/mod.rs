@@ -40,4 +40,6 @@ pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,
     destroy_group, generate_key_package, join_group, remove_member,
 };
-pub use storage::{ScpMlsProvider, new_provider};
+pub use storage::{
+    InMemoryMlsProvider, MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider, new_provider,
+};

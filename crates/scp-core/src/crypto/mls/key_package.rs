@@ -21,7 +21,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use super::credential::ScpCredential;
 use super::error::MlsError;
 use super::group::generate_key_package;
-use super::storage::ScpMlsProvider;
+use super::storage::InMemoryMlsProvider;
 
 /// Default minimum buffer size: 10 key packages per identity.
 const DEFAULT_MIN_BUFFER: usize = 10;
@@ -43,7 +43,7 @@ pub struct KeyPackageEntry {
     /// The Ed25519 signing key pair associated with this key package.
     pub signer: SignatureKeyPair,
     /// The MLS provider holding the cryptographic state for this key package.
-    pub provider: ScpMlsProvider,
+    pub provider: InMemoryMlsProvider,
 }
 
 /// Pre-generated buffer of single-use `KeyPackage`s for offline member addition.

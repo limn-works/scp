@@ -180,6 +180,17 @@ impl<S: Storage> ProtocolStore<S> {
         Self { storage }
     }
 
+    /// Returns a reference to the underlying storage backend.
+    ///
+    /// Used by [`MlsStorageBridge`](crate::crypto::mls::storage::MlsStorageBridge)
+    /// to perform raw storage operations for `OpenMLS` state persistence.
+    ///
+    /// See spec section 17.9. See SCP-PERSIST-050.
+    #[must_use]
+    pub const fn storage(&self) -> &S {
+        &self.storage
+    }
+
     /// Serializes a value into a `StoredValue` envelope using `MessagePack`.
     ///
     /// Wraps the data in a version envelope (spec section 17.5) and

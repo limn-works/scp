@@ -20,7 +20,7 @@ use std::ops::Deref;
 
 use super::credential::ScpCredential;
 use super::error::MlsError;
-use super::storage::ScpMlsProvider;
+use super::storage::InMemoryMlsProvider;
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -109,7 +109,7 @@ pub struct ScpMlsGroup {
     /// drops the MLS state (tree secrets, epoch keys, etc.).
     pub(crate) group: Option<MlsGroup>,
     /// The MLS provider (crypto + storage) for this group.
-    pub(crate) provider: ScpMlsProvider,
+    pub(crate) provider: InMemoryMlsProvider,
     /// The local member's Ed25519 signing key pair, wrapped in
     /// [`ZeroizingSigner`] for best-effort zeroization on drop.
     /// Inner `Option` is `None` after [`destroy_group`] drops the
@@ -134,7 +134,7 @@ impl ScpMlsGroup {
 
     /// Returns a reference to the provider for this group.
     #[must_use]
-    pub const fn provider(&self) -> &ScpMlsProvider {
+    pub const fn provider(&self) -> &InMemoryMlsProvider {
         &self.provider
     }
 
@@ -237,7 +237,7 @@ impl ScpMlsGroup {
 ///
 /// See ADR-001 acceptance criterion 1.
 pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError> {
-    let provider = ScpMlsProvider::default();
+    let provider = InMemoryMlsProvider::default();
 
     // Generate an Ed25519 signing key pair for the creator.
     let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())
@@ -454,7 +454,7 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // Replace the provider with a fresh empty instance. The old provider's
     // MemoryStorage contains encryption key pairs, key packages, and other
     // MLS artifacts — dropping it releases all of that key material.
-    group.provider = ScpMlsProvider::default();
+    group.provider = InMemoryMlsProvider::default();
 
     // Mark the group as destroyed so all future operations are rejected.
     group.destroyed = true;
@@ -474,7 +474,7 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
 ///
 /// # Returns
 ///
-/// A tuple of (`KeyPackageBundle`, `SignatureKeyPair`, `ScpMlsProvider`).
+/// A tuple of (`KeyPackageBundle`, `SignatureKeyPair`, `InMemoryMlsProvider`).
 /// The `KeyPackageBundle` contains the public `KeyPackage` that should be
 /// published, plus private keys stored in the provider. The provider and
 /// signer must be retained by the participant to later join a group via a
@@ -488,8 +488,8 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
 /// generation fails.
 pub fn generate_key_package(
     credential: &ScpCredential,
-) -> Result<(KeyPackageBundle, SignatureKeyPair, ScpMlsProvider), MlsError> {
-    let provider = ScpMlsProvider::default();
+) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
+    let provider = InMemoryMlsProvider::default();
 
     let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())
         .map_err(|e| MlsError::KeyPackageGenerationFailed(format!("signer generation: {e}")))?;
@@ -536,7 +536,7 @@ pub fn generate_key_package(
 /// cannot be processed.
 pub fn join_group(
     welcome: &MlsMessageOut,
-    provider: ScpMlsProvider,
+    provider: InMemoryMlsProvider,
     signer: SignatureKeyPair,
 ) -> Result<ScpMlsGroup, MlsError> {
     // Serialize MlsMessageOut to bytes, then deserialize as MlsMessageIn.
