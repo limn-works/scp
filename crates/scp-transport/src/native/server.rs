@@ -641,6 +641,8 @@ pub fn hex_encode_32(bytes: &[u8; 32]) -> String {
 /// include a `token` query parameter whose hex-decoded value matches the
 /// secret (constant-time comparison). Connections without a valid token are
 /// rejected during the handshake — no protocol messages are exchanged.
+// Relay handler passes through connection state; bundling into a struct
+// would add allocation overhead per-message with no readability gain.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection<S: BlobStorage + 'static>(
     stream: TcpStream,
@@ -912,6 +914,8 @@ async fn handle_client_message<S: BlobStorage>(
 }
 
 /// Handles a PUBLISH operation.
+// PUBLISH handler receives protocol-defined fields plus connection state;
+// grouping would obscure the protocol-level parameters.
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish<S: BlobStorage>(
     ref_id: Option<String>,
@@ -1115,6 +1119,8 @@ async fn deliver_to_subscribers(
 }
 
 /// Handles a SUBSCRIBE operation.
+// SUBSCRIBE handler receives protocol-defined fields plus connection state;
+// grouping would obscure the protocol-level parameters.
 #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
 async fn handle_subscribe<S: BlobStorage>(
     ref_id: Option<String>,

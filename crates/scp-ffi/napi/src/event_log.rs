@@ -122,6 +122,7 @@ pub async fn event_log_query(
     })
     .to_string();
 
+    // Unix timestamp seconds fit in f64 mantissa for centuries.
     #[allow(clippy::cast_precision_loss)]
     let timestamp = scp_core::time::now_secs()
         .map_err(|e| ScpNapiError::Context {
@@ -134,6 +135,7 @@ pub async fn event_log_query(
         event_type: "LogSummary".to_owned(),
         actor_did: String::new(),
         timestamp,
+        // Sequence number is a small counter; precision loss is negligible.
         payload_json,
         #[allow(clippy::cast_precision_loss)]
         sequence: event_count.saturating_sub(1) as f64,

@@ -358,6 +358,8 @@ mod tests {
         }
     }
 
+    // Mock only implements resolve(); other DidMethod methods are intentionally
+    // unimplemented as they are not exercised by well_known tests.
     #[allow(clippy::unimplemented)]
     impl DidMethod for MockDidMethod {
         fn create(

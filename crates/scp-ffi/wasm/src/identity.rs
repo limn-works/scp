@@ -212,6 +212,7 @@ impl WasmDIDDocument {
     /// All parameters must be valid JSON strings. Validation is performed by
     /// the TypeScript SDK before calling this constructor.
     #[must_use]
+    // wasm-bindgen JS constructor must accept all fields individually.
     #[allow(clippy::too_many_arguments)]
     #[wasm_bindgen(js_name = "fromFields")]
     pub fn from_fields(

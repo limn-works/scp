@@ -305,6 +305,7 @@ impl RelayDeletionStats {
         if self.total_requests == 0 {
             return 1.0;
         }
+        // Ratio of small counts; precision loss is negligible.
         #[allow(clippy::cast_precision_loss)]
         let rate = self.confirmed as f64 / self.total_requests as f64;
         rate

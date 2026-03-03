@@ -534,6 +534,7 @@ impl TruncatedEventLog {
 
         // Extract leaf hashes for the pruned region.
         let all_leaves = log.leaves();
+        // checkpoint_count derived from log size; fits in usize.
         #[allow(clippy::cast_possible_truncation)]
         let pruned_leaves: Vec<[u8; 32]> = all_leaves[..checkpoint_count as usize].to_vec();
 
@@ -616,6 +617,7 @@ impl TruncatedEventLog {
                 count: self.pruned_event_count,
             });
         }
+        // leaf_index validated against pruned_leaf_hashes.len().
 
         #[allow(clippy::cast_possible_truncation)]
         let idx = leaf_index as usize;
@@ -774,6 +776,7 @@ pub fn verify_cross_checkpoint_with_leaves(
 
     if older.event_count > newer.event_count {
         return CrossCheckpointResult::OrderViolation;
+        // newer_leaves.len() bounded by event log size; fits in u64.
     }
 
     #[allow(clippy::cast_possible_truncation)]

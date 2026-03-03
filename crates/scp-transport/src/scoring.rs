@@ -178,6 +178,7 @@ pub fn update_score<S: ::std::hash::BuildHasher>(
                 latency_ms as f64,
                 (1.0 - EMA_ALPHA) * (score.average_latency_ms as f64),
             );
+            // Latency ms and EMA values are small positive numbers.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             {
                 score.average_latency_ms = new_latency as u64;

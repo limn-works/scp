@@ -34,6 +34,8 @@ impl Default for InMemoryPush {
 
 // The trait uses RPITIT (`-> impl Future<...> + Send`), so each impl method
 // must return a future rather than use `async fn` directly.
+// Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
+// does not guarantee Send futures, so manual impl Future is required.
 #[allow(clippy::manual_async_fn)]
 impl Push for InMemoryPush {
     fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send {

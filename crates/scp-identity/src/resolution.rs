@@ -264,6 +264,8 @@ impl InMemoryRelayQuerier {
     }
 }
 
+// Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
+// does not guarantee Send futures, so manual impl Future is required.
 #[allow(clippy::manual_async_fn)]
 impl RelayQuerier for InMemoryRelayQuerier {
     fn query(

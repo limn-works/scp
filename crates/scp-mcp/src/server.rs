@@ -301,6 +301,8 @@ impl<P: ContextProvider> McpServer<P> {
     }
 
     /// Handles the `notifications/initialized` notification.
+    // Instance method signature kept for consistency with other handle_* methods
+    // in the dispatch table; will use `self` for metrics/logging.
     #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
     fn handle_initialized(&self) {
         // The client confirms it received the initialize response.
@@ -308,6 +310,8 @@ impl<P: ContextProvider> McpServer<P> {
     }
 
     /// Handles the `ping` request.
+    // Instance method signature kept for consistency with other handle_* methods
+    // in the dispatch table; will use `self` for metrics/logging.
     #[allow(clippy::unused_self)]
     fn handle_ping(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         JsonRpcResponse::success(
@@ -385,6 +389,9 @@ impl<P: ContextProvider> McpServer<P> {
     /// Handles `tools/call` -- parses context namespace, validates membership
     /// and capability, validates input against schema, invokes the tool,
     /// validates output, and attaches provenance.
+    // Five sequential validation phases (namespace parse, membership, UCAN,
+    // input schema, output schema) plus invocation and provenance attachment
+    // form a linear pipeline that reads worse when split across functions.
     #[allow(clippy::too_many_lines)]
     fn handle_tools_call(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let params: ToolsCallParams = match parse_params(request.params.as_ref()) {
@@ -750,30 +757,33 @@ impl<P: ContextProvider> McpServer<P> {
 ///
 /// Returns the parsed value or a JSON-RPC error response (without an ID --
 /// caller must attach the ID).
-#[allow(clippy::result_large_err)]
 fn parse_params<T: serde::de::DeserializeOwned>(
     params: Option<&Value>,
-) -> Result<T, JsonRpcResponse> {
+) -> Result<T, Box<JsonRpcResponse>> {
     let value = params
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
 
     serde_json::from_value(value).map_err(|e| {
-        JsonRpcResponse::error(
+        Box::new(JsonRpcResponse::error(
             RequestId::Number(0), // Placeholder -- caller replaces.
             JsonRpcError {
                 code: protocol::INVALID_PARAMS,
                 message: format!("invalid params: {e}"),
                 data: None,
             },
-        )
+        ))
     })
 }
 
 /// Replaces the ID on a placeholder error response.
-fn with_id(mut response: JsonRpcResponse, id: RequestId) -> JsonRpcResponse {
-    response.id = id;
-    response
+// Accepts Box<JsonRpcResponse> to pair with parse_params which returns
+// Box<JsonRpcResponse> as the error type to avoid clippy::result_large_err.
+#[allow(clippy::boxed_local)]
+fn with_id(response: Box<JsonRpcResponse>, id: RequestId) -> JsonRpcResponse {
+    let mut resp = *response;
+    resp.id = id;
+    resp
 }
 
 /// Creates an internal error response.

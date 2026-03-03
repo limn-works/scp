@@ -451,6 +451,7 @@ impl TieredEventLog {
 
         let hot_leaves = self.hot.leaves();
 
+        // count comes from event log size; fits in usize.
         #[allow(clippy::cast_possible_truncation)]
         let count_usize = count as usize;
 

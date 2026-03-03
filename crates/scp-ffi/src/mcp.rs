@@ -834,6 +834,7 @@ impl ContextProvider for FfiBridgeProvider {
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
 
+        // Unix timestamp seconds fit in u64 for centuries.
         #[allow(clippy::cast_possible_truncation)]
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

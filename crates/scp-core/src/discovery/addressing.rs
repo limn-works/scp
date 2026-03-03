@@ -472,6 +472,7 @@ impl ResolutionCache {
     ///
     /// Panics if `DEFAULT_CACHE_CAPACITY` is zero (compile-time constant, always non-zero).
     #[must_use]
+    // SAFETY: DEFAULT_CACHE_CAPACITY is a non-zero compile-time constant (128).
     #[allow(clippy::expect_used)]
     pub fn new() -> Self {
         Self {

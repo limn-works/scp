@@ -1137,6 +1137,7 @@ fn resolve_nat(
 // Shared no-domain build logic (used by HasNoDomain::build and domain fallthrough)
 // ---------------------------------------------------------------------------
 
+// Node builder internal: all parameters are required for server construction.
 #[allow(clippy::too_many_arguments)]
 async fn build_no_domain_inner<
     D: DidMethod + 'static,

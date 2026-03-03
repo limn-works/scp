@@ -122,7 +122,7 @@ impl TestAdapter {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    #[allow(clippy::expect_used, clippy::significant_drop_tightening)]
+    #[allow(clippy::expect_used, clippy::significant_drop_tightening)] // Test infra: poisoned mutex is unrecoverable.
     pub fn seed_balance(&self, did: DID, amount: Amount, currency: CurrencyCode) {
         let mut ledger = self.inner.lock().expect("ledger lock poisoned");
         let entry = ledger.balances.entry((did, currency)).or_insert(0);
@@ -138,7 +138,7 @@ impl TestAdapter {
     ///
     /// Panics if the internal mutex is poisoned.
     #[must_use]
-    #[allow(clippy::expect_used, clippy::significant_drop_tightening)]
+    #[allow(clippy::expect_used, clippy::significant_drop_tightening)] // Test infra: poisoned mutex is unrecoverable.
     pub fn available_balance(&self, did: &DID, currency: &CurrencyCode) -> Amount {
         let ledger = self.inner.lock().expect("ledger lock poisoned");
         let balance = ledger

@@ -285,6 +285,7 @@ pub fn py_ucan_mint(
         issuer: token.payload.iss.clone(),
         audience: token.payload.aud.clone(),
         capabilities: capability_uris,
+        // Unix timestamp seconds fit in f64 mantissa for centuries.
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),
         proofs: token.payload.prf,
@@ -319,6 +320,7 @@ pub fn py_ucan_mint(
 ///
 /// See ADR-016 criterion 4 and SCP-214 criterion 8.
 #[pyfunction]
+// PyO3 requires owned types for #[pyfunction] arguments.
 #[pyo3(name = "ucan_delegate")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn py_ucan_delegate(
@@ -384,6 +386,7 @@ pub fn py_ucan_delegate(
         token_id: token.payload.nnc.clone(),
         issuer: token.payload.iss.clone(),
         audience: token.payload.aud.clone(),
+        // Unix timestamp seconds fit in f64 mantissa for centuries.
         capabilities: capability_uris,
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),

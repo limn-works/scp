@@ -64,6 +64,7 @@ mod byte_array_32_opt {
     use serde::de::Error;
     use serde::{Deserializer, Serializer};
 
+    // serde Serialize signature requires &Option<T>.
     #[allow(clippy::ref_option)]
     pub fn serialize<S: Serializer>(
         value: &Option<[u8; 32]>,
