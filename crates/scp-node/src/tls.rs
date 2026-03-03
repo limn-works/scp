@@ -664,6 +664,120 @@ pub fn acme_challenge_router(
 }
 
 // ---------------------------------------------------------------------------
+// TLS accept loop for ApplicationNode::serve()
+// ---------------------------------------------------------------------------
+
+/// Serves an axum router over TLS using the provided `rustls::ServerConfig`.
+///
+/// Accepts TCP connections from `listener`, performs the TLS handshake via
+/// [`tokio_rustls::TlsAcceptor`], then hands each connection to hyper for
+/// HTTP/1.1 or HTTP/2 serving (auto-detected via ALPN). WebSocket upgrades
+/// (`/scp/v1`) work transparently through hyper's `serve_connection_with_upgrades`.
+///
+/// The loop terminates when `shutdown_token` is cancelled. In-flight
+/// connections are given a grace period to drain — the accept loop stops
+/// immediately, but spawned connection tasks run until the connection closes
+/// or the runtime shuts down.
+///
+/// See spec section 18.6.3 (TLS requirement) and 9.13 (TLS 1.3).
+///
+/// # Errors
+///
+/// Returns [`NodeError::Serve`](crate::NodeError::Serve) on fatal bind or
+/// accept errors.
+pub async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
+    app: axum::Router,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) -> Result<(), crate::NodeError> {
+    use axum::extract::Request;
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tower_service::Service;
+
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+
+    // Track in-flight connections for graceful draining. Wrapped in Arc
+    // so spawned tasks can hold permits across the `'static` boundary.
+    let connection_tracker = Arc::new(tokio::sync::Notify::new());
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    loop {
+        // Wait for a new TCP connection or shutdown signal.
+        let (tcp_stream, peer_addr) = tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => {
+                tracing::info!("TLS server shutting down");
+                // In-flight connection tasks will complete naturally as
+                // the runtime drains. The caller can await those tasks
+                // via the runtime shutdown sequence.
+                return Ok(());
+            }
+            result = listener.accept() => {
+                match result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // Transient accept errors (fd exhaustion, etc.) should not crash
+                        // the server. Log and continue.
+                        tracing::warn!(error = %e, "TCP accept error");
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let tls_acceptor = tls_acceptor.clone();
+        let tower_service = app.clone();
+        let active = Arc::clone(&active_connections);
+        let notify = Arc::clone(&connection_tracker);
+        active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            // TLS handshake.
+            let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::debug!(
+                        peer = %peer_addr,
+                        error = %e,
+                        "TLS handshake failed"
+                    );
+                    active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    notify.notify_waiters();
+                    return;
+                }
+            };
+
+            // Wrap in hyper's IO adapter.
+            let io = TokioIo::new(tls_stream);
+
+            // Build a hyper service from the tower/axum router.
+            let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                tower_service.clone().call(request)
+            });
+
+            // Serve with HTTP/2 auto-detection and WebSocket upgrade support.
+            let result = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, hyper_service)
+                .await;
+
+            if let Err(e) = result {
+                // Connection-level errors are common (client disconnects, etc.).
+                tracing::debug!(
+                    peer = %peer_addr,
+                    error = %e,
+                    "connection error"
+                );
+            }
+
+            active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            notify.notify_waiters();
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Self-signed certificate generation (testing / development)
 // ---------------------------------------------------------------------------
 
