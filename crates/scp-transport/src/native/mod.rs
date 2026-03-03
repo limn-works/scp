@@ -32,6 +32,8 @@ pub mod adapter;
 pub(crate) mod client;
 pub mod error;
 pub mod protocol;
+#[cfg(feature = "redb-blob")]
+pub mod redb_blob;
 pub mod server;
 #[cfg(feature = "sqlite-blob")]
 pub mod sqlite_blob;
