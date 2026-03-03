@@ -13,6 +13,7 @@ ci-tier3 = ["ci-tier2"]
 [dependencies]
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
+scp-platform = { path = "../scp-platform" }
 scp-transport = { path = "../scp-transport" }
 sha2 = { workspace = true }
 tokio = { workspace = true }
