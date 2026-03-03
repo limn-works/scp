@@ -10,10 +10,12 @@ license.workspace = true
 sqlite-blob = ["dep:rusqlite"]
 redb-blob = ["dep:redb"]
 local-cache = []
+combined = ["dep:rusqlite", "dep:scp-platform"]
 
 [dependencies]
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
+scp-platform = { path = "../scp-platform", optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
@@ -36,12 +38,14 @@ redb = { workspace = true, optional = true }
 [dev-dependencies]
 scp-core = { path = "../scp-core" }
 ed25519-dalek = { workspace = true }
+scp-platform = { path = "../scp-platform" }
 scp-testing = { path = "../scp-testing" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
 rmpv = { version = "1", features = ["with-serde"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
 
 [lints]
 workspace = true

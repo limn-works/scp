@@ -30,6 +30,8 @@
 
 pub mod adapter;
 pub(crate) mod client;
+#[cfg(feature = "combined")]
+pub mod combined;
 pub mod error;
 #[cfg(feature = "local-cache")]
 pub mod local_cache;
