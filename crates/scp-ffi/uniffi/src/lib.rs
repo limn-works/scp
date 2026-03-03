@@ -586,10 +586,16 @@ mod tests {
                 );
             }
             Ok(_) => {
-                assert!(false, "identity_create(\"in_memory\") should fail without allow_in_memory_custody feature");
+                assert!(
+                    false,
+                    "identity_create(\"in_memory\") should fail without allow_in_memory_custody feature"
+                );
             }
             Err(other) => {
-                assert!(false, "expected ScpError::Identity with SCP-IDN-1008, got: {other:?}");
+                assert!(
+                    false,
+                    "expected ScpError::Identity with SCP-IDN-1008, got: {other:?}"
+                );
             }
         }
     }
