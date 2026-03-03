@@ -110,7 +110,7 @@
       "gate": "gate-persist-0",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/roles.rs",
         "crates/scp-core/src/context/membership.rs"
@@ -152,7 +152,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/event_log.rs",
         "crates/scp-core/src/store/mod.rs"
@@ -198,7 +198,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/nonce.rs",
         "crates/scp-core/src/store/ucan.rs",
@@ -243,7 +243,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/transport.rs",
         "crates/scp-core/src/store/mod.rs"
@@ -290,7 +290,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/context.rs"
       ],
@@ -336,7 +336,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/identity.rs"
       ],
@@ -377,7 +377,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/economy.rs"
       ],
@@ -417,7 +417,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/economy.rs"
       ],
@@ -457,7 +457,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/event_log.rs"
       ],
@@ -503,7 +503,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/mod.rs"
       ],
@@ -545,7 +545,7 @@
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/mod.rs"
       ],
@@ -584,7 +584,7 @@
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
@@ -627,7 +627,7 @@
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
@@ -670,7 +670,7 @@
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
@@ -717,7 +717,7 @@
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
@@ -761,7 +761,7 @@
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
@@ -808,7 +808,7 @@
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
@@ -851,7 +851,7 @@
       "gate": "gate-persist-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/src/conformance/storage.rs",
         "crates/scp-testing/src/conformance/mod.rs"
@@ -898,7 +898,7 @@
       "gate": "gate-persist-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/src/sqlite/mod.rs",
         "crates/scp-platform/Cargo.toml",
@@ -944,7 +944,7 @@
       "gate": "gate-persist-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/src/filesystem/mod.rs",
         "crates/scp-platform/Cargo.toml",
@@ -990,7 +990,7 @@
       "gate": "gate-persist-4",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/src/conformance/blob_store.rs",
         "crates/scp-testing/src/conformance/mod.rs"
@@ -1033,7 +1033,7 @@
       "gate": "gate-persist-4",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/sqlite_blob.rs",
         "crates/scp-transport/Cargo.toml",
@@ -1078,7 +1078,7 @@
       "gate": "gate-persist-4",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/redb_blob.rs",
         "crates/scp-transport/Cargo.toml",
@@ -1123,7 +1123,7 @@
       "gate": "gate-persist-5",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/storage.rs",
         "crates/scp-core/src/crypto/mls/mod.rs"
