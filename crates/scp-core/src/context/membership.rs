@@ -783,7 +783,7 @@ mod tests {
     // MessagePack roundtrip -- SCP-PERSIST-001
     // -----------------------------------------------------------------------
 
-    /// SCP-PERSIST-001: `MembershipState` survives MessagePack roundtrip.
+    /// SCP-PERSIST-001: `MembershipState` survives `MessagePack` roundtrip.
     #[test]
     fn membership_state_msgpack_roundtrip() {
         use crate::context::roles::{UcanAttestation, UcanToken};

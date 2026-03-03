@@ -1597,7 +1597,7 @@ mod tests {
     // MessagePack roundtrip -- SCP-PERSIST-001
     // -----------------------------------------------------------------------
 
-    /// SCP-PERSIST-001: `ContextRoleState` survives MessagePack roundtrip.
+    /// SCP-PERSIST-001: `ContextRoleState` survives `MessagePack` roundtrip.
     #[test]
     fn context_role_state_msgpack_roundtrip() {
         let ceiling = test_ceiling();

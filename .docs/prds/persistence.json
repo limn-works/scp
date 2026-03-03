@@ -6,7 +6,7 @@
       "id": "gate-persist-0",
       "name": "Serialization Prerequisites",
       "priority": "P0",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-PERSIST-001"
       ]
@@ -15,7 +15,7 @@
       "id": "gate-persist-1",
       "name": "Missing ProtocolStore Modules",
       "priority": "P0",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-PERSIST-010",
         "SCP-PERSIST-011",
@@ -33,7 +33,7 @@
       "id": "gate-persist-2",
       "name": "ContextPersistence Trait and Manager Wiring",
       "priority": "P0",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-PERSIST-020",
         "SCP-PERSIST-021",
@@ -47,7 +47,7 @@
       "id": "gate-persist-3",
       "name": "Storage Conformance and Production Adapters",
       "priority": "P0",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-PERSIST-030",
         "SCP-PERSIST-031",
@@ -58,7 +58,7 @@
       "id": "gate-persist-4",
       "name": "BlobStore Adapters",
       "priority": "P0",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-PERSIST-040",
         "SCP-PERSIST-041",
@@ -69,7 +69,7 @@
       "id": "gate-persist-5",
       "name": "MLS StorageProvider Bridge",
       "priority": "P0",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-PERSIST-050"
       ]
@@ -78,7 +78,7 @@
       "id": "gate-persist-6",
       "name": "Additional Adapters and Platform Storage",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-PERSIST-060",
         "SCP-PERSIST-061",
@@ -95,7 +95,7 @@
       "id": "gate-persist-7",
       "name": "End-to-End Integration",
       "priority": "P0",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-PERSIST-070",
         "SCP-PERSIST-071",

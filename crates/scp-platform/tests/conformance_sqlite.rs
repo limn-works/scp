@@ -1,4 +1,4 @@
-//! SQLite storage conformance tests.
+//! `SQLite` storage conformance tests.
 //!
 //! Validates that `SqliteStorage` passes all 13 conformance tests defined
 //! in `storage_conformance!()` (spec sections 17.6, 17.11, 17.13).

@@ -196,6 +196,13 @@ impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersis
         tokens: f64,
         window_start_secs: u64,
     ) -> Result<(), BoxError> {
+        // Validate IP to prevent key injection (e.g., "../../identity/victim").
+        let _: std::net::IpAddr = ip.parse().map_err(|e| -> BoxError {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid IP for rate limit key: {e}"),
+            ))
+        })?;
         let key = format!("{}{}", RATE_LIMIT_PREFIX, ip);
         let value = rmp_serde::to_vec(&(tokens, window_start_secs))
             .map_err(|e| -> BoxError { Box::new(e) })?;
@@ -211,6 +218,13 @@ impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersis
     }
 
     fn load_rate_limit(&self, ip: &str) -> Result<Option<(f64, u64)>, BoxError> {
+        // Validate IP to prevent key injection.
+        let _: std::net::IpAddr = ip.parse().map_err(|e| -> BoxError {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid IP for rate limit key: {e}"),
+            ))
+        })?;
         let key = format!("{}{}", RATE_LIMIT_PREFIX, ip);
         let storage = Arc::clone(&self.storage);
         tokio::task::block_in_place(|| {
@@ -254,7 +268,11 @@ impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersis
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
 mod tests {
     use super::*;
     use std::sync::Arc;

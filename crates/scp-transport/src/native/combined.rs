@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 
 use scp_platform::{PlatformError, Storage};
+use zeroize::Zeroize;
 
 use super::storage::{BlobStorage, StorageError, StoredBlob};
 
@@ -146,15 +147,18 @@ impl CombinedNodeStorage {
 
         // Apply SQLCipher encryption key and hardening PRAGMAs.
         // Matches SqliteStorage settings for consistent security posture.
-        let hex_key = hex::encode(key);
-        conn.execute_batch(&format!(
+        let mut hex_key = hex::encode(key);
+        let mut pragma_sql = format!(
             "PRAGMA key = \"x'{hex_key}'\";\n\
              PRAGMA cipher_page_size = 4096;\n\
              PRAGMA kdf_iter = 256000;\n\
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\
              PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;"
-        ))
-        .map_err(|e| StorageError::Internal(format!("failed to set encryption key: {e}")))?;
+        );
+        hex_key.zeroize();
+        let result = conn.execute_batch(&pragma_sql);
+        pragma_sql.zeroize();
+        result.map_err(|e| StorageError::Internal(format!("failed to set encryption key: {e}")))?;
 
         // Enable WAL mode for concurrent reads.
         conn.execute_batch("PRAGMA journal_mode = WAL;")

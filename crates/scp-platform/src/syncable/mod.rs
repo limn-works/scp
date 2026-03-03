@@ -134,6 +134,14 @@ impl<S: Storage> SyncableStorage<S> {
         Ok(entries)
     }
 
+    /// Namespaces that must never be writable via sync changesets.
+    ///
+    /// These contain identity material, MLS key state, and internal metadata
+    /// that would enable privilege escalation or key theft if overwritten by
+    /// a malicious sync peer.
+    const SYNC_DENIED_PREFIXES: &'static [&'static str] =
+        &["identity/", "mls/", "_meta/", "_sync/"];
+
     /// Applies a remote changeset to local storage.
     ///
     /// For each entry in the changeset, applies the operation to the inner
@@ -141,18 +149,32 @@ impl<S: Storage> SyncableStorage<S> {
     /// sequence number. Last-write-wins semantics: operations are applied in
     /// order.
     ///
+    /// Keys in protected namespaces (`identity/`, `mls/`, `_meta/`, `_sync/`)
+    /// are rejected to prevent privilege escalation via sync injection.
+    ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::StorageError`] if any write fails.
+    /// Returns [`PlatformError::StorageError`] if any write fails or a key
+    /// targets a denied namespace.
     pub async fn apply_changeset(&self, changeset: Changeset) -> Result<(), PlatformError> {
+        for entry in &changeset {
+            // Reject keys targeting protected namespaces.
+            if Self::SYNC_DENIED_PREFIXES
+                .iter()
+                .any(|p| entry.key.starts_with(p))
+            {
+                return Err(PlatformError::StorageError(format!(
+                    "changeset key '{}' targets a protected namespace",
+                    entry.key
+                )));
+            }
+        }
         for entry in changeset {
             match &entry.value {
                 Some(data) => {
-                    // Apply the store to inner storage and log it.
                     self.store(&entry.key, data).await?;
                 }
                 None => {
-                    // Apply the delete to inner storage and log it.
                     self.delete(&entry.key).await?;
                 }
             }

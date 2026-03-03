@@ -105,3 +105,15 @@ Notes:
 - **Compose rememberScpHotStream scope race (MEDIUM):** scope.launch{onStop()} then scope.cancel() — onStop never executes. Pattern: launching cleanup work then immediately cancelling the scope.
 - **HotStreamFactory.contextEvents TOCTOU (MEDIUM):** ConcurrentHashMap get-then-put with suspend point between. Duplicate subscriptions possible, first leaks. Pattern: check-then-act on ConcurrentHashMap across suspension points.
 - **CheckpointManager.is_checkpoint_due ignores min_events_since_last (LOW):** Doc says min_events prevents spam, but time_due returns true regardless. Field is dead.
+
+### Known Bug Patterns (Mar 2026 — Persistence Layer PR, feat/broadcast-persistence-across-restarts)
+- **TTL snapshot captures configured duration not remaining (HIGH):** snapshot_context saves ttl_duration.as_secs() instead of actual remaining. Contexts get full TTL reset on every restart. Pattern: capturing config value when runtime state is needed.
+- **InMemoryBlobStorage routing_index stale entries on overwrite (HIGH):** store() pushes blob_id to routing_index without removing old entry. Duplicate/stale entries in query results. Pattern: secondary index not maintained on primary overwrite.
+- **restore_all_contexts wrong state for non-Active contexts (HIGH):** Only transitions handle for Active state; non-Active contexts get handle stuck in Creating. Pattern: incomplete match on state enum in restore logic.
+- **Event log append_event non-atomic two-step write (MEDIUM):** Event hash written then count updated. Crash between = orphaned event, stale count, next append overwrites. Pattern: multi-write without transaction support.
+- **prefix_successor behavioral divergence (MEDIUM):** Three implementations — Apple uses from_utf8_lossy (produces wrong bound), others use from_utf8.ok(). Pattern: independent re-implementations of shared algorithm.
+- **LocalBlobCache holds mutex across async I/O (MEDIUM):** evict_if_needed locks entries then calls inner.get/delete in loop. Blocks all concurrent cache ops. Pattern: lock held across async I/O boundary.
+- **S3BlobStore non-atomic three-object write (MEDIUM):** Blob, routing index, expiry index are separate PutObject calls. Crash between = orphaned/undiscoverable blobs.
+- **Nonce check_and_record post-write re-read fails with same-second timestamps (MEDIUM):** Two writers with same first_seen both pass re-read check. Pattern: using non-unique timestamp as writer identity proxy.
+- **SyncableStorage changelog unbounded growth (LOW):** No compaction mechanism for _sync/log/ entries.
+- **RedbBlobStore delete uses two transactions (LOW):** Safe behind mutex but fragile if locking changes.

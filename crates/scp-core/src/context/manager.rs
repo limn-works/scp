@@ -376,13 +376,7 @@ impl ContextManager {
     /// Must be called while the contexts mutex is held (snapshot under lock).
     fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
-        let ttl_remaining_secs = ctx.handle.params().ttl.and_then(|ttl_duration| {
-            if ctx.ttl_timer.is_active() {
-                Some(ttl_duration.as_secs())
-            } else {
-                None
-            }
-        });
+        let ttl_remaining_secs = ctx.ttl_timer.remaining_secs();
         ContextSnapshot {
             context_id: ctx.handle.context_id().to_owned(),
             state,
@@ -562,12 +556,14 @@ impl ContextManager {
                 }
             };
 
+            // Only restore Active contexts. Contexts in Closing/Closed/Expired
+            // states should not be resurrected after restart.
+            if ctx_snapshot.state != ContextState::Active {
+                continue;
+            }
+
             let handle = ContextHandle::new(ctx_id.clone(), ctx_snapshot.context_params.clone());
-            // Transition handle to the persisted state (Creating -> Active etc.).
-            // The handle starts in Creating; we need to get to the persisted state.
-            if ctx_snapshot.state == ContextState::Active
-                && handle.transition_to(&ContextState::Active).await.is_err()
-            {
+            if handle.transition_to(&ContextState::Active).await.is_err() {
                 continue;
             }
 

@@ -10,7 +10,7 @@ license.workspace = true
 sqlite-blob = ["dep:rusqlite"]
 redb-blob = ["dep:redb"]
 local-cache = []
-combined = ["dep:rusqlite", "dep:scp-platform"]
+combined = ["dep:rusqlite", "dep:scp-platform", "dep:zeroize"]
 relay-persistence = ["dep:scp-platform"]
 postgres-blob = ["dep:sqlx"]
 s3-blob = ["dep:aws-sdk-s3", "dep:aws-config"]
@@ -37,6 +37,7 @@ rand = { workspace = true }
 subtle = "2"
 rusqlite = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
