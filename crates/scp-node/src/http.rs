@@ -68,9 +68,11 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     pub(crate) relay_addr: SocketAddr,
     /// Shared secret for authenticating internal bridge connections.
     ///
-    /// Generated at startup and included as a query parameter when the
-    /// axum handler connects to the internal relay. The relay validates
-    /// this token during the WebSocket handshake (defense-in-depth, #85).
+    /// Generated at startup and included as an `Authorization: Bearer`
+    /// header when the axum handler connects to the internal relay. The
+    /// relay validates this token during the WebSocket handshake
+    /// (defense-in-depth, #85). Moved from query parameter to header to
+    /// prevent leakage via server logs or error messages (#225).
     pub(crate) bridge_secret: [u8; 32],
     /// Bearer token for the dev API (`scp_local_token_<32 hex chars>`).
     ///
@@ -233,19 +235,44 @@ async fn ws_upgrade_handler<B: BlobStorage + 'static>(
 /// Bridges an axum WebSocket to the internal relay server.
 ///
 /// Connects to the relay at `relay_addr` with the bridge secret included
-/// as a `token` query parameter, then forwards frames in both directions
-/// until either side closes or the connection is idle for
+/// as an `Authorization: Bearer <hex>` header, then forwards frames in
+/// both directions until either side closes or the connection is idle for
 /// [`BRIDGE_IDLE_TIMEOUT`]. Sends explicit WebSocket close frames on
 /// both sides when the bridge terminates.
+///
+/// The secret is transmitted via HTTP header rather than query parameter
+/// to prevent leakage through server logs, error messages, or debug
+/// output (#225).
 ///
 /// The idle timeout resets only on data frames (Text/Binary), not on
 /// Ping/Pong control frames. This prevents an attacker from keeping
 /// connections alive indefinitely by sending pings without real data
 /// (#229).
 async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret: [u8; 32]) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
     let token_hex = scp_transport::native::server::hex_encode_32(&bridge_secret);
-    let url = format!("ws://{relay_addr}/?token={token_hex}");
-    let relay_conn = tokio_tungstenite::connect_async(&url).await;
+    let url = format!("ws://{relay_addr}/");
+    let mut request = match url.into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                addr = %relay_addr,
+                error = %e,
+                "failed to build WebSocket request for internal relay bridge"
+            );
+            return;
+        }
+    };
+    // Safety: the token is a 64-char lowercase hex string — always valid
+    // as an HTTP header value. `parse()` only fails on non-visible ASCII
+    // or control characters, which hex digits never contain.
+    let Ok(header_value) = format!("Bearer {token_hex}").parse() else {
+        tracing::error!("bridge token produced invalid HTTP header value");
+        return;
+    };
+    request.headers_mut().insert("Authorization", header_value);
+    let relay_conn = tokio_tungstenite::connect_async(request).await;
 
     let Ok((relay_ws, _)) = relay_conn else {
         tracing::error!(

@@ -247,9 +247,10 @@ impl<S: Storage, B: BlobStorage> ApplicationNode<S, B> {
 
     /// Returns the hex-encoded bridge secret for the internal relay.
     ///
-    /// This is the token that must be included as a `token` query parameter
-    /// when connecting directly to the relay's bound address. Used by tests
-    /// that bypass the axum bridge layer.
+    /// This is the token that must be included as an
+    /// `Authorization: Bearer <hex>` header when connecting directly to
+    /// the relay's bound address. Used by tests that bypass the axum
+    /// bridge layer.
     ///
     /// **Security:** This value is a secret. Do not log or expose it.
     #[must_use]
@@ -1929,6 +1930,8 @@ mod tests {
 
     #[tokio::test]
     async fn relay_accepts_connections_with_valid_bridge_token() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
         let node = test_builder()
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
             .build()
@@ -1938,9 +1941,13 @@ mod tests {
         let addr = node.relay().bound_addr();
         let token = node.bridge_token_hex();
 
-        // Connect with the bridge token (explicit `/` path before query).
-        let url = format!("ws://{addr}/?token={token}");
-        let connect_result = tokio_tungstenite::connect_async(&url).await;
+        // Connect with the bridge token in the Authorization header (#225).
+        let url = format!("ws://{addr}/");
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let connect_result = tokio_tungstenite::connect_async(request).await;
 
         assert!(
             connect_result.is_ok(),
@@ -1959,8 +1966,8 @@ mod tests {
 
         let addr = node.relay().bound_addr();
 
-        // Connect without the bridge token — should be rejected.
-        let url = format!("ws://{addr}");
+        // Connect without the Authorization header — should be rejected.
+        let url = format!("ws://{addr}/");
         let connect_result = tokio_tungstenite::connect_async(&url).await;
 
         assert!(
