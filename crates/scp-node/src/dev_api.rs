@@ -533,6 +533,7 @@ mod tests {
             start_time: Instant::now(),
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            cors_origins: None,
         })
     }
 

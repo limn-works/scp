@@ -31,6 +31,7 @@ tokio = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util = { workspace = true }
 tokio-tungstenite = { version = "0.24" }
+tower-http = { workspace = true }
 futures = "0.3"
 hex = { workspace = true }
 percent-encoding = { workspace = true }

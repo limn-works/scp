@@ -628,6 +628,9 @@ pub struct ApplicationNodeBuilder<
     /// internal listener to avoid double-binding (#224). Defaults to
     /// [`DEFAULT_HTTP_BIND_ADDR`] (`0.0.0.0:8443`).
     http_bind_addr: Option<SocketAddr>,
+    /// CORS allowed origins for public endpoints. `None` = permissive (`*`).
+    /// See issue #231.
+    cors_origins: Option<Vec<String>>,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -652,6 +655,7 @@ impl ApplicationNodeBuilder {
             tls_provider: None,
             local_api_addr: None,
             http_bind_addr: None,
+            cors_origins: None,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -701,6 +705,7 @@ impl<
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
+            cors_origins: self.cors_origins,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -730,6 +735,7 @@ impl<
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
+            cors_origins: self.cors_origins,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -846,6 +852,34 @@ impl<
         self.http_bind_addr = Some(addr);
         self
     }
+
+    /// Sets the allowed CORS origins for public endpoints.
+    ///
+    /// Public endpoints (`.well-known/scp`, broadcast projection feeds and
+    /// messages) include `Access-Control-Allow-Origin` headers so that
+    /// browser-based JavaScript and WASM clients can read responses
+    /// cross-origin.
+    ///
+    /// - If not called, or called with an empty list: permissive CORS
+    ///   (`Access-Control-Allow-Origin: *`). This is the default because
+    ///   broadcast content is public by design (spec section 18.11.6).
+    /// - If called with a non-empty list: restricts to exactly those
+    ///   origins (e.g., `["https://example.com"]`).
+    ///
+    /// CORS is NOT applied to the WebSocket relay endpoint (`/scp/v1`)
+    /// because WebSocket upgrades have their own origin mechanism, nor to
+    /// the dev API (localhost-only).
+    ///
+    /// See issue #231.
+    #[must_use]
+    pub fn cors_origins(mut self, origins: Vec<String>) -> Self {
+        self.cors_origins = if origins.is_empty() {
+            None
+        } else {
+            Some(origins)
+        };
+        self
+    }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, Dom, Id>
@@ -871,6 +905,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, B: BlobStorage + 'static, 
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
+            cors_origins: self.cors_origins,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -901,6 +936,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
+            cors_origins: self.cors_origins,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -937,6 +973,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
+            cors_origins: self.cors_origins,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -966,6 +1003,7 @@ impl<S: Storage + 'static, B: BlobStorage + 'static, Dom>
             tls_provider: self.tls_provider,
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
+            cors_origins: self.cors_origins,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1062,6 +1100,7 @@ impl<
                     blob_storage,
                     relay_config,
                     http_bind_addr,
+                    self.cors_origins,
                 )
                 .await
             }
@@ -1085,6 +1124,7 @@ impl<
                     blob_storage,
                     relay_config,
                     Some(http_bind_addr),
+                    self.cors_origins,
                 )
                 .await
             }
@@ -1173,6 +1213,7 @@ async fn build_domain_inner<
     blob_storage: Arc<B>,
     relay_config: RelayConfig,
     http_bind_addr: SocketAddr,
+    cors_origins: Option<Vec<String>>,
 ) -> Result<ApplicationNode<S, B>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
     document.add_relay_service(&relay_url)?;
@@ -1198,6 +1239,7 @@ async fn build_domain_inner<
         start_time: std::time::Instant::now(),
         http_bind_addr,
         shutdown_token: CancellationToken::new(),
+        cors_origins,
     });
 
     Ok(ApplicationNode {
@@ -1236,6 +1278,7 @@ async fn build_no_domain_inner<
     blob_storage: Arc<B>,
     relay_config: RelayConfig,
     http_bind_addr: Option<SocketAddr>,
+    cors_origins: Option<Vec<String>>,
 ) -> Result<ApplicationNode<S, B>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
@@ -1285,6 +1328,7 @@ async fn build_no_domain_inner<
         start_time: std::time::Instant::now(),
         http_bind_addr,
         shutdown_token: CancellationToken::new(),
+        cors_origins,
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
@@ -1392,6 +1436,7 @@ impl<
             blob_storage,
             relay_config,
             self.http_bind_addr,
+            self.cors_origins,
         )
         .await
     }

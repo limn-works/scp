@@ -20,6 +20,7 @@ use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
@@ -109,6 +110,40 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     /// See SCP-245 action item: "Ensure graceful shutdown of dev API
     /// listener alongside main server."
     pub(crate) shutdown_token: CancellationToken,
+    /// CORS allowed origins for public endpoints (`.well-known/scp`,
+    /// broadcast projection). `None` means permissive (`*`); `Some(list)`
+    /// restricts to exactly those origins.
+    ///
+    /// See issue #231.
+    pub(crate) cors_origins: Option<Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// CORS layer construction
+// ---------------------------------------------------------------------------
+
+/// Constructs a [`CorsLayer`] from the node's CORS configuration.
+///
+/// - `None` origins: permissive (`Access-Control-Allow-Origin: *`).
+/// - `Some(list)`: restricts to exactly the listed origins.
+///
+/// Applied to public endpoints (`.well-known/scp`, broadcast projection)
+/// so browser-based JavaScript / WASM clients can read responses cross-origin
+/// (issue #231). Not applied to the WebSocket relay endpoint (WebSocket
+/// upgrades have their own origin mechanism) or the dev API (localhost-only).
+pub fn build_cors_layer(origins: &Option<Vec<String>>) -> CorsLayer {
+    let allow_origin = origins.as_ref().map_or_else(AllowOrigin::any, |list| {
+        let parsed: Vec<axum::http::HeaderValue> =
+            list.iter().filter_map(|o| o.parse().ok()).collect();
+        AllowOrigin::list(parsed)
+    });
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([axum::http::Method::GET, axum::http::Method::OPTIONS])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::IF_NONE_MATCH,
+        ])
 }
 
 // ---------------------------------------------------------------------------
@@ -384,9 +419,14 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
         app_router: Router,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), NodeError> {
-        let well_known = well_known_router(Arc::clone(&self.state));
+        let cors = build_cors_layer(&self.state.cors_origins);
+
+        // Apply CORS to public endpoints only. The WebSocket relay endpoint
+        // uses its own origin mechanism; the dev API is localhost-only.
+        let well_known = well_known_router(Arc::clone(&self.state)).layer(cors.clone());
         let relay_rt = relay_router(Arc::clone(&self.state));
-        let projection = crate::projection::broadcast_projection_router(Arc::clone(&self.state));
+        let projection =
+            crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
 
         // Extract dev API configuration before building the merged router.
         let dev_router = {
@@ -488,5 +528,152 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
         tracing::info!("application node shut down");
 
         result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    use scp_transport::native::storage::InMemoryBlobStorage;
+
+    use super::*;
+
+    /// Creates a minimal `NodeState` for CORS tests.
+    fn test_state(cors_origins: Option<Vec<String>>) -> Arc<NodeState<InMemoryBlobStorage>> {
+        Arc::new(NodeState {
+            did: "did:dht:cors_test".to_owned(),
+            relay_url: "wss://localhost/scp/v1".to_owned(),
+            broadcast_contexts: RwLock::new(Vec::new()),
+            relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
+            bridge_secret: [0u8; 32],
+            dev_token: None,
+            dev_bind_addr: None,
+            projected_contexts: RwLock::new(HashMap::new()),
+            blob_storage: Arc::new(InMemoryBlobStorage::new()),
+            relay_config: scp_transport::native::server::RelayConfig::default(),
+            start_time: Instant::now(),
+            http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            shutdown_token: CancellationToken::new(),
+            cors_origins,
+        })
+    }
+
+    #[tokio::test]
+    async fn cors_permissive_well_known_returns_wildcard_origin() {
+        let state = test_state(None);
+        let cors = build_cors_layer(&state.cors_origins);
+        let router = well_known_router(state).layer(cors);
+
+        let req = Request::builder()
+            .uri("/.well-known/scp")
+            .header("Origin", "https://example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let acao = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("should have ACAO header")
+            .to_str()
+            .unwrap();
+        assert_eq!(acao, "*", "permissive mode should return wildcard origin");
+    }
+
+    #[tokio::test]
+    async fn cors_restricted_well_known_allows_matching_origin() {
+        let origins = Some(vec!["https://allowed.example".to_owned()]);
+        let state = test_state(origins);
+        let cors = build_cors_layer(&state.cors_origins);
+        let router = well_known_router(state).layer(cors);
+
+        let req = Request::builder()
+            .uri("/.well-known/scp")
+            .header("Origin", "https://allowed.example")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let acao = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("should have ACAO header for allowed origin")
+            .to_str()
+            .unwrap();
+        assert_eq!(acao, "https://allowed.example");
+    }
+
+    #[tokio::test]
+    async fn cors_restricted_well_known_rejects_non_matching_origin() {
+        let origins = Some(vec!["https://allowed.example".to_owned()]);
+        let state = test_state(origins);
+        let cors = build_cors_layer(&state.cors_origins);
+        let router = well_known_router(state).layer(cors);
+
+        let req = Request::builder()
+            .uri("/.well-known/scp")
+            .header("Origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // The response should succeed (CORS doesn't block the response,
+        // it omits the ACAO header so the browser rejects it client-side).
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "non-matching origin should NOT receive ACAO header"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_options_returns_200() {
+        let state = test_state(None);
+        let cors = build_cors_layer(&state.cors_origins);
+        let router = well_known_router(state).layer(cors);
+
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/.well-known/scp")
+            .header("Origin", "https://example.com")
+            .header("Access-Control-Request-Method", "GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let acao = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("preflight should include ACAO")
+            .to_str()
+            .unwrap();
+        assert_eq!(acao, "*");
+
+        let methods = resp
+            .headers()
+            .get("access-control-allow-methods")
+            .expect("preflight should include allow-methods")
+            .to_str()
+            .unwrap();
+        assert!(methods.contains("GET"), "should allow GET method");
     }
 }
