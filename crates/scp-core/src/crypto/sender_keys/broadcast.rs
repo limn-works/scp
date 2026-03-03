@@ -27,7 +27,8 @@
 //! The `author_did` and `key_epoch` fields in [`BroadcastEnvelope`] are cleartext
 //! metadata that must be authenticated by the AEAD tag. Both [`seal_broadcast`]
 //! and [`open_broadcast`] bind these fields as Additional Authenticated Data
-//! (AAD) in the AES-256-GCM construction: `AAD = "{author_did}:{key_epoch}"`.
+//! (AAD) in the AES-256-GCM construction using a length-prefixed binary format:
+//! `[4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]`.
 //! This prevents attribution forgery by context members who possess the
 //! broadcast key (issue #228, cryptographer review finding 1, RED-210).
 //!
@@ -147,7 +148,7 @@ pub struct BroadcastKeyEpochAdvance {
 /// wire format as [`encrypt_sender_layer`]: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
 ///
 /// The `author_did` and `key_epoch` fields are authenticated via AES-256-GCM
-/// AAD binding (`"{author_did}:{key_epoch}"`). Tampering with either field
+/// AAD binding (length-prefixed binary format). Tampering with either field
 /// causes AEAD tag verification to fail on decryption. See issue #228.
 ///
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
@@ -238,15 +239,25 @@ pub fn rotate_broadcast_key(
 /// Constructs the Additional Authenticated Data (AAD) for `BroadcastEnvelope`
 /// AES-256-GCM operations.
 ///
-/// Format: `"{author_did}:{key_epoch}"` encoded as UTF-8 bytes. This binds
-/// the cleartext metadata fields to the AEAD tag, preventing attribution
-/// forgery and epoch substitution by context members who possess the
-/// broadcast key. Both [`seal_broadcast`] and [`open_broadcast`] use this
+/// Format: length-prefixed binary — `[4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]`.
+/// This binds the cleartext metadata fields to the AEAD tag, preventing
+/// attribution forgery and epoch substitution by context members who possess
+/// the broadcast key. Both [`seal_broadcast`] and [`open_broadcast`] use this
 /// identical construction.
 ///
+/// The binary format is canonically parseable by construction. The previous
+/// colon-delimited string format (`"{did}:{epoch}"`) was ambiguous because
+/// DIDs themselves contain colons (e.g., `did:dht:abc`, `did:web:host:path`).
+///
 /// See issue #228, cryptographer review finding 1, RED-210.
+#[allow(clippy::cast_possible_truncation)] // DID strings are always < 4 GiB
 fn build_broadcast_aad(author_did: &str, key_epoch: u64) -> Vec<u8> {
-    format!("{author_did}:{key_epoch}").into_bytes()
+    let did_bytes = author_did.as_bytes();
+    let mut aad = Vec::with_capacity(4 + did_bytes.len() + 8);
+    aad.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(did_bytes);
+    aad.extend_from_slice(&key_epoch.to_be_bytes());
+    aad
 }
 
 // ---------------------------------------------------------------------------
@@ -371,7 +382,7 @@ pub fn open_broadcast(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -654,8 +665,8 @@ mod tests {
         };
 
         // Open with a key that has the forged author_did (same key material,
-        // same epoch) to match the envelope's metadata. The AAD will be
-        // "did:dht:bob:0" but the ciphertext was sealed with "did:dht:alice:0".
+        // same epoch) to match the envelope's metadata. The AAD will differ
+        // because the DID bytes are different (bob vs alice).
         let forged_key = BroadcastKey {
             key: key_alice.key.clone(),
             epoch: 0,
@@ -724,15 +735,56 @@ mod tests {
 
     #[test]
     fn aad_binding_verified_on_build_broadcast_aad() {
-        // Verify the AAD construction is deterministic and format-correct.
+        // Verify the AAD construction is deterministic and uses the
+        // length-prefixed binary format:
+        //   [4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]
         let aad = build_broadcast_aad("did:dht:alice", 42);
-        assert_eq!(aad, b"did:dht:alice:42");
+        let did_bytes = b"did:dht:alice";
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+        expected.extend_from_slice(did_bytes);
+        expected.extend_from_slice(&42_u64.to_be_bytes());
+        assert_eq!(aad, expected);
 
         let aad_zero = build_broadcast_aad("did:dht:bob", 0);
-        assert_eq!(aad_zero, b"did:dht:bob:0");
+        let did_bytes_bob = b"did:dht:bob";
+        let mut expected_zero = Vec::new();
+        expected_zero.extend_from_slice(&(did_bytes_bob.len() as u32).to_be_bytes());
+        expected_zero.extend_from_slice(did_bytes_bob);
+        expected_zero.extend_from_slice(&0_u64.to_be_bytes());
+        assert_eq!(aad_zero, expected_zero);
 
         let aad_max = build_broadcast_aad("did:dht:charlie", u64::MAX);
-        assert_eq!(aad_max, format!("did:dht:charlie:{}", u64::MAX).as_bytes());
+        let did_bytes_charlie = b"did:dht:charlie";
+        let mut expected_max = Vec::new();
+        expected_max.extend_from_slice(&(did_bytes_charlie.len() as u32).to_be_bytes());
+        expected_max.extend_from_slice(did_bytes_charlie);
+        expected_max.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(aad_max, expected_max);
+    }
+
+    #[test]
+    fn aad_empty_author_did_produces_correct_binary_layout() {
+        // Empty DID: 4-byte zero length prefix + no DID bytes + 8-byte epoch.
+        let aad = build_broadcast_aad("", 42);
+        assert_eq!(
+            aad,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42],
+            "empty DID must produce [4-byte zero length][8-byte epoch BE]"
+        );
+    }
+
+    #[test]
+    fn seal_open_roundtrip_with_colons_in_did() {
+        // DIDs naturally contain colons (did:web:example.com:path:sub).
+        // The length-prefixed binary AAD format must handle this without
+        // ambiguity. This was the original bug: colon-delimited string
+        // AAD was unparseable for DIDs containing colons.
+        let key = generate_broadcast_key("did:web:example.com:path:sub");
+        let plaintext = b"colon-heavy DID roundtrip";
+        let envelope = seal_broadcast(&key, plaintext).unwrap();
+        let decrypted = open_broadcast(&key, &envelope).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     // -----------------------------------------------------------------------
