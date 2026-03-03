@@ -221,9 +221,9 @@ async fn run_full_node() {
         "application node identity ready"
     );
 
-    // serve() consumes the node (per spec §18.6). The relay shuts down
-    // when the node is dropped at the end of serve().
-    if let Err(e) = node.serve(axum::Router::new()).await {
+    // serve() takes ownership of the node and handles graceful shutdown
+    // internally when the shutdown signal fires.
+    if let Err(e) = node.serve(axum::Router::new(), shutdown_signal()).await {
         tracing::error!(error = %e, "application node exited with error");
         std::process::exit(1);
     }
