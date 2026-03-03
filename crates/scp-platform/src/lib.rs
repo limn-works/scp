@@ -47,6 +47,10 @@ pub mod testing;
 pub use testing as software;
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(feature = "filesystem")]
+pub mod filesystem;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod traits;
 
 // Re-export all public types for ergonomic access.
