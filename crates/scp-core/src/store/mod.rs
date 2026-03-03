@@ -24,6 +24,7 @@ pub mod event_log;
 pub mod identity;
 pub mod nonce;
 pub mod tools;
+pub mod transport;
 pub mod ucan;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
