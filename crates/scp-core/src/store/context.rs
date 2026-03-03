@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 
 use scp_platform::traits::Storage;
+use zeroize::Zeroize;
 
 use scp_identity::DID;
 
