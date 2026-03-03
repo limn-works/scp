@@ -82,8 +82,30 @@
 - Anti-spam tracks per-DID independently (Sybil deterrent)
 - Standing channels use deterministic SHA-256 IDs from sorted DID pairs
 
+## PR #255 Reachability Defense-in-Depth Review (2026-03-03)
+
+### Strong Controls
+- Bridge auth: 4 independent layers (Ed25519 verify_strict, domain sep, routing_id derivation, timestamp). TOCTOU prevented via dual write lock (bridge.rs L369-373)
+- DID anti-rollback: cached_sequence high-water mark survives cache TTL expiry (resolver.rs L495-523)
+- Self-test: same socket reuse preserves NAT mapping, source addr + 96-bit txn_id anti-spoofing
+- Tier re-eval: watch + Drop + abort fallback. Events emitted only after successful DID publish
+
+### P1 Findings
+- lib.rs L747: No jitter on 30-min tier re-eval interval (synchronized storm risk)
+- lib.rs L802-831: apply_tier_change should validate exactly one SCPRelay after update
+
+### P2 Findings
+- bridge.rs L573-584: Manual URL parsing for bridge_target (should use url::Url)
+- lib.rs L826-829: No retry on DID republish failure after tier change
+- resolver.rs L623-645: No circuit breaker on healing task panics
+- lib.rs L1220-1223: Dev API loopback uses assert! (panic) instead of Result
+
+### No Fail-Open Paths
+All security controls fail closed. Healing is best-effort by design.
+
 ## Recurring Patterns
 - TOCTOU races in check-then-act patterns (nonce replay, standing channels, budget)
 - Missing zeroization on crypto key material
 - WASM bridge diverges from scp-core (re-implements rather than delegates)
 - unwrap_or_default on serialization hides failures with known-constant fallbacks
+- Manual string parsing where URL parser should be used (bridge_target, well_known context names)

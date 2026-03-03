@@ -144,6 +144,48 @@ Notes:
 - Feed limit clamped to 100
 - #![forbid(unsafe_code)] on scp-node
 
+## Key Attack Surfaces -- Reachability Features (PR #255)
+
+### HIGH: Bridge registration replay within 60s window (no nonce)
+- File: `crates/scp-transport/src/relay/bridge.rs` lines 149-166, 230-266
+- Signed payload = prefix || routing_id || timestamp -- no nonce or connection binding
+- Attacker captures valid BRIDGE_REGISTER, replays within 60s to hijack routing
+
+### HIGH: DID healing amplification -- no rate limiting
+- File: `crates/scp-identity/src/resolver.rs` lines 598-645
+- Malicious relay returns stale seq -> triggers healing write -> discards -> repeat
+- No per-DID cooldown, no backoff, no failure tracking
+
+### HIGH: ws:// in DID document relay URLs (UPnP/STUN tiers)
+- File: `crates/scp-node/src/lib.rs` lines 781-788
+- tier_to_relay_url uses ws:// for non-bridge tiers, metadata visible to observers
+
+### HIGH: Both default STUN servers are Google (single-vendor)
+- File: `crates/scp-node/src/lib.rs` lines 432-435
+- Single-vendor compromise defeats multi-STUN divergence detection
+
+### MEDIUM: No debounce on network-change-triggered re-evaluation
+- File: `crates/scp-node/src/lib.rs` lines 855-917
+- Rapid network changes cause DID document churn
+
+### MEDIUM: Bridge registry flooding -- 16 conns x 64 = fills 1000 limit
+- File: `crates/scp-transport/src/relay/bridge.rs` lines 74-81
+- No per-IP rate limiting
+
+### MEDIUM: deregister_connection TOCTOU -- phantom count drift
+- File: `crates/scp-transport/src/relay/bridge.rs` lines 480-505
+- entries lock dropped before counts lock acquired
+
+## Patterns Confirmed Working (Reachability PR #255)
+- Ed25519 bridge auth: domain separator, routing_id derivation, verify_strict
+- Multi-STUN divergence detection: sequential on shared socket, correct classification
+- DID doc verification: BEP44 sig + self-certification + seq anti-rollback
+- Reachability self-test: independent STUN intermediary + tx ID anti-spoofing
+- Register() acquires both locks atomically (no TOCTOU on registration)
+- Per-connection deregistration authorization check
+- Dual-layer resolver: parallel with per-layer timeout, graceful degradation
+- Healing publishes only validly-signed BEP44 records (cannot inject forged docs)
+
 ## Patterns Confirmed Working (prior PRs)
 - Ceiling inheritance in nesting is sound
 - Template spoofing detection works correctly
