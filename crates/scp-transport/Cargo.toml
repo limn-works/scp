@@ -32,6 +32,9 @@ subtle = "2"
 rusqlite = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 
+[features]
+local-cache = []
+
 [dev-dependencies]
 scp-core = { path = "../scp-core" }
 ed25519-dalek = { workspace = true }

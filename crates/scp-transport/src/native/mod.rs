@@ -31,6 +31,8 @@
 pub mod adapter;
 pub(crate) mod client;
 pub mod error;
+#[cfg(feature = "local-cache")]
+pub mod local_cache;
 pub mod protocol;
 #[cfg(feature = "redb-blob")]
 pub mod redb_blob;
