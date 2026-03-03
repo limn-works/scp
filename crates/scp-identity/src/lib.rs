@@ -47,8 +47,8 @@ pub use resolution::{
     relay_resolve,
 };
 pub use resolver::{
-    DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher,
-    MultiRelayQuerier, NoOpHealer, ResolutionSource, ResolvedDidDocument, StaleLayer,
+    DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
+    NoOpHealer, ResolutionSource, ResolvedDidDocument, StaleLayer,
 };
 
 use serde::{Deserialize, Serialize};

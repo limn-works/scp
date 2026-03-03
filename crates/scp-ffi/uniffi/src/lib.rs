@@ -585,10 +585,12 @@ mod tests {
                     "expected SCP-IDN-1008 error code when in_memory custody is disabled"
                 );
             }
-            Ok(_) => panic!(
-                "identity_create(\"in_memory\") should fail without allow_in_memory_custody feature"
-            ),
-            Err(other) => panic!("expected ScpError::Identity with SCP-IDN-1008, got: {other:?}"),
+            Ok(_) => {
+                assert!(false, "identity_create(\"in_memory\") should fail without allow_in_memory_custody feature");
+            }
+            Err(other) => {
+                assert!(false, "expected ScpError::Identity with SCP-IDN-1008, got: {other:?}");
+            }
         }
     }
 
