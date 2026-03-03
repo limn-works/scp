@@ -38,6 +38,7 @@ pub mod local_cache;
 pub mod protocol;
 #[cfg(feature = "redb-blob")]
 pub mod redb_blob;
+pub mod relay_persistence;
 pub mod server;
 #[cfg(feature = "sqlite-blob")]
 pub mod sqlite_blob;

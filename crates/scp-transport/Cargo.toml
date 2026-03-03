@@ -11,6 +11,7 @@ sqlite-blob = ["dep:rusqlite"]
 redb-blob = ["dep:redb"]
 local-cache = []
 combined = ["dep:rusqlite", "dep:scp-platform"]
+relay-persistence = ["dep:scp-platform"]
 
 [dependencies]
 scp-core = { path = "../scp-core" }

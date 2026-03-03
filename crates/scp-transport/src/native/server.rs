@@ -44,6 +44,7 @@ use super::protocol::{
     ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT, MIN_BLOB_TTL,
     RelayMessage,
 };
+use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend, StoredBlob};
 
 /// Configuration for the relay server.
@@ -202,6 +203,12 @@ pub struct RelayServer {
     connection_tracker: ConnectionTracker,
     /// Per-IP publish rate limiter (token bucket).
     publish_rate_limiter: PublishRateLimiter,
+    /// Optional persistence for relay operational state (subscriptions,
+    /// rate limits). When `Some`, subscriptions are persisted on
+    /// subscribe/unsubscribe and restored on startup.
+    ///
+    /// See SCP-PERSIST-066.
+    persistence: Option<Arc<dyn RelayPersistence>>,
 }
 
 impl RelayServer {
@@ -221,6 +228,60 @@ impl RelayServer {
             next_connection_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             connection_tracker: Arc::new(RwLock::new(HashMap::new())),
             publish_rate_limiter: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            persistence: None,
+        }
+    }
+
+    /// Creates a new relay server with operational state persistence.
+    ///
+    /// When persistence is provided, subscriptions are stored on subscribe,
+    /// removed on unsubscribe, and restored on startup. Rate limit state
+    /// is also persisted periodically.
+    ///
+    /// See SCP-PERSIST-066.
+    #[must_use]
+    pub fn with_persistence(
+        config: RelayConfig,
+        storage: impl Into<Arc<BlobStorageBackend>>,
+        persistence: Arc<dyn RelayPersistence>,
+    ) -> Self {
+        Self {
+            config,
+            storage: storage.into(),
+            subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            next_connection_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            connection_tracker: Arc::new(RwLock::new(HashMap::new())),
+            publish_rate_limiter: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            persistence: Some(persistence),
+        }
+    }
+
+    /// Restores persisted subscriptions into the in-memory registry.
+    ///
+    /// Called on startup from both [`run`](Self::run) and [`start`](Self::start).
+    /// Best-effort — logs warnings on failure and continues.
+    async fn restore_persisted_subscriptions(&self) {
+        if let Some(ref persistence) = self.persistence {
+            match persistence.load_subscribed_routing_ids() {
+                Ok(routing_ids) => {
+                    if !routing_ids.is_empty() {
+                        tracing::info!(
+                            count = routing_ids.len(),
+                            "restored persisted subscription routing IDs"
+                        );
+                        let mut registry = self.subscriptions.write().await;
+                        for routing_id in routing_ids {
+                            registry.entry(routing_id).or_default();
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to restore persisted subscriptions (continuing without)"
+                    );
+                }
+            }
         }
     }
 
@@ -237,6 +298,9 @@ impl RelayServer {
     /// Returns [`RelayError::BindFailed`] if the server cannot bind to
     /// the configured address.
     pub async fn run(&self) -> Result<(), RelayError> {
+        // Restore persisted subscriptions on startup (SCP-PERSIST-066).
+        self.restore_persisted_subscriptions().await;
+
         let listener = TcpListener::bind(self.config.bind_addr)
             .await
             .map_err(|e| RelayError::BindFailed(e.to_string()))?;
@@ -280,6 +344,7 @@ impl RelayServer {
             let config = self.config.clone();
             let conn_tracker = Arc::clone(&self.connection_tracker);
             let rate_limiter = Arc::clone(&self.publish_rate_limiter);
+            let persistence = self.persistence.clone();
 
             tokio::spawn(async move {
                 if let Err(_e) = handle_connection(
@@ -290,6 +355,7 @@ impl RelayServer {
                     subscriptions,
                     config,
                     rate_limiter,
+                    persistence,
                 )
                 .await
                 {
@@ -312,6 +378,9 @@ impl RelayServer {
     /// Returns [`RelayError::BindFailed`] if the server cannot bind to
     /// the configured address.
     pub async fn start(&self) -> Result<(ShutdownHandle, SocketAddr), RelayError> {
+        // Restore persisted subscriptions on startup (SCP-PERSIST-066).
+        self.restore_persisted_subscriptions().await;
+
         let listener = TcpListener::bind(self.config.bind_addr)
             .await
             .map_err(|e| RelayError::BindFailed(e.to_string()))?;
@@ -340,6 +409,7 @@ impl RelayServer {
         let next_id = Arc::clone(&self.next_connection_id);
         let conn_tracker = Arc::clone(&self.connection_tracker);
         let rate_limiter = Arc::clone(&self.publish_rate_limiter);
+        let persistence = self.persistence.clone();
         let accept_token = token.clone();
 
         tokio::spawn(async move {
@@ -375,6 +445,7 @@ impl RelayServer {
                 let config = config.clone();
                 let conn_tracker = Arc::clone(&conn_tracker);
                 let rate_limiter = Arc::clone(&rate_limiter);
+                let persistence = persistence.clone();
 
                 tokio::spawn(async move {
                     let _ = handle_connection(
@@ -385,6 +456,7 @@ impl RelayServer {
                         subscriptions,
                         config,
                         rate_limiter,
+                        persistence,
                     )
                     .await;
                     // Decrement connection count on disconnect.
@@ -669,6 +741,7 @@ async fn handle_connection(
     subscriptions: SubscriptionRegistry,
     config: RelayConfig,
     rate_limiter: PublishRateLimiter,
+    persistence: Option<Arc<dyn RelayPersistence>>,
 ) -> Result<(), ConnectionError> {
     let ws_stream = if let Some(expected_secret) = config.bridge_secret {
         // Validate the bridge token during the WebSocket handshake.
@@ -740,6 +813,7 @@ async fn handle_connection(
                     &config,
                     &rate_limiter,
                     &mut subscribe_rate_limiter,
+                    persistence.as_ref(),
                 )
                 .await;
             }
@@ -799,6 +873,7 @@ async fn handle_client_message(
     config: &RelayConfig,
     rate_limiter: &PublishRateLimiter,
     subscribe_rate_limiter: &mut SubscribeRateLimiter,
+    persistence: Option<&Arc<dyn RelayPersistence>>,
 ) {
     match msg {
         ClientMessage::Publish {
@@ -839,6 +914,7 @@ async fn handle_client_message(
                 my_subscriptions,
                 config,
                 subscribe_rate_limiter,
+                persistence,
             )
             .await;
         }
@@ -850,6 +926,7 @@ async fn handle_client_message(
                 tx,
                 subscriptions,
                 my_subscriptions,
+                persistence,
             )
             .await;
         }
@@ -1150,6 +1227,7 @@ async fn handle_subscribe(
     my_subscriptions: &Arc<RwLock<HashSet<[u8; 32]>>>,
     config: &RelayConfig,
     subscribe_rate_limiter: &mut SubscribeRateLimiter,
+    persistence: Option<&Arc<dyn RelayPersistence>>,
 ) {
     // Check subscribe rate limit (ADR-004: 20/min per connection).
     if !subscribe_rate_limiter.check() {
@@ -1200,6 +1278,17 @@ async fn handle_subscribe(
         my_subs.insert(routing_id);
     }
 
+    // Persist subscription (best-effort, SCP-PERSIST-066).
+    if let Some(persistence) = persistence
+        && let Err(e) = persistence.persist_subscription(&routing_id)
+    {
+        tracing::warn!(
+            error = %e,
+            routing_id = hex::encode(routing_id),
+            "failed to persist subscription"
+        );
+    }
+
     // Send OK response.
     let ok = RelayMessage::Ok {
         ref_id: ref_id.clone(),
@@ -1237,6 +1326,7 @@ async fn handle_subscribe(
 }
 
 /// Handles an UNSUBSCRIBE operation.
+#[allow(clippy::too_many_arguments)]
 async fn handle_unsubscribe(
     ref_id: Option<String>,
     routing_id: [u8; 32],
@@ -1244,21 +1334,41 @@ async fn handle_unsubscribe(
     tx: &mpsc::Sender<RelayMessage>,
     subscriptions: &SubscriptionRegistry,
     my_subscriptions: &Arc<RwLock<HashSet<[u8; 32]>>>,
+    persistence: Option<&Arc<dyn RelayPersistence>>,
 ) {
     // Remove from the registry.
+    let routing_id_removed;
     {
         let mut registry = subscriptions.write().await;
         if let Some(entries) = registry.get_mut(&routing_id) {
             entries.retain(|e| e.connection_id != connection_id);
             if entries.is_empty() {
                 registry.remove(&routing_id);
+                routing_id_removed = true;
+            } else {
+                routing_id_removed = false;
             }
+        } else {
+            routing_id_removed = false;
         }
     }
 
     {
         let mut my_subs = my_subscriptions.write().await;
         my_subs.remove(&routing_id);
+    }
+
+    // Only remove from persistence when no subscribers remain for this
+    // routing ID. Other connections may still be subscribed.
+    if routing_id_removed
+        && let Some(persistence) = persistence
+        && let Err(e) = persistence.remove_subscription(&routing_id)
+    {
+        tracing::warn!(
+            error = %e,
+            routing_id = hex::encode(routing_id),
+            "failed to remove persisted subscription"
+        );
     }
 
     let ok = RelayMessage::Ok {
