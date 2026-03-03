@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use scp_transport::native::server::{RelayConfig, RelayServer};
-use scp_transport::native::storage::InMemoryBlobStorage;
+use scp_transport::native::storage::BlobStorageBackend;
 use tracing_subscriber::EnvFilter;
 
 /// Reads an environment variable and parses it, returning the default on
@@ -101,7 +101,7 @@ async fn main() {
         "starting scp-relay"
     );
 
-    let storage = Arc::new(InMemoryBlobStorage::new());
+    let storage = Arc::new(BlobStorageBackend::in_memory());
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {

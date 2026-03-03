@@ -24,7 +24,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
-use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
+use scp_transport::native::storage::BlobStorageBackend;
 
 use crate::tls;
 
@@ -54,11 +54,9 @@ pub struct BroadcastContext {
 /// Read on every `.well-known/scp` request to generate the response
 /// dynamically (spec section 18.6.4).
 ///
-/// # Type parameter
-///
-/// `B` is the blob storage backend, shared between the relay server and
-/// projection handlers via `Arc<B>` (spec section 18.11.5).
-pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
+/// Blob storage uses [`BlobStorageBackend`] (enum dispatch), shared between
+/// the relay server and projection handlers via `Arc` (spec section 18.11.5).
+pub struct NodeState {
     /// The operator's DID string.
     pub(crate) did: String,
     /// The relay URL (e.g., `wss://example.com/scp/v1`).
@@ -95,7 +93,7 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     /// projection handlers to read stored blobs.
     ///
     /// See spec section 18.11.5.
-    pub(crate) blob_storage: Arc<B>,
+    pub(crate) blob_storage: Arc<BlobStorageBackend>,
     /// Relay operational parameters exposed in `.well-known/scp`
     /// `relay_config` (spec section 18.3.3).
     pub(crate) relay_config: TransportRelayConfig,
@@ -201,9 +199,9 @@ const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 ///
 /// The handler dynamically generates the `.well-known/scp` JSON document
 /// from the provided [`NodeState`]. See spec section 18.3.
-pub fn well_known_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Router {
+pub fn well_known_router(state: Arc<NodeState>) -> Router {
     Router::new()
-        .route("/.well-known/scp", get(well_known_handler::<B>))
+        .route("/.well-known/scp", get(well_known_handler))
         .with_state(state)
 }
 
@@ -220,10 +218,10 @@ pub fn well_known_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> 
 /// for the entire WebSocket connection lifetime — ensuring the semaphore
 /// accurately tracks active connections, not just in-flight upgrade
 /// requests (#229).
-pub fn relay_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Router {
+pub fn relay_router(state: Arc<NodeState>) -> Router {
     let bridge_semaphore = Arc::new(Semaphore::new(state.relay_config.max_total_connections));
     Router::new()
-        .route("/scp/v1", get(ws_upgrade_handler::<B>))
+        .route("/scp/v1", get(ws_upgrade_handler))
         .with_state((state, bridge_semaphore))
 }
 
@@ -234,9 +232,9 @@ pub fn relay_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Route
 /// connection lifetime. If the HTTP 101 upgrade never completes, axum
 /// drops the response — which drops the closure and releases the permit.
 /// Returns 503 Service Unavailable when the bridge is at capacity.
-async fn ws_upgrade_handler<B: BlobStorage + 'static>(
+async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
-    State((state, sem)): State<(Arc<NodeState<B>>, Arc<Semaphore>)>,
+    State((state, sem)): State<(Arc<NodeState>, Arc<Semaphore>)>,
 ) -> impl IntoResponse {
     let Ok(permit) = sem.try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -385,7 +383,7 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret:
 // ApplicationNode HTTP methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNode<S, B> {
+impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// Returns an axum [`Router`] serving `GET /.well-known/scp`.
     ///
     /// The response is dynamically generated from the node's current state:
@@ -668,12 +666,12 @@ mod tests {
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
-    use scp_transport::native::storage::InMemoryBlobStorage;
+    use scp_transport::native::storage::BlobStorageBackend;
 
     use super::*;
 
     /// Creates a minimal `NodeState` for CORS tests.
-    fn test_state(cors_origins: Option<Vec<String>>) -> Arc<NodeState<InMemoryBlobStorage>> {
+    fn test_state(cors_origins: Option<Vec<String>>) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:cors_test".to_owned(),
             relay_url: "wss://localhost/scp/v1".to_owned(),
@@ -683,7 +681,7 @@ mod tests {
             dev_token: None,
             dev_bind_addr: None,
             projected_contexts: RwLock::new(HashMap::new()),
-            blob_storage: Arc::new(InMemoryBlobStorage::new()),
+            blob_storage: Arc::new(BlobStorageBackend::default()),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),

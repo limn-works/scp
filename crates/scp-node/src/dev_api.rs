@@ -31,8 +31,6 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use scp_transport::native::storage::BlobStorage;
-
 use crate::http::NodeState;
 
 // ---------------------------------------------------------------------------
@@ -260,9 +258,7 @@ pub struct CreateContextRequest {
 /// [`NodeState::start_time`]), relay connection count, and storage status.
 ///
 /// See spec section 18.10.3.
-pub async fn health_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
-) -> impl IntoResponse {
+pub async fn health_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
     let uptime = state.start_time.elapsed().as_secs();
 
     (
@@ -283,9 +279,7 @@ pub async fn health_handler<B: BlobStorage>(
 /// serialization is available in `NodeState`.
 ///
 /// See spec section 18.10.3.
-pub async fn identity_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
-) -> impl IntoResponse {
+pub async fn identity_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(IdentityResponse {
@@ -303,9 +297,7 @@ pub async fn identity_handler<B: BlobStorage>(
 /// placeholders until SCP-245 wires real metrics.
 ///
 /// See spec section 18.10.3.
-pub async fn relay_status_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
-) -> impl IntoResponse {
+pub async fn relay_status_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(RelayStatusResponse {
@@ -325,9 +317,7 @@ pub async fn relay_status_handler<B: BlobStorage>(
 /// are registered.
 ///
 /// See spec section 18.10.3.
-pub async fn list_contexts_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
-) -> impl IntoResponse {
+pub async fn list_contexts_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
     let responses: Vec<ContextResponse> = state
         .broadcast_contexts
         .read()
@@ -346,8 +336,8 @@ pub async fn list_contexts_handler<B: BlobStorage>(
 /// registered.
 ///
 /// See spec section 18.10.3.
-pub async fn get_context_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
+pub async fn get_context_handler(
+    State(state): State<Arc<NodeState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let id = id.to_ascii_lowercase();
@@ -375,8 +365,8 @@ const MAX_CONTEXT_NAME_LEN: usize = 256;
 /// - No duplicate context ID already registered
 ///
 /// See spec section 18.10.3.
-pub async fn create_context_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
+pub async fn create_context_handler(
+    State(state): State<Arc<NodeState>>,
     body: Result<Json<CreateContextRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     // Unwrap JSON body, mapping extraction failures to DevApiError (spec §18.10.4).
@@ -439,8 +429,8 @@ pub async fn create_context_handler<B: BlobStorage>(
 /// that ID is registered.
 ///
 /// See spec section 18.10.3.
-pub async fn delete_context_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
+pub async fn delete_context_handler(
+    State(state): State<Arc<NodeState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let id = id.to_ascii_lowercase();
@@ -468,25 +458,22 @@ pub async fn delete_context_handler<B: BlobStorage>(
 /// `Authorization: Bearer <token>` header receive HTTP 401.
 ///
 /// See spec section 18.10.2.
-pub fn dev_router<B: BlobStorage + 'static>(
-    state: Arc<NodeState<B>>,
-    token: String,
-) -> axum::Router {
+pub fn dev_router(state: Arc<NodeState>, token: String) -> axum::Router {
     use axum::middleware;
     use axum::routing::get;
 
     let expected = token;
     axum::Router::new()
-        .route("/scp/dev/v1/health", get(health_handler::<B>))
-        .route("/scp/dev/v1/identity", get(identity_handler::<B>))
-        .route("/scp/dev/v1/relay/status", get(relay_status_handler::<B>))
+        .route("/scp/dev/v1/health", get(health_handler))
+        .route("/scp/dev/v1/identity", get(identity_handler))
+        .route("/scp/dev/v1/relay/status", get(relay_status_handler))
         .route(
             "/scp/dev/v1/contexts",
-            get(list_contexts_handler::<B>).post(create_context_handler::<B>),
+            get(list_contexts_handler).post(create_context_handler),
         )
         .route(
             "/scp/dev/v1/contexts/{id}",
-            get(get_context_handler::<B>).delete(delete_context_handler::<B>),
+            get(get_context_handler).delete(delete_context_handler),
         )
         .layer(middleware::from_fn(move |req, next| {
             bearer_auth_middleware(req, next, expected.clone())
@@ -509,7 +496,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
-    use scp_transport::native::storage::InMemoryBlobStorage;
+    use scp_transport::native::storage::BlobStorageBackend;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
@@ -518,7 +505,7 @@ mod tests {
     use super::*;
 
     /// Creates a test `NodeState` with the given dev token.
-    fn test_state(token: &str) -> Arc<NodeState<InMemoryBlobStorage>> {
+    fn test_state(token: &str) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:test123".to_owned(),
             relay_url: "wss://localhost/scp/v1".to_owned(),
@@ -528,7 +515,7 @@ mod tests {
             dev_token: Some(token.to_owned()),
             dev_bind_addr: Some("127.0.0.1:9100".parse::<SocketAddr>().unwrap()),
             projected_contexts: RwLock::new(HashMap::new()),
-            blob_storage: Arc::new(InMemoryBlobStorage::default()),
+            blob_storage: Arc::new(BlobStorageBackend::default()),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
@@ -1377,7 +1364,7 @@ mod tests {
     /// Sends a request and asserts the response has the expected status and
     /// `application/json` Content-Type (skipped for 204 No Content).
     async fn assert_json_content_type(
-        state: &Arc<NodeState<InMemoryBlobStorage>>,
+        state: &Arc<NodeState>,
         token: &str,
         method: &str,
         path: &str,

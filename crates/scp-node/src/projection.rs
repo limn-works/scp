@@ -383,8 +383,8 @@ fn decrypt_blobs(
 /// - **400** — Invalid routing ID hex or invalid `since` blob ID hex.
 ///
 /// See spec section 18.11.3.
-pub async fn feed_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
+pub async fn feed_handler(
+    State(state): State<Arc<NodeState>>,
     Path(routing_id_hex): Path<String>,
     Query(params): Query<FeedQuery>,
 ) -> impl IntoResponse {
@@ -543,8 +543,8 @@ pub async fn feed_handler<B: BlobStorage>(
 ///
 /// See spec section 18.11.4.
 #[allow(clippy::too_many_lines)]
-pub async fn message_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
+pub async fn message_handler(
+    State(state): State<Arc<NodeState>>,
     Path((routing_id_hex, blob_id_hex)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -744,12 +744,12 @@ pub async fn message_handler<B: BlobStorage>(
 /// contexts and blob storage.
 ///
 /// See spec sections 18.11.3 and 18.11.4.
-pub fn broadcast_projection_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Router {
+pub fn broadcast_projection_router(state: Arc<NodeState>) -> Router {
     Router::new()
-        .route("/scp/broadcast/{routing_id}/feed", get(feed_handler::<B>))
+        .route("/scp/broadcast/{routing_id}/feed", get(feed_handler))
         .route(
             "/scp/broadcast/{routing_id}/messages/{blob_id}",
-            get(message_handler::<B>),
+            get(message_handler),
         )
         .with_state(state)
 }
@@ -934,7 +934,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode as HttpStatus};
     use http_body_util::BodyExt;
-    use scp_transport::native::storage::InMemoryBlobStorage;
+    use scp_transport::native::storage::{BlobStorageBackend, InMemoryBlobStorage};
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
@@ -945,7 +945,7 @@ mod tests {
     fn test_state_with(
         projected: HashMap<[u8; 32], ProjectedContext>,
         storage: InMemoryBlobStorage,
-    ) -> Arc<NodeState<InMemoryBlobStorage>> {
+    ) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:test".to_owned(),
             relay_url: "wss://localhost/scp/v1".to_owned(),
@@ -955,7 +955,7 @@ mod tests {
             dev_token: None,
             dev_bind_addr: None,
             projected_contexts: RwLock::new(projected),
-            blob_storage: Arc::new(storage),
+            blob_storage: Arc::new(BlobStorageBackend::from(storage)),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),

@@ -13,10 +13,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-use scp_core::well_known::{RelayConfig, WellKnownContext, WellKnownScp};
-use scp_transport::native::storage::BlobStorage;
-
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use scp_core::well_known::{RelayConfig, WellKnownContext, WellKnownScp};
 
 /// Characters that must be percent-encoded when embedded as a query parameter
 /// value.  Preserves URL-safe characters (`:`, `/`, `.`, `?`, `@`) so relay
@@ -40,9 +38,7 @@ use crate::http::NodeState;
 /// 18.6.4: "dynamically generated from node state").
 ///
 /// Returns `application/json` with the `WellKnownScp` payload.
-pub async fn well_known_handler<B: BlobStorage>(
-    State(state): State<Arc<NodeState<B>>>,
-) -> impl IntoResponse {
+pub async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
     let contexts = {
         let guard = state.broadcast_contexts.read().await;
         if guard.is_empty() {

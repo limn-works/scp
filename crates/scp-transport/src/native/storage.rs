@@ -1,8 +1,13 @@
-//! Blob storage trait and in-memory implementation for the SCP native relay.
+//! Blob storage trait and implementations for the SCP native relay.
 //!
 //! The [`BlobStorage`] trait defines the storage interface used by the relay
 //! server. Phase 1 provides [`InMemoryBlobStorage`], a `HashMap`-backed
 //! implementation suitable for development and testing.
+//!
+//! [`BlobStorageBackend`] is a concrete enum that wraps all available storage
+//! implementations, eliminating the need for generic type parameters on
+//! [`RelayServer`](super::server::RelayServer) and its downstream consumers.
+//! New storage backends are added as enum variants.
 //!
 //! Blobs are keyed by `(routing_id, blob_id)` and carry a TTL. The storage
 //! layer is responsible for tracking when blobs expire so the relay's
@@ -325,6 +330,100 @@ impl BlobStorage for InMemoryBlobStorage {
         }
 
         Ok(count)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enum dispatch: concrete storage backend (eliminates generic propagation)
+// ---------------------------------------------------------------------------
+
+/// Concrete blob storage backend used by [`RelayServer`](super::server::RelayServer).
+///
+/// Wraps all available [`BlobStorage`] implementations behind an enum,
+/// eliminating the `<S: BlobStorage>` generic parameter from `RelayServer`
+/// and all downstream handler functions. This trades a single `match` per
+/// storage call (negligible cost vs. the I/O itself) for removing turbofish
+/// operators and generic propagation across the entire server stack.
+///
+/// New backends (e.g., `SQLite`, redb) are added as variants here.
+///
+/// See issue [#242](https://github.com/limn-works/scp/issues/242).
+#[derive(Debug, Clone)]
+pub enum BlobStorageBackend {
+    /// In-memory `HashMap`-backed storage (development / testing).
+    InMemory(InMemoryBlobStorage),
+}
+
+impl BlobStorageBackend {
+    /// Creates a new in-memory backend with default capacity.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self::InMemory(InMemoryBlobStorage::new())
+    }
+
+    /// Creates a new in-memory backend with the given capacity limit.
+    #[must_use]
+    pub fn in_memory_with_capacity(max_blobs: usize) -> Self {
+        Self::InMemory(InMemoryBlobStorage::with_capacity(max_blobs))
+    }
+}
+
+impl Default for BlobStorageBackend {
+    fn default() -> Self {
+        Self::in_memory()
+    }
+}
+
+impl From<InMemoryBlobStorage> for BlobStorageBackend {
+    fn from(storage: InMemoryBlobStorage) -> Self {
+        Self::InMemory(storage)
+    }
+}
+
+impl BlobStorage for BlobStorageBackend {
+    async fn store(
+        &self,
+        routing_id: [u8; 32],
+        blob_id: [u8; 32],
+        recipient_hint: Option<[u8; 32]>,
+        blob_ttl: u32,
+        blob: Vec<u8>,
+    ) -> Result<StoredBlob, StorageError> {
+        match self {
+            Self::InMemory(s) => {
+                s.store(routing_id, blob_id, recipient_hint, blob_ttl, blob)
+                    .await
+            }
+        }
+    }
+
+    async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError> {
+        match self {
+            Self::InMemory(s) => s.get(blob_id).await,
+        }
+    }
+
+    async fn query(
+        &self,
+        routing_id: &[u8; 32],
+        since: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<StoredBlob>, StorageError> {
+        match self {
+            Self::InMemory(s) => s.query(routing_id, since, limit).await,
+        }
+    }
+
+    async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
+        match self {
+            Self::InMemory(s) => s.delete(blob_id).await,
+        }
+    }
+
+    async fn purge_expired(&self) -> Result<usize, StorageError> {
+        match self {
+            Self::InMemory(s) => s.purge_expired().await,
+        }
     }
 }
 
