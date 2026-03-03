@@ -25,6 +25,7 @@ use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
+use tokio_util::sync::CancellationToken;
 
 pub use http::BroadcastContext;
 pub use projection::ProjectedContext;
@@ -267,11 +268,17 @@ impl<S: Storage, B: BlobStorage> ApplicationNode<S, B> {
         self.state.dev_token.as_deref()
     }
 
-    /// Gracefully shuts down the relay server.
+    /// Gracefully shuts down the node.
     ///
-    /// In-flight connection handlers drain naturally — they are not cancelled.
+    /// Signals the relay server, the public HTTPS listener, and the dev API
+    /// listener (if running) to stop accepting new connections. In-flight
+    /// connection handlers drain naturally -- they are not cancelled.
+    ///
+    /// See SCP-245: "Ensure graceful shutdown of dev API listener alongside
+    /// main server."
     pub fn shutdown(&self) {
         self.relay.shutdown_handle.shutdown();
+        self.state.shutdown_token.cancel();
     }
 
     /// Activates HTTP broadcast projection for the given context.
@@ -1190,6 +1197,7 @@ async fn build_domain_inner<
         relay_config,
         start_time: std::time::Instant::now(),
         http_bind_addr,
+        shutdown_token: CancellationToken::new(),
     });
 
     Ok(ApplicationNode {
@@ -1276,6 +1284,7 @@ async fn build_no_domain_inner<
         relay_config,
         start_time: std::time::Instant::now(),
         http_bind_addr,
+        shutdown_token: CancellationToken::new(),
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
