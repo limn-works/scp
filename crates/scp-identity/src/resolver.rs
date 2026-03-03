@@ -2,7 +2,7 @@
 //!
 //! Implements the parallel dual-layer resolution protocol defined in §3.10.10
 //! and §3.10.4. Both layers (SCP relay QUERY and Mainline DHT BEP44 lookup)
-//! are queried in parallel; both layers are queried in parallel, highest seq
+//! are queried in parallel via `tokio::join!`. The result with the highest seq
 //! wins per section 3.10.7. "Valid" means the BEP44 signature verifies against
 //! the public key encoded in the DID string AND the sequence number is greater
 //! than or equal to the last known sequence number for that DID.
@@ -11,26 +11,35 @@
 //! sequence number is accepted. On a tie, the relay result is preferred
 //! (lower latency for subsequent operations).
 //!
+//! When both layers return valid documents with different sequence numbers,
+//! protocol-level healing (§3.10.7) re-publishes the fresher document to the
+//! stale layer. Healing is asynchronous (does not block the resolve call) and
+//! best-effort (failure is logged, not propagated).
+//!
 //! # Architecture
 //!
 //! - [`DidResolver`] — Trait for unified DID resolution (§3.10.10).
 //! - [`ResolvedDidDocument`] — Resolution result with provenance metadata.
 //! - [`ResolutionSource`] — Which layer served the document.
 //! - [`MultiRelayQuerier`] — Trait abstracting SCP relay QUERY operations.
+//! - [`HealingPublisher`] — Trait abstracting republish to a stale layer (§3.10.7).
 //! - [`DualLayerResolver`] — Composes relay + DHT resolution in parallel.
 //!
-//! See SCP-241 in `.docs/prds/reachability.json`.
+//! See SCP-241 and SCP-245 in `.docs/prds/reachability.json`.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::IdentityError;
 use crate::cache::{Clock, DidCache, SystemClock};
 use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
 use crate::dht_client::{DhtClient, DhtRecord};
 use crate::document::DidDocument;
+use crate::republish::RelayPublisher;
+use crate::resolution::did_routing_id;
 
 // ---------------------------------------------------------------------------
 // Core types (§3.10.10)
@@ -136,6 +145,61 @@ pub trait MultiRelayQuerier: Send + Sync {
     ) -> impl Future<Output = Result<Option<RelayRecord>, IdentityError>> + Send;
 }
 
+// ---------------------------------------------------------------------------
+// Healing publisher abstraction (§3.10.7, SCP-245)
+// ---------------------------------------------------------------------------
+
+/// Identifies which resolution layer has the stale document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleLayer {
+    /// The SCP relay returned a lower sequence number than the DHT.
+    /// Contains relay URLs that were queried (hints for where to republish).
+    Relay {
+        /// Relay URLs that returned the stale document.
+        relay_urls: Vec<String>,
+    },
+    /// The Mainline DHT returned a lower sequence number than the relay.
+    Dht,
+}
+
+/// Abstracts the ability to republish a fresher DID document to the resolution
+/// layer that returned a stale copy (protocol-level healing per §3.10.7).
+///
+/// When `DualLayerResolver` detects that both layers returned valid documents
+/// with different sequence numbers, it fires a healing republish to the stale
+/// layer via this trait. The call is spawned asynchronously and is best-effort:
+/// failures are logged, not propagated to the caller.
+///
+/// Production implementations may delegate to [`super::republish::RelayPublisher`]
+/// for relay healing and [`super::dht_client::DhtClient`] for DHT healing.
+/// Test implementations record calls for assertion.
+pub trait HealingPublisher: Send + Sync {
+    /// Republishes the fresher document to the stale layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `did` — The DID string whose document diverged across layers.
+    /// * `stale_layer` — Which layer had the stale document.
+    /// * `document_bytes` — The BEP44-signed DID document bytes (fresher copy).
+    /// * `signature` — The Ed25519 signature for the BEP44 record.
+    /// * `seq` — The sequence number of the fresher document.
+    /// * `public_key` — The 32-byte Ed25519 public key from the DID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on publish failure. The caller logs the error and
+    /// discards it (best-effort healing).
+    fn heal(
+        &self,
+        did: &str,
+        stale_layer: &StaleLayer,
+        document_bytes: &[u8],
+        signature: &[u8; 64],
+        seq: u64,
+        public_key: &[u8; 32],
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send;
+}
+
 // Re-exports `did_routing_id` from `resolution` — no duplication.
 // BEP44 verification helpers (`verify_bep44_signature`, `extract_public_key`,
 // `bep44_signable`) are imported from `super::dht`.
@@ -190,18 +254,123 @@ const LAYER_TIMEOUT: Duration = Duration::from_secs(10);
 /// 6. When one layer times out, the other's valid result is used.
 /// 7. When both fail or return nothing, returns `Ok(None)`.
 /// 8. Cache the result.
+/// 9. If both layers returned valid documents with different seq numbers,
+///    trigger protocol-level healing (§3.10.7): asynchronously republish the
+///    fresher document to the stale layer.
 ///
 /// See §3.10.4 and §3.10.7 for the full resolution protocol.
-pub struct DualLayerResolver<R: MultiRelayQuerier, D: DhtClient, C: Clock = SystemClock> {
+pub struct DualLayerResolver<
+    R: MultiRelayQuerier,
+    D: DhtClient,
+    C: Clock = SystemClock,
+    H: HealingPublisher = NoOpHealer,
+> {
     relay_querier: Arc<R>,
     dht_client: Arc<D>,
     cache: Arc<DidCache<C>>,
     /// Bootstrap relay URLs used when the identity's relays are not known.
     bootstrap_relays: Vec<String>,
+    /// Optional healing publisher for protocol-level healing (§3.10.7, SCP-245).
+    ///
+    /// When set, the resolver triggers an asynchronous best-effort republish
+    /// of the fresher document to the layer that returned a stale copy.
+    healing_publisher: Option<Arc<H>>,
+}
+
+/// A no-op healing publisher used as the default type parameter.
+///
+/// This exists only to provide a concrete default for the `H` type parameter
+/// on [`DualLayerResolver`] so that existing construction sites that do not
+/// need healing remain unchanged.
+pub struct NoOpHealer;
+
+#[allow(clippy::manual_async_fn)]
+impl HealingPublisher for NoOpHealer {
+    fn heal(
+        &self,
+        _did: &str,
+        _stale_layer: &StaleLayer,
+        _document_bytes: &[u8],
+        _signature: &[u8; 64],
+        _seq: u64,
+        _public_key: &[u8; 32],
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        async { Ok(()) }
+    }
+}
+
+/// Production healing publisher that delegates to [`DhtClient`] and
+/// [`RelayPublisher`] for the respective stale layers (§3.10.7, SCP-245).
+///
+/// When the stale layer is `Dht`, the fresher document is published via the
+/// `DhtClient::publish` method. When the stale layer is `Relay`, the document
+/// is published via `RelayPublisher::publish` to each relay URL that returned
+/// the stale copy.
+pub struct DualLayerHealingPublisher<D: DhtClient, R: RelayPublisher> {
+    dht_client: Arc<D>,
+    relay_publisher: Arc<R>,
+}
+
+impl<D: DhtClient, R: RelayPublisher> DualLayerHealingPublisher<D, R> {
+    /// Creates a new production healing publisher.
+    #[must_use]
+    pub const fn new(dht_client: Arc<D>, relay_publisher: Arc<R>) -> Self {
+        Self {
+            dht_client,
+            relay_publisher,
+        }
+    }
+}
+
+/// DID document blob TTL for relay publishing: 7 days (§3.10.2).
+const DID_DOCUMENT_BLOB_TTL_SECS: u64 = 604_800;
+
+#[allow(clippy::manual_async_fn)]
+impl<D: DhtClient + 'static, R: RelayPublisher + 'static> HealingPublisher
+    for DualLayerHealingPublisher<D, R>
+{
+    fn heal(
+        &self,
+        did: &str,
+        stale_layer: &StaleLayer,
+        document_bytes: &[u8],
+        signature: &[u8; 64],
+        seq: u64,
+        public_key: &[u8; 32],
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        let dht_client = Arc::clone(&self.dht_client);
+        let relay_publisher = Arc::clone(&self.relay_publisher);
+        let stale_layer = stale_layer.clone();
+        let document_bytes = document_bytes.to_vec();
+        let signature = *signature;
+        let public_key = *public_key;
+        let did = did.to_owned();
+
+        async move {
+            match stale_layer {
+                StaleLayer::Dht => {
+                    debug!(did = %did, seq, "healing: republishing to DHT");
+                    dht_client
+                        .publish(&public_key, &signature, &document_bytes, seq)
+                        .await
+                }
+                StaleLayer::Relay { relay_urls: _ } => {
+                    // Publish the fresher document to relays via the relay
+                    // publisher. The relay publisher distributes to the
+                    // identity's own relays + bootstrap relays (§18.5.1).
+                    let routing_id = did_routing_id(&did);
+                    debug!(did = %did, seq, "healing: republishing to relay");
+                    relay_publisher
+                        .publish(&routing_id, DID_DOCUMENT_BLOB_TTL_SECS, &document_bytes)
+                        .await
+                }
+            }
+        }
+    }
 }
 
 impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
-    /// Creates a new dual-layer resolver.
+    /// Creates a new dual-layer resolver without healing.
     #[must_use]
     pub const fn new(
         relay_querier: Arc<R>,
@@ -214,6 +383,34 @@ impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
             dht_client,
             cache,
             bootstrap_relays,
+            healing_publisher: None,
+        }
+    }
+}
+
+impl<R: MultiRelayQuerier, D: DhtClient, C: Clock, H: HealingPublisher>
+    DualLayerResolver<R, D, C, H>
+{
+    /// Creates a new dual-layer resolver with protocol-level healing (§3.10.7).
+    ///
+    /// When both resolution layers return valid documents with different
+    /// sequence numbers, the resolver asynchronously republishes the fresher
+    /// document to the layer that returned the stale copy. Healing is
+    /// best-effort: failures are logged, not propagated to the caller.
+    #[must_use]
+    pub const fn with_healing(
+        relay_querier: Arc<R>,
+        dht_client: Arc<D>,
+        cache: Arc<DidCache<C>>,
+        bootstrap_relays: Vec<String>,
+        healing_publisher: Arc<H>,
+    ) -> Self {
+        Self {
+            relay_querier,
+            dht_client,
+            cache,
+            bootstrap_relays,
+            healing_publisher: Some(healing_publisher),
         }
     }
 }
@@ -221,8 +418,12 @@ impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
 #[allow(clippy::manual_async_fn)]
-impl<R: MultiRelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static> DidResolver
-    for DualLayerResolver<R, D, C>
+impl<
+    R: MultiRelayQuerier + 'static,
+    D: DhtClient + 'static,
+    C: Clock + 'static,
+    H: HealingPublisher + 'static,
+> DidResolver for DualLayerResolver<R, D, C, H>
 {
     fn resolve(
         &self,
@@ -233,6 +434,7 @@ impl<R: MultiRelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static>
         let dht_client = Arc::clone(&self.dht_client);
         let cache = Arc::clone(&self.cache);
         let bootstrap_relays = self.bootstrap_relays.clone();
+        let healing_publisher = self.healing_publisher.clone();
 
         async move {
             // Step 1: Check cache for a fresh entry.
@@ -282,82 +484,206 @@ impl<R: MultiRelayQuerier + 'static, D: DhtClient + 'static, C: Clock + 'static>
 
             let (relay_result, dht_result) = tokio::join!(relay_fut, dht_fut);
 
-            // Validate both results independently.
-            let relay_doc = validate_relay_result(relay_result, &did, &public_key);
-            let dht_doc = validate_dht_result(dht_result, &did, &public_key);
+            // Validate both results independently. The validate functions
+            // return `ValidatedRecord` which bundles the resolved document with
+            // the raw BEP44 bytes and signature needed for healing (SCP-245).
+            let relay_validated = validate_relay_result(relay_result, &did, &public_key);
+            let dht_validated = validate_dht_result(dht_result, &did, &public_key);
 
             // Step 5: Reject results with sequence numbers lower than the
             // last known cached sequence. Prevents rollback attacks where an
             // attacker serves a validly-signed but outdated document after
             // cache TTL expiry.
             let cached_seq = cache.cached_sequence(&did).await;
-            let relay_doc = relay_doc.and_then(|doc| {
+            let relay_validated = relay_validated.and_then(|rec| {
                 if let Some(min_seq) = cached_seq
-                    && doc.seq < min_seq
+                    && rec.resolved.seq < min_seq
                 {
                     warn!(
                         did = %did,
-                        received_seq = doc.seq,
+                        received_seq = rec.resolved.seq,
                         cached_seq = min_seq,
                         "relay returned stale seq, rejecting"
                     );
                     return None;
                 }
-                Some(doc)
+                Some(rec)
             });
-            let dht_doc = dht_doc.and_then(|doc| {
+            let dht_validated = dht_validated.and_then(|rec| {
                 if let Some(min_seq) = cached_seq
-                    && doc.seq < min_seq
+                    && rec.resolved.seq < min_seq
                 {
                     warn!(
                         did = %did,
-                        received_seq = doc.seq,
+                        received_seq = rec.resolved.seq,
                         cached_seq = min_seq,
                         "DHT returned stale seq, rejecting"
                     );
                     return None;
                 }
-                Some(doc)
+                Some(rec)
             });
 
             // Step 6: Pick the result with the highest sequence number.
             // On a tie, prefer relay (lower latency for subsequent operations).
-            let result = match (relay_doc, dht_doc) {
-                (Some(relay), Some(dht)) => {
-                    if relay.seq >= dht.seq {
-                        // Relay wins on higher seq or tie (prefer relay on tie).
-                        Some(relay)
-                    } else {
-                        Some(dht)
-                    }
-                }
-                (Some(relay), None) => Some(relay),
-                (None, Some(dht)) => Some(dht),
-                (None, None) => None,
-            };
+            // Also detect sequence divergence for protocol-level healing.
+            let (result, healing_info) =
+                pick_winner_and_detect_divergence(relay_validated, dht_validated, &relay_urls);
 
-            // Step 6: Cache the result.
+            // Step 7: Cache the result.
             if let Some(ref resolved) = result {
                 cache
                     .insert(&did, resolved.document.clone(), resolved.seq)
                     .await;
             }
 
+            // Step 8: Trigger protocol-level healing (§3.10.7, SCP-245).
+            maybe_trigger_healing(healing_info, healing_publisher, &did, &public_key);
+
             Ok(result)
         }
     }
 }
 
+/// Picks the winning resolution result and detects sequence divergence for
+/// protocol-level healing (§3.10.7, SCP-245).
+///
+/// Returns the winning `ResolvedDidDocument` (highest seq, relay preferred on
+/// tie) and an optional `HealingInfo` when both layers returned valid
+/// documents with different sequence numbers.
+fn pick_winner_and_detect_divergence(
+    relay: Option<ValidatedRecord>,
+    dht: Option<ValidatedRecord>,
+    relay_urls: &[String],
+) -> (Option<ResolvedDidDocument>, Option<HealingInfo>) {
+    match (relay, dht) {
+        (Some(relay_rec), Some(dht_rec)) => {
+            // Detect divergence for healing.
+            let healing = match relay_rec.resolved.seq.cmp(&dht_rec.resolved.seq) {
+                Ordering::Greater => Some(HealingInfo {
+                    stale_layer: StaleLayer::Dht,
+                    raw_value: relay_rec.raw_value.clone(),
+                    raw_signature: relay_rec.raw_signature,
+                    fresher_seq: relay_rec.resolved.seq,
+                }),
+                Ordering::Less => Some(HealingInfo {
+                    stale_layer: StaleLayer::Relay { relay_urls: relay_urls.to_vec() },
+                    raw_value: dht_rec.raw_value.clone(),
+                    raw_signature: dht_rec.raw_signature,
+                    fresher_seq: dht_rec.resolved.seq,
+                }),
+                Ordering::Equal => None,
+            };
+
+            // Highest seq wins; on tie, relay preferred.
+            let winner = if relay_rec.resolved.seq >= dht_rec.resolved.seq {
+                relay_rec.resolved
+            } else {
+                dht_rec.resolved
+            };
+            (Some(winner), healing)
+        }
+        (Some(relay_rec), None) => (Some(relay_rec.resolved), None),
+        (None, Some(dht_rec)) => (Some(dht_rec.resolved), None),
+        (None, None) => (None, None),
+    }
+}
+
+/// Triggers protocol-level healing asynchronously if divergence was detected
+/// (§3.10.7, SCP-245).
+///
+/// Healing is best-effort: the republish is spawned on the tokio runtime and
+/// does not block the resolve call. Failures are logged at `warn` level and
+/// discarded.
+fn maybe_trigger_healing<H: HealingPublisher + 'static>(
+    healing_info: Option<HealingInfo>,
+    healing_publisher: Option<Arc<H>>,
+    did: &str,
+    public_key: &[u8; 32],
+) {
+    let Some(healing) = healing_info else { return };
+    let Some(healer) = healing_publisher else {
+        return;
+    };
+
+    let did_owned = did.to_owned();
+    let pk = *public_key;
+    let stale = healing.stale_layer;
+    let raw_value = healing.raw_value;
+    let raw_sig = healing.raw_signature;
+    let fresher_seq = healing.fresher_seq;
+
+    info!(
+        did = %did_owned,
+        fresher_seq = fresher_seq,
+        stale_layer = ?stale,
+        "triggering protocol-level healing (§3.10.7)"
+    );
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = healer
+            .heal(&did_owned, &stale, &raw_value, &raw_sig, fresher_seq, &pk)
+            .await
+        {
+            warn!(
+                did = %did_owned,
+                stale_layer = ?stale,
+                error = %e,
+                "protocol-level healing failed (best-effort, §3.10.7)"
+            );
+        }
+    });
+
+    // Monitor for panics in the healing task (defense in depth).
+    tokio::spawn(async move {
+        if let Err(e) = handle.await
+            && e.is_panic()
+        {
+            warn!("protocol-level healing task panicked: {e}");
+        }
+    });
+}
+
+/// Internal struct holding information needed for protocol-level healing
+/// (§3.10.7, SCP-245).
+struct HealingInfo {
+    /// Which layer had the stale document.
+    stale_layer: StaleLayer,
+    /// The raw BEP44-signed document bytes from the fresher layer.
+    raw_value: Vec<u8>,
+    /// The Ed25519 signature from the fresher layer's BEP44 record.
+    raw_signature: [u8; 64],
+    /// The sequence number of the fresher document.
+    fresher_seq: u64,
+}
+
+/// A validated resolution result bundling the `ResolvedDidDocument` with the
+/// raw BEP44 record data. The raw bytes are retained for protocol-level
+/// healing (§3.10.7, SCP-245) — when both layers return valid documents
+/// with different sequence numbers, the resolver republishes the fresher
+/// document's raw bytes to the stale layer.
+struct ValidatedRecord {
+    /// The verified and deserialized resolution result.
+    resolved: ResolvedDidDocument,
+    /// The raw BEP44-signed document bytes (pre-deserialization).
+    raw_value: Vec<u8>,
+    /// The Ed25519 signature from the BEP44 record.
+    raw_signature: [u8; 64],
+}
+
 /// Validates a relay resolution result: verifies BEP44 signature, deserializes
-/// document, and wraps in `ResolvedDidDocument`.
+/// document, and wraps in `ValidatedRecord`.
 ///
 /// Network errors and verification failures are logged (not silently swallowed)
 /// and mapped to `None` so that the other layer can still provide a result.
+///
+/// The raw BEP44 bytes and signature are retained in the `ValidatedRecord` for
+/// protocol-level healing (§3.10.7, SCP-245).
 fn validate_relay_result(
     result: Result<Option<RelayRecord>, IdentityError>,
     did: &str,
     public_key: &[u8; 32],
-) -> Option<ResolvedDidDocument> {
+) -> Option<ValidatedRecord> {
     let record = match result {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -377,12 +703,16 @@ fn validate_relay_result(
         &record.signature,
         record.seq,
     ) {
-        Ok(document) => Some(ResolvedDidDocument {
-            document,
-            seq: record.seq,
-            source: ResolutionSource::ScpRelay {
-                relay_url: record.relay_url,
+        Ok(document) => Some(ValidatedRecord {
+            resolved: ResolvedDidDocument {
+                document,
+                seq: record.seq,
+                source: ResolutionSource::ScpRelay {
+                    relay_url: record.relay_url,
+                },
             },
+            raw_value: record.value,
+            raw_signature: record.signature,
         }),
         Err(e) => {
             warn!(did, error = %e, "relay record verification failed");
@@ -392,15 +722,18 @@ fn validate_relay_result(
 }
 
 /// Validates a DHT resolution result: verifies BEP44 signature, deserializes
-/// document, and wraps in `ResolvedDidDocument`.
+/// document, and wraps in `ValidatedRecord`.
 ///
 /// Network errors and verification failures are logged (not silently swallowed)
 /// and mapped to `None` so that the other layer can still provide a result.
+///
+/// The raw BEP44 bytes and signature are retained in the `ValidatedRecord` for
+/// protocol-level healing (§3.10.7, SCP-245).
 fn validate_dht_result(
     result: Result<Option<DhtRecord>, IdentityError>,
     did: &str,
     public_key: &[u8; 32],
-) -> Option<ResolvedDidDocument> {
+) -> Option<ValidatedRecord> {
     let record = match result {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -420,10 +753,14 @@ fn validate_dht_result(
         &record.signature,
         record.seq,
     ) {
-        Ok(document) => Some(ResolvedDidDocument {
-            document,
-            seq: record.seq,
-            source: ResolutionSource::MainlineDht,
+        Ok(document) => Some(ValidatedRecord {
+            resolved: ResolvedDidDocument {
+                document,
+                seq: record.seq,
+                source: ResolutionSource::MainlineDht,
+            },
+            raw_value: record.value,
+            raw_signature: record.signature,
         }),
         Err(e) => {
             warn!(did, error = %e, "DHT record verification failed");
@@ -1155,5 +1492,439 @@ mod tests {
 
         let resolved = result.expect("seq=7 > cached seq=5, should be accepted");
         assert_eq!(resolved.seq, 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol-level healing tests (§3.10.7, SCP-245)
+    // -----------------------------------------------------------------------
+
+    /// A recorded healing call for test assertions.
+    #[derive(Debug, Clone)]
+    struct RecordedHeal {
+        did: String,
+        stale_layer: StaleLayer,
+        document_bytes: Vec<u8>,
+        signature: [u8; 64],
+        seq: u64,
+        public_key: [u8; 32],
+    }
+
+    /// In-memory healing publisher for testing (SCP-245).
+    ///
+    /// Records all `heal()` calls so tests can inspect which layer was healed,
+    /// the document bytes, and the sequence number.
+    struct InMemoryHealingPublisher {
+        heals: Mutex<Vec<RecordedHeal>>,
+        should_fail: Mutex<bool>,
+    }
+
+    impl InMemoryHealingPublisher {
+        fn new() -> Self {
+            Self {
+                heals: Mutex::new(Vec::new()),
+                should_fail: Mutex::new(false),
+            }
+        }
+
+        async fn recorded_heals(&self) -> Vec<RecordedHeal> {
+            let heals = self.heals.lock().await;
+            heals.clone()
+        }
+
+        async fn set_should_fail(&self, fail: bool) {
+            let mut should_fail = self.should_fail.lock().await;
+            *should_fail = fail;
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl HealingPublisher for InMemoryHealingPublisher {
+        fn heal(
+            &self,
+            did: &str,
+            stale_layer: &StaleLayer,
+            document_bytes: &[u8],
+            signature: &[u8; 64],
+            seq: u64,
+            public_key: &[u8; 32],
+        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+            let stale_layer = stale_layer.clone();
+            async move {
+                let fail = *self.should_fail.lock().await;
+                if fail {
+                    return Err(IdentityError::RelayPublishFailed(
+                        "healing publish failed (test)".to_owned(),
+                    ));
+                }
+                let mut heals = self.heals.lock().await;
+                heals.push(RecordedHeal {
+                    did: did.to_owned(),
+                    stale_layer,
+                    document_bytes: document_bytes.to_vec(),
+                    signature: *signature,
+                    seq,
+                    public_key: *public_key,
+                });
+                drop(heals);
+                Ok(())
+            }
+        }
+    }
+
+    /// Creates a `DualLayerResolver` with healing enabled.
+    fn make_resolver_with_healing<R: MultiRelayQuerier, D: DhtClient>(
+        relay: Arc<R>,
+        dht: Arc<D>,
+        cache: Arc<DidCache<Arc<TestClock>>>,
+        healer: Arc<InMemoryHealingPublisher>,
+    ) -> DualLayerResolver<R, D, Arc<TestClock>, InMemoryHealingPublisher> {
+        DualLayerResolver::with_healing(
+            relay,
+            dht,
+            cache,
+            vec!["wss://bootstrap.example.com/scp/v1".to_owned()],
+            healer,
+        )
+    }
+
+    #[tokio::test]
+    async fn healing_triggered_when_relay_stale_dht_fresher() {
+        // Relay returns seq=1, DHT returns seq=5. The resolver should trigger
+        // healing to republish the DHT's seq=5 document to the relay layer.
+        let (signing_key, did, _) = make_test_identity();
+        let public_key = signing_key.verifying_key();
+
+        // Relay: seq=1 (stale).
+        let doc_v1 = DidDocument::new(&did, public_key.as_bytes(), &[2u8; 32], &[3u8; 32]);
+        let (value_v1, sig_v1) = sign_document(&signing_key, &doc_v1, 1);
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value: value_v1,
+                    signature: sig_v1,
+                    seq: 1,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        // DHT: seq=5 (fresher).
+        let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
+        let (value_v5, sig_v5) = sign_document(&signing_key, &doc_v5, 5);
+
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &sig_v5, &value_v5, 5)
+            .await
+            .unwrap();
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        let healer = Arc::new(InMemoryHealingPublisher::new());
+        let resolver =
+            make_resolver_with_healing(relay, dht, Arc::clone(&cache), Arc::clone(&healer));
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        // DHT's seq=5 should win.
+        let resolved = result.expect("should resolve successfully");
+        assert_eq!(resolved.seq, 5);
+        assert_eq!(resolved.source, ResolutionSource::MainlineDht);
+
+        // Give the spawned healing task time to complete.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify healing was triggered: DHT doc republished to relay layer.
+        let heals = healer.recorded_heals().await;
+        assert_eq!(heals.len(), 1, "exactly one healing call expected");
+        assert!(matches!(heals[0].stale_layer, StaleLayer::Relay { .. }));
+        assert_eq!(heals[0].seq, 5);
+        assert_eq!(heals[0].did, did);
+        assert_eq!(heals[0].public_key, *public_key.as_bytes());
+        // The raw document bytes should be the DHT's fresher document.
+        assert_eq!(heals[0].document_bytes, value_v5);
+        assert_eq!(heals[0].signature, sig_v5);
+    }
+
+    #[tokio::test]
+    async fn healing_triggered_when_dht_stale_relay_fresher() {
+        // Relay returns seq=5, DHT returns seq=1. The resolver should trigger
+        // healing to republish the relay's seq=5 document to the DHT layer.
+        let (signing_key, did, _) = make_test_identity();
+        let public_key = signing_key.verifying_key();
+
+        // Relay: seq=5 (fresher).
+        let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
+        let (value_v5, sig_v5) = sign_document(&signing_key, &doc_v5, 5);
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value: value_v5.clone(),
+                    signature: sig_v5,
+                    seq: 5,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        // DHT: seq=1 (stale).
+        let doc_v1 = DidDocument::new(&did, public_key.as_bytes(), &[2u8; 32], &[3u8; 32]);
+        let (value_v1, sig_v1) = sign_document(&signing_key, &doc_v1, 1);
+
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &sig_v1, &value_v1, 1)
+            .await
+            .unwrap();
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        let healer = Arc::new(InMemoryHealingPublisher::new());
+        let resolver =
+            make_resolver_with_healing(relay, dht, Arc::clone(&cache), Arc::clone(&healer));
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        // Relay's seq=5 should win.
+        let resolved = result.expect("should resolve successfully");
+        assert_eq!(resolved.seq, 5);
+        assert_eq!(
+            resolved.source,
+            ResolutionSource::ScpRelay {
+                relay_url: "wss://relay1.example.com/scp/v1".to_owned()
+            }
+        );
+
+        // Give the spawned healing task time to complete.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify healing was triggered: relay doc republished to DHT layer.
+        let heals = healer.recorded_heals().await;
+        assert_eq!(heals.len(), 1, "exactly one healing call expected");
+        assert_eq!(heals[0].stale_layer, StaleLayer::Dht);
+        assert_eq!(heals[0].seq, 5);
+        assert_eq!(heals[0].did, did);
+        assert_eq!(heals[0].public_key, *public_key.as_bytes());
+        // The raw document bytes should be the relay's fresher document.
+        assert_eq!(heals[0].document_bytes, value_v5);
+        assert_eq!(heals[0].signature, sig_v5);
+    }
+
+    #[tokio::test]
+    async fn healing_not_triggered_when_seqs_equal() {
+        // Both layers return seq=3. No healing should be triggered.
+        let (signing_key, did, doc) = make_test_identity();
+        let (value, signature) = sign_document(&signing_key, &doc, 3);
+        let public_key = signing_key.verifying_key();
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value: value.clone(),
+                    signature,
+                    seq: 3,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &signature, &value, 3)
+            .await
+            .unwrap();
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        let healer = Arc::new(InMemoryHealingPublisher::new());
+        let resolver =
+            make_resolver_with_healing(relay, dht, Arc::clone(&cache), Arc::clone(&healer));
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        let resolved = result.expect("should resolve");
+        assert_eq!(resolved.seq, 3);
+
+        // Give time for any healing task to complete (there should be none).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let heals = healer.recorded_heals().await;
+        assert!(
+            heals.is_empty(),
+            "no healing should be triggered when seqs are equal"
+        );
+    }
+
+    #[tokio::test]
+    async fn healing_not_triggered_when_only_one_layer_responds() {
+        // Only relay responds (DHT has no document). No healing.
+        let (signing_key, did, doc) = make_test_identity();
+        let (value, signature) = sign_document(&signing_key, &doc, 3);
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value,
+                    signature,
+                    seq: 3,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        // DHT has no document stored.
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        let healer = Arc::new(InMemoryHealingPublisher::new());
+        let resolver =
+            make_resolver_with_healing(relay, dht, Arc::clone(&cache), Arc::clone(&healer));
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        let resolved = result.expect("should resolve from relay");
+        assert_eq!(resolved.seq, 3);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let heals = healer.recorded_heals().await;
+        assert!(heals.is_empty(), "no healing when only one layer responds");
+    }
+
+    #[tokio::test]
+    async fn healing_failure_does_not_affect_resolve_result() {
+        // Relay returns seq=1, DHT returns seq=5. Healing publisher is
+        // configured to fail. The resolve result should still be the fresher
+        // document (seq=5), and the healing failure should be silently
+        // absorbed (logged but not propagated).
+        let (signing_key, did, _) = make_test_identity();
+        let public_key = signing_key.verifying_key();
+
+        // Relay: seq=1 (stale).
+        let doc_v1 = DidDocument::new(&did, public_key.as_bytes(), &[2u8; 32], &[3u8; 32]);
+        let (value_v1, sig_v1) = sign_document(&signing_key, &doc_v1, 1);
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value: value_v1,
+                    signature: sig_v1,
+                    seq: 1,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        // DHT: seq=5 (fresher).
+        let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
+        let (value_v5, sig_v5) = sign_document(&signing_key, &doc_v5, 5);
+
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &sig_v5, &value_v5, 5)
+            .await
+            .unwrap();
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+
+        // Healing publisher configured to FAIL.
+        let healer = Arc::new(InMemoryHealingPublisher::new());
+        healer.set_should_fail(true).await;
+
+        let resolver =
+            make_resolver_with_healing(relay, dht, Arc::clone(&cache), Arc::clone(&healer));
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        // The resolve result must NOT be affected by healing failure.
+        let resolved = result.expect("should resolve despite healing failure");
+        assert_eq!(resolved.seq, 5);
+        assert_eq!(resolved.source, ResolutionSource::MainlineDht);
+
+        // Give the spawned healing task time to attempt and fail.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The healing publisher was called but failed. No recorded heals
+        // (the failure path does not record the call).
+        let heals = healer.recorded_heals().await;
+        assert!(heals.is_empty(), "healing failure should not record a heal");
+    }
+
+    #[tokio::test]
+    async fn healing_not_triggered_without_healing_publisher() {
+        // Use the regular make_resolver (no healing). Seq divergence should
+        // NOT trigger healing (no publisher configured).
+        let (signing_key, did, _) = make_test_identity();
+        let public_key = signing_key.verifying_key();
+
+        let doc_v1 = DidDocument::new(&did, public_key.as_bytes(), &[2u8; 32], &[3u8; 32]);
+        let (value_v1, sig_v1) = sign_document(&signing_key, &doc_v1, 1);
+
+        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        relay
+            .insert(
+                &did,
+                RelayRecord {
+                    value: value_v1,
+                    signature: sig_v1,
+                    seq: 1,
+                    relay_url: "wss://relay1.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
+        let (value_v5, sig_v5) = sign_document(&signing_key, &doc_v5, 5);
+
+        let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
+        dht.inner
+            .publish(public_key.as_bytes(), &sig_v5, &value_v5, 5)
+            .await
+            .unwrap();
+
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        let resolver = make_resolver(relay, dht, cache);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), resolver.resolve(&did))
+            .await
+            .expect("should not timeout")
+            .unwrap();
+
+        // Should still resolve correctly.
+        let resolved = result.expect("should resolve");
+        assert_eq!(resolved.seq, 5);
+
+        // No healing publisher configured — nothing should happen (no panic).
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

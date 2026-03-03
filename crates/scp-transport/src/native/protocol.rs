@@ -249,8 +249,14 @@ pub enum ClientMessage {
     /// its routing ID so the bridge can forward traffic for that ID over
     /// this connection.
     ///
-    /// The relay responds with `OK` on success or `ERR` if bridging is
-    /// not supported or the registration limit is exceeded.
+    /// # Authentication (SCP-247)
+    ///
+    /// The message MUST include an Ed25519 signature proving the sender
+    /// owns the DID that maps to the claimed `routing_id`. The signature
+    /// covers `routing_id || timestamp` (concatenated bytes, big-endian
+    /// timestamp). The relay responds with `OK` on success, `ERR` with
+    /// code `BRIDGE_AUTH_FAILED` (4034) if authentication fails, or `ERR`
+    /// with `BRIDGE_NOT_SUPPORTED` (4030) if bridging is not enabled.
     #[serde(rename = "BRIDGE_REGISTER")]
     BridgeRegister {
         /// Client-assigned request ID.
@@ -260,6 +266,21 @@ pub enum ClientMessage {
         /// The routing ID to register for bridge proxying (32 bytes).
         #[serde(with = "serde_bytes")]
         routing_id: [u8; 32],
+
+        /// Ed25519 public key of the DID owner (32 bytes). The relay derives
+        /// the DID string from this key and verifies that
+        /// `SHA-256("scp:did:" || did_string) == routing_id` (SCP-247).
+        #[serde(with = "serde_bytes")]
+        public_key: [u8; 32],
+
+        /// Ed25519 signature over `routing_id || timestamp` (64 bytes).
+        /// Proves the sender holds the private key for `public_key` (SCP-247).
+        #[serde(with = "serde_bytes")]
+        signature: [u8; 64],
+
+        /// Unix timestamp (seconds since epoch) included in the signed payload.
+        /// Must be within 60 seconds of the server's current time (SCP-247).
+        timestamp: u64,
 
         /// URL hint for reaching this self-hosted relay directly (used for
         /// informational purposes and potential future direct connection).
@@ -727,6 +748,9 @@ mod tests {
         let msg = ClientMessage::BridgeRegister {
             ref_id: Some("br-1".to_string()),
             routing_id: [0xBB; 32],
+            public_key: [0xAA; 32],
+            signature: [0xCC; 64],
+            timestamp: 1_700_000_000,
             target_relay_hint: Some("ws://192.168.1.1:9000/scp/v1".to_string()),
         };
 
@@ -740,6 +764,9 @@ mod tests {
         let msg = ClientMessage::BridgeRegister {
             ref_id: None,
             routing_id: [0xCC; 32],
+            public_key: [0xDD; 32],
+            signature: [0xEE; 64],
+            timestamp: 1_700_000_000,
             target_relay_hint: None,
         };
 
@@ -1164,6 +1191,9 @@ mod tests {
         let msg = ClientMessage::BridgeRegister {
             ref_id: Some("br-1".to_string()),
             routing_id: [0x00; 32],
+            public_key: [0xAA; 32],
+            signature: [0xBB; 64],
+            timestamp: 1_700_000_000,
             target_relay_hint: Some("ws://192.168.1.1:9000/scp/v1".to_string()),
         };
         assert!(msg.validate().is_ok());
@@ -1174,6 +1204,9 @@ mod tests {
         let msg = ClientMessage::BridgeRegister {
             ref_id: Some("x".repeat(MAX_REF_ID_LEN + 1)),
             routing_id: [0x00; 32],
+            public_key: [0xAA; 32],
+            signature: [0xBB; 64],
+            timestamp: 1_700_000_000,
             target_relay_hint: None,
         };
         let err = msg.validate().unwrap_err();
@@ -1291,6 +1324,9 @@ mod tests {
                 ClientMessage::BridgeRegister {
                     ref_id: None,
                     routing_id: [0; 32],
+                    public_key: [0; 32],
+                    signature: [0; 64],
+                    timestamp: 0,
                     target_relay_hint: None,
                 },
                 "BRIDGE_REGISTER",
