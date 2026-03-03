@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// The error message is intentionally generic to avoid exposing raw system
 /// error details.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClockError;
 
 impl std::fmt::Display for ClockError {

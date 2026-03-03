@@ -280,6 +280,10 @@ scp/
 │   │   ├── web/               # WebCrypto, ServiceWorker, IndexedDB (Phase 7+, location TBD)
 │   │   └── testing/           # In-memory implementations for tests
 │   │
+│   ├── scp-primitives/        # Pure utility crate — zero SCP dependencies (Layer 0)
+│   │   ├── time.rs            # Clock helpers (now_secs, now_millis) with ClockError
+│   │   └── crypto.rs          # Ed25519 signature verification helpers
+│   │
 │   ├── scp-mcp/               # MCP adapter
 │   │   ├── server.rs          # SCP agent as MCP server
 │   │   └── client.rs          # SCP agent as MCP client (consuming tools)
@@ -665,17 +669,19 @@ This section documents the layered dependency graph, every replaceable subsystem
 Dependencies flow strictly upward. No crate may depend on a crate at the same or higher layer. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
-Layer 0 ─ scp-platform              Platform abstraction traits (KeyCustody, Storage,
-           │                          DeviceAttestation, Push). Zero protocol knowledge.
+Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashing helpers).
+           │  scp-platform            Platform abstraction traits (KeyCustody, Storage,
+           │                          DeviceAttestation, Push).
+           │                          Zero SCP dependencies — leaf crates.
            │
 Layer 1 ─ scp-core                  Protocol engine. Contexts, identity, trust, discovery,
            │                          crypto, event log, store, envelope, provenance, economy.
-           │                          Depends only on scp-platform.
+           │                          Depends on scp-primitives and scp-platform.
            │
 Layer 2 ─ scp-transport             Transport abstraction + native relay adapter.
            │  scp-mcp                 MCP bridge (server + client).
            │  scp-media               Media session handling.
-           │                          All depend on scp-core (and transitively scp-platform).
+           │                          All depend on scp-core (and transitively layers 0).
            │
 Layer 3 ─ scp-node                  Application deployment node (AGPL boundary).
            │  scp-ffi                 Language bindings (PyO3, UniFFI, wasm-bindgen, napi-rs).
@@ -688,7 +694,7 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Never imported by production code.
 ```
 
-**Planned extractions:** The identity module (`scp-core/identity/`) and event log module (`scp-core/event_log/`) are candidates for extraction into standalone Layer 1 crates (`scp-identity`, `scp-event-log`). Both are already architecturally independent — identity depends only on scp-platform, and event log has no protocol dependencies. Extraction is tracked in issues #93 and #94.
+**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates (issues #93, #94). `scp-primitives` was extracted as a Layer 0 leaf crate housing shared utilities (time, encoding, hashing) that previously lived in `scp-core` (issue #233).
 
 #### 2.5.2 Replaceable Subsystems
 
