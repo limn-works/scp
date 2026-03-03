@@ -1,10 +1,14 @@
 //! Economic governance storage operations for `ProtocolStore`.
 //!
-//! Implements adapter credential storage following the key convention from
-//! spec section 17.3:
+//! Implements adapter credential storage, economic policy, payment receipts,
+//! and spending UCAN persistence following the key convention from spec
+//! section 17.3:
 //!
 //! ```text
 //! identity/{did}/adapter_credentials/{adapter_id}
+//! context/{context_id}/economic_policy
+//! context/{context_id}/payment_receipt/{receipt_id_hex}
+//! context/{context_id}/spending_ucan/{token_id}
 //! ```
 //!
 //! Adapter credentials are identity-private state (spec section 19.2.5).
@@ -12,6 +16,7 @@
 //! or relays.
 //!
 //! See spec sections 17.3, 17.4, and 19.2.5.
+//! See SCP-PERSIST-015 and SCP-PERSIST-016.
 
 use scp_platform::traits::Storage;
 
@@ -40,6 +45,54 @@ fn adapter_credential_key(did: &DID, adapter_id: &str) -> Result<String, super::
 fn adapter_credentials_prefix(did: &DID) -> Result<String, super::StoreError> {
     let did_str = super::sanitize_key_component(did.as_ref())?;
     Ok(format!("identity/{did_str}/adapter_credentials/"))
+}
+
+/// Builds the storage key for an economic policy within a context.
+///
+/// Format: `context/{context_id}/economic_policy`
+/// See spec section 17.3.
+fn economic_policy_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/economic_policy"))
+}
+
+/// Builds the storage key for a payment receipt within a context.
+///
+/// Format: `context/{context_id}/payment_receipt/{receipt_id_hex}`
+/// See spec section 17.3.
+fn payment_receipt_key(
+    context_id: &str,
+    receipt_id: &[u8; 32],
+) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let receipt_hex = hex::encode(receipt_id);
+    Ok(format!("context/{ctx}/payment_receipt/{receipt_hex}"))
+}
+
+/// Builds the prefix for listing all payment receipts in a context.
+///
+/// Format: `context/{context_id}/payment_receipt/`
+fn payment_receipts_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/payment_receipt/"))
+}
+
+/// Builds the storage key for a spending UCAN within a context.
+///
+/// Format: `context/{context_id}/spending_ucan/{token_id}`
+/// See spec section 17.3.
+fn spending_ucan_key(context_id: &str, token_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let tok = super::sanitize_key_component(token_id)?;
+    Ok(format!("context/{ctx}/spending_ucan/{tok}"))
+}
+
+/// Builds the prefix for listing all spending UCANs in a context.
+///
+/// Format: `context/{context_id}/spending_ucan/`
+fn spending_ucans_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/spending_ucan/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +168,175 @@ impl<S: Storage> ProtocolStore<S> {
         let key = adapter_credential_key(did, adapter_id)?;
         self.storage.delete(&key).await?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Economic policy methods (SCP-PERSIST-015)
+    // -----------------------------------------------------------------------
+
+    /// Stores an economic policy for a context.
+    ///
+    /// Serializes the policy bytes under
+    /// `context/{context_id}/economic_policy` wrapped in a
+    /// `StoredValue` version envelope.
+    ///
+    /// See spec section 17.4. See SCP-PERSIST-015.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_economic_policy(
+        &self,
+        context_id: &str,
+        policy: &[u8],
+    ) -> Result<(), StoreError> {
+        let key = economic_policy_key(context_id)?;
+        self.store_value(&key, &policy.to_vec()).await
+    }
+
+    /// Loads an economic policy for a context.
+    ///
+    /// Returns `None` if no economic policy exists for the given context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_economic_policy(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = economic_policy_key(context_id)?;
+        self.load_value(&key).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Payment receipt methods (SCP-PERSIST-015)
+    // -----------------------------------------------------------------------
+
+    /// Stores a payment receipt within a context.
+    ///
+    /// Serializes the receipt bytes under
+    /// `context/{context_id}/payment_receipt/{receipt_id_hex}` wrapped
+    /// in a `StoredValue` version envelope.
+    ///
+    /// See spec section 17.4. See SCP-PERSIST-015.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_payment_receipt(
+        &self,
+        context_id: &str,
+        receipt_id: &[u8; 32],
+        receipt: &[u8],
+    ) -> Result<(), StoreError> {
+        let key = payment_receipt_key(context_id, receipt_id)?;
+        self.store_value(&key, &receipt.to_vec()).await
+    }
+
+    /// Loads a payment receipt from a context.
+    ///
+    /// Returns `None` if no receipt with the given ID exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_payment_receipt(
+        &self,
+        context_id: &str,
+        receipt_id: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = payment_receipt_key(context_id, receipt_id)?;
+        self.load_value(&key).await
+    }
+
+    /// Lists all payment receipt IDs for a context.
+    ///
+    /// Returns the 32-byte receipt IDs extracted from stored keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
+    pub async fn list_payment_receipts(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
+        let prefix = payment_receipts_prefix(context_id)?;
+        let keys = self.storage.list_keys(&prefix).await?;
+        let mut receipt_ids = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(hex_str) = key.strip_prefix(&prefix)
+                && let Ok(bytes) = hex::decode(hex_str)
+                && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
+            {
+                receipt_ids.push(arr);
+            }
+        }
+        Ok(receipt_ids)
+    }
+
+    // -----------------------------------------------------------------------
+    // Spending UCAN methods (SCP-PERSIST-016)
+    // -----------------------------------------------------------------------
+
+    /// Stores a spending UCAN within a context.
+    ///
+    /// Serializes the UCAN bytes under
+    /// `context/{context_id}/spending_ucan/{token_id}` wrapped in a
+    /// `StoredValue` version envelope.
+    ///
+    /// See spec section 17.4. See SCP-PERSIST-016.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_spending_ucan(
+        &self,
+        context_id: &str,
+        token_id: &str,
+        ucan: &[u8],
+    ) -> Result<(), StoreError> {
+        let key = spending_ucan_key(context_id, token_id)?;
+        self.store_value(&key, &ucan.to_vec()).await
+    }
+
+    /// Loads a spending UCAN from a context.
+    ///
+    /// Returns `None` if no UCAN with the given token ID exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_spending_ucan(
+        &self,
+        context_id: &str,
+        token_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = spending_ucan_key(context_id, token_id)?;
+        self.load_value(&key).await
+    }
+
+    /// Lists all spending UCAN token IDs for a context.
+    ///
+    /// Returns token ID strings extracted from stored keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
+    pub async fn list_spending_ucans(&self, context_id: &str) -> Result<Vec<String>, StoreError> {
+        let prefix = spending_ucans_prefix(context_id)?;
+        let keys = self.storage.list_keys(&prefix).await?;
+        let token_ids: Vec<String> = keys
+            .into_iter()
+            .filter_map(|key| key.strip_prefix(&prefix).map(String::from))
+            .collect();
+        Ok(token_ids)
     }
 }
 
@@ -401,8 +623,159 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Economic policy (SCP-PERSIST-015)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_and_load_economic_policy_roundtrip() {
+        let store = make_store();
+        let policy = b"economic-policy-bytes".to_vec();
+
+        store.store_economic_policy("ctx-1", &policy).await.unwrap();
+        let loaded = store.load_economic_policy("ctx-1").await.unwrap();
+        assert_eq!(loaded, Some(policy));
+    }
+
+    #[tokio::test]
+    async fn load_economic_policy_returns_none_for_missing() {
+        let store = make_store();
+        let loaded = store.load_economic_policy("ctx-1").await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Payment receipts (SCP-PERSIST-015)
+    // -------------------------------------------------------------------
+
+    fn test_receipt_id(byte: u8) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        id
+    }
+
+    #[tokio::test]
+    async fn store_and_load_payment_receipt_roundtrip() {
+        let store = make_store();
+        let receipt_id = test_receipt_id(0xAA);
+        let receipt = b"receipt-data".to_vec();
+
+        store
+            .store_payment_receipt("ctx-1", &receipt_id, &receipt)
+            .await
+            .unwrap();
+        let loaded = store
+            .load_payment_receipt("ctx-1", &receipt_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(receipt));
+    }
+
+    #[tokio::test]
+    async fn load_payment_receipt_returns_none_for_missing() {
+        let store = make_store();
+        let receipt_id = test_receipt_id(0xBB);
+        let loaded = store
+            .load_payment_receipt("ctx-1", &receipt_id)
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_payment_receipts_returns_all_ids() {
+        let store = make_store();
+        let id_a = test_receipt_id(0xAA);
+        let id_b = test_receipt_id(0xBB);
+
+        store
+            .store_payment_receipt("ctx-1", &id_a, b"receipt-a")
+            .await
+            .unwrap();
+        store
+            .store_payment_receipt("ctx-1", &id_b, b"receipt-b")
+            .await
+            .unwrap();
+
+        let ids = store.list_payment_receipts("ctx-1").await.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&id_a));
+        assert!(ids.contains(&id_b));
+    }
+
+    // -------------------------------------------------------------------
+    // Spending UCANs (SCP-PERSIST-016)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_and_load_spending_ucan_roundtrip() {
+        let store = make_store();
+        let ucan = b"spending-ucan-body".to_vec();
+
+        store
+            .store_spending_ucan("ctx-1", "spend-tok-1", &ucan)
+            .await
+            .unwrap();
+        let loaded = store
+            .load_spending_ucan("ctx-1", "spend-tok-1")
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(ucan));
+    }
+
+    #[tokio::test]
+    async fn load_spending_ucan_returns_none_for_missing() {
+        let store = make_store();
+        let loaded = store
+            .load_spending_ucan("ctx-1", "nonexistent")
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_spending_ucans_returns_all_token_ids() {
+        let store = make_store();
+
+        store
+            .store_spending_ucan("ctx-1", "spend-aaa", b"ucan-a")
+            .await
+            .unwrap();
+        store
+            .store_spending_ucan("ctx-1", "spend-bbb", b"ucan-b")
+            .await
+            .unwrap();
+
+        let ids = store.list_spending_ucans("ctx-1").await.unwrap();
+        assert_eq!(ids, vec!["spend-aaa", "spend-bbb"]);
+    }
+
+    // -------------------------------------------------------------------
     // Key convention tests
     // -------------------------------------------------------------------
+
+    #[test]
+    fn economic_policy_key_follows_convention() {
+        assert_eq!(
+            economic_policy_key("ctx-123").unwrap(),
+            "context/ctx-123/economic_policy"
+        );
+    }
+
+    #[test]
+    fn payment_receipt_key_follows_convention() {
+        let id = test_receipt_id(0xFF);
+        let key = payment_receipt_key("ctx-123", &id).unwrap();
+        assert!(key.starts_with("context/ctx-123/payment_receipt/"));
+        assert!(key.contains("ff"));
+    }
+
+    #[test]
+    fn spending_ucan_key_follows_convention() {
+        assert_eq!(
+            spending_ucan_key("ctx-123", "tok-abc").unwrap(),
+            "context/ctx-123/spending_ucan/tok-abc"
+        );
+    }
 
     #[test]
     fn adapter_credential_key_follows_convention() {
