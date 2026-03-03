@@ -776,9 +776,9 @@ pub fn verify_cross_checkpoint_with_leaves(
 
     if older.event_count > newer.event_count {
         return CrossCheckpointResult::OrderViolation;
-        // newer_leaves.len() bounded by event log size; fits in u64.
     }
 
+    // newer_leaves.len() bounded by event log size; fits in u64.
     #[allow(clippy::cast_possible_truncation)]
     let newer_count = newer_leaves.len() as u64;
     if newer_count != newer.event_count {
