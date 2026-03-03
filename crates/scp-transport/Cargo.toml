@@ -6,6 +6,10 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+sqlite-blob = ["dep:rusqlite"]
+redb-blob = ["dep:redb"]
+
 [dependencies]
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
@@ -25,10 +29,13 @@ tokio-util = { workspace = true }
 lru = { workspace = true }
 rand = { workspace = true }
 subtle = "2"
+rusqlite = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core" }
 ed25519-dalek = { workspace = true }
+scp-testing = { path = "../scp-testing" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
