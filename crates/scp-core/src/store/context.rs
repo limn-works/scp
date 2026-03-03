@@ -227,7 +227,12 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn delete_context(&self, context_id: &str) -> Result<u64, StoreError> {
         let prefix = context_prefix(context_id)?;
-        Ok(self.storage.delete_prefix(&prefix).await?)
+        let mut deleted = self.storage.delete_prefix(&prefix).await?;
+        // Also delete MLS state which lives under a separate namespace.
+        let ctx = super::sanitize_key_component(context_id)?;
+        let mls_prefix = format!("mls/{ctx}/");
+        deleted += self.storage.delete_prefix(&mls_prefix).await?;
+        Ok(deleted)
     }
 
     /// Lists all active context IDs.
@@ -248,6 +253,33 @@ impl<S: Storage> ProtocolStore<S> {
                 let rest = key.strip_prefix("context/")?;
                 if rest.ends_with("/state") {
                     let id = rest.strip_suffix("/state")?;
+                    Some(id.to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(context_ids)
+    }
+
+    /// Lists all context IDs that have a persisted full snapshot.
+    ///
+    /// Scans for keys matching `context/*/full_snapshot` by listing all keys
+    /// with the `context/` prefix and filtering for snapshot keys. Used by
+    /// [`ProtocolStorePersistence`] to implement
+    /// [`ContextPersistence::list_persisted_contexts`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
+    pub async fn list_persisted_snapshot_contexts(&self) -> Result<Vec<ContextId>, StoreError> {
+        let keys = self.storage.list_keys("context/").await?;
+        let context_ids: Vec<ContextId> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let rest = key.strip_prefix("context/")?;
+                if rest.ends_with("/full_snapshot") {
+                    let id = rest.strip_suffix("/full_snapshot")?;
                     Some(id.to_owned())
                 } else {
                     None
@@ -719,7 +751,8 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.clone();
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async { store.list_active_contexts().await })
+            tokio::runtime::Handle::current()
+                .block_on(async { store.list_persisted_snapshot_contexts().await })
         })?;
         Ok(result)
     }
@@ -1431,14 +1464,20 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let bridge = super::ProtocolStorePersistence::new(store.clone());
 
-        // Store a context state (needed for list_active_contexts which
-        // looks for `context/{id}/state` keys).
+        // Use store_full_snapshot (the actual persistence path used by
+        // ContextManager) instead of store_context_state, so
+        // list_persisted_contexts finds contexts via full_snapshot keys.
+        let mut snap1 = make_context_snapshot();
+        snap1.context_id = "ctx-list-1".to_owned();
         store
-            .store_context_state("ctx-list-1", b"state")
+            .store_full_snapshot("ctx-list-1", &snap1)
             .await
             .unwrap();
+
+        let mut snap2 = make_context_snapshot();
+        snap2.context_id = "ctx-list-2".to_owned();
         store
-            .store_context_state("ctx-list-2", b"state")
+            .store_full_snapshot("ctx-list-2", &snap2)
             .await
             .unwrap();
 

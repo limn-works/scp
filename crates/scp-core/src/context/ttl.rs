@@ -601,6 +601,9 @@ pub struct TtlTimer {
     pub(crate) task: Option<JoinHandle<()>>,
     /// Cancellation signal.
     pub(crate) cancel: Arc<Notify>,
+    /// Absolute deadline as Unix epoch seconds, set when timer is spawned.
+    /// Used to compute remaining TTL for persistence snapshots.
+    pub(crate) deadline_unix_secs: Option<u64>,
 }
 
 impl TtlTimer {
@@ -610,6 +613,7 @@ impl TtlTimer {
         Self {
             task: None,
             cancel: Arc::new(Notify::new()),
+            deadline_unix_secs: None,
         }
     }
 
@@ -621,6 +625,13 @@ impl TtlTimer {
         crypto: Arc<dyn ContextCryptoProvider>,
         event_log: Arc<dyn ContextEventLogProvider>,
     ) {
+        // Record absolute deadline for persistence snapshots.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.deadline_unix_secs = Some(now_secs + duration.as_secs());
+
         let cancel = self.cancel.clone();
 
         let task = tokio::spawn(async move {
@@ -645,6 +656,23 @@ impl TtlTimer {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.task.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    /// Returns the remaining TTL seconds, computed from the stored deadline.
+    ///
+    /// Returns `None` if the timer is not active or has no deadline.
+    /// Returns `0` if the deadline has already passed.
+    #[must_use]
+    pub fn remaining_secs(&self) -> Option<u64> {
+        if !self.is_active() {
+            return None;
+        }
+        let deadline = self.deadline_unix_secs?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Some(deadline.saturating_sub(now_secs))
     }
 }
 

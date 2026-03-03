@@ -17,6 +17,8 @@ use std::sync::Mutex;
 
 use rusqlite::Connection;
 
+use zeroize::Zeroize;
+
 use crate::error::PlatformError;
 use crate::traits::Storage;
 
@@ -66,15 +68,20 @@ impl SqliteStorage {
         // The hex key format is `PRAGMA key = "x'<hex>'"` — a double-quoted
         // string containing `x'...'`. This tells SQLCipher to interpret the
         // value as raw hex key bytes rather than a passphrase.
-        let hex_key = hex::encode(key);
-        conn.execute_batch(&format!(
+        let mut hex_key = hex::encode(key);
+        let mut pragma_sql = format!(
             "PRAGMA key = \"x'{hex_key}'\";\n\
              PRAGMA cipher_page_size = 4096;\n\
              PRAGMA kdf_iter = 256000;\n\
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\
              PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;"
-        ))
-        .map_err(|e| {
+        );
+        // Zeroize the hex key immediately — it's now embedded in pragma_sql.
+        hex_key.zeroize();
+        let result = conn.execute_batch(&pragma_sql);
+        // Zeroize the SQL string containing the key material.
+        pragma_sql.zeroize();
+        result.map_err(|e| {
             PlatformError::StorageError(format!("failed to set SQLCipher pragmas: {e}"))
         })?;
 

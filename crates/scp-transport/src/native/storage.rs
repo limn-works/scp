@@ -256,17 +256,27 @@ impl BlobStorage for InMemoryBlobStorage {
             expires_at,
         };
 
-        {
+        let old_routing_id = {
             let mut blobs = self.blobs.write().await;
             // Enforce capacity limit. Overwrites of existing blob_ids are allowed.
             if blobs.len() >= self.max_blobs && !blobs.contains_key(&blob_id) {
                 return Err(StorageError::StorageFull);
             }
-            blobs.insert(blob_id, entry);
-        }
+            let old = blobs.insert(blob_id, entry);
+            old.map(|e| e.stored_blob.routing_id)
+        };
 
         {
             let mut index = self.routing_index.write().await;
+            // Remove stale routing index entry on overwrite.
+            if let Some(old_rid) = old_routing_id
+                && let Some(ids) = index.get_mut(&old_rid)
+            {
+                ids.retain(|id| id != &blob_id);
+                if ids.is_empty() {
+                    index.remove(&old_rid);
+                }
+            }
             index.entry(routing_id).or_default().push(blob_id);
         }
 

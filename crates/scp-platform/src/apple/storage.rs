@@ -35,6 +35,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::Mutex;
 
+use zeroize::Zeroize;
+
 use crate::error::PlatformError;
 use crate::traits::Storage;
 
@@ -93,15 +95,18 @@ impl AppleStorage {
         })?;
 
         // Apply `SQLCipher` encryption key as hex-encoded PRAGMA.
-        let hex_key = hex::encode(encryption_key);
-        conn.execute_batch(&format!(
+        let mut hex_key = hex::encode(encryption_key);
+        let mut pragma_sql = format!(
             "PRAGMA key = \"x'{hex_key}'\";\
              PRAGMA cipher_page_size = 4096;\
              PRAGMA kdf_iter = 256000;\
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\
              PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;"
-        ))
-        .map_err(|e| {
+        );
+        hex_key.zeroize();
+        let result = conn.execute_batch(&pragma_sql);
+        pragma_sql.zeroize();
+        result.map_err(|e| {
             PlatformError::StorageError(format!("failed to apply `SQLCipher` pragmas: {e}"))
         })?;
 
@@ -157,9 +162,9 @@ fn prefix_successor(prefix: &str) -> Option<String> {
         *last += 1;
     }
 
-    // The result may not be valid UTF-8 in edge cases, but `SQLite` TEXT
-    // comparison is byte-based so this is correct for range queries.
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    // If incrementing the byte produced invalid UTF-8 (e.g., multi-byte
+    // sequence edge case), fall back to unbounded scan.
+    String::from_utf8(bytes).ok()
 }
 
 // The trait uses RPITIT (`-> impl Future<...> + Send`), so each impl method

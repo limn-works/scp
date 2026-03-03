@@ -104,10 +104,22 @@ pub struct MlsStorageBridge<S: Storage> {
 impl<S: Storage> MlsStorageBridge<S> {
     /// Creates a new `MlsStorageBridge` for the given context.
     ///
-    /// All storage keys will be prefixed with `mls/{context_id}/`.
-    #[must_use]
-    pub const fn new(store: Arc<ProtocolStore<S>>, context_id: ContextId) -> Self {
-        Self { store, context_id }
+    /// Validates the `context_id` via [`sanitize_key_component`] to prevent
+    /// namespace escape in storage keys. All storage keys will be prefixed
+    /// with `mls/{context_id}/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsStorageBridgeError::Serialization`] if the context ID
+    /// contains forbidden characters (`/`, `\`, `..`, or null bytes).
+    pub fn new(
+        store: Arc<ProtocolStore<S>>,
+        context_id: ContextId,
+    ) -> Result<Self, MlsStorageBridgeError> {
+        crate::store::sanitize_key_component(&context_id).map_err(|e| {
+            MlsStorageBridgeError::Serialization(format!("invalid context_id for MLS storage: {e}"))
+        })?;
+        Ok(Self { store, context_id })
     }
 
     /// Returns the context ID this bridge is scoped to.
@@ -929,12 +941,19 @@ pub struct ScpMlsProvider<S: Storage> {
 
 impl<S: Storage> ScpMlsProvider<S> {
     /// Creates a new `ScpMlsProvider` with the given store and context ID.
-    #[must_use]
-    pub fn new(store: Arc<ProtocolStore<S>>, context_id: ContextId) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsStorageBridgeError`] if the context ID contains
+    /// forbidden characters.
+    pub fn new(
+        store: Arc<ProtocolStore<S>>,
+        context_id: ContextId,
+    ) -> Result<Self, MlsStorageBridgeError> {
+        Ok(Self {
             crypto: RustCrypto::default(),
-            storage: MlsStorageBridge::new(store, context_id),
-        }
+            storage: MlsStorageBridge::new(store, context_id)?,
+        })
     }
 
     /// Returns a reference to the underlying [`MlsStorageBridge`].
@@ -1024,7 +1043,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_state_roundtrip_via_bridge() {
         let store = test_store();
-        let bridge = MlsStorageBridge::new(store, "ctx-roundtrip".to_owned());
+        let bridge = MlsStorageBridge::new(store, "ctx-roundtrip".to_owned()).unwrap();
 
         let group_id = test_group_id(b"test-group-1");
         let state_value = MlsGroupState::Operational;
@@ -1043,7 +1062,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_state_returns_none_for_missing() {
         let store = test_store();
-        let bridge = MlsStorageBridge::new(store, "ctx-empty".to_owned());
+        let bridge = MlsStorageBridge::new(store, "ctx-empty".to_owned()).unwrap();
 
         let group_id = test_group_id(b"nonexistent");
         let loaded: Option<MlsGroupState> =
@@ -1054,7 +1073,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_state_overwrite() {
         let store = test_store();
-        let bridge = MlsStorageBridge::new(store, "ctx-overwrite".to_owned());
+        let bridge = MlsStorageBridge::new(store, "ctx-overwrite".to_owned()).unwrap();
 
         let group_id = test_group_id(b"group-ow");
 
@@ -1076,7 +1095,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_and_read_group_value_roundtrip() {
         let store = test_store();
-        let bridge = MlsStorageBridge::new(store, "ctx-internal".to_owned());
+        let bridge = MlsStorageBridge::new(store, "ctx-internal".to_owned()).unwrap();
 
         let key_data = "some-group-id";
         let value_data = vec![1u8, 2, 3, 4, 5];
@@ -1091,7 +1110,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_group_value_returns_none_for_missing() {
         let store = test_store();
-        let bridge = MlsStorageBridge::new(store, "ctx-miss".to_owned());
+        let bridge = MlsStorageBridge::new(store, "ctx-miss".to_owned()).unwrap();
 
         let loaded: Option<Vec<u8>> = bridge
             .read_group_value::<&str, Vec<u8>>("missing_label", &"no-key")
@@ -1102,7 +1121,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_append_and_read() {
         let store = test_store();
-        let bridge = MlsStorageBridge::new(store, "ctx-list".to_owned());
+        let bridge = MlsStorageBridge::new(store, "ctx-list".to_owned()).unwrap();
 
         let group_key = "list-group";
         bridge
@@ -1119,7 +1138,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_remove_item() {
         let store = test_store();
-        let bridge = MlsStorageBridge::new(store, "ctx-rm".to_owned());
+        let bridge = MlsStorageBridge::new(store, "ctx-rm".to_owned()).unwrap();
 
         let group_key = "rm-group";
         bridge
@@ -1146,8 +1165,8 @@ mod tests {
     async fn context_isolation_between_bridges() {
         let store = test_store();
 
-        let bridge_a = MlsStorageBridge::new(Arc::clone(&store), "ctx-alpha".to_owned());
-        let bridge_b = MlsStorageBridge::new(Arc::clone(&store), "ctx-beta".to_owned());
+        let bridge_a = MlsStorageBridge::new(Arc::clone(&store), "ctx-alpha".to_owned()).unwrap();
+        let bridge_b = MlsStorageBridge::new(Arc::clone(&store), "ctx-beta".to_owned()).unwrap();
 
         let group_id = test_group_id(b"shared-group-id");
 
@@ -1177,8 +1196,8 @@ mod tests {
     async fn context_isolation_internal_values() {
         let store = test_store();
 
-        let bridge_a = MlsStorageBridge::new(Arc::clone(&store), "ctx-iso-1".to_owned());
-        let bridge_b = MlsStorageBridge::new(Arc::clone(&store), "ctx-iso-2".to_owned());
+        let bridge_a = MlsStorageBridge::new(Arc::clone(&store), "ctx-iso-1".to_owned()).unwrap();
+        let bridge_b = MlsStorageBridge::new(Arc::clone(&store), "ctx-iso-2".to_owned()).unwrap();
 
         let key = "same-key";
 
@@ -1195,7 +1214,7 @@ mod tests {
         assert_eq!(loaded_b, Some(vec![40, 50, 60]));
 
         // A third context sees no data
-        let bridge_c = MlsStorageBridge::new(Arc::clone(&store), "ctx-iso-3".to_owned());
+        let bridge_c = MlsStorageBridge::new(Arc::clone(&store), "ctx-iso-3".to_owned()).unwrap();
         let loaded_c: Option<Vec<u8>> = bridge_c.read_group_value("data", &key).unwrap();
         assert!(loaded_c.is_none());
     }
@@ -1204,8 +1223,8 @@ mod tests {
     async fn context_isolation_delete_does_not_affect_other() {
         let store = test_store();
 
-        let bridge_a = MlsStorageBridge::new(Arc::clone(&store), "ctx-del-1".to_owned());
-        let bridge_b = MlsStorageBridge::new(Arc::clone(&store), "ctx-del-2".to_owned());
+        let bridge_a = MlsStorageBridge::new(Arc::clone(&store), "ctx-del-1".to_owned()).unwrap();
+        let bridge_b = MlsStorageBridge::new(Arc::clone(&store), "ctx-del-2".to_owned()).unwrap();
 
         let group_id = test_group_id(b"gid-del");
 
@@ -1235,7 +1254,8 @@ mod tests {
 
         // Phase 1: Write state and drop the bridge
         {
-            let bridge = MlsStorageBridge::new(Arc::clone(&store), "ctx-restart".to_owned());
+            let bridge =
+                MlsStorageBridge::new(Arc::clone(&store), "ctx-restart".to_owned()).unwrap();
             StorageProvider::write_group_state(&bridge, &group_id, &MlsGroupState::Operational)
                 .unwrap();
             // bridge is dropped here
@@ -1243,7 +1263,8 @@ mod tests {
 
         // Phase 2: Recreate bridge with same store + context_id
         {
-            let bridge = MlsStorageBridge::new(Arc::clone(&store), "ctx-restart".to_owned());
+            let bridge =
+                MlsStorageBridge::new(Arc::clone(&store), "ctx-restart".to_owned()).unwrap();
             let loaded: Option<MlsGroupState> =
                 StorageProvider::group_state(&bridge, &group_id).unwrap();
             assert!(loaded.is_some());
@@ -1261,7 +1282,7 @@ mod tests {
 
         // Phase 1: Write multiple value types via internal helpers
         {
-            let bridge = MlsStorageBridge::new(Arc::clone(&store), context_id.clone());
+            let bridge = MlsStorageBridge::new(Arc::clone(&store), context_id.clone()).unwrap();
             bridge
                 .write_group_value("state", &"key1", &vec![1u8, 2, 3])
                 .unwrap();
@@ -1275,7 +1296,7 @@ mod tests {
 
         // Phase 2: Recreate and verify all state types
         {
-            let bridge = MlsStorageBridge::new(Arc::clone(&store), context_id);
+            let bridge = MlsStorageBridge::new(Arc::clone(&store), context_id).unwrap();
             let state: Option<Vec<u8>> = bridge.read_group_value("state", &"key1").unwrap();
             let config: Option<Vec<u8>> = bridge.read_group_value("config", &"key1").unwrap();
             let nodes: Vec<Vec<u8>> = bridge.read_list("nodes", &"key1").unwrap();
@@ -1291,7 +1312,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn keys_use_correct_mls_prefix() {
         let store = test_store();
-        let bridge = MlsStorageBridge::new(Arc::clone(&store), "ctx-prefix".to_owned());
+        let bridge = MlsStorageBridge::new(Arc::clone(&store), "ctx-prefix".to_owned()).unwrap();
 
         bridge
             .write_group_value("group_state", &"gid", &vec![1u8])
@@ -1308,7 +1329,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provider_exposes_storage_and_crypto() {
         let store = test_store();
-        let provider = ScpMlsProvider::new(store, "ctx-provider".to_owned());
+        let provider = ScpMlsProvider::new(store, "ctx-provider".to_owned()).unwrap();
 
         // Verify the provider implements the required traits
         let _storage = provider.storage();
@@ -1319,7 +1340,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provider_group_state_roundtrip() {
         let store = test_store();
-        let provider = ScpMlsProvider::new(store, "ctx-prov-rt".to_owned());
+        let provider = ScpMlsProvider::new(store, "ctx-prov-rt".to_owned()).unwrap();
 
         let group_id = test_group_id(b"prov-group");
         StorageProvider::write_group_state(
