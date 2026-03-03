@@ -52,8 +52,12 @@ async fn main() {
     let rid = RoutingId::new(routing_id);
 
     eprintln!("Connecting to {url}...");
-    // Examples use DhtResolved source for local ws:// relay URLs.
-    // Production code should use the actual discovery source.
+    // Semantic note: DhtResolved is used here because it is the only
+    // RelayUrlSource variant that permits ws:// (plaintext) connections
+    // (§10.12.6). The URL was not actually resolved via DHT -- it is a
+    // CLI-provided local address. This is acceptable for examples targeting
+    // local development relays. Production code must use the variant matching
+    // the actual discovery path (Explicit, WellKnown, PeerDiscovered, etc.).
     let sourced = SourcedRelayUrl {
         url: url.to_owned(),
         source: RelayUrlSource::DhtResolved,

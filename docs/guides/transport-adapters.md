@@ -375,12 +375,16 @@ let manager = TransportManager::new(Box::new(adapter));
 
 ```rust
 use scp_transport::{TransportConfig, TransportManager};
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 let config = TransportConfig::default();
 let mut manager = TransportManager::with_config(&config);
 
-// Register the native relay adapter
-let native = NativeRelayAdapter::connect("wss://relay.example.com/scp/v1").await?;
+// Register the native relay adapter (connect_sourced validates ws:// vs wss:// per §10.12.6)
+let native = NativeRelayAdapter::connect_sourced(&SourcedRelayUrl {
+    url: "wss://relay.example.com/scp/v1".to_owned(),
+    source: RelayUrlSource::Explicit,
+}).await?;
 manager.add_adapter(Box::new(native));
 
 // Register an MQTT adapter for IoT devices
