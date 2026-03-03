@@ -56,6 +56,7 @@ lru = "0.12"
 dashmap = "6"
 hex = "0.4"
 axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 subtle = "2"
