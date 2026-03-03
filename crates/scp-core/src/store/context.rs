@@ -123,6 +123,15 @@ fn broadcast_block_key(context_id: &str, author_did: &str) -> Result<String, sup
     Ok(format!("context/{ctx}/broadcast_block/{author}"))
 }
 
+/// Builds the storage key for a full context snapshot.
+///
+/// Format: `context/{context_id}/full_snapshot`
+/// See spec section 17.4 and SCP-PERSIST-021.
+fn full_snapshot_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/full_snapshot"))
+}
+
 /// Builds the prefix for all keys belonging to a context.
 ///
 /// Format: `context/{context_id}/`
@@ -245,6 +254,56 @@ impl<S: Storage> ProtocolStore<S> {
             })
             .collect();
         Ok(context_ids)
+    }
+
+    /// Stores a full context snapshot for persistence across restarts.
+    ///
+    /// Serializes the [`ContextSnapshot`] under
+    /// `context/{context_id}/full_snapshot` as a single atomic blob.
+    /// Buffer zeroization is applied after write (defense-in-depth for
+    /// any key material that may be referenced in the snapshot).
+    ///
+    /// See SCP-PERSIST-021 and spec section 17.4.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_full_snapshot(
+        &self,
+        context_id: &str,
+        snapshot: &crate::context::manager::ContextSnapshot,
+    ) -> Result<(), StoreError> {
+        let key = full_snapshot_key(context_id)?;
+        let mut bytes = Self::serialize(snapshot)?;
+        let result = self
+            .storage
+            .store(&key, &bytes)
+            .await
+            .map_err(StoreError::Storage);
+        // Defense-in-depth: clear serialized data from memory.
+        bytes.zeroize();
+        result
+    }
+
+    /// Loads a full context snapshot from persistence.
+    ///
+    /// Returns `None` if no full snapshot has been persisted for the given
+    /// context. The caller should use the returned [`ContextSnapshot`] to
+    /// reconstruct `PerContextState` during restart.
+    ///
+    /// See SCP-PERSIST-021 and spec section 17.4.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_full_snapshot(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<crate::context::manager::ContextSnapshot>, StoreError> {
+        let key = full_snapshot_key(context_id)?;
+        self.load_value(&key).await
     }
 
     /// Stores a membership record for a DID within a context.
@@ -548,6 +607,120 @@ impl<S: Storage> ProtocolStore<S> {
     ) -> Result<Option<HashSet<String>>, StoreError> {
         let key = broadcast_block_key(context_id, author_did)?;
         self.load_value(&key).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProtocolStorePersistence — canonical bridge (SCP-PERSIST-021)
+// ---------------------------------------------------------------------------
+
+/// Canonical bridge from `ContextPersistence` (dyn-compatible) to the generic
+/// `ProtocolStore<S>`.
+///
+/// Wraps `Arc<ProtocolStore<S>>` and implements the synchronous
+/// [`ContextPersistence`] trait by blocking on the async `ProtocolStore`
+/// methods via `tokio::task::block_in_place` + `Handle::block_on`. This is
+/// safe because `ContextPersistence` methods are always called from within a
+/// tokio runtime context (after the `contexts` mutex is released).
+///
+/// See SCP-PERSIST-021 and spec section 17.4.
+pub struct ProtocolStorePersistence<S: Storage> {
+    store: std::sync::Arc<ProtocolStore<S>>,
+}
+
+impl<S: Storage> ProtocolStorePersistence<S> {
+    /// Creates a new bridge wrapping the given `ProtocolStore`.
+    pub const fn new(store: std::sync::Arc<ProtocolStore<S>>) -> Self {
+        Self { store }
+    }
+}
+
+impl<S: Storage + 'static> crate::context::manager::ContextPersistence
+    for ProtocolStorePersistence<S>
+{
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &crate::context::manager::ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        let snap = snapshot.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { store.store_full_snapshot(&ctx_id, &snap).await })
+        })?;
+        Ok(())
+    }
+
+    fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<crate::context::manager::ContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { store.load_full_snapshot(&ctx_id).await })
+        })?;
+        Ok(result)
+    }
+
+    fn persist_broadcast(
+        &self,
+        context_id: &str,
+        snapshot: &crate::context::broadcast::BroadcastContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        let snap = snapshot.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { store.store_broadcast_state(&ctx_id, &snap).await })
+        })?;
+        Ok(())
+    }
+
+    fn load_broadcast(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<crate::context::broadcast::BroadcastContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { store.load_broadcast_state(&ctx_id).await })
+        })?;
+        Ok(result)
+    }
+
+    fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { store.delete_context(&ctx_id).await })
+        })?;
+        Ok(())
+    }
+
+    fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { store.list_active_contexts().await })
+        })?;
+        Ok(result)
     }
 }
 
@@ -1124,5 +1297,166 @@ mod tests {
             broadcast_state_key("ctx-123").unwrap(),
             "context/ctx-123/broadcast_state"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Full snapshot persistence (SCP-PERSIST-021)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn full_snapshot_key_follows_convention() {
+        assert_eq!(
+            full_snapshot_key("ctx-123").unwrap(),
+            "context/ctx-123/full_snapshot"
+        );
+    }
+
+    fn make_context_snapshot() -> crate::context::manager::ContextSnapshot {
+        use crate::context::membership::MembershipState;
+        use crate::context::roles::ContextRoleState;
+        use crate::context::{ContextParams, ContextState};
+
+        let mut membership = MembershipState::new();
+        membership.add_member("did:dht:z6MkCreator".into(), "admin".into(), vec![]);
+
+        let role_state = ContextRoleState::new(
+            "ctx-snap-1",
+            "did:dht:z6MkCreator",
+            crate::context::roles::CapabilityCeiling::new(std::iter::empty()),
+            vec![],
+        )
+        .unwrap();
+
+        crate::context::manager::ContextSnapshot {
+            context_id: "ctx-snap-1".to_owned(),
+            state: ContextState::Active,
+            context_params: ContextParams::default(),
+            membership,
+            role_state,
+            executed_proposals: std::collections::HashSet::new(),
+            ttl_remaining_secs: Some(300),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_and_load_full_snapshot_roundtrip() {
+        let store = make_store();
+        let snapshot = make_context_snapshot();
+
+        store
+            .store_full_snapshot("ctx-snap-1", &snapshot)
+            .await
+            .unwrap();
+
+        let loaded = store.load_full_snapshot("ctx-snap-1").await.unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.context_id, "ctx-snap-1");
+        assert_eq!(loaded.state, crate::context::ContextState::Active);
+        assert_eq!(loaded.ttl_remaining_secs, Some(300));
+        assert!(loaded.membership.contains("did:dht:z6MkCreator"));
+    }
+
+    #[tokio::test]
+    async fn load_full_snapshot_returns_none_for_missing() {
+        let store = make_store();
+        let loaded = store.load_full_snapshot("nonexistent").await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_context_removes_full_snapshot() {
+        let store = make_store();
+        let snapshot = make_context_snapshot();
+
+        store
+            .store_full_snapshot("ctx-snap-1", &snapshot)
+            .await
+            .unwrap();
+
+        store.delete_context("ctx-snap-1").await.unwrap();
+
+        let loaded = store.load_full_snapshot("ctx-snap-1").await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // ProtocolStorePersistence bridge (SCP-PERSIST-021)
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn protocol_store_persistence_context_roundtrip() {
+        use crate::context::manager::ContextPersistence;
+
+        let store = std::sync::Arc::new(make_store());
+        let bridge = super::ProtocolStorePersistence::new(store);
+
+        let snapshot = make_context_snapshot();
+
+        bridge.persist_context("ctx-bridge-1", &snapshot).unwrap();
+
+        let loaded = bridge.load_context("ctx-bridge-1").unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.context_id, "ctx-snap-1");
+        assert_eq!(loaded.state, crate::context::ContextState::Active);
+        assert_eq!(loaded.ttl_remaining_secs, Some(300));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn protocol_store_persistence_broadcast_roundtrip() {
+        use crate::context::manager::ContextPersistence;
+
+        let store = std::sync::Arc::new(make_store());
+        let bridge = super::ProtocolStorePersistence::new(store);
+
+        let snapshot = make_broadcast_snapshot();
+
+        bridge
+            .persist_broadcast("ctx-bc-bridge", &snapshot)
+            .unwrap();
+
+        let loaded = bridge.load_broadcast("ctx-bc-bridge").unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.context_id, "ctx-broadcast-1");
+        assert_eq!(loaded.subscribers.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn protocol_store_persistence_delete_and_list() {
+        use crate::context::manager::ContextPersistence;
+
+        let store = std::sync::Arc::new(make_store());
+        let bridge = super::ProtocolStorePersistence::new(store.clone());
+
+        // Store a context state (needed for list_active_contexts which
+        // looks for `context/{id}/state` keys).
+        store
+            .store_context_state("ctx-list-1", b"state")
+            .await
+            .unwrap();
+        store
+            .store_context_state("ctx-list-2", b"state")
+            .await
+            .unwrap();
+
+        let listed = bridge.list_persisted_contexts().unwrap();
+        assert_eq!(listed, vec!["ctx-list-1", "ctx-list-2"]);
+
+        bridge.delete_context("ctx-list-1").unwrap();
+
+        let listed = bridge.list_persisted_contexts().unwrap();
+        assert_eq!(listed, vec!["ctx-list-2"]);
+    }
+
+    #[test]
+    fn protocol_store_persistence_is_object_safe() {
+        // Compile-time dyn-compatibility check: verifies that
+        // ProtocolStorePersistence can be used as a trait object.
+        fn assert_object_safe(_: &dyn crate::context::manager::ContextPersistence) {}
+        let store = std::sync::Arc::new(make_store());
+        let bridge = super::ProtocolStorePersistence::new(store);
+        assert_object_safe(&bridge);
     }
 }

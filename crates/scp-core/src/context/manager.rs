@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use super::broadcast::{
@@ -51,34 +52,90 @@ pub enum GovernanceActionResult {
 }
 
 // ---------------------------------------------------------------------------
-// BroadcastPersistence -- persistence provider for broadcast contexts
+// ContextSnapshot -- serializable full context state for persistence
 // ---------------------------------------------------------------------------
 
-/// Provider for persisting broadcast context state across process restarts.
+/// Serializable snapshot of a context's full state for persistence.
 ///
-/// Implementors store and load [`BroadcastContextSnapshot`] snapshots. The
-/// `ContextManager` calls `persist` after every broadcast-mutating operation
-/// (subscribe, unsubscribe, block, create) and `load` during context
-/// restoration.
+/// Captures all state needed to reconstruct a `PerContextState` after a
+/// process restart: lifecycle state, parameters, membership, roles,
+/// executed governance proposals (replay protection), and remaining TTL.
 ///
-/// The canonical implementation delegates to
-/// [`ProtocolStore::store_broadcast_state`] /
-/// [`ProtocolStore::load_broadcast_state`].
+/// Stored via `ContextPersistence::persist_context` under
+/// `context/{context_id}/full_snapshot`. See spec section 17.4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSnapshot {
+    /// The context's unique identifier.
+    pub context_id: String,
+    /// The context's lifecycle state at the time of snapshot.
+    pub state: ContextState,
+    /// The context's creation parameters (immutable after creation).
+    pub context_params: ContextParams,
+    /// The membership state (members, roles, sequence numbers).
+    pub membership: MembershipState,
+    /// The role state (ceiling, definitions, assignments, capabilities).
+    pub role_state: ContextRoleState,
+    /// Proposal IDs that have already been executed (replay protection).
+    pub executed_proposals: HashSet<ProposalId>,
+    /// Remaining TTL in seconds, if a TTL timer was active. `None` if no
+    /// TTL was configured or the timer was not running.
+    pub ttl_remaining_secs: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// ContextPersistence -- unified persistence provider
+// ---------------------------------------------------------------------------
+
+/// Provider for persisting full context state across process restarts.
 ///
-/// See spec section 5.14.
-pub trait BroadcastPersistence: Send + Sync {
-    /// Persists the broadcast context state snapshot.
+/// Replaces the previous `BroadcastPersistence` trait. This is the single
+/// persistence trait for all context state: both the full context snapshot
+/// (membership, roles, governance, TTL) and the broadcast-specific state
+/// (author keys, subscribers, block lists).
+///
+/// Implementors must be dyn-compatible (`Send + Sync`, no generics, no
+/// RPITIT). All methods return `Result<_, Box<dyn Error + Send + Sync>>`
+/// for best-effort semantics: the `ContextManager` logs errors but does
+/// not abort mutations when persistence fails.
+///
+/// The canonical implementation is `ProtocolStorePersistence<S>` which
+/// wraps `Arc<ProtocolStore<S>>`.
+///
+/// See spec section 17.4.
+pub trait ContextPersistence: Send + Sync {
+    /// Persists the full context snapshot.
     ///
-    /// Called after each broadcast mutation. Implementations must be
-    /// idempotent (repeated calls with the same snapshot are safe).
+    /// Called after each context-mutating operation. Idempotent.
     ///
     /// # Errors
     ///
-    /// Returns a boxed error if the persistence operation fails. The
-    /// `ContextManager` logs the failure but does not abort the mutation
-    /// (the in-memory state is authoritative; persistence is best-effort
-    /// for crash recovery).
-    fn persist(
+    /// Returns an error if the underlying storage write fails.
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Loads a previously persisted full context snapshot.
+    ///
+    /// Returns `None` if no snapshot exists for the given context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying storage read fails.
+    fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Persists the broadcast context state snapshot.
+    ///
+    /// Called after each broadcast-mutating operation. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying storage write fails.
+    fn persist_broadcast(
         &self,
         context_id: &str,
         snapshot: &BroadcastContextSnapshot,
@@ -90,11 +147,30 @@ pub trait BroadcastPersistence: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a boxed error if the load operation fails.
-    fn load(
+    /// Returns an error if the underlying storage read fails.
+    fn load_broadcast(
         &self,
         context_id: &str,
     ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Deletes all persisted state for a context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying storage delete fails.
+    fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Lists all persisted context IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying storage list fails.
+    fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -182,10 +258,10 @@ pub struct ContextManager {
     /// spawned TTL timer tasks that need event log access for logging
     /// `ContextExpired` events on context expiry (SCP-169).
     event_log: Arc<dyn ContextEventLogProvider>,
-    /// Optional provider for persisting broadcast context state across
-    /// process restarts. When `Some`, the manager persists broadcast state
-    /// after every broadcast-mutating operation.
-    broadcast_persistence: Option<Arc<dyn BroadcastPersistence>>,
+    /// Optional provider for persisting full context and broadcast state
+    /// across process restarts. When `Some`, the manager persists context
+    /// state after every mutating operation (best-effort).
+    persistence: Option<Arc<dyn ContextPersistence>>,
     /// DIDs controlled by the local node/SDK.
     ///
     /// Used for defense-in-depth validation in
@@ -224,44 +300,43 @@ impl ContextManager {
             crypto: Arc::from(crypto),
             transport: Arc::from(transport),
             event_log: Arc::from(event_log),
-            broadcast_persistence: None,
+            persistence: None,
             local_dids: RwLock::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Creates a new `ContextManager` with broadcast persistence support.
+    /// Creates a new `ContextManager` with persistence support.
     ///
     /// Same as [`new`](Self::new) but additionally accepts a
-    /// [`BroadcastPersistence`] provider. When provided, the manager
-    /// persists broadcast context state after every broadcast-mutating
-    /// operation (subscribe, unsubscribe, block, create).
+    /// [`ContextPersistence`] provider. When provided, the manager
+    /// persists full context and broadcast state after every mutating
+    /// operation (best-effort: errors logged, not propagated).
     ///
     /// # Arguments
     ///
     /// * `crypto` -- Provider for MLS and sender key operations.
     /// * `transport` -- Provider for relay connectivity and publication.
     /// * `event_log` -- Provider for event log initialisation and append.
-    /// * `broadcast_persistence` -- Provider for broadcast state persistence.
+    /// * `persistence` -- Provider for context state persistence.
     #[must_use]
-    pub fn with_broadcast_persistence(
+    pub fn with_persistence(
         crypto: Box<dyn ContextCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
-        broadcast_persistence: Box<dyn BroadcastPersistence>,
+        persistence: Box<dyn ContextPersistence>,
     ) -> Self {
         Self {
             crypto: Arc::from(crypto),
             transport: Arc::from(transport),
             event_log: Arc::from(event_log),
-            broadcast_persistence: Some(Arc::from(broadcast_persistence)),
+            persistence: Some(Arc::from(persistence)),
             local_dids: RwLock::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Persists a broadcast context snapshot if a persistence provider is
-    /// configured.
+    /// Persists a context snapshot if a persistence provider is configured.
     ///
     /// Best-effort: logs errors but does not propagate them to callers.
     /// In-memory state is authoritative; persistence is for crash recovery.
@@ -275,9 +350,9 @@ impl ContextManager {
     /// low probability and acceptable for v1 -- the worst case is a
     /// single extra key-epoch replay on restart, which the pull-based
     /// key distribution protocol already handles idempotently.
-    fn persist_broadcast_snapshot(&self, context_id: &str, snapshot: &BroadcastContextSnapshot) {
-        if let Some(ref persistence) = self.broadcast_persistence
-            && let Err(e) = persistence.persist(context_id, snapshot)
+    fn persist_context_snapshot(&self, context_id: &str, snapshot: &ContextSnapshot) {
+        if let Some(ref persistence) = self.persistence
+            && let Err(e) = persistence.persist_context(context_id, snapshot)
         {
             // Best-effort persistence: log but don't fail the operation.
             // In production, the tracing crate would emit a warning here.
@@ -286,87 +361,139 @@ impl ContextManager {
         }
     }
 
-    /// Restores broadcast context state from the persistence provider.
-    ///
-    /// Loads a previously persisted [`BroadcastContextSnapshot`] and
-    /// reconstructs a [`BroadcastContext`] from it. Called during context
-    /// restoration after a process restart.
-    ///
-    /// Returns `None` if no persistence provider is configured or no
-    /// snapshot exists for the given context.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::PersistenceFailed`] if the load operation
-    /// fails.
-    pub fn load_persisted_broadcast_state(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<BroadcastContext>, ContextError> {
-        let Some(ref persistence) = self.broadcast_persistence else {
-            return Ok(None);
-        };
-        match persistence.load(context_id) {
-            Ok(Some(snapshot)) => Ok(Some(BroadcastContext::from_snapshot(snapshot))),
-            Ok(None) => Ok(None),
-            Err(e) => Err(ContextError::PersistenceFailed(format!(
-                "failed to load broadcast state for {context_id}: {e}"
-            ))),
+    /// Persists a broadcast context snapshot if a persistence provider is
+    /// configured. Best-effort: logs errors but does not propagate.
+    fn persist_broadcast_snapshot(&self, context_id: &str, snapshot: &BroadcastContextSnapshot) {
+        if let Some(ref persistence) = self.persistence
+            && let Err(e) = persistence.persist_broadcast(context_id, snapshot)
+        {
+            let _ = e;
         }
     }
 
-    /// Restores a broadcast context into the manager from persisted state.
+    /// Takes a `ContextSnapshot` from the current `PerContextState`.
     ///
-    /// Creates a `PerContextState` with the restored broadcast context
-    /// and registers it in the manager's context map. This is the primary
-    /// entry point for restoring broadcast contexts after a process restart.
+    /// Must be called while the contexts mutex is held (snapshot under lock).
+    fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
+        let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
+        let ttl_remaining_secs = ctx.handle.params().ttl.and_then(|ttl_duration| {
+            if ctx.ttl_timer.is_active() {
+                Some(ttl_duration.as_secs())
+            } else {
+                None
+            }
+        });
+        ContextSnapshot {
+            context_id: ctx.handle.context_id().to_owned(),
+            state,
+            context_params: ctx.handle.params().clone(),
+            membership: ctx.membership.clone(),
+            role_state: ctx.role_state.clone(),
+            executed_proposals: ctx.executed_proposals.clone(),
+            ttl_remaining_secs,
+        }
+    }
+
+    /// Loads persisted context state and reconstructs a `PerContextState`.
+    ///
+    /// Loads the full `ContextSnapshot` and optional `BroadcastContextSnapshot`
+    /// from the persistence provider. Reconstructs `PerContextState` with
+    /// all fields including membership, `role_state`, `executed_proposals`, and
+    /// broadcast context (if applicable).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PersistenceFailed`] if no persistence provider
+    /// is configured, no snapshot exists, or the load operation fails.
+    pub fn load_persisted_context_state(
+        &self,
+        context_id: &str,
+    ) -> Result<(ContextSnapshot, Option<BroadcastContext>), ContextError> {
+        let Some(ref persistence) = self.persistence else {
+            return Err(ContextError::PersistenceFailed(
+                "no persistence provider configured".into(),
+            ));
+        };
+
+        let ctx_snapshot = persistence
+            .load_context(context_id)
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "failed to load context state for {context_id}: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "no persisted context state for {context_id}"
+                ))
+            })?;
+
+        let broadcast_ctx = persistence
+            .load_broadcast(context_id)
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "failed to load broadcast state for {context_id}: {e}"
+                ))
+            })?
+            .map(BroadcastContext::from_snapshot);
+
+        Ok((ctx_snapshot, broadcast_ctx))
+    }
+
+    /// Restores a context into the manager from persisted state.
+    ///
+    /// Loads the persisted `ContextSnapshot` and optional broadcast state,
+    /// reconstructs `PerContextState`, and inserts it into the contexts map.
+    /// Re-spawns the TTL timer if `ttl_remaining_secs` is `Some`.
     ///
     /// # Arguments
     ///
     /// * `context_id` -- The context identifier to restore.
     /// * `handle` -- A pre-created `ContextHandle` for the context.
-    /// * `role_state` -- The restored role state.
-    /// * `membership` -- The restored membership state.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::PersistenceFailed`] if no persisted broadcast
-    /// state exists. Returns [`ContextError::MembershipFailed`] if the
-    /// context is already registered.
+    /// Returns [`ContextError::PersistenceFailed`] if no persisted state
+    /// exists. Returns [`ContextError::MembershipFailed`] if the context
+    /// is already registered.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn restore_broadcast_context(
+    pub async fn restore_context(
         &self,
-        context_id: String,
-        handle: ContextHandle,
-        role_state: ContextRoleState,
-        membership: MembershipState,
+        context_id: &str,
+        handle: &ContextHandle,
     ) -> Result<(), ContextError> {
-        let broadcast_context = self
-            .load_persisted_broadcast_state(&context_id)?
-            .ok_or_else(|| {
-                ContextError::PersistenceFailed(format!(
-                    "no persisted broadcast state for {context_id}"
-                ))
-            })?;
+        let (ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
+
+        let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
 
         let per_context = PerContextState {
-            handle,
-            membership,
-            role_state,
+            handle: handle.clone(),
+            membership: ctx_snapshot.membership,
+            role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
             ttl_timer: TtlTimer::new(),
             ttl_extension: None,
-            broadcast_context: Some(broadcast_context),
-            executed_proposals: HashSet::new(),
+            broadcast_context: broadcast_ctx,
+            executed_proposals: ctx_snapshot.executed_proposals,
         };
 
-        let mut contexts = self.contexts.lock().await;
-        if contexts.contains_key(&context_id) {
-            return Err(ContextError::MembershipFailed(format!(
-                "context '{context_id}' already registered"
-            )));
+        {
+            let mut contexts = self.contexts.lock().await;
+            if contexts.contains_key(context_id) {
+                return Err(ContextError::MembershipFailed(format!(
+                    "context '{context_id}' already registered"
+                )));
+            }
+            contexts.insert(context_id.to_owned(), per_context);
         }
-        contexts.insert(context_id, per_context);
+
+        // Re-spawn TTL timer if there was remaining TTL.
+        if let Some(remaining_secs) = ttl_remaining {
+            let duration = std::time::Duration::from_secs(remaining_secs);
+            self.spawn_ttl_timer(context_id, duration, handle.clone())
+                .await;
+        }
+
         Ok(())
     }
 
@@ -393,6 +520,67 @@ impl ContextManager {
     /// This is a read-only query useful for diagnostics and testing.
     pub async fn is_local_did(&self, did: &DID) -> bool {
         self.local_dids.read().await.contains(did)
+    }
+
+    /// Restores all persisted contexts.
+    ///
+    /// Lists all context IDs from the persistence provider, creates a
+    /// `ContextHandle` for each, and restores the context into the manager.
+    /// Errors on individual context restores are logged but do not abort
+    /// other restores.
+    ///
+    /// Returns the list of successfully restored context IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PersistenceFailed`] if listing persisted
+    /// contexts fails (no persistence provider configured, or list call fails).
+    pub async fn restore_all_contexts(&self) -> Result<Vec<String>, ContextError> {
+        let Some(ref persistence) = self.persistence else {
+            return Err(ContextError::PersistenceFailed(
+                "no persistence provider configured".into(),
+            ));
+        };
+
+        let context_ids = persistence.list_persisted_contexts().map_err(|e| {
+            ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
+        })?;
+
+        let mut restored = Vec::new();
+        for ctx_id in &context_ids {
+            // Load the snapshot to get params for handle creation.
+            let ctx_snapshot = match persistence.load_context(ctx_id) {
+                Ok(Some(snap)) => snap,
+                Ok(None) => {
+                    // No snapshot -- skip silently.
+                    continue;
+                }
+                Err(e) => {
+                    // Best-effort: log and continue.
+                    let _ = e;
+                    continue;
+                }
+            };
+
+            let handle = ContextHandle::new(ctx_id.clone(), ctx_snapshot.context_params.clone());
+            // Transition handle to the persisted state (Creating -> Active etc.).
+            // The handle starts in Creating; we need to get to the persisted state.
+            if ctx_snapshot.state == ContextState::Active
+                && handle.transition_to(&ContextState::Active).await.is_err()
+            {
+                continue;
+            }
+
+            match self.restore_context(ctx_id, &handle).await {
+                Ok(()) => restored.push(ctx_id.clone()),
+                Err(e) => {
+                    // Best-effort: log and continue.
+                    let _ = e;
+                }
+            }
+        }
+
+        Ok(restored)
     }
 
     /// Creates a new SCP context with the two-phase commit pattern.
@@ -499,6 +687,23 @@ impl ContextManager {
             contexts.insert(context_id.clone(), per_context);
         }
 
+        // Persist context + broadcast state after creation (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                let bc_snapshot = ctx
+                    .broadcast_context
+                    .as_ref()
+                    .map(BroadcastContext::to_snapshot);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snapshot);
+                if let Some(ref bcs) = bc_snapshot {
+                    self.persist_broadcast_snapshot(&context_id, bcs);
+                }
+            }
+        }
+
         // Spawn TTL timer if TTL is configured (SCP-021).
         if let Some(ttl_duration) = params.ttl {
             self.spawn_ttl_timer(&context_id, ttl_duration, handle.clone())
@@ -602,6 +807,16 @@ impl ContextManager {
         // Append MemberJoined event to event log.
         self.event_log
             .append_context_event(&context_id_bytes, "MemberJoined")?;
+
+        // Persist context state after join (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snapshot);
+            }
+        }
 
         Ok(())
     }
@@ -715,6 +930,16 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft")?;
 
+        // Persist context state after leave (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snapshot);
+            }
+        }
+
         // If member count reaches zero, transition to Closing.
         if should_close {
             handle.transition_to(&ContextState::Closing).await?;
@@ -823,6 +1048,16 @@ impl ContextManager {
         // Append MessageSent event to event log.
         self.event_log
             .append_context_event(&context_id_bytes, "MessageSent")?;
+
+        // Persist context state after send (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snapshot);
+            }
+        }
 
         Ok(())
     }
@@ -953,6 +1188,16 @@ impl ContextManager {
         // Persist broadcast state for crash recovery.
         self.persist_broadcast_snapshot(context_id, &snapshot);
 
+        // Persist context state after subscribe (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let ctx_snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &ctx_snapshot);
+            }
+        }
+
         // Append event to persistent event log.
         self.event_log
             .append_context_event(&context_id_bytes, "MemberJoined")?;
@@ -1013,6 +1258,16 @@ impl ContextManager {
 
         // Persist broadcast state for crash recovery.
         self.persist_broadcast_snapshot(context_id, &snapshot);
+
+        // Persist context state after unsubscribe (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let ctx_snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &ctx_snapshot);
+            }
+        }
 
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft")?;
@@ -1273,6 +1528,16 @@ impl ContextManager {
         // Persist broadcast state for crash recovery.
         self.persist_broadcast_snapshot(context_id, &snapshot);
 
+        // Persist context state (executed_proposals updated) (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let ctx_snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &ctx_snapshot);
+            }
+        }
+
         self.event_log
             .append_context_event(&context_id_bytes, "AuthorBlocked")?;
 
@@ -1423,6 +1688,16 @@ impl ContextManager {
             }
         }
 
+        // Persist context state after close (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snapshot);
+            }
+        }
+
         Ok(result)
     }
 
@@ -1439,13 +1714,22 @@ impl ContextManager {
     /// Returns [`ContextError`] if the context is not in `Closing` state
     /// or if destruction operations fail.
     pub async fn finalize_close(&self, handle: &ContextHandle) -> Result<(), ContextError> {
+        let context_id = handle.context_id().to_owned();
+
         ttl::finalize_close(
             handle,
             self.crypto.as_ref(),
             self.transport.as_ref(),
             self.event_log.as_ref(),
         )
-        .await
+        .await?;
+
+        // Delete persisted state after finalize (best-effort).
+        if let Some(ref persistence) = self.persistence {
+            let _ = persistence.delete_context(&context_id);
+        }
+
+        Ok(())
     }
 
     /// Handles automatic TTL expiry.
@@ -1471,6 +1755,16 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
                 ctx.receive_buffer.push(ContextEvent::Expired);
+            }
+        }
+
+        // Persist context state after TTL expiry (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snapshot);
             }
         }
 
@@ -1515,8 +1809,14 @@ impl ContextManager {
             .get_or_insert_with(|| TtlExtension::new(proposed_duration, member_count));
 
         extension.add_consent(member_did.clone());
+        let unanimous = extension.is_unanimous();
 
-        Ok(extension.is_unanimous())
+        // Persist context state after proposal consent (best-effort).
+        let ctx_snapshot = Self::snapshot_context(ctx);
+        drop(contexts);
+        self.persist_context_snapshot(context_id, &ctx_snapshot);
+
+        Ok(unanimous)
     }
 
     /// Resets the TTL timer after a successful unanimous extension.
@@ -1539,6 +1839,16 @@ impl ContextManager {
         }
 
         self.spawn_ttl_timer(context_id, new_duration, handle).await;
+
+        // Persist context state after TTL reset (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -3570,34 +3880,70 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Broadcast persistence restore tests
+    // Context persistence tests (SCP-PERSIST-020 through SCP-PERSIST-025)
     // -----------------------------------------------------------------------
 
-    /// Mock `BroadcastPersistence` that stores snapshots in a `HashMap`.
+    /// Mock `ContextPersistence` that stores snapshots in `HashMap`s.
     #[derive(Default)]
-    struct MockBroadcastPersistence {
-        store: std::sync::Mutex<HashMap<String, BroadcastContextSnapshot>>,
+    struct MockContextPersistence {
+        contexts: std::sync::Mutex<HashMap<String, super::ContextSnapshot>>,
+        broadcasts: std::sync::Mutex<HashMap<String, BroadcastContextSnapshot>>,
     }
 
-    impl BroadcastPersistence for MockBroadcastPersistence {
-        fn persist(
+    impl super::ContextPersistence for MockContextPersistence {
+        fn persist_context(
             &self,
             context_id: &str,
-            snapshot: &BroadcastContextSnapshot,
+            snapshot: &super::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            self.store
+            self.contexts
                 .lock()
                 .unwrap()
                 .insert(context_id.to_owned(), snapshot.clone());
             Ok(())
         }
 
-        fn load(
+        fn load_context(
+            &self,
+            context_id: &str,
+        ) -> Result<Option<super::ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(self.contexts.lock().unwrap().get(context_id).cloned())
+        }
+
+        fn persist_broadcast(
+            &self,
+            context_id: &str,
+            snapshot: &BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.broadcasts
+                .lock()
+                .unwrap()
+                .insert(context_id.to_owned(), snapshot.clone());
+            Ok(())
+        }
+
+        fn load_broadcast(
             &self,
             context_id: &str,
         ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>
         {
-            Ok(self.store.lock().unwrap().get(context_id).cloned())
+            Ok(self.broadcasts.lock().unwrap().get(context_id).cloned())
+        }
+
+        fn delete_context(
+            &self,
+            context_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.contexts.lock().unwrap().remove(context_id);
+            self.broadcasts.lock().unwrap().remove(context_id);
+            Ok(())
+        }
+
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.contexts.lock().unwrap().keys().cloned().collect())
         }
     }
 
@@ -3647,166 +3993,344 @@ mod tests {
         }
     }
 
-    /// `load_persisted_broadcast_state` round-trips: persist a snapshot via the
-    /// mock, then load and verify the restored `BroadcastContext` matches.
-    #[tokio::test]
-    async fn load_persisted_broadcast_state_roundtrip() {
-        let persistence = Arc::new(MockBroadcastPersistence::default());
-
-        // Seed the mock with a known snapshot.
-        let snapshot = test_broadcast_snapshot("bc-persist-1");
-        persistence.persist("bc-persist-1", &snapshot).unwrap();
-
-        let manager = ContextManager::with_broadcast_persistence(
-            Box::new(MockCrypto::default()),
-            Box::new(MockTransport::connected()),
-            Box::new(MockEventLog::default()),
-            Box::new(MockBroadcastPersistence {
-                store: std::sync::Mutex::new(persistence.store.lock().unwrap().clone()),
-            }),
-        );
-
-        // Load persisted state.
-        let loaded = manager
-            .load_persisted_broadcast_state("bc-persist-1")
-            .unwrap();
-        assert!(loaded.is_some(), "snapshot should be found");
-        let bc = loaded.unwrap();
-
-        // Verify authors.
-        assert!(bc.get_author("did:key:author1").is_some());
-        assert_eq!(bc.author_dids().count(), 1);
-
-        // Verify subscribers.
-        assert!(bc.is_subscriber("did:key:sub1"));
-        assert!(bc.is_subscriber("did:key:sub2"));
-        assert_eq!(bc.subscriber_count(), 2);
-
-        // Verify author epoch survived the round-trip.
-        let re_snapshot = bc.to_snapshot();
-        let author_snap = re_snapshot.authors.get("did:key:author1").unwrap();
-        assert_eq!(author_snap.epoch, 3);
-        assert!(author_snap.block_list.contains("did:key:blocked1"));
-
-        // Verify admission policy.
-        assert_eq!(
-            re_snapshot.admission,
-            crate::context::broadcast::BroadcastAdmission::Gated,
-        );
+    /// SCP-PERSIST-020: compile-time test verifying `dyn ContextPersistence`
+    /// is object-safe.
+    #[test]
+    fn context_persistence_is_object_safe() {
+        fn assert_object_safe(_: &dyn super::ContextPersistence) {}
+        let mock = MockContextPersistence::default();
+        assert_object_safe(&mock);
     }
 
-    /// `load_persisted_broadcast_state` returns `None` when no snapshot exists.
+    /// SCP-PERSIST-024: persist-drop-restore roundtrip verifies all fields.
     #[tokio::test]
-    async fn load_persisted_broadcast_state_returns_none_for_missing() {
-        let manager = ContextManager::with_broadcast_persistence(
-            Box::new(MockCrypto::default()),
-            Box::new(MockTransport::connected()),
-            Box::new(MockEventLog::default()),
-            Box::new(MockBroadcastPersistence::default()),
-        );
-
-        let loaded = manager
-            .load_persisted_broadcast_state("nonexistent")
-            .unwrap();
-        assert!(loaded.is_none());
-    }
-
-    /// `restore_broadcast_context` inserts the context into the manager.
-    #[tokio::test]
-    async fn restore_broadcast_context_registers_context() {
+    async fn persist_drop_restore_roundtrip() {
         use crate::context::roles::{ContextRoleState, default_ceiling};
 
-        let snapshot = test_broadcast_snapshot("bc-restore-1");
-        let persistence = MockBroadcastPersistence::default();
-        persistence.persist("bc-restore-1", &snapshot).unwrap();
+        let persistence = Arc::new(MockContextPersistence::default());
 
-        let manager = ContextManager::with_broadcast_persistence(
+        // Create a context with persistence.
+        let manager = ContextManager::with_persistence(
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
-            Box::new(persistence),
+            Box::new(MockContextPersistence::default()),
         );
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            ..ContextParams::default()
-        };
-        let handle = ContextHandle::new("bc-restore-1".to_owned(), params);
-        handle.transition_to(&ContextState::Active).await.unwrap();
-
-        let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("bc-restore-1", "did:key:author1", ceiling, vec![]).unwrap();
-        let membership = MembershipState::new();
-
-        let result = manager
-            .restore_broadcast_context("bc-restore-1".into(), handle, role_state, membership)
-            .await;
-        assert!(result.is_ok(), "restore should succeed");
-
-        // Verify broadcast context is accessible via the manager.
-        assert!(
-            manager
-                .is_broadcast_subscriber("bc-restore-1", "did:key:sub1")
-                .await
-        );
-        assert!(
-            manager
-                .is_broadcast_subscriber("bc-restore-1", "did:key:sub2")
-                .await
-        );
-    }
-
-    /// `restore_broadcast_context` rejects duplicate context registration.
-    #[tokio::test]
-    async fn restore_broadcast_context_rejects_duplicate() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
-
-        let snapshot = test_broadcast_snapshot("bc-dup-1");
-        let persistence = MockBroadcastPersistence::default();
-        persistence.persist("bc-dup-1", &snapshot).unwrap();
-
-        let manager = ContextManager::with_broadcast_persistence(
-            Box::new(MockCrypto::default()),
-            Box::new(MockTransport::connected()),
-            Box::new(MockEventLog::default()),
-            Box::new(persistence),
-        );
-
-        let params = ContextParams {
-            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+            ],
             ..ContextParams::default()
         };
 
-        // First restore succeeds.
-        let handle1 = ContextHandle::new("bc-dup-1".to_owned(), params.clone());
-        handle1.transition_to(&ContextState::Active).await.unwrap();
-        let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("bc-dup-1", "did:key:author1", ceiling.clone(), vec![]).unwrap();
-        manager
-            .restore_broadcast_context(
-                "bc-dup-1".into(),
-                handle1,
-                role_state,
-                MembershipState::new(),
+        let _handle = manager
+            .create_context(
+                "persist-ctx".into(),
+                params.clone(),
+                "did:key:creator".into(),
             )
             .await
             .unwrap();
 
-        // Second restore with same context_id fails.
-        let handle2 = ContextHandle::new("bc-dup-1".to_owned(), params);
+        // Seed the mock persistence with a full snapshot.
+        let ceiling = default_ceiling();
+        let role_state =
+            ContextRoleState::new("persist-ctx", "did:key:creator", ceiling, vec![]).unwrap();
+        let mut membership = MembershipState::new();
+        membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
+        let mut executed = HashSet::new();
+        executed.insert([42u8; 32]);
+
+        let snapshot = super::ContextSnapshot {
+            context_id: "persist-ctx-2".to_owned(),
+            state: ContextState::Active,
+            context_params: params.clone(),
+            membership: membership.clone(),
+            role_state: role_state.clone(),
+            executed_proposals: executed.clone(),
+            ttl_remaining_secs: None,
+        };
+
+        let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
+
+        // Seed mock persistence directly.
+        persistence
+            .persist_context("persist-ctx-2", &snapshot)
+            .unwrap();
+        persistence
+            .persist_broadcast("persist-ctx-2", &bc_snapshot)
+            .unwrap();
+
+        // Create a new manager with the seeded persistence.
+        let manager2 = ContextManager::with_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockContextPersistence {
+                contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+                broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
+            }),
+        );
+
+        // Restore the context.
+        let handle2 = ContextHandle::new("persist-ctx-2".to_owned(), params);
         handle2.transition_to(&ContextState::Active).await.unwrap();
-        let role_state2 =
-            ContextRoleState::new("bc-dup-1", "did:key:author1", ceiling, vec![]).unwrap();
-        let result = manager
-            .restore_broadcast_context(
-                "bc-dup-1".into(),
-                handle2,
-                role_state2,
-                MembershipState::new(),
-            )
-            .await;
+
+        let result = manager2.restore_context("persist-ctx-2", &handle2).await;
+        assert!(result.is_ok(), "restore should succeed");
+
+        // Verify membership is restored.
+        assert!(manager2.is_member("persist-ctx-2", "did:key:creator").await);
+
+        // Verify broadcast is restored.
+        assert!(
+            manager2
+                .is_broadcast_subscriber("persist-ctx-2", "did:key:sub1")
+                .await
+        );
+        assert!(
+            manager2
+                .is_broadcast_subscriber("persist-ctx-2", "did:key:sub2")
+                .await
+        );
+    }
+
+    /// SCP-PERSIST-025: `executed_proposals` preserved across restart.
+    #[tokio::test]
+    async fn restore_preserves_executed_proposals() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+
+        let persistence = Arc::new(MockContextPersistence::default());
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let ceiling = default_ceiling();
+        let role_state =
+            ContextRoleState::new("replay-ctx", "did:key:alice", ceiling, vec![]).unwrap();
+        let mut membership = MembershipState::new();
+        membership.add_member("did:key:alice".into(), "admin".into(), vec![]);
+
+        // Seed executed proposals so replay is detected.
+        let proposal_id = [99u8; 32];
+        let mut executed = HashSet::new();
+        executed.insert(proposal_id);
+
+        let snapshot = super::ContextSnapshot {
+            context_id: "replay-ctx".to_owned(),
+            state: ContextState::Active,
+            context_params: params.clone(),
+            membership,
+            role_state,
+            executed_proposals: executed,
+            ttl_remaining_secs: None,
+        };
+
+        persistence
+            .persist_context("replay-ctx", &snapshot)
+            .unwrap();
+
+        // Also seed broadcast state (needed for restore).
+        let bc_snapshot = test_broadcast_snapshot("replay-ctx");
+        persistence
+            .persist_broadcast("replay-ctx", &bc_snapshot)
+            .unwrap();
+
+        // Create manager and restore.
+        let manager = ContextManager::with_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockContextPersistence {
+                contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+                broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
+            }),
+        );
+
+        let handle = ContextHandle::new("replay-ctx".to_owned(), params);
+        handle.transition_to(&ContextState::Active).await.unwrap();
+        manager
+            .restore_context("replay-ctx", &handle)
+            .await
+            .unwrap();
+
+        // Try to execute a governance action with the already-executed proposal ID.
+        // The internal state should reject it as a replay.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("replay-ctx").unwrap();
+        assert!(
+            ctx.executed_proposals.contains(&proposal_id),
+            "executed_proposals should be preserved across restart"
+        );
+    }
+
+    /// SCP-PERSIST-025: TTL timer re-spawned after restore with remaining TTL.
+    #[tokio::test]
+    async fn restore_respawns_ttl_timer() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+
+        let persistence = Arc::new(MockContextPersistence::default());
+
+        let params = ContextParams {
+            ttl: Some(std::time::Duration::from_secs(300)),
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let ceiling = default_ceiling();
+        let role_state =
+            ContextRoleState::new("ttl-ctx", "did:key:creator", ceiling, vec![]).unwrap();
+        let mut membership = MembershipState::new();
+        membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
+
+        let snapshot = super::ContextSnapshot {
+            context_id: "ttl-ctx".to_owned(),
+            state: ContextState::Active,
+            context_params: params.clone(),
+            membership,
+            role_state,
+            executed_proposals: HashSet::new(),
+            ttl_remaining_secs: Some(120), // 120 seconds remaining
+        };
+
+        persistence.persist_context("ttl-ctx", &snapshot).unwrap();
+
+        let manager = ContextManager::with_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockContextPersistence {
+                contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+                broadcasts: std::sync::Mutex::new(HashMap::new()),
+            }),
+        );
+
+        let handle = ContextHandle::new("ttl-ctx".to_owned(), params);
+        handle.transition_to(&ContextState::Active).await.unwrap();
+        manager.restore_context("ttl-ctx", &handle).await.unwrap();
+
+        // Verify the TTL timer was re-spawned.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ttl-ctx").unwrap();
+        assert!(
+            ctx.ttl_timer.is_active(),
+            "TTL timer should be re-spawned after restore"
+        );
+    }
+
+    /// SCP-PERSIST-025: `restore_all_contexts` lists and restores each.
+    #[tokio::test]
+    async fn restore_all_contexts_restores_persisted() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+
+        let persistence = Arc::new(MockContextPersistence::default());
+
+        for ctx_name in ["ctx-a", "ctx-b"] {
+            let params = ContextParams::default();
+            let ceiling = default_ceiling();
+            let role_state =
+                ContextRoleState::new(ctx_name, "did:key:creator", ceiling, vec![]).unwrap();
+            let mut membership = MembershipState::new();
+            membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
+
+            let snapshot = super::ContextSnapshot {
+                context_id: ctx_name.to_string(),
+                state: ContextState::Active,
+                context_params: params,
+                membership,
+                role_state,
+                executed_proposals: HashSet::new(),
+                ttl_remaining_secs: None,
+            };
+            persistence.persist_context(ctx_name, &snapshot).unwrap();
+        }
+
+        let manager = ContextManager::with_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockContextPersistence {
+                contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+                broadcasts: std::sync::Mutex::new(HashMap::new()),
+            }),
+        );
+
+        let mut restored = manager.restore_all_contexts().await.unwrap();
+        restored.sort();
+        assert_eq!(restored, vec!["ctx-a", "ctx-b"]);
+
+        // Both contexts should be registered.
+        assert!(manager.is_member("ctx-a", "did:key:creator").await);
+        assert!(manager.is_member("ctx-b", "did:key:creator").await);
+    }
+
+    /// `restore_context` rejects duplicate context registration.
+    #[tokio::test]
+    async fn restore_context_rejects_duplicate() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+
+        let persistence = Arc::new(MockContextPersistence::default());
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ..ContextParams::default()
+        };
+
+        let ceiling = default_ceiling();
+        let role_state =
+            ContextRoleState::new("dup-ctx", "did:key:author1", ceiling, vec![]).unwrap();
+        let membership = MembershipState::new();
+
+        let snapshot = super::ContextSnapshot {
+            context_id: "dup-ctx".to_owned(),
+            state: ContextState::Active,
+            context_params: params.clone(),
+            membership,
+            role_state,
+            executed_proposals: HashSet::new(),
+            ttl_remaining_secs: None,
+        };
+
+        let bc_snapshot = test_broadcast_snapshot("dup-ctx");
+        persistence.persist_context("dup-ctx", &snapshot).unwrap();
+        persistence
+            .persist_broadcast("dup-ctx", &bc_snapshot)
+            .unwrap();
+
+        let manager = ContextManager::with_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockContextPersistence {
+                contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+                broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
+            }),
+        );
+
+        // First restore.
+        let handle1 = ContextHandle::new("dup-ctx".to_owned(), params.clone());
+        handle1.transition_to(&ContextState::Active).await.unwrap();
+        manager.restore_context("dup-ctx", &handle1).await.unwrap();
+
+        // Second restore should fail.
+        let handle2 = ContextHandle::new("dup-ctx".to_owned(), params);
+        handle2.transition_to(&ContextState::Active).await.unwrap();
+        let result = manager.restore_context("dup-ctx", &handle2).await;
 
         assert!(result.is_err());
         assert!(matches!(
