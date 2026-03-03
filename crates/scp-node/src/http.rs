@@ -133,8 +133,22 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
 /// upgrades have their own origin mechanism) or the dev API (localhost-only).
 pub fn build_cors_layer(origins: &Option<Vec<String>>) -> CorsLayer {
     let allow_origin = origins.as_ref().map_or_else(AllowOrigin::any, |list| {
-        let parsed: Vec<axum::http::HeaderValue> =
-            list.iter().filter_map(|o| o.parse().ok()).collect();
+        let parsed: Vec<axum::http::HeaderValue> = list
+            .iter()
+            .filter_map(|o| {
+                o.parse().map_or_else(
+                    |_| {
+                        tracing::warn!(
+                            origin = %o,
+                            "ignoring invalid CORS origin; \
+                             this may make endpoints more permissive than intended"
+                        );
+                        None
+                    },
+                    Some,
+                )
+            })
+            .collect();
         AllowOrigin::list(parsed)
     });
     CorsLayer::new()
