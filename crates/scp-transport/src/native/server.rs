@@ -247,6 +247,15 @@ impl<S: BlobStorage + 'static> RelayServer<S> {
             let ip = addr.ip();
 
             // Enforce connection limits before upgrading to WebSocket.
+            //
+            // When `bridge_secret` is configured, the relay is only reachable
+            // through the authenticated axum bridge — all connections originate
+            // from localhost (127.0.0.1). Per-IP limits are skipped in this
+            // mode because they would count all bridge connections as a single
+            // IP, enabling a trivial denial-of-service. The bridge layer
+            // enforces its own concurrency limit instead (see #229).
+            // The global `max_total_connections` limit still applies.
+            let bridge_mode = self.config.bridge_secret.is_some();
             {
                 let tracker = self.connection_tracker.read().await;
                 let total: usize = tracker.values().sum();
@@ -260,21 +269,23 @@ impl<S: BlobStorage + 'static> RelayServer<S> {
                     drop(stream);
                     continue;
                 }
-                let ip_count = tracker.get(&ip).copied().unwrap_or(0);
-                drop(tracker);
-                if ip_count >= self.config.max_connections_per_ip {
-                    tracing::warn!(
-                        ip = %ip,
-                        ip_connections = ip_count,
-                        limit = self.config.max_connections_per_ip,
-                        "rejecting connection: max connections per IP reached"
-                    );
-                    drop(stream);
-                    continue;
+                if !bridge_mode {
+                    let ip_count = tracker.get(&ip).copied().unwrap_or(0);
+                    drop(tracker);
+                    if ip_count >= self.config.max_connections_per_ip {
+                        tracing::warn!(
+                            ip = %ip,
+                            ip_connections = ip_count,
+                            limit = self.config.max_connections_per_ip,
+                            "rejecting connection: max connections per IP reached"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                 }
             }
 
-            // Register this connection.
+            // Register this connection (always tracked for max_total_connections).
             {
                 let mut tracker = self.connection_tracker.write().await;
                 *tracker.entry(ip).or_insert(0) += 1;
@@ -365,6 +376,10 @@ impl<S: BlobStorage + 'static> RelayServer<S> {
                 let ip = addr.ip();
 
                 // Enforce connection limits.
+                //
+                // Per-IP limits are skipped when bridge_secret is configured
+                // (see the run() method comment and #229 for rationale).
+                let bridge_mode = config.bridge_secret.is_some();
                 {
                     let tracker = conn_tracker.read().await;
                     let total: usize = tracker.values().sum();
@@ -378,21 +393,23 @@ impl<S: BlobStorage + 'static> RelayServer<S> {
                         drop(stream);
                         continue;
                     }
-                    let ip_count = tracker.get(&ip).copied().unwrap_or(0);
-                    drop(tracker);
-                    if ip_count >= config.max_connections_per_ip {
-                        tracing::warn!(
-                            ip = %ip,
-                            ip_connections = ip_count,
-                            limit = config.max_connections_per_ip,
-                            "rejecting connection: max connections per IP reached"
-                        );
-                        drop(stream);
-                        continue;
+                    if !bridge_mode {
+                        let ip_count = tracker.get(&ip).copied().unwrap_or(0);
+                        drop(tracker);
+                        if ip_count >= config.max_connections_per_ip {
+                            tracing::warn!(
+                                ip = %ip,
+                                ip_connections = ip_count,
+                                limit = config.max_connections_per_ip,
+                                "rejecting connection: max connections per IP reached"
+                            );
+                            drop(stream);
+                            continue;
+                        }
                     }
                 }
 
-                // Register this connection.
+                // Register this connection (always tracked for max_total_connections).
                 {
                     let mut tracker = conn_tracker.write().await;
                     *tracker.entry(ip).or_insert(0) += 1;
