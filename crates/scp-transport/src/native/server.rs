@@ -415,7 +415,6 @@ enum ConnectionError {
     WebSocket(String),
 }
 
-/// Decrements the per-IP connection count when a connection is dropped.
 /// Checks whether a new connection from `ip` should be accepted, given the
 /// current tracker state and relay configuration.
 ///
@@ -456,6 +455,10 @@ async fn check_connection_allowed(
     true
 }
 
+/// Decrements the per-IP connection count when a connection is dropped.
+///
+/// Removes the entry entirely when the count reaches zero to prevent the
+/// tracker map from growing unboundedly.
 async fn decrement_connection(tracker: &ConnectionTracker, ip: IpAddr) {
     let mut t = tracker.write().await;
     if let Some(count) = t.get_mut(&ip) {

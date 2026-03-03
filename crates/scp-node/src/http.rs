@@ -158,9 +158,11 @@ pub fn relay_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Route
 
 /// Axum handler for WebSocket upgrade at `/scp/v1`.
 ///
-/// Acquires a semaphore permit before upgrading; the permit is held for
-/// the entire WebSocket connection lifetime. Returns 503 Service
-/// Unavailable when the bridge is at capacity.
+/// Acquires a semaphore permit before upgrading; the permit is moved into
+/// the `on_upgrade` closure so it is held for the entire WebSocket
+/// connection lifetime. If the HTTP 101 upgrade never completes, axum
+/// drops the response — which drops the closure and releases the permit.
+/// Returns 503 Service Unavailable when the bridge is at capacity.
 async fn ws_upgrade_handler<B: BlobStorage + 'static>(
     ws: WebSocketUpgrade,
     State((state, sem)): State<(Arc<NodeState<B>>, Arc<Semaphore>)>,
@@ -170,9 +172,11 @@ async fn ws_upgrade_handler<B: BlobStorage + 'static>(
     };
     let relay_addr = state.relay_addr;
     let bridge_secret = state.bridge_secret;
+    // Move the permit into the closure — it is released when the closure
+    // is dropped, either after the bridge ends or if the upgrade fails.
     ws.on_upgrade(move |socket| async move {
+        let _permit = permit; // bind to ensure drop at end of scope
         relay_bridge(socket, relay_addr, bridge_secret).await;
-        drop(permit); // held for entire WS lifetime
     })
     .into_response()
 }
