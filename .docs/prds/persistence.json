@@ -1581,7 +1581,7 @@
       "gate": "gate-persist-7",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/tests/integration/persistence.rs"
       ],
@@ -1628,7 +1628,7 @@
       "gate": "gate-persist-7",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/tests/integration/persistence.rs"
       ],
@@ -1674,7 +1674,7 @@
       "gate": "gate-persist-7",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/tests/integration/persistence.rs"
       ],
