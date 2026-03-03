@@ -14,6 +14,7 @@ license.workspace = true
 testing = ["dep:rand"]
 
 [dependencies]
+scp-primitives = { path = "../scp-primitives" }
 scp-identity = { path = "../scp-identity" }
 sha2 = { workspace = true }
 serde = { workspace = true }

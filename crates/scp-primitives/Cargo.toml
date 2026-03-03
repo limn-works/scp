@@ -1,0 +1,16 @@
+[package]
+name = "scp-primitives"
+version = "0.1.0"
+description = "Shared low-level primitives for SCP (Shareable Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[lints]
+workspace = true
