@@ -21,7 +21,21 @@
 //! (AES-256-GCM) and packages it into a [`BroadcastEnvelope`].
 //! [`open_broadcast`] decrypts using the author's broadcast key at the specified
 //! epoch.
+//!
+//! # AAD Binding (Security)
+//!
+//! The `author_did` and `key_epoch` fields in [`BroadcastEnvelope`] are cleartext
+//! metadata that must be authenticated by the AEAD tag. Both [`seal_broadcast`]
+//! and [`open_broadcast`] bind these fields as Additional Authenticated Data
+//! (AAD) in the AES-256-GCM construction using a length-prefixed binary format:
+//! `[4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]`.
+//! This prevents attribution forgery by context members who possess the
+//! broadcast key (issue #228, cryptographer review finding 1, RED-210).
+//!
+//! **BREAKING**: This changes the wire format. Envelopes sealed without AAD
+//! cannot be opened by this version (and vice versa).
 
+use aes_gcm::aead::Payload;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -133,6 +147,10 @@ pub struct BroadcastKeyEpochAdvance {
 /// decryption and verification. The `encrypted_content` field uses the same
 /// wire format as [`encrypt_sender_layer`]: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
 ///
+/// The `author_did` and `key_epoch` fields are authenticated via AES-256-GCM
+/// AAD binding (length-prefixed binary format). Tampering with either field
+/// causes AEAD tag verification to fail on decryption. See issue #228.
+///
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroadcastEnvelope {
@@ -215,6 +233,34 @@ pub fn rotate_broadcast_key(
 }
 
 // ---------------------------------------------------------------------------
+// AAD construction
+// ---------------------------------------------------------------------------
+
+/// Constructs the Additional Authenticated Data (AAD) for `BroadcastEnvelope`
+/// AES-256-GCM operations.
+///
+/// Format: length-prefixed binary — `[4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]`.
+/// This binds the cleartext metadata fields to the AEAD tag, preventing
+/// attribution forgery and epoch substitution by context members who possess
+/// the broadcast key. Both [`seal_broadcast`] and [`open_broadcast`] use this
+/// identical construction.
+///
+/// The binary format is canonically parseable by construction. The previous
+/// colon-delimited string format (`"{did}:{epoch}"`) was ambiguous because
+/// DIDs themselves contain colons (e.g., `did:dht:abc`, `did:web:host:path`).
+///
+/// See issue #228, cryptographer review finding 1, RED-210.
+#[allow(clippy::cast_possible_truncation)] // DID strings are always < 4 GiB
+fn build_broadcast_aad(author_did: &str, key_epoch: u64) -> Vec<u8> {
+    let did_bytes = author_did.as_bytes();
+    let mut aad = Vec::with_capacity(4 + did_bytes.len() + 8);
+    aad.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(did_bytes);
+    aad.extend_from_slice(&key_epoch.to_be_bytes());
+    aad
+}
+
+// ---------------------------------------------------------------------------
 // Seal / Open
 // ---------------------------------------------------------------------------
 
@@ -223,6 +269,11 @@ pub fn rotate_broadcast_key(
 ///
 /// Uses AES-256-GCM with a random 12-byte nonce per invocation. The wire
 /// format matches [`encrypt_sender_layer`]: `nonce (12 bytes) || ciphertext || auth_tag (16 bytes)`.
+///
+/// The `author_did` and `key_epoch` from the broadcast key are bound as
+/// Additional Authenticated Data (AAD) in the AES-256-GCM construction.
+/// This cryptographically authenticates the cleartext metadata fields,
+/// preventing attribution forgery. See issue #228.
 ///
 /// # Arguments
 ///
@@ -245,8 +296,15 @@ pub fn seal_broadcast(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
+    let aad = build_broadcast_aad(&key.author_did, key.epoch);
     let ciphertext = cipher
-        .encrypt(nonce, payload)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: payload,
+                aad: &aad,
+            },
+        )
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
     let mut encrypted_content = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
@@ -264,7 +322,10 @@ pub fn seal_broadcast(
 ///
 /// Verifies that the envelope's `key_epoch` matches the provided key's epoch.
 /// If the epochs do not match, returns [`SenderKeyError::EpochMismatch`].
-/// Then decrypts the AES-256-GCM ciphertext and verifies the authentication tag.
+/// Then decrypts the AES-256-GCM ciphertext and verifies the authentication
+/// tag, including AAD verification of the envelope's `author_did` and
+/// `key_epoch` fields. If the cleartext metadata was tampered with, the AEAD
+/// tag verification will fail. See issue #228.
 ///
 /// # Arguments
 ///
@@ -275,7 +336,8 @@ pub fn seal_broadcast(
 ///
 /// - [`SenderKeyError::EpochMismatch`] if the key epoch does not match the envelope epoch.
 /// - [`SenderKeyError::CiphertextTooShort`] if the encrypted content is too short.
-/// - [`SenderKeyError::AuthenticationFailed`] if the AEAD tag verification fails.
+/// - [`SenderKeyError::AuthenticationFailed`] if the AEAD tag verification fails
+///   (including AAD mismatch from tampered `author_did` or `key_epoch`).
 pub fn open_broadcast(
     key: &BroadcastKey,
     envelope: &BroadcastEnvelope,
@@ -300,8 +362,18 @@ pub fn open_broadcast(
     let cipher = Aes256Gcm::new_from_slice(key.key.as_bytes())
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
+    // Reconstruct AAD from the envelope's metadata. This MUST match the AAD
+    // used during seal_broadcast. If author_did or key_epoch were tampered
+    // with in the envelope, the AAD will differ and AEAD decryption will fail.
+    let aad = build_broadcast_aad(&envelope.author_did, envelope.key_epoch);
     cipher
-        .decrypt(nonce, encrypted)
+        .decrypt(
+            nonce,
+            Payload {
+                msg: encrypted,
+                aad: &aad,
+            },
+        )
         .map_err(|_| SenderKeyError::AuthenticationFailed)
 }
 
@@ -310,7 +382,11 @@ pub fn open_broadcast(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -572,6 +648,147 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         let deserialized: BroadcastEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, envelope);
+    }
+
+    // -----------------------------------------------------------------------
+    // AAD tampering detection tests (issue #228)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_with_tampered_author_did_fails() {
+        // Seal with Alice's key, then forge the envelope's author_did to Bob.
+        // The AAD mismatch must cause AEAD tag verification to fail.
+        let key_alice = generate_broadcast_key("did:dht:alice");
+        let envelope = seal_broadcast(&key_alice, b"alice's message").unwrap();
+
+        // Forge: change author_did in the envelope but keep everything else.
+        let forged_envelope = BroadcastEnvelope {
+            author_did: "did:dht:bob".to_owned(),
+            key_epoch: envelope.key_epoch,
+            encrypted_content: envelope.encrypted_content,
+        };
+
+        // Open with a key that has the forged author_did (same key material,
+        // same epoch) to match the envelope's metadata. The AAD will differ
+        // because the DID bytes are different (bob vs alice).
+        let forged_key = BroadcastKey {
+            key: key_alice.key.clone(),
+            epoch: 0,
+            author_did: "did:dht:bob".to_owned(),
+        };
+        let result = open_broadcast(&forged_key, &forged_envelope);
+        assert!(
+            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
+            "tampered author_did must cause AEAD failure, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn open_with_tampered_key_epoch_fails() {
+        // Seal at epoch 0, then forge the envelope to claim epoch 5.
+        // Create a key at epoch 5 with the same key material.
+        // The AAD mismatch must cause AEAD tag verification to fail.
+        let key = generate_broadcast_key("did:dht:alice");
+        let envelope = seal_broadcast(&key, b"epoch zero content").unwrap();
+
+        // Forge: change key_epoch in the envelope.
+        let forged_envelope = BroadcastEnvelope {
+            author_did: envelope.author_did.clone(),
+            key_epoch: 5,
+            encrypted_content: envelope.encrypted_content,
+        };
+
+        // Create a key with epoch 5 but same key material (simulating an
+        // attacker who has the key bytes and wants to replay at a different
+        // epoch).
+        let forged_key = BroadcastKey {
+            key: key.key.clone(),
+            epoch: 5,
+            author_did: "did:dht:alice".to_owned(),
+        };
+        let result = open_broadcast(&forged_key, &forged_envelope);
+        assert!(
+            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
+            "tampered key_epoch must cause AEAD failure, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn open_with_both_author_and_epoch_tampered_fails() {
+        // Seal as Alice at epoch 0, forge to Bob at epoch 3.
+        let key_alice = generate_broadcast_key("did:dht:alice");
+        let envelope = seal_broadcast(&key_alice, b"double forge test").unwrap();
+
+        let forged_envelope = BroadcastEnvelope {
+            author_did: "did:dht:mallory".to_owned(),
+            key_epoch: 3,
+            encrypted_content: envelope.encrypted_content,
+        };
+
+        let forged_key = BroadcastKey {
+            key: key_alice.key.clone(),
+            epoch: 3,
+            author_did: "did:dht:mallory".to_owned(),
+        };
+        let result = open_broadcast(&forged_key, &forged_envelope);
+        assert!(
+            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
+            "tampered author_did + key_epoch must cause AEAD failure, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn aad_binding_verified_on_build_broadcast_aad() {
+        // Verify the AAD construction is deterministic and uses the
+        // length-prefixed binary format:
+        //   [4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]
+        let aad = build_broadcast_aad("did:dht:alice", 42);
+        let did_bytes = b"did:dht:alice";
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+        expected.extend_from_slice(did_bytes);
+        expected.extend_from_slice(&42_u64.to_be_bytes());
+        assert_eq!(aad, expected);
+
+        let aad_zero = build_broadcast_aad("did:dht:bob", 0);
+        let did_bytes_bob = b"did:dht:bob";
+        let mut expected_zero = Vec::new();
+        expected_zero.extend_from_slice(&(did_bytes_bob.len() as u32).to_be_bytes());
+        expected_zero.extend_from_slice(did_bytes_bob);
+        expected_zero.extend_from_slice(&0_u64.to_be_bytes());
+        assert_eq!(aad_zero, expected_zero);
+
+        let aad_max = build_broadcast_aad("did:dht:charlie", u64::MAX);
+        let did_bytes_charlie = b"did:dht:charlie";
+        let mut expected_max = Vec::new();
+        expected_max.extend_from_slice(&(did_bytes_charlie.len() as u32).to_be_bytes());
+        expected_max.extend_from_slice(did_bytes_charlie);
+        expected_max.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(aad_max, expected_max);
+    }
+
+    #[test]
+    fn aad_empty_author_did_produces_correct_binary_layout() {
+        // Empty DID: 4-byte zero length prefix + no DID bytes + 8-byte epoch.
+        let aad = build_broadcast_aad("", 42);
+        assert_eq!(
+            aad,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42],
+            "empty DID must produce [4-byte zero length][8-byte epoch BE]"
+        );
+    }
+
+    #[test]
+    fn seal_open_roundtrip_with_colons_in_did() {
+        // DIDs naturally contain colons (did:web:example.com:path:sub).
+        // The length-prefixed binary AAD format must handle this without
+        // ambiguity. This was the original bug: colon-delimited string
+        // AAD was unparseable for DIDs containing colons.
+        let key = generate_broadcast_key("did:web:example.com:path:sub");
+        let plaintext = b"colon-heavy DID roundtrip";
+        let envelope = seal_broadcast(&key, plaintext).unwrap();
+        let decrypted = open_broadcast(&key, &envelope).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     // -----------------------------------------------------------------------
