@@ -14,11 +14,24 @@
 //!
 //! See spec sections 17.3 and 17.4. See SCP-PERSIST-012.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use scp_platform::traits::Storage;
 
 use super::{ProtocolStore, StoreError};
+
+/// A relay score entry with the original URL preserved.
+///
+/// Stored alongside the relay score so that `list_relay_scores` can return
+/// usable URLs instead of opaque hashes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayScoreEntry {
+    /// The original relay URL.
+    pub url: String,
+    /// The opaque score bytes (format defined by the scoring algorithm).
+    pub score: Vec<u8>,
+}
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -75,8 +88,10 @@ fn key_package_prefix(relay_url: &str) -> String {
 impl<S: Storage> ProtocolStore<S> {
     /// Stores a relay score for a relay URL.
     ///
-    /// Serializes the score bytes under `relay_score/{sha256_hex(url)}`
-    /// wrapped in a `StoredValue` version envelope.
+    /// Serializes a [`RelayScoreEntry`] (URL + score bytes) under
+    /// `relay_score/{sha256_hex(url)}` wrapped in a `StoredValue` version
+    /// envelope. The original URL is preserved in the value so that
+    /// `list_relay_scores` can return usable URLs.
     ///
     /// # Errors
     ///
@@ -84,7 +99,11 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::Storage`] if the underlying storage write fails.
     pub async fn store_relay_score(&self, relay_url: &str, score: &[u8]) -> Result<(), StoreError> {
         let key = relay_score_key(relay_url);
-        self.store_value(&key, &score.to_vec()).await
+        let entry = RelayScoreEntry {
+            url: relay_url.to_owned(),
+            score: score.to_vec(),
+        };
+        self.store_value(&key, &entry).await
     }
 
     /// Loads a relay score for a relay URL.
@@ -97,29 +116,34 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::Storage`] if the underlying storage read fails.
     pub async fn load_relay_score(&self, relay_url: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let key = relay_score_key(relay_url);
-        self.load_value(&key).await
+        let entry: Option<RelayScoreEntry> = self.load_value(&key).await?;
+        Ok(entry.map(|e| e.score))
     }
 
     /// Lists all relay scores.
     ///
-    /// Returns a vector of `(url_hash, score_bytes)` pairs. The URL hash
-    /// is the SHA-256 hex of the original URL. Callers that need to map
-    /// back to URLs must maintain their own URL-to-hash index.
+    /// Returns a vector of [`RelayScoreEntry`] containing the original
+    /// relay URL and score bytes.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     /// Returns [`StoreError::DeserializationFailed`] if any score record fails
     /// to deserialize.
-    pub async fn list_relay_scores(&self) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+    pub async fn list_relay_scores(&self) -> Result<Vec<RelayScoreEntry>, StoreError> {
         let prefix = relay_score_prefix();
         let keys = self.storage.list_keys(prefix).await?;
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(url_hash) = key.strip_prefix(prefix)
-                && let Some(score) = self.load_value::<Vec<u8>>(&key).await?
-            {
-                results.push((url_hash.to_owned(), score));
+            if key.strip_prefix(prefix).is_some() {
+                if let Some(entry) = self.load_value::<RelayScoreEntry>(&key).await? {
+                    results.push(entry);
+                } else {
+                    tracing::warn!(
+                        key = %key,
+                        "relay score key exists but load_value returned None — data integrity issue"
+                    );
+                }
             }
         }
         Ok(results)
@@ -227,7 +251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_relay_scores_returns_all_entries() {
+    async fn list_relay_scores_returns_all_entries_with_urls() {
         let store = make_store();
 
         store
@@ -243,8 +267,15 @@ mod tests {
             .await
             .unwrap();
 
-        let scores = store.list_relay_scores().await.unwrap();
+        let mut scores = store.list_relay_scores().await.unwrap();
         assert_eq!(scores.len(), 3);
+
+        // Verify original URLs are preserved (sort for deterministic order).
+        scores.sort_by(|a, b| a.url.cmp(&b.url));
+        assert_eq!(scores[0].url, "https://relay-a.example.com");
+        assert_eq!(scores[0].score, b"score-a");
+        assert_eq!(scores[1].url, "https://relay-b.example.com");
+        assert_eq!(scores[2].url, "https://relay-c.example.com");
     }
 
     // -------------------------------------------------------------------

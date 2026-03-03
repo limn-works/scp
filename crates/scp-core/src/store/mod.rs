@@ -28,6 +28,7 @@ pub mod transport;
 pub mod ucan;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use zeroize::Zeroize;
 
 use scp_platform::traits::Storage;
 
@@ -222,6 +223,27 @@ impl<S: Storage> ProtocolStore<S> {
         Ok(())
     }
 
+    /// Stores a serialized value under the given key, then zeroizes the
+    /// serialized buffer.
+    ///
+    /// Defense-in-depth: prevents sensitive key material from lingering
+    /// in memory after the storage write completes. Use this instead of
+    /// `store_value` when the serialized data contains cryptographic keys.
+    async fn store_value_zeroize<T: Serialize + Sync>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), StoreError> {
+        let mut bytes = Self::serialize(value)?;
+        let result = self
+            .storage
+            .store(key, &bytes)
+            .await
+            .map_err(StoreError::Storage);
+        bytes.zeroize();
+        result
+    }
+
     /// Loads and deserializes a value from the given key.
     ///
     /// Returns `None` if the key does not exist. Checks the version
@@ -304,18 +326,42 @@ impl<S: Storage> ProtocolStore<S> {
             });
         }
 
-        // Version is behind — pass the full raw bytes to migrate().
-        match T::migrate(peek.version, &raw) {
-            Some(migrated) => {
-                // Write back the upgraded value.
-                self.store_migratable(key, &migrated).await?;
-                Ok(Some(migrated))
+        // Version is behind — apply migration chain iteratively.
+        // Each call to T::migrate(v, raw) transforms version v to v+1.
+        // The chain repeats until we reach CURRENT_VERSION.
+        let mut current_raw = raw;
+        let mut current_version = peek.version;
+
+        while current_version < T::CURRENT_VERSION {
+            match T::migrate(current_version, &current_raw) {
+                Some(migrated) => {
+                    current_version += 1;
+                    if current_version < T::CURRENT_VERSION {
+                        // Re-serialize at the intermediate version for the next step.
+                        let envelope = StoredValue {
+                            version: current_version,
+                            data: &migrated,
+                        };
+                        current_raw = rmp_serde::to_vec(&envelope)
+                            .map_err(|e| StoreError::SerializationFailed(e.to_string()))?;
+                    } else {
+                        // Reached CURRENT_VERSION — write back and return.
+                        self.store_migratable(key, &migrated).await?;
+                        return Ok(Some(migrated));
+                    }
+                }
+                None => {
+                    return Err(StoreError::DeserializationFailed(format!(
+                        "migration from version {current_version} not supported for this type",
+                    )));
+                }
             }
-            None => Err(StoreError::DeserializationFailed(format!(
-                "migration from version {} not supported for this type",
-                peek.version
-            ))),
         }
+
+        // Should not reach here — the while loop exits via return.
+        Err(StoreError::DeserializationFailed(
+            "migration chain did not reach current version".to_owned(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -554,6 +600,74 @@ mod tests {
         let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
         let loaded: Option<TestMigratable> = store.load_migratable("nonexistent").await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn migratable_migration_from_v2() {
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        // Manually store a v2 value: (String, u32) tuple.
+        let v2_data = ("from-v2".to_owned(), 77u32);
+        let envelope = StoredValue {
+            version: 2u16,
+            data: &v2_data,
+        };
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        store.storage.store("test/migrate-v2", &bytes).await.unwrap();
+
+        // Load should trigger migration from v2 to v3.
+        let loaded: Option<TestMigratable> =
+            store.load_migratable("test/migrate-v2").await.unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.value, "from-v2");
+        assert_eq!(loaded.extra, 77);
+
+        // Verify the migrated value was written back at v3.
+        let raw = store
+            .storage
+            .retrieve("test/migrate-v2")
+            .await
+            .unwrap()
+            .unwrap();
+        let check: StoredValue<TestMigratable> = rmp_serde::from_slice(&raw).unwrap();
+        assert_eq!(check.version, 3);
+    }
+
+    #[tokio::test]
+    async fn migratable_chain_migration_v1_to_v3_via_v2() {
+        // Verifies that iterative chain migration works: v1 -> v2 -> v3.
+        // The v1 migrate step produces a TestMigratable (at v2 semantics),
+        // which is then re-serialized at v2 and fed into the v2 migrate step.
+        let store = ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        // Store a v1 value.
+        let v1_data = "chain-test".to_owned();
+        let envelope = StoredValue {
+            version: 1u16,
+            data: &v1_data,
+        };
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        store.storage.store("test/chain", &bytes).await.unwrap();
+
+        // Load triggers v1 -> v2 -> v3 chain.
+        let loaded: Option<TestMigratable> =
+            store.load_migratable("test/chain").await.unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.value, "chain-test");
+        // v1 migration sets extra=0; if the chain goes v1->v3 directly
+        // instead of v1->v2->v3, the v2 step would overwrite extra.
+        // Both paths produce extra=0 for this data, but the version
+        // written back must be 3.
+        assert_eq!(loaded.extra, 0);
+
+        let raw = store
+            .storage
+            .retrieve("test/chain")
+            .await
+            .unwrap()
+            .unwrap();
+        let check: StoredValue<TestMigratable> = rmp_serde::from_slice(&raw).unwrap();
+        assert_eq!(check.version, 3);
     }
 
     // -------------------------------------------------------------------

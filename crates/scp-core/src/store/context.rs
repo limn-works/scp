@@ -15,7 +15,6 @@
 use std::collections::HashSet;
 
 use scp_platform::traits::Storage;
-use zeroize::Zeroize;
 
 use scp_identity::DID;
 
@@ -231,7 +230,9 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn list_active_contexts(&self) -> Result<Vec<ContextId>, StoreError> {
         let keys = self.storage.list_keys("context/").await?;
-        let mut context_ids: Vec<ContextId> = keys
+        // list_keys returns sorted order; each context has exactly one
+        // /state key, so no duplicates are possible.
+        let context_ids: Vec<ContextId> = keys
             .into_iter()
             .filter_map(|key| {
                 let rest = key.strip_prefix("context/")?;
@@ -243,8 +244,6 @@ impl<S: Storage> ProtocolStore<S> {
                 }
             })
             .collect();
-        context_ids.sort();
-        context_ids.dedup();
         Ok(context_ids)
     }
 
@@ -397,7 +396,8 @@ impl<S: Storage> ProtocolStore<S> {
         key: &[u8],
     ) -> Result<(), StoreError> {
         let storage_key = sender_key_key(context_id, did)?;
-        self.store_value(&storage_key, &key.to_vec()).await
+        // Sender keys are cryptographic material — zeroize after storage.
+        self.store_value_zeroize(&storage_key, &key.to_vec()).await
     }
 
     /// Loads a sender key for a DID within a context.
@@ -479,15 +479,8 @@ impl<S: Storage> ProtocolStore<S> {
         snapshot: &crate::context::broadcast::BroadcastContextSnapshot,
     ) -> Result<(), StoreError> {
         let key = broadcast_state_key(context_id)?;
-        let mut bytes = Self::serialize(snapshot)?;
-        let result = self
-            .storage
-            .store(&key, &bytes)
-            .await
-            .map_err(StoreError::Storage);
-        // Defense-in-depth: clear serialized key material from memory.
-        bytes.zeroize();
-        result
+        // Uses store_value_zeroize to clear serialized key material from memory.
+        self.store_value_zeroize(&key, snapshot).await
     }
 
     /// Loads the broadcast context state from persistence.
