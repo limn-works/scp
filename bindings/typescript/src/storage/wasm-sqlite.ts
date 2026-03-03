@@ -10,8 +10,8 @@
  * See SCP-PERSIST-062.
  */
 
-import SQLiteESMFactory from "wa-sqlite/dist/wa-sqlite-async.mjs";
 import * as SQLite from "wa-sqlite";
+import SQLiteESMFactory from "wa-sqlite/dist/wa-sqlite-async.mjs";
 
 // ---------------------------------------------------------------------------
 // StorageInterface
@@ -53,7 +53,11 @@ const IV_LENGTH = 12;
  */
 async function encrypt(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
   const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    plaintext.buffer as ArrayBuffer,
+  );
   const result = new Uint8Array(IV_LENGTH + ciphertext.byteLength);
   result.set(iv, 0);
   result.set(new Uint8Array(ciphertext), IV_LENGTH);
@@ -174,16 +178,19 @@ export class WasmSqliteStorage implements StorageInterface {
     const sqlite = SQLite.Factory(module);
 
     // Register the appropriate VFS.
+    // VFS classes are untyped -- cast through unknown to satisfy vfs_register.
     if (vfsType === "opfs") {
-      const { OPFSCoopSyncVFS } = await import("wa-sqlite/src/examples/OPFSCoopSyncVFS.js");
-      const vfs = new OPFSCoopSyncVFS();
+      const { OriginPrivateFileSystemVFS } = await import(
+        "wa-sqlite/src/examples/OriginPrivateFileSystemVFS.js"
+      );
+      const vfs = new OriginPrivateFileSystemVFS();
       await vfs.isReady;
-      sqlite.vfs_register(vfs, true);
+      sqlite.vfs_register(vfs as unknown as SQLiteVFS, true);
     } else {
       const { IDBBatchAtomicVFS } = await import("wa-sqlite/src/examples/IDBBatchAtomicVFS.js");
       const vfs = new IDBBatchAtomicVFS();
       await vfs.isReady;
-      sqlite.vfs_register(vfs, true);
+      sqlite.vfs_register(vfs as unknown as SQLiteVFS, true);
     }
 
     const db = await sqlite.open_v2(dbName);
@@ -203,12 +210,10 @@ export class WasmSqliteStorage implements StorageInterface {
 
   async store(key: string, data: Uint8Array): Promise<void> {
     const encrypted = await encrypt(this.#encryptionKey, data);
-    await run(
-      this.#sqlite,
-      this.#db,
-      "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
-      [key, encrypted],
-    );
+    await run(this.#sqlite, this.#db, "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", [
+      key,
+      encrypted,
+    ]);
   }
 
   async retrieve(key: string): Promise<Uint8Array | null> {

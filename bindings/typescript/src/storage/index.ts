@@ -10,8 +10,8 @@
 
 export {
   InMemorySqliteStorage,
-  WasmSqliteStorage,
   prefixSuccessor,
   type StorageInterface,
   type VfsType,
+  WasmSqliteStorage,
 } from "./wasm-sqlite.js";
