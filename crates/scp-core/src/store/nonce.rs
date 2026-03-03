@@ -69,6 +69,11 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns `true` if this is a new nonce (first time seen),
     /// `false` if the nonce was already recorded (replay attempt).
     ///
+    /// The `nonce_hash` parameter must be a SHA-256 hash of the original
+    /// nonce string. The caller is responsible for performing this hash
+    /// before calling this method — raw nonce strings must not be passed
+    /// directly.
+    ///
     /// Uses `load_value()` (not `exists()`) to check for a prior record,
     /// then `store_value()` to claim the slot. A post-write `load_value()`
     /// re-verifies ownership so that concurrent writers that both passed the
@@ -99,6 +104,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Storage backends that support atomic insert-if-absent should
     /// override this at the adapter level for true atomicity.
+    #[must_use = "ignoring nonce check result is a security bug"]
     pub async fn check_and_record_nonce(
         &self,
         context_id: &str,
@@ -297,6 +303,14 @@ mod tests {
     // Concurrent nonce checking
     // -------------------------------------------------------------------
 
+    /// Validates the in-memory defense-in-depth concurrency behavior.
+    ///
+    /// This test exercises the post-write re-read pattern in
+    /// `check_and_record_nonce`. It validates that at most one concurrent
+    /// writer succeeds for the same nonce in a single-process
+    /// `InMemoryStorage` backend. It does NOT test universal atomicity
+    /// across distributed storage backends — that requires CAS support
+    /// at the adapter level (see the SAFETY note on `check_and_record_nonce`).
     #[tokio::test]
     async fn concurrent_nonce_checks_allow_at_most_one() {
         use std::sync::Arc;

@@ -124,7 +124,10 @@ fn remove_empty_parents(path: &Path, base_dir: &Path) {
     }
 }
 
-/// Converts a `tokio::task::JoinError` to a `PlatformError`.
+/// Converts a [`tokio::task::JoinError`] to a [`PlatformError`].
+///
+/// Takes ownership because `map_err` passes the error by value.
+#[allow(clippy::needless_pass_by_value)]
 fn join_err(e: tokio::task::JoinError) -> PlatformError {
     PlatformError::StorageError(format!("blocking task failed: {e}"))
 }
