@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tower::limit::ConcurrencyLimitLayer;
 
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
@@ -143,30 +143,38 @@ pub fn well_known_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> 
 /// WebSocket, then connects to the relay on localhost and forwards
 /// frames bidirectionally.
 ///
-/// A [`ConcurrencyLimitLayer`] caps the number of simultaneously active
-/// bridge connections to `max_total_connections` from the relay config,
-/// preventing an external attacker from exhausting relay resources by
-/// opening many WebSocket connections to the public endpoint (#229).
+/// An `Arc<Semaphore>` caps concurrent bridge connections to
+/// `max_total_connections` from the relay config. The permit is acquired
+/// before the HTTP 101 upgrade and held inside the `on_upgrade` closure
+/// for the entire WebSocket connection lifetime — ensuring the semaphore
+/// accurately tracks active connections, not just in-flight upgrade
+/// requests (#229).
 pub fn relay_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Router {
-    let max_bridge_connections = state.relay_config.max_total_connections;
+    let bridge_semaphore = Arc::new(Semaphore::new(state.relay_config.max_total_connections));
     Router::new()
         .route("/scp/v1", get(ws_upgrade_handler::<B>))
-        .layer(ConcurrencyLimitLayer::new(max_bridge_connections))
-        .with_state(state)
+        .with_state((state, bridge_semaphore))
 }
 
 /// Axum handler for WebSocket upgrade at `/scp/v1`.
 ///
-/// Bridges the incoming WebSocket connection to the node's internal
-/// relay server by connecting to `relay_addr` on localhost, authenticated
-/// with the bridge secret.
+/// Acquires a semaphore permit before upgrading; the permit is held for
+/// the entire WebSocket connection lifetime. Returns 503 Service
+/// Unavailable when the bridge is at capacity.
 async fn ws_upgrade_handler<B: BlobStorage + 'static>(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<NodeState<B>>>,
+    State((state, sem)): State<(Arc<NodeState<B>>, Arc<Semaphore>)>,
 ) -> impl IntoResponse {
+    let Ok(permit) = sem.try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let relay_addr = state.relay_addr;
     let bridge_secret = state.bridge_secret;
-    ws.on_upgrade(move |socket| relay_bridge(socket, relay_addr, bridge_secret))
+    ws.on_upgrade(move |socket| async move {
+        relay_bridge(socket, relay_addr, bridge_secret).await;
+        drop(permit); // held for entire WS lifetime
+    })
+    .into_response()
 }
 
 /// Bridges an axum WebSocket to the internal relay server.
@@ -177,8 +185,9 @@ async fn ws_upgrade_handler<B: BlobStorage + 'static>(
 /// [`BRIDGE_IDLE_TIMEOUT`]. Sends explicit WebSocket close frames on
 /// both sides when the bridge terminates.
 ///
-/// The idle timeout prevents stale connections from holding resources
-/// indefinitely when a client disconnects without sending a close frame
+/// The idle timeout resets only on data frames (Text/Binary), not on
+/// Ping/Pong control frames. This prevents an attacker from keeping
+/// connections alive indefinitely by sending pings without real data
 /// (#229).
 async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret: [u8; 32]) {
     let token_hex = scp_transport::native::server::hex_encode_32(&bridge_secret);
@@ -196,7 +205,7 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret:
     let (mut relay_sink, mut relay_source) = relay_ws.split();
     let (mut axum_sink, mut axum_source) = axum_ws.split();
 
-    // Idle timeout: resets on every message in either direction.
+    // Idle timeout: resets only on data frames (Text/Binary), not control frames.
     let idle_timeout = tokio::time::sleep(BRIDGE_IDLE_TIMEOUT);
     tokio::pin!(idle_timeout);
 
@@ -206,10 +215,15 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret:
                 match msg {
                     Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                     Some(Ok(msg)) => {
-                        idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
                         let relay_msg = match msg {
-                            Message::Text(t) => tokio_tungstenite::tungstenite::Message::Text(t.to_string()),
-                            Message::Binary(b) => tokio_tungstenite::tungstenite::Message::Binary(b.to_vec()),
+                            Message::Text(t) => {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
+                                tokio_tungstenite::tungstenite::Message::Text(t.to_string())
+                            }
+                            Message::Binary(b) => {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
+                                tokio_tungstenite::tungstenite::Message::Binary(b.to_vec())
+                            }
                             Message::Ping(p) => tokio_tungstenite::tungstenite::Message::Ping(p.to_vec()),
                             Message::Pong(p) => tokio_tungstenite::tungstenite::Message::Pong(p.to_vec()),
                             Message::Close(_) => break,
@@ -229,10 +243,15 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret:
                 match msg {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_)) | None => break,
                     Some(Ok(msg)) => {
-                        idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
                         let axum_msg = match msg {
-                            tokio_tungstenite::tungstenite::Message::Text(t) => Message::Text(t.into()),
-                            tokio_tungstenite::tungstenite::Message::Binary(b) => Message::Binary(b.into()),
+                            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
+                                Message::Text(t.into())
+                            }
+                            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
+                                Message::Binary(b.into())
+                            }
                             tokio_tungstenite::tungstenite::Message::Ping(p) => Message::Ping(p.into()),
                             tokio_tungstenite::tungstenite::Message::Pong(p) => Message::Pong(p.into()),
                             tokio_tungstenite::tungstenite::Message::Close(_) => break,
