@@ -306,11 +306,15 @@ mod tests {
     use super::*;
     use crate::testing::InMemoryStorage;
 
+    // Required so that `scp_testing::storage_conformance!` can resolve
+    // `scp_platform::Storage` when invoked from within this crate.
+    extern crate self as scp_platform;
+
     // -----------------------------------------------------------------------
     // Storage conformance suite — proves the wrapper is transparent.
     // -----------------------------------------------------------------------
 
-    scp_testing::storage_conformance!(|| SyncableStorage::new(InMemoryStorage::new()));
+    scp_testing::storage_conformance!(SyncableStorage::new(InMemoryStorage::new()));
 
     // -----------------------------------------------------------------------
     // Sync-specific tests
