@@ -151,12 +151,16 @@ The governance model is declared at creation and visible to all. Governance impl
 
 **Membership/access decoupling.** These actions do NOT remove the target from the context. A member with revoked read access remains a member for governance participation and presence but cannot decrypt content. Member states:
 
-| State | In context | Can read | Can write |
-|-------|-----------|----------|-----------|
-| Full member | Yes | Yes | Yes |
-| Read-only member (write revoked) | Yes | Yes | No |
-| Presence-only member (read revoked) | Yes | No | No |
-| Non-member (removed) | No | No | No |
+| State | In context | Can read | Can write | Can vote |
+|-------|-----------|----------|-----------|----------|
+| Full member | Yes | Yes | Yes | Yes |
+| Read-only member (write revoked) | Yes | Yes | No | Yes |
+| Presence-only member (read + write revoked) | Yes | No | No | No |
+| Non-member (removed) | No | No | No | No |
+
+Presence-only members lose `GovernanceVote` and `GovernancePropose` capabilities alongside content access. A member who can neither read nor write content should not influence governance decisions about content they cannot see. Read-only members retain governance capabilities — they can still observe content and participate meaningfully in governance.
+
+**Redundant operations.** Revoking access for a member whose access is already revoked (same scope) is a no-op that returns success. Restoring access for a member who was never revoked returns `GovernanceError::NothingToRestore`. Revoking with `FutureOnly` scope when a `Full` revocation is already active is a no-op (Full subsumes FutureOnly). Revoking with `Full` scope when `FutureOnly` is active upgrades to Full.
 
 Content access actions go through the context's governance model (propose/vote/execute). In SingleAdmin contexts, the admin's proposal auto-executes. In multi-admin contexts, the action requires the configured quorum. Tiers 1-2 (DID-to-DID blocking) are unilateral identity-layer operations and do NOT go through governance.
 

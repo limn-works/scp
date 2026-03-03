@@ -2357,6 +2357,16 @@ pub trait GovernanceEngine: Send + Sync {
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
+    /// Cancel a pending proposal. Only the original proposer can cancel.
+    /// Returns Cancelled status on success, error if proposal is not Pending
+    /// or if the caller is not the proposer.
+    fn cancel(
+        &self,
+        proposal_id: &ProposalId,
+        proposer: &DID,
+        context: &GovernanceContext,
+    ) -> Result<ProposalStatus, GovernanceError>;
+
     /// Check whether a proposal has reached resolution (quorum met, rejected,
     /// or expired). Called after each vote and periodically by the SDK.
     fn resolve(
@@ -2419,12 +2429,12 @@ pub enum GovernanceModelConfig {
     Majority {
         /// Voting window in seconds. Default: 86_400 (24 hours).
         voting_window_secs: u64,
-        /// Minimum participation threshold as a fraction (0.0 to 1.0).
-        /// The proposal is only valid if at least this fraction of eligible
-        /// voters cast a vote (approve or reject). Default: 0.5 (50%).
-        /// Prevents a proposal from passing with 2 approvals out of 100
-        /// eligible voters when 98 are absent.
-        min_participation: f64,
+        /// Minimum participation threshold in basis points (1–10000).
+        /// E.g., 5000 = 50%. The proposal is only valid if at least
+        /// this fraction of eligible voters cast a vote (approve or reject).
+        /// Default: 5000 (50%). Using u32 basis points instead of f64 so
+        /// GovernanceModelConfig can derive Eq.
+        min_participation_bps: u32,
     },
 
     /// Unanimity among all context members holding `GovernanceVote`
@@ -2441,7 +2451,7 @@ pub enum GovernanceModelConfig {
 **Validation at context creation:**
 
 - `Threshold`: `signers` must be non-empty, `threshold` must be in `[1, signers.len()]`, all signer DIDs must be among the context's initial members, `voting_window_secs` must be in `[300, 604_800]` (5 minutes to 7 days).
-- `Majority`: `min_participation` must be in `(0.0, 1.0]`, `voting_window_secs` must be in `[300, 604_800]`.
+- `Majority`: `min_participation_bps` must be in `(0, 10000]`, `voting_window_secs` must be in `[300, 604_800]`.
 - `Unanimity`: `voting_window_secs` must be in `[300, 604_800]`.
 
 #### 3. Governance Proposal Lifecycle
@@ -2580,6 +2590,10 @@ pub enum GovernanceAction {
     /// Not DID-targeted — rotates keys for all members.
     /// Use after compromise detection, bulk revocations, or periodic hygiene.
     RotateContentKeys { reason: Option<String> },
+    /// Deadlock recovery: modify governance parameters without changing model type.
+    /// Uses fallback quorum (majority-of-active) regardless of original model.
+    /// See section 10 (Deadlock Recovery).
+    ReconfigureGovernance { changes: Vec<GovernanceReconfigAction>, justification: DeadlockJustification },
 }
 
 /// Scope of content access revocation.
@@ -2661,6 +2675,10 @@ ADR-029 section 5c defines the conflict scenario: two admins both offline simult
 - Two `ChangeRole` proposals for the same DID with different target roles.
 - Two `ModifyCeiling` proposals with different ceiling sets.
 - A `RemoveMember` and a `ChangeRole` for the same DID.
+- A `RevokeReadAccess` and a `RestoreReadAccess` for the same DID (mutually contradictory).
+- A `RevokeWriteAccess` and a `RestoreWriteAccess` for the same DID (mutually contradictory).
+- Two `RevokeReadAccess` proposals for the same DID with different scopes (Full vs FutureOnly).
+- Two `RevokeWriteAccess` proposals for the same DID with different scopes (Full vs FutureOnly).
 
 **Conflict resolution.** When a conflict is detected:
 
@@ -2671,9 +2689,9 @@ ADR-029 section 5c defines the conflict scenario: two admins both offline simult
 
 **Simultaneous commit (same sequence number).** If two conflicting proposals land at the exact same event log sequence (extremely rare — requires both to be appended in the same batch), the protocol enters a `GovernanceConflict` state:
 
-1. The context is frozen for new governance actions (no new proposals accepted). Message sending and tool invocation continue normally.
+1. The context is frozen for new governance actions — no new proposals accepted EXCEPT `ResolveConflict`. Message sending and tool invocation continue normally.
 2. A `GovernanceConflictDetected` event is emitted.
-3. Resolution requires an explicit `ResolveConflict` governance action from any DID with `GovernanceVote` capability. The resolution specifies which proposal wins.
+3. Resolution requires an explicit `ResolveConflict` governance action from any DID with `GovernanceVote` capability. The resolution specifies which proposal wins. `ResolveConflict` is explicitly exempt from the governance freeze — it is the designated mechanism for lifting the freeze.
 4. The `ResolveConflict` action itself follows the context's governance model (requires threshold/majority/unanimity). This prevents unilateral conflict resolution.
 5. If no resolution is reached within the voting window, both proposals are invalidated and the governance freeze is lifted. The context returns to its pre-proposal state.
 
@@ -2718,25 +2736,19 @@ Deadlock occurs when the governance model requires votes from DIDs that are perm
 **Detection.** A governance model is in deadlock when:
 
 - `Threshold`: fewer than `threshold` signers are active context members (signers who left or were removed are no longer eligible).
-- `Majority`: fewer than `ceil(eligible_voters * min_participation)` members are responsive (no vote cast within 3 consecutive voting windows).
+- `Majority`: fewer than `ceil(eligible_voters * min_participation_bps / 10000)` members are responsive (no vote cast within 3 consecutive voting windows).
 - `Unanimity`: any eligible voter has been offline beyond the Tier 3 threshold (7+ days) with no response to proposals.
 
 **Recovery protocol.** When deadlock is detected:
 
-1. Any member with `GovernancePropose` capability can propose a `ReconfigureGovernance` meta-action. This is a special governance action that modifies the governance model's parameters (e.g., reducing `threshold`, removing inactive signers) without changing the model type.
-2. The `ReconfigureGovernance` proposal follows a fallback quorum: the remaining active voters use majority-of-active as the quorum rule, regardless of the original governance model. This prevents a dead signer from permanently blocking all governance.
+1. Any member with `GovernancePropose` capability can propose a `GovernanceAction::ReconfigureGovernance` action via the standard `propose()` interface. This is a governance action that modifies the governance model's parameters (e.g., reducing `threshold`, removing inactive signers) without changing the model type.
+2. The `ReconfigureGovernance` proposal follows a fallback quorum: the remaining active voters use majority-of-active as the quorum rule, regardless of the original governance model. The governance engine detects the `ReconfigureGovernance` variant and applies the fallback quorum instead of the context's normal resolution rules. This prevents a dead signer from permanently blocking all governance.
 3. The fallback is logged as a `GovernanceDeadlockRecovery` event in the event log with full justification (which signers are unavailable, how long, what the original quorum was).
 4. Members who disagree with the deadlock recovery can exercise exit-as-veto (§9.2.1) — leave the context.
 
 ```rust
-/// Deadlock recovery meta-action. Uses fallback quorum rules.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReconfigureGovernance {
-    /// What to change in the governance configuration.
-    pub changes: Vec<GovernanceReconfigAction>,
-    /// Justification — which voters are unavailable and evidence.
-    pub justification: DeadlockJustification,
-}
+// ReconfigureGovernance is now a GovernanceAction variant (see section 2).
+// Supporting types:
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceReconfigAction {
@@ -2821,21 +2833,23 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 // GovernanceModelConfig with SingleAdmin, Threshold, Majority, Unanimity variants.
 // Validation: GovernanceModelConfig::validate() -> Result<(), GovernanceError>
 //   - Threshold: 1 <= threshold <= signers.len(), signers non-empty, window in [300, 604_800]
-//   - Majority: min_participation in (0.0, 1.0], window in [300, 604_800]
+//   - Majority: min_participation_bps in (0, 10000], window in [300, 604_800]
 //   - Unanimity: window in [300, 604_800]
 ```
 
 2. **`GovernanceProposal` struct and `GovernanceAction` enum:**
 
    - `GovernanceProposal` with `proposal_id`, `context_id`, `proposer_did`, `action`, `status`, `created_at`, `voting_deadline`, `approvals`, `rejections`, `created_at_epoch`.
-   - `GovernanceAction` with all 23 variants listed in section 3 (including content access actions: RevokeReadAccess, RestoreReadAccess, RevokeWriteAccess, RestoreWriteAccess, RotateContentKeys) and `RevocationScope` enum (Full, FutureOnly).
+   - `GovernanceAction` with all 24 variants listed in section 3 (including content access actions: RevokeReadAccess, RestoreReadAccess, RevokeWriteAccess, RestoreWriteAccess, RotateContentKeys) and `RevocationScope` enum (Full, FutureOnly).
    - `ProposalStatus` with `Pending`, `Approved`, `Rejected`, `Expired`, `Cancelled`, `Invalidated`.
    - Proposals are persisted to `ProtocolStore` on creation and on every status change.
 
 3. **`SingleAdminEngine` implementation:**
 
    - `propose()` creates a proposal and immediately sets status to `Approved` if the proposer is the admin DID. Returns `GovernanceError::NotAdmin` if proposer is not the admin.
+   - **Content access revocation cool-down:** `RevokeReadAccess` and `RevokeWriteAccess` actions in `SingleAdmin` contexts MUST deliver the revocation notification to the affected member before executing the access key deletion. This prevents silent, instant silencing with no recourse. The affected member receives the notification and can exercise exit-as-veto (§9.2.1) or appeal to other context members. The cool-down does not apply to multi-admin models (which already require governance approval from multiple parties).
    - `approve()`/`reject()` return current status (no-op).
+   - `cancel()` sets status to `Cancelled` if the proposal is `Pending` and the caller is the admin. Returns error otherwise.
    - `eligible_voters()` returns `[admin_did]`.
 
 4. **`ThresholdEngine` implementation:**
@@ -2897,6 +2911,12 @@ GovernanceConflictResolved {
 GovernanceDeadlockRecovery {
     justification: DeadlockJustification,
     changes: Vec<GovernanceReconfigAction>,
+},
+GovernanceActionExecuted {
+    proposal_id: ProposalId,
+    action: GovernanceAction,
+    executor_did: DID,
+    resulting_epoch: Option<u64>,
 },
 ```
 
@@ -3072,7 +3092,7 @@ pub struct WrappedCek {
 
 #### 2. Access Key Lifecycle
 
-**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE using the same pull-based protocol as sender keys (ADR-007 §9.16.2): the new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-encrypted access key.
+**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE using the same pull-based protocol as sender keys (ADR-007 §9.16.2): the new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-encrypted access key. HPKE info strings for access key distribution MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch` (sender keys use `"scp-sender-key-v1"`). This prevents cross-protocol key confusion where a compromised access key response could be replayed as a sender key response.
 
 **Distribution.** Access keys are distributed via two new wire types:
 
@@ -3080,7 +3100,11 @@ pub struct WrappedCek {
 pub struct AccessKeyRequest {
     pub requester_did: DID,
     pub context_id: ContextId,
+    pub epoch: u64,
+    pub timestamp: u64,  // Unix milliseconds; requests older than 30s are rejected
     pub wrapping_pubkey: X25519PublicKey,  // Ephemeral, per-request
+    /// Ed25519 signature over: SHA-256(context_id || requester_did || epoch || timestamp || wrapping_pubkey)
+    /// using the requester's Active Signing Key. Prevents replay and impersonation.
     pub signature: Ed25519Signature,
 }
 
@@ -3098,14 +3122,13 @@ pub struct AccessKeyResponse {
 1. Generate a fresh CEK (32 random bytes).
 2. Encrypt the message content with AES-256-GCM using the CEK.
 3. For each intended recipient: wrap the CEK with AES-256-KW using the recipient's access key.
-4. Publish: `{ ciphertext, nonce, wrapped_ceks, content_hash }`.
+4. Publish: `{ ciphertext, nonce, wrapped_ceks }`. Integrity is verified by the AES-256-GCM authentication tag — no separate content hash is stored.
 
 On receive:
 
 1. Look up own `member_id` (truncated DID hash) in `wrapped_ceks`.
 2. Unwrap the CEK with own access key using AES-256-KW.
-3. Decrypt the ciphertext with AES-256-GCM using the unwrapped CEK.
-4. Verify `content_hash == SHA-256(plaintext)`.
+3. Decrypt the ciphertext with AES-256-GCM using the unwrapped CEK. The AEAD authentication tag verifies integrity.
 
 **Revocation (Full).** On `RevokeReadAccess { did, scope: Full }` or identity-level block:
 
@@ -3166,9 +3189,11 @@ pub struct WrappedContent {
     /// Key: first 8 bytes of SHA-256(member_did) — prevents DID publication.
     /// Value: AES-256-KW wrapped CEK (40 bytes).
     pub wrapped_ceks: Vec<WrappedCek>,
-    /// SHA-256 of plaintext for integrity verification.
-    pub content_hash: [u8; 32],
 }
+// Integrity is verified by AES-256-GCM's authentication tag.
+// No separate content_hash field — storing SHA-256(plaintext) alongside
+// ciphertext would create a plaintext confirmation oracle for low-entropy
+// messages, allowing attackers to verify guesses without the access key.
 ```
 
 The `wrapped_ceks` field uses a `Vec<WrappedCek>` (not a HashMap) for deterministic serialization and to avoid hash-table overhead in the wire format. Recipients scan linearly for their `member_id` — for typical context sizes (<1000 members), linear scan is faster than hash lookup.
@@ -3180,7 +3205,15 @@ Layer 2 (§9.16.7) and Layer 3 (this ADR) are complementary:
 - **Layer 2** requires the target's SDK to destroy cached material from the blocker.
 - **Layer 3** requires all SDKs to destroy the target's access key.
 
-Together: the target cannot decrypt historical content (Layer 3 — access key gone from all clients) AND the target's local cache is purged (Layer 2 — cached plaintext destroyed). Defense-in-depth: either layer alone is sufficient against a compliant SDK; both together provide robustness against bugs in either layer's implementation.
+Together: the target cannot decrypt historical content (Layer 3 — access key gone from all clients) AND the target's local cache is purged (Layer 2 — cached plaintext destroyed). Each layer handles a distinct threat surface that the other cannot:
+
+| Layer | Uniquely handles |
+|-------|-----------------|
+| 1 (key denial) | Immediate future message protection, O(1) |
+| 2 (SDK destruction) | Cached plaintext on target's device (compliance, not cryptographic) |
+| 3 (access key) | Retroactive ciphertext revocation at relay |
+
+The layers are not redundant — they cover distinct failure modes.
 
 ### Rationale
 
@@ -3235,7 +3268,7 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
    - `wrap_cek(cek, access_key) -> WrappedCek` uses AES-256-KW (RFC 3394), producing 40-byte output.
    - `unwrap_cek(wrapped_cek, access_key) -> Result<ContentEncryptionKey, CryptoError>` verifies integrity check.
    - `wrap_content(plaintext, recipients: &[AccessKey]) -> WrappedContent` generates CEK, encrypts content, wraps CEK for each recipient.
-   - `unwrap_content(wrapped: &WrappedContent, access_key: &AccessKey) -> Result<Vec<u8>, CryptoError>` finds own wrapped CEK, unwraps, decrypts, verifies content_hash.
+   - `unwrap_content(wrapped: &WrappedContent, access_key: &AccessKey) -> Result<Vec<u8>, CryptoError>` finds own wrapped CEK, unwraps, decrypts (AEAD tag verifies integrity).
 
 3. **Full revocation:**
 
