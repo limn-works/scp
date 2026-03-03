@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 sqlite-blob = ["dep:rusqlite"]
 redb-blob = ["dep:redb"]
+local-cache = []
 
 [dependencies]
 scp-core = { path = "../scp-core" }
@@ -31,9 +32,6 @@ rand = { workspace = true }
 subtle = "2"
 rusqlite = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
-
-[features]
-local-cache = []
 
 [dev-dependencies]
 scp-core = { path = "../scp-core" }

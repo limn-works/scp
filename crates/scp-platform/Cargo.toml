@@ -24,12 +24,18 @@ testing = ["software_platform"]
 sqlite = ["dep:rusqlite", "dep:hex"]
 # Filesystem storage adapter (spec section 17.6).
 filesystem = []
+# SyncableStorage wrapper for P2P state synchronization (SCP-PERSIST-064).
+# Adds mutation tracking via a write-ahead changelog stored in the inner storage.
+sync = ["dep:rmp-serde"]
 
 [dependencies]
 serde = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
 zeroize = { workspace = true }
+
+# sync dependencies, gated behind the `sync` feature flag.
+rmp-serde = { workspace = true, optional = true }
 
 # software_platform dependencies, gated behind the `software_platform` feature flag.
 ed25519-dalek = { workspace = true, optional = true }

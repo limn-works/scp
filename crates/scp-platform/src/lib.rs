@@ -51,6 +51,8 @@ pub mod android;
 pub mod filesystem;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(feature = "sync")]
+pub mod syncable;
 pub mod traits;
 
 // Re-export all public types for ergonomic access.

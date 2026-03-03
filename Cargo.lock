@@ -3816,6 +3816,7 @@ dependencies = [
  "hex",
  "hmac",
  "rand 0.8.5",
+ "rmp-serde",
  "rusqlite",
  "scp-testing",
  "serde",
