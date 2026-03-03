@@ -87,6 +87,24 @@ fn roles_prefix(context_id: &str) -> Result<String, super::StoreError> {
     Ok(format!("context/{ctx}/role/"))
 }
 
+/// Builds the storage key for a sender key within a context.
+///
+/// Format: `context/{context_id}/sender_key/{did}`
+/// See spec section 17.3.
+fn sender_key_key(context_id: &str, did: &DID) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("context/{ctx}/sender_key/{did_str}"))
+}
+
+/// Builds the prefix for listing all sender keys in a context.
+///
+/// Format: `context/{context_id}/sender_key/`
+fn sender_key_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/sender_key/"))
+}
+
 /// Builds the storage key for broadcast context state.
 ///
 /// Format: `context/{context_id}/broadcast_state`
@@ -354,6 +372,89 @@ impl<S: Storage> ProtocolStore<S> {
             .filter_map(|key| key.strip_prefix(&prefix).map(String::from))
             .collect();
         Ok(role_names)
+    }
+
+    // -----------------------------------------------------------------------
+    // Sender key methods (SCP-PERSIST-013)
+    // -----------------------------------------------------------------------
+
+    /// Stores a sender key for a DID within a context.
+    ///
+    /// Serializes the sender key under
+    /// `context/{context_id}/sender_key/{did}` wrapped in a
+    /// `StoredValue` version envelope.
+    ///
+    /// See spec section 17.3 and 17.4. See SCP-PERSIST-013.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_sender_key(
+        &self,
+        context_id: &str,
+        did: &DID,
+        key: &[u8],
+    ) -> Result<(), StoreError> {
+        let storage_key = sender_key_key(context_id, did)?;
+        self.store_value(&storage_key, &key.to_vec()).await
+    }
+
+    /// Loads a sender key for a DID within a context.
+    ///
+    /// Returns `None` if no sender key exists for the given DID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_sender_key(
+        &self,
+        context_id: &str,
+        did: &DID,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let storage_key = sender_key_key(context_id, did)?;
+        self.load_value(&storage_key).await
+    }
+
+    /// Lists all sender keys for a context.
+    ///
+    /// Returns a vector of `(DID, sender_key_bytes)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
+    /// Returns [`StoreError::DeserializationFailed`] if any sender key fails
+    /// to deserialize.
+    pub async fn list_sender_keys(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<(DID, Vec<u8>)>, StoreError> {
+        let prefix = sender_key_prefix(context_id)?;
+        let keys = self.storage.list_keys(&prefix).await?;
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(did_str) = key.strip_prefix(&prefix) {
+                let did = DID::from(did_str);
+                if let Some(sk) = self.load_sender_key(context_id, &did).await? {
+                    results.push((did, sk));
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Removes a sender key for a DID within a context.
+    ///
+    /// No-op if the sender key does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
+    pub async fn remove_sender_key(&self, context_id: &str, did: &DID) -> Result<(), StoreError> {
+        let storage_key = sender_key_key(context_id, did)?;
+        self.storage.delete(&storage_key).await?;
+        Ok(())
     }
 
     /// Stores the full broadcast context state for persistence across restarts.
@@ -717,6 +818,82 @@ mod tests {
         assert_eq!(
             role_key("ctx-123", "admin").unwrap(),
             "context/ctx-123/role/admin"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Sender keys (SCP-PERSIST-013)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_and_load_sender_key_roundtrip() {
+        let store = make_store();
+        let did = test_did();
+        let key_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+
+        store
+            .store_sender_key("ctx-1", &did, &key_data)
+            .await
+            .unwrap();
+        let loaded = store.load_sender_key("ctx-1", &did).await.unwrap();
+        assert_eq!(loaded, Some(key_data));
+    }
+
+    #[tokio::test]
+    async fn load_sender_key_returns_none_for_missing() {
+        let store = make_store();
+        let did = test_did();
+
+        let loaded = store.load_sender_key("ctx-1", &did).await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_sender_keys_returns_all_pairs() {
+        let store = make_store();
+        let did_a = DID::from("did:dht:z6MkAlice");
+        let did_b = DID::from("did:dht:z6MkBob");
+
+        store
+            .store_sender_key("ctx-1", &did_a, b"key-a")
+            .await
+            .unwrap();
+        store
+            .store_sender_key("ctx-1", &did_b, b"key-b")
+            .await
+            .unwrap();
+
+        let mut keys = store.list_sender_keys("ctx-1").await.unwrap();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].0, did_a);
+        assert_eq!(keys[0].1, b"key-a".to_vec());
+        assert_eq!(keys[1].0, did_b);
+        assert_eq!(keys[1].1, b"key-b".to_vec());
+    }
+
+    #[tokio::test]
+    async fn remove_sender_key_deletes_entry() {
+        let store = make_store();
+        let did = test_did();
+
+        store
+            .store_sender_key("ctx-1", &did, b"key-data")
+            .await
+            .unwrap();
+        store.remove_sender_key("ctx-1", &did).await.unwrap();
+
+        let loaded = store.load_sender_key("ctx-1", &did).await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn sender_key_key_follows_convention() {
+        let did = DID::from("did:dht:z6MkTest");
+        assert_eq!(
+            sender_key_key("ctx-123", &did).unwrap(),
+            "context/ctx-123/sender_key/did:dht:z6MkTest"
         );
     }
 
