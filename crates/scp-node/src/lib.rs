@@ -1024,10 +1024,7 @@ fn spawn_tier_reevaluation(
             }
         }
     });
-    TierReEvalHandle {
-        task,
-        cancel_tx,
-    }
+    TierReEvalHandle { task, cancel_tx }
 }
 
 // ---------------------------------------------------------------------------

@@ -567,7 +567,9 @@ fn pick_winner_and_detect_divergence(
                     fresher_seq: relay_rec.resolved.seq,
                 }),
                 Ordering::Less => Some(HealingInfo {
-                    stale_layer: StaleLayer::Relay { relay_urls: relay_urls.to_vec() },
+                    stale_layer: StaleLayer::Relay {
+                        relay_urls: relay_urls.to_vec(),
+                    },
                     raw_value: dht_rec.raw_value.clone(),
                     raw_signature: dht_rec.raw_signature,
                     fresher_seq: dht_rec.resolved.seq,

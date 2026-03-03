@@ -179,8 +179,7 @@ const BRIDGE_REGISTER_SIGN_PREFIX: &[u8] = b"SCP-BRIDGE-REGISTER-V1:";
 /// The domain separator prevents cross-protocol signature confusion.
 #[must_use]
 pub fn bridge_register_signable(routing_id: &[u8; 32], timestamp: u64) -> Vec<u8> {
-    let mut buf =
-        Vec::with_capacity(BRIDGE_REGISTER_SIGN_PREFIX.len() + 32 + 8);
+    let mut buf = Vec::with_capacity(BRIDGE_REGISTER_SIGN_PREFIX.len() + 32 + 8);
     buf.extend_from_slice(BRIDGE_REGISTER_SIGN_PREFIX);
     buf.extend_from_slice(routing_id);
     buf.extend_from_slice(&timestamp.to_be_bytes());
@@ -268,9 +267,11 @@ pub fn verify_bridge_registration(
 
     let signable = bridge_register_signable(&registration.routing_id, registration.timestamp);
     let signature = ed25519_dalek::Signature::from_bytes(&registration.signature);
-    verifying_key.verify_strict(&signable, &signature).map_err(|e| {
-        BridgeAuthError::InvalidSignature(format!("signature verification failed: {e}"))
-    })?;
+    verifying_key
+        .verify_strict(&signable, &signature)
+        .map_err(|e| {
+            BridgeAuthError::InvalidSignature(format!("signature verification failed: {e}"))
+        })?;
 
     // Step 3: Verify routing_id == SHA-256("scp:did:" || did_string).
     let did_string = did_from_ed25519_public_key(&registration.public_key);
@@ -372,9 +373,7 @@ impl BridgeRegistry {
         let server_time_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .map_err(|_| {
-                TransportError::ProtocolError("system clock error".into())
-            })?;
+            .map_err(|_| TransportError::ProtocolError("system clock error".into()))?;
 
         verify_bridge_registration(registration, server_time_secs).map_err(|e| {
             warn!(
