@@ -800,12 +800,13 @@ Sender keys are distributed via a pull-based request/response protocol. When a s
 
 When Alice blocks Bob:
 
-1. Alice generates a new AES-256-GCM sender key and increments her `sender_key_epoch`.
-2. Alice publishes `SenderKeyEpochAdvance { sender_did: alice_did, epoch: N, signature }` as an MLS application message. **O(1) cost** — no per-recipient HPKE payloads. All group members see the epoch advance.
-3. Alice sends a **signed** block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice", "blocked": "did:dht:bob", "timestamp": unix_ms, "signature": Ed25519_sign(alice_active_signing_key, SHA-256(context_id || "block" || alice_did || bob_did || timestamp))}`. The signature prevents forgery — without it, any group member could impersonate Alice and trick Bob into rotating his sender key. MLS application messages prove group membership but not individual sender identity within the message payload.
-4. Non-blocked members observe the epoch advance and send `SenderKeyRequest` for Alice's new key (§9.16.2). Alice's SDK checks the block list for each request — responds with the HPKE-encrypted key for non-blocked members, ignores requests from Bob. **O(1) per response.**
-5. Bob's client **verifies the block notification signature** against Alice's known Active Signing Key (from her MLS LeafNode `scp_signing_key` extension). If verification fails, the notification is discarded and logged for anomaly detection. If verification succeeds, Bob's client automatically rotates Bob's sender key (incrementing his own epoch), publishes his own `SenderKeyEpochAdvance`, and adds Alice to Bob's block list. When members request Bob's new key, Bob's SDK responds to everyone except Alice.
-6. The block event is recorded in the context event log with `EventType::MemberBlocked { blocker, blocked, signature }` for auditability.
+1. Alice persists the block to her block list (identity private state, §3.7.1 for global blocks; context state for in-context blocks) BEFORE any key operations. **This ordering is mandatory** — the block list must be authoritative before `SenderKeyEpochAdvance` publication. Without this ordering invariant, Bob can race to send a `SenderKeyRequest` for the new key before the block list is updated, defeating the block.
+2. Alice generates a new AES-256-GCM sender key and increments her `sender_key_epoch`.
+3. Alice publishes `SenderKeyEpochAdvance { sender_did: alice_did, epoch: N, signature }` as an MLS application message. **O(1) cost** — no per-recipient HPKE payloads. All group members see the epoch advance.
+4. Alice sends a **signed** block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice", "blocked": "did:dht:bob", "timestamp": unix_ms, "signature": Ed25519_sign(alice_active_signing_key, SHA-256(context_id || "block" || alice_did || bob_did || timestamp))}`. The signature prevents forgery — without it, any group member could impersonate Alice and trick Bob into rotating his sender key. MLS application messages prove group membership but not individual sender identity within the message payload.
+5. Non-blocked members observe the epoch advance and send `SenderKeyRequest` for Alice's new key (§9.16.2). Alice's SDK checks the block list for each request — responds with the HPKE-encrypted key for non-blocked members, ignores requests from Bob. **O(1) per response.** For global blocks (Tier 2), Alice's SDK checks the identity-level block list directly — not only the per-context block list — to prevent bypass via context-level propagation delays.
+6. Bob's client **verifies the block notification signature** against Alice's known Active Signing Key (from her MLS LeafNode `scp_signing_key` extension). If verification fails, the notification is discarded and logged for anomaly detection. If verification succeeds, Bob's client automatically rotates Bob's sender key (incrementing his own epoch), publishes his own `SenderKeyEpochAdvance`, and adds Alice to Bob's block list. When members request Bob's new key, Bob's SDK responds to everyone except Alice.
+7. The block event is recorded in the context event log with `EventType::MemberBlocked { blocker, blocked, signature }` for auditability.
 
 **Block event observability:** Block events are observable to the group. The epoch advance notifications are visible to all members, and the block notification is an MLS application message. Other members can infer the block. This is an acceptable tradeoff, consistent with how other messaging systems handle blocks. The protocol prioritizes cryptographic enforcement of the block over concealing the block event.
 
@@ -846,3 +847,161 @@ The expansion mechanism is provided by `expand_block_list`, which accepts a bloc
 **Mitigation 3: Group blocking.** When a Sybil cluster is identified, all linked DIDs SHOULD be blocked atomically in a single key rotation (one epoch advance) rather than N separate rotations. This prevents the Sybil attacker from observing individual blocks and rotating identities between rotations.
 
 **Residual risk.** These mitigations raise the cost and complexity of Sybil block bypass but do not eliminate it. A sufficiently motivated attacker who can satisfy context admission requirements with a fresh DID — one with no attestation linkage to the blocked identity — can still obtain sender keys. This is consistent with the protocol's Sybil resistance philosophy (§9.3): make attacks expensive to sustain, not impossible to attempt. The defense layers compose: membership gates make Sybil identities useless without admission, identity-linked expansion blocks known aliases, and context-level thresholds raise the cost of creating useful new identities.
+
+### 9.16.7 SDK-Mandated State Destruction (Layer 2)
+
+When a block event is received and verified (§9.16.3 step 5), the blocked party's SDK MUST destroy all locally cached material from the blocking party:
+
+1. **Cached sender keys.** Delete all sender key epochs from the blocker. The blocked party cannot request new keys (Layer 1) and MUST NOT retain old keys for historical decryption of the blocker's content. This is a protocol requirement, not a recommendation.
+2. **Cached plaintext.** Delete all decrypted message content originating from the blocker. Application-layer caches (message databases, search indices) MUST be purged of the blocker's content.
+3. **Cached access keys.** If access keys (§9.17) are in use, delete the blocker's access key for the blocked party. This makes stored ciphertext from the blocker undecryptable at the relay level.
+
+**Compliance requirement.** SDK-mandated destruction is a protocol requirement for compliant clients. An SDK that retains cached material from a blocking party after receiving a verified block notification is non-compliant. The protocol cannot prevent a determined adversary from forking the SDK, but the default behavior of all compliant implementations enforces destruction. This is consistent with the protocol's trust model: the blocker trusts the blocked party's SDK to be compliant (same as trusting MLS implementations to delete old epoch keys).
+
+**Timing.** Destruction MUST occur before the SDK processes any subsequent messages. The block notification handler is synchronous with respect to message processing — no messages from the blocker are decrypted between receiving the block notification and completing destruction. In practice, this means the block handler runs in the message processing pipeline, not in a background task.
+
+**Batch processing.** When processing a catch-up queue (multiple messages in a batch), the block notification's sequence number determines the enforcement boundary. Messages from the blocker with sequence numbers LOWER than the block notification were legitimately sent before the block and SHOULD be processed normally. Messages with sequence numbers HIGHER than the block notification MUST be discarded. The SDK MUST drain pre-block messages from the batch before executing destruction.
+
+### 9.16.8 Unblocking (Forward-Only Restoration)
+
+Unblocking reverses the key distribution denial (Layer 1) but does NOT restore historical access:
+
+1. The blocker removes the target DID from their block list (identity private state, §3.7.1).
+2. The blocker does NOT rotate their sender key. The current key remains valid.
+3. When the previously-blocked party sends a `SenderKeyRequest`, the blocker's SDK checks the updated block list and responds with the current sender key.
+4. The previously-blocked party can now decrypt the blocker's future messages (encrypted with the current sender key epoch and all subsequent epochs).
+
+**Historical gap is permanent.** Content encrypted during the block period used sender key epochs that the blocked party never received and cannot retroactively obtain. The blocker's SDK destroyed the blocked party's access keys (Layer 3, §9.17) and the blocked party's SDK destroyed cached material (Layer 2). Neither side retains the material needed to restore historical access. This is by design: the user promise is "if you're blocked, content is gone; if you're unblocked, you can see new content going forward."
+
+**Forward secrecy interaction.** Old sender keys are destroyed on the blocked party's side (Layer 2) and access keys are deleted (Layer 3). Even if the blocked party somehow retained old sender keys (non-compliant SDK), the access key deletion at Layer 3 makes stored ciphertext undecryptable at the relay level. The three layers provide defense-in-depth with distinct coverage:
+
+| Layer | Uniquely handles |
+|-------|-----------------|
+| 1 (key denial) | Immediate future message protection, O(1) |
+| 2 (SDK destruction) | Cached plaintext on target's device |
+| 3 (access key) | Retroactive ciphertext revocation at relay |
+
+Layer 2 is a compliance requirement for already-decrypted plaintext, not a cryptographic guarantee — a non-compliant SDK can retain cached plaintext. Layers 1 and 3 provide cryptographic enforcement. All three together make the guarantee robust against distinct failure modes.
+
+**Stacking with governance.** If governance (Tier 3) has also revoked the target's access via `RevokeReadAccess` or `RevokeWriteAccess`, the identity-level unblock (Tier 1 or 2) does NOT restore access. Both the identity-level block and the governance revocation must be independently reversed. The target's effective access is the intersection (most restrictive) of all active tiers.
+
+## 9.17 Content Access Key Layer
+
+The sender-side key layer (§9.16) provides selective readability through key distribution denial. The content access key layer adds a second cryptographic enforcement mechanism: per-member access keys that wrap content encryption keys (CEKs). Deleting a member's access key makes stored content undecryptable — retroactive revocation that Layer 1 alone cannot achieve.
+
+### 9.17.1 Key Architecture
+
+Each member in a context holds a per-member **access key** — an AES-256 symmetric key generated at join time. Content encryption keys (CEKs) are wrapped (encrypted) with each intended recipient's access key before storage. A member who loses their access key cannot unwrap the CEK, and therefore cannot decrypt the content.
+
+```
+Content Encryption:
+  plaintext → AES-256-GCM(CEK) → ciphertext
+  CEK → AES-256-KW(access_key_alice) → wrapped_cek_alice
+  CEK → AES-256-KW(access_key_bob) → wrapped_cek_bob
+  ...
+  stored: { ciphertext, wrapped_ceks: { alice: wrapped_cek_alice, bob: wrapped_cek_bob, ... } }
+```
+
+**Key types:**
+- **Content Encryption Key (CEK):** AES-256, generated per message (or per message batch). Encrypts the actual content. Ephemeral — not stored after wrapping.
+- **Access Key:** AES-256, per member per context. Generated at join time. Used to wrap/unwrap CEKs. Stored in the member's local key store and distributed via HPKE (same mechanism as sender keys, §9.16.2). HPKE info strings for access key distribution MUST use a distinct domain separator from sender key distribution: `info = "scp-access-key-v1" || context_id || member_did || epoch` (vs `"scp-sender-key-v1"` for sender keys). This prevents cross-protocol key confusion.
+- **Key Wrapping:** AES-256-KW (RFC 3394). Deterministic, no IV needed. The wrapped CEK is stored alongside the ciphertext.
+
+**AES-256-GCM additional authenticated data (AAD).** Content encryption MUST bind `context_id` as AAD: `AAD = context_id || sender_did || sequence_number`. This prevents ciphertext from being moved between contexts or reordered within a context. The AEAD authentication tag provides integrity verification — no separate content hash is needed.
+
+**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp }` signed with the requester's Active Signing Key. The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. The timestamp prevents replay (requests older than 30 seconds are rejected).
+
+### 9.17.2 Access Key Lifecycle
+
+1. **Generation.** When a member joins a context, a fresh random 32-byte AES-256 access key is generated by the context creator (or the member who executed the `AddMember` governance action). The access key is distributed to the new member via HPKE, using the same pull-based protocol as sender keys (§9.16.2).
+
+2. **Normal operation.** Each message sender generates a fresh CEK, encrypts the content, wraps the CEK with each intended recipient's access key, and publishes the wrapped CEKs alongside the ciphertext. In encrypted contexts, this wrapping occurs BEFORE the MLS encryption layer. In broadcast contexts, it occurs before the sender key encryption.
+
+3. **Revocation.** On `RevokeReadAccess { did, scope: Full }` (governance, Tier 3) or on block (Tiers 1-2): the target's access key is deleted from all members who hold it. Without the access key, the target cannot unwrap CEKs for any stored content. This is retroactive — previously decryptable content becomes undecryptable.
+
+4. **Revocation (FutureOnly).** On `RevokeReadAccess { did, scope: FutureOnly }`: the target is excluded from future CEK wrapping (their access key is no longer used for new messages) but existing wrapped CEKs are not deleted. The target can still decrypt historical content with their cached access key.
+
+5. **Restoration.** On `RestoreReadAccess { did }` or unblock: a NEW access key is generated for the target. The new key is used for future CEK wrapping only. Historical wrapped CEKs used the old (deleted) access key — they are permanently inaccessible. This enforces the forward-only restoration guarantee.
+
+6. **Context-wide rotation.** On `RotateContentKeys { reason }`: all access keys are rotated. Every member receives a new access key. Future content uses new CEKs wrapped with new access keys. Historical content remains accessible with old access keys (which members retain locally). This is for periodic hygiene or post-compromise recovery, not for targeted revocation.
+
+### 9.17.3 Wire Format
+
+```rust
+pub struct WrappedContent {
+    /// AES-256-GCM encrypted content.
+    pub ciphertext: Vec<u8>,
+    /// AES-256-GCM nonce.
+    pub nonce: [u8; 12],
+    /// Per-recipient wrapped CEKs. Ordered by member_id for deterministic serialization.
+    pub wrapped_ceks: Vec<WrappedCek>,
+}
+
+pub struct WrappedCek {
+    /// First 8 bytes of SHA-256(member_did) — prevents DID publication.
+    pub member_id: [u8; 8],
+    /// AES-256-KW wrapped CEK (40 bytes: 32-byte CEK + 8-byte integrity check).
+    pub wrapped_key: [u8; 40],
+}
+```
+
+The `wrapped_ceks` field uses `Vec<WrappedCek>` (not a HashMap) for deterministic serialization and to avoid hash-table overhead in the wire format. Recipients scan linearly for their `member_id` — for typical context sizes (<1000 members), linear scan is faster than hash lookup. Truncated DID hashes (8 bytes) avoid publishing full DIDs in the envelope, primarily beneficial for broadcast contexts where the subscriber list is not universally known; applied uniformly across context types for wire format consistency. Collision probability for 8-byte hashes is negligible for context sizes up to millions of members. Integrity verification uses AES-256-GCM's authentication tag — no separate content hash is needed.
+
+### 9.17.4 Interaction with MLS and Sender Keys
+
+**Encrypted contexts (MLS).** The content access key layer sits INNERMOST (closest to plaintext). Content encryption + CEK wrapping is a single logical operation: generate a CEK, encrypt plaintext with the CEK, wrap the CEK for each recipient. The result is then passed through the sender key and MLS layers:
+
+```
+Encryption: plaintext → AES-GCM(CEK) → {ciphertext, wrapped_ceks} → sender_key_encrypt → MLS_encrypt → relay
+Decryption: relay → MLS_decrypt → sender_key_decrypt → unwrap_cek → AES-GCM_decrypt(CEK) → plaintext
+```
+
+The access key provides per-member selectivity (Tier 3 governance). The sender key provides per-sender selectivity (Tiers 1-2 blocking). MLS provides group confidentiality against outsiders. All three layers are independent — revoking any single layer's key is sufficient to deny access.
+
+**Broadcast contexts.** The content access key layer is innermost, with the broadcast key as the outer layer:
+
+```
+Encryption: plaintext → AES-GCM(CEK) → {ciphertext, wrapped_ceks} → broadcast_key_encrypt → relay
+Decryption: relay → broadcast_key_decrypt → unwrap_cek → AES-GCM_decrypt(CEK) → plaintext
+```
+
+Because `WrappedContent` (including the `wrapped_ceks` entries) is inside the broadcast key encryption boundary, the relay and non-subscribers cannot observe the wrapped CEK entries. This prevents the `wrapped_ceks` from serving as a membership enumeration oracle.
+
+### 9.17.5 Revocation Mechanics
+
+**Full revocation (retroactive):**
+
+1. Delete the target's access key from all members' local stores.
+2. Notify all members via an `AccessKeyRevoked { did, scope: Full }` event.
+3. Each member's SDK purges the target's access key from their key store.
+4. The relay retains the ciphertext and wrapped CEKs, but the target's wrapped CEK is now useless — the target's access key (needed to unwrap it) no longer exists on any compliant client.
+5. The target cannot request the access key via the pull-based protocol — the key holder checks the revocation list and denies the request (same pattern as sender key block list check).
+
+**FutureOnly revocation:**
+
+1. The target's DID is added to the exclusion list for future CEK wrapping.
+2. New messages do not include a wrapped CEK for the target.
+3. The target retains their existing access key and can still unwrap CEKs for historical messages.
+4. Effectively a "soft block" — the target can read the past but not the future.
+
+### 9.17.6 Forward Secrecy Interaction
+
+The content access key layer interacts with forward secrecy as follows:
+
+- **CEKs are ephemeral.** Each message gets a fresh CEK. Compromise of one CEK reveals one message, not the entire conversation.
+- **Access keys are long-lived within an epoch.** An access key persists from join to revocation (or context-wide rotation). This is necessary for the retroactive revocation property — if access keys rotated frequently, retroactive revocation would only cover the current epoch.
+- **Old access keys are retained by legitimate members.** Members keep their access keys for historical message decryption. This is consistent with §9.16.5 — sender keys are also retained for historical access. The boundary is block/revocation events, not time.
+- **On revocation, access keys are destroyed.** The target's access key is deleted from all compliant clients (Layer 3). The key is not archived or escrowed. This is permanent — there is no mechanism to restore historical access after a Full revocation.
+
+### 9.17.7 Performance Characteristics
+
+| Operation | Cost | Notes |
+|-----------|------|-------|
+| CEK generation | 32 bytes random | Per message or per batch |
+| CEK wrapping | AES-256-KW per recipient | O(N) where N = recipients. ~0.1μs per wrap |
+| CEK unwrapping | Single AES-256-KW | O(1) for the recipient |
+| Access key distribution | HPKE per new member | Same as sender key distribution |
+| Full revocation | Delete from local stores | O(M) where M = members holding the key |
+| Storage overhead | 40 bytes per recipient per message | Wrapped CEK = 32-byte CEK + 8-byte KW check value |
+
+For a context with 100 members, each message adds ~4KB of wrapped CEKs (100 × 40 bytes). For broadcast contexts with thousands of subscribers, the wrapped CEK map scales linearly but remains small relative to content size. Contexts with >10,000 members SHOULD use batched CEK wrapping (wrap once per batch of messages, not per message) to amortize the per-recipient cost.

@@ -131,6 +131,8 @@ Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (ag
 
 **Reviews are not rubber stamps.** Read every finding. If a reviewer flags something, understand the concern fully before dismissing it. Assume reviewers are right until you can prove otherwise with evidence from specs or code. Act on review feedback — don't acknowledge and move on. When a review surfaces a real issue, fix it and update the relevant artifacts.
 
+**Take every finding seriously.** Only dismiss things that are categorically, objectively false or truly non-issues. Even slight suggestions — defense in depth, cleanup, clarity, incorrect comments, spec gaps, learnings — if there's any merit to them at all, whether in literal content or in spirit, take them seriously and use them to improve the code. Don't dismiss things because they seem out of scope, are nits, or appear generally not actionable. Only dismiss things that are absolutely not actionable because they are wrong.
+
 ## Project Map
 
 ```

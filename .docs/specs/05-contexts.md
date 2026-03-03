@@ -139,6 +139,33 @@ The governance model is declared at creation and visible to all. Governance impl
 
 2. **Proposal replay protection.** Each context MUST track the set of executed proposal IDs. A proposal that has already been executed MUST be rejected on subsequent submission. This prevents double-execution of approved proposals — even when the underlying operation is idempotent (e.g., blocking an already-blocked author returns `MemberNotFound`), explicit replay detection provides a clean error path and prevents side effects from re-executing event log entries or notifications.
 
+**Content access governance.** Governance controls five content access actions that decouple membership from access (see ADR-031, §9.17):
+
+| Action | Effect | Scope |
+|--------|--------|-------|
+| `RevokeReadAccess { did, scope }` | Revoke decryption access to context content | `Full` (retroactive + future) or `FutureOnly` |
+| `RestoreReadAccess { did }` | Restore decryption access, forward-only | Future content only — historical gap permanent |
+| `RevokeWriteAccess { did, scope }` | Revoke publishing authority | `Full` (stop + suppress historical) or `FutureOnly` |
+| `RestoreWriteAccess { did }` | Restore publishing authority, forward-only | Future content only |
+| `RotateContentKeys { reason }` | Context-wide key rotation | All members, not DID-targeted |
+
+**Membership/access decoupling.** These actions do NOT remove the target from the context. A member with revoked read access remains a member for governance participation and presence but cannot decrypt content. Member states:
+
+| State | In context | Can read | Can write | Can vote |
+|-------|-----------|----------|-----------|----------|
+| Full member | Yes | Yes | Yes | Yes |
+| Read-only member (write revoked) | Yes | Yes | No | Yes |
+| Presence-only member (read + write revoked) | Yes | No | No | No |
+| Non-member (removed) | No | No | No | No |
+
+Presence-only members lose `GovernanceVote` and `GovernancePropose` capabilities alongside content access. A member who can neither read nor write content should not influence governance decisions about content they cannot see. Read-only members retain governance capabilities — they can still observe content and participate meaningfully in governance.
+
+**Redundant operations.** Revoking access for a member whose access is already revoked (same scope) is a no-op that returns success. Restoring access for a member who was never revoked returns `GovernanceError::NothingToRestore`. Revoking with `FutureOnly` scope when a `Full` revocation is already active is a no-op (Full subsumes FutureOnly). Revoking with `Full` scope when `FutureOnly` is active upgrades to Full.
+
+Content access actions go through the context's governance model (propose/vote/execute). In SingleAdmin contexts, the admin's proposal auto-executes. In multi-admin contexts, the action requires the configured quorum. Tiers 1-2 (DID-to-DID blocking) are unilateral identity-layer operations and do NOT go through governance.
+
+**Content scoping.** Granular content access control (e.g., admin-only channels, per-topic areas) uses child contexts (§5.13) as the scoping mechanism. Each "scope" is a child context with its own keys, governance, and membership. Parent governance controls children via `ParentGovernanceConfig`. Tier 3 governance actions are per-context — submit the action to whichever context (parent or child) it applies to.
+
 ## 5.10 Context TTL (Time-to-Live)
 
 Contexts gain an optional time-to-live — a declared lifespan after which the context closes automatically. TTL is set at creation and visible in context metadata (visible before opt-in).
@@ -888,7 +915,7 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
 
-**Author removal.** Removing an author from a broadcast context (revoking their sender key and preventing future publishing) is a governance-gated action. Author removal MUST go through the context's governance model (`GovernanceAction::BlockAuthor` proposal → governance approval → execution). There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers. Same rules as any human-bound participant." A direct bypass of governance for author removal would be the vulnerability, not the feature. When the governance proposal is approved and executed, the author's sender key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and an `AuthorBlocked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages.
+**Author removal.** Removing an author from a broadcast context (revoking their broadcast key and preventing future publishing) is a governance-gated action. Author removal uses `GovernanceAction::RevokeWriteAccess { did, scope }` — the general content access revocation mechanism (§5.9, ADR-031). `RevokeWriteAccess` with `scope: Full` stops publishing AND suppresses historical content; `scope: FutureOnly` stops future publishing only. There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers." When the governance proposal is approved and executed: the author's broadcast key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and a `WriteAccessRevoked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages (unless `scope: Full` was used, in which case access keys are also destroyed per §9.17).
 
 **Sybil resistance.** Broadcast contexts are the primary target for Sybil block bypass because key requests travel as relay messages (not MLS application messages). The membership gate in `handle_sender_key_request` verifies that the requester is a registered subscriber before distributing keys. Identity-linked block expansion and group blocking further mitigate Sybil attacks. See §9.16.6 for the full mitigation specification.
 
@@ -908,7 +935,7 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 - `roleAssigned` — reused for author grant (role: `author`) and subscriber registration (role: `subscriber`)
 - `MemberJoined` — reused for subscriber registration
 - `TokenRevoked` — reused for gated subscriber revocation
-- **`AuthorBlocked { author_did }`** — emitted when a governance-approved author removal executes. The author's sender key is destroyed. Distinct from `TokenRevoked` (which has different semantics: UCAN revocation).
+- **`WriteAccessRevoked { did, scope }`** — emitted when a governance-approved write access revocation executes (replaces the former AuthorBlocked event). The author's sender key is destroyed. scope indicates Full (retroactive) or FutureOnly. Distinct from `TokenRevoked` (which has different semantics: UCAN revocation).
 - **`KeyEpochAdvance { sender_did, epoch }`** — NEW event type, shared across both Encrypted and Broadcast modes
 
 `ConsistencyCheckpoint.epoch` becomes `Option<u64>` (`None` for broadcast contexts, which have no MLS epoch).

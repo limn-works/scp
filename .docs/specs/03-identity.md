@@ -74,7 +74,21 @@ This extends to relationship metadata — not just whether a connection exists, 
 
 **Block/mute** is stored in identity private state (§3.7) — persistent, portable, encrypted.
 
-**Block** is DID-to-DID and bidirectional. When Alice blocks Dave, neither can see the other — across all shared contexts. Blocking is cryptographically enforced through a **sender-side key layer** (§9.16, discussed also in §10.5), which is distinct from MLS group membership. When a block is issued, the blocker rotates their personal sender key and redistributes it to all context members except the blocked party. The blocked party physically cannot decrypt the blocker's future messages. Critically, blocking does NOT remove the blocked party from the MLS group — they remain a context member and can still see other members' messages. Blocking is a unilateral, per-relationship action by the blocker; it does not require group coordination or affect the blocked party's relationship with other context members. This is fundamentally different from member removal, which IS a group action (MLS Remove Commit + epoch advancement). Blocks can optionally be scoped to a specific context, but the default and most common case is DID-to-DID across all shared contexts.
+**Blocking** operates at three tiers, each enforced through the same three cryptographic layers (§9.16, §9.17):
+
+- **Layer 1 (key distribution denial):** Block list check denies key re-requests to blocked DIDs.
+- **Layer 2 (SDK-mandated state destruction):** On block event, the blocker's SDK destroys cached keys and plaintext from the blocked party. This is a protocol requirement for compliant clients.
+- **Layer 3 (access key wrapping):** Content keys are wrapped with per-member access keys. Deleting a member's access key = cryptographic revocation of stored content. See §9.17.
+
+**Tier 1: DID-to-DID in-context (per-relationship, unilateral).** Alice blocks Dave in context X. Affects Alice's content in that context only — Dave can still see other members' content. This is the §9.16 sender-side blocking, scoped to a single context. On block: Alice rotates her sender key excluding Dave (Layer 1), Alice's SDK destroys Dave's cached content from Alice (Layer 2), Alice deletes Dave's access key for her content (Layer 3). On unblock: Alice removes Dave from her block list. Forward-only — Dave receives Alice's future content but historical content from before/during the block remains inaccessible (access keys were destroyed, not archived).
+
+**Tier 2: DID-to-DID global (identity-level, cross-context).** Alice blocks Dave everywhere. Stored in identity private state (§3.7). Propagates to all contexts Alice and Dave share — equivalent to Tier 1 applied to every shared context simultaneously. On block: same three layers, applied across all shared contexts. On unblock: same forward-only restoration, across all shared contexts. Blocking is bidirectional: when Alice blocks Dave, both Alice's and Dave's SDKs rotate their sender keys excluding each other (§9.16.3).
+
+**Tier 3: Governance-gated (context-level, all content).** Context governance revokes a member's content access. Goes through GovernanceEngine (propose/approve/reject per §5.9). Affects the target's access to ALL content in the context — not just one member's content. Governance actions: `RevokeReadAccess`, `RevokeWriteAccess`, `RestoreReadAccess`, `RestoreWriteAccess`, `RotateContentKeys` (see ADR-031). Restoration is forward-only.
+
+**Tier stacking:** All three tiers compose. If both Alice (Tier 1) and governance (Tier 3) have revoked Dave's access, both must be independently reversed for full restoration. Each tier's revocation and restoration is independent.
+
+**Key difference between tiers:** Tiers 1-2 are per-relationship (Alice blocks Dave = Dave can't see Alice's content; Dave can still see Bob's content). Tier 3 is per-context (governance revokes Dave = Dave can't see ANY content in the context).
 
 **Mute** is unidirectional. Alice mutes Dave; Alice no longer sees Dave's content. Dave is unaffected and can still see Alice. Muting is a protocol rule enforced in the SDK — apps built on the SDK inherit this behavior. Because the muter is not adversarial against themselves (they chose the mute), SDK-level enforcement is sufficient; cryptographic exclusion is not required.
 
@@ -121,6 +135,39 @@ Most identity private state operations are naturally commutative — "block X" a
 - **Key rotation.** On identity key rotation (§9.12), private state is re-encrypted to the new key. Single-owner case requires no group redistribution — the owner re-encrypts and republishes. For large private state, re-encryption is incremental: most recent events first, backfill in background.
 - **Discovery pointer.** Explicit. The DID document includes a service endpoint of type `IdentityPrivateState` listing relays that store private state. This cleanly disambiguates context event fetches from private state fetches without relay-side guessing.
 - **Relay service endpoints.** The DID document includes service endpoints of type `SCPRelay` listing the identity's transport-layer relay URLs — the endpoints where `TransportManager` routes encrypted blobs for this identity. Multiple entries are recommended for suppression resistance (§9.9.2). Self-certified via BEP44 signature (§9.6.3). See §18.2 for the full specification of DID document service endpoint types.
+
+### 3.7.1 Block List Storage
+
+Identity private state stores block lists at two granularities:
+
+**Global block list.** DIDs blocked across all shared contexts (Tier 2). Stored as an append-only event log within identity private state:
+
+- `BlockDID { target_did, timestamp }` — add DID to global block list.
+- `UnblockDID { target_did, timestamp }` — remove DID from global block list.
+
+The current block list is derived by replaying the event log. Both operations are commutative — "block X" and "block Y" produce the same state regardless of order. Multi-device sync is conflict-free: two devices can independently add blocks, and the union is correct.
+
+**Per-context block list.** DIDs blocked in a specific context only (Tier 1). Same event types but scoped:
+
+- `BlockDIDInContext { target_did, context_id, timestamp }`
+- `UnblockDIDInContext { target_did, context_id, timestamp }`
+
+**Block list propagation.** When a global block is issued (Tier 2), the SDK propagates to all shared contexts:
+
+1. Enumerate contexts where both the blocker and the target are members.
+2. For each shared context, execute the Tier 1 block protocol (§9.16.3) — rotate sender key, destroy cached content, delete access key.
+3. Record the block in identity private state.
+
+Propagation is best-effort and idempotent — if the SDK is offline for some contexts, the block executes on next connection. The identity private state event log is the authoritative record; per-context enforcement is the mechanism.
+
+**ProtocolStore methods.** The `Storage` trait (§17) requires these methods for block list persistence:
+
+- `get_global_block_list(did: &DID) -> Result<Vec<DID>>`
+- `is_globally_blocked(blocker: &DID, target: &DID) -> Result<bool>`
+- `get_context_block_list(did: &DID, context_id: &ContextId) -> Result<Vec<DID>>`
+- `is_blocked_in_context(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<bool>`
+
+These methods derive current state from the identity private state event log. Implementations MAY maintain materialized views for query performance.
 
 ## 3.8 DID Resolution Security
 
