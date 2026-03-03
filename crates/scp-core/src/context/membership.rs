@@ -791,8 +791,10 @@ mod tests {
         let mut state = MembershipState::new();
 
         // Add members with various roles and tokens.
-        state.add_member("did:key:alice".into(), "admin".into(), vec![
-            UcanToken {
+        state.add_member(
+            "did:key:alice".into(),
+            "admin".into(),
+            vec![UcanToken {
                 iss: "did:dht:creator".to_owned(),
                 aud: "did:key:alice".to_owned(),
                 att: vec![UcanAttestation {
@@ -800,8 +802,8 @@ mod tests {
                     can: "invoke".to_owned(),
                 }],
                 nnc: "1708646400000-aabbccdd".to_owned(),
-            },
-        ]);
+            }],
+        );
         state.add_member("did:key:bob".into(), "member".into(), vec![]);
         state.add_member("did:key:carol".into(), "observer".into(), vec![]);
 

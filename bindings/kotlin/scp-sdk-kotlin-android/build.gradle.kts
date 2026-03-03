@@ -105,6 +105,9 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.11.4")
 
+    // SQLite JDBC — JVM-side SQLite for storage conformance tests (SCP-PERSIST-060)
+    testImplementation("org.xerial:sqlite-jdbc:3.47.2.0")
+
     // Compose testing (SCP-118)
     testImplementation("androidx.compose.ui:ui-test-junit4")
     // Available in all test variants so Robolectric can resolve ComponentActivity

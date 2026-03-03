@@ -45,14 +45,8 @@ async fn membership_store_load_list_remove_roundtrip() {
     let bob = DID::from("did:dht:z6MkBob");
 
     // Store memberships.
-    store
-        .store_membership(ctx, &alice, "admin")
-        .await
-        .unwrap();
-    store
-        .store_membership(ctx, &bob, "member")
-        .await
-        .unwrap();
+    store.store_membership(ctx, &alice, "admin").await.unwrap();
+    store.store_membership(ctx, &bob, "member").await.unwrap();
 
     // Load individual memberships.
     assert_eq!(
@@ -122,10 +116,7 @@ async fn role_store_load_list_roundtrip() {
     let store = make_store();
     let ctx = "ctx-role-test";
 
-    store
-        .store_role(ctx, "admin", b"admin-caps")
-        .await
-        .unwrap();
+    store.store_role(ctx, "admin", b"admin-caps").await.unwrap();
     store
         .store_role(ctx, "member", b"member-caps")
         .await
@@ -207,26 +198,11 @@ async fn delete_context_removes_all_associated_state() {
     let did = DID::from("did:dht:z6MkMember");
 
     // Populate context with state, params, membership, role, tool, session.
-    store
-        .store_context_state(ctx, b"state")
-        .await
-        .unwrap();
-    store
-        .store_context_params(ctx, b"params")
-        .await
-        .unwrap();
-    store
-        .store_membership(ctx, &did, "member")
-        .await
-        .unwrap();
-    store
-        .store_role(ctx, "admin", b"role-data")
-        .await
-        .unwrap();
-    store
-        .store_tool(ctx, "tool-1", b"tool-reg")
-        .await
-        .unwrap();
+    store.store_context_state(ctx, b"state").await.unwrap();
+    store.store_context_params(ctx, b"params").await.unwrap();
+    store.store_membership(ctx, &did, "member").await.unwrap();
+    store.store_role(ctx, "admin", b"role-data").await.unwrap();
+    store.store_tool(ctx, "tool-1", b"tool-reg").await.unwrap();
     store
         .store_tool_session(ctx, "sess-1", b"sess-data")
         .await
@@ -238,7 +214,10 @@ async fn delete_context_removes_all_associated_state() {
 
     // Delete the entire context.
     let deleted = store.delete_context(ctx).await.unwrap();
-    assert!(deleted >= 7, "expected at least 7 keys deleted, got {deleted}");
+    assert!(
+        deleted >= 7,
+        "expected at least 7 keys deleted, got {deleted}"
+    );
 
     // Verify all state is gone.
     assert!(store.load_context_state(ctx).await.unwrap().is_none());
@@ -253,13 +232,7 @@ async fn delete_context_removes_all_associated_state() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        store
-            .load_ucan_token(ctx, "tok-1")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store.load_ucan_token(ctx, "tok-1").await.unwrap().is_none());
 }
 
 // =========================================================================
@@ -345,10 +318,7 @@ async fn broadcast_block_list_overwrite() {
         .await
         .unwrap();
 
-    let loaded = store
-        .load_broadcast_block_list(ctx, author)
-        .await
-        .unwrap();
+    let loaded = store.load_broadcast_block_list(ctx, author).await.unwrap();
     assert_eq!(loaded, Some(v2));
 }
 
@@ -367,10 +337,7 @@ async fn delete_context_removes_broadcast_block_lists() {
 
     store.delete_context(ctx).await.unwrap();
 
-    let loaded = store
-        .load_broadcast_block_list(ctx, author)
-        .await
-        .unwrap();
+    let loaded = store.load_broadcast_block_list(ctx, author).await.unwrap();
     assert!(loaded.is_none());
 }
 
@@ -466,13 +433,7 @@ async fn identity_document_roundtrip() {
 async fn identity_document_returns_none_for_missing() {
     let store = make_store();
     let did = DID::from("did:dht:z6MkUnknown");
-    assert!(
-        store
-            .load_identity_document(&did)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store.load_identity_document(&did).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -514,24 +475,15 @@ async fn identity_private_state_sequence_ordering() {
 
     // Load by specific sequence — each returns its own data.
     assert_eq!(
-        store
-            .load_identity_private_state(&did, 0)
-            .await
-            .unwrap(),
+        store.load_identity_private_state(&did, 0).await.unwrap(),
         Some(b"state-0".to_vec())
     );
     assert_eq!(
-        store
-            .load_identity_private_state(&did, 1)
-            .await
-            .unwrap(),
+        store.load_identity_private_state(&did, 1).await.unwrap(),
         Some(b"state-1".to_vec())
     );
     assert_eq!(
-        store
-            .load_identity_private_state(&did, 42)
-            .await
-            .unwrap(),
+        store.load_identity_private_state(&did, 42).await.unwrap(),
         Some(b"state-42".to_vec())
     );
 
@@ -554,14 +506,8 @@ async fn delete_identity_removes_all_state() {
     let store = make_store();
     let did = DID::from("did:dht:z6MkDeleteIdent");
 
-    store
-        .store_identity_document(&did, b"doc")
-        .await
-        .unwrap();
-    store
-        .store_active_signing_key(&did, b"key")
-        .await
-        .unwrap();
+    store.store_identity_document(&did, b"doc").await.unwrap();
+    store.store_active_signing_key(&did, b"key").await.unwrap();
     store
         .store_identity_private_state(&did, 0, b"state")
         .await
@@ -578,20 +524,8 @@ async fn delete_identity_removes_all_state() {
         "expected at least 4 keys deleted, got {deleted}"
     );
 
-    assert!(
-        store
-            .load_identity_document(&did)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .load_active_signing_key(&did)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store.load_identity_document(&did).await.unwrap().is_none());
+    assert!(store.load_active_signing_key(&did).await.unwrap().is_none());
     assert!(
         store
             .load_identity_private_state(&did, 0)
@@ -783,13 +717,7 @@ async fn ucan_token_store_load_list_delete_roundtrip() {
     assert!(store.load_ucan_token(ctx, "tok-1").await.unwrap().is_none());
 
     // Other still present.
-    assert!(
-        store
-            .load_ucan_token(ctx, "tok-2")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(store.load_ucan_token(ctx, "tok-2").await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -874,10 +802,7 @@ async fn adapter_credentials_store_load_list_remove_roundtrip() {
         Some(b"cred-ln".to_vec())
     );
     assert_eq!(
-        store
-            .load_adapter_credentials(&did, "x402")
-            .await
-            .unwrap(),
+        store.load_adapter_credentials(&did, "x402").await.unwrap(),
         Some(b"cred-x402".to_vec())
     );
 
@@ -932,10 +857,7 @@ async fn adapter_credentials_isolated_between_identities() {
         Some(b"alice-cred".to_vec())
     );
     assert_eq!(
-        store
-            .load_adapter_credentials(&bob, "x402")
-            .await
-            .unwrap(),
+        store.load_adapter_credentials(&bob, "x402").await.unwrap(),
         Some(b"bob-cred".to_vec())
     );
 }
@@ -1052,13 +974,7 @@ async fn context_isolation_between_modules() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        store
-            .load_context_state("ctx-2")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store.load_context_state("ctx-2").await.unwrap().is_none());
     assert!(
         store
             .load_ucan_token("ctx-2", "tok-1")
@@ -1066,13 +982,7 @@ async fn context_isolation_between_modules() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        store
-            .load_context_state("ctx-3")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store.load_context_state("ctx-3").await.unwrap().is_none());
     assert!(store.load_tool("ctx-3", "tool-1").await.unwrap().is_none());
 }
 

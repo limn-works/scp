@@ -22,11 +22,11 @@ use scp_core::context::broadcast::{
     AuthorStateSnapshot, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
     SubscriberRecord,
 };
+use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::{
-    CapabilityCeiling, Capability, ContextHandle, ContextParams, ContextRoleState, ContextState,
+    Capability, CapabilityCeiling, ContextHandle, ContextParams, ContextRoleState, ContextState,
     MembershipState,
 };
-use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::crypto::sender_keys::generate_sender_key;
 use scp_core::store::ProtocolStore;
 use scp_identity::DID;
@@ -242,14 +242,8 @@ macro_rules! persistence_tests {
                 let did = DID::from("did:dht:z6MkMember");
 
                 // Populate all context key types.
-                store
-                    .store_context_state(ctx_id, b"state")
-                    .await
-                    .unwrap();
-                store
-                    .store_context_params(ctx_id, b"params")
-                    .await
-                    .unwrap();
+                store.store_context_state(ctx_id, b"state").await.unwrap();
+                store.store_context_params(ctx_id, b"params").await.unwrap();
                 store
                     .store_membership(ctx_id, &did, "member")
                     .await
@@ -284,7 +278,10 @@ macro_rules! persistence_tests {
 
                 // Delete context.
                 let deleted = store.delete_context(ctx_id).await.unwrap();
-                assert!(deleted >= 6, "should have deleted at least 6 keys, got {deleted}");
+                assert!(
+                    deleted >= 6,
+                    "should have deleted at least 6 keys, got {deleted}"
+                );
 
                 // Verify all state is gone.
                 assert!(store.load_context_state(ctx_id).await.unwrap().is_none());
@@ -320,19 +317,11 @@ macro_rules! persistence_tests {
                     .await
                     .unwrap();
                 store
-                    .store_membership(
-                        "ctx-keep",
-                        &DID::from("did:dht:z6MkAlice"),
-                        "admin",
-                    )
+                    .store_membership("ctx-keep", &DID::from("did:dht:z6MkAlice"), "admin")
                     .await
                     .unwrap();
                 store
-                    .store_membership(
-                        "ctx-delete",
-                        &DID::from("did:dht:z6MkBob"),
-                        "admin",
-                    )
+                    .store_membership("ctx-delete", &DID::from("did:dht:z6MkBob"), "admin")
                     .await
                     .unwrap();
 
@@ -371,8 +360,7 @@ macro_rules! persistence_tests {
 
                 // Simulate an expired context: store context state containing
                 // a serialized ContextState::Expired marker.
-                let expired_state =
-                    rmp_serde::to_vec(&ContextState::Expired).unwrap();
+                let expired_state = rmp_serde::to_vec(&ContextState::Expired).unwrap();
                 store
                     .store_context_state(ctx_id, &expired_state)
                     .await
@@ -384,8 +372,7 @@ macro_rules! persistence_tests {
 
                 // Verify roundtrip.
                 let loaded_bytes = store.load_context_state(ctx_id).await.unwrap().unwrap();
-                let loaded_state: ContextState =
-                    rmp_serde::from_slice(&loaded_bytes).unwrap();
+                let loaded_state: ContextState = rmp_serde::from_slice(&loaded_bytes).unwrap();
                 assert_eq!(loaded_state, ContextState::Expired);
 
                 // The expired context still shows up in active contexts (it
@@ -414,10 +401,8 @@ macro_rules! persistence_tests {
                 }
 
                 for (ctx_id, expected_state) in &states {
-                    let loaded_bytes =
-                        store.load_context_state(ctx_id).await.unwrap().unwrap();
-                    let loaded: ContextState =
-                        rmp_serde::from_slice(&loaded_bytes).unwrap();
+                    let loaded_bytes = store.load_context_state(ctx_id).await.unwrap().unwrap();
+                    let loaded: ContextState = rmp_serde::from_slice(&loaded_bytes).unwrap();
                     assert_eq!(
                         &loaded, expected_state,
                         "lifecycle state mismatch for {ctx_id}"
@@ -556,11 +541,7 @@ macro_rules! persistence_tests {
                     .await
                     .unwrap();
 
-                let loaded = store
-                    .load_broadcast_state(ctx_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let loaded = store.load_broadcast_state(ctx_id).await.unwrap().unwrap();
 
                 assert_eq!(loaded.context_id, ctx_id);
                 assert_eq!(loaded.admission, BroadcastAdmission::Open);
@@ -593,11 +574,7 @@ macro_rules! persistence_tests {
                     .await
                     .unwrap();
 
-                let loaded = store
-                    .load_broadcast_state(ctx_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let loaded = store.load_broadcast_state(ctx_id).await.unwrap().unwrap();
 
                 // Reconstruct BroadcastContext from snapshot.
                 let bc = BroadcastContext::from_snapshot(loaded);
@@ -637,10 +614,7 @@ macro_rules! persistence_tests {
                 assert_eq!(loaded, block_list);
 
                 // delete_context should also remove block lists.
-                store
-                    .store_context_state(ctx_id, b"state")
-                    .await
-                    .unwrap();
+                store.store_context_state(ctx_id, b"state").await.unwrap();
                 store.delete_context(ctx_id).await.unwrap();
 
                 assert!(
@@ -729,10 +703,7 @@ macro_rules! persistence_tests {
                     .store_membership(ctx_id, &did, "member")
                     .await
                     .unwrap();
-                store
-                    .store_membership(ctx_id, &did, "admin")
-                    .await
-                    .unwrap();
+                store.store_membership(ctx_id, &did, "admin").await.unwrap();
 
                 let loaded = store.load_membership(ctx_id, &did).await.unwrap();
                 assert_eq!(loaded, Some("admin".to_owned()));
@@ -757,10 +728,7 @@ macro_rules! persistence_tests {
                 for i in 0..50u32 {
                     let did = DID::from(format!("did:dht:z6MkMember{i:03}"));
                     let role = if i == 0 { "admin" } else { "member" };
-                    store
-                        .store_membership(ctx_id, &did, role)
-                        .await
-                        .unwrap();
+                    store.store_membership(ctx_id, &did, role).await.unwrap();
                 }
 
                 // Add 5 roles.
@@ -858,10 +826,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(())
     }
 
-    fn load_context(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<ContextSnapshot>, BoxError> {
+    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         let guard = self
             .contexts
             .lock()
@@ -946,18 +911,10 @@ mod mock_providers {
         fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
             Ok(())
         }
-        fn add_member(
-            &self,
-            _ctx_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
+        fn add_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
             Ok(())
         }
-        fn remove_member(
-            &self,
-            _ctx_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
+        fn remove_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
             Ok(())
         }
         fn distribute_sender_key(
@@ -1037,17 +994,8 @@ async fn context_manager_broadcast_restore_roundtrip() {
     let ctx_id = "ctx-manager-restore";
 
     // Persist a context snapshot (required for restore_context).
-    let ceiling = CapabilityCeiling::new(vec![
-        Capability::MessagesRead,
-        Capability::MessagesWrite,
-    ]);
-    let role_state = ContextRoleState::new(
-        ctx_id,
-        "did:dht:z6MkAuthor1",
-        ceiling,
-        vec![],
-    )
-    .unwrap();
+    let ceiling = CapabilityCeiling::new(vec![Capability::MessagesRead, Capability::MessagesWrite]);
+    let role_state = ContextRoleState::new(ctx_id, "did:dht:z6MkAuthor1", ceiling, vec![]).unwrap();
 
     let context_snapshot = ContextSnapshot {
         context_id: ctx_id.to_owned(),
@@ -1078,10 +1026,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
 
     // Create a context handle in Active state (simulating post-restart).
     let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
-    handle
-        .transition_to(&ContextState::Active)
-        .await
-        .unwrap();
+    handle.transition_to(&ContextState::Active).await.unwrap();
 
     // Restore the context from persistence.
     manager.restore_context(ctx_id, &handle).await.unwrap();
@@ -1089,10 +1034,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
     // Verify the context is registered by trying to restore again (should fail
     // with "already registered").
     let handle2 = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
-    handle2
-        .transition_to(&ContextState::Active)
-        .await
-        .unwrap();
+    handle2.transition_to(&ContextState::Active).await.unwrap();
     let result = manager.restore_context(ctx_id, &handle2).await;
     assert!(result.is_err(), "double-restore should fail");
 }

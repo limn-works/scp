@@ -47,6 +47,8 @@ pub mod testing;
 pub use testing as software;
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(feature = "apple")]
+pub mod apple;
 #[cfg(feature = "filesystem")]
 pub mod filesystem;
 #[cfg(feature = "sqlite")]

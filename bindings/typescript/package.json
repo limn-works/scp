@@ -28,6 +28,9 @@
     "node": ">=22",
     "bun": ">=1.0"
   },
+  "dependencies": {
+    "wa-sqlite": "^0.9.0"
+  },
   "optionalDependencies": {
     "@scp/sdk-napi-linux-x64-gnu": "0.1.0",
     "@scp/sdk-napi-linux-arm64-gnu": "0.1.0",

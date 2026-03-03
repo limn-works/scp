@@ -198,14 +198,13 @@ impl BlobStorage for SqliteBlobStore {
             let stored_at: u64 = row.get(3)?;
             let blob: Vec<u8> = row.get(4)?;
 
-            let routing_id: [u8; 32] =
-                routing_id_vec.as_slice().try_into().map_err(|_| {
-                    rusqlite::Error::InvalidColumnType(
-                        0,
-                        "routing_id".to_owned(),
-                        rusqlite::types::Type::Blob,
-                    )
-                })?;
+            let routing_id: [u8; 32] = routing_id_vec.as_slice().try_into().map_err(|_| {
+                rusqlite::Error::InvalidColumnType(
+                    0,
+                    "routing_id".to_owned(),
+                    rusqlite::types::Type::Blob,
+                )
+            })?;
 
             let recipient_hint = hint_opt
                 .map(|h| -> Result<[u8; 32], rusqlite::Error> {
@@ -267,14 +266,13 @@ impl BlobStorage for SqliteBlobStore {
                     let stored_at: u64 = row.get(3)?;
                     let blob: Vec<u8> = row.get(4)?;
 
-                    let blob_id: [u8; 32] =
-                        blob_id_vec.as_slice().try_into().map_err(|_| {
-                            rusqlite::Error::InvalidColumnType(
-                                0,
-                                "blob_id".to_owned(),
-                                rusqlite::types::Type::Blob,
-                            )
-                        })?;
+                    let blob_id: [u8; 32] = blob_id_vec.as_slice().try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            0,
+                            "blob_id".to_owned(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?;
 
                     let recipient_hint = hint_opt
                         .map(|h| -> Result<[u8; 32], rusqlite::Error> {

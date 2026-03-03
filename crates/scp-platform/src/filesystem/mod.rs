@@ -291,8 +291,7 @@ impl Storage for FilesystemStorage {
                 let matching: Vec<PathBuf> = files
                     .into_iter()
                     .filter(|path| {
-                        path_to_key(&base_dir, path)
-                            .is_some_and(|key| key.starts_with(&prefix))
+                        path_to_key(&base_dir, path).is_some_and(|key| key.starts_with(&prefix))
                     })
                     .collect();
 

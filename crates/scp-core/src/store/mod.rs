@@ -624,7 +624,11 @@ mod tests {
             data: &v2_data,
         };
         let bytes = rmp_serde::to_vec(&envelope).unwrap();
-        store.storage.store("test/migrate-v2", &bytes).await.unwrap();
+        store
+            .storage
+            .store("test/migrate-v2", &bytes)
+            .await
+            .unwrap();
 
         // Load should trigger migration from v2 to v3.
         let loaded: Option<TestMigratable> =
@@ -661,8 +665,7 @@ mod tests {
         store.storage.store("test/chain", &bytes).await.unwrap();
 
         // Load triggers v1 -> v2 -> v3 chain.
-        let loaded: Option<TestMigratable> =
-            store.load_migratable("test/chain").await.unwrap();
+        let loaded: Option<TestMigratable> = store.load_migratable("test/chain").await.unwrap();
         let loaded = loaded.unwrap();
         assert_eq!(loaded.value, "chain-test");
         // v1 migration sets extra=0; if the chain goes v1->v3 directly
@@ -671,12 +674,7 @@ mod tests {
         // written back must be 3.
         assert_eq!(loaded.extra, 0);
 
-        let raw = store
-            .storage
-            .retrieve("test/chain")
-            .await
-            .unwrap()
-            .unwrap();
+        let raw = store.storage.retrieve("test/chain").await.unwrap().unwrap();
         let check: StoredValue<TestMigratable> = rmp_serde::from_slice(&raw).unwrap();
         assert_eq!(check.version, 3);
     }

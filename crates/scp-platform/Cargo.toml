@@ -20,6 +20,9 @@ software_platform = [
 # (Ed25519, X25519) can enable `software_platform` without pulling in the
 # insecure in-memory implementations. See GitHub issue #88.
 testing = ["software_platform"]
+# Apple storage adapter with SQLCipher encryption (spec section 17.6).
+# Same engine as `sqlite` but encryption key provided by caller (Apple Keychain).
+apple = ["dep:rusqlite", "dep:hex"]
 # SQLite storage adapter with SQLCipher encryption (spec section 17.6).
 sqlite = ["dep:rusqlite", "dep:hex"]
 # Filesystem storage adapter (spec section 17.6).

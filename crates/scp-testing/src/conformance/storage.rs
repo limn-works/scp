@@ -292,10 +292,7 @@ macro_rules! storage_conformance {
                         .await
                         .expect("retrieve should succeed")
                         .expect("key should exist");
-                    assert_eq!(
-                        actual, expected,
-                        "value mismatch for key {key}"
-                    );
+                    assert_eq!(actual, expected, "value mismatch for key {key}");
                 }
             }
 
