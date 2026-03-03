@@ -1302,7 +1302,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/src/combined/mod.rs",
         "crates/scp-platform/Cargo.toml"
@@ -1352,7 +1352,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/src/syncable/mod.rs",
         "crates/scp-platform/Cargo.toml"
@@ -1398,7 +1398,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/local_cache.rs",
         "crates/scp-transport/Cargo.toml"
@@ -1443,7 +1443,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/server.rs"
       ],
