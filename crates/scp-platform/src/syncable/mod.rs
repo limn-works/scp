@@ -204,17 +204,17 @@ impl<S: Storage> Storage for SyncableStorage<S> {
         let key = key.to_owned();
         let data = data.to_vec();
         async move {
-            // Write the actual data to inner storage.
-            self.inner.store(&key, &data).await?;
-
             // Skip changelog for internal sync keys to avoid infinite recursion.
             if key.starts_with(SYNC_PREFIX) {
-                return Ok(());
+                return self.inner.store(&key, &data).await;
             }
 
-            // Serialize seq allocation + log append to prevent concurrent
-            // store/delete calls from producing duplicate sequence numbers.
+            // Serialize data mutation + seq allocation + log append to ensure
+            // the changelog accurately reflects the order mutations were applied
+            // to the inner storage. Without this, concurrent store/delete calls
+            // could produce a changelog that diverges from the actual data state.
             let _guard = self.seq_lock.lock().await;
+            self.inner.store(&key, &data).await?;
             let seq = self.allocate_seq().await?;
             let entry = ChangeEntry {
                 seq,
@@ -236,17 +236,15 @@ impl<S: Storage> Storage for SyncableStorage<S> {
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), PlatformError>> + Send {
         let key = key.to_owned();
         async move {
-            // Delete from inner storage.
-            self.inner.delete(&key).await?;
-
             // Skip changelog for internal sync keys to avoid infinite recursion.
             if key.starts_with(SYNC_PREFIX) {
-                return Ok(());
+                return self.inner.delete(&key).await;
             }
 
-            // Serialize seq allocation + log append to prevent concurrent
-            // store/delete calls from producing duplicate sequence numbers.
+            // Serialize data mutation + seq allocation + log append to ensure
+            // the changelog accurately reflects the order mutations were applied.
             let _guard = self.seq_lock.lock().await;
+            self.inner.delete(&key).await?;
             let seq = self.allocate_seq().await?;
             let entry = ChangeEntry {
                 seq,

@@ -38,11 +38,6 @@ pub fn system_clock() -> ClockFn {
 // Prefix successor computation (for B-tree range scans)
 // ---------------------------------------------------------------------------
 
-/// Computes the lexicographic successor of `prefix` for B-tree range scans.
-///
-/// Returns `None` if the prefix is empty or consists entirely of `0xFF` bytes
-/// (no finite successor exists). Otherwise, increments the last non-`0xFF`
-/// byte and truncates.
 /// Converts a `Vec<u8>` to a `[u8; 32]` array, returning a `rusqlite::Error`
 /// if the length doesn't match.
 fn vec_to_array(v: Vec<u8>, field: &str) -> Result<[u8; 32], rusqlite::Error> {
@@ -55,6 +50,11 @@ fn vec_to_array(v: Vec<u8>, field: &str) -> Result<[u8; 32], rusqlite::Error> {
     })
 }
 
+/// Computes the lexicographic successor of `prefix` for B-tree range scans.
+///
+/// Returns `None` if the prefix is empty or consists entirely of `0xFF` bytes
+/// (no finite successor exists). Otherwise, increments the last non-`0xFF`
+/// byte and truncates.
 fn prefix_successor(prefix: &str) -> Option<String> {
     let mut bytes = prefix.as_bytes().to_vec();
     // Pop trailing 0xFF bytes.

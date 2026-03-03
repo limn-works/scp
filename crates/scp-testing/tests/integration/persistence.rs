@@ -570,7 +570,13 @@ macro_rules! persistence_tests {
                 assert_eq!(loaded.authors.len(), 1);
 
                 let author = loaded.authors.get("did:dht:z6MkAuthor1").unwrap();
+                let original_author = snapshot.authors.get("did:dht:z6MkAuthor1").unwrap();
                 assert_eq!(author.epoch, 3);
+                assert_eq!(
+                    author.broadcast_key.as_bytes(),
+                    original_author.broadcast_key.as_bytes(),
+                    "broadcast_key must survive persist/load roundtrip"
+                );
                 assert!(author.block_list.contains("did:dht:z6MkBlocked"));
             }
 
