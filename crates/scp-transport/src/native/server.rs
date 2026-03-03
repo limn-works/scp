@@ -247,34 +247,16 @@ impl<S: BlobStorage + 'static> RelayServer<S> {
             let ip = addr.ip();
 
             // Enforce connection limits before upgrading to WebSocket.
-            {
-                let tracker = self.connection_tracker.read().await;
-                let total: usize = tracker.values().sum();
-                if total >= self.config.max_total_connections {
-                    tracing::warn!(
-                        ip = %ip,
-                        total_connections = total,
-                        limit = self.config.max_total_connections,
-                        "rejecting connection: max total connections reached"
-                    );
-                    drop(stream);
-                    continue;
-                }
-                let ip_count = tracker.get(&ip).copied().unwrap_or(0);
-                drop(tracker);
-                if ip_count >= self.config.max_connections_per_ip {
-                    tracing::warn!(
-                        ip = %ip,
-                        ip_connections = ip_count,
-                        limit = self.config.max_connections_per_ip,
-                        "rejecting connection: max connections per IP reached"
-                    );
-                    drop(stream);
-                    continue;
-                }
+            //
+            // When `bridge_secret` is configured, per-IP limits are skipped
+            // (all connections originate from localhost). The bridge layer
+            // enforces its own concurrency limit instead (see #229).
+            if !check_connection_allowed(&self.connection_tracker, ip, &self.config).await {
+                drop(stream);
+                continue;
             }
 
-            // Register this connection.
+            // Register this connection (always tracked for max_total_connections).
             {
                 let mut tracker = self.connection_tracker.write().await;
                 *tracker.entry(ip).or_insert(0) += 1;
@@ -364,35 +346,14 @@ impl<S: BlobStorage + 'static> RelayServer<S> {
 
                 let ip = addr.ip();
 
-                // Enforce connection limits.
-                {
-                    let tracker = conn_tracker.read().await;
-                    let total: usize = tracker.values().sum();
-                    if total >= config.max_total_connections {
-                        tracing::warn!(
-                            ip = %ip,
-                            total_connections = total,
-                            limit = config.max_total_connections,
-                            "rejecting connection: max total connections reached"
-                        );
-                        drop(stream);
-                        continue;
-                    }
-                    let ip_count = tracker.get(&ip).copied().unwrap_or(0);
-                    drop(tracker);
-                    if ip_count >= config.max_connections_per_ip {
-                        tracing::warn!(
-                            ip = %ip,
-                            ip_connections = ip_count,
-                            limit = config.max_connections_per_ip,
-                            "rejecting connection: max connections per IP reached"
-                        );
-                        drop(stream);
-                        continue;
-                    }
+                // Enforce connection limits (per-IP limits skipped in bridge
+                // mode — see #229).
+                if !check_connection_allowed(&conn_tracker, ip, &config).await {
+                    drop(stream);
+                    continue;
                 }
 
-                // Register this connection.
+                // Register this connection (always tracked for max_total_connections).
                 {
                     let mut tracker = conn_tracker.write().await;
                     *tracker.entry(ip).or_insert(0) += 1;
@@ -454,7 +415,50 @@ enum ConnectionError {
     WebSocket(String),
 }
 
+/// Checks whether a new connection from `ip` should be accepted, given the
+/// current tracker state and relay configuration.
+///
+/// Returns `true` if the connection is allowed, `false` if it should be
+/// rejected. When `bridge_mode` is `true`, per-IP limits are skipped (all
+/// connections originate from localhost; see #229).
+async fn check_connection_allowed(
+    tracker: &ConnectionTracker,
+    ip: IpAddr,
+    config: &RelayConfig,
+) -> bool {
+    let bridge_mode = config.bridge_secret.is_some();
+    let guard = tracker.read().await;
+    let total: usize = guard.values().sum();
+    if total >= config.max_total_connections {
+        tracing::warn!(
+            ip = %ip,
+            total_connections = total,
+            limit = config.max_total_connections,
+            "rejecting connection: max total connections reached"
+        );
+        return false;
+    }
+    if !bridge_mode {
+        let ip_count = guard.get(&ip).copied().unwrap_or(0);
+        // Drop the read lock before the comparison — we have our copy.
+        drop(guard);
+        if ip_count >= config.max_connections_per_ip {
+            tracing::warn!(
+                ip = %ip,
+                ip_connections = ip_count,
+                limit = config.max_connections_per_ip,
+                "rejecting connection: max connections per IP reached"
+            );
+            return false;
+        }
+    }
+    true
+}
+
 /// Decrements the per-IP connection count when a connection is dropped.
+///
+/// Removes the entry entirely when the count reaches zero to prevent the
+/// tracker map from growing unboundedly.
 async fn decrement_connection(tracker: &ConnectionTracker, ip: IpAddr) {
     let mut t = tracker.write().await;
     if let Some(count) = t.get_mut(&ip) {

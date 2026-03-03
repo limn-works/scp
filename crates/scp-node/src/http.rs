@@ -9,15 +9,16 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use scp_platform::traits::Storage;
@@ -111,6 +112,17 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
 }
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Idle timeout for bridge WebSocket connections (5 minutes).
+///
+/// If no data flows in either direction for this duration, the bridge
+/// connection is closed. This prevents stale connections from holding
+/// resources indefinitely (#229).
+const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+// ---------------------------------------------------------------------------
 // Router constructors
 // ---------------------------------------------------------------------------
 
@@ -130,32 +142,57 @@ pub fn well_known_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> 
 /// relay server. The axum handler upgrades the HTTP connection to
 /// WebSocket, then connects to the relay on localhost and forwards
 /// frames bidirectionally.
+///
+/// An `Arc<Semaphore>` caps concurrent bridge connections to
+/// `max_total_connections` from the relay config. The permit is acquired
+/// before the HTTP 101 upgrade and held inside the `on_upgrade` closure
+/// for the entire WebSocket connection lifetime — ensuring the semaphore
+/// accurately tracks active connections, not just in-flight upgrade
+/// requests (#229).
 pub fn relay_router<B: BlobStorage + 'static>(state: Arc<NodeState<B>>) -> Router {
+    let bridge_semaphore = Arc::new(Semaphore::new(state.relay_config.max_total_connections));
     Router::new()
         .route("/scp/v1", get(ws_upgrade_handler::<B>))
-        .with_state(state)
+        .with_state((state, bridge_semaphore))
 }
 
 /// Axum handler for WebSocket upgrade at `/scp/v1`.
 ///
-/// Bridges the incoming WebSocket connection to the node's internal
-/// relay server by connecting to `relay_addr` on localhost, authenticated
-/// with the bridge secret.
+/// Acquires a semaphore permit before upgrading; the permit is moved into
+/// the `on_upgrade` closure so it is held for the entire WebSocket
+/// connection lifetime. If the HTTP 101 upgrade never completes, axum
+/// drops the response — which drops the closure and releases the permit.
+/// Returns 503 Service Unavailable when the bridge is at capacity.
 async fn ws_upgrade_handler<B: BlobStorage + 'static>(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<NodeState<B>>>,
+    State((state, sem)): State<(Arc<NodeState<B>>, Arc<Semaphore>)>,
 ) -> impl IntoResponse {
+    let Ok(permit) = sem.try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let relay_addr = state.relay_addr;
     let bridge_secret = state.bridge_secret;
-    ws.on_upgrade(move |socket| relay_bridge(socket, relay_addr, bridge_secret))
+    // Move the permit into the closure — it is released when the closure
+    // is dropped, either after the bridge ends or if the upgrade fails.
+    ws.on_upgrade(move |socket| async move {
+        let _permit = permit; // bind to ensure drop at end of scope
+        relay_bridge(socket, relay_addr, bridge_secret).await;
+    })
+    .into_response()
 }
 
 /// Bridges an axum WebSocket to the internal relay server.
 ///
 /// Connects to the relay at `relay_addr` with the bridge secret included
 /// as a `token` query parameter, then forwards frames in both directions
-/// until either side closes. Sends explicit WebSocket close frames on
+/// until either side closes or the connection is idle for
+/// [`BRIDGE_IDLE_TIMEOUT`]. Sends explicit WebSocket close frames on
 /// both sides when the bridge terminates.
+///
+/// The idle timeout resets only on data frames (Text/Binary), not on
+/// Ping/Pong control frames. This prevents an attacker from keeping
+/// connections alive indefinitely by sending pings without real data
+/// (#229).
 async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret: [u8; 32]) {
     let token_hex = scp_transport::native::server::hex_encode_32(&bridge_secret);
     let url = format!("ws://{relay_addr}/?token={token_hex}");
@@ -169,72 +206,83 @@ async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret:
         return;
     };
 
-    let (relay_sink, mut relay_source) = relay_ws.split();
-    let (axum_sink, mut axum_source) = axum_ws.split();
+    let (mut relay_sink, mut relay_source) = relay_ws.split();
+    let (mut axum_sink, mut axum_source) = axum_ws.split();
 
-    // Wrap sinks in Arc<Mutex<>> so both forwarding tasks and the cleanup
-    // code can access them. This is the minimal restructuring needed to
-    // send explicit close frames after the select completes.
-    let relay_sink = Arc::new(tokio::sync::Mutex::new(relay_sink));
-    let axum_sink = Arc::new(tokio::sync::Mutex::new(axum_sink));
+    // Idle timeout: resets only on data frames (Text/Binary), not control frames.
+    let idle_timeout = tokio::time::sleep(BRIDGE_IDLE_TIMEOUT);
+    tokio::pin!(idle_timeout);
 
-    let relay_sink_fwd = Arc::clone(&relay_sink);
-    let axum_sink_fwd = Arc::clone(&axum_sink);
-
-    // Forward: client (axum) -> relay
-    let client_to_relay = async move {
-        while let Some(Ok(msg)) = StreamExt::next(&mut axum_source).await {
-            let relay_msg = match msg {
-                Message::Text(t) => tokio_tungstenite::tungstenite::Message::Text(t.to_string()),
-                Message::Binary(b) => tokio_tungstenite::tungstenite::Message::Binary(b.to_vec()),
-                Message::Ping(p) => tokio_tungstenite::tungstenite::Message::Ping(p.to_vec()),
-                Message::Pong(p) => tokio_tungstenite::tungstenite::Message::Pong(p.to_vec()),
-                Message::Close(_) => return,
-            };
-            if let Err(e) = SinkExt::send(&mut *relay_sink_fwd.lock().await, relay_msg).await {
-                tracing::debug!(
-                    direction = "client->relay",
-                    error = %e,
-                    "bridge forwarding failed"
-                );
-                return;
+    loop {
+        tokio::select! {
+            msg = StreamExt::next(&mut axum_source) => {
+                match msg {
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(msg)) => {
+                        let relay_msg = match msg {
+                            Message::Text(t) => {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
+                                tokio_tungstenite::tungstenite::Message::Text(t.to_string())
+                            }
+                            Message::Binary(b) => {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
+                                tokio_tungstenite::tungstenite::Message::Binary(b.to_vec())
+                            }
+                            Message::Ping(p) => tokio_tungstenite::tungstenite::Message::Ping(p.to_vec()),
+                            Message::Pong(p) => tokio_tungstenite::tungstenite::Message::Pong(p.to_vec()),
+                            Message::Close(_) => break,
+                        };
+                        if let Err(e) = SinkExt::send(&mut relay_sink, relay_msg).await {
+                            tracing::debug!(
+                                direction = "client->relay",
+                                error = %e,
+                                "bridge forwarding failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            msg = StreamExt::next(&mut relay_source) => {
+                match msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(msg)) => {
+                        let axum_msg = match msg {
+                            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
+                                Message::Text(t.into())
+                            }
+                            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + BRIDGE_IDLE_TIMEOUT);
+                                Message::Binary(b.into())
+                            }
+                            tokio_tungstenite::tungstenite::Message::Ping(p) => Message::Ping(p.into()),
+                            tokio_tungstenite::tungstenite::Message::Pong(p) => Message::Pong(p.into()),
+                            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                            tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+                        };
+                        if let Err(e) = SinkExt::send(&mut axum_sink, axum_msg).await {
+                            tracing::debug!(
+                                direction = "relay->client",
+                                error = %e,
+                                "bridge forwarding failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            () = &mut idle_timeout => {
+                tracing::debug!("bridge connection idle timeout reached");
+                break;
             }
         }
-    };
-
-    // Forward: relay -> client (axum)
-    let relay_to_client = async move {
-        while let Some(Ok(msg)) = StreamExt::next(&mut relay_source).await {
-            let axum_msg = match msg {
-                tokio_tungstenite::tungstenite::Message::Text(t) => Message::Text(t.into()),
-                tokio_tungstenite::tungstenite::Message::Binary(b) => Message::Binary(b.into()),
-                tokio_tungstenite::tungstenite::Message::Ping(p) => Message::Ping(p.into()),
-                tokio_tungstenite::tungstenite::Message::Pong(p) => Message::Pong(p.into()),
-                tokio_tungstenite::tungstenite::Message::Close(_) => return,
-                tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
-            };
-            if let Err(e) = SinkExt::send(&mut *axum_sink_fwd.lock().await, axum_msg).await {
-                tracing::debug!(
-                    direction = "relay->client",
-                    error = %e,
-                    "bridge forwarding failed"
-                );
-                return;
-            }
-        }
-    };
-
-    // Run both directions concurrently; when either side finishes, close both
-    // sinks with explicit WebSocket close frames. SplitSink::drop() does NOT
-    // send close frames in tokio-tungstenite 0.24.
-    tokio::select! {
-        () = client_to_relay => {}
-        () = relay_to_client => {}
     }
 
     // Send explicit close frames (best-effort, ignore errors on close).
-    let _ = SinkExt::close(&mut *relay_sink.lock().await).await;
-    let _ = SinkExt::close(&mut *axum_sink.lock().await).await;
+    // SplitSink::drop() does NOT send close frames in tokio-tungstenite 0.24.
+    let _ = SinkExt::close(&mut relay_sink).await;
+    let _ = SinkExt::close(&mut axum_sink).await;
 }
 
 // ---------------------------------------------------------------------------
