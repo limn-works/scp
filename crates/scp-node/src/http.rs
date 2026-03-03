@@ -95,6 +95,11 @@ pub struct NodeState<B: BlobStorage = InMemoryBlobStorage> {
     /// The instant the node was started, used to compute uptime for the
     /// dev API health endpoint (spec section 18.10.3).
     pub(crate) start_time: Instant,
+    /// Bind address for the public HTTP server used by [`ApplicationNode::serve`].
+    ///
+    /// Separate from `relay_addr` (the relay's internal listener) to avoid
+    /// double-binding the same port (#224). Defaults to `0.0.0.0:8443`.
+    pub(crate) http_bind_addr: SocketAddr,
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +299,10 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
     /// SCP routes take precedence for `/.well-known/scp`, `/scp/v1`, and
     /// `/scp/broadcast/*`. All other paths route to `app_router`.
     ///
+    /// This method consumes the node. Callers that need to retain access
+    /// to the relay's [`ShutdownHandle`] should extract it before calling
+    /// `serve` (via [`ApplicationNode::relay`]).
+    ///
     /// When the dev API is configured (via [`ApplicationNodeBuilder::local_api`]),
     /// a separate tokio task is spawned to serve the dev API on the configured
     /// address. The dev API listener runs concurrently with the public HTTPS
@@ -311,7 +320,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
         let relay = self.relay_router();
         let projection = self.broadcast_projection_router();
 
-        // Extract dev API configuration before self is consumed.
+        // Extract dev API configuration before building the merged router.
         let dev_router = self.dev_router();
         let dev_bind_addr = self.state.dev_bind_addr;
 
@@ -347,7 +356,7 @@ impl<S: Storage + Send + Sync + 'static, B: BlobStorage + 'static> ApplicationNo
             });
         }
 
-        let bind_addr = self.relay.bound_addr;
+        let bind_addr = self.state.http_bind_addr;
 
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
