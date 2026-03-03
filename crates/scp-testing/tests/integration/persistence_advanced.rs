@@ -526,10 +526,7 @@ async fn combined_node_multiple_contexts_independent() {
 
     // Membership is context-scoped.
     assert_eq!(
-        client_store
-            .load_membership(ctx_1, &did_a)
-            .await
-            .unwrap(),
+        client_store.load_membership(ctx_1, &did_a).await.unwrap(),
         Some("admin".to_owned()),
     );
     assert!(
@@ -541,10 +538,7 @@ async fn combined_node_multiple_contexts_independent() {
         "Bob should not be a member of ctx_1"
     );
     assert_eq!(
-        client_store
-            .load_membership(ctx_2, &did_b)
-            .await
-            .unwrap(),
+        client_store.load_membership(ctx_2, &did_b).await.unwrap(),
         Some("viewer".to_owned()),
     );
     assert!(
@@ -721,10 +715,7 @@ async fn executed_proposals_cleaned_up_on_context_delete() {
     store.store_context_state(ctx_id, &bytes).await.unwrap();
 
     // Also store other context data.
-    store
-        .store_context_params(ctx_id, b"params")
-        .await
-        .unwrap();
+    store.store_context_params(ctx_id, b"params").await.unwrap();
 
     // Delete context.
     let deleted = store.delete_context(ctx_id).await.unwrap();

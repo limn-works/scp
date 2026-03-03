@@ -128,6 +128,13 @@ export type {
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+export { InMemorySqliteStorage, WasmSqliteStorage, prefixSuccessor } from "./storage/index.js";
+export type { StorageInterface, VfsType } from "./storage/index.js";
+
+// ---------------------------------------------------------------------------
 // Internal — bridge target detection (read-only, for diagnostics)
 // ---------------------------------------------------------------------------
 

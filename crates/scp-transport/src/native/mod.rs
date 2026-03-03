@@ -35,10 +35,14 @@ pub mod combined;
 pub mod error;
 #[cfg(feature = "local-cache")]
 pub mod local_cache;
+#[cfg(feature = "postgres-blob")]
+pub mod postgres_blob;
 pub mod protocol;
 #[cfg(feature = "redb-blob")]
 pub mod redb_blob;
 pub mod relay_persistence;
+#[cfg(feature = "s3-blob")]
+pub mod s3_blob;
 pub mod server;
 #[cfg(feature = "sqlite-blob")]
 pub mod sqlite_blob;

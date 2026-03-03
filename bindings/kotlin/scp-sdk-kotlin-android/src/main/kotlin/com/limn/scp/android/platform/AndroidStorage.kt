@@ -7,7 +7,10 @@
 // database a hardware-rooted chain of trust without requiring SQLCipher itself
 // to understand Android Keystore.
 //
-// The database file is "scp.db" in the application's private database directory.
+// The database file is "scp.db" in the application's noBackupFilesDir directory.
+// This directory is excluded from Android Auto Backup, ensuring that SQLCipher
+// databases protected by TEE-derived keys are not backed up to Google Drive
+// (where the TEE key would not be available to decrypt them).
 // SQLCipher provides transparent full-database encryption — the OS file is
 // unreadable without the derived passphrase.
 //
@@ -21,6 +24,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import net.zetetic.database.sqlcipher.SQLiteDatabase
 import net.zetetic.database.sqlcipher.SQLiteOpenHelper
+import java.io.File
 import java.security.GeneralSecurityException
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -82,7 +86,13 @@ class AndroidStorage(private val context: Context) : StorageProvider {
             // The ByteArray source (encryptionKey) is zeroed in the finally block.
             // The real protection is TEE-backed key derivation — the passphrase is
             // useless without the Android Keystore key.
-            val helper = ScpDatabaseHelper(context, encryptionKey)
+            //
+            // The database path is computed from noBackupFilesDir so that the
+            // encrypted database is excluded from Android Auto Backup. Backed-up
+            // databases would be unreadable on a different device because the TEE
+            // key that derived the passphrase is device-bound.
+            val dbPath = File(context.noBackupFilesDir, DATABASE_NAME).absolutePath
+            val helper = ScpDatabaseHelper(context, dbPath, encryptionKey)
             return helper.writableDatabase
         } finally {
             // Zero key material immediately after use to limit exposure window.
@@ -329,16 +339,21 @@ class AndroidStorage(private val context: Context) : StorageProvider {
 /**
  * SQLiteOpenHelper for the SCP encrypted key-value database.
  *
- * Creates the `kv` table with a unique `key` column (TEXT) and a `value` column (BLOB)
- * on first database creation. The `key` column has a UNIQUE constraint to enforce
- * INSERT OR REPLACE semantics.
+ * Creates the `kv` table with `key` as `TEXT PRIMARY KEY` and `value` as `BLOB NOT NULL`,
+ * using `WITHOUT ROWID` for a clustered primary key layout that matches the Rust
+ * `SqliteStorage` schema. The primary key enforces INSERT OR REPLACE semantics.
+ *
+ * The [databasePath] is the full filesystem path to the database file (typically
+ * within `noBackupFilesDir`). Passing a full path rather than just a filename
+ * overrides SQLiteOpenHelper's default database directory.
  */
 internal class ScpDatabaseHelper(
     context: Context,
+    databasePath: String,
     password: ByteArray,
 ) : SQLiteOpenHelper(
     context,
-    AndroidStorage.DATABASE_NAME,
+    databasePath,
     password,
     null, // cursorFactory
     AndroidStorage.DATABASE_VERSION,
@@ -351,9 +366,9 @@ internal class ScpDatabaseHelper(
         db.execSQL(
             """
             CREATE TABLE IF NOT EXISTS ${AndroidStorage.TABLE_NAME} (
-                ${AndroidStorage.COLUMN_KEY} TEXT NOT NULL UNIQUE,
+                ${AndroidStorage.COLUMN_KEY} TEXT PRIMARY KEY,
                 ${AndroidStorage.COLUMN_VALUE} BLOB NOT NULL
-            )
+            ) WITHOUT ROWID
             """.trimIndent()
         )
     }

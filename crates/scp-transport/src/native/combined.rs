@@ -448,7 +448,9 @@ impl BlobStorage for CombinedNodeStorage {
                 let blob: Vec<u8> = row.get(4)?;
 
                 let routing_id: [u8; 32] = vec_to_array(routing_id_vec, "routing_id")?;
-                let recipient_hint = hint_vec.map(|h| vec_to_array(h, "recipient_hint")).transpose()?;
+                let recipient_hint = hint_vec
+                    .map(|h| vec_to_array(h, "recipient_hint"))
+                    .transpose()?;
 
                 Ok(StoredBlob {
                     routing_id,
@@ -497,8 +499,9 @@ impl BlobStorage for CombinedNodeStorage {
                     let blob: Vec<u8> = row.get(4)?;
 
                     let blob_id: [u8; 32] = vec_to_array(blob_id_vec, "blob_id")?;
-                    let recipient_hint =
-                        hint_vec.map(|h| vec_to_array(h, "recipient_hint")).transpose()?;
+                    let recipient_hint = hint_vec
+                        .map(|h| vec_to_array(h, "recipient_hint"))
+                        .transpose()?;
 
                     Ok(StoredBlob {
                         routing_id: *routing_id,

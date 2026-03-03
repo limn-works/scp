@@ -1167,7 +1167,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/src/android/storage.rs",
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/works/limn/scp/android/AndroidStorage.kt"
@@ -1212,7 +1212,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/src/apple/mod.rs",
         "crates/scp-platform/src/apple/storage.rs",
@@ -1258,7 +1258,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/typescript/src/storage/wasm-sqlite.ts",
         "bindings/typescript/package.json"
@@ -1487,7 +1487,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/postgres_blob.rs",
         "crates/scp-transport/Cargo.toml",
@@ -1532,7 +1532,7 @@
       "gate": "gate-persist-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/s3_blob.rs",
         "crates/scp-transport/Cargo.toml",

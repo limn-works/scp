@@ -172,13 +172,12 @@ impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersis
 
                 let mut routing_ids = Vec::with_capacity(keys.len());
                 for key in keys {
-                    let hex_part = key
-                        .strip_prefix(SUBSCRIPTION_PREFIX)
-                        .ok_or_else(|| -> BoxError {
-                            format!("unexpected key without prefix: {key}").into()
-                        })?;
-                    let bytes = hex::decode(hex_part)
-                        .map_err(|e| -> BoxError { Box::new(e) })?;
+                    let hex_part =
+                        key.strip_prefix(SUBSCRIPTION_PREFIX)
+                            .ok_or_else(|| -> BoxError {
+                                format!("unexpected key without prefix: {key}").into()
+                            })?;
+                    let bytes = hex::decode(hex_part).map_err(|e| -> BoxError { Box::new(e) })?;
                     if bytes.len() != 32 {
                         continue; // skip malformed entries
                     }
@@ -378,7 +377,12 @@ mod tests {
 
         persistence.clear_all().unwrap();
 
-        assert!(persistence.load_subscribed_routing_ids().unwrap().is_empty());
+        assert!(
+            persistence
+                .load_subscribed_routing_ids()
+                .unwrap()
+                .is_empty()
+        );
         assert!(persistence.load_rate_limit("1.2.3.4").unwrap().is_none());
     }
 

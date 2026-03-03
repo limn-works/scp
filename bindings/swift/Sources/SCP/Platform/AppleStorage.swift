@@ -10,6 +10,20 @@
 /// It is one of the four platform providers assembled by ``ApplePlatformAdapter``
 /// (ADR-025) and injected into the Rust engine at SDK initialisation.
 ///
+/// ## Storage Backend
+///
+/// Uses the system `sqlite3` C library (available on all Apple platforms) with
+/// SQLCipher pragmas for encryption. The database is stored in Application
+/// Support at `dev.limn.scp/scp.db`. The schema matches the Rust core's
+/// `SqliteStorage`:
+///
+/// ```sql
+/// CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+/// ```
+///
+/// Prefix queries use B-tree range scans (`key >= ? AND key < ?`) via
+/// `prefixSuccessor(_:)` rather than `LIKE`, leveraging the clustered index.
+///
 /// ## Encryption Key Management
 ///
 /// On first use, `AppleStorage` generates a 32-byte random encryption key and
@@ -23,22 +37,11 @@
 /// On subsequent opens the key is retrieved from Keychain and passed to
 /// SQLCipher via `PRAGMA key = "x'<hex>'"` before any other SQL is executed.
 ///
-/// ## Simplified Storage
-///
-/// The full SQLCipher integration requires the Rust FFI round-trip that is
-/// wired in a separate infrastructure story. This implementation:
-/// - Correctly performs all Keychain operations (generate / retrieve the 32-byte
-///   encryption key) to demonstrate the key-management pattern.
-/// - Uses a thread-safe actor-isolated `[String: Data]` dictionary as the
-///   backing store until the SQLCipher bridge is wired.
-/// - Sets `NSFileProtectionCompleteUntilFirstUserAuthentication` on the
-///   database file path on iOS (no-op on macOS where file protection is N/A).
-///
 /// ## Thread Safety
 ///
 /// `AppleStorage` is a Swift actor. UniFFI callback interfaces execute on Rust
 /// tokio threads — not the Swift or macOS main thread. The actor executor
-/// ensures all dictionary mutations are serialised without data races.
+/// ensures all database mutations are serialised without data races.
 ///
 /// See ADR-025 (Apple Platform Adapter) and ADR-021 (UniFFI Bridge).
 
@@ -46,6 +49,9 @@
 
 import Foundation
 import Security
+#if canImport(SQLite3)
+import SQLite3
+#endif
 
 // MARK: - StorageError
 
@@ -84,11 +90,13 @@ public actor AppleStorage {
 
     // MARK: Internal state
 
-    /// In-memory backing store. Replaced by SQLCipher once the FFI bridge is wired.
-    private var store: [String: Data] = [:]
+    /// SQLite database handle. Opened once during `open()` and used for all
+    /// subsequent operations.
+    private let db: OpaquePointer
 
     /// The 32-byte encryption key retrieved (or generated) from Keychain.
-    /// Stored here for future SQLCipher `PRAGMA key` use.
+    /// Retained for documentation / debugging; the key is applied to SQLite
+    /// via `PRAGMA key` during `open()`.
     private let encryptionKey: Data
 
     // MARK: Keychain constants
@@ -108,10 +116,15 @@ public actor AppleStorage {
 
     /// Designated internal initialiser.
     ///
-    /// Callers must use ``open()`` which performs the Keychain setup and (on iOS)
-    /// the file protection step before constructing the actor.
-    private init(encryptionKey: Data) {
+    /// Callers must use ``open()`` which performs the Keychain setup, database
+    /// opening, and (on iOS) the file protection step before constructing the actor.
+    private init(db: OpaquePointer, encryptionKey: Data) {
+        self.db = db
         self.encryptionKey = encryptionKey
+    }
+
+    deinit {
+        sqlite3_close_v2(db)
     }
 
     // MARK: Factory
@@ -123,12 +136,18 @@ public actor AppleStorage {
     ///    ``generateOrRetrieveEncryptionKey()``.
     /// 2. On iOS, sets `NSFileProtectionCompleteUntilFirstUserAuthentication`
     ///    on the database file path before first open.
-    /// 3. Constructs and returns the actor.
+    /// 3. Opens the SQLite database and applies SQLCipher encryption pragmas.
+    /// 4. Creates the `kv` table if it does not exist.
+    /// 5. Constructs and returns the actor.
     ///
     /// - Throws: ``StorageError/keychainError(_:)`` if the Keychain is
     ///   inaccessible (e.g., device not yet unlocked after boot).
+    /// - Throws: ``StorageError/databaseError(_:)`` if the database cannot
+    ///   be opened or configured.
     public static func open() throws -> AppleStorage {
         let key = try generateOrRetrieveEncryptionKey()
+
+        let dbURL = databaseFileURL()
 
 #if os(iOS)
         // Set file protection before opening the database.
@@ -136,7 +155,6 @@ public actor AppleStorage {
         // access once the device has been unlocked at least once after boot.
         // NSFileProtectionComplete would block background processing while
         // the device is locked — unacceptable for relay message processing.
-        let dbURL = databaseFileURL()
         let fm = FileManager.default
         // Only set the attribute if the file already exists; SQLCipher will
         // create the file on first connection. On creation the attribute must
@@ -150,7 +168,36 @@ public actor AppleStorage {
         )
 #endif
 
-        return AppleStorage(encryptionKey: key)
+        // Open the SQLite database.
+        var dbHandle: OpaquePointer?
+        let openResult = sqlite3_open(dbURL.path, &dbHandle)
+        guard openResult == SQLITE_OK, let db = dbHandle else {
+            let msg = dbHandle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
+            if let handle = dbHandle { sqlite3_close_v2(handle) }
+            throw StorageError.databaseError("Failed to open database: \(msg)")
+        }
+
+        // Apply SQLCipher encryption key (spec §17.5).
+        let hexKey = key.hexEncodedString
+        let pragmas = """
+            PRAGMA key = "x'\(hexKey)'";
+            PRAGMA cipher_page_size = 4096;
+            PRAGMA kdf_iter = 256000;
+            PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
+            PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
+            PRAGMA journal_mode = WAL;
+            """
+        try execSQL(db: db, sql: pragmas)
+
+        // Create the KV table.
+        try execSQL(db: db, sql: """
+            CREATE TABLE IF NOT EXISTS kv (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            ) WITHOUT ROWID;
+            """)
+
+        return AppleStorage(db: db, encryptionKey: key)
     }
 
     // MARK: Encryption Key
@@ -232,40 +279,144 @@ public actor AppleStorage {
 
     /// Store `value` under `key`, overwriting any existing value.
     public func set(key: String, value: Data) throws {
-        store[key] = value
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        let sql = "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
+        sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        value.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(ptr.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
     }
 
     /// Retrieve the bytes stored under `key`, or `nil` if absent.
     public func get(key: String) throws -> Data? {
-        return store[key]
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        let sql = "SELECT value FROM kv WHERE key = ?1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
+        sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_ROW {
+            let length = sqlite3_column_bytes(stmt, 0)
+            if let blob = sqlite3_column_blob(stmt, 0) {
+                return Data(bytes: blob, count: Int(length))
+            }
+            return Data()
+        } else if result == SQLITE_DONE {
+            return nil
+        } else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
     }
 
     /// Delete the value stored under `key`. No-op if absent.
     public func delete(key: String) throws {
-        store.removeValue(forKey: key)
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        let sql = "DELETE FROM kv WHERE key = ?1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
+        sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
     }
 
     /// List all keys whose prefix matches `prefix` in lexicographic order.
+    ///
+    /// Uses B-tree range scan via ``prefixSuccessor(_:)`` for efficiency.
     public func listKeys(prefix: String) throws -> [String] {
-        return store.keys
-            .filter { $0.hasPrefix(prefix) }
-            .sorted()
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        if let upper = Self.prefixSuccessor(prefix) {
+            let sql = "SELECT key FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw StorageError.databaseError(lastErrorMessage())
+            }
+            sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
+            sqlite3_bind_text(stmt, 2, (upper as NSString).utf8String, -1, transient)
+        } else {
+            let sql = "SELECT key FROM kv WHERE key >= ?1 ORDER BY key"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw StorageError.databaseError(lastErrorMessage())
+            }
+            sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
+        }
+
+        var keys: [String] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let cStr = sqlite3_column_text(stmt, 0) {
+                keys.append(String(cString: cStr))
+            }
+        }
+        return keys
     }
 
     /// Delete all keys whose prefix matches `prefix`.
     ///
     /// - Returns: The number of keys deleted.
     public func deletePrefix(prefix: String) throws -> UInt64 {
-        let matching = store.keys.filter { $0.hasPrefix(prefix) }
-        for key in matching {
-            store.removeValue(forKey: key)
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        if let upper = Self.prefixSuccessor(prefix) {
+            let sql = "DELETE FROM kv WHERE key >= ?1 AND key < ?2"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw StorageError.databaseError(lastErrorMessage())
+            }
+            sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
+            sqlite3_bind_text(stmt, 2, (upper as NSString).utf8String, -1, transient)
+        } else {
+            let sql = "DELETE FROM kv WHERE key >= ?1"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw StorageError.databaseError(lastErrorMessage())
+            }
+            sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
         }
-        return UInt64(matching.count)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
+        return UInt64(sqlite3_changes(db))
     }
 
     /// Return `true` if `key` exists without reading its value.
     public func exists(key: String) throws -> Bool {
-        return store[key] != nil
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        let sql = "SELECT 1 FROM kv WHERE key = ?1 LIMIT 1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
+        sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_ROW {
+            return true
+        } else if result == SQLITE_DONE {
+            return false
+        } else {
+            throw StorageError.databaseError(lastErrorMessage())
+        }
     }
 
     // MARK: Helpers
@@ -281,6 +432,47 @@ public actor AppleStorage {
         // Create the directory if it does not exist.
         try? fm.createDirectory(at: scpDir, withIntermediateDirectories: true)
         return scpDir.appendingPathComponent("scp.db")
+    }
+
+    /// Returns the last SQLite error message for the current connection.
+    private func lastErrorMessage() -> String {
+        String(cString: sqlite3_errmsg(db))
+    }
+
+    /// Execute a batch SQL statement (no results expected).
+    private static func execSQL(db: OpaquePointer, sql: String) throws {
+        var errMsg: UnsafeMutablePointer<CChar>?
+        let rc = sqlite3_exec(db, sql, nil, nil, &errMsg)
+        if rc != SQLITE_OK {
+            let msg = errMsg.map { String(cString: $0) } ?? "unknown error"
+            sqlite3_free(errMsg)
+            throw StorageError.databaseError(msg)
+        }
+    }
+
+    /// Compute the exclusive upper bound for a B-tree range scan on `prefix`.
+    ///
+    /// Given a prefix string, returns a string lexicographically just past all
+    /// strings that start with `prefix`. Increments the last byte; if the last
+    /// byte is `0xFF`, strips it and increments the preceding byte (recursively).
+    /// Returns `nil` when the prefix is empty or all `0xFF` bytes (no finite
+    /// upper bound).
+    static func prefixSuccessor(_ prefix: String) -> String? {
+        var bytes = Array(prefix.utf8)
+
+        // Pop trailing 0xFF bytes — they cannot be incremented.
+        while bytes.last == 0xFF {
+            bytes.removeLast()
+        }
+
+        guard !bytes.isEmpty else {
+            return nil
+        }
+
+        // Increment the last non-0xFF byte.
+        bytes[bytes.count - 1] += 1
+
+        return String(bytes: bytes, encoding: .utf8) ?? String(decoding: bytes, as: UTF8.self)
     }
 }
 
