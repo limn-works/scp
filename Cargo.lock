@@ -4768,6 +4768,7 @@ dependencies = [
  "futures",
  "hex",
  "openmls",
+ "openmls_traits 0.5.0",
  "rmp-serde",
  "scp-core",
  "scp-identity",
