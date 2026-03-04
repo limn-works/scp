@@ -36,6 +36,7 @@
 //! See SCP-PERSIST-068 for the full story.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
@@ -57,6 +58,17 @@ pub struct S3BlobStore {
     bucket: String,
     prefix: String,
     clock: ClockFn,
+}
+
+impl Clone for S3BlobStore {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
+            clock: Arc::clone(&self.clock),
+        }
+    }
 }
 
 impl S3BlobStore {
@@ -972,6 +984,111 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].stored_at > 1_000_000);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires S3-compatible endpoint"]
+    async fn store_returns_correct_blob_id() {
+        let (clock, _time) = test_clock(1_000_000);
+        let store = test_store(clock).await;
+        let routing_id = [0xAA; 32];
+        let blob_data = vec![11, 22, 33, 44, 55];
+        let expected_id = make_blob_id(&blob_data);
+
+        let stored = store
+            .store(routing_id, expected_id, None, 3600, blob_data)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.blob_id, expected_id);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires S3-compatible endpoint"]
+    async fn concurrent_store_purge() {
+        let (clock, time) = test_clock(1_000_000);
+        let store = test_store(clock).await;
+        let routing_id = [0xAA; 32];
+
+        // Store blobs with short TTL.
+        for i in 0u8..5 {
+            time.store(1_000_000 + u64::from(i), Ordering::SeqCst);
+            let data = vec![i; 10];
+            let blob_id = make_blob_id(&data);
+            store
+                .store(routing_id, blob_id, None, 10, data)
+                .await
+                .unwrap();
+        }
+
+        // Advance clock past TTL.
+        time.store(1_000_020, Ordering::SeqCst);
+
+        // Run purge and store concurrently.
+        let store_clone = store.clone();
+        let purge_handle = tokio::spawn(async move { store_clone.purge_expired().await });
+
+        // Store new blobs while purge runs.
+        for i in 10u8..15 {
+            time.store(1_000_020 + u64::from(i), Ordering::SeqCst);
+            let data = vec![i; 10];
+            let blob_id = make_blob_id(&data);
+            store
+                .store(routing_id, blob_id, None, 3600, data)
+                .await
+                .unwrap();
+        }
+
+        let purge_result = purge_handle.await.unwrap();
+        assert!(purge_result.is_ok());
+
+        // Verify newly stored blobs are still retrievable.
+        for i in 10u8..15 {
+            let data = vec![i; 10];
+            let blob_id = make_blob_id(&data);
+            let result = store.get(&blob_id).await.unwrap();
+            assert!(result.is_some(), "blob {i} should survive concurrent purge");
+            assert_eq!(result.unwrap().blob, data);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires S3-compatible endpoint"]
+    async fn purge_expired_only_removes_expired() {
+        let (clock, time) = test_clock(1_000_000);
+        let store = test_store(clock).await;
+        let routing_id = [0xAA; 32];
+
+        // Store a short-lived blob (TTL 10s).
+        let short_data = vec![1, 2, 3];
+        let short_id = make_blob_id(&short_data);
+        store
+            .store(routing_id, short_id, None, 10, short_data)
+            .await
+            .unwrap();
+
+        // Store a long-lived blob (TTL 3600s).
+        time.store(1_000_001, Ordering::SeqCst);
+        let long_data = vec![4, 5, 6];
+        let long_id = make_blob_id(&long_data);
+        store
+            .store(routing_id, long_id, None, 3600, long_data.clone())
+            .await
+            .unwrap();
+
+        // Advance clock past short TTL but not long TTL.
+        time.store(1_000_011, Ordering::SeqCst);
+
+        let purged = store.purge_expired().await.unwrap();
+        assert_eq!(purged, 1);
+
+        // Short-lived blob should be gone.
+        let short_result = store.get(&short_id).await.unwrap();
+        assert!(short_result.is_none());
+
+        // Long-lived blob should still exist.
+        let long_result = store.get(&long_id).await.unwrap().unwrap();
+        assert_eq!(long_result.blob, long_data);
     }
 
     #[tokio::test]

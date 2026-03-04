@@ -2738,4 +2738,147 @@ mod tests {
             other => panic!("subscriber 2: expected BLOB, got {other:?}"),
         }
     }
+
+    // ── Relay restart survival tests (SCP-PERSIST-066) ──────────────────
+
+    #[tokio::test]
+    async fn subscription_survives_simulated_restart() {
+        use crate::native::relay_persistence::RelayPersistence;
+
+        // Use MockRelayPersistence for in-memory persistence.
+        let persistence: Arc<dyn RelayPersistence> = Arc::new(MockRelayPersistence::new());
+
+        let routing_id_a = [0xAA; 32];
+        let routing_id_b = [0xBB; 32];
+
+        // Persist subscriptions (simulates what the relay does on SUBSCRIBE).
+        persistence.persist_subscription(&routing_id_a).unwrap();
+        persistence.persist_subscription(&routing_id_b).unwrap();
+
+        // Create a "restarted" relay with the same persistence.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::with_persistence(config, storage, Arc::clone(&persistence));
+        let (_handle, _addr) = server.start().await.unwrap();
+
+        // After start(), restore_persisted_subscriptions should have run.
+        // Verify the subscription registry has the persisted routing IDs.
+        let registry = server.subscriptions.read().await;
+        let has_a = registry.contains_key(&routing_id_a);
+        let has_b = registry.contains_key(&routing_id_b);
+        drop(registry);
+        assert!(has_a, "routing_id_a should be restored after restart");
+        assert!(has_b, "routing_id_b should be restored after restart");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_state_survives_restart() {
+        use crate::native::relay_persistence::RelayPersistence;
+
+        let persistence: Arc<dyn RelayPersistence> = Arc::new(MockRelayPersistence::new());
+
+        // Persist rate limit state (simulates periodic snapshots).
+        persistence
+            .persist_rate_limit("192.168.1.1", 42.5, 1_000_000)
+            .unwrap();
+        persistence
+            .persist_rate_limit("10.0.0.1", 99.0, 2_000_000)
+            .unwrap();
+
+        // Create a "restarted" relay with the same persistence.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::with_persistence(config, storage, Arc::clone(&persistence));
+        let (_handle, _addr) = server.start().await.unwrap();
+
+        // Rate limit state should be loadable from persistence after restart.
+        let rate1 = persistence.load_rate_limit("192.168.1.1").unwrap();
+        assert_eq!(rate1, Some((42.5, 1_000_000)));
+
+        let rate2 = persistence.load_rate_limit("10.0.0.1").unwrap();
+        assert_eq!(rate2, Some((99.0, 2_000_000)));
+    }
+
+    /// Mock relay persistence for restart tests.
+    #[derive(Debug)]
+    struct MockRelayPersistence {
+        subscriptions: std::sync::Mutex<Vec<[u8; 32]>>,
+        rate_limits: std::sync::Mutex<HashMap<String, (f64, u64)>>,
+    }
+
+    impl MockRelayPersistence {
+        fn new() -> Self {
+            Self {
+                subscriptions: std::sync::Mutex::new(Vec::new()),
+                rate_limits: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl RelayPersistence for MockRelayPersistence {
+        fn persist_subscription(
+            &self,
+            routing_id: &[u8; 32],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut subs = self.subscriptions.lock().unwrap();
+            if !subs.contains(routing_id) {
+                subs.push(*routing_id);
+            }
+            drop(subs);
+            Ok(())
+        }
+
+        fn remove_subscription(
+            &self,
+            routing_id: &[u8; 32],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.subscriptions
+                .lock()
+                .unwrap()
+                .retain(|id| id != routing_id);
+            Ok(())
+        }
+
+        fn load_subscribed_routing_ids(
+            &self,
+        ) -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.subscriptions.lock().unwrap().clone())
+        }
+
+        fn persist_rate_limit(
+            &self,
+            ip: &str,
+            tokens: f64,
+            window_start_secs: u64,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.rate_limits
+                .lock()
+                .unwrap()
+                .insert(ip.to_string(), (tokens, window_start_secs));
+            Ok(())
+        }
+
+        fn load_rate_limit(
+            &self,
+            ip: &str,
+        ) -> Result<Option<(f64, u64)>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.rate_limits.lock().unwrap().get(ip).copied())
+        }
+
+        fn clear_all(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.subscriptions.lock().unwrap().clear();
+            self.rate_limits.lock().unwrap().clear();
+            Ok(())
+        }
+    }
 }

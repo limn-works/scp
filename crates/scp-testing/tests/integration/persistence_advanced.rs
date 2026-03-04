@@ -754,6 +754,171 @@ async fn executed_proposals_duplicate_insertion_idempotent() {
     assert!(loaded.contains(&proposal));
 }
 
+// =========================================================================
+// Test 5: SyncableStorage export/apply roundtrip (SCP-PERSIST-071)
+// =========================================================================
+
+/// Tests that `SyncableStorage` `export_changeset` / `apply_changeset`
+/// roundtrips correctly. Mutations on store A are tracked, exported as a
+/// changeset, and applied to store B, which then contains identical state.
+#[cfg(feature = "sync")]
+#[tokio::test]
+async fn syncable_storage_export_apply_roundtrip() {
+    use scp_platform::Storage;
+    use scp_platform::syncable::SyncableStorage;
+
+    let inner_a = InMemoryStorage::new();
+    let sync_a = SyncableStorage::new(inner_a);
+
+    let inner_b = InMemoryStorage::new();
+    let sync_b = SyncableStorage::new(inner_b);
+
+    // Mutate store A through SyncableStorage.
+    Storage::store(&sync_a, "ctx/state", b"active")
+        .await
+        .unwrap();
+    Storage::store(&sync_a, "ctx/params", b"params-v1")
+        .await
+        .unwrap();
+    Storage::store(&sync_a, "identity/doc", b"my-identity")
+        .await
+        .unwrap();
+
+    // Export changeset from A (since seq 0 = all changes).
+    let changeset = sync_a.export_changeset(0).await.unwrap();
+    assert!(!changeset.is_empty(), "changeset should contain entries");
+    // identity/ keys should be in the changeset (they are tracked by the
+    // changelog even though apply_changeset will reject them on import).
+    assert_eq!(changeset.len(), 3, "all 3 mutations should be tracked");
+
+    // Filter out identity/ keys before applying (apply_changeset rejects
+    // protected namespaces). In a real sync flow, the sender would filter
+    // or the receiver would handle the error. Here we test the happy path
+    // with only context/ keys.
+    let safe_changeset: Vec<_> = changeset
+        .into_iter()
+        .filter(|e| !e.key.starts_with("identity/"))
+        .collect();
+    assert_eq!(safe_changeset.len(), 2);
+
+    // Apply to B.
+    sync_b.apply_changeset(safe_changeset).await.unwrap();
+
+    // Verify B matches A for the synced keys.
+    assert_eq!(
+        Storage::retrieve(&sync_b, "ctx/state").await.unwrap(),
+        Some(b"active".to_vec()),
+    );
+    assert_eq!(
+        Storage::retrieve(&sync_b, "ctx/params").await.unwrap(),
+        Some(b"params-v1".to_vec()),
+    );
+
+    // identity/doc was not synced — should be absent on B.
+    assert_eq!(
+        Storage::retrieve(&sync_b, "identity/doc").await.unwrap(),
+        None,
+        "identity keys should not be synced"
+    );
+
+    // Verify that applying a changeset containing a protected key fails.
+    let bad_changeset = vec![scp_platform::syncable::ChangeEntry {
+        seq: 0,
+        key: "identity/secret".to_owned(),
+        value: Some(b"evil".to_vec()),
+    }];
+    let result = sync_b.apply_changeset(bad_changeset).await;
+    assert!(
+        result.is_err(),
+        "apply_changeset should reject protected namespace keys"
+    );
+}
+
+// =========================================================================
+// Test 6: CombinedNodeStorage — both Storage and BlobStorage traits
+// =========================================================================
+
+/// Tests that `CombinedNodeStorage` serves both `Storage` and `BlobStorage`
+/// from a single SQLite database, and data survives roundtrip. Uses
+/// trait-qualified (UFCS) method calls to disambiguate `store` and `delete`
+/// which exist on both traits.
+#[cfg(feature = "combined")]
+#[tokio::test]
+async fn combined_node_storage_both_traits_roundtrip() {
+    use scp_platform::Storage;
+    use scp_transport::native::combined::CombinedNodeStorage;
+    use scp_transport::native::storage::BlobStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = [0xABu8; 32];
+    let combined = CombinedNodeStorage::new(dir.path(), &key).unwrap();
+
+    // Use as Storage (KV) — UFCS to disambiguate from BlobStorage::store.
+    Storage::store(&combined, "context/test/state", b"active")
+        .await
+        .unwrap();
+    Storage::store(&combined, "context/test/params", b"params")
+        .await
+        .unwrap();
+
+    // Use as BlobStorage — UFCS to disambiguate from Storage::store.
+    let routing_id = [0xAA; 32];
+    let blob_data = vec![1, 2, 3, 4, 5];
+    let blob_id = make_blob_id(&blob_data);
+    BlobStorage::store(
+        &combined,
+        routing_id,
+        blob_id,
+        None,
+        3600,
+        blob_data.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Verify KV data.
+    let state = Storage::retrieve(&combined, "context/test/state")
+        .await
+        .unwrap();
+    assert_eq!(state, Some(b"active".to_vec()));
+
+    let params = Storage::retrieve(&combined, "context/test/params")
+        .await
+        .unwrap();
+    assert_eq!(params, Some(b"params".to_vec()));
+
+    // Verify blob data.
+    let blob = combined.get(&blob_id).await.unwrap().unwrap();
+    assert_eq!(blob.blob, blob_data);
+    assert_eq!(blob.routing_id, routing_id);
+
+    // Verify they don't interfere: delete KV key, blob stays.
+    Storage::delete(&combined, "context/test/state")
+        .await
+        .unwrap();
+    assert!(
+        Storage::retrieve(&combined, "context/test/state")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        combined.get(&blob_id).await.unwrap().is_some(),
+        "blob should be unaffected by KV delete"
+    );
+
+    // Verify blob deletion doesn't affect KV.
+    BlobStorage::delete(&combined, &blob_id).await.unwrap();
+    assert!(combined.get(&blob_id).await.unwrap().is_none());
+    assert_eq!(
+        Storage::retrieve(&combined, "context/test/params")
+            .await
+            .unwrap(),
+        Some(b"params".to_vec()),
+        "KV data should be unaffected by blob delete"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Proposal ID helper
 // ---------------------------------------------------------------------------
