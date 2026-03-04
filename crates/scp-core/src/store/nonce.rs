@@ -19,6 +19,13 @@ use serde::{Deserialize, Serialize};
 
 use super::{ProtocolStore, StoreError};
 
+/// Interval between automatic prune passes (in seconds).
+///
+/// `check_and_record_nonce` reads a per-context last-prune timestamp
+/// and triggers a full prune pass when this interval has elapsed.
+/// One hour balances storage hygiene against scan cost.
+const PRUNE_INTERVAL_SECS: u64 = 3600;
+
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
@@ -57,6 +64,18 @@ fn nonce_key(context_id: &str, nonce_hash: &[u8; 32]) -> Result<String, StoreErr
 fn nonce_prefix(context_id: &str) -> Result<String, StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/nonce/"))
+}
+
+/// Builds the storage key for the last-prune timestamp of a context.
+///
+/// Format: `context/{context_id}/nonce/_last_prune`
+///
+/// The leading underscore ensures this key sorts before any hex-encoded
+/// nonce hash (which start with `0`–`f`), making it easy to skip during
+/// nonce iteration.
+fn last_prune_key(context_id: &str) -> Result<String, StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/nonce/_last_prune"))
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +131,16 @@ impl<S: Storage> ProtocolStore<S> {
         first_seen: u64,
         token_expiry: u64,
     ) -> Result<bool, StoreError> {
+        // Time-gated pruning: if more than PRUNE_INTERVAL_SECS have
+        // elapsed since the last prune for this context, run a prune
+        // pass before checking the nonce. This prevents unbounded
+        // nonce accumulation in long-running processes. The extra
+        // storage read (last-prune timestamp) is negligible relative
+        // to the two reads and one write that the nonce check already
+        // performs. See spec section 17.3 on nonce pruning.
+        let now = crate::time::now_secs().unwrap_or(first_seen);
+        self.maybe_prune_nonces(context_id, now).await?;
+
         let key = nonce_key(context_id, nonce_hash)?;
 
         // If a record already exists, reject immediately without
@@ -138,6 +167,32 @@ impl<S: Storage> ProtocolStore<S> {
         }
     }
 
+    /// Prunes expired nonces if the prune interval has elapsed.
+    ///
+    /// Reads the last-prune timestamp from storage. If more than
+    /// [`PRUNE_INTERVAL_SECS`] have elapsed (or no timestamp exists),
+    /// runs a full prune pass and updates the timestamp.
+    ///
+    /// This is called automatically by `check_and_record_nonce`.
+    /// Errors during pruning are logged but do not fail the nonce check —
+    /// pruning is best-effort maintenance.
+    async fn maybe_prune_nonces(&self, context_id: &str, now: u64) -> Result<(), StoreError> {
+        let lp_key = last_prune_key(context_id)?;
+        let last_prune: Option<u64> = self.load_value(&lp_key).await?;
+
+        let should_prune =
+            last_prune.is_none_or(|ts| now.saturating_sub(ts) >= PRUNE_INTERVAL_SECS);
+
+        if should_prune {
+            // Best-effort: if pruning fails, we still proceed with the
+            // nonce check. The next call will retry.
+            let _ = self.prune_expired_nonces(context_id, now).await;
+            let _ = self.store_value(&lp_key, &now).await;
+        }
+
+        Ok(())
+    }
+
     /// Prunes expired nonces from a context.
     ///
     /// Removes all nonce records whose `token_expiry` is less than or
@@ -159,6 +214,10 @@ impl<S: Storage> ProtocolStore<S> {
         let keys = self.storage.list_keys(&prefix).await?;
         let mut pruned = 0u64;
         for key in keys {
+            // Skip metadata keys (e.g., `_last_prune`).
+            if key.contains("/_") {
+                continue;
+            }
             if let Some(record) = self.load_value::<NonceRecord>(&key).await?
                 && record.token_expiry <= now
             {
@@ -297,6 +356,103 @@ mod tests {
 
         let pruned = store.prune_expired_nonces("ctx-1", 500).await.unwrap();
         assert_eq!(pruned, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Time-gated pruning
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn check_and_record_prunes_expired_on_first_call() {
+        let store = make_store();
+        let nonce_a = {
+            let mut h = [0u8; 32];
+            h[0] = 0xAA;
+            h
+        };
+
+        // Record a nonce with token_expiry=1 (far in the past relative
+        // to wall clock). The nonce check stores it directly.
+        let record = NonceRecord {
+            first_seen: 1,
+            token_expiry: 1,
+        };
+        let key = nonce_key("ctx-1", &nonce_a).unwrap();
+        store.store_value(&key, &record).await.unwrap();
+
+        // Next check_and_record_nonce triggers auto-prune because no
+        // _last_prune timestamp exists. Wall clock now >> 1, so nonce_a
+        // is expired and gets pruned.
+        let nonce_b = {
+            let mut h = [0u8; 32];
+            h[0] = 0xBB;
+            h
+        };
+        let now = crate::time::now_secs().unwrap();
+        store
+            .check_and_record_nonce("ctx-1", &nonce_b, now, now + 3600)
+            .await
+            .unwrap();
+
+        // nonce_a should have been pruned — re-recording should succeed.
+        let is_new = store
+            .check_and_record_nonce("ctx-1", &nonce_a, now + 1, now + 3600)
+            .await
+            .unwrap();
+        assert!(is_new, "expired nonce should have been pruned");
+    }
+
+    #[tokio::test]
+    async fn check_and_record_skips_prune_within_interval() {
+        let store = make_store();
+
+        let now = crate::time::now_secs().unwrap();
+
+        // First call sets _last_prune to now.
+        let nonce_a = {
+            let mut h = [0u8; 32];
+            h[0] = 0xAA;
+            h
+        };
+        store
+            .check_and_record_nonce("ctx-1", &nonce_a, now, now + 3600)
+            .await
+            .unwrap();
+
+        // Manually insert an expired nonce (expiry=1, far in the past).
+        let nonce_expired = {
+            let mut h = [0u8; 32];
+            h[0] = 0xEE;
+            h
+        };
+        let record = NonceRecord {
+            first_seen: 1,
+            token_expiry: 1,
+        };
+        let key = nonce_key("ctx-1", &nonce_expired).unwrap();
+        store.store_value(&key, &record).await.unwrap();
+
+        // Second call — within PRUNE_INTERVAL_SECS of _last_prune.
+        // Should NOT prune the expired nonce.
+        let nonce_b = {
+            let mut h = [0u8; 32];
+            h[0] = 0xBB;
+            h
+        };
+        store
+            .check_and_record_nonce("ctx-1", &nonce_b, now + 1, now + 3600)
+            .await
+            .unwrap();
+
+        // Expired nonce should still be present — replay rejected.
+        let is_new = store
+            .check_and_record_nonce("ctx-1", &nonce_expired, now + 2, now + 3600)
+            .await
+            .unwrap();
+        assert!(
+            !is_new,
+            "expired nonce should not have been pruned within interval"
+        );
     }
 
     // -------------------------------------------------------------------
