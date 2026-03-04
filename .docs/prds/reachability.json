@@ -6,7 +6,7 @@
       "id": "gate-reachability-1",
       "name": "NAT Traversal + Transport",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-232",
         "SCP-233",
@@ -20,7 +20,7 @@
       "id": "gate-reachability-2",
       "name": "DID Resolution Layers",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-238",
         "SCP-239",
@@ -33,7 +33,7 @@
       "id": "gate-reachability-3",
       "name": "Reachability Hardening",
       "priority": "P2",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-242",
         "SCP-243",
@@ -511,7 +511,7 @@
       "gate": "gate-reachability-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-transport/src/nat/mod.rs"
@@ -550,7 +550,8 @@
       "details": {
         "phase": 3,
         "crate": "scp-node"
-      }
+      },
+      "result": "ReachabilityProbe trait + DefaultReachabilityProbe implemented. Self-test integrated in DefaultNatStrategy::select_tier() for Tier 1 (after UPnP mapping) and Tier 2 (after STUN discovery). Failure triggers fallthrough to next tier. Tests: upnp_selftest_failure_falls_through_to_tier2, upnp_selftest_success_returns_tier1, upnp_mapping_failure_skips_tier1."
     },
     {
       "id": "SCP-243",
@@ -558,7 +559,7 @@
       "gate": "gate-reachability-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-transport/src/nat/mod.rs"
@@ -591,7 +592,8 @@
       "details": {
         "phase": 3,
         "crate": "scp-node"
-      }
+      },
+      "result": "TierReEvalHandle with 30-min background loop, tier_change_rx channel for DID republish trigger. NetworkChangeDetector trait + ChannelNetworkChangeDetector for immediate re-eval on network events. Platform-injectable via ApplicationNodeBuilder::network_detector(). Tests: tier_reeval_handle_notifies_on_tier_change, network_change_triggers_immediate_reeval."
     },
     {
       "id": "SCP-244",
@@ -599,7 +601,7 @@
       "gate": "gate-reachability-3",
       "priority": "P2",
       "severity": "moderate",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/nat/stun.rs",
         "crates/scp-transport/src/nat/types.rs"
@@ -635,7 +637,8 @@
       "details": {
         "phase": 3,
         "crate": "scp-transport"
-      }
+      },
+      "result": "Multi-STUN divergence detection: NatProber queries all configured endpoints, compares external addresses. Diverging addresses → symmetric NAT classification. Single-endpoint fallback uses port-mapping heuristics. Tests: two_stun_same_addr_non_symmetric, two_stun_different_addr_symmetric."
     },
     {
       "id": "SCP-245",
@@ -643,7 +646,7 @@
       "gate": "gate-reachability-2",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-identity/src/resolver.rs",
         "crates/scp-identity/src/republish.rs"
@@ -675,7 +678,8 @@
       "details": {
         "phase": 3,
         "crate": "scp-core"
-      }
+      },
+      "result": "DualLayerHealingPublisher trait + DualLayerResolver integration. When seq numbers diverge between relay and DHT, fresher document is asynchronously republished to stale layer via tokio::spawn. HealingPublisher trait enables mock injection. NoOpHealer for tests. Tests: seq_divergence_triggers_healing, healing_failure_logged_not_propagated."
     },
     {
       "id": "SCP-246",
@@ -725,7 +729,7 @@
       "gate": "gate-reachability-3",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/bridge.rs",
         "crates/scp-transport/src/native/server.rs"
@@ -760,7 +764,8 @@
       "details": {
         "phase": 3,
         "crate": "scp-transport"
-      }
+      },
+      "result": "Ed25519 signature verification for BRIDGE_REGISTER: domain-separated payload SCP-BRIDGE-REGISTER-V1: || routing_id || timestamp, 60s replay window, routing ID ownership validation via did_routing_id derivation. Tests: valid_signature_accepted, invalid_signature_rejected, expired_timestamp_rejected."
     }
   ]
 }
