@@ -457,13 +457,24 @@ BRIDGE_REGISTER {
 The bridge relay authenticates the registration (§10.12.4.1) and records the routing ID → connection mapping. Responds with `OK` on success, `ERR` with code `BRIDGE_AUTH_FAILED` (4034) on authentication failure, or `ERR` with `BRIDGE_NOT_SUPPORTED` (4030) if bridging is disabled.
 
 ```
-BRIDGE_DATA {
+BRIDGE_DATA (client → bridge) {
     target_routing_id: [u8; 32],     // Routing ID of the bridged relay
     payload: Vec<u8>,                // Opaque data to forward
 }
 ```
 
-The bridge looks up the target routing ID, wraps the payload in a `BRIDGE_DATA` relay message (with `source_routing_id` set by the bridge), and forwards the serialized message to the registered self-hosted relay over its outbound connection. The bridge does NOT inspect, modify, decrypt, or cache payloads — it is a transparent pipe. Responds with `OK` to the sending peer on success, `ERR` with `BRIDGE_TARGET_NOT_FOUND` (4032) if the target is not registered.
+The bridge looks up the target routing ID, wraps the payload in a relay-side `BRIDGE_DATA` message, and forwards it to the registered self-hosted relay over its outbound connection. The bridge does NOT inspect, modify, decrypt, or cache payloads — it is a transparent pipe. Responds with `OK` to the sending peer on success, `ERR` with `BRIDGE_TARGET_NOT_FOUND` (4032) if the target is not registered.
+
+**Relay-side forwarding format.** The message delivered to the self-hosted relay uses a different wire structure from the client-side `BRIDGE_DATA`:
+
+```
+BRIDGE_DATA (bridge → self-hosted relay) {
+    source_routing_id: [u8; 32],     // Zeroed — bridge does not track peer identities
+    payload: Vec<u8>,                // Opaque payload from the sending peer
+}
+```
+
+The `source_routing_id` field is zeroed (`[0u8; 32]`) because the bridge operates as a transparent pipe and does not track or inject peer identity information. The payload itself contains all necessary routing context (encrypted SCP messages include their own sender metadata). This field is reserved for future use by bridge implementations that choose to track peer connections.
 
 **Authentication (SCP-247):**
 
