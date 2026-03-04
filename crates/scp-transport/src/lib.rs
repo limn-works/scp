@@ -28,16 +28,28 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "coap")]
+pub mod coap;
 pub mod config;
 pub mod cover_traffic;
 pub mod error;
 pub mod heartbeat;
+#[cfg(feature = "http3")]
+pub mod http3;
 pub mod manager;
 pub mod nat;
 pub mod native;
+pub mod pool;
+pub mod profile;
+#[cfg(feature = "quic")]
+pub mod quic;
 pub mod relay;
 pub mod scoring;
 pub mod traits;
+#[cfg(feature = "udp")]
+pub mod udp;
+#[cfg(any(feature = "http3", feature = "webtransport-wasm"))]
+pub mod webtransport;
 
 // Re-export primary types at the crate level for convenience.
 pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
@@ -48,10 +60,12 @@ pub use error::TransportError;
 pub use heartbeat::{
     HeartbeatConfig, HeartbeatConfigError, HeartbeatMonitor, SuppressionSuspected,
 };
-pub use manager::TransportManager;
+pub use manager::{EvictionOutcome, TransportManager};
 pub use nat::{
     MappingProtocol, NatKeepalive, NatProbeResult, NatProber, NatTierChange, NatType, PortMapper,
     PortMappingError, PortMappingManager, PortMappingResult, StunEndpoint,
 };
+pub use pool::{ConnectionPool, PoolKey, TransportType};
+pub use profile::{CoverTrafficTier, TransportProfile};
 pub use scoring::SuppressionWarning;
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};

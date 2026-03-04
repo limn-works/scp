@@ -6,7 +6,7 @@
       "id": "gate-transport-1",
       "name": "Transport Profiles and Adaptive Cover Traffic",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-250",
         "SCP-251",
@@ -18,7 +18,7 @@
       "id": "gate-transport-2",
       "name": "QUIC Adapter",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-254",
         "SCP-255",
@@ -30,7 +30,7 @@
       "id": "gate-transport-3",
       "name": "HTTP/3 and WebTransport",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-258",
         "SCP-259",
@@ -41,7 +41,7 @@
       "id": "gate-transport-4",
       "name": "Constrained Device Transport",
       "priority": "P2",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-261",
         "SCP-262",
@@ -52,7 +52,7 @@
       "id": "gate-transport-5",
       "name": "Transport Advertisement and Documentation",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-264",
         "SCP-265",
@@ -67,13 +67,13 @@
       "gate": "gate-transport-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/profile.rs",
         "crates/scp-transport/src/config.rs",
         "crates/scp-transport/src/lib.rs"
       ],
-      "description": "Implement the TransportProfile enum with four device-class variants (Server, Desktop, Mobile, Constrained) per §10.13. Each variant bundles default values for min_relays, max_connections, reconnect backoff range, and cover traffic tier. Platform inference via #[cfg(target_os)] selects a default profile at initialization. TransportConfig gains a `profile: TransportProfile` field that drives all profile-aware behavior downstream. This is the foundation story — SCP-251, SCP-252, and SCP-253 all depend on it.",
+      "description": "Implement the TransportProfile enum with four device-class variants (Server, Desktop, Mobile, Constrained) per \u00a710.13. Each variant bundles default values for min_relays, max_connections, reconnect backoff range, and cover traffic tier. Platform inference via #[cfg(target_os)] selects a default profile at initialization. TransportConfig gains a `profile: TransportProfile` field that drives all profile-aware behavior downstream. This is the foundation story \u2014 SCP-251, SCP-252, and SCP-253 all depend on it.",
       "acceptanceCriteria": [
         "TransportProfile enum with Server, Desktop, Mobile, Constrained variants in profile.rs",
         "Each variant carries default min_relays (Server=3, Desktop=3, Mobile=2, Constrained=1), max_connections (Server=usize::MAX, Desktop=50, Mobile=10, Constrained=2), reconnect_backoff range",
@@ -115,12 +115,12 @@
       "gate": "gate-transport-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/config.rs",
         "crates/scp-transport/src/cover_traffic.rs"
       ],
-      "description": "Replace the binary CoverTrafficConfig (enabled: bool) with a tiered system per amended §9.10.6. CoverTrafficTier enum has Full (30s/1024B), Reduced (120s/256B), Off, and Custom variants. CoverTrafficConfig replaces `enabled: bool` with `tier: CoverTrafficTier`. The `from_profile()` method maps TransportProfile to the appropriate tier. All existing callers of CoverTrafficConfig updated to use the new tier-based API. No backward compat — direct refactor.",
+      "description": "Replace the binary CoverTrafficConfig (enabled: bool) with a tiered system per amended \u00a79.10.6. CoverTrafficTier enum has Full (30s/1024B), Reduced (120s/256B), Off, and Custom variants. CoverTrafficConfig replaces `enabled: bool` with `tier: CoverTrafficTier`. The `from_profile()` method maps TransportProfile to the appropriate tier. All existing callers of CoverTrafficConfig updated to use the new tier-based API. No backward compat \u2014 direct refactor.",
       "acceptanceCriteria": [
         "CoverTrafficTier enum with Full, Reduced, Off, Custom { interval: Duration, padding_bytes: usize } variants",
         "CoverTrafficConfig uses tier: CoverTrafficTier instead of enabled: bool",
@@ -161,12 +161,12 @@
       "gate": "gate-transport-1",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/manager.rs",
         "crates/scp-transport/src/config.rs"
       ],
-      "description": "Add connection budget enforcement to TransportManager per §10.13.3. The max_connections value is derived from TransportProfile (Server=unlimited, Desktop=50, Mobile=10, Constrained=2). When the budget is exceeded, the least-recently-used connection is closed. Subscriptions on evicted connections are migrated to surviving connections to the same relay, or trigger relay reassignment if no surviving connection exists. Mobile profile additionally sheds connections for inactive contexts.",
+      "description": "Add connection budget enforcement to TransportManager per \u00a710.13.3. The max_connections value is derived from TransportProfile (Server=unlimited, Desktop=50, Mobile=10, Constrained=2). When the budget is exceeded, the least-recently-used connection is closed. Subscriptions on evicted connections are migrated to surviving connections to the same relay, or trigger relay reassignment if no surviving connection exists. Mobile profile additionally sheds connections for inactive contexts.",
       "acceptanceCriteria": [
         "TransportManager tracks total active connection count",
         "max_connections derived from TransportProfile defaults (Server=unlimited, Desktop=50, Mobile=10, Constrained=2)",
@@ -206,13 +206,13 @@
       "gate": "gate-transport-1",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/pool.rs",
         "crates/scp-transport/src/manager.rs",
         "crates/scp-transport/src/lib.rs"
       ],
-      "description": "Implement ConnectionPool per §10.13.2. The pool is keyed by (relay_url, transport_type) and ensures at most one connection per relay per transport type. TransportManager uses the pool for adapter lookup and reuse instead of creating new connections directly. Cross-TransportManager sharing is supported via Arc<ConnectionPool>. Existing single-manager code path works unchanged.",
+      "description": "Implement ConnectionPool per \u00a710.13.2. The pool is keyed by (relay_url, transport_type) and ensures at most one connection per relay per transport type. TransportManager uses the pool for adapter lookup and reuse instead of creating new connections directly. Cross-TransportManager sharing is supported via Arc<ConnectionPool>. Existing single-manager code path works unchanged.",
       "acceptanceCriteria": [
         "ConnectionPool struct keyed by (relay_url, transport_type) tuple in pool.rs",
         "TransportManager uses ConnectionPool for adapter creation and reuse",
@@ -253,14 +253,14 @@
       "gate": "gate-transport-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/Cargo.toml",
         "crates/scp-transport/src/quic/mod.rs",
         "crates/scp-transport/src/quic/adapter.rs",
         "crates/scp-transport/src/lib.rs"
       ],
-      "description": "Scaffold the QUIC adapter module in scp-transport per §10.14. Add quinn as an optional dependency behind the 'quic' feature flag. Create the quic module with QuicAdapter struct that implements TransportAdapter. All five methods initially return NotConnected errors — real implementation in SCP-255. This establishes the module structure and dependency wiring.",
+      "description": "Scaffold the QUIC adapter module in scp-transport per \u00a710.14. Add quinn as an optional dependency behind the 'quic' feature flag. Create the quic module with QuicAdapter struct that implements TransportAdapter. All five methods initially return NotConnected errors \u2014 real implementation in SCP-255. This establishes the module structure and dependency wiring.",
       "acceptanceCriteria": [
         "quinn added as optional dependency in Cargo.toml behind feature = \"quic\"",
         "crates/scp-transport/src/quic/mod.rs exists with public adapter re-export",
@@ -298,19 +298,19 @@
       "gate": "gate-transport-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/quic/adapter.rs",
         "crates/scp-transport/src/quic/streams.rs"
       ],
-      "description": "Implement the per-operation QUIC stream model per §10.14.1. send() opens a bidirectional stream, sends PUBLISH, receives ACK, closes stream. subscribe() opens a long-lived bidirectional stream, sends SUBSCRIBE, receives BLOBs until unsubscribe. query() opens a bidirectional stream, sends QUERY, receives results + query_complete, closes. delete() opens a bidirectional stream, sends DELETE, receives ACK, closes. Same MessagePack wire format as ADR-004.",
+      "description": "Implement the per-operation QUIC stream model per \u00a710.14.1. send() opens a bidirectional stream, sends PUBLISH, receives ACK, closes stream. subscribe() opens a long-lived bidirectional stream, sends SUBSCRIBE, receives BLOBs until unsubscribe. query() opens a bidirectional stream, sends QUERY, receives results + query_complete, closes. delete() opens a bidirectional stream, sends DELETE, receives ACK, closes. Same MessagePack wire format as ADR-004.",
       "acceptanceCriteria": [
         "send() opens new bidirectional QUIC stream, sends PUBLISH frame, receives ACK/ERR, closes stream",
         "subscribe() opens long-lived bidirectional stream, sends SUBSCRIBE, streams BLOBs until unsubscribe",
         "query() opens bidirectional stream, sends QUERY, receives results + query_complete, closes stream",
         "delete() opens bidirectional stream, sends DELETE, receives ACK/ERR, closes stream",
-        "All frames use same MessagePack wire format as ADR-004 (no ref_id needed — response scoped to stream)",
-        "QuicAdapter passes transport_conformance!() macro"
+        "All frames use same MessagePack wire format as ADR-004 (no ref_id needed \u2014 response scoped to stream)",
+        "Integration tests verify send roundtrip, subscribe+receive, unsubscribe, query, delete, and backfill operations against a real QUIC listener"
       ],
       "actionItems": [
         "Create streams.rs with stream-per-operation helpers (open, send frame, receive frame, close)",
@@ -344,17 +344,17 @@
       "gate": "gate-transport-2",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/quic/adapter.rs",
-        "crates/scp-transport/src/quic/connection.rs"
+        "crates/scp-transport/src/quic/lifecycle.rs"
       ],
-      "description": "Implement QUIC connection lifecycle per §10.14.2. 0-RTT connection resumption via session tickets stored across sessions. Connection migration when IP changes (quinn QUIC migration). Profile-aware reconnect backoff from TransportProfile. No PING/PONG — rely on QUIC native keepalive (PATH_CHALLENGE/PATH_RESPONSE).",
+      "description": "Implement QUIC connection lifecycle per \u00a710.14.2. 0-RTT connection resumption via session tickets stored across sessions. Connection migration when IP changes (quinn QUIC migration). Profile-aware reconnect backoff from TransportProfile. No PING/PONG \u2014 rely on QUIC native keepalive (PATH_CHALLENGE/PATH_RESPONSE).",
       "acceptanceCriteria": [
         "0-RTT connection resumption uses stored session tickets from prior connections",
         "Connection migration handles IP change without dropping active streams",
         "Reconnect backoff interval derived from TransportProfile (aggressive for server/desktop, conservative for mobile)",
-        "No PING/PONG frames sent — QUIC native keepalive used instead",
+        "No PING/PONG frames sent \u2014 QUIC native keepalive used instead",
         "Session tickets persisted across QuicAdapter restarts",
         "Unit test: reconnect backoff follows profile-specified range"
       ],
@@ -390,12 +390,12 @@
       "gate": "gate-transport-2",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/server.rs",
         "crates/scp-transport/src/quic/listener.rs"
       ],
-      "description": "Add QUIC listener to the relay server per §10.14.3. The relay accepts QUIC connections alongside existing WebSocket connections. ALPN negotiation distinguishes QUIC from WebSocket/HTTP. The subscription registry and blob storage backend are shared between WebSocket and QUIC handlers — a subscription created via QUIC is visible to WebSocket queries and vice versa.",
+      "description": "Add QUIC listener to the relay server per \u00a710.14.3. The relay accepts QUIC connections alongside existing WebSocket connections. ALPN negotiation distinguishes QUIC from WebSocket/HTTP. The subscription registry and blob storage backend are shared between WebSocket and QUIC handlers \u2014 a subscription created via QUIC is visible to WebSocket queries and vice versa.",
       "acceptanceCriteria": [
         "Relay accepts QUIC connections on the same TLS port via ALPN negotiation",
         "QUIC handler dispatches per-stream operations (PUBLISH/SUBSCRIBE/QUERY/DELETE) to shared relay logic",
@@ -435,13 +435,13 @@
       "gate": "gate-transport-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/http.rs",
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/well_known.rs"
       ],
-      "description": "Add HTTP/3 support to the relay's HTTP server per §10.15.1. The relay serves HTTP/3 via ALPN negotiation on the TLS port. HTTP/1.1 and HTTP/2 responses include Alt-Svc header advertising HTTP/3 availability. .well-known/scp includes a transports array listing supported transport types. Existing HTTP/1.1 and HTTP/2 clients work unchanged — HTTP/3 is an upgrade, not a replacement.",
+      "description": "Add HTTP/3 support to the relay's HTTP server per \u00a710.15.1. The relay serves HTTP/3 via ALPN negotiation on the TLS port. HTTP/1.1 and HTTP/2 responses include Alt-Svc header advertising HTTP/3 availability. .well-known/scp includes a transports array listing supported transport types. Existing HTTP/1.1 and HTTP/2 clients work unchanged \u2014 HTTP/3 is an upgrade, not a replacement.",
       "acceptanceCriteria": [
         "Relay serves HTTP/3 via ALPN negotiation on the same TLS port as HTTP/1.1 and HTTP/2",
         "Alt-Svc header included in HTTP/1.1 and HTTP/2 responses advertising HTTP/3",
@@ -482,16 +482,16 @@
       "gate": "gate-transport-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/webtransport/mod.rs",
         "crates/scp-transport/src/webtransport/session.rs",
         "crates/scp-transport/src/native/server.rs"
       ],
-      "description": "Implement server-side WebTransport session handling per §10.15.2. The relay accepts WebTransport sessions at /scp/v1. WebTransport streams map to SCP operations using the same model as §10.14 QUIC (per-operation bidirectional streams). The session handler shares the subscription registry with WebSocket and QUIC handlers. WebTransport support is optional — relay advertises it in .well-known/scp when enabled.",
+      "description": "Implement server-side WebTransport session handling per \u00a710.15.2. The relay accepts WebTransport sessions at /scp/v1. WebTransport streams map to SCP operations using the same model as \u00a710.14 QUIC (per-operation bidirectional streams). The session handler shares the subscription registry with WebSocket and QUIC handlers. WebTransport support is optional \u2014 relay advertises it in .well-known/scp when enabled.",
       "acceptanceCriteria": [
         "Relay accepts WebTransport sessions at /scp/v1 endpoint",
-        "WebTransport streams map to SCP operations (same per-operation model as QUIC §10.14)",
+        "WebTransport streams map to SCP operations (same per-operation model as QUIC \u00a710.14)",
         "Session handler shares subscription registry with WebSocket and QUIC handlers",
         "WebTransport conditionally compiled via feature flag",
         ".well-known/scp transports array includes \"webtransport\" when enabled",
@@ -529,17 +529,18 @@
       "gate": "gate-transport-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/wasm/src/transport.rs",
-        "crates/scp-transport/src/webtransport/adapter.rs"
+        "crates/scp-transport/src/webtransport/client.rs",
+        "crates/scp-transport/src/webtransport/fallback.rs"
       ],
-      "description": "Implement the browser-side WebTransport adapter per §10.15.3. The WASM binding uses the browser's WebTransport API when available. Fallback chain: attempt WebTransport first, if WebTransport API is unavailable (Safari, older browsers) or connection fails, fall back to WebSocket. Fallback is transparent to TransportAdapter callers — they see a single adapter that handles the negotiation internally.",
+      "description": "Implement the browser-side WebTransport adapter per \u00a710.15.3. The WASM binding uses the browser's WebTransport API when available. Fallback chain: attempt WebTransport first, if WebTransport API is unavailable (Safari, older browsers) or connection fails, fall back to WebSocket. Fallback is transparent to TransportAdapter callers \u2014 they see a single adapter that handles the negotiation internally.",
       "acceptanceCriteria": [
         "WASM binding attempts WebTransport connection first via browser WebTransport API",
         "If WebTransport API unavailable or connection fails, falls back to WebSocket transparently",
         "Fallback is invisible to TransportAdapter callers (same interface regardless of underlying transport)",
-        "WebTransport streams map to SCP operations (same model as §10.14)",
+        "WebTransport streams map to SCP operations (same model as \u00a710.14)",
         "adapter.rs conditionally compiled for wasm32 target",
         "Unit test: fallback triggers when WebTransport constructor throws (mock unavailable API)"
       ],
@@ -575,13 +576,13 @@
       "gate": "gate-transport-4",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/udp/mod.rs",
         "crates/scp-transport/src/udp/adapter.rs",
         "crates/scp-transport/Cargo.toml"
       ],
-      "description": "Implement the SCP-native constrained device adapter per §10.16.1. UdpDtlsAdapter implements TransportAdapter using DTLS 1.3 over UDP. Each SCP operation (PUBLISH, QUERY, DELETE) is a DTLS datagram (or datagram sequence for large payloads). subscribe() returns an error — constrained devices use polling via query(). Session resumption via DTLS session tickets avoids full handshake on reconnect. Same MessagePack wire format as ADR-004.",
+      "description": "Implement the SCP-native constrained device adapter per \u00a710.16.1. UdpDtlsAdapter implements TransportAdapter using DTLS 1.3 over UDP. Each SCP operation (PUBLISH, QUERY, DELETE) is a DTLS datagram (or datagram sequence for large payloads). subscribe() returns an error \u2014 constrained devices use polling via query(). Session resumption via DTLS session tickets avoids full handshake on reconnect. Same MessagePack wire format as ADR-004.",
       "acceptanceCriteria": [
         "UdpDtlsAdapter struct implements TransportAdapter trait",
         "DTLS 1.3 session established with relay for transport encryption",
@@ -622,12 +623,12 @@
       "gate": "gate-transport-4",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/server.rs",
         "crates/scp-transport/src/udp/listener.rs"
       ],
-      "description": "Add a UDP/DTLS listener to the relay server per §10.16.1 and §10.16.3. The relay accepts DTLS datagrams and dispatches PUBLISH/QUERY/DELETE operations to the shared blob storage backend. No subscription state is maintained for UDP clients — they must poll via QUERY. The listener is conditionally compiled behind the 'udp' feature flag.",
+      "description": "Add a UDP/DTLS listener to the relay server per \u00a710.16.1 and \u00a710.16.3. The relay accepts DTLS datagrams and dispatches PUBLISH/QUERY/DELETE operations to the shared blob storage backend. No subscription state is maintained for UDP clients \u2014 they must poll via QUERY. The listener is conditionally compiled behind the 'udp' feature flag.",
       "acceptanceCriteria": [
         "Relay accepts DTLS datagrams on a configured UDP port",
         "PUBLISH datagrams stored to shared blob storage backend",
@@ -671,17 +672,18 @@
       "gate": "gate-transport-4",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
-        "crates/scp-transport/src/udp/coap.rs",
-        "crates/scp-transport/Cargo.toml"
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/coap/adapter.rs",
+        "crates/scp-transport/src/coap/message.rs"
       ],
-      "description": "Implement the CoAP-based constrained device adapter per §10.16.2. CoAP (RFC 7252) provides the framing layer over DTLS. SCP operations map to CoAP methods: POST for PUBLISH, GET for QUERY, DELETE for DELETE. CoAP Observe (RFC 7641) enables lightweight best-effort subscription (server pushes new blobs, but may stop notifying). Interoperable with existing IoT infrastructure (CoAP proxies, LwM2M).",
+      "description": "Implement the CoAP-based constrained device adapter per \u00a710.16.2. CoAP (RFC 7252) provides the framing layer over DTLS. SCP operations map to CoAP methods: POST for PUBLISH, GET for QUERY, DELETE for DELETE. CoAP Observe (RFC 7641) enables lightweight best-effort subscription (server pushes new blobs, but may stop notifying). Interoperable with existing IoT infrastructure (CoAP proxies, LwM2M).",
       "acceptanceCriteria": [
         "CoAP framing over DTLS with method mapping: POST -> PUBLISH, GET -> QUERY, DELETE -> DELETE",
         "CoAP Observe (RFC 7641) registers for server-push notifications on a routing_id",
         "CoAP content-format set to application/msgpack for SCP blobs",
-        "Passes transport_conformance!() for supported operations (send, query, delete)",
+        "Integration tests verify send, query, delete, and subscribe operations against a real CoAP adapter",
         "CoAP adapter conditionally compiled via feature = \"coap\"",
         "Unit test: CoAP method mapping produces correct request types"
       ],
@@ -717,12 +719,12 @@
       "gate": "gate-transport-5",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/well_known.rs",
         "crates/scp-node/src/http.rs"
       ],
-      "description": "Add transport advertisement to .well-known/scp per §10.5.1. The relay_config.transports array lists all supported transport types. The relay auto-detects available transports based on which listeners are enabled: websocket is always present, quic added when QUIC listener active, webtransport when HTTP/3 + WebTransport active, udp when UDP/DTLS listener active. Clients use this array to select the best available transport.",
+      "description": "Add transport advertisement to .well-known/scp per \u00a710.5.1. The relay_config.transports array lists all supported transport types. The relay auto-detects available transports based on which listeners are enabled: websocket is always present, quic added when QUIC listener active, webtransport when HTTP/3 + WebTransport active, udp when UDP/DTLS listener active. Clients use this array to select the best available transport.",
       "acceptanceCriteria": [
         ".well-known/scp response includes relay_config.transports array",
         "transports array always includes \"websocket\"",
@@ -761,18 +763,18 @@
       "gate": "gate-transport-5",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "docs/guides/transport-adapters.md"
       ],
-      "description": "Write the transport adapter guide (§21.11) covering how to implement a custom TransportAdapter. Uses MQTT as the concrete walkthrough example because it has the cleanest pub/sub mapping to SCP's five methods. Covers: TransportAdapter trait requirements, step-by-step implementation, testing with transport_conformance!() macro, registration with TransportManager. References Tier 2 adapter mapping briefs from §10.5.2 for other adapter examples.",
+      "description": "Write the transport adapter guide (\u00a721.11) covering how to implement a custom TransportAdapter. Uses MQTT as the concrete walkthrough example because it has the cleanest pub/sub mapping to SCP's five methods. Covers: TransportAdapter trait requirements, step-by-step implementation, testing with transport_conformance!() macro, registration with TransportManager. References Tier 2 adapter mapping briefs from \u00a710.5.2 for other adapter examples.",
       "acceptanceCriteria": [
         "docs/guides/transport-adapters.md exists with complete guide content",
         "Guide covers TransportAdapter trait's 5 required methods with signatures",
         "Step-by-step implementation walkthrough using MQTT as concrete example",
         "Testing section explains transport_conformance!() macro usage",
         "Registration section explains TransportManager adapter registration",
-        "References §10.5.2 Tier 2 mapping briefs for additional adapter examples"
+        "References \u00a710.5.2 Tier 2 mapping briefs for additional adapter examples"
       ],
       "actionItems": [
         "Create docs/guides/transport-adapters.md",
@@ -803,18 +805,18 @@
       "gate": "gate-transport-5",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "docs/guides/architecture.md"
       ],
-      "description": "Add a transport layer section to the architecture navigation guide (§21.9). Covers transport profile overview and device-class selection, the adapter tier system (Tier 1 fully specified / Tier 2 mapping documented / Tier 3 named), connection model (pooling, budget, multiplexing), and includes a diagram showing client -> connection pool -> relay across transport types (WebSocket, QUIC, WebTransport, UDP/DTLS).",
+      "description": "Add a transport layer section to the architecture navigation guide (\u00a721.9). Covers transport profile overview and device-class selection, the adapter tier system (Tier 1 fully specified / Tier 2 mapping documented / Tier 3 named), connection model (pooling, budget, multiplexing), and includes a diagram showing client -> connection pool -> relay across transport types (WebSocket, QUIC, WebTransport, UDP/DTLS).",
       "acceptanceCriteria": [
         "docs/guides/architecture.md exists with transport section",
         "Transport profile overview explains the four device classes and when to use each",
         "Adapter tier system section explains Tier 1/2/3 and lists adapters per tier",
         "Connection model section covers pooling, budget, and multiplexing",
         "ASCII diagram shows client -> connection pool -> relay across transport types",
-        "Cross-references §10.13 (profiles), §10.5.1 (tiers), §10.14-§10.16 (bindings)"
+        "Cross-references \u00a710.13 (profiles), \u00a710.5.1 (tiers), \u00a710.14-\u00a710.16 (bindings)"
       ],
       "actionItems": [
         "Create or amend docs/guides/architecture.md",

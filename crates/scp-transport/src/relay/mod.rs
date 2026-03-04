@@ -26,5 +26,7 @@
 pub mod bridge;
 pub mod config;
 pub mod connection;
+pub mod rate_limit;
 pub mod stun_service;
+pub mod subscription;
 pub mod wellknown;

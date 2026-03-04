@@ -205,6 +205,10 @@ pub struct ApplicationNode<S: Storage> {
     tier_reeval: Option<TierReEvalHandle>,
     /// Channel for tier change events (§10.12.1, SCP-243).
     tier_change_rx: Option<tokio::sync::mpsc::Receiver<NatTierChange>>,
+    /// HTTP/3 configuration for the QUIC-based HTTP/3 endpoint (spec §10.15.1).
+    /// `None` if HTTP/3 is not configured. Only available with the `http3` feature.
+    #[cfg(feature = "http3")]
+    http3_config: Option<scp_transport::http3::Http3Config>,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -1087,6 +1091,9 @@ pub struct ApplicationNodeBuilder<
     /// CORS allowed origins for public endpoints. `None` = permissive (`*`).
     /// See issue #231.
     cors_origins: Option<Vec<String>>,
+    /// HTTP/3 configuration (spec §10.15.1). `None` = HTTP/3 disabled.
+    #[cfg(feature = "http3")]
+    http3_config: Option<scp_transport::http3::Http3Config>,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -1115,6 +1122,8 @@ impl ApplicationNodeBuilder {
             local_api_addr: None,
             http_bind_addr: None,
             cors_origins: None,
+            #[cfg(feature = "http3")]
+            http3_config: None,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1156,6 +1165,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            #[cfg(feature = "http3")]
+            http3_config: self.http3_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1189,6 +1200,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            #[cfg(feature = "http3")]
+            http3_config: self.http3_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1373,6 +1386,21 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
         };
         self
     }
+
+    /// Configures HTTP/3 support for the node (spec §10.15.1).
+    ///
+    /// When set, the node starts an HTTP/3 listener on a QUIC endpoint
+    /// alongside the HTTP/1.1+HTTP/2 listener. All HTTP/1.1 and HTTP/2
+    /// responses will include an `Alt-Svc` header advertising the HTTP/3
+    /// endpoint.
+    ///
+    /// Requires the `http3` feature flag.
+    #[cfg(feature = "http3")]
+    #[must_use]
+    pub fn http3(mut self, config: scp_transport::http3::Http3Config) -> Self {
+        self.http3_config = Some(config);
+        self
+    }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
@@ -1402,6 +1430,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            #[cfg(feature = "http3")]
+            http3_config: self.http3_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1456,6 +1486,8 @@ impl<S: Storage + 'static, Dom>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            #[cfg(feature = "http3")]
+            http3_config: self.http3_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1489,6 +1521,8 @@ impl<S: Storage + 'static, Dom>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            #[cfg(feature = "http3")]
+            http3_config: self.http3_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1572,6 +1606,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     http_bind_addr,
                     self.cors_origins.clone(),
                     cert_data,
+                    #[cfg(feature = "http3")]
+                    self.http3_config,
                 )
                 .await
             }
@@ -1730,6 +1766,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     http_bind_addr: SocketAddr,
     cors_origins: Option<Vec<String>>,
     cert_data: tls::CertificateData,
+    #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
     document.add_relay_service(&relay_url)?;
@@ -1777,6 +1814,8 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         state,
         tier_reeval: None,
         tier_change_rx: None,
+        #[cfg(feature = "http3")]
+        http3_config,
     })
 }
 
@@ -1893,6 +1932,9 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         state,
         tier_reeval: Some(tier_reeval),
         tier_change_rx: Some(tier_event_rx),
+        // HTTP/3 is not supported in no-domain mode (no TLS certificate).
+        #[cfg(feature = "http3")]
+        http3_config: None,
     })
 }
 

@@ -144,47 +144,59 @@ Notes:
 - Feed limit clamped to 100
 - #![forbid(unsafe_code)] on scp-node
 
-## Key Attack Surfaces -- Reachability Features (PR #255)
+## Key Attack Surfaces -- Transport Expansion (commit 8873a54)
 
-### HIGH: Bridge registration replay within 60s window (no nonce)
-- File: `crates/scp-transport/src/relay/bridge.rs` lines 149-166, 230-266
-- Signed payload = prefix || routing_id || timestamp -- no nonce or connection binding
-- Attacker captures valid BRIDGE_REGISTER, replays within 60s to hijack routing
+### HIGH: owner_id collision across transports (BLACK-201)
+- Three independent AtomicU64 counters (QUIC, WebTransport, WebSocket) all start at 1
+- SubscriptionRegistry uses owner_id as sole identity for cleanup/removal
+- After relay restart, session 1 via QUIC and session 1 via WebTransport collide
+- Files: webtransport/server.rs:153, quic/listener.rs, relay/subscription.rs
 
-### HIGH: DID healing amplification -- no rate limiting
-- File: `crates/scp-identity/src/resolver.rs` lines 598-645
-- Malicious relay returns stale seq -> triggers healing write -> discards -> repeat
-- No per-DID cooldown, no backoff, no failure tracking
+### HIGH: WASM SendSyncWrapper unsound under SharedArrayBuffer (BLACK-202)
+- File: webtransport/client.rs lines 80-95
+- `unsafe impl Send/Sync` for JsValue types, safety relies on "WASM is single-threaded"
+- No runtime guard against SharedArrayBuffer multi-threading
+- If SAB enabled, instant UB -- no compile-time or runtime detection
 
-### HIGH: ws:// in DID document relay URLs (UPnP/STUN tiers)
-- File: `crates/scp-node/src/lib.rs` lines 781-788
-- tier_to_relay_url uses ws:// for non-bridge tiers, metadata visible to observers
+### HIGH: WebSocket backfill_complete broadcast to ALL subscriptions (BLACK-203)
+- File: webtransport/client.rs lines 1273-1288
+- Event with ref_id: None broadcast to every subscription sender
+- Malicious relay can truncate any subscription's backfill
 
-### HIGH: Both default STUN servers are Google (single-vendor)
-- File: `crates/scp-node/src/lib.rs` lines 432-435
-- Single-vendor compromise defeats multi-STUN divergence detection
+### HIGH: Cover traffic budget degradation = traffic analysis oracle (BLACK-204)
+- File: cover_traffic.rs lines 298-338
+- Stepwise Full->Reduced->Off creates observable pattern on wire
+- 60-second period reset creates synchronized burst pattern
+- Budget exhaustion timing reveals real traffic volume
 
-### MEDIUM: No debounce on network-change-triggered re-evaluation
-- File: `crates/scp-node/src/lib.rs` lines 855-917
-- Rapid network changes cause DID document churn
+### MEDIUM: active_subscriptions Vec never pruned on unsubscribe (BLACK-205)
+- File: webtransport/session.rs handle_unsubscribe_inner
+- Unsubscribe removes from registry + my_subscriptions but NOT active_subscriptions
+- Memory leak proportional to subscribe/unsubscribe frequency
 
-### MEDIUM: Bridge registry flooding -- 16 conns x 64 = fills 1000 limit
-- File: `crates/scp-transport/src/relay/bridge.rs` lines 74-81
-- No per-IP rate limiting
+### MEDIUM: QUIC adapter lifecycle manager never used after connect (BLACK-206)
+- File: quic/adapter.rs -- lifecycle field stored but never read
+- No reconnection, no health monitoring, network disruption = permanent death
 
-### MEDIUM: deregister_connection TOCTOU -- phantom count drift
-- File: `crates/scp-transport/src/relay/bridge.rs` lines 480-505
-- entries lock dropped before counts lock acquired
+### MEDIUM: HTTP/3 serve() has no rate limiting (BLACK-208)
+- File: http3/adapter.rs lines 195-293
+- No ConnectionTracker, no per-IP limits, unbounded task spawning
+- Unlike QUIC/WebTransport listeners which have full rate limiting
 
-## Patterns Confirmed Working (Reachability PR #255)
-- Ed25519 bridge auth: domain separator, routing_id derivation, verify_strict
-- Multi-STUN divergence detection: sequential on shared socket, correct classification
-- DID doc verification: BEP44 sig + self-certification + seq anti-rollback
-- Reachability self-test: independent STUN intermediary + tx ID anti-spoofing
-- Register() acquires both locks atomically (no TOCTOU on registration)
-- Per-connection deregistration authorization check
-- Dual-layer resolver: parallel with per-layer timeout, graceful degradation
-- Healing publishes only validly-signed BEP44 records (cannot inject forged docs)
+### CORRECTNESS: WebSocket QUERY clobbers existing subscription (CA-3)
+- File: webtransport/client.rs lines 1106-1154
+- query() over WS does HashMap::insert(routing_id, tx), overwrites existing sub
+- After query cleanup, original subscription is gone entirely
+
+## Patterns Confirmed Working (Transport Expansion)
+- 0-RTT correctly disabled in HTTP/3 config (http3/config.rs:364-370)
+- Frame size validation at 512KB in both client and server paths
+- Blob size/TTL validated server-side in WebTransport session handler
+- PublishRateLimiter shared across transports (per-IP)
+- Delivery jitter breaks timing correlation (BLACK-001 mitigation)
+- Session cleanup correctly scoped by owner_id (within single transport)
+- TLS enforced on all transports (QUIC/rustls, WASM/wss:// or https://)
+- Connection tracking on QUIC and WebTransport listeners (per-IP + total)
 
 ## Patterns Confirmed Working (prior PRs)
 - Ceiling inheritance in nesting is sound

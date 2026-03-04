@@ -4,11 +4,18 @@ This guide walks through implementing a custom SCP transport adapter. It covers 
 
 **Prerequisites:** Familiarity with SCP's envelope model (`OuterEnvelope`, `RoutingId`, `BlobId`), async Rust (tokio, futures), and the transport you are targeting.
 
+**Contents:**
+1. [TransportAdapter Trait Contract](#1-transportadapter-trait-contract)
+2. [Step-by-Step Implementation: MQTT Adapter](#2-step-by-step-implementation-mqtt-adapter)
+3. [Testing with `transport_conformance!()`](#3-testing-with-transport_conformance)
+4. [Registration with TransportManager](#4-registration-with-transportmanager)
+5. [Reference: Tier 2 Adapter Mapping Briefs](#5-reference-tier-2-adapter-mapping-briefs)
+
 ---
 
 ## 1. TransportAdapter Trait Contract
 
-The trait lives in `scp-transport::traits` and defines five async methods. All return boxed futures for dyn-compatibility. The trait requires `Send + Sync`.
+The trait lives in `scp-transport::traits` and defines five async methods. All return boxed futures (`BoxFuture`) instead of `async fn` because `async fn` in traits is not dyn-compatible -- `TransportAdapter` must be usable as `dyn TransportAdapter` across adapter types. Each method implementation wraps its async body in `Box::pin(async move { ... })`. The trait requires `Send + Sync`.
 
 ```rust
 pub trait TransportAdapter: Send + Sync {
@@ -83,6 +90,8 @@ MQTT v5.0 has the cleanest mapping to the `TransportAdapter` contract among Tier
 
 ```toml
 # Cargo.toml for scp-transport-mqtt
+# Path dependencies assume the adapter lives within the SCP workspace.
+# For out-of-tree crates, replace path deps with version deps from crates.io.
 [package]
 name = "scp-transport-mqtt"
 version = "0.1.0"
@@ -93,6 +102,7 @@ scp-core = { path = "../scp-core" }
 scp-transport = { path = "../scp-transport" }
 rumqttc = { version = "0.24", features = ["v5"] }  # MQTT v5 client
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 futures = { workspace = true }
 hex = "0.4"
 tracing = { workspace = true }
@@ -108,24 +118,30 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::Stream;
-use rumqttc::v5::{AsyncClient, EventLoop, MqttOptions};
+use futures::{Stream, StreamExt};
+use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
+use rumqttc::v5::mqttbytes::v5::Packet;
 use scp_core::envelope::OuterEnvelope;
 use scp_transport::{
     BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportError, TransportEvent,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, mpsc};
 
 type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 pub struct MqttTransportAdapter {
     client: AsyncClient,
-    /// Active subscription streams keyed by routing_id hex.
-    subscriptions: Arc<Mutex<HashMap<String, broadcast::Sender<TransportEvent>>>>,
+    /// Active subscription channels keyed by routing_id hex.
+    /// Uses mpsc instead of broadcast because SubscriptionStream yields
+    /// TransportEvent directly (not Result), and mpsc::Receiver implements
+    /// Stream<Item = T> without wrapping.
+    subscriptions: Arc<Mutex<HashMap<String, mpsc::Sender<TransportEvent>>>>,
 }
 ```
 
-### Construction
+Note on channel choice: the trait's `SubscriptionStream` is `Pin<Box<dyn Stream<Item = TransportEvent> + Send>>`. An `mpsc::Receiver` yields `TransportEvent` directly and implements `Stream<Item = T>` via `tokio-stream`, which matches the expected type. A `broadcast::Receiver` yields `Result<T, RecvError>` and would require a `.filter_map()` adapter.
+
+### Construction and event dispatch
 
 ```rust
 impl MqttTransportAdapter {
@@ -135,7 +151,7 @@ impl MqttTransportAdapter {
 
         let (client, mut event_loop) = AsyncClient::new(opts, 256);
 
-        let subscriptions: Arc<Mutex<HashMap<String, broadcast::Sender<TransportEvent>>>> =
+        let subscriptions: Arc<Mutex<HashMap<String, mpsc::Sender<TransportEvent>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         // Spawn the event loop handler
@@ -159,6 +175,50 @@ impl MqttTransportAdapter {
             subscriptions,
         })
     }
+
+    /// Dispatches incoming MQTT PUBLISH events to the matching subscription channel.
+    ///
+    /// Parses the topic to extract the routing_id hex, looks up the matching
+    /// mpsc::Sender, deserializes the payload as an OuterEnvelope, and sends
+    /// it as a TransportEvent::Envelope. Deserialization failures are logged
+    /// and skipped (the envelope may be from a different protocol version).
+    async fn handle_notification(
+        event: Event,
+        subs: &Mutex<HashMap<String, mpsc::Sender<TransportEvent>>>,
+    ) {
+        // Only handle incoming Publish packets
+        let Event::Incoming(Packet::Publish(publish)) = event else {
+            return;
+        };
+
+        // Extract routing_id hex from topic: "scp/{hex}" -> "{hex}"
+        let topic = std::str::from_utf8(&publish.topic).unwrap_or_default();
+        let routing_id_hex = match topic.strip_prefix("scp/") {
+            Some(hex) => hex,
+            None => return, // Not an SCP topic
+        };
+
+        // Deserialize the payload as an OuterEnvelope
+        let envelope = match OuterEnvelope::from_bytes(&publish.payload) {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(
+                    topic = %topic,
+                    error = %e,
+                    "Failed to deserialize MQTT payload as OuterEnvelope, skipping"
+                );
+                return;
+            }
+        };
+
+        // Dispatch to the matching subscription channel
+        let lock = subs.lock().await;
+        if let Some(tx) = lock.get(routing_id_hex) {
+            if tx.send(TransportEvent::Envelope(envelope)).await.is_err() {
+                tracing::debug!(topic = %topic, "Subscription receiver dropped");
+            }
+        }
+    }
 }
 ```
 
@@ -169,7 +229,7 @@ impl MqttTransportAdapter {
 ```rust
 fn send(&self, envelope: &OuterEnvelope) -> BoxFuture<'_, Result<BlobId, TransportError>> {
     Box::pin(async move {
-        let wire_bytes = scp_core::envelope::serialize(envelope)
+        let wire_bytes = envelope.to_bytes()
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
         let blob_id = BlobId::from_sha256(&wire_bytes);
 
@@ -186,6 +246,8 @@ fn send(&self, envelope: &OuterEnvelope) -> BoxFuture<'_, Result<BlobId, Transpo
 ```
 
 The `BlobId` is the SHA-256 hash of the serialized envelope bytes -- this is the canonical derivation used across all adapters.
+
+**Note on routing_id types:** `OuterEnvelope.routing_id` is `Vec<u8>`, while the trait's `subscribe`, `unsubscribe`, and `query` methods receive `&RoutingId` (a `[u8; 32]` wrapper). In `send`, you work with the raw vec from the envelope. In other methods, use `routing_id.as_bytes()` to get the `&[u8; 32]`. The native relay adapter does an explicit `try_into()` conversion when needed.
 
 #### `subscribe`
 
@@ -206,8 +268,10 @@ fn subscribe(
             .await
             .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
 
-        // Create a broadcast channel for this subscription
-        let (tx, rx) = broadcast::channel(256);
+        // Create an mpsc channel for this subscription.
+        // mpsc::Receiver implements Stream<Item = TransportEvent> directly
+        // (via tokio-stream), matching the SubscriptionStream type alias.
+        let (tx, rx) = mpsc::channel(256);
         self.subscriptions.lock().await.insert(topic_hex, tx);
 
         // If `since` is provided, handle backfill.
@@ -220,7 +284,8 @@ fn subscribe(
             // after retained messages are delivered.
         }
 
-        let stream = BroadcastStream::new(rx);
+        // tokio_stream::wrappers::ReceiverStream adapts mpsc::Receiver to Stream
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Box::pin(stream) as SubscriptionStream)
     })
 }
@@ -238,7 +303,7 @@ fn unsubscribe(&self, routing_id: &RoutingId) -> BoxFuture<'_, Result<(), Transp
         self.client
             .unsubscribe(&topic)
             .await
-            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
 
         self.subscriptions.lock().await.remove(&topic_hex);
         Ok(())
@@ -248,6 +313,8 @@ fn unsubscribe(&self, routing_id: &RoutingId) -> BoxFuture<'_, Result<(), Transp
 
 #### `query`
 
+MQTT has no native query/history mechanism, so `query` requires either the MQTT 5.0 Request/Response pattern with a broker-side query service, or returning only retained messages (limited to one per topic). The skeleton below shows the Request/Response approach:
+
 ```rust
 fn query(
     &self,
@@ -256,18 +323,39 @@ fn query(
 ) -> BoxFuture<'_, Result<Vec<OuterEnvelope>, TransportError>> {
     let routing_id = *routing_id;
     Box::pin(async move {
-        // MQTT 5.0 Request/Response pattern:
-        // Publish a query request with a Response Topic and Correlation Data,
-        // then await the response on the response topic.
-        //
-        // If the broker doesn't support this (or no query-service plugin is
-        // running), fall back to returning the retained message only.
-        //
-        // Full backfill requires broker-side storage or an external query
-        // service. This is a known MQTT constraint (see spec section 10.5.2).
-        let _topic = format!("scp/{}", hex::encode(routing_id.as_bytes()));
+        let topic = format!("scp/{}", hex::encode(routing_id.as_bytes()));
 
-        // Placeholder: implement broker-specific query mechanism
+        // MQTT 5.0 Request/Response pattern:
+        // 1. Generate a unique response topic and correlation ID
+        // 2. Subscribe to the response topic
+        // 3. Publish a query request to a well-known query-service topic
+        //    with Response Topic and Correlation Data properties set
+        // 4. Collect responses until timeout or completion signal
+        //
+        // If no query-service is running (common in simple deployments),
+        // fall back to reading the retained message on the routing topic.
+        // This returns at most one envelope -- a documented MQTT limitation
+        // (see spec section 10.5.2).
+
+        // Retained message fallback: subscribe, collect the retained message
+        // (if any), then unsubscribe. This is the minimal viable implementation.
+        self.client
+            .subscribe(&topic, rumqttc::v5::mqttbytes::QoS::AtLeastOnce)
+            .await
+            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
+
+        // Wait briefly for retained message delivery
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        self.client
+            .unsubscribe(&topic)
+            .await
+            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
+
+        // In a full implementation, collect envelopes from the event loop
+        // during the subscription window and filter by `since` timestamp.
+        // For brevity, this returns empty -- a real adapter would wire this
+        // to the event loop's collected messages.
         Ok(Vec::new())
     })
 }
@@ -307,9 +395,9 @@ These are documented in the spec (section 10.5.2) and worth internalizing:
 
 ## 3. Testing with `transport_conformance!()`
 
-The `scp-testing` crate provides a conformance test macro that validates any `TransportAdapter` implementation against the trait contract. Passing means your adapter satisfies the same invariants as the reference `InMemoryTransport` implementation.
+The spec (section 16.12.1) defines a `transport_conformance!()` macro for the `scp-testing` crate that validates any `TransportAdapter` implementation against the trait contract. **Note:** this macro is specified but not yet implemented -- it is part of the transport expansion work. Until it is available, write manual tests following the contract described below.
 
-### Usage
+### Intended usage (once implemented)
 
 ```rust
 // In your adapter crate's tests
@@ -326,7 +414,7 @@ The constructor closure must return an instance of your adapter ready to send an
 
 ### What it tests
 
-The macro expands into a test module with these cases:
+The macro expands into a test module with these cases (per spec section 16.12.1):
 
 | Test | What it verifies |
 |------|------------------|
@@ -336,10 +424,13 @@ The macro expands into a test module with these cases:
 | `query_returns_stored` | Store envelopes, query by `routing_id`, verify results match. |
 | `delete_removes_blob` | Store a blob, delete it, query again, verify it is gone. |
 
-### What passing means
+### Writing manual conformance tests
+
+Until the macro is available, test each of the five cases above manually. The key invariants to verify:
 
 - Your adapter correctly routes envelopes by `routing_id`.
 - Backfill with `since` filters stored envelopes by timestamp.
+- `BackfillComplete` is emitted after backfill when `since` was provided.
 - Unsubscribe actually stops delivery.
 - Query returns stored data without creating a live subscription.
 - Delete removes blobs (best-effort is acceptable -- the test verifies the request completes without error).
@@ -352,7 +443,7 @@ Some transports cannot support all five methods fully. For example, MQTT has no 
 - Document the limitation in the adapter's module-level doc comment.
 - The conformance suite tests the contract -- if your transport fundamentally cannot pass a test (e.g., no backfill), you may need to pair it with a storage backend or skip that test with a documented justification.
 
-Tier 1 adapters (SCP native relay, QUIC, WebTransport, UDP/DTLS) must pass the full conformance suite. Tier 2 adapters should pass as many tests as the transport's native capabilities allow.
+Tier 1 adapters (SCP native relay, QUIC, WebTransport, UDP/DTLS) must pass the full conformance suite. Tier 2 adapters should pass as many tests as the transport's native capabilities allow. Note that UDP/DTLS is Tier 1 but does not support `subscribe` (constrained devices poll via `query` instead) -- this is a documented exception, not a conformance failure.
 
 ---
 
@@ -380,11 +471,14 @@ use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 let config = TransportConfig::default();
 let mut manager = TransportManager::with_config(&config);
 
-// Register the native relay adapter (connect_sourced validates ws:// vs wss:// per §10.12.6)
-let native = NativeRelayAdapter::connect_sourced(&SourcedRelayUrl {
+// Register the native relay adapter. connect_sourced validates that ws:// URLs
+// are only used with DHT-resolved sources (where BEP44 signatures provide the
+// trust anchor), preventing protocol downgrade attacks (section 10.12.6).
+let sourced = SourcedRelayUrl {
     url: "wss://relay.example.com/scp/v1".to_owned(),
     source: RelayUrlSource::Explicit,
-}).await?;
+};
+let native = NativeRelayAdapter::connect_sourced(&sourced).await?;
 manager.add_adapter(Box::new(native));
 
 // Register an MQTT adapter for IoT devices
@@ -421,7 +515,7 @@ The spec (section 10.5.2) documents method mappings for all 12 Tier 2 adapters. 
 
 ### Quick reference for select Tier 2 adapters
 
-**Nostr:** Routes via Nostr events (kind=30078). `subscribe` maps to `REQ` with filter. `query` uses `REQ` with `since` filter, collects until `EOSE`. JSON format adds ~33% overhead from base64 blob encoding.
+**Nostr:** Routes via Nostr events. The spec (section 10.5.2) specifies kind=29078, but note this falls in NIP-01's ephemeral range (20000-29999) where relays SHOULD NOT store events -- this would break `query` and `subscribe` with `since`. A kind in the regular range (1000-9999, e.g., kind=9078) is more appropriate for durable SCP blobs. Avoid parameterized-replaceable kinds 30000-39999 which silently discard prior messages. `subscribe` maps to `REQ` with filter. `query` uses `REQ` with `since` filter, collects until `EOSE`. JSON format adds ~33% overhead from base64 blob encoding.
 
 **NATS:** Near-identical to SCP's semantics. `send` maps to `PUB`, `subscribe` to `SUB`. JetStream required for `query` (persistent storage) and `delete`. Sub-millisecond latency locally.
 

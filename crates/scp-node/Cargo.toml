@@ -53,5 +53,11 @@ http-body-util = "0.1"
 hyper = "1"
 rcgen = "0.14"
 
+[features]
+quic = ["scp-transport/quic"]
+http3 = ["scp-transport/http3"]
+udp = ["scp-transport/udp"]
+coap = ["scp-transport/coap"]
+
 [lints]
 workspace = true

@@ -51,4 +51,24 @@ pub enum TransportError {
         /// The SHA-256 hash of the actual blob content (hex-encoded).
         actual: String,
     },
+
+    /// The requested operation is not supported by this transport adapter.
+    ///
+    /// Some adapters do not support all five [`TransportAdapter`] methods.
+    /// For example, UDP/DTLS (section 10.16.1) cannot maintain long-lived
+    /// subscription streams — callers should poll via `query()` instead.
+    ///
+    /// See SCP-261 and spec section 10.16.1 point 6.
+    #[error("not supported: {0}")]
+    NotSupported(String),
+
+    /// A received or reassembled payload exceeds the adapter's configured
+    /// maximum size.
+    ///
+    /// This protects constrained devices from memory exhaustion during
+    /// operations like CoAP block-wise reassembly (RFC 7959) where a
+    /// malicious or misconfigured server could send arbitrarily large
+    /// payloads.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
 }

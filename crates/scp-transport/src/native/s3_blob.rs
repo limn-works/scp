@@ -677,7 +677,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Returns the test endpoint URL from env, defaulting to localhost MinIO.
+    /// Returns the test endpoint URL from env, defaulting to localhost `MinIO`.
     fn test_endpoint() -> String {
         std::env::var("S3_TEST_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_owned())
     }
@@ -694,7 +694,7 @@ mod tests {
         format!("test/{suffix:016x}")
     }
 
-    /// Creates a deterministic blob_id from data (SHA-256).
+    /// Creates a deterministic `blob_id` from data (SHA-256).
     fn make_blob_id(data: &[u8]) -> [u8; 32] {
         let hash = Sha256::digest(data);
         let mut out = [0u8; 32];

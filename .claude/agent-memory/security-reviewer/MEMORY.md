@@ -26,6 +26,15 @@
 
 ### Relay Server (`crates/scp-transport/src/native/server.rs`)
 - FINDING (PR#4): Zero rate limiting; no storage quota; DELETE unauthenticated
+- PARTIAL FIX (2026-03-03): Shared PublishRateLimiter + ConnectionTracker across WS/QUIC
+- REMAINING (MEDIUM): Total connection limit TOCTOU -- two-step (register_connection then separate read lock) vs QUIC single write lock
+- GOOD: Per-IP register_connection is atomic (check+increment under single write lock)
+
+### Transport Expansion Audit (2026-03-04) -- QUIC/HTTP3/WebTransport/UDP/CoAP
+- See `transport-expansion-audit.md` for full finding list (SEC-001 through SEC-008)
+- HIGH: UDP TOCTOU on max_sessions (read lock, handshake, write lock)
+- MEDIUM x6: HTTP/3 conn limit TOCTOU, HTTP/3 bypasses ConnectionTracker, QUIC 0-RTT not explicitly disabled, SubscriptionRegistry unbounded, QUIC query() unbounded Vec, HTTP/3 doc/code mismatch
+- GOOD: QUIC accept_loop single write lock (exemplary); shared rate limiting across WS/QUIC/UDP; global owner ID counter; cover traffic constant-rate invariant; delivery jitter; DTLS ECDHE-ECDSA-AES-GCM only
 
 ### UCAN (`crates/scp-core/src/crypto/ucan/`)
 - 11-step validation pipeline thorough; SpendingCapability attenuation correct
@@ -173,33 +182,16 @@
 
 ### Persistence Layer (feat/broadcast-persistence-across-restarts) -- 2026-03-03
 - See `persistence-layer-findings.md` for detailed finding list
-- HIGH: identity.rs store_active_signing_key/store_identity_private_state use store_value not store_value_zeroize
-- HIGH: MLS storage bridge build_key() bypasses sanitize_key_component for context_id -- cross-namespace write
-- HIGH: SyncableStorage apply_changeset has no auth/integrity on incoming changesets -- arbitrary key overwrite
-- MEDIUM: relay_persistence rate limit IP unsanitized in storage key
-- MEDIUM: SqliteStorage/CombinedNodeStorage no key length validation (Apple does 32-byte check)
-- MEDIUM: Swift AppleStorage retains encryptionKey Data property for actor lifetime (never used after open)
-- MEDIUM: Event log append_event non-atomic count update -- count can drift on crash
-- MEDIUM: Context snapshot TTL stores original duration, not remaining time -- TTL reset on restart
-- MEDIUM: MLS storage bridge stores key material as JSON without zeroization
-- MEDIUM: sanitize_key_component echoes forbidden input in error message
-- GOOD: Parameterized SQL everywhere; B-tree range scans (no LIKE); belt-and-suspenders path traversal; atomic filesystem writes; nonce replay defense-in-depth; sender key zeroization; schema version forward-compat guard; transport URL hashing; Apple Keychain config; SQLCipher 256000 KDF iterations
+- HIGH x3: identity keys not zeroized; MLS bridge bypasses sanitize_key_component; SyncableStorage apply_changeset no auth
+- MEDIUM x7: IP in storage key; no key length validation; encryptionKey retained; non-atomic count; TTL reset; MLS JSON key material; error echoes input
+- GOOD: Parameterized SQL; B-tree range scans; atomic fs writes; SQLCipher 256000 KDF
 
 ### General Patterns
-- No `unwrap`/`expect` in lib code -- project standard via clippy deny
-- `thiserror` for error types; Rust edition 2024; `#![forbid(unsafe_code)]` on all crates except scp-ffi
-- `zeroize` crate used in store layer (store_value_zeroize, full_snapshot, sender_key) but inconsistently -- identity signing keys and MLS key pairs still not zeroized
-- `unwrap_or_default()` on clock ops is a recurring systemic pattern
-- Inner envelope now uses domain-separated length-prefixed canonical hash -- gold standard pattern for other hash functions to follow
-- FfiBridgeProvider reimplementing scp-core logic instead of delegating silently drops spec obligations (event log, timeout, request_id) -- always prefer delegation
-- DashMap shard locks must not be held across Python GIL acquisition -- clone Arc before entering with_context
-- New PyO3 Rust functions must also be wrapped in the Python SDK layer or they are unreachable to SDK users
-- Test adapters that return hardcoded values weaken invariant tests; duplicated canonical hash logic in test helpers diverges from production
-- Android Keystore AES-GCM requires setRandomizedEncryptionRequired(false) for deterministic IV usage -- default is true and will throw InvalidAlgorithmParameterException
-- SQL LIKE prefix matching without wildcard escaping (% and _) is a recurring KV store risk; prefer ESCAPE clause or range queries (>= and <)
-- Persistence layer uses B-tree range scans (prefix_successor) consistently across all platforms -- eliminates LIKE wildcard injection risk
-- Static DashMap registries in scp-ffi (CONTEXT_REGISTRY, KNOWN_CONTEXTS, IDENTITY_ROUTING_SECRETS) all lack eviction -- unbounded growth pattern
-- SyncableStorage changelog and nonce records grow unboundedly -- no automatic compaction/pruning
-- Kotlin runBlocking in callbackFlow awaitClose is the correct fix for non-suspend lambda but requires multi-threaded dispatcher
-- MLS StorageProvider bridge bypasses ProtocolStore domain methods, calling Storage trait directly -- loses sanitization and zeroization guarantees
-- Any module that builds storage keys from user-controlled strings MUST call sanitize_key_component() -- the MLS bridge is the only exception found
+- clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
+- zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no
+- unwrap_or_default() on clock ops is recurring systemic pattern
+- DashMap shard locks must not cross Python GIL; clone Arc first
+- Static DashMap registries (CONTEXT_REGISTRY, KNOWN_CONTEXTS, IDENTITY_ROUTING_SECRETS) lack eviction
+- MLS StorageProvider bridge bypasses ProtocolStore -- loses sanitization and zeroization
+- Storage keys from user-controlled strings MUST call sanitize_key_component()
+- B-tree range scans eliminate LIKE wildcard injection risk across all platforms

@@ -128,7 +128,7 @@ impl<S> fmt::Debug for StorageRelayPersistence<S> {
 #[cfg(feature = "relay-persistence")]
 impl<S> StorageRelayPersistence<S> {
     /// Creates a new relay persistence provider wrapping the given storage.
-    pub fn new(storage: Arc<S>) -> Self {
+    pub const fn new(storage: Arc<S>) -> Self {
         Self { storage }
     }
 }
@@ -203,7 +203,7 @@ impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersis
                 format!("invalid IP for rate limit key: {e}"),
             ))
         })?;
-        let key = format!("{}{}", RATE_LIMIT_PREFIX, ip);
+        let key = format!("{RATE_LIMIT_PREFIX}{ip}");
         let value = rmp_serde::to_vec(&(tokens, window_start_secs))
             .map_err(|e| -> BoxError { Box::new(e) })?;
         let storage = Arc::clone(&self.storage);
@@ -225,7 +225,7 @@ impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersis
                 format!("invalid IP for rate limit key: {e}"),
             ))
         })?;
-        let key = format!("{}{}", RATE_LIMIT_PREFIX, ip);
+        let key = format!("{RATE_LIMIT_PREFIX}{ip}");
         let storage = Arc::clone(&self.storage);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {

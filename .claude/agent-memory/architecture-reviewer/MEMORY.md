@@ -48,6 +48,25 @@ Any story that replaces placeholder bindings with real generated ones MUST recon
 ### CI and local build scripts must stay synchronized for Swift
 build-xcframework.sh renames `scp_ffi_uniffi.swift` to `ScpBindings.swift` and copies to `Sources/SCP/Internal/`. CI workflow writes to `Sources/SCP/` without renaming. CI module map uses `scpFFI.h` (lowercase), build script uses `ScpFFI.h` (uppercase). Always verify CI mirrors local build layout when reviewing Swift build stories.
 
+## Transport expansion patterns
+- `TransportProfile` and `CoverTrafficTier` live in `profile.rs`, are non-feature-gated
+- `ConnectionPool` in `pool.rs` is keyed by `(relay_url, TransportType)`, also non-feature-gated
+- `TransportType` enum has 4 variants: NativeWebSocket, Quic, WebTransport, UdpDtls -- NO CoAP variant
+- `webtransport/` module is NOT feature-gated in lib.rs (session.rs and fallback.rs compile on all targets; client.rs is `#[cfg(target_arch = "wasm32")]`)
+- Architecture docs reference `webtransport` feature flag but Cargo.toml only has `webtransport-wasm` for the WASM client dependencies
+- Three separate incompatible SubscriptionRegistry types exist (native/server.rs, quic/listener.rs, webtransport/session.rs) -- spec requires a shared one
+- Architecture doc tree shows `quic/connection.rs` but actual file is `quic/lifecycle.rs`
+- Architecture doc tree shows `udp/coap.rs` but CoAP is a separate module `coap/` with its own feature flag
+
+## relay/ shared types pattern
+- `relay/subscription.rs` -- shared SubscriberEntry + SubscriptionRegistry + deliver_to_subscribers
+- `relay/rate_limit.rs` -- shared PublishRateLimiter, SubscribeRateLimiter, ConnectionTracker, register/unregister_connection, rate_limiter_cleanup_task
+- Native server uses `register_connection()` (shared); QUIC accept_loop does inline tracking with total-connection check
+- WebTransport session accepts SubscriptionRegistry but NOT rate limiters (all handlers are stubs per SCP-259)
+- UDP listener accepts PublishRateLimiter only; no SubscriptionRegistry (connectionless, poll-only)
+- `deliver_to_subscribers()` holds registry read lock during jitter await -- blocks writes for up to jitter_ms
+- Only QUIC `start()` spawns `rate_limiter_cleanup_task` -- native server does NOT, creating potential memory leak when running WebSocket-only
+
 ## ADR Reference Quick Map
 - ADR-029: Offline/Sync Strategy -- phase-6.md line 1227+
 - ADR-030: Event Log Pruning -- phase-6.md line 1698+

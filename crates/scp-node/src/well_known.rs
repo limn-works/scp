@@ -30,15 +30,37 @@ const QUERY_VALUE: &AsciiSet = &CONTROLS
 
 use crate::http::NodeState;
 
-/// Axum handler for `GET /.well-known/scp`.
+/// Returns the list of transports advertised in `.well-known/scp`.
 ///
-/// Reads the current node state (DID, relay URL, registered broadcast
-/// contexts) and constructs a [`WellKnownScp`] response. The document
-/// is generated fresh on every request -- never cached (spec section
-/// 18.6.4: "dynamically generated from node state").
+/// WebSocket is always included (it is the baseline SCP transport).
+/// Additional transports are included when their corresponding feature
+/// flags are enabled at compile time:
 ///
-/// Returns `application/json` with the `WellKnownScp` payload.
-pub async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
+/// - `quic` feature -> `"quic"`
+/// - `http3` feature -> `"webtransport"`
+/// - `udp` feature -> `"udp-dtls"`
+///
+/// See spec §10.5.1 and SCP-264.
+#[must_use]
+fn advertised_transports() -> Vec<String> {
+    #[allow(unused_mut)]
+    let mut transports = vec!["websocket".to_owned()];
+    #[cfg(feature = "quic")]
+    transports.push("quic".to_owned());
+    #[cfg(feature = "http3")]
+    transports.push("webtransport".to_owned());
+    #[cfg(feature = "udp")]
+    transports.push("udp-dtls".to_owned());
+    #[cfg(feature = "coap")]
+    transports.push("coap".to_owned());
+    transports
+}
+
+/// Builds the complete [`WellKnownScp`] document from node state.
+///
+/// Shared between the Axum handler (HTTP/1.1 + HTTP/2) and the HTTP/3
+/// request handler to guarantee identical responses across transports.
+pub async fn build_well_known_scp(state: &NodeState) -> WellKnownScp {
     let contexts = {
         let guard = state.broadcast_contexts.read().await;
         if guard.is_empty() {
@@ -83,17 +105,121 @@ pub async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl Int
         rate_limit_subscribe: Some(
             u32::try_from(rc.max_subscriptions_per_connection).unwrap_or(u32::MAX),
         ),
+        transports: Some(advertised_transports()),
         economic: None,
     };
 
-    let doc = WellKnownScp {
+    WellKnownScp {
         version: 1,
         did: state.did.clone(),
         relay: state.relay_url.clone(),
         contexts,
         relay_config: Some(relay_config),
         handles: None,
-    };
+    }
+}
 
+/// Axum handler for `GET /.well-known/scp`.
+///
+/// Reads the current node state (DID, relay URL, registered broadcast
+/// contexts) and constructs a [`WellKnownScp`] response. The document
+/// is generated fresh on every request -- never cached (spec section
+/// 18.6.4: "dynamically generated from node state").
+///
+/// Returns `application/json` with the `WellKnownScp` payload.
+pub async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
+    let doc = build_well_known_scp(&state).await;
     (StatusCode::OK, Json(doc))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_transports_always_includes_websocket() {
+        let transports = advertised_transports();
+        assert!(
+            transports.contains(&"websocket".to_owned()),
+            "websocket must always be present in advertised transports"
+        );
+        // WebSocket is always the first entry.
+        assert_eq!(transports[0], "websocket");
+    }
+
+    #[test]
+    #[cfg(not(feature = "quic"))]
+    fn advertised_transports_excludes_quic_without_feature() {
+        let transports = advertised_transports();
+        assert!(
+            !transports.contains(&"quic".to_owned()),
+            "quic must not be advertised without the quic feature flag"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "quic")]
+    fn advertised_transports_includes_quic_with_feature() {
+        let transports = advertised_transports();
+        assert!(
+            transports.contains(&"quic".to_owned()),
+            "quic must be advertised when the quic feature flag is enabled"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "http3"))]
+    fn advertised_transports_excludes_webtransport_without_feature() {
+        let transports = advertised_transports();
+        assert!(
+            !transports.contains(&"webtransport".to_owned()),
+            "webtransport must not be advertised without the http3 feature flag"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "http3")]
+    fn advertised_transports_includes_webtransport_with_feature() {
+        let transports = advertised_transports();
+        assert!(
+            transports.contains(&"webtransport".to_owned()),
+            "webtransport must be advertised when the http3 feature flag is enabled"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "udp"))]
+    fn advertised_transports_excludes_udp_dtls_without_feature() {
+        let transports = advertised_transports();
+        assert!(
+            !transports.contains(&"udp-dtls".to_owned()),
+            "udp-dtls must not be advertised without the udp feature flag"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "udp")]
+    fn advertised_transports_includes_udp_dtls_with_feature() {
+        let transports = advertised_transports();
+        assert!(
+            transports.contains(&"udp-dtls".to_owned()),
+            "udp-dtls must be advertised when the udp feature flag is enabled"
+        );
+    }
+
+    #[test]
+    #[cfg(not(any(feature = "quic", feature = "http3", feature = "udp")))]
+    fn advertised_transports_default_is_websocket_only() {
+        let transports = advertised_transports();
+        assert_eq!(
+            transports,
+            vec!["websocket".to_owned()],
+            "without any transport feature flags, only websocket should be advertised"
+        );
+    }
 }

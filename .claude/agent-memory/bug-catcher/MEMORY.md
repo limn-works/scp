@@ -106,14 +106,31 @@ Notes:
 - **HotStreamFactory.contextEvents TOCTOU (MEDIUM):** ConcurrentHashMap get-then-put with suspend point between. Duplicate subscriptions possible, first leaks. Pattern: check-then-act on ConcurrentHashMap across suspension points.
 - **CheckpointManager.is_checkpoint_due ignores min_events_since_last (LOW):** Doc says min_events prevents spam, but time_due returns true regardless. Field is dead.
 
-### Known Bug Patterns (Mar 2026 — Persistence Layer PR, feat/broadcast-persistence-across-restarts)
-- **TTL snapshot captures configured duration not remaining (HIGH):** snapshot_context saves ttl_duration.as_secs() instead of actual remaining. Contexts get full TTL reset on every restart. Pattern: capturing config value when runtime state is needed.
-- **InMemoryBlobStorage routing_index stale entries on overwrite (HIGH):** store() pushes blob_id to routing_index without removing old entry. Duplicate/stale entries in query results. Pattern: secondary index not maintained on primary overwrite.
-- **restore_all_contexts wrong state for non-Active contexts (HIGH):** Only transitions handle for Active state; non-Active contexts get handle stuck in Creating. Pattern: incomplete match on state enum in restore logic.
-- **Event log append_event non-atomic two-step write (MEDIUM):** Event hash written then count updated. Crash between = orphaned event, stale count, next append overwrites. Pattern: multi-write without transaction support.
-- **prefix_successor behavioral divergence (MEDIUM):** Three implementations — Apple uses from_utf8_lossy (produces wrong bound), others use from_utf8.ok(). Pattern: independent re-implementations of shared algorithm.
-- **LocalBlobCache holds mutex across async I/O (MEDIUM):** evict_if_needed locks entries then calls inner.get/delete in loop. Blocks all concurrent cache ops. Pattern: lock held across async I/O boundary.
-- **S3BlobStore non-atomic three-object write (MEDIUM):** Blob, routing index, expiry index are separate PutObject calls. Crash between = orphaned/undiscoverable blobs.
-- **Nonce check_and_record post-write re-read fails with same-second timestamps (MEDIUM):** Two writers with same first_seen both pass re-read check. Pattern: using non-unique timestamp as writer identity proxy.
-- **SyncableStorage changelog unbounded growth (LOW):** No compaction mechanism for _sync/log/ entries.
-- **RedbBlobStore delete uses two transactions (LOW):** Safe behind mutex but fragile if locking changes.
+### Known Bug Patterns (Mar 2026 — Transport Expansion PR, DTLS/CoAP/QUIC/pool/manager/cover review)
+- **FIXED: MergedStream::poll_next returns Pending for duplicates (HIGH):** Now uses `i += 1; continue;` loop instead of Poll::Pending. BUT: see deferred fix review below — missing wake_by_ref in duplicate branch.
+- **FIXED: TOCTOU in QUIC accept_loop (HIGH):** quic/listener.rs now uses single write lock for check+increment (lines 389-415).
+- **TOCTOU in UDP listener dispatch_datagram (HIGH):** Comment claims fix but session limit uses read lock, not write lock. Safe only because recv loop is sequential.
+- **UDP adapter send_request triple lock acquisition (MEDIUM):** udp/adapter.rs:176-194. is_connected/send_datagram/recv_datagram each acquire-release the mutex separately. Concurrent callers get mismatched responses.
+- **CoAP Observe + request() DTLS interleaving (MEDIUM):** coap/adapter.rs:238-244. Documented "known limitation" but no enforcement. Observe recv steals request responses, request recv steals Observe notifications.
+- **QUIC deliver_to_subscribers silent drop (MEDIUM):** Now unified in subscription.rs:deliver_to_subscribers. Still try_send, but with better logging.
+- **BlockOption::block_size SZX=7 not validated (LOW):** coap/message.rs:450-452. RFC 7959 reserves SZX=7 but decode() accepts it.
+- **send_to_context latency_ms: 0 (LOW, pre-existing):** manager.rs:459. Still hardcoded from prior reviews.
+- **RECURRING PATTERN:** TOCTOU across async lock boundaries (read-check-drop-write-act) is the #1 recurring bug pattern in this codebase. Found in: standing_channel (fixed), NAPI transport_disconnect (fixed), Swift resolveKeyId, HotStreamFactory.contextEvents, and now QUIC accept_loop (fixed) + UDP listener dispatch_datagram. Fix pattern: hold single write lock for check-and-mutate, or use entry() API.
+
+### Known Bug Patterns (Mar 2026 — Transport Expansion PR, deferred fix review)
+- **MergedStream poll_next missing wake after duplicate (HIGH):** manager.rs:1230-1232. Duplicate branch does `i += 1; continue;` without wake_by_ref(). If remaining streams return Pending, task hangs. Pattern: filtering items in Stream::poll_next without ensuring re-poll.
+- **per_client_recv_loop holds RwLock across blocking recv (HIGH):** udp/listener.rs:607-614. Read lock held for up to 10s DTLS_RECV_TIMEOUT. Starves cleanup task, serializes last_activity updates. Pattern: RwLock guard held across async suspension point.
+- **WebSocket server missing rate_limiter_cleanup_task (MEDIUM):** native/server.rs. Only QUIC spawns cleanup. WebSocket-only relay leaks rate limiter entries. Pattern: shared resource cleanup responsibility not coordinated.
+- **Misleading comment in handle_new_client (MEDIUM):** udp/listener.rs:383-385. Claims "single write lock" but uses read lock + separate write lock. Safe only due to sequential processing.
+- **datagram_recv_loop blocks on DTLS handshake (MEDIUM):** udp/listener.rs:337-357. Awaits handle_new_client in-line, blocking recv from all other new clients during handshake.
+- **deliver_to_subscribers holds read lock during jitter sleep (LOW):** subscription.rs:58-113. Lock held for up to 50ms jitter delay. Pattern: RwLock guard held across spawned task joins.
+- **RECURRING PATTERN:** RwLock held across async boundaries continues as #1 pattern. Now found in per_client_recv_loop AND deliver_to_subscribers.
+
+### Known Bug Patterns (Mar 2026 — Transport Expansion, relay listener/session/client review)
+- **QUIC listener handle_subscribe TOCTOU (MEDIUM):** quic/listener.rs:852-884. Read lock on my_subscriptions for limit check, dropped, then write lock for insert. Concurrent QUIC streams bypass limit. WebTransport session.rs does this correctly (single write lock). Pattern: TOCTOU across lock boundaries (recurring).
+- **WebSocket relay total connection limit TOCTOU (MEDIUM):** native/server.rs:482-512. register_connection (write lock) then separate read lock for total check. Fix: incorporate total check into register_connection. Pattern: two-step atomic operation split into separate locks.
+- **WebTransport subscribe_rate_limit unit mismatch (MEDIUM):** webtransport/session.rs:109. Doc says "per second" but SubscribeRateLimiter::new treats param as "per minute". QUIC listener names field correctly (rate_limit_subscribes_per_minute). Pattern: incorrect doc on config field leads to misconfiguration.
+- **WebTransport listener missing rate_limiter cleanup (MEDIUM):** webtransport/server.rs. WebSocket and QUIC spawn cleanup tasks; WebTransport doesn't. Per-IP buckets leak. Pattern: shared cleanup responsibility not coordinated across transports (same as prior deferred-fix review finding for WebSocket server).
+- **WASM client Closure::forget() leaks on reconnection (LOW):** webtransport/client.rs:386,399,430. Three closures leaked per WebSocket reconnection cycle. Pattern: wasm-bindgen Closure::forget without lifecycle management.
+- **WASM client backfill_complete broadcast (LOW):** webtransport/client.rs:1339-1352. EVENT without ref_id broadcasts BackfillComplete to ALL subscriptions. Pattern: fallback dispatch that broadcasts instead of dropping unroutable events.
+- **RECURRING PATTERN UPDATE:** TOCTOU across async lock boundaries remains the #1 recurring pattern. Now also found in QUIC handle_subscribe and WebSocket total connection check. Total count: 8+ instances across codebase (4 fixed, 4+ remaining).

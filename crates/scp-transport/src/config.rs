@@ -26,6 +26,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::error::TransportError;
+use crate::profile::TransportProfile;
 
 // ---------------------------------------------------------------------------
 // TransportConfig
@@ -46,13 +47,15 @@ const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// Transport layer configuration.
 ///
 /// Passed to [`TransportManager::with_config`](crate::TransportManager::with_config)
-/// at initialization. Carries explicit relay URLs, an optional bootstrap
-/// domain for `.well-known/scp` discovery, and deduplication cache parameters.
+/// at initialization. Carries a transport profile for device-class-aware
+/// defaults, explicit relay URLs, an optional bootstrap domain for
+/// `.well-known/scp` discovery, and deduplication cache parameters.
 ///
 /// # Defaults
 ///
 /// ```rust
 /// use scp_transport::config::TransportConfig;
+/// use scp_transport::profile::TransportProfile;
 /// use std::time::Duration;
 ///
 /// let config = TransportConfig::default();
@@ -60,11 +63,24 @@ const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// assert!(config.bootstrap_domain.is_none());
 /// assert_eq!(config.dedup_cache_size, 10_000);
 /// assert_eq!(config.dedup_cache_ttl, Duration::from_secs(3600));
+/// // Profile is platform-inferred by default.
+/// let _ = config.profile;
 /// ```
 ///
-/// See ADR-032 in `.docs/adrs/phase-2.md` for the full design.
+/// See ADR-032 in `.docs/adrs/phase-2.md` for bootstrap design and
+/// ADR-036 for transport profile design.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
+    /// Transport profile controlling device-class-aware connection behavior.
+    ///
+    /// Determines default values for minimum relay count, maximum connection
+    /// count, reconnect backoff range, and cover traffic tier. Inferred from
+    /// the platform at initialization via
+    /// [`TransportProfile::platform_default`], overridable explicitly.
+    ///
+    /// See spec section 10.13 and ADR-036 in `.docs/adrs/phase-2.md`.
+    pub profile: TransportProfile,
+
     /// Explicit relay URLs provided at SDK initialization.
     ///
     /// Highest trust level in the bootstrap priority chain (section 18.5.1
@@ -99,6 +115,7 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
+            profile: TransportProfile::platform_default(),
             relay_urls: Vec::new(),
             bootstrap_domain: None,
             dedup_cache_size: DEFAULT_DEDUP_CACHE_SIZE,
@@ -322,13 +339,47 @@ impl ResolveRelays for DefaultRelayResolver {
 mod tests {
     use super::*;
 
+    use crate::profile::TransportProfile;
+
     #[test]
     fn transport_config_default_values() {
         let config = TransportConfig::default();
+        assert_eq!(config.profile, TransportProfile::platform_default());
         assert!(config.relay_urls.is_empty());
         assert!(config.bootstrap_domain.is_none());
         assert_eq!(config.dedup_cache_size, 10_000);
         assert_eq!(config.dedup_cache_ttl, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn transport_config_default_has_platform_inferred_profile() {
+        let config = TransportConfig::default();
+        // On macOS, platform default is Desktop per §10.13.1.
+        #[cfg(target_os = "macos")]
+        assert_eq!(config.profile, TransportProfile::Desktop);
+        // On any platform, the profile must be a valid variant.
+        let _ = config.profile.min_relays();
+    }
+
+    #[test]
+    fn transport_config_with_relay_urls_preserves_profile() {
+        let config = TransportConfig::with_relay_urls(vec!["wss://r.example.com/scp/v1".into()]);
+        assert_eq!(config.profile, TransportProfile::platform_default());
+    }
+
+    #[test]
+    fn transport_config_with_bootstrap_domain_preserves_profile() {
+        let config = TransportConfig::with_bootstrap_domain("example.com".into());
+        assert_eq!(config.profile, TransportProfile::platform_default());
+    }
+
+    #[test]
+    fn transport_config_explicit_profile_override() {
+        let config = TransportConfig {
+            profile: TransportProfile::Server,
+            ..TransportConfig::default()
+        };
+        assert_eq!(config.profile, TransportProfile::Server);
     }
 
     #[test]

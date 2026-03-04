@@ -28,7 +28,7 @@ use tokio::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use scp_core::envelope::OuterEnvelope;
-use sha2::{Digest, Sha256};
+
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -311,7 +311,7 @@ impl NativeRelayClient {
                 ..
             } => {
                 // Verify blob integrity: SHA-256(blob) must match relay-provided blob_id.
-                let computed_hash: [u8; 32] = Sha256::digest(blob).into();
+                let computed_hash = *crate::traits::BlobId::from_sha256(blob).as_bytes();
                 if computed_hash != *blob_id {
                     let expected = hex::encode(blob_id);
                     let actual = hex::encode(computed_hash);
@@ -958,7 +958,7 @@ mod tests {
 
     /// Computes SHA-256 of the given data, returning a 32-byte array.
     fn sha256(data: &[u8]) -> [u8; 32] {
-        Sha256::digest(data).into()
+        *crate::traits::BlobId::from_sha256(data).as_bytes()
     }
 
     #[tokio::test]

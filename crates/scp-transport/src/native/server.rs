@@ -23,13 +23,12 @@
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
@@ -45,7 +44,9 @@ use super::protocol::{
     RelayMessage,
 };
 use super::relay_persistence::RelayPersistence;
-use super::storage::{BlobStorage, BlobStorageBackend, StoredBlob};
+use super::storage::{BlobStorage, BlobStorageBackend};
+use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
+use crate::relay::subscription::{self, SubscriptionRegistry};
 
 /// Configuration for the relay server.
 ///
@@ -150,35 +151,6 @@ impl ShutdownHandle {
     }
 }
 
-/// The subscription registry: `routing_id -> Vec<SubscriberEntry>`.
-type SubscriptionRegistry = Arc<RwLock<HashMap<[u8; 32], Vec<SubscriberEntry>>>>;
-
-/// An entry in the subscription registry.
-struct SubscriberEntry {
-    /// Unique ID for this connection (to allow targeted removal).
-    connection_id: u64,
-    /// Channel for pushing relay messages to this subscriber.
-    tx: mpsc::Sender<RelayMessage>,
-}
-
-/// Per-IP connection counter, shared across all connection handlers.
-type ConnectionTracker = Arc<RwLock<HashMap<IpAddr, usize>>>;
-
-/// Per-IP token-bucket rate limiter for publish operations.
-///
-/// Each bucket tracks remaining tokens and the last refill time. Tokens are
-/// replenished lazily on each check rather than via a background task.
-#[derive(Debug)]
-struct RateLimitBucket {
-    /// Remaining tokens in this bucket.
-    tokens: f64,
-    /// Last time tokens were refilled.
-    last_refill: Instant,
-}
-
-/// Shared rate limiter state mapping IP addresses to their token buckets.
-type PublishRateLimiter = Arc<tokio::sync::Mutex<HashMap<IpAddr, RateLimitBucket>>>;
-
 /// The SCP native relay server.
 ///
 /// Accepts WebSocket connections, processes client messages, and manages
@@ -198,7 +170,6 @@ pub struct RelayServer {
     config: RelayConfig,
     storage: Arc<BlobStorageBackend>,
     subscriptions: SubscriptionRegistry,
-    next_connection_id: Arc<std::sync::atomic::AtomicU64>,
     /// Tracks active connection count per IP address.
     connection_tracker: ConnectionTracker,
     /// Per-IP publish rate limiter (token bucket).
@@ -214,20 +185,24 @@ pub struct RelayServer {
 impl RelayServer {
     /// Creates a new relay server with the given configuration and storage.
     ///
-    /// Accepts any type that implements [`Into<BlobStorageBackend>`], which
+    /// Accepts any type that implements [`Into<Arc<BlobStorageBackend>>`], which
     /// includes [`InMemoryBlobStorage`](super::storage::InMemoryBlobStorage)
     /// and [`BlobStorageBackend`] itself. Also accepts `Arc<BlobStorageBackend>`
     /// for sharing between the relay and other components (e.g., broadcast
     /// projection handlers). See spec section 18.11.5.
+    ///
+    /// Use this constructor when only running the WebSocket transport. For
+    /// multi-transport setups, use [`new_shared`] to pass shared rate limiters
+    /// and connection trackers.
     #[must_use]
     pub fn new(config: RelayConfig, storage: impl Into<Arc<BlobStorageBackend>>) -> Self {
+        let publish_rate_limiter = PublishRateLimiter::new(config.rate_limit_publishes_per_second);
         Self {
             config,
             storage: storage.into(),
-            subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            next_connection_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            connection_tracker: Arc::new(RwLock::new(HashMap::new())),
-            publish_rate_limiter: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            subscriptions: subscription::new_registry(),
+            connection_tracker: rate_limit::new_connection_tracker(),
+            publish_rate_limiter,
             persistence: None,
         }
     }
@@ -245,13 +220,13 @@ impl RelayServer {
         storage: impl Into<Arc<BlobStorageBackend>>,
         persistence: Arc<dyn RelayPersistence>,
     ) -> Self {
+        let publish_rate_limiter = PublishRateLimiter::new(config.rate_limit_publishes_per_second);
         Self {
             config,
             storage: storage.into(),
-            subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            next_connection_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            connection_tracker: Arc::new(RwLock::new(HashMap::new())),
-            publish_rate_limiter: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            subscriptions: subscription::new_registry(),
+            connection_tracker: rate_limit::new_connection_tracker(),
+            publish_rate_limiter,
             persistence: Some(persistence),
         }
     }
@@ -259,7 +234,7 @@ impl RelayServer {
     /// Restores persisted subscriptions into the in-memory registry.
     ///
     /// Called on startup from both [`run`](Self::run) and [`start`](Self::start).
-    /// Best-effort — logs warnings on failure and continues.
+    /// Best-effort -- logs warnings on failure and continues.
     async fn restore_persisted_subscriptions(&self) {
         if let Some(ref persistence) = self.persistence {
             match persistence.load_subscribed_routing_ids() {
@@ -283,6 +258,50 @@ impl RelayServer {
                 }
             }
         }
+    }
+
+    /// Creates a new relay server with shared cross-transport state.
+    ///
+    /// The `subscriptions`, `publish_rate_limiter`, and `connection_tracker`
+    /// are shared with QUIC and UDP/DTLS listeners so that per-IP limits
+    /// apply across all transports (ADR-037 AC3, spec §10.14.3).
+    #[must_use]
+    pub fn new_shared(
+        config: RelayConfig,
+        storage: impl Into<Arc<BlobStorageBackend>>,
+        subscriptions: SubscriptionRegistry,
+        publish_rate_limiter: PublishRateLimiter,
+        connection_tracker: ConnectionTracker,
+    ) -> Self {
+        Self {
+            config,
+            storage: storage.into(),
+            subscriptions,
+            connection_tracker,
+            publish_rate_limiter,
+            persistence: None,
+        }
+    }
+
+    /// Returns a clone of the subscription registry for sharing with other
+    /// transport listeners.
+    #[must_use]
+    pub fn subscriptions(&self) -> SubscriptionRegistry {
+        Arc::clone(&self.subscriptions)
+    }
+
+    /// Returns a clone of the publish rate limiter for sharing with other
+    /// transport listeners.
+    #[must_use]
+    pub fn publish_rate_limiter(&self) -> PublishRateLimiter {
+        self.publish_rate_limiter.clone()
+    }
+
+    /// Returns a clone of the connection tracker for sharing with other
+    /// transport listeners.
+    #[must_use]
+    pub fn connection_tracker(&self) -> ConnectionTracker {
+        Arc::clone(&self.connection_tracker)
     }
 
     /// Runs the relay server, listening for WebSocket connections.
@@ -320,30 +339,31 @@ impl RelayServer {
 
             let ip = addr.ip();
 
-            // Enforce connection limits before upgrading to WebSocket.
-            //
-            // When `bridge_secret` is configured, per-IP limits are skipped
-            // (all connections originate from localhost). The bridge layer
-            // enforces its own concurrency limit instead (see #229).
-            if !check_connection_allowed(&self.connection_tracker, ip, &self.config).await {
+            // Enforce per-IP and total connection limits atomically (BUG-002).
+            if let Err(e) = rate_limit::register_connection(
+                &self.connection_tracker,
+                ip,
+                self.config.max_connections_per_ip,
+                Some(self.config.max_total_connections),
+            )
+            .await
+            {
+                tracing::warn!(
+                    ip = %ip,
+                    current = e.current,
+                    limit = e.max,
+                    "rejecting connection: connection limit reached"
+                );
                 drop(stream);
                 continue;
             }
 
-            // Register this connection (always tracked for max_total_connections).
-            {
-                let mut tracker = self.connection_tracker.write().await;
-                *tracker.entry(ip).or_insert(0) += 1;
-            }
-
-            let conn_id = self
-                .next_connection_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let conn_id = subscription::next_owner_id();
             let storage = Arc::clone(&self.storage);
             let subscriptions = Arc::clone(&self.subscriptions);
             let config = self.config.clone();
             let conn_tracker = Arc::clone(&self.connection_tracker);
-            let rate_limiter = Arc::clone(&self.publish_rate_limiter);
+            let rate_limiter = self.publish_rate_limiter.clone();
             let persistence = self.persistence.clone();
 
             tokio::spawn(async move {
@@ -362,7 +382,7 @@ impl RelayServer {
                     // Connection handler errors are expected (client disconnect, etc.).
                 }
                 // Decrement connection count on disconnect.
-                decrement_connection(&conn_tracker, ip).await;
+                rate_limit::unregister_connection(&conn_tracker, ip).await;
             });
         }
     }
@@ -373,6 +393,32 @@ impl RelayServer {
     /// binding and spawns the accept loop in a background task. The returned
     /// [`ShutdownHandle`] can be used to gracefully stop the server.
     ///
+    /// Spawns background maintenance tasks (TTL expiry + rate limiter cleanup).
+    fn spawn_background_tasks(&self, token: &CancellationToken) {
+        let storage_for_ttl = Arc::clone(&self.storage);
+        let ttl_interval = self.config.ttl_check_interval;
+        let ttl_token = token.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = ttl_token.cancelled() => {}
+                () = ttl_expiry_task(storage_for_ttl, ttl_interval) => {}
+            }
+        });
+
+        let cleanup_limiter = self.publish_rate_limiter.clone();
+        let cleanup_token = token.clone();
+        tokio::spawn(async move {
+            cleanup_limiter
+                .cleanup_loop(
+                    Duration::from_secs(60),
+                    Duration::from_secs(90),
+                    cleanup_token,
+                )
+                .await;
+        });
+    }
+
     /// # Errors
     ///
     /// Returns [`RelayError::BindFailed`] if the server cannot bind to
@@ -391,24 +437,13 @@ impl RelayServer {
 
         let token = CancellationToken::new();
 
-        // Spawn the TTL expiry background task with cancellation.
-        let storage_for_ttl = Arc::clone(&self.storage);
-        let ttl_interval = self.config.ttl_check_interval;
-        let ttl_token = token.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                () = ttl_token.cancelled() => {}
-                () = ttl_expiry_task(storage_for_ttl, ttl_interval) => {}
-            }
-        });
+        self.spawn_background_tasks(&token);
 
         let storage = Arc::clone(&self.storage);
         let subscriptions = Arc::clone(&self.subscriptions);
         let config = self.config.clone();
-        let next_id = Arc::clone(&self.next_connection_id);
         let conn_tracker = Arc::clone(&self.connection_tracker);
-        let rate_limiter = Arc::clone(&self.publish_rate_limiter);
+        let rate_limiter = self.publish_rate_limiter.clone();
         let persistence = self.persistence.clone();
         let accept_token = token.clone();
 
@@ -426,25 +461,31 @@ impl RelayServer {
 
                 let ip = addr.ip();
 
-                // Enforce connection limits (per-IP limits skipped in bridge
-                // mode — see #229).
-                if !check_connection_allowed(&conn_tracker, ip, &config).await {
+                // Enforce per-IP and total connection limits atomically (BUG-002).
+                if let Err(e) = rate_limit::register_connection(
+                    &conn_tracker,
+                    ip,
+                    config.max_connections_per_ip,
+                    Some(config.max_total_connections),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        ip = %ip,
+                        current = e.current,
+                        limit = e.max,
+                        "rejecting connection: connection limit reached"
+                    );
                     drop(stream);
                     continue;
                 }
 
-                // Register this connection (always tracked for max_total_connections).
-                {
-                    let mut tracker = conn_tracker.write().await;
-                    *tracker.entry(ip).or_insert(0) += 1;
-                }
-
-                let conn_id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let conn_id = subscription::next_owner_id();
                 let storage = Arc::clone(&storage);
                 let subscriptions = Arc::clone(&subscriptions);
                 let config = config.clone();
                 let conn_tracker = Arc::clone(&conn_tracker);
-                let rate_limiter = Arc::clone(&rate_limiter);
+                let rate_limiter = rate_limiter.clone();
                 let persistence = persistence.clone();
 
                 tokio::spawn(async move {
@@ -460,7 +501,7 @@ impl RelayServer {
                     )
                     .await;
                     // Decrement connection count on disconnect.
-                    decrement_connection(&conn_tracker, ip).await;
+                    rate_limit::unregister_connection(&conn_tracker, ip).await;
                 });
             }
         });
@@ -495,138 +536,6 @@ async fn ttl_expiry_task(storage: Arc<BlobStorageBackend>, interval: Duration) {
 enum ConnectionError {
     #[error("websocket error: {0}")]
     WebSocket(String),
-}
-
-/// Checks whether a new connection from `ip` should be accepted, given the
-/// current tracker state and relay configuration.
-///
-/// Returns `true` if the connection is allowed, `false` if it should be
-/// rejected. When `bridge_mode` is `true`, per-IP limits are skipped (all
-/// connections originate from localhost; see #229).
-async fn check_connection_allowed(
-    tracker: &ConnectionTracker,
-    ip: IpAddr,
-    config: &RelayConfig,
-) -> bool {
-    let bridge_mode = config.bridge_secret.is_some();
-    let guard = tracker.read().await;
-    let total: usize = guard.values().sum();
-    if total >= config.max_total_connections {
-        tracing::warn!(
-            ip = %ip,
-            total_connections = total,
-            limit = config.max_total_connections,
-            "rejecting connection: max total connections reached"
-        );
-        return false;
-    }
-    if !bridge_mode {
-        let ip_count = guard.get(&ip).copied().unwrap_or(0);
-        // Drop the read lock before the comparison — we have our copy.
-        drop(guard);
-        if ip_count >= config.max_connections_per_ip {
-            tracing::warn!(
-                ip = %ip,
-                ip_connections = ip_count,
-                limit = config.max_connections_per_ip,
-                "rejecting connection: max connections per IP reached"
-            );
-            return false;
-        }
-    }
-    true
-}
-
-/// Decrements the per-IP connection count when a connection is dropped.
-///
-/// Removes the entry entirely when the count reaches zero to prevent the
-/// tracker map from growing unboundedly.
-async fn decrement_connection(tracker: &ConnectionTracker, ip: IpAddr) {
-    let mut t = tracker.write().await;
-    if let Some(count) = t.get_mut(&ip) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            t.remove(&ip);
-        }
-    }
-}
-
-/// Per-connection token-bucket rate limiter for subscribe operations.
-///
-/// Unlike the publish rate limiter (which is per-IP and shared across
-/// connections), the subscribe rate limiter is per-connection per ADR-004.
-/// Each connection owns its own bucket -- no shared state required.
-struct SubscribeRateLimiter {
-    /// Remaining tokens in this bucket.
-    tokens: f64,
-    /// Last time tokens were refilled.
-    last_refill: Instant,
-    /// Tokens per second (derived from the per-minute rate).
-    rate_per_second: f64,
-    /// Maximum bucket capacity (equal to the per-minute rate, allowing short bursts).
-    capacity: f64,
-}
-
-impl SubscribeRateLimiter {
-    /// Creates a new subscribe rate limiter with the given per-minute rate.
-    fn new(rate_per_minute: u32) -> Self {
-        let capacity = f64::from(rate_per_minute);
-        Self {
-            tokens: capacity,
-            last_refill: Instant::now(),
-            rate_per_second: capacity / 60.0,
-            capacity,
-        }
-    }
-
-    /// Checks whether a subscribe operation is allowed. Returns `true` if the
-    /// operation should proceed, `false` if rate-limited.
-    fn check(&mut self) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = elapsed
-            .mul_add(self.rate_per_second, self.tokens)
-            .min(self.capacity);
-        self.last_refill = now;
-
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Checks whether a publish is allowed under the per-IP token-bucket rate
-/// limit. Returns `true` if the publish should proceed, `false` if rate-limited.
-async fn check_publish_rate_limit(
-    rate_limiter: &PublishRateLimiter,
-    ip: IpAddr,
-    rate: u32,
-) -> bool {
-    let mut limiter = rate_limiter.lock().await;
-    let now = Instant::now();
-    let bucket = limiter.entry(ip).or_insert_with(|| RateLimitBucket {
-        tokens: f64::from(rate),
-        last_refill: now,
-    });
-
-    // Refill tokens based on elapsed time.
-    let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-    bucket.tokens = elapsed
-        .mul_add(f64::from(rate), bucket.tokens)
-        .min(f64::from(rate));
-    bucket.last_refill = now;
-
-    let allowed = if bucket.tokens >= 1.0 {
-        bucket.tokens -= 1.0;
-        true
-    } else {
-        false
-    };
-    drop(limiter);
-    allowed
 }
 
 /// Callback for `accept_hdr_async` that validates the bridge secret.
@@ -873,7 +782,7 @@ async fn cleanup_connection_subscriptions(
     let mut removed_ids = Vec::new();
     for routing_id in &routing_ids {
         if let Some(entries) = registry.get_mut(routing_id) {
-            entries.retain(|e| e.connection_id != connection_id);
+            entries.retain(|e| e.owner_id != connection_id);
             if entries.is_empty() {
                 registry.remove(routing_id);
                 removed_ids.push(*routing_id);
@@ -1061,7 +970,7 @@ async fn handle_publish(
     rate_limiter: &PublishRateLimiter,
 ) {
     // Check rate limit.
-    if !check_publish_rate_limit(rate_limiter, ip, config.rate_limit_publishes_per_second).await {
+    if !rate_limiter.check(ip).await {
         tracing::warn!(ip = %ip, "publish rate limit exceeded");
         let err = RelayMessage::Err {
             ref_id,
@@ -1102,14 +1011,7 @@ async fn handle_publish(
     }
 
     // Compute blob_id = SHA-256(blob).
-    let blob_id = {
-        let mut hasher = Sha256::new();
-        hasher.update(blob);
-        let hash = hasher.finalize();
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&hash);
-        id
-    };
+    let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
 
     // Store the blob.
     let stored = match storage
@@ -1132,7 +1034,8 @@ async fn handle_publish(
     // The return value tracks failed sends (logged inside the function)
     // for suppression detection.
     let _failed_deliveries =
-        deliver_to_subscribers(&stored, subscriptions, config.delivery_jitter_ms).await;
+        subscription::deliver_to_subscribers(&stored, subscriptions, config.delivery_jitter_ms)
+            .await;
 
     // Respond with OK + blob_id.
     let ok = RelayMessage::Ok {
@@ -1144,110 +1047,6 @@ async fn handle_publish(
 
 /// Delivers a stored blob to matching subscribers with optional delivery jitter.
 ///
-/// When `jitter_ms > 0`, a uniformly random delay in `[0, jitter_ms)` is applied
-/// before delivery to each subscriber. This breaks the timing correlation between
-/// PUBLISH arrival and subscriber delivery, mitigating relay-side traffic analysis
-/// (BLACK-001). The jitter is per-subscriber so that even subscribers on the same
-/// `routing_id` receive blobs at slightly different times.
-///
-/// Returns the number of delivery failures (subscribers whose channel was
-/// full or closed). A non-zero count indicates potential selective message
-/// suppression if a relay artificially fills a target's buffer.
-#[allow(clippy::significant_drop_tightening)]
-async fn deliver_to_subscribers(
-    stored: &StoredBlob,
-    subscriptions: &SubscriptionRegistry,
-    jitter_ms: u64,
-) -> u64 {
-    let registry = subscriptions.read().await;
-
-    let Some(entries) = registry.get(&stored.routing_id) else {
-        return 0;
-    };
-
-    let blob_msg = RelayMessage::Blob {
-        routing_id: stored.routing_id,
-        blob_id: stored.blob_id,
-        recipient_hint: stored.recipient_hint,
-        blob_ttl: stored.blob_ttl,
-        stored_at: stored.stored_at,
-        blob: stored.blob.clone(),
-    };
-
-    let total_subscribers = entries.len();
-
-    // When jitter is enabled, spawn parallel tasks so each subscriber's
-    // random delay runs concurrently instead of cascading sequentially.
-    // With N subscribers at J ms max jitter, worst-case drops from ~N*J/2
-    // to ~J ms total wall time.
-    let failed = if jitter_ms > 0 {
-        let mut handles = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let msg = blob_msg.clone();
-            let tx = entry.tx.clone();
-            let connection_id = entry.connection_id;
-            let blob_id = stored.blob_id;
-
-            handles.push(tokio::spawn(async move {
-                // Per-subscriber delivery jitter (BLACK-001 mitigation).
-                let delay_ms = rand::random::<u64>() % jitter_ms;
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-                if let Err(e) = tx.try_send(msg) {
-                    tracing::warn!(
-                        connection_id,
-                        blob_id = ?blob_id,
-                        error = %e,
-                        total_subscribers,
-                        "failed to deliver blob to subscriber (channel full or closed) — \
-                         possible selective suppression vector"
-                    );
-                    1u64
-                } else {
-                    0u64
-                }
-            }));
-        }
-
-        let mut total_failed = 0u64;
-        for handle in handles {
-            // Unwrap is safe: the spawned tasks do not panic.
-            total_failed += handle.await.unwrap_or(1);
-        }
-        total_failed
-    } else {
-        // Zero-jitter fast path: deliver sequentially without spawn overhead.
-        let mut total_failed = 0u64;
-        for entry in entries {
-            if let Err(e) = entry.tx.try_send(blob_msg.clone()) {
-                total_failed += 1;
-                tracing::warn!(
-                    connection_id = entry.connection_id,
-                    blob_id = ?stored.blob_id,
-                    error = %e,
-                    failed_count = total_failed,
-                    total_subscribers,
-                    "failed to deliver blob to subscriber (channel full or closed) — \
-                     possible selective suppression vector"
-                );
-            }
-        }
-        total_failed
-    };
-
-    if failed > 0 {
-        tracing::warn!(
-            blob_id = ?stored.blob_id,
-            routing_id = ?stored.routing_id,
-            failed_deliveries = failed,
-            total_subscribers,
-            "blob delivery incomplete: {failed}/{total_subscribers} subscribers received the blob",
-        );
-    }
-
-    failed
-}
-
 /// Handles a SUBSCRIBE operation.
 // SUBSCRIBE handler receives protocol-defined fields plus connection state;
 // grouping would obscure the protocol-level parameters.
@@ -1297,16 +1096,24 @@ async fn handle_subscribe(
         }
     }
 
-    // Register the subscription.
+    // Register the subscription (SEC-006: enforces global + per-routing-ID limits).
+    if let Err(reason) =
+        subscription::register_subscriber(subscriptions, routing_id, connection_id, tx.clone())
+            .await
     {
-        let mut registry = subscriptions.write().await;
-        let entries = registry.entry(routing_id).or_default();
-        // Remove any existing subscription from this connection for this routing_id.
-        entries.retain(|e| e.connection_id != connection_id);
-        entries.push(SubscriberEntry {
+        tracing::warn!(
             connection_id,
-            tx: tx.clone(),
-        });
+            routing_id = hex::encode(routing_id),
+            reason = %reason,
+            "subscription registry capacity exceeded"
+        );
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::TOO_MANY_SUBSCRIPTIONS,
+            msg: reason,
+        };
+        let _ = tx.send(err).await;
+        return;
     }
 
     {
@@ -1377,7 +1184,7 @@ async fn handle_unsubscribe(
     {
         let mut registry = subscriptions.write().await;
         if let Some(entries) = registry.get_mut(&routing_id) {
-            entries.retain(|e| e.connection_id != connection_id);
+            entries.retain(|e| e.owner_id != connection_id);
             if entries.is_empty() {
                 registry.remove(&routing_id);
                 routing_id_removed = true;
@@ -1499,9 +1306,12 @@ async fn handle_delete(
     clippy::too_many_lines
 )]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::native::storage::BlobStorageBackend;
     use futures::{SinkExt, StreamExt};
+    use sha2::{Digest, Sha256};
     use tokio_tungstenite::connect_async;
 
     /// Helper: create a test server on a random port and return the address.

@@ -22,7 +22,7 @@ use super::storage::{BlobStorage, ClockFn, StorageError, StoredBlob, system_cloc
 /// No at-rest encryption is applied because relay blob stores contain
 /// already-encrypted data (MLS ciphertexts or broadcast AES-256-GCM
 /// payloads). Operators who want at-rest encryption can use
-/// filesystem-level encryption (e.g., LUKS, FileVault).
+/// filesystem-level encryption (e.g., LUKS, `FileVault`).
 ///
 /// Schema per spec section 17.7:
 ///
