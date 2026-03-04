@@ -287,7 +287,7 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 | §11.1.2 Autobase and Multi-Writer | **N** | Single-writer-composed vs native multi-writer — informational |
 | §11.1.3 Keet and Group Encryption | **N** | Existence proof vs published spec — informational |
 | §11.1.4 Architectural Divergences | **N** | Transport coupling, trust, governance, offline — informational |
-| §11.2 DID DHT and SCP's Identity Layer (new) | **P/N** | did:dht spec, SCP departures (dual-layer, three-key, healing, JSON-LD), implementation independence, governance risk. The departures description (§11.2.3) contains **normative protocol content** that belongs in the SCP Identity protocol document. The did:dht spec summary (§11.2.1) and governance analysis (§11.2.4-5) are informational. |
+| §11.2 DID DHT and SCP's Identity Layer (new) | **P/N** | did:dht spec, SCP departures (dual-layer, multi-key incl. `#agent`, healing, JSON-LD), implementation independence, governance risk. The departures description (§11.2.3) contains **normative protocol content** — updated for ADR-039 shared-DID model — that belongs in the SCP Identity protocol document. The did:dht spec summary (§11.2.1) and governance analysis (§11.2.4-5) are informational. |
 | §11.3 "What no existing standard covers" | **N** | Informational — updated to include DID innovations |
 
 **Action:** Does not belong in protocol spec as a whole. However, §11.2.3 (SCP's departures from did:dht) contains normative content that should be extracted into the SCP Identity document. The structural comparisons (Hypercore, did:dht) belong in the white paper. The "What no existing standard covers" summary belongs in the white paper introduction.
