@@ -6,7 +6,7 @@
       "id": "gate-http-1",
       "name": "Local HTTP Control API",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-242",
         "SCP-243",
@@ -18,7 +18,7 @@
       "id": "gate-http-2",
       "name": "HTTP Broadcast Projection",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-246",
         "SCP-247",
@@ -34,7 +34,7 @@
       "gate": "gate-http-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/http.rs",
@@ -96,7 +96,7 @@
       "gate": "gate-http-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/dev_api.rs",
         "crates/scp-node/src/lib.rs"
@@ -153,7 +153,7 @@
       "gate": "gate-http-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/dev_api.rs"
       ],
@@ -202,7 +202,7 @@
       "gate": "gate-http-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/http.rs"
@@ -255,7 +255,7 @@
       "gate": "gate-http-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/projection.rs",
         "crates/scp-node/src/lib.rs"
@@ -310,7 +310,7 @@
       "gate": "gate-http-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/projection.rs"
       ],
@@ -362,7 +362,7 @@
       "gate": "gate-http-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/projection.rs"
       ],
@@ -414,7 +414,7 @@
       "gate": "gate-http-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/http.rs"
