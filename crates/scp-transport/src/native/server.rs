@@ -45,6 +45,7 @@ use super::protocol::{
 };
 use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
+use crate::relay::bridge::{BridgeRegistration, BridgeRegistry};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 
@@ -180,6 +181,14 @@ pub struct RelayServer {
     ///
     /// See SCP-PERSIST-066.
     persistence: Option<Arc<dyn RelayPersistence>>,
+    /// Bridge relay registry for symmetric NAT fallback (spec §10.12.4).
+    ///
+    /// When `config.supports_bridge` is `true`, the relay accepts
+    /// `BRIDGE_REGISTER` operations and proxies traffic for registered
+    /// routing IDs via the `BridgeRegistry`. Initialized unconditionally
+    /// (empty registry is zero-cost) so the handler can check it without
+    /// `Option` wrapping.
+    bridge_registry: Arc<BridgeRegistry>,
 }
 
 impl RelayServer {
@@ -204,6 +213,7 @@ impl RelayServer {
             connection_tracker: rate_limit::new_connection_tracker(),
             publish_rate_limiter,
             persistence: None,
+            bridge_registry: Arc::new(BridgeRegistry::new()),
         }
     }
 
@@ -228,6 +238,7 @@ impl RelayServer {
             connection_tracker: rate_limit::new_connection_tracker(),
             publish_rate_limiter,
             persistence: Some(persistence),
+            bridge_registry: Arc::new(BridgeRegistry::new()),
         }
     }
 
@@ -365,6 +376,7 @@ impl RelayServer {
             let conn_tracker = Arc::clone(&self.connection_tracker);
             let rate_limiter = self.publish_rate_limiter.clone();
             let persistence = self.persistence.clone();
+            let bridge_registry = Arc::clone(&self.bridge_registry);
 
             tokio::spawn(async move {
                 if let Err(_e) = handle_connection(
@@ -376,6 +388,7 @@ impl RelayServer {
                     config,
                     rate_limiter,
                     persistence,
+                    bridge_registry,
                 )
                 .await
                 {
@@ -445,6 +458,7 @@ impl RelayServer {
         let conn_tracker = Arc::clone(&self.connection_tracker);
         let rate_limiter = self.publish_rate_limiter.clone();
         let persistence = self.persistence.clone();
+        let bridge_registry = Arc::clone(&self.bridge_registry);
         let accept_token = token.clone();
 
         tokio::spawn(async move {
@@ -487,6 +501,7 @@ impl RelayServer {
                 let conn_tracker = Arc::clone(&conn_tracker);
                 let rate_limiter = rate_limiter.clone();
                 let persistence = persistence.clone();
+                let bridge_registry = Arc::clone(&bridge_registry);
 
                 tokio::spawn(async move {
                     let _ = handle_connection(
@@ -498,6 +513,7 @@ impl RelayServer {
                         config,
                         rate_limiter,
                         persistence,
+                        bridge_registry,
                     )
                     .await;
                     // Decrement connection count on disconnect.
@@ -651,6 +667,7 @@ async fn handle_connection(
     config: RelayConfig,
     rate_limiter: PublishRateLimiter,
     persistence: Option<Arc<dyn RelayPersistence>>,
+    bridge_registry: Arc<BridgeRegistry>,
 ) -> Result<(), ConnectionError> {
     let ws_stream = if let Some(expected_secret) = config.bridge_secret {
         // Validate the bridge token during the WebSocket handshake.
@@ -673,6 +690,13 @@ async fn handle_connection(
     // Channel for sending relay messages back to this client.
     let (tx, mut rx) = mpsc::channel::<RelayMessage>(256);
 
+    // Channel for forwarding raw bridge data to this client (§10.12.4).
+    // When this connection is a self-hosted relay that registered via
+    // BRIDGE_REGISTER, peers send BRIDGE_DATA which is forwarded as raw
+    // bytes through this channel. The forward task multiplexes both
+    // protocol messages and raw bridge data onto the WebSocket.
+    let (bridge_forward_tx, mut bridge_forward_rx) = mpsc::channel::<Vec<u8>>(256);
+
     // Track this connection's subscriptions for cleanup.
     let my_subscriptions: Arc<RwLock<HashSet<[u8; 32]>>> = Arc::new(RwLock::new(HashSet::new()));
 
@@ -680,14 +704,26 @@ async fn handle_connection(
     let mut subscribe_rate_limiter =
         SubscribeRateLimiter::new(config.rate_limit_subscribes_per_minute);
 
-    // Spawn a task to forward relay messages from the channel to the WebSocket.
+    // Spawn a task to forward relay messages and bridge data to the WebSocket.
+    // Multiplexes two channels: protocol messages (RelayMessage) are
+    // serialized to MessagePack; bridge-forwarded payloads are sent as
+    // raw binary frames (transparent proxy, §10.12.4).
     let forward_handle = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let Ok(bytes) = msg.to_bytes() else {
-                continue;
-            };
-            if ws_sink.send(Message::Binary(bytes)).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break; };
+                    let Ok(bytes) = msg.to_bytes() else { continue; };
+                    if ws_sink.send(Message::Binary(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                data = bridge_forward_rx.recv() => {
+                    let Some(data) = data else { break; };
+                    if ws_sink.send(Message::Binary(data)).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -723,6 +759,8 @@ async fn handle_connection(
                     &rate_limiter,
                     &mut subscribe_rate_limiter,
                     persistence.as_ref(),
+                    &bridge_registry,
+                    &bridge_forward_tx,
                 )
                 .await;
             }
@@ -752,8 +790,12 @@ async fn handle_connection(
     )
     .await;
 
+    // Cleanup: remove any bridge registrations for this connection (§10.12.4).
+    bridge_registry.deregister_connection(connection_id).await;
+
     // Drop the sender to signal the forward task to stop.
     drop(tx);
+    drop(bridge_forward_tx);
     let _ = forward_handle.await;
 
     Ok(())
@@ -819,6 +861,8 @@ async fn handle_client_message(
     rate_limiter: &PublishRateLimiter,
     subscribe_rate_limiter: &mut SubscribeRateLimiter,
     persistence: Option<&Arc<dyn RelayPersistence>>,
+    bridge_registry: &Arc<BridgeRegistry>,
+    bridge_forward_tx: &mpsc::Sender<Vec<u8>>,
 ) {
     match msg {
         ClientMessage::Publish {
@@ -902,52 +946,42 @@ async fn handle_client_message(
             let pong = RelayMessage::Pong { ts: *ts };
             let _ = tx.send(pong).await;
         }
-        ClientMessage::BridgeRegister { ref_id, .. } => {
-            // Bridge registration requires a BridgeRegistry, which is
-            // managed separately from the standard relay server.
-            if config.supports_bridge {
-                // Bridge service layer (relay::bridge::BridgeRegistry) is
-                // not yet wired into the relay server. Return an error so
-                // clients know the feature is not operational yet.
-                let err_msg = RelayMessage::Err {
-                    ref_id: ref_id.clone(),
-                    code: code::BRIDGE_NOT_INTEGRATED,
-                    msg:
-                        "bridge relay integration pending — handler not yet wired to BridgeRegistry"
-                            .to_string(),
-                };
-                let _ = tx.send(err_msg).await;
-            } else {
-                let err_msg = RelayMessage::Err {
-                    ref_id: ref_id.clone(),
-                    code: code::BRIDGE_NOT_SUPPORTED,
-                    msg: "this relay does not support BRIDGE operations".to_string(),
-                };
-                let _ = tx.send(err_msg).await;
-            }
+        ClientMessage::BridgeRegister {
+            ref_id,
+            routing_id,
+            public_key,
+            signature,
+            timestamp,
+            ..
+        } => {
+            handle_bridge_register(
+                ref_id.clone(),
+                *routing_id,
+                *public_key,
+                *signature,
+                *timestamp,
+                connection_id,
+                tx,
+                config,
+                bridge_registry,
+                bridge_forward_tx,
+            )
+            .await;
         }
-        ClientMessage::BridgeData { ref_id, .. } => {
-            // Bridge data forwarding requires the bridge service layer.
-            if config.supports_bridge {
-                // Bridge service layer is not yet wired into the relay
-                // server. Return an error so clients know the feature is
-                // not operational yet.
-                let err_msg = RelayMessage::Err {
-                    ref_id: ref_id.clone(),
-                    code: code::BRIDGE_NOT_INTEGRATED,
-                    msg:
-                        "bridge relay integration pending — handler not yet wired to BridgeRegistry"
-                            .to_string(),
-                };
-                let _ = tx.send(err_msg).await;
-            } else {
-                let err_msg = RelayMessage::Err {
-                    ref_id: ref_id.clone(),
-                    code: code::BRIDGE_NOT_SUPPORTED,
-                    msg: "this relay does not support BRIDGE operations".to_string(),
-                };
-                let _ = tx.send(err_msg).await;
-            }
+        ClientMessage::BridgeData {
+            ref_id,
+            target_routing_id,
+            payload,
+        } => {
+            handle_bridge_data(
+                ref_id.clone(),
+                *target_routing_id,
+                payload,
+                tx,
+                config,
+                bridge_registry,
+            )
+            .await;
         }
     }
 }
@@ -1291,6 +1325,150 @@ async fn handle_delete(
     // Best-effort deletion -- always return OK.
     let _ = storage.delete(&blob_id).await;
 
+    let ok = RelayMessage::Ok {
+        ref_id,
+        blob_id: None,
+    };
+    let _ = tx.send(ok).await;
+}
+
+/// Handles a `BRIDGE_REGISTER` operation (spec §10.12.4, SCP-236 AC8).
+///
+/// Verifies that bridging is enabled, authenticates the registration via
+/// Ed25519 ownership proof (SCP-247), and registers the routing ID in the
+/// [`BridgeRegistry`]. On success, spawns a pipe task that forwards data
+/// from the registry's forward channel to the connection's bridge forward
+/// channel, which is multiplexed onto the WebSocket by the forward task.
+#[allow(clippy::too_many_arguments)]
+async fn handle_bridge_register(
+    ref_id: Option<String>,
+    routing_id: [u8; 32],
+    public_key: [u8; 32],
+    signature: [u8; 64],
+    timestamp: u64,
+    connection_id: u64,
+    tx: &mpsc::Sender<RelayMessage>,
+    config: &RelayConfig,
+    bridge_registry: &Arc<BridgeRegistry>,
+    bridge_forward_tx: &mpsc::Sender<Vec<u8>>,
+) {
+    // Gate: bridging must be enabled on this relay.
+    if !config.supports_bridge {
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::BRIDGE_NOT_SUPPORTED,
+            msg: "this relay does not support BRIDGE operations".to_string(),
+        };
+        let _ = tx.send(err).await;
+        return;
+    }
+
+    // Build the registration struct for the BridgeRegistry.
+    let registration = BridgeRegistration {
+        routing_id,
+        public_key,
+        signature,
+        timestamp,
+    };
+
+    // Register (authentication is performed inside BridgeRegistry::register).
+    let forward_rx = match bridge_registry.register(&registration, connection_id).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            // Distinguish auth failures from limit violations.
+            let (err_code, err_msg) = if e.to_string().contains("BRIDGE_AUTH_FAILED") {
+                (code::BRIDGE_AUTH_FAILED, e.to_string())
+            } else {
+                (code::BRIDGE_LIMIT_EXCEEDED, e.to_string())
+            };
+            let err = RelayMessage::Err {
+                ref_id,
+                code: err_code,
+                msg: err_msg,
+            };
+            let _ = tx.send(err).await;
+            return;
+        }
+    };
+
+    // Spawn a pipe task: reads from the BridgeForwardReceiver and sends
+    // to the connection's bridge_forward_tx. The forward task multiplexes
+    // this onto the WebSocket as raw binary frames (transparent proxy).
+    let pipe_tx = bridge_forward_tx.clone();
+    tokio::spawn(async move {
+        let mut forward_rx = forward_rx;
+        while let Some(data) = forward_rx.recv().await {
+            if pipe_tx.send(data).await.is_err() {
+                // Connection closed — stop piping.
+                break;
+            }
+        }
+    });
+
+    // Respond with OK.
+    let ok = RelayMessage::Ok {
+        ref_id,
+        blob_id: None,
+    };
+    let _ = tx.send(ok).await;
+}
+
+/// Handles a `BRIDGE_DATA` operation (spec §10.12.4, SCP-236 AC8).
+///
+/// Looks up the target routing ID in the [`BridgeRegistry`] and forwards
+/// the opaque payload to the registered self-hosted relay. The bridge
+/// does not inspect, modify, or cache the payload — it is a transparent
+/// pipe.
+async fn handle_bridge_data(
+    ref_id: Option<String>,
+    target_routing_id: [u8; 32],
+    payload: &[u8],
+    tx: &mpsc::Sender<RelayMessage>,
+    config: &RelayConfig,
+    bridge_registry: &Arc<BridgeRegistry>,
+) {
+    // Gate: bridging must be enabled on this relay.
+    if !config.supports_bridge {
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::BRIDGE_NOT_SUPPORTED,
+            msg: "this relay does not support BRIDGE operations".to_string(),
+        };
+        let _ = tx.send(err).await;
+        return;
+    }
+
+    // Look up the forwarding channel for the target routing ID.
+    let Some(forward_tx) = bridge_registry.lookup(&target_routing_id).await else {
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::BRIDGE_TARGET_NOT_FOUND,
+            msg: format!(
+                "routing ID {} is not registered on this bridge",
+                hex::encode(target_routing_id)
+            ),
+        };
+        let _ = tx.send(err).await;
+        return;
+    };
+
+    // Forward the payload to the self-hosted relay (transparent proxy).
+    if let Err(e) = forward_tx.send(payload.to_vec()).await {
+        tracing::warn!(
+            target_routing_id = hex::encode(target_routing_id),
+            error = %e,
+            "bridge data forwarding failed (target channel closed)"
+        );
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::BRIDGE_TARGET_NOT_FOUND,
+            msg: "bridge target connection closed".to_string(),
+        };
+        let _ = tx.send(err).await;
+        return;
+    }
+
+    // Respond with OK.
     let ok = RelayMessage::Ok {
         ref_id,
         blob_id: None,
@@ -2689,6 +2867,221 @@ mod tests {
             self.subscriptions.lock().unwrap().clear();
             self.rate_limits.lock().unwrap().clear();
             Ok(())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bridge relay integration tests (SCP-236 AC8, §10.12.4)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a bridge-enabled test server on a random port.
+    async fn start_bridge_test_server() -> SocketAddr {
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            supports_bridge: true,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        addr
+    }
+
+    /// Helper: create a signed `BridgeRegistration` for testing.
+    fn make_bridge_registration(
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> (ClientMessage, [u8; 32]) {
+        use ed25519_dalek::Signer;
+        use scp_identity::{did_from_ed25519_public_key, resolution::did_routing_id};
+
+        let public_key = signing_key.verifying_key().to_bytes();
+        let did_string = did_from_ed25519_public_key(&public_key);
+        let routing_id = did_routing_id(&did_string);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let signable = crate::relay::bridge::bridge_register_signable(&routing_id, timestamp);
+        let signature = signing_key.sign(&signable);
+
+        let msg = ClientMessage::BridgeRegister {
+            ref_id: Some("br-1".to_string()),
+            routing_id,
+            public_key,
+            signature: signature.to_bytes(),
+            timestamp,
+            target_relay_hint: Some("ws://self-hosted.local:9000/scp/v1".to_string()),
+        };
+
+        (msg, routing_id)
+    }
+
+    #[tokio::test]
+    async fn bridge_register_succeeds_on_bridge_enabled_relay() {
+        let addr = start_bridge_test_server().await;
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let (register_msg, _routing_id) = make_bridge_registration(&signing_key);
+
+        send_msg(&mut sink, &register_msg).await;
+        let reply = recv_msg(&mut stream).await;
+
+        assert!(
+            matches!(reply, RelayMessage::Ok { ref ref_id, .. } if *ref_id == Some("br-1".to_string())),
+            "expected OK, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_register_rejected_on_non_bridge_relay() {
+        // Standard test server has supports_bridge = false.
+        let addr = start_test_server().await;
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let (register_msg, _routing_id) = make_bridge_registration(&signing_key);
+
+        send_msg(&mut sink, &register_msg).await;
+        let reply = recv_msg(&mut stream).await;
+
+        match reply {
+            RelayMessage::Err { code: c, .. } => {
+                assert_eq!(c, code::BRIDGE_NOT_SUPPORTED);
+            }
+            other => panic!("expected ERR(BRIDGE_NOT_SUPPORTED), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_data_forwarded_to_registered_relay() {
+        let addr = start_bridge_test_server().await;
+
+        // Connection 1: self-hosted relay registers a bridge.
+        let (mut sink1, mut stream1) = connect_client(addr).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let (register_msg, routing_id) = make_bridge_registration(&signing_key);
+
+        send_msg(&mut sink1, &register_msg).await;
+        let reply = recv_msg(&mut stream1).await;
+        assert!(matches!(reply, RelayMessage::Ok { .. }));
+
+        // Connection 2: peer sends BRIDGE_DATA targeting the registered relay.
+        let (mut sink2, mut stream2) = connect_client(addr).await;
+        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        let bridge_data = ClientMessage::BridgeData {
+            ref_id: Some("bd-1".to_string()),
+            target_routing_id: routing_id,
+            payload: payload.clone(),
+        };
+        send_msg(&mut sink2, &bridge_data).await;
+
+        // Peer should get OK response.
+        let peer_reply = recv_msg(&mut stream2).await;
+        assert!(
+            matches!(peer_reply, RelayMessage::Ok { ref ref_id, .. } if *ref_id == Some("bd-1".to_string())),
+            "expected OK for BRIDGE_DATA, got {peer_reply:?}"
+        );
+
+        // Self-hosted relay (connection 1) should receive the forwarded payload
+        // as a raw binary frame.
+        let forwarded = tokio::time::timeout(Duration::from_secs(5), stream1.next()).await;
+        let forwarded_msg = forwarded.unwrap().unwrap().unwrap();
+        match forwarded_msg {
+            Message::Binary(data) => {
+                assert_eq!(data, payload, "forwarded payload must match original");
+            }
+            other => panic!("expected binary frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_data_to_unregistered_target_returns_error() {
+        let addr = start_bridge_test_server().await;
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        let bridge_data = ClientMessage::BridgeData {
+            ref_id: Some("bd-miss".to_string()),
+            target_routing_id: [0xFF; 32],
+            payload: vec![1, 2, 3],
+        };
+        send_msg(&mut sink, &bridge_data).await;
+
+        let reply = recv_msg(&mut stream).await;
+        match reply {
+            RelayMessage::Err { code: c, .. } => {
+                assert_eq!(c, code::BRIDGE_TARGET_NOT_FOUND);
+            }
+            other => panic!("expected ERR(BRIDGE_TARGET_NOT_FOUND), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_deregisters_on_disconnect() {
+        let addr = start_bridge_test_server().await;
+
+        // Register a bridge.
+        let (mut sink1, mut stream1) = connect_client(addr).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let (register_msg, routing_id) = make_bridge_registration(&signing_key);
+
+        send_msg(&mut sink1, &register_msg).await;
+        let reply = recv_msg(&mut stream1).await;
+        assert!(matches!(reply, RelayMessage::Ok { .. }));
+
+        // Close the connection (drop both sink and stream).
+        drop(sink1);
+        drop(stream1);
+
+        // Brief pause to let the server process the disconnect.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A new client sending BRIDGE_DATA should get TARGET_NOT_FOUND.
+        let (mut sink2, mut stream2) = connect_client(addr).await;
+        let bridge_data = ClientMessage::BridgeData {
+            ref_id: Some("bd-after".to_string()),
+            target_routing_id: routing_id,
+            payload: vec![1],
+        };
+        send_msg(&mut sink2, &bridge_data).await;
+
+        let reply = recv_msg(&mut stream2).await;
+        match reply {
+            RelayMessage::Err { code: c, .. } => {
+                assert_eq!(c, code::BRIDGE_TARGET_NOT_FOUND);
+            }
+            other => panic!("expected TARGET_NOT_FOUND after disconnect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_register_with_invalid_signature_rejected() {
+        let addr = start_bridge_test_server().await;
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let (mut register_msg, _routing_id) = make_bridge_registration(&signing_key);
+
+        // Corrupt the signature.
+        if let ClientMessage::BridgeRegister {
+            ref mut signature, ..
+        } = register_msg
+        {
+            signature[0] ^= 0xFF;
+        }
+
+        send_msg(&mut sink, &register_msg).await;
+        let reply = recv_msg(&mut stream).await;
+
+        match reply {
+            RelayMessage::Err { code: c, .. } => {
+                assert_eq!(c, code::BRIDGE_AUTH_FAILED);
+            }
+            other => panic!("expected ERR(BRIDGE_AUTH_FAILED), got {other:?}")
         }
     }
 }
